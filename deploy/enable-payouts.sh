@@ -15,7 +15,7 @@ import json, sys
 cfg = json.load(open(sys.argv[1])); cfg["payouts"]["enabled"] = True
 json.dump(cfg, open(sys.argv[1], "w"), indent=2)
 PY
-grep -q -- '--enable-payouts' "$UNIT" || sed -i -E 's#^(ExecStart=/usr/bin/python3 /opt/xmzpool/xmzpool.py /etc/xmzpool/pool.json)$#\1 --enable-payouts#' "$UNIT"
+grep -q -- '^ExecStart=.*--enable-payouts' "$UNIT" || sed -i -E 's#^(ExecStart=/usr/bin/python3 /opt/xmzpool/xmzpool.py /etc/xmzpool/pool.json)$#\1 --enable-payouts#' "$UNIT"
 grep -q -- '^ExecStart=.*--enable-payouts' "$UNIT" || { echo "!! unit not updated; restoring"; cp -p "$CFG.before-payouts" "$CFG"; cp -p "$UNIT.before-payouts" "$UNIT"; exit 1; }
 systemctl daemon-reload; systemctl restart xmzpool; sleep 5
 systemctl is-active xmzpool
