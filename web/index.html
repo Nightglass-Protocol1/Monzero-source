@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monzero Pool</title>
+<style>
+:root { --bg:#0b1118; --panel:#111c27; --line:#293b49; --ink:#edf3f7; --muted:#a8bac8; --accent:#69d5c2; --warn:#edc48d;
+  --sans:"Segoe UI",Arial,sans-serif; --mono:"SFMono-Regular",Consolas,monospace; color-scheme:dark }
+* { box-sizing:border-box }
+body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 var(--sans); padding:32px max(16px,env(safe-area-inset-left)) 64px max(16px,env(safe-area-inset-right)) }
+main { max-width:960px; margin:0 auto; display:grid; gap:28px }
+h1 { margin:0; font-size:30px } h2 { margin:0 0 10px; font-size:18px }
+.muted { color:var(--muted) } code { font-family:var(--mono); font-size:.92em }
+.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px }
+.tile { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px }
+.tile b { display:block; font:600 22px/1.2 var(--mono); font-variant-numeric:tabular-nums }
+.tile span { color:var(--muted); font-size:13px }
+.wrap { overflow-x:auto; border:1px solid var(--line); border-radius:8px; background:var(--panel) }
+table { width:100%; border-collapse:collapse; font-size:14px; font-variant-numeric:tabular-nums }
+th,td { padding:9px 12px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap }
+th { color:var(--muted); font-weight:500 }
+.box { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; display:grid; gap:8px }
+input { width:100%; padding:10px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--ink); font-family:var(--mono) }
+.ok { color:var(--accent) } .warn { color:var(--warn) }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>Monzero Pool</h1><p class="muted">RandomX (rx/0) · PPLNS · <span id="fee">–</span> fee · paid after <span id="depth">–</span> confirmations · <span id="paymode">–</span></p></header>
+  <section class="tiles">
+    <div class="tile"><b id="poolhr">–</b><span>Pool hash rate</span></div>
+    <div class="tile"><b id="nethr">–</b><span>Network hash rate</span></div>
+    <div class="tile"><b id="miners">–</b><span>Miners / workers</span></div>
+    <div class="tile"><b id="height">–</b><span>Network height</span></div>
+    <div class="tile"><b id="blocks">–</b><span>Blocks found</span></div>
+    <div class="tile"><b id="last">–</b><span>Last block</span></div>
+  </section>
+  <section class="box">
+    <h2>Connect</h2>
+    <p>XMRig: <code id="cmd">xmrig -o pool.monzero.org:3333 -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0</code></p>
+    <p class="muted">Use your own Monzero wallet address as the username. Add <code>+50000</code> to the address for a fixed difficulty. Ports: <span id="ports">–</span></p>
+  </section>
+  <section class="box">
+    <h2>Your stats</h2>
+    <input id="addr" placeholder="Paste your XMZ address" autocomplete="off">
+    <div id="mine" class="muted">Enter an address to see hash rate, pending balance and payments.</div>
+  </section>
+  <section><h2>Recent blocks</h2><div class="wrap"><table><thead><tr><th>Height</th><th>Hash</th><th>Found</th><th>Reward</th><th>Status</th></tr></thead><tbody id="blist"></tbody></table></div></section>
+  <section><h2>Recent payments</h2><div class="wrap"><table><thead><tr><th>Sent</th><th>Transaction</th><th>Miners</th><th>Amount</th></tr></thead><tbody id="plist"></tbody></table></div></section>
+</main>
+<script>
+const U = 1e11;
+const hr = h => h >= 1e6 ? (h/1e6).toFixed(2)+" MH/s" : h >= 1e3 ? (h/1e3).toFixed(2)+" kH/s" : h.toFixed(0)+" H/s";
+const ago = t => { if (!t) return "never"; const s = Date.now()/1000 - t; return s < 120 ? Math.round(s)+" s ago" : s < 7200 ? Math.round(s/60)+" min ago" : Math.round(s/3600)+" h ago"; };
+const xmz = a => (a/U).toFixed(5)+" XMZ";
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const $ = id => document.getElementById(id);
+async function load() {
+  try {
+    const s = await (await fetch("/api/stats")).json();
+    $("fee").textContent = s.config.fee + "%"; $("depth").textContent = s.config.depth;
+    $("paymode").innerHTML = s.config.paymentsEnabled ? '<span class="ok">payments on</span>' : '<span class="warn">payments not yet enabled</span>';
+    $("poolhr").textContent = hr(s.pool.hashrate); $("nethr").textContent = hr(s.network.hashrate || 0);
+    $("miners").textContent = s.pool.miners + " / " + s.pool.workers; $("height").textContent = s.network.height ?? "–";
+    $("blocks").textContent = s.pool.totalBlocks; $("last").textContent = ago(s.pool.lastBlockFound/1000);
+    $("ports").textContent = s.config.ports.map(p => p.port + " (diff " + p.difficulty + ")").join(", ");
+    $("cmd").textContent = "xmrig -o " + s.config.poolHost + ":" + s.config.ports[0].port + " -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0";
+    $("blist").innerHTML = s.pool.blocks.map(b => `<tr><td>${b.height}</td><td><code>${esc(b.hash.slice(0,16))}…</code></td><td>${ago(b.timestamp)}</td><td>${xmz(b.reward)}</td><td>${esc(b.status)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No blocks yet</td></tr>';
+    $("plist").innerHTML = s.pool.payments.map(p => `<tr><td>${ago(p.timestamp)}</td><td><code>${esc(p.txid.slice(0,16))}…</code></td><td>${p.miners}</td><td>${xmz(p.amount)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">No payments yet</td></tr>';
+  } catch (e) { $("poolhr").textContent = "offline"; }
+  const a = $("addr").value.trim();
+  if (a.length > 90) {
+    try {
+      const m = await (await fetch("/api/miner?address=" + encodeURIComponent(a))).json();
+      $("mine").innerHTML = m.error ? esc(m.error) : `Hash rate <b>${hr(m.hashrate)}</b> · pending <b>${xmz(m.pending)}</b> · paid <b>${xmz(m.paid)}</b> · workers ${m.workers.map(w => esc(w.name)).join(", ") || "none online"}`;
+    } catch (e) {}
+  }
+}
+$("addr").addEventListener("change", load);
+load(); setInterval(load, 15000);
+</script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+[Unit]
+Description=Monzero mining pool (xmzpool)
+After=network-online.target monzerod.service
+Wants=network-online.target
+
+[Service]
+User=xmzpool
+Group=xmzpool
+ExecStart=/usr/bin/python3 /opt/xmzpool/xmzpool.py /etc/xmzpool/pool.json
+# For payouts, after the first blocks are credited correctly:
+# ExecStart=/usr/bin/python3 /opt/xmzpool/xmzpool.py /etc/xmzpool/pool.json --enable-payouts
+Restart=on-failure
+RestartSec=10
+StateDirectory=xmzpool
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/xmzpool
+
+[Install]
+WantedBy=multi-user.target

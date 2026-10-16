@@ -1,0 +1,21 @@
+{
+  "nettype": "mainnet",
+  "daemon_rpc": "http://127.0.0.1:6185",
+  "wallet_rpc": "http://127.0.0.1:6190",
+  "wallet_rpc_login": "pool:CHANGE_ME",
+  "pool_address": "POOL_WALLET_ADDRESS",
+  "database": "/var/lib/xmzpool/pool.sqlite",
+  "bind": "0.0.0.0",
+  "api_bind": "127.0.0.1",
+  "api_port": 8117,
+  "public_host": "pool.monzero.org",
+  "stratum_ports": [
+    {"port": 3333, "difficulty": 5000, "desc": "CPUs and laptops"},
+    {"port": 5555, "difficulty": 50000, "desc": "Servers and rigs"}
+  ],
+  "min_difficulty": 1000,
+  "fee_basis_points": 100,
+  "pplns_window_factor": 2.0,
+  "confirmations": 60,
+  "payouts": {"enabled": false, "threshold_xmz": 1.0, "interval_seconds": 3600, "max_destinations": 15, "fee_reserve_xmz": 0.1}
+}
