@@ -7,7 +7,7 @@ ssh -o BatchMode=yes "$HOST" sudo bash -s <<'REMOTE'
 set -euo pipefail
 CFG=/etc/xmzpool/pool.json UNIT=/etc/systemd/system/xmzpool.service
 [ -e /var/lib/xmzpool/pool.payouts-halted ] && { echo "!! payouts are halted; reconcile first"; exit 1; }
-confirmed=$(python3 -c 'import sqlite3;print(sqlite3.connect("file:/var/lib/xmzpool/pool.sqlite?mode=ro",uri=True).execute("SELECT COUNT(*) FROM blocks WHERE status=\"confirmed\"").fetchone()[0])')
+confirmed=$(python3 -c 'import sqlite3;print(sqlite3.connect("file:/var/lib/xmzpool/pool.sqlite?mode=ro",uri=True).execute("SELECT COUNT(*) FROM blocks WHERE status=?",("confirmed",)).fetchone()[0])')
 [ "$confirmed" -gt 0 ] || { echo "!! no confirmed blocks yet; nothing checked"; exit 1; }
 cp -p "$CFG" "$CFG.before-payouts"; cp -p "$UNIT" "$UNIT.before-payouts"
 python3 - "$CFG" <<'PY'
