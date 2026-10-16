@@ -113,5 +113,49 @@ class Payouts(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class WalletLogin(unittest.TestCase):
+    """monero-wallet-rpc offers MD5 and MD5-sess digest challenges together."""
+
+    def setUp(self):
+        import hashlib, http.server, json, threading
+        calls = self.calls = []
+
+        class Wallet(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                a = self.headers.get("Authorization", "")
+                f = dict((k.strip(), v.strip().strip('"')) for k, _, v in (p.partition("=") for p in a[7:].split(",")))
+                h = lambda s: hashlib.md5(s.encode()).hexdigest()
+                ok = a.startswith("Digest ") and f.get("response") == h(
+                    f"{h('pool:monero-rpc:s3cret')}:{f.get('nonce')}:{f.get('nc')}:{f.get('cnonce')}:auth:{h('POST:/json_rpc')}")
+                calls.append(ok)
+                if not ok:
+                    self.send_response(401)
+                    for alg in ("MD5", "MD5-sess"):
+                        self.send_header("WWW-authenticate", f'Digest qop="auth",algorithm={alg},realm="monero-rpc",nonce="bm9uY2U=",stale=false')
+                    self.send_header("Content-Length", "0"); self.end_headers()
+                    return
+                out = json.dumps({"id": "0", "jsonrpc": "2.0", "result": {"valid": True}}).encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers()
+                self.wfile.write(out)
+
+        self.srv = http.server.HTTPServer(("127.0.0.1", 0), Wallet)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_port}/json_rpc"
+
+    def tearDown(self):
+        self.srv.shutdown(); self.srv.server_close()
+
+    def test_answers_md5_challenge(self):
+        self.assertEqual(xp.rpc(self.url, "validate_address", {}, 5, ("pool", "s3cret")), {"valid": True})
+        self.assertEqual(self.calls, [False, True])
+
+    def test_wrong_login_is_definite_error(self):
+        with self.assertRaises(xp.RpcError):
+            xp.rpc(self.url, "validate_address", {}, 5, ("pool", "wrong"))
+        self.assertEqual(self.calls, [False, False])
+
+
 if __name__ == "__main__":
     unittest.main()

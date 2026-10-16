@@ -19,6 +19,7 @@ from stratum_miner import StratumMiner  # noqa: E402
 P = {"p2p": 36174, "rpc": 36175, "zmq": 36176, "wpool": 36180, "wmine": 36181, "stratum": 36333, "api": 36117}
 DAEMON = f"http://127.0.0.1:{P['rpc']}"
 WPOOL, WMINE = f"http://127.0.0.1:{P['wpool']}/json_rpc", f"http://127.0.0.1:{P['wmine']}/json_rpc"
+POOL_LOGIN = ("pool", "regtest-login-9f3")   # the pool wallet runs with a login, as in production
 results = []
 
 
@@ -66,8 +67,9 @@ def main():
             os.makedirs(f"{work}/{name}", exist_ok=True)
             start(name, [f"{a.bin}/monzero-wallet-rpc", "--daemon-address", f"127.0.0.1:{P['rpc']}", "--trusted-daemon",
                          "--allow-mismatched-daemon-version", "--rpc-bind-port", str(P[name]), "--rpc-bind-ip", "127.0.0.1",
-                         "--disable-rpc-login", "--wallet-dir", f"{work}/{name}", "--non-interactive"])
-        wait_for(lambda: rpc(WPOOL, "get_version"), 120, "pool wallet-rpc")
+                         *(["--rpc-login", ":".join(POOL_LOGIN)] if name == "wpool" else ["--disable-rpc-login"]),
+                         "--wallet-dir", f"{work}/{name}", "--non-interactive"])
+        wait_for(lambda: rpc(WPOOL, "get_version", auth=POOL_LOGIN), 120, "pool wallet-rpc")
         wait_for(lambda: rpc(WMINE, "get_version"), 120, "miner wallet-rpc")
 
         addrs = {}
@@ -75,13 +77,13 @@ def main():
             rpc(WMINE, "create_wallet", {"filename": who, "password": "", "language": "English"})
             addrs[who] = rpc(WMINE, "get_address", {"account_index": 0})["address"]
             rpc(WMINE, "close_wallet")
-        rpc(WPOOL, "create_wallet", {"filename": "pool", "password": "", "language": "English"})
-        pool_addr = rpc(WPOOL, "get_address", {"account_index": 0})["address"]
+        rpc(WPOOL, "create_wallet", {"filename": "pool", "password": "", "language": "English"}, auth=POOL_LOGIN)
+        pool_addr = rpc(WPOOL, "get_address", {"account_index": 0}, auth=POOL_LOGIN)["address"]
 
         # History for ring decoys, mined outside the pool.
         d("generateblocks", {"amount_of_blocks": 120, "wallet_address": addrs["carol"]})
 
-        cfg = {"nettype": "mainnet", "daemon_rpc": DAEMON, "wallet_rpc": f"http://127.0.0.1:{P['wpool']}",
+        cfg = {"nettype": "mainnet", "daemon_rpc": DAEMON, "wallet_rpc": f"http://127.0.0.1:{P['wpool']}", "wallet_rpc_login": ":".join(POOL_LOGIN),
                "pool_address": pool_addr, "database": f"{work}/pool.sqlite", "bind": "127.0.0.1",
                "api_port": P["api"], "public_host": "127.0.0.1",
                "stratum_ports": [{"port": P["stratum"], "difficulty": 20, "desc": "test"}],
@@ -171,7 +173,7 @@ def main():
               f"{{alice: {cred.get(addrs['alice'], 0) / ATOMIC:.5f}, bob: {cred.get(addrs['bob'], 0) / ATOMIC:.5f}}}")
 
         # --- payouts reach the miners' wallets
-        rpc(WPOOL, "refresh")
+        rpc(WPOOL, "refresh", auth=POOL_LOGIN)
         sent = wait_for(lambda: db.execute("SELECT id, txid FROM payments WHERE status='sent'").fetchall(), 120, "payment")
         check("payment sent with a transaction id", sent and len(sent[0][1]) == 64, sent)
         d("generateblocks", {"amount_of_blocks": 12, "wallet_address": addrs["carol"]})

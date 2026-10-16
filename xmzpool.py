@@ -16,7 +16,7 @@ Money rules:
   restores the balances; an uncertain result (timeout, lost reply) stops all
   payouts until the operator reconciles it. Nothing is ever retried blindly.
 """
-import argparse, asyncio, json, logging, os, secrets, sqlite3, sys, time, urllib.request, urllib.error
+import argparse, asyncio, hashlib, http.client, json, logging, os, secrets, sqlite3, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 
 ATOMIC = 10**11
@@ -32,20 +32,56 @@ class RpcError(Exception):
 class RpcUncertain(Exception):
     """No usable answer (timeout, connection lost): the outcome is unknown."""
 
+def digest_header(challenges, user, password, path):
+    """Answer an RFC 2617 MD5 qop=auth challenge. monero-wallet-rpc offers MD5
+    and MD5-sess together, which urllib's digest handler fails on."""
+    for c in challenges:
+        if not c.lower().startswith("digest "):
+            continue
+        f = dict((k.strip().lower(), v.strip().strip('"')) for k, _, v in
+                 (p.partition("=") for p in c[7:].split(",")))
+        if f.get("algorithm", "MD5").upper() != "MD5" or "auth" not in f.get("qop", "").split(","):
+            continue
+        h = lambda s: hashlib.md5(s.encode()).hexdigest()
+        cnonce, nc = secrets.token_hex(8), "00000001"
+        realm, nonce = f["realm"], f["nonce"]
+        ha1, ha2 = h(f"{user}:{realm}:{password}"), h(f"POST:{path}")
+        resp = h(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}")
+        return (f'Digest username="{user}", realm="{realm}", nonce="{nonce}", uri="{path}", '
+                f'algorithm=MD5, qop=auth, nc={nc}, cnonce="{cnonce}", response="{resp}"')
+    return None
+
 def rpc(url, method, params=None, timeout=30, auth=None):
     body = json.dumps({"jsonrpc": "2.0", "id": "0", "method": method, "params": params or {}}).encode()
-    req = urllib.request.Request(url, body, {"Content-Type": "application/json"})
-    if auth:
-        mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-        mgr.add_password(None, url, *auth)
-        opener = urllib.request.build_opener(urllib.request.HTTPDigestAuthHandler(mgr))
-    else:
-        opener = urllib.request.build_opener()
+    headers = {"Content-Type": "application/json"}
+    parts = urllib.parse.urlsplit(url)
+    path = parts.path or "/"
+    # monero-wallet-rpc keeps its digest challenge per connection, so the answer
+    # must go back on the same keep-alive connection that received the 401.
+    conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
     try:
-        with opener.open(req, timeout=timeout) as resp:
-            reply = json.load(resp)
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, json.JSONDecodeError) as e:
+        for attempt in (1, 2):
+            conn.request("POST", path, body, headers)
+            resp = conn.getresponse()
+            data = resp.read()
+            if resp.status == 401 and auth:
+                # A 401 means the request was refused before it ran, so answering
+                # the challenge and sending it again cannot repeat a payment.
+                if attempt == 2:
+                    raise RpcError(f"{method}: wallet RPC login rejected")
+                header = digest_header(resp.headers.get_all("WWW-Authenticate") or [], *auth, path)
+                if not header:
+                    raise RpcError(f"{method}: no supported auth challenge")
+                headers["Authorization"] = header
+                continue
+            if resp.status != 200:
+                raise RpcError(f"{method}: HTTP {resp.status}")
+            reply = json.loads(data)
+            break
+    except (http.client.HTTPException, TimeoutError, ConnectionError, OSError, json.JSONDecodeError) as e:
         raise RpcUncertain(f"{method}: {e}") from e
+    finally:
+        conn.close()
     if reply.get("error"):
         raise RpcError(f"{method}: {reply['error']}")
     return reply["result"]
