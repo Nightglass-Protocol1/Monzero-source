@@ -23,9 +23,28 @@ th { color:var(--muted); font-weight:500 }
 .box { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; display:grid; gap:8px }
 input { width:100%; padding:10px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--ink); font-family:var(--mono) }
 .ok { color:var(--accent) } .warn { color:var(--warn) }
+/* Site bar: the same links as every monzero.org page. */
+.site { max-width:960px; margin:-16px auto 8px; display:flex; align-items:center; justify-content:space-between; gap:16px; position:relative; padding-bottom:16px; border-bottom:1px solid var(--line) }
+.site .brand { display:inline-flex; align-items:center; gap:12px; color:var(--ink); text-decoration:none; font-weight:700; letter-spacing:.14em; font-size:14px }
+.site .mark { display:inline-grid; place-items:center; width:34px; height:34px; border:1px solid var(--accent); border-radius:9px; color:var(--accent); font:600 11px var(--mono); letter-spacing:0 }
+.site nav { display:flex; flex-wrap:wrap; gap:18px }
+.site nav a { color:var(--muted); text-decoration:none; font-size:13px }
+.site nav a:hover, .site nav a[aria-current=page] { color:var(--ink) }
+.site .menu { display:none; padding:8px 14px; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--ink); font:500 14px var(--sans); cursor:pointer }
+@media (max-width:1000px) {
+  .site .menu { display:block }
+  .site nav { display:none; position:absolute; top:100%; left:0; right:0; z-index:5; flex-direction:column; gap:4px; padding:12px 16px; background:var(--panel); border:1px solid var(--line); border-radius:0 0 12px 12px }
+  .site nav.open { display:flex }
+  .site nav a { padding:10px 4px; font-size:15px }
+}
 </style>
 </head>
 <body>
+<header class="site">
+  <a class="brand" href="https://monzero.org/" aria-label="Monzero home"><span class="mark">MZ</span>MONZERO</a>
+  <button class="menu" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button>
+  <nav id="site-nav" aria-label="Primary navigation"><a href="https://monzero.org/">Home</a><a href="https://monzero.org/explorer/">Explorer</a><a href="https://monzero.org/app/">Studio</a><a href="https://monzero.org/roadmap/">Roadmap</a><a href="https://monzero.org/WHITEPAPER.md?rev=1.4-20260926">Whitepaper</a><a href="https://monzero.org/#mine">Mining</a><a href="./" aria-current="page">Pool</a><a href="https://monzero.org/founder/">Founder</a><a href="https://monzero.org/fund/">Donate</a><a href="https://monzero.org/security/">Security</a></nav>
+</header>
 <main>
   <header><h1>Monzero Pool</h1><p class="muted">RandomX (rx/0) · PPLNS · <span id="fee">–</span> fee · paid after <span id="depth">–</span> confirmations · <span id="paymode">–</span></p></header>
   <section class="tiles">
@@ -79,6 +98,12 @@ async function load() {
 }
 $("addr").addEventListener("change", load);
 load(); setInterval(load, 15000);
+</script>
+<script>
+(function () {
+  const button = document.querySelector(".site .menu"), nav = document.getElementById("site-nav");
+  button.addEventListener("click", () => button.setAttribute("aria-expanded", String(nav.classList.toggle("open"))));
+})();
 </script>
 </body>
 </html>
