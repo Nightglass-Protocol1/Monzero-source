@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+    <id>org.monzero.Monzero</id>
+    <metadata_license>CC0-1.0</metadata_license>
+    <project_license>BSD-3-Clause</project_license>
+    <content_rating type="oars-1.1"/>
+    <developer_name>The Monzero Project</developer_name>
+    <categories>
+        <category>Network</category>
+        <category>Qt</category>
+        <category>Finance</category>
+    </categories>
+    <name>Monzero GUI</name>
+    <summary>Monzero: private, secure digital money</summary>
+    
+    <description>
+        <p>Monzero is a private, secure, decentralised digital currency. You
+            are your bank, you control your funds, and nobody can trace your transfers
+            unless you allow them to do so.</p>
+
+        <p>Privacy: Monzero uses a cryptographically sound system to allow you to send
+            and receive funds without your transactions being easily revealed on the
+            blockchain (the ledger of transactions that everyone has). This ensures that
+            your purchases, receipts, and all transfers remain absolutely private by
+            default.</p>
+
+        <p>Security: Using the power of a distributed peer-to-peer consensus network,
+            every transaction on the network is cryptographically secured. Individual
+            wallets have a 25 word mnemonic seed that is only displayed once, and can be
+            written down to backup the wallet. Wallet files are encrypted with a passphrase
+            to ensure they are useless if stolen.</p>
+
+        <p>Untraceability: By taking advantage of ring signatures, a special property of
+            a certain type of cryptography, Monzero is able to ensure that transactions are
+            not only untraceable, but have an optional measure of ambiguity that ensures
+            that transactions cannot easily be tied back to an individual user or computer.</p>
+    </description>
+
+    <launchable type="desktop-id">org.monzero.Monzero.desktop</launchable>
+
+    <screenshots>
+        <screenshot type="default">
+            <caption>A screenshot of the Monzero GUI wallet</caption>
+            <image>https://monzero.org/assets/monzero-xmz-coin.png</image>
+        </screenshot>
+    </screenshots>
+
+    <url type="homepage">https://monzero.org</url>
+    <releases>
+        <release version="0.18.5.1-genesis-pre2" date="2026-08-22" type="development"/>
+    </releases>
+
+</component>

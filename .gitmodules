@@ -1,0 +1,15 @@
+[submodule "core/external/rapidjson"]
+	path = core/external/rapidjson
+	url = https://github.com/Tencent/rapidjson
+[submodule "core/external/trezor-common"]
+	path = core/external/trezor-common
+	url = https://github.com/trezor/trezor-common.git
+[submodule "core/external/randomx"]
+	path = core/external/randomx
+	url = https://github.com/tevador/RandomX
+[submodule "core/external/supercop"]
+	path = core/external/supercop
+	url = https://github.com/monero-project/supercop
+[submodule "gui/external/quirc"]
+	path = gui/external/quirc
+	url = https://github.com/dlbeer/quirc/

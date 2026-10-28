@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Monzero GUI
+GenericName=Cryptocurrency wallet
+Comment=Monzero GUI wallet
+Exec=monzero-wallet-gui
+Type=Application
+Terminal=false
+Categories=Network;Qt;
+Icon=org.monzero.Monzero
+StartupNotify=true

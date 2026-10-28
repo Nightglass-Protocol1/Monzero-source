@@ -1,0 +1,26 @@
+[Unit]
+Description=Monzero isolated regression-test node
+After=network.target
+
+[Service]
+Type=simple
+User=monzero
+Group=monzero
+ExecStart=/srv/monzero-dex/bin/monzerod --regtest --keep-fakechain --fixed-difficulty 1 --offline --no-igd --hide-my-port --no-zmq --non-interactive --data-dir /srv/monzero-dex/data/monzero-fakechain --rpc-bind-ip 127.0.0.1 --rpc-bind-port 6175 --p2p-bind-ip 127.0.0.1 --p2p-bind-port 6174 --log-file /srv/monzero-dex/logs/monzerod-regtest.log
+ExecStop=/bin/kill -INT $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/srv/monzero-dex/data/monzero-fakechain /srv/monzero-dex/logs
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

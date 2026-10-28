@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Monzero Miner</string>
+    <string name="address_hint">Your Monzero address (starts with F)</string>
+    <string name="pool_hint">Pool (host:port)</string>
+    <string name="worker_hint">Worker name</string>
+    <string name="threads_label">CPU threads: %1$d of %2$d</string>
+    <string name="only_charging">Mine only while charging</string>
+    <string name="light_mode">Low-memory mode (uses 256 MB instead of 2 GB, much slower)</string>
+    <string name="action_start">Start mining</string>
+    <string name="action_stop">Stop</string>
+    <string name="hashrate_title">Hashrate</string>
+    <string name="shares">Accepted shares: %1$d · rejected: %2$d</string>
+    <string name="height">pool height %1$d</string>
+    <string name="state_mining">Mining</string>
+    <string name="state_paused">Paused</string>
+    <string name="state_stopped">Stopped</string>
+    <string name="state_failed">Stopped with an error</string>
+    <string name="status_stopped">Stopped</string>
+    <string name="status_starting">Starting…</string>
+    <string name="status_connecting">connecting to %1$s</string>
+    <string name="status_warming_up">Preparing RandomX…</string>
+    <string name="status_paused_unplugged">waiting for the charger</string>
+    <string name="status_paused_hot">battery at %1$d °C, cooling down</string>
+    <string name="status_failed">could not start the miner: %1$s</string>
+    <string name="status_exited">the miner exited (code %1$d); see the log</string>
+    <string name="notification_mining">%1$.1f H/s · %2$d accepted shares</string>
+    <string name="channel_mining">Mining status</string>
+    <string name="error_address">Enter a Monzero address: 95 or 106 characters starting with F.</string>
+    <string name="error_pool">Enter the pool as host:port, for example pool.monzero.org:3333.</string>
+    <string name="error_worker">Worker names use letters, digits, - and _ (up to 32).</string>
+    <string name="error_threads">Choose at least one thread.</string>
+    <string name="battery_warning_title">Mine on battery?</string>
+    <string name="battery_warning">Mining keeps the CPU at full load. On battery it drains the phone quickly and makes it warm. Mining still pauses if the battery reaches 40 °C.</string>
+    <string name="log_title">Miner log</string>
+    <string name="about"><![CDATA[Mining heats the phone and uses power; keep it plugged in and somewhere cool. Rewards are paid by the pool to your address, see <a href="https://pool.monzero.org/">pool.monzero.org</a>.<br/><br/>Powered by <a href="https://xmrig.com/">XMRig</a> (GPLv3), which mines for its developers 1% of the time; source code for this app and its XMRig build is at <a href="https://monzero.org/">monzero.org</a>.]]></string>
+</resources>

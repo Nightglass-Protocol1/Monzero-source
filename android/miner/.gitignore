@@ -1,0 +1,8 @@
+.gradle/
+build/
+local.properties
+app/build/
+*.log
+xmrig/build/
+# built by xmrig/build-android.sh
+app/src/main/jniLibs/

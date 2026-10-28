@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools" tools:locale="en">
+    <string name="about_close">Close</string>
+    <string name="about_whoami">I am Monzero Wallet</string>
+    <string name="about_version">Version %1$s (%2$d)</string>
+
+    <string name="credits_text"><![CDATA[
+        <b>Credits</b>
+        <br/>
+        Monzero Wallet is based on Monerujo by m2049r, baltsar777, anhdres, keejef,
+        rehrar, EarlOfEgo, ErCiccione et al. (Apache License 2.0).
+        It is not affiliated with or endorsed by the Monerujo project.
+        <br/><br/>
+        <a href="https://monzero.org/">monzero.org</a>
+        ]]></string>
+
+    <string name="privacy_policy"><![CDATA[
+        <h1>Privacy Policy</h1>
+        <p>This page explains what the Monzero Wallet app does with your information.</p>
+        <h2>Data Collected</h2>
+        <p>Your wallet keys, seed, addresses and transaction history are stored only on your
+        device. Keys never leave the device. To find and send transactions the app connects to
+        the Monzero node you choose (node.monzero.org by default); that node can see your
+        IP address and the transactions you broadcast, but not your keys or balance.</p>
+        <p>The app has no analytics, no advertising and no account. It does not fetch market
+        prices or use any exchange service.</p>
+        <h2>App Permissions</h2>
+        <ul>
+        <li>INTERNET : Connect to the Monzero network through a Monzero node</li>
+        <li>WAKE_LOCK : Keep the device awake while syncing</li>
+        <li>CAMERA : Scan QR codes for addresses</li>
+        <li>FOREGROUND_SERVICE : Keep the wallet syncing while it is open</li>
+        <li>ACCESS_NETWORK_STATE : Notice when the connection drops</li>
+        <li>READ_EXTERNAL_STORAGE : Import wallet backups you choose</li>
+        <li>USE_BIOMETRIC / USE_FINGERPRINT : Optional fingerprint unlock</li>
+        <li>BLUETOOTH : Inherited hardware-wallet support; unused, as no hardware wallet supports Monzero yet</li>
+        </ul>
+        <h2>Changes to this Privacy Policy</h2>
+        <p>Changes are published in the app and on monzero.org.</p>
+        <p>This Privacy Policy was last updated: 24 October 2026.</p>
+        <h2>Contact Us</h2>
+        <p>Questions about privacy or security: security@monzero.org.</p>
+        ]]></string>
+</resources>

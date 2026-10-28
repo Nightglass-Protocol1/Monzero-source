@@ -1,0 +1,3 @@
+.git* export-ignore
+version.cmake export-subst
+website/downloads export-ignore

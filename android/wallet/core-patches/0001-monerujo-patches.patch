@@ -1,0 +1,849 @@
+From ed71108fa8442f1ee76e158236213fe4b822b329 Mon Sep 17 00:00:00 2001
+From: m2049r <m2049r@monerujo.io>
+Date: Sun, 17 Mar 2024 19:24:00 +0100
+Subject: [PATCH 1/4] monerujo patches
+
+---
+ .dockerignore                     |   3 +
+ CMakeLists.txt                    |   5 +-
+ Makefile                          |  17 +++++
+ src/device/CMakeLists.txt         |  16 ++++
+ src/device/device.hpp             |  12 +--
+ src/device/device_io_monerujo.hpp |  88 +++++++++++++++++++++
+ src/device/device_ledger.cpp      |   8 ++
+ src/device/device_ledger.hpp      |   8 ++
+ src/wallet/api/CMakeLists.txt     |   4 +
+ src/wallet/api/coins.cpp          | 122 ++++++++++++++++++++++++++++++
+ src/wallet/api/coins.h            |  34 +++++++++
+ src/wallet/api/coins_info.cpp     | 118 +++++++++++++++++++++++++++++
+ src/wallet/api/coins_info.h       |  67 ++++++++++++++++
+ src/wallet/api/wallet.cpp         |   7 ++
+ src/wallet/api/wallet.h           |   4 +
+ src/wallet/api/wallet2_api.h      |  42 ++++++++++
+ src/wallet/wallet2.cpp            |   4 +-
+ src/wallet/wallet2.h              |   2 +
+ 18 files changed, 548 insertions(+), 13 deletions(-)
+ create mode 100644 .dockerignore
+ create mode 100644 src/device/device_io_monerujo.hpp
+ create mode 100644 src/wallet/api/coins.cpp
+ create mode 100644 src/wallet/api/coins.h
+ create mode 100644 src/wallet/api/coins_info.cpp
+ create mode 100644 src/wallet/api/coins_info.h
+
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 000000000..ebf6c4bea
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,3 @@
++**/.git*
++.dockerignore
++build
+\ No newline at end of file
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 46b596efe..2babf91d0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -602,7 +602,10 @@ if (WIN32)
+   list(APPEND OPENSSL_LIBRARIES ws2_32 crypt32)
+ endif()
+ 
+-find_package(HIDAPI)
++option(MONERUJO_HIDAPI "HIDAPI is handled by Monerujo" OFF)
++if(NOT MONERUJO_HIDAPI)
++  find_package(HIDAPI)
++endif()
+ 
+ add_definition_if_library_exists(c memset_s "string.h" HAVE_MEMSET_S)
+ add_definition_if_library_exists(c explicit_bzero "strings.h" HAVE_EXPLICIT_BZERO)
+diff --git a/Makefile b/Makefile
+index 393c68b49..df1cb3480 100644
+--- a/Makefile
++++ b/Makefile
+@@ -130,6 +130,23 @@ release-static-android-armv8:
+ 	cd $(builddir)/release/translations && cmake ../../../translations && $(MAKE)
+ 	cd $(builddir)/release && CC=aarch64-linux-android-clang CXX=aarch64-linux-android-clang++ cmake -D BUILD_TESTS=OFF -D ARCH="armv8-a" -D STATIC=ON -D BUILD_64=ON -D CMAKE_BUILD_TYPE=Release -D ANDROID=true -D BUILD_TAG="android-armv8" -D CMAKE_SYSTEM_NAME="Android" -D CMAKE_ANDROID_STANDALONE_TOOLCHAIN="${ANDROID_STANDALONE_TOOLCHAIN_PATH}" -D CMAKE_ANDROID_ARCH_ABI="arm64-v8a" ../.. && $(MAKE)
+ 
++release-static-android-armv7-wallet_api:
++	mkdir -p $(builddir)/release
++	cd $(builddir)/release && CC=arm-linux-androideabi-clang CXX=arm-linux-androideabi-clang++ cmake -D MONERUJO_HIDAPI=ON -D USE_DEVICE_TREZOR=OFF -D BUILD_GUI_DEPS=1 -D BUILD_TESTS=OFF -D ARCH="armv7-a" -D STATIC=ON -D BUILD_64=OFF -D CMAKE_BUILD_TYPE=release -D ANDROID=true -D BUILD_TAG="android-armv7" -D CMAKE_SYSTEM_NAME="Android" -D CMAKE_ANDROID_STANDALONE_TOOLCHAIN="${ANDROID_STANDALONE_TOOLCHAIN_PATH}" -D CMAKE_ANDROID_ARM_MODE=ON -D CMAKE_ANDROID_ARCH_ABI="armeabi-v7a" -D NO_AES=true ../.. && $(MAKE) wallet_api
++
++release-static-android-armv8-wallet_api:
++	mkdir -p $(builddir)/release
++	cd $(builddir)/release && CC=aarch64-linux-android-clang CXX=aarch64-linux-android-clang++ cmake -D MONERUJO_HIDAPI=ON -D USE_DEVICE_TREZOR=OFF -D BUILD_GUI_DEPS=1 -D BUILD_TESTS=OFF -D ARCH="armv8-a" -D STATIC=ON -D BUILD_64=ON -D CMAKE_BUILD_TYPE=release -D ANDROID=true -D BUILD_TAG="android-armv8" -D CMAKE_SYSTEM_NAME="Android" -D CMAKE_ANDROID_STANDALONE_TOOLCHAIN="${ANDROID_STANDALONE_TOOLCHAIN_PATH}" -D CMAKE_ANDROID_ARCH_ABI="arm64-v8a" ../.. && $(MAKE) wallet_api
++
++release-static-android-x86_64-wallet_api:
++	mkdir -p $(builddir)/release
++	cd $(builddir)/release && CC=x86_64-linux-android-clang CXX=x86_64-linux-android-clang++ cmake -D MONERUJO_HIDAPI=ON -D USE_DEVICE_TREZOR=OFF -D BUILD_GUI_DEPS=1 -D BUILD_TESTS=OFF -D ARCH="x86-64" -D STATIC=ON -D BUILD_64=ON -D CMAKE_BUILD_TYPE=release -D ANDROID=true -D BUILD_TAG="android-x86_64" -D CMAKE_SYSTEM_NAME="Android" -D CMAKE_ANDROID_STANDALONE_TOOLCHAIN="${ANDROID_STANDALONE_TOOLCHAIN_PATH}" -D CMAKE_ANDROID_ARCH_ABI="x86_64" ../.. && $(MAKE) wallet_api
++
++release-static-android-x86-wallet_api:
++	mkdir -p $(builddir)/release
++	cd $(builddir)/release && CC=i686-linux-android-clang CXX=i686-linux-android-clang++ cmake -D MONERUJO_HIDAPI=ON -D USE_DEVICE_TREZOR=OFF -D BUILD_GUI_DEPS=1 -D BUILD_TESTS=OFF -D ARCH="i686" -D STATIC=ON -D BUILD_64=OFF -D CMAKE_BUILD_TYPE=release -D ANDROID=true -D BUILD_TAG="android-x86" -D CMAKE_SYSTEM_NAME="Android" -D CMAKE_ANDROID_STANDALONE_TOOLCHAIN="${ANDROID_STANDALONE_TOOLCHAIN_PATH}" -D CMAKE_ANDROID_ARCH_ABI="x86" ../.. && $(MAKE) wallet_api
++
++
+ release-static-linux-armv8:
+ 	mkdir -p $(builddir)/release
+ 	cd $(builddir)/release && cmake -D BUILD_TESTS=OFF -D ARCH="armv8-a" -D STATIC=ON -D BUILD_64=ON -D CMAKE_BUILD_TYPE=Release -D BUILD_TAG="linux-armv8" $(topdir) && $(MAKE)
+diff --git a/src/device/CMakeLists.txt b/src/device/CMakeLists.txt
+index e4f1159b5..d43f9301c 100644
+--- a/src/device/CMakeLists.txt
++++ b/src/device/CMakeLists.txt
+@@ -56,6 +56,22 @@ if(HIDAPI_FOUND)
+     )
+ endif()
+ 
++if(MONERUJO_HIDAPI)
++  if(HIDAPI_FOUND)
++    message(FATAL_ERROR "HIDAPI_FOUND but we want MONERUJO_HIDAPI")
++  endif()
++  add_definitions(-DHAVE_MONERUJO)
++  set(device_sources
++    ${device_sources}
++    device_ledger.cpp
++    )
++  set(device_headers
++    ${device_headers}
++    device_ledger.hpp
++    device_io_monerujo.hpp
++    )
++endif()
++
+ set(device_private_headers)
+ 
+ 
+diff --git a/src/device/device.hpp b/src/device/device.hpp
+index 392703a24..97771f660 100644
+--- a/src/device/device.hpp
++++ b/src/device/device.hpp
+@@ -34,17 +34,7 @@
+ #include "ringct/rctTypes.h"
+ #include "cryptonote_config.h"
+ 
+-
+-#ifndef USE_DEVICE_LEDGER
+-#define USE_DEVICE_LEDGER 1
+-#endif
+-
+-#if !defined(HAVE_HIDAPI) 
+-#undef  USE_DEVICE_LEDGER
+-#define USE_DEVICE_LEDGER 0
+-#endif
+-
+-#if USE_DEVICE_LEDGER
++#if defined(HAVE_HIDAPI) || defined(HAVE_MONERUJO)
+ #define WITH_DEVICE_LEDGER
+ #endif
+ 
+diff --git a/src/device/device_io_monerujo.hpp b/src/device/device_io_monerujo.hpp
+new file mode 100644
+index 000000000..b444edab2
+--- /dev/null
++++ b/src/device/device_io_monerujo.hpp
+@@ -0,0 +1,88 @@
++// Copyright (c) 2017-2018, The Monero Project
++//
++// All rights reserved.
++//
++// Redistribution and use in source and binary forms, with or without modification, are
++// permitted provided that the following conditions are met:
++//
++// 1. Redistributions of source code must retain the above copyright notice, this list of
++//    conditions and the following disclaimer.
++//
++// 2. Redistributions in binary form must reproduce the above copyright notice, this list
++//    of conditions and the following disclaimer in the documentation and/or other
++//    materials provided with the distribution.
++//
++// 3. Neither the name of the copyright holder nor the names of its contributors may be
++//    used to endorse or promote products derived from this software without specific
++//    prior written permission.
++//
++// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
++// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
++// MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
++// THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
++// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
++// THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++//
++
++#if defined(HAVE_MONERUJO)
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif
++
++/**
++ * @brief LedgerFind - find Ledger Device and return it's name
++ * @param buffer     - buffer for name of found device
++ * @param len        - length of buffer
++ * @return  0 - success
++ *         -1 - no device connected / found
++ *         -2 - JVM not found
++ */
++int LedgerFind(char *buffer, size_t len);
++
++/**
++ * @brief LedgerExchange - exchange data with Ledger Device
++ * @param command        - buffer for data to send
++ * @param cmd_len        - length of send to send
++ * @param response       - buffer for received data
++ * @param max_resp_len   - size of receive buffer
++ *
++ * @return length of received data in response or -1 if error
++ */
++int  LedgerExchange(unsigned char *command, unsigned int cmd_len, unsigned char *response, unsigned int max_resp_len);
++
++#ifdef __cplusplus
++}
++#endif
++
++#include "device_io.hpp"
++
++#pragma once
++
++namespace hw {
++  namespace io {
++    class device_io_monerujo: device_io {
++    public:
++      device_io_monerujo() {};
++      ~device_io_monerujo() {};
++
++      void init() {};
++      void release() {};
++
++      void connect(void *params) {};
++      void disconnect() {};
++      bool connected() const {return true;}; // monerujo is always connected before it gets here
++
++      // returns number of bytes read or -1 on error
++      int  exchange(unsigned char *command, unsigned int cmd_len, unsigned char *response, unsigned int max_resp_len, bool user_input) {
++        return LedgerExchange(command, cmd_len, response, max_resp_len);
++      }
++    };
++  };
++};
++
++#endif //#if defined(HAVE_MONERUJO)
+diff --git a/src/device/device_ledger.cpp b/src/device/device_ledger.cpp
+index 6dde4a564..85db8b18b 100644
+--- a/src/device/device_ledger.cpp
++++ b/src/device/device_ledger.cpp
+@@ -297,7 +297,11 @@ namespace hw {
+     #define INS_GET_RESPONSE                    0xc0
+ 
+ 
++#ifndef HAVE_MONERUJO
+     device_ledger::device_ledger(): hw_device(0x0101, 0x05, 64, 2000) {
++#else
++    device_ledger::device_ledger() {
++#endif
+       this->id = device_id++;
+       this->reset_buffer();      
+       this->mode = NONE;
+@@ -522,6 +526,7 @@ namespace hw {
+       return true;
+     }
+     
++#ifndef HAVE_MONERUJO
+     static const std::vector<hw::io::hid_conn_params> known_devices {
+         {0x2c97, 0x0001, 0, 0xffa0}, 
+         {0x2c97, 0x0004, 0, 0xffa0},       
+@@ -530,10 +535,13 @@ namespace hw {
+         {0x2c97, 0x0007, 0, 0xffa0},
+         {0x2c97, 0x0008, 0, 0xffa0},
+     };
++#endif
+ 
+     bool device_ledger::connect(void) {
+       this->disconnect();
++#ifndef HAVE_MONERUJO
+       hw_device.connect(known_devices);
++#endif
+       this->reset();
+       #ifdef DEBUG_HWDEVICE
+       cryptonote::account_public_address pubkey;
+diff --git a/src/device/device_ledger.hpp b/src/device/device_ledger.hpp
+index 61ac6f9c8..2b568faeb 100644
+--- a/src/device/device_ledger.hpp
++++ b/src/device/device_ledger.hpp
+@@ -34,7 +34,11 @@
+ #include <string>
+ #include "device.hpp"
+ #include "log.hpp"
++#ifndef HAVE_MONERUJO
+ #include "device_io_hid.hpp"
++#else
++#include "device_io_monerujo.hpp"
++#endif
+ #include <boost/thread/mutex.hpp>
+ #include <boost/thread/recursive_mutex.hpp>
+ 
+@@ -148,7 +152,11 @@ namespace hw {
+         mutable boost::mutex   command_locker;
+ 
+         //IO
++#ifndef HAVE_MONERUJO
+         hw::io::device_io_hid hw_device;
++#else
++        hw::io::device_io_monerujo hw_device;
++#endif
+         unsigned int  length_send;
+         unsigned char buffer_send[BUFFER_SEND_SIZE];
+         unsigned int  length_recv;
+diff --git a/src/wallet/api/CMakeLists.txt b/src/wallet/api/CMakeLists.txt
+index af7948d8a..766e3ba54 100644
+--- a/src/wallet/api/CMakeLists.txt
++++ b/src/wallet/api/CMakeLists.txt
+@@ -38,6 +38,8 @@ set(wallet_api_sources
+   pending_transaction.cpp
+   utils.cpp
+   address_book.cpp
++  coins.cpp
++  coins_info.cpp
+   subaddress.cpp
+   subaddress_account.cpp
+   unsigned_transaction.cpp)
+@@ -53,6 +55,8 @@ set(wallet_api_private_headers
+   pending_transaction.h
+   common_defines.h
+   address_book.h
++  coins.h
++  coins_info.h
+   subaddress.h
+   subaddress_account.h
+   unsigned_transaction.h)
+diff --git a/src/wallet/api/coins.cpp b/src/wallet/api/coins.cpp
+new file mode 100644
+index 000000000..99c3a51f8
+--- /dev/null
++++ b/src/wallet/api/coins.cpp
+@@ -0,0 +1,122 @@
++#include "coins.h"
++#include "coins_info.h"
++#include "wallet.h"
++#include "crypto/hash.h"
++#include "wallet/wallet2.h"
++#include "common_defines.h"
++
++#include <string>
++#include <vector>
++
++using namespace epee;
++
++namespace Monero {
++
++    Coins::~Coins() = default;
++
++    CoinsImpl::CoinsImpl(WalletImpl *wallet)
++            : m_wallet(wallet) {}
++
++    CoinsImpl::~CoinsImpl()
++    {
++        for (auto t : m_rows)
++            delete t;
++    }
++
++    int CoinsImpl::count() const
++    {
++        boost::shared_lock<boost::shared_mutex> lock(m_rowsMutex);
++        int result = m_rows.size();
++        return result;
++    }
++
++    CoinsInfo *CoinsImpl::coin(int index) const
++    {
++        boost::shared_lock<boost::shared_mutex> lock(m_rowsMutex);
++        // sanity check
++        if (index < 0)
++            return nullptr;
++        auto index_ = static_cast<unsigned>(index);
++        return index_ < m_rows.size() ? m_rows[index_] : nullptr;
++    }
++
++    std::vector<CoinsInfo *> CoinsImpl::getAll() const
++    {
++        boost::shared_lock<boost::shared_mutex> lock(m_rowsMutex);
++        return m_rows;
++    }
++
++
++    void CoinsImpl::refresh()
++    {
++        LOG_PRINT_L2("Refreshing coins");
++
++        boost::unique_lock<boost::shared_mutex> lock(m_rowsMutex);
++        boost::shared_lock<boost::shared_mutex> transfers_lock(m_wallet->m_wallet->m_transfers_mutex);
++
++        // delete old outputs;
++        for (auto t : m_rows)
++            delete t;
++        m_rows.clear();
++
++        for (size_t i = 0; i < m_wallet->m_wallet->get_num_transfer_details(); ++i)
++        {
++            const tools::wallet2::transfer_details &td = m_wallet->m_wallet->get_transfer_details(i);
++
++            auto ci = new CoinsInfoImpl();
++            ci->m_blockHeight = td.m_block_height;
++            ci->m_hash = string_tools::pod_to_hex(td.m_txid);
++            ci->m_internalOutputIndex = td.m_internal_output_index;
++            ci->m_globalOutputIndex = td.m_global_output_index;
++            ci->m_spent = td.m_spent;
++            ci->m_frozen = td.m_frozen;
++            ci->m_spentHeight = td.m_spent_height;
++            ci->m_amount = td.m_amount;
++            ci->m_rct = td.m_rct;
++            ci->m_keyImageKnown = td.m_key_image_known;
++            ci->m_pkIndex = td.m_pk_index;
++            ci->m_subaddrIndex = td.m_subaddr_index.minor;
++            ci->m_subaddrAccount = td.m_subaddr_index.major;
++            ci->m_address = m_wallet->m_wallet->get_subaddress_as_str(td.m_subaddr_index); // todo: this is expensive, cache maybe?
++            ci->m_addressLabel = m_wallet->m_wallet->get_subaddress_label(td.m_subaddr_index);
++            ci->m_keyImage = string_tools::pod_to_hex(td.m_key_image);
++            ci->m_unlockTime = td.m_tx.unlock_time;
++            ci->m_unlocked = m_wallet->m_wallet->is_transfer_unlocked(td);
++            ci->m_pubKey = string_tools::pod_to_hex(td.get_public_key());
++            ci->m_coinbase = td.m_tx.vin.size() == 1 && td.m_tx.vin[0].type() == typeid(cryptonote::txin_gen);
++
++            m_rows.push_back(ci);
++        }
++    }
++
++    void CoinsImpl::setFrozen(int index)
++    {
++        try
++        {
++            m_wallet->m_wallet->freeze(index);
++            refresh();
++        }
++        catch (const std::exception& e)
++        {
++            LOG_ERROR("setLabel: " << e.what());
++        }
++    }
++
++    void CoinsImpl::thaw(int index)
++    {
++        try
++        {
++            m_wallet->m_wallet->thaw(index);
++            refresh();
++        }
++        catch (const std::exception& e)
++        {
++            LOG_ERROR("thaw: " << e.what());
++        }
++    }
++
++    bool CoinsImpl::isTransferUnlocked(uint64_t unlockTime, uint64_t blockHeight) {
++        return m_wallet->m_wallet->is_transfer_unlocked(unlockTime, blockHeight);
++    }
++
++} // namespace
+diff --git a/src/wallet/api/coins.h b/src/wallet/api/coins.h
+new file mode 100644
+index 000000000..3293d8ae9
+--- /dev/null
++++ b/src/wallet/api/coins.h
+@@ -0,0 +1,34 @@
++#ifndef WOWLET_COINS_H
++#define WOWLET_COINS_H
++
++#include "wallet/api/wallet2_api.h"
++#include "wallet/wallet2.h"
++
++namespace Monero {
++
++    class WalletImpl;
++
++    class CoinsImpl : public Coins
++    {
++    public:
++        explicit CoinsImpl(WalletImpl * wallet);
++        ~CoinsImpl() override;
++        int count() const override;
++        CoinsInfo * coin(int index) const override;
++        std::vector<CoinsInfo*> getAll() const override;
++        void refresh() override;
++
++        void setFrozen(int index) override;
++        void thaw(int index) override;
++
++        bool isTransferUnlocked(uint64_t unlockTime, uint64_t blockHeight) override;
++
++    private:
++        WalletImpl *m_wallet;
++        std::vector<CoinsInfo*> m_rows;
++        mutable boost::shared_mutex   m_rowsMutex;
++    };
++
++}
++
++#endif //WOWLET_COINS_H
+diff --git a/src/wallet/api/coins_info.cpp b/src/wallet/api/coins_info.cpp
+new file mode 100644
+index 000000000..06d874ddf
+--- /dev/null
++++ b/src/wallet/api/coins_info.cpp
+@@ -0,0 +1,118 @@
++#include "coins_info.h"
++
++using namespace std;
++
++namespace Monero {
++
++    CoinsInfo::~CoinsInfo() = default;
++
++    CoinsInfoImpl::CoinsInfoImpl()
++            : m_blockHeight(0)
++            , m_internalOutputIndex(0)
++            , m_globalOutputIndex(0)
++            , m_spent(false)
++            , m_frozen(false)
++            , m_spentHeight(0)
++            , m_amount(0)
++            , m_rct(false)
++            , m_keyImageKnown(false)
++            , m_pkIndex(0)
++            , m_subaddrAccount(0)
++            , m_subaddrIndex(0)
++            , m_unlockTime(0)
++            , m_unlocked(false)
++    {
++
++    }
++
++    CoinsInfoImpl::~CoinsInfoImpl() = default;
++
++    uint64_t CoinsInfoImpl::blockHeight() const
++    {
++        return m_blockHeight;
++    }
++
++    string CoinsInfoImpl::hash() const
++    {
++        return m_hash;
++    }
++
++    size_t CoinsInfoImpl::internalOutputIndex() const {
++        return m_internalOutputIndex;
++    }
++
++    uint64_t CoinsInfoImpl::globalOutputIndex() const
++    {
++        return m_globalOutputIndex;
++    }
++
++    bool CoinsInfoImpl::spent() const
++    {
++        return m_spent;
++    }
++
++    bool CoinsInfoImpl::frozen() const
++    {
++        return m_frozen;
++    }
++
++    uint64_t CoinsInfoImpl::spentHeight() const
++    {
++        return m_spentHeight;
++    }
++
++    uint64_t CoinsInfoImpl::amount() const
++    {
++        return m_amount;
++    }
++
++    bool CoinsInfoImpl::rct() const {
++        return m_rct;
++    }
++
++    bool CoinsInfoImpl::keyImageKnown() const {
++        return m_keyImageKnown;
++    }
++
++    size_t CoinsInfoImpl::pkIndex() const {
++        return m_pkIndex;
++    }
++
++    uint32_t CoinsInfoImpl::subaddrIndex() const {
++        return m_subaddrIndex;
++    }
++
++    uint32_t CoinsInfoImpl::subaddrAccount() const {
++        return m_subaddrAccount;
++    }
++
++    string CoinsInfoImpl::address() const {
++        return m_address;
++    }
++
++    string CoinsInfoImpl::addressLabel() const {
++        return m_addressLabel;
++    }
++
++    string CoinsInfoImpl::keyImage() const {
++        return m_keyImage;
++    }
++
++    uint64_t CoinsInfoImpl::unlockTime() const {
++        return m_unlockTime;
++    }
++
++    bool CoinsInfoImpl::unlocked() const {
++        return m_unlocked;
++    }
++
++    string CoinsInfoImpl::pubKey() const {
++        return m_pubKey;
++    }
++
++    bool CoinsInfoImpl::coinbase() const {
++        return m_coinbase;
++    }
++} // namespace
++
++namespace Bitmonero = Monero;
+diff --git a/src/wallet/api/coins_info.h b/src/wallet/api/coins_info.h
+new file mode 100644
+index 000000000..c76109334
+--- /dev/null
++++ b/src/wallet/api/coins_info.h
+@@ -0,0 +1,67 @@
++#ifndef WOWLET_COINS_INFO_H
++#define WOWLET_COINS_INFO_H
++
++#include "wallet/api/wallet2_api.h"
++#include <string>
++#include <ctime>
++
++namespace Monero {
++
++    class CoinsImpl;
++
++    class CoinsInfoImpl : public CoinsInfo
++    {
++    public:
++        CoinsInfoImpl();
++        ~CoinsInfoImpl();
++
++        virtual uint64_t blockHeight() const override;
++        virtual std::string hash() const override;
++        virtual size_t internalOutputIndex() const override;
++        virtual uint64_t globalOutputIndex() const override;
++        virtual bool spent() const override;
++        virtual bool frozen() const override;
++        virtual uint64_t spentHeight() const override;
++        virtual uint64_t amount() const override;
++        virtual bool rct() const override;
++        virtual bool keyImageKnown() const override;
++        virtual size_t pkIndex() const override;
++        virtual uint32_t subaddrIndex() const override;
++        virtual uint32_t subaddrAccount() const override;
++        virtual std::string address() const override;
++        virtual std::string addressLabel() const override;
++        virtual std::string keyImage() const override;
++        virtual uint64_t unlockTime() const override;
++        virtual bool unlocked() const override;
++        virtual std::string pubKey() const override;
++        virtual bool coinbase() const override;
++
++    private:
++        uint64_t    m_blockHeight;
++        std::string m_hash;
++        size_t      m_internalOutputIndex;
++        uint64_t    m_globalOutputIndex;
++        bool        m_spent;
++        bool        m_frozen;
++        uint64_t    m_spentHeight;
++        uint64_t    m_amount;
++        bool        m_rct;
++        bool        m_keyImageKnown;
++        size_t      m_pkIndex;
++        uint32_t    m_subaddrIndex;
++        uint32_t    m_subaddrAccount;
++        std::string m_address;
++        std::string m_addressLabel;
++        std::string m_keyImage;
++        uint64_t    m_unlockTime;
++        bool        m_unlocked;
++        std::string m_pubKey;
++        bool        m_coinbase;
++
++        friend class CoinsImpl;
++
++    };
++
++} // namespace
++
++#endif //WOWLET_COINS_INFO_H
+diff --git a/src/wallet/api/wallet.cpp b/src/wallet/api/wallet.cpp
+index 1540596b1..573955bb8 100644
+--- a/src/wallet/api/wallet.cpp
++++ b/src/wallet/api/wallet.cpp
+@@ -34,6 +34,7 @@
+ #include "unsigned_transaction.h"
+ #include "transaction_history.h"
+ #include "address_book.h"
++#include "coins.h"
+ #include "subaddress.h"
+ #include "subaddress_account.h"
+ #include "common_defines.h"
+@@ -468,6 +469,7 @@ WalletImpl::WalletImpl(NetworkType nettype, uint64_t kdf_rounds)
+     m_refreshThreadDone = false;
+     m_refreshEnabled = false;
+     m_addressBook.reset(new AddressBookImpl(this));
++    m_coins.reset(new CoinsImpl(this));
+     m_subaddress.reset(new SubaddressImpl(this));
+     m_subaddressAccount.reset(new SubaddressAccountImpl(this));
+ 
+@@ -2068,6 +2070,11 @@ AddressBook *WalletImpl::addressBook()
+     return m_addressBook.get();
+ }
+ 
++Coins *WalletImpl::coins()
++{
++    return m_coins.get();
++}
++
+ Subaddress *WalletImpl::subaddress()
+ {
+     return m_subaddress.get();
+diff --git a/src/wallet/api/wallet.h b/src/wallet/api/wallet.h
+index c6c0ff630..cb2ca6981 100644
+--- a/src/wallet/api/wallet.h
++++ b/src/wallet/api/wallet.h
+@@ -45,6 +45,7 @@ class TransactionHistoryImpl;
+ class PendingTransactionImpl;
+ class UnsignedTransactionImpl;
+ class AddressBookImpl;
++class CoinsImpl;
+ class SubaddressImpl;
+ class SubaddressAccountImpl;
+ struct Wallet2CallbackImpl;
+@@ -197,6 +198,7 @@ public:
+                                             PendingTransaction::Priority priority) const override;
+     virtual TransactionHistory * history() override;
+     virtual AddressBook * addressBook() override;
++    virtual Coins * coins() override;
+     virtual Subaddress * subaddress() override;
+     virtual SubaddressAccount * subaddressAccount() override;
+     virtual void setListener(WalletListener * l) override;
+@@ -268,6 +270,7 @@ private:
+     friend class TransactionHistoryImpl;
+     friend struct Wallet2CallbackImpl;
+     friend class AddressBookImpl;
++    friend class CoinsImpl;
+     friend class SubaddressImpl;
+     friend class SubaddressAccountImpl;
+ 
+@@ -283,6 +286,7 @@ private:
+     std::unique_ptr<TransactionHistoryImpl> m_history;
+     std::unique_ptr<Wallet2CallbackImpl> m_wallet2Callback;
+     std::unique_ptr<AddressBookImpl>  m_addressBook;
++    std::unique_ptr<CoinsImpl> m_coins;
+     std::unique_ptr<SubaddressImpl>  m_subaddress;
+     std::unique_ptr<SubaddressAccountImpl>  m_subaddressAccount;
+ 
+diff --git a/src/wallet/api/wallet2_api.h b/src/wallet/api/wallet2_api.h
+index f912020fa..ffd23a95c 100644
+--- a/src/wallet/api/wallet2_api.h
++++ b/src/wallet/api/wallet2_api.h
+@@ -261,6 +261,47 @@ struct AddressBook
+     virtual int lookupPaymentID(const std::string &payment_id) const = 0;
+ };
+ 
++/**
++ * @brief The CoinsInfo - interface for displaying coins information
++ */
++struct CoinsInfo
++{
++    virtual ~CoinsInfo() = 0;
++
++    virtual uint64_t blockHeight() const = 0;
++    virtual std::string hash() const = 0;
++    virtual size_t internalOutputIndex() const = 0;
++    virtual uint64_t globalOutputIndex() const = 0;
++    virtual bool spent() const = 0;
++    virtual bool frozen() const = 0;
++    virtual uint64_t spentHeight() const = 0;
++    virtual uint64_t amount() const = 0;
++    virtual bool rct() const = 0;
++    virtual bool keyImageKnown() const = 0;
++    virtual size_t pkIndex() const = 0;
++    virtual uint32_t subaddrIndex() const = 0;
++    virtual uint32_t subaddrAccount() const = 0;
++    virtual std::string address() const = 0;
++    virtual std::string addressLabel() const = 0;
++    virtual std::string keyImage() const = 0;
++    virtual uint64_t unlockTime() const = 0;
++    virtual bool unlocked() const = 0;
++    virtual std::string pubKey() const = 0;
++    virtual bool coinbase() const = 0;
++};
++
++struct Coins
++{
++    virtual ~Coins() = 0;
++    virtual int count() const = 0;
++    virtual CoinsInfo * coin(int index)  const = 0;
++    virtual std::vector<CoinsInfo*> getAll() const = 0;
++    virtual void refresh() = 0;
++    virtual void setFrozen(int index) = 0;
++    virtual void thaw(int index) = 0;
++    virtual bool isTransferUnlocked(uint64_t unlockTime, uint64_t blockHeight) = 0;
++};
++
+ struct SubaddressRow {
+ public:
+     SubaddressRow(std::size_t _rowId, const std::string &_address, const std::string &_label):
+@@ -1012,6 +1053,7 @@ struct Wallet
+ 
+     virtual TransactionHistory * history() = 0;
+     virtual AddressBook * addressBook() = 0;
++    virtual Coins * coins() = 0;
+     virtual Subaddress * subaddress() = 0;
+     virtual SubaddressAccount * subaddressAccount() = 0;
+     virtual void setListener(WalletListener *) = 0;
+diff --git a/src/wallet/wallet2.cpp b/src/wallet/wallet2.cpp
+index d96d6c7ba..20a4fe3b8 100644
+--- a/src/wallet/wallet2.cpp
++++ b/src/wallet/wallet2.cpp
+@@ -2641,7 +2641,8 @@ void wallet2::process_new_transaction(const crypto::hash &txid, const cryptonote
+           uint64_t amount = tx.vout[o].amount ? tx.vout[o].amount : tx_scan_info[o].amount;
+           if (!pool)
+           {
+-	    m_transfers.push_back(transfer_details{});
++	    boost::unique_lock<boost::shared_mutex> lock(m_transfers_mutex);
++      m_transfers.push_back(transfer_details{});
+ 	    transfer_details& td = m_transfers.back();
+ 	    td.m_block_height = height;
+ 	    td.m_internal_output_index = o;
+@@ -2744,6 +2745,7 @@ void wallet2::process_new_transaction(const crypto::hash &txid, const cryptonote
+           uint64_t extra_amount = amount - burnt;
+           if (!pool)
+           {
++            boost::unique_lock<boost::shared_mutex> lock(m_transfers_mutex);
+             transfer_details &td = m_transfers[kit->second];
+ 	    td.m_block_height = height;
+ 	    td.m_internal_output_index = o;
+diff --git a/src/wallet/wallet2.h b/src/wallet/wallet2.h
+index 0ba234840..b91d207d0 100644
+--- a/src/wallet/wallet2.h
++++ b/src/wallet/wallet2.h
+@@ -1941,6 +1941,8 @@ private:
+ 
+     static std::string get_default_daemon_address() { CRITICAL_REGION_LOCAL(default_daemon_address_lock); return default_daemon_address; }
+ 
++    boost::shared_mutex m_transfers_mutex;
++
+   private:
+     /*!
+      * \brief  Stores wallet information to wallet file.
+-- 
+2.56.0
+

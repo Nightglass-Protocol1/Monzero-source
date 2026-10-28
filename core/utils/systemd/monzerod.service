@@ -1,0 +1,35 @@
+[Unit]
+Description=Monzero full node
+Documentation=https://monzero.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monzero
+Group=monzero
+StateDirectory=monzero
+LogsDirectory=monzero
+RuntimeDirectory=monzero
+UMask=0077
+ExecStart=/usr/bin/monzerod --config-file /etc/monzero/monzerod.conf --data-dir /var/lib/monzero --log-file /var/log/monzero/monzerod.log --non-interactive
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=120s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/var/lib/monzero /var/log/monzero
+
+[Install]
+WantedBy=multi-user.target
