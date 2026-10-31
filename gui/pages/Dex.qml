@@ -175,6 +175,8 @@ Rectangle {
     }
     property var bchNativeObservation: root.dex.bchNativeObservationStatus || ({})
     property var evmTrade: root.dex.evmTradeStatus || ({})
+    // The lab panels are for testers; traders see the trade card first.
+    property bool showAdvanced: false
     property string evmTradeError: ""
     function evmStageText(role, stage) {
         var owner = {
@@ -400,7 +402,7 @@ Rectangle {
 
         RowLayout {
             Layout.fillWidth: true
-            M.Label { fontSize: 25; text: qsTr("Monzero Spot Exchange") + translationManager.emptyString }
+            M.Label { fontSize: 25; text: qsTr("Trade") + translationManager.emptyString }
             Item { Layout.fillWidth: true }
             Rectangle {
                 Layout.preferredWidth: 160; Layout.preferredHeight: 32; radius: 16
@@ -408,6 +410,46 @@ Rectangle {
                 M.TextPlain { anchors.centerIn: parent; color: "#ffb4c8"; font.bold: true; font.pixelSize: 12; text: (root.hasMarketData ? qsTr("VERIFIED OFFERS") : qsTr("NO OFFERS LOADED")) + translationManager.emptyString }
             }
         }
+
+        // ---- The simple way to trade: one active trade, then a new trade card
+        M.DexTradeProgress {
+            id: tradeProgress
+            objectName: "tradeProgress"
+            Layout.fillWidth: true
+            visible: root.evmTrade.configured === true
+            trade: root.evmTrade
+            coin: "BNB"
+            errorText: root.evmTradeError
+            onApprove: root.evmTradeError = root.dex.approveEvmTrade(commitment) ? "" : qsTr("Approval could not start.")
+            onRefresh: root.evmTradeError = root.dex.refreshEvmTrade() ? "" : qsTr("Refresh could not start.")
+        }
+        M.DexTradeCard {
+            id: tradeCard
+            objectName: "tradeCard"
+            Layout.fillWidth: true
+            offers: root.marketSnapshot.valid === true ? (root.marketSnapshot.offers || []) : []
+            xmzBalance: appWindow.currentWallet ? Number(walletManager.displayAmount(appWindow.currentWallet.unlockedBalanceAll())) : -1
+            canStart: false
+            startBlockedReason: qsTr("Testnet preview: taking an offer from the app comes next. Testnet trades are started with the trade kit for now.")
+        }
+
+        // ---- Everything else: wallets, recovery and the testnet lab, closed by default
+        Rectangle {
+            objectName: "advancedToggle"
+            Layout.fillWidth: true; implicitHeight: 44; radius: 8
+            color: "transparent"; border.color: M.Style.accentMuted
+            M.TextPlain {
+                anchors.left: parent.left; anchors.leftMargin: 16; anchors.verticalCenter: parent.verticalCenter
+                text: (root.showAdvanced ? "▾ " : "▸ ") + qsTr("Advanced: coin wallets, recovery and testnet lab")
+            }
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.showAdvanced = !root.showAdvanced }
+        }
+        ColumnLayout {
+            id: advancedTools
+            objectName: "advancedTools"
+            Layout.fillWidth: true
+            visible: root.showAdvanced
+            spacing: 12
         Rectangle {
             objectName: "litecoinWalletOverview"
             // Litecoin wallet card; on a Bitcoin stage the BTC wallet panel below takes its place.
@@ -3957,6 +3999,7 @@ Later addresses may be missing from this backup. Payment and active swap recover
                     RowLayout { anchors.fill:parent;anchors.margins:10;M.TextPlain { color:sideText==="BUY"?"#49c991":"#ef6575";font.bold:true;text:sideText+" "+root.baseCoin } M.TextPlain { Layout.fillWidth:true;color:M.Style.defaultFontColor;text:amountText+" @ "+priceText } M.TextPlain { color:"#d5a6ff";text:settlementLabel+": "+settlementText+" XMZ · fees "+feeText+" XMZ · "+qsTr("external fee: ")+minerFeeText } M.InlineButton { text:qsTr("Cancel");onClicked:{ root.dex.cancelLocalOffer(offerId); root.refreshOffers() } } }
                 } }
             }
+        }
         }
     }
 }

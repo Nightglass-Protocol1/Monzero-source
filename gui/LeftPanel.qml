@@ -423,7 +423,7 @@ Rectangle {
                 visible: dexPrototypeEnabled
                 anchors.left: parent.left
                 anchors.right: parent.right
-                text: qsTr("DEX Lab") + translationManager.emptyString
+                text: qsTr("Trade") + translationManager.emptyString
                 symbol: qsTr("Preview") + translationManager.emptyString
                 onClicked: {
                     parent.previousButton.checked = false
