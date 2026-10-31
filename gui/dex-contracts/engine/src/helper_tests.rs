@@ -126,3 +126,33 @@ async fn tick_takes_vault_keys_or_the_prototype_seed_but_not_both() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn payout_needs_a_finished_trade_and_a_valid_address() {
+    let (dir, _) = trade_dir("payout");
+    let endpoint = json!({"url": "http://127.0.0.1:1"});
+    let seed = [5u8; 64];
+    let tick = json!({"evmRpc": "http://127.0.0.1:1", "mainWallet": endpoint, "swapWallet": endpoint,
+                      "walletSeedHex": hex::encode(seed), "accountIndex": 0});
+    let call_with = |addr: Value| json!({"schema": REQUEST_SCHEMA, "command": "payout", "tradeDir": dir, "tick": tick, "payoutAddress": addr});
+    // A trade that has not finished keeps its funds where the swap needs them
+    let v = call(call_with(json!("0x4b7c0a922d663ec68bc6d5d5f9fa77e420c28faf"))).await;
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().unwrap().contains("not finished"), "{v}");
+    // Address mistakes are refused before anything else
+    for bad in ["4b7c0a922d663ec68bc6d5d5f9fa77e420c28faf", "0x4b7c0a922d663ec68bc6d5d5f9fa77e420c28fa", "0x4B7c0a922d663ec68Bc6d5D5f9fa77E420C28FAa"] {
+        let v = call(call_with(json!(bad))).await;
+        assert_eq!(v["ok"], false, "accepted {bad}");
+        assert!(!v["error"].as_str().unwrap().contains("not finished"), "{bad}: {v}");
+    }
+    let v = call(json!({"schema": REQUEST_SCHEMA, "command": "payout", "tradeDir": dir, "tick": tick})).await;
+    assert!(v["error"].as_str().unwrap().contains("payoutAddress"), "{v}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn addresses_as_metamask_shows_them_are_accepted() {
+    let a = parse_address("0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF").unwrap();
+    assert_eq!(a, parse_address("0x4b7c0a922d663ec68bc6d5d5f9fa77e420c28faf").unwrap());
+    assert!(parse_address("0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAf").is_err(), "one wrong case is a typo");
+}
