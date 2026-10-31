@@ -1,0 +1,43 @@
+diff --git a/src/utils/monero_utils.cpp b/src/utils/monero_utils.cpp
+index 17743a5..e4aaa1a 100644
+--- a/src/utils/monero_utils.cpp
++++ b/src/utils/monero_utils.cpp
+@@ -628,7 +628,7 @@ static std::string make_uri(const std::string &address, const std::string &payme
+     return std::string();
+   }
+ 
+-  std::string uri = "monero:" + address;
++  std::string uri = "monzero:" + address;
+   unsigned int n_fields = 0;
+ 
+   if (amount > 0) {
+@@ -668,12 +668,12 @@ std::string monero_utils::get_payment_uri(const monero_tx_config& config, monero
+ 
+ // implementation based on monero-project's wallet2::parse_uri()
+ static bool parse_uri(const std::string &uri, std::string &address, monero_network_type network_type, std::string &payment_id, uint64_t &amount, std::string &tx_description, std::string &recipient_name, std::vector<std::string> &unknown_parameters, std::string &error) {
+-  if (uri.substr(0, 7) != "monero:") {
+-    error = std::string("URI has wrong scheme (expected \"monero:\"): ") + uri;
++  if (uri.substr(0, 8) != "monzero:") {
++    error = std::string("URI has wrong scheme (expected \"monzero:\"): ") + uri;
+     return false;
+   }
+ 
+-  std::string remainder = uri.substr(7);
++  std::string remainder = uri.substr(8);  // after "monzero:"
+   const char *ptr = strchr(remainder.c_str(), '?');
+   address = ptr ? remainder.substr(0, ptr-remainder.c_str()) : remainder;
+ 
+diff --git a/src/utils/monero_utils.h b/src/utils/monero_utils.h
+index 407d3e5..316fb72 100644
+--- a/src/utils/monero_utils.h
++++ b/src/utils/monero_utils.h
+@@ -70,7 +70,8 @@ namespace monero_utils
+   // ------------------------------ CONSTANTS ---------------------------------
+ 
+   static const int RING_SIZE = 16;  // network-enforced ring size
+-  static const uint64_t XMR_AU_MULTIPLIER = 1000000000000ULL;
++  // Monzero: 1 XMZ = 10^11 atomic units (COIN in core/src/cryptonote_config.h), not Monero's 10^12
++  static const uint64_t XMR_AU_MULTIPLIER = 100000000000ULL;
+ 
+   // -------------------------------- UTILS -----------------------------------
+ 
