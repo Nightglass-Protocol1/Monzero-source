@@ -1,0 +1,198 @@
+diff --git a/swap-machine/src/litecoin_negotiation/execution/light_funding.rs b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+--- a/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+@@ -1,5 +1,5 @@
+ //! Light-wallet input claims enter the existing negotiated recovery protocol.
+-//! This prepares recovery signatures, never signs or broadcasts the funding lock.
++//! Recovery preparation and separately approved local funding signatures. No relay.
+ use super::*;
+ use crate::litecoin_light::{accounting::ObservedWallet,headers::HeaderSequence,
+     network::LightNetwork,vault::signing::review::confirmed::claimed::ObservedClaimedSpend};
+@@ -17,10 +17,7 @@
+         let keys=exchange.finish()?;
+         let psbt=spend.funding_psbt_on(chain,observed,self.claim.trade,approved_claim)?;
+         RecoveryPlan::new(&quote,&self.policy,now,&keys,psbt.clone())?;
+-        let binding=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-light-funding-binding-v1",
+-            "trade":self.claim.trade,"quote":self.claim.quote,"checkpoint":head.checkpoint,
+-            "claimCommitment":approved_claim,"psbtDigest":sha256::Hash::hash(&psbt.serialize()),
+-            "network":chain.network().storage_identity()}))?;
++        let binding=self.light_funding_binding(&head,&psbt,chain,approved_claim)?;
+         let name=format!("{}.ltc-light-funding",self.claim.trade);
+         self.metadata.compatible(&name,&binding)?;
+         let frame=self.recovery_signing_frame(&psbt,now)?;
+@@ -29,3 +26,14 @@
+         Ok(frame)
+     }
+ }
++
++impl Execution {
++    fn light_funding_binding(&self,head:&Head,psbt:&bitcoin::psbt::Psbt,
++        chain:&HeaderSequence,claim:sha256::Hash)->Result<Vec<u8>> {
++        Ok(serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-light-funding-binding-v1",
++            "trade":self.claim.trade,"quote":self.claim.quote,"checkpoint":head.checkpoint,
++            "claimCommitment":claim,"psbtDigest":sha256::Hash::hash(&psbt.serialize()),
++            "network":chain.network().storage_identity()}))?)
++    }
++}
++pub mod approval;
+diff --git a/swap-machine/src/litecoin_light/funding_tests.rs b/swap-machine/src/litecoin_light/funding_tests.rs
+--- a/swap-machine/src/litecoin_light/funding_tests.rs
++++ b/swap-machine/src/litecoin_light/funding_tests.rs
+@@ -1,4 +1,7 @@
+ use anyhow::Result;
++use crate::litecoin_negotiation::execution::light_funding::approval::LightFundingVault;
++use crate::litecoin_light::vault::{SeedVault,mnemonic::{MnemonicMaterial,storage::MnemonicVault}};
++use crate::litecoin_light::vault::signing::review::{claims::ClaimedSpend,confirmed::claimed::ObservedClaimedSpend};
+ use crate::litecoin_negotiation::{execution::Execution,LocalRole};
+ use crate::litecoin_light::{headers::HeaderSequence,accounting::ObservedWallet};
+ use bitcoin::hashes::{Hash,sha256};
+@@ -16,7 +19,10 @@
+ }
+ impl Drop for Root {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
+ #[test]
+-fn light_claims_bind_the_trade_before_recovery_and_never_sign_funding()->Result<()> {
++fn seed_funding_requires_approved_peer_recovery_and_resumes_exactly()->Result<()> { funding_approval(false) }
++#[test]
++fn mnemonic_funding_requires_approved_peer_recovery_and_resumes_exactly()->Result<()> { funding_approval(true) }
++fn funding_approval(mnemonic:bool)->Result<()> {
+     let root=Root::new()?;let bm=root.child("bob-meta")?;let bs=root.child("bob-secrets")?;
+     let am=root.child("alice-meta")?;let als=root.child("alice-secrets")?;
+     let (policy,terms)=crate::litecoin_quote::tests::fixture();
+@@ -31,7 +37,16 @@
+     let second=alice.outgoing(&ai,1001)?;bob.accept_peer(second.bytes(),second.signature(),1001)?;
+     let keys=bob.completed_keys()?;
+     let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([42;32]));
+-    let account=seed.public_account(policy.ltc_network,0)?;let owned=account.derive(Branch::Receive,0)?;
++    let material=MnemonicMaterial::from_entropy(&[42;32])?;
++    let account=if mnemonic {material.public_account(policy.ltc_network,0,"fixture passphrase")?}
++        else {seed.public_account(policy.ltc_network,0)?};
++    let wallet=uuid::Uuid::new_v4();let password=b"local fixture password";
++    let vault_dir=root.child("vault")?;
++    let seed_vault=if mnemonic {None} else {Some(SeedVault::create(&vault_dir,policy.ltc_network,wallet,password,&seed)?)};
++    let mnemonic_vault=if mnemonic {Some(MnemonicVault::create(&vault_dir,policy.ltc_network,wallet,password,&material,"fixture passphrase")?)} else {None};
++    let vault=||if mnemonic {LightFundingVault::Mnemonic(mnemonic_vault.as_ref().unwrap())}
++        else {LightFundingVault::Seed(seed_vault.as_ref().unwrap())};
++    let owned=account.derive(Branch::Receive,0)?;
+     let prevout=TxOut {value:Amount::from_sat(100_001_000),script_pubkey:owned.address().script_pubkey().clone()};
+     let chain=HeaderSequence::new(policy.ltc_network)?;
+     let credit=Transaction {version:Version::TWO,lock_time:LockTime::ZERO,
+@@ -71,6 +86,7 @@
+     let stale=ObservedWallet::reconcile(&chain,&[payment.script_pubkey.clone()],&[])?;
+     assert!(spend.funding_psbt_on(&chain,&stale,trade,commitment).is_err());
+     let before=fs::read_dir(&claims)?.count();
++    assert!(bob.review_light_funding(&spend,&chain,&observed,commitment,1002).is_err());
+     let frame=bob.light_recovery_signing_frame(&spend,&chain,&observed,commitment,1002)?;
+     assert_eq!(fs::read_dir(&claims)?.count(),before);assert!(spend.retained_signed().is_err());
+     let binding=fs::read(bm.join(format!("{trade}.ltc-light-funding")))?;
+@@ -80,12 +96,38 @@
+     assert_eq!(fs::read(bm.join(format!("{trade}.ltc-light-funding")))?,binding);
+     let signed=bi.sign(&crate::litecoin_negotiation::recovery::signing_bytes(&frame)?).to_bytes();
+     let bob_message=bob.submit_recovery_signature(&frame,&signed,1003)?;
++    assert!(bob.review_light_funding(&spend,&chain,&observed,commitment,1003).is_err());
++    assert!(bob.sign_light_funding(&spend,&chain,&observed,commitment,&[0;32],vault(),password,1003).is_err());
++    assert!(spend.retained_signed().is_err());
+     let alice_message=alice.prepare_recovery(&psbt,&ai,1002)?;
+     let recovery=bob.accept_recovery(alice_message.bytes(),alice_message.signature())?;
+     alice.accept_recovery(bob_message.bytes(),bob_message.signature())?;
+     assert_eq!(recovery.cancel.input[0].previous_output.txid,transaction.compute_txid());
+     assert!(recovery.refund.is_some());assert!(spend.retained_signed().is_err());
+     assert_eq!(fs::read_dir(&claims)?.count(),before);
++    let review=bob.review_light_funding(&spend,&chain,&observed,commitment,1003)?;
++    assert_eq!(review.details["txid"],transaction.compute_txid().to_string());
++    assert_eq!(review.details["feeAtoms"],"1000");assert_eq!(review.details["broadcastAuthorized"],false);
++    assert!(bob.sign_light_funding(&spend,&chain,&observed,commitment,&[0;32],vault(),password,1003).is_err());
++    assert!(bob.sign_light_funding(&spend,&chain,&spent,commitment,&review.commitment,vault(),password,1003).is_err());
++    assert!(bob.sign_light_funding(&spend,&chain,&observed,commitment,&review.commitment,vault(),password,2001).is_err());
++    assert!(bob.sign_light_funding(&spend,&chain,&observed,commitment,&review.commitment,vault(),b"wrong",1003).is_err());
++    assert!(spend.retained_signed().is_err());assert_eq!(fs::read_dir(&claims)?.count(),before);
++    // Recheck the peer receipt at signing, not just when showing the review.
++    let peer_path=bm.join(format!("{trade}.ltc-recovery-incoming"));let peer=fs::read(&peer_path)?;
++    fs::write(&peer_path,b"altered")?;
++    assert!(bob.sign_light_funding(&spend,&chain,&observed,commitment,&review.commitment,vault(),password,1003).is_err());
++    assert!(spend.retained_signed().is_err());fs::write(&peer_path,peer)?;
++    let signed=bob.sign_light_funding(&spend,&chain,&observed,commitment,&review.commitment,vault(),password,1003)?;
++    assert_eq!(signed.compute_txid(),transaction.compute_txid());assert_eq!(signed.input[0].witness.len(),2);
++    assert_eq!(spend.retained_signed()?,signed);
++    drop(bob);drop(spend);
++    let mut bob=Execution::resume(&bm,&bs,trade,&policy,LocalRole::LitecoinFunder,pins)?;
++    let reopened=ClaimedSpend::open(&claims,trade,&account,&payment,None,Amount::from_sat(1000),commitment)?;
++    let spend=ObservedClaimedSpend::revalidate(reopened,&chain,&observed,&inputs,1)?;
++    assert_eq!(bob.review_light_funding(&spend,&chain,&observed,commitment,1004)?.commitment,review.commitment);
++    assert_eq!(bob.sign_light_funding(&spend,&chain,&observed,commitment,&review.commitment,vault(),password,1004)?,signed);
++    assert!(!fs::read_dir(&claims)?.any(|entry|entry.unwrap().file_name().to_string_lossy().contains("submission")));
+     // A changed input claim must fail before producing further recovery output.
+     let entry=fs::read_dir(&claims)?.collect::<std::io::Result<Vec<_>>>()?.into_iter()
+         .find(|entry|entry.path().extension().is_some_and(|e|e=="claim")).unwrap();
+diff --git a/swap-machine/src/litecoin_negotiation/execution/light_funding/approval.rs b/swap-machine/src/litecoin_negotiation/execution/light_funding/approval.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_negotiation/execution/light_funding/approval.rs
+@@ -0,0 +1,68 @@
++//! Local funding approval after durable two-party recovery. Never broadcasts.
++use super::*;
++use crate::litecoin_light::vault::{SeedVault,mnemonic::storage::MnemonicVault};
++use super::super::lock_approval::LockFundingReview;
++use bitcoin::{Transaction,consensus::encode::serialize_hex};
++
++/// Borrow local encrypted storage; the password is never retained in the review.
++pub enum LightFundingVault<'a> { Seed(&'a SeedVault),Mnemonic(&'a MnemonicVault) }
++
++impl Execution {
++    /// Recheck the exact wallet claim, fresh quote policy and both retained
++    /// recovery messages. The returned public details are for explicit review;
++    /// obtaining them does not unlock keys, sign funding or authorize relay.
++    pub fn review_light_funding(&mut self,spend:&ObservedClaimedSpend,
++        chain:&HeaderSequence,observed:&ObservedWallet,claim:sha256::Hash,now:u64)->Result<LockFundingReview> {
++        ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong light funding role");
++        ensure!(chain.network()==LightNetwork::from(self.policy.ltc_network),"wrong light funding network");
++        let (head,_,quote,_,exchange)=self.load()?;
++        let psbt=spend.funding_psbt_on(chain,observed,self.claim.trade,claim)?;
++        let binding=self.light_funding_binding(&head,&psbt,chain,claim)?;
++        ensure!(self.metadata.read(&format!("{}.ltc-light-funding",self.claim.trade))?==binding,
++            "light funding proposal differs from retained binding");
++        let keys=exchange.finish()?;
++        let plan=RecoveryPlan::new(&quote,&self.policy,now,&keys,psbt.clone())?;
++        // A fresh plan must authenticate the already-retained local message,
++        // including its exact lock/cancel/refund/punish binding. Cold recovery
++        // then independently rechecks the peer message and durable receipts.
++        let outgoing=self.recover_recovery_outgoing()?;
++        plan.verify_local_message(outgoing.bytes(),outgoing.signature())?;
++        let recovery=self.recover_recovery()?;
++        ensure!(recovery.punish.is_none(),"unexpected light-funder punishment");
++        let refund=recovery.refund.context("missing retained light-funder refund")?;
++        ensure!(recovery.cancel.input.first().is_some_and(|i|i.previous_output==plan.lock_outpoint())
++            && refund.compute_txid()==plan.refund_txid(),"light funding recovery differs from review");
++        let details=serde_json::json!({"schema":"monzero-ltc-light-funding-approval-v1",
++            "trade":self.claim.trade,"quote":self.claim.quote,"network":chain.network().storage_identity(),
++            "claimCommitment":claim,"bindingDigest":sha256::Hash::hash(&binding),
++            "txid":psbt.unsigned_tx.compute_txid(),"transaction":serialize_hex(&psbt.unsigned_tx),
++            "amountAtoms":quote.terms()["ltcAtoms"],"feeAtoms":spend.fee().to_sat().to_string(),
++            "contractAddress":keys.contract_address().to_string(),
++            "refundAddress":quote.destinations().ltc_refund.to_string(),
++            "cancelTxid":recovery.cancel.compute_txid(),"refundTxid":refund.compute_txid(),
++            "cancelBlocks":self.policy.cancel_blocks,"punishBlocks":self.policy.punish_blocks,
++            "observedHeight":observed.height(),"observedTip":observed.tip(),"action":"sign",
++            "broadcastAuthorized":false});
++        let mut hash=Sha256::new();hash.update(b"MONZERO-LTC-LIGHT-FUNDING-APPROVAL-V1\0");
++        hash.update(serde_json::to_vec(&details)?);
++        Ok(LockFundingReview {details,commitment:hash.finalize().into()})
++    }
++
++    /// Explicit approval is compared before password-based unlocking. The wallet
++    /// retains exact signed bytes under its shared input lease. Retry revalidates
++    /// the same agreement and returns those bytes; it never creates a replacement.
++    /// Expired quotes or prior submission require the separate recovery path.
++    pub fn sign_light_funding(&mut self,spend:&ObservedClaimedSpend,
++        chain:&HeaderSequence,observed:&ObservedWallet,claim:sha256::Hash,
++        approved:&[u8;32],vault:LightFundingVault<'_>,password:&[u8],now:u64)->Result<Transaction> {
++        let review=self.review_light_funding(spend,chain,observed,claim,now)?;
++        ensure!(review.commitment==*approved,"light funding approval is stale or changed");
++        let signed=match vault {
++            LightFundingVault::Seed(vault)=>spend.approve_with_vault_on(chain,observed,vault,password,claim)?,
++            LightFundingVault::Mnemonic(vault)=>spend.approve_with_mnemonic_on(chain,observed,vault,password,claim)?,
++        };
++        ensure!(signed.compute_txid()==spend.transaction().compute_txid()
++            && spend.retained_signed()?==signed,"light funding signed record changed");
++        Ok(signed)
++    }
++}

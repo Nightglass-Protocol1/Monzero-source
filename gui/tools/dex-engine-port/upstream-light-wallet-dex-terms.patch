@@ -1,0 +1,122 @@
+diff --git a/swap-machine/src/bin/native-ltc-light/dex.rs b/swap-machine/src/bin/native-ltc-light/dex.rs
+--- a/swap-machine/src/bin/native-ltc-light/dex.rs
++++ b/swap-machine/src/bin/native-ltc-light/dex.rs
+@@ -17,7 +17,7 @@
+ 
+ pub(super) fn mode(flag:&str)->Option<&str> {
+     let name=flag.strip_prefix("--dex-funding-")?.strip_suffix("-stdio-v1")?;
+-    ["prepare","review","sign","send-review","send","observe","retry-review","retry"].contains(&name).then_some(name)
++    ["terms","prepare","review","sign","send-review","send","observe","retry-review","retry"].contains(&name).then_some(name)
+ }
+ fn cold(mode:&str)->bool {matches!(mode,"observe"|"retry-review"|"retry")}
+ fn digest(value:&str)->Result<sha256::Hash> {
+@@ -50,6 +50,7 @@
+ pub(super) fn run(path:&Path,mode:&str)->Result<()> {
+     let mut input=Zeroizing::new(Vec::new());std::io::stdin().take(8193).read_to_end(&mut input)?;
+     ensure!(!input.is_empty() && input.len()<=8192,"invalid light DEX request size");
++    if mode=="terms" {return terms(path,&input);}
+     let request:DexRequest=serde_json::from_slice(&input)?;drop(input);validate(&request,mode)?;
+     let (_lease,bytes)=private_config(path)?;let dex:DexConfig=serde_json::from_slice(&bytes)?;
+     ensure!(dex.schema=="monzero-private-ltc-light-dex-v1" && !dex.trade_id.is_nil()
+@@ -70,6 +71,27 @@
+         "requestId":request.request_id,"tradeId":dex.trade_id,"configurationDigest":expected,
+         "executable":false,"result":result});
+     let bytes=serde_json::to_vec(&response)?;ensure!(bytes.len()<=262144,"oversized light DEX response");
++    std::io::stdout().write_all(&bytes)?;Ok(())
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct TermsRequest {schema:String,request_id:uuid::Uuid,approved_config_digest:String}
++fn terms(path:&Path,input:&[u8])->Result<()> {
++    let request:TermsRequest=serde_json::from_slice(input)?;
++    ensure!(request.schema=="monzero-ltc-light-dex-funding-terms-request-v1" && !request.request_id.is_nil(),"invalid funding terms request");
++    let (_lease,bytes)=private_config(path)?;let dex:DexConfig=serde_json::from_slice(&bytes)?;
++    ensure!(dex.schema=="monzero-private-ltc-light-dex-v1" && !dex.trade_id.is_nil()
++        && dex.policy.ltc_network==LtcNetwork::Regtest,"light DEX terms require isolated Litecoin regtest");
++    let (_wallet_lease,wallet_bytes)=private_config(&dex.wallet_config_file)?;
++    let expected=context_digest(&bytes,&wallet_bytes)?;
++    ensure!(expected==digest(&request.approved_config_digest)?,"light DEX configuration changed");
++    let config=parse_config(&wallet_bytes,"ltc")?;
++    ensure!(network_for("ltc",&config.network)?==LightNetwork::from(LtcNetwork::Regtest),"wrong funding terms wallet network");
++    let execution=Execution::resume(&dex.metadata_directory,&dex.snapshot_directory,dex.trade_id,
++        &dex.policy,LocalRole::LitecoinFunder,dex.pins)?;
++    let response=json!({"schema":"monzero-ltc-light-dex-funding-terms-response-v1","requestId":request.request_id,
++        "tradeId":dex.trade_id,"configurationDigest":expected,"executable":false,"result":execution.light_funding_terms(now()?)?});
++    let bytes=serde_json::to_vec(&response)?;ensure!(bytes.len()<=4096,"oversized funding terms response");
+     std::io::stdout().write_all(&bytes)?;Ok(())
+ }
+ async fn execute(config:&Config,network:LightNetwork,dex:&DexConfig,request:&DexRequest,
+@@ -177,6 +199,18 @@
+         if mode=="sign" {value["password"]=json!("test credential");}value
+     }
+     #[test]
++    fn terms_request_has_no_payment_or_secret_fields()->Result<()> {
++        let value=json!({"schema":"monzero-ltc-light-dex-funding-terms-request-v1",
++            "requestId":uuid::Uuid::new_v4(),"approvedConfigDigest":"11".repeat(32)});
++        let _:TermsRequest=serde_json::from_value(value.clone())?;
++        assert_eq!(mode("--dex-funding-terms-stdio-v1"),Some("terms"));
++        for field in ["payment","password","approval","walletScan","maximumDownloadHeaders","retainedReview"] {
++            let mut bad=value.clone();bad[field]=json!("unexpected");
++            assert!(serde_json::from_value::<TermsRequest>(bad).is_err());
++        }
++        Ok(())
++    }
++    #[test]
+     fn modes_isolate_passwords_approvals_and_observation_budgets()->Result<()> {
+         for name in ["prepare","review","sign","send-review","send","observe","retry-review","retry"] {
+             assert_eq!(mode(&format!("--dex-funding-{name}-stdio-v1")),Some(name));
+diff --git a/swap-machine/src/litecoin_light/funding_tests.rs b/swap-machine/src/litecoin_light/funding_tests.rs
+--- a/swap-machine/src/litecoin_light/funding_tests.rs
++++ b/swap-machine/src/litecoin_light/funding_tests.rs
+@@ -33,9 +33,23 @@
+     let mut rng=rand::rngs::StdRng::seed_from_u64(7812);
+     let mut bob=Execution::begin(&bm,&bs,&quote,&policy,LocalRole::LitecoinFunder,quote.commitment(),1000,&mut rng)?;
+     let mut alice=Execution::begin(&am,&als,&quote,&policy,LocalRole::NativeFunder,quote.commitment(),1000,&mut rng)?;
++    assert!(bob.light_funding_terms(1000).is_err());
+     let first=bob.outgoing(&bi,1000)?;alice.accept_peer(first.bytes(),first.signature(),1000)?;
+     let second=alice.outgoing(&ai,1001)?;bob.accept_peer(second.bytes(),second.signature(),1001)?;
+     let keys=bob.completed_keys()?;
++    let before=bob.saved_status()?;
++    let funding=bob.light_funding_terms(1001)?;
++    assert_eq!(funding["quoteCommitment"],quote.commitment().iter().map(|b|format!("{b:02x}")).collect::<String>());
++    assert_eq!(funding["lockConfirmations"],policy.ltc_confirmations);
++    assert_eq!(funding["contractAddress"],keys.contract_address().to_string());
++    assert_eq!(funding["amountAtomic"],quote.terms()["ltcAtoms"]);
++    assert_eq!(funding["maximumFeeAtomic"],quote.terms()["ltcFundingFeeMaxAtoms"]);
++    assert_eq!(funding["minimumChangeAtomic"],quote.terms()["ltcMinimumOutputAtoms"]);
++    assert_eq!(funding["watchOnly"],true);assert_eq!(funding["broadcastAuthorized"],false);
++    assert_eq!(bob.saved_status()?,before);
++    assert!(alice.light_funding_terms(1001).is_err());
++    assert!(bob.light_funding_terms(quote.terms()["expiresAt"].parse::<u64>()?+1).is_err());
++    assert!(!bm.join(format!("{trade}.ltc-light-funding")).exists());
+     let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([42;32]));
+     let material=MnemonicMaterial::from_entropy(&[42;32])?;
+     let account=if mnemonic {material.public_account(policy.ltc_network,0,"fixture passphrase")?}
+diff --git a/swap-machine/src/litecoin_negotiation/execution/light_funding.rs b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+--- a/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+@@ -41,6 +41,24 @@
+ pub mod relay;
+ 
+ impl Execution {
++    /// Public terms from the admitted quote and completed exchange. This never
++    /// reserves wallet inputs, prepares recovery, unlocks a vault or sends.
++    pub fn light_funding_terms(&self,now:u64)->Result<serde_json::Value> {
++        ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong light funding role");
++        let (_,_,quote,_,exchange)=self.load()?;
++        quote.check_policy(&self.policy,now)?;
++        let keys=exchange.finish()?;
++        Ok(serde_json::json!({"schema":"monzero-ltc-light-funding-terms-v1",
++            "tradeId":self.claim.trade,"quoteCommitment":hex(&self.claim.quote),
++            "network":LightNetwork::from(self.policy.ltc_network).storage_identity(),
++            "contractAddress":keys.contract_address().to_string(),
++            "amountAtomic":quote.terms()["ltcAtoms"],"maximumFeeAtomic":quote.terms()["ltcFundingFeeMaxAtoms"],
++            "minimumChangeAtomic":quote.terms()["ltcMinimumOutputAtoms"],
++            "lockConfirmations":self.policy.ltc_confirmations,
++            "refundAddress":quote.destinations().ltc_refund.to_string(),
++            "expiresAt":quote.terms()["expiresAt"],"watchOnly":true,"broadcastAuthorized":false}))
++    }
++
+     /// Admit wallet preparation before reserving addresses/inputs. This checks
+     /// payment policy only; it is neither a reservation nor spending authority.
+     pub fn check_light_funding_payment(&self,payment:&bitcoin::TxOut,fee:bitcoin::Amount,

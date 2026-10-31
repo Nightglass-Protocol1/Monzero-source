@@ -1,0 +1,175 @@
+diff --git a/swap-core/src/lib.rs b/swap-core/src/lib.rs
+index cf51952..4e9cd57 100644
+--- a/swap-core/src/lib.rs
++++ b/swap-core/src/lib.rs
+@@ -1,3 +1,4 @@
+ pub mod bitcoin;
+ pub mod compat;
+ pub mod monero;
++pub mod xmz;
+diff --git a/swap-core/src/xmz.rs b/swap-core/src/xmz.rs
+new file mode 100644
+index 0000000..18ff579
+--- /dev/null
++++ b/swap-core/src/xmz.rs
+@@ -0,0 +1,160 @@
++//! XMZ amount boundary for the engine port. No wallet or network authority.
++//! Raw wallet/RPC atom counts are preserved, never scaled from/to XMR units.
++use std::{fmt, str::FromStr};
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
++pub struct XmzAmount(u64);
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum AmountError { Invalid, Precision, Overflow }
++
++/// Exact quoted ratio. No floating point, implicit network fee or app fee.
++/// Rates smaller than one satoshi per XMZ remain representable.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct XmzBtcRate {
++    xmz_atoms: std::num::NonZeroU64,
++    bitcoin_sats: std::num::NonZeroU64,
++}
++
++impl XmzBtcRate {
++    pub fn new(xmz: XmzAmount, bitcoin: crate::bitcoin::Amount) -> Result<Self, AmountError> {
++        Ok(Self {
++            xmz_atoms: std::num::NonZeroU64::new(xmz.atoms()).ok_or(AmountError::Invalid)?,
++            bitcoin_sats: std::num::NonZeroU64::new(bitcoin.to_sat()).ok_or(AmountError::Invalid)?,
++        })
++    }
++
++    /// Maximum whole satoshis purchasable with this XMZ amount (round down).
++    pub fn bitcoin_for_xmz(self, xmz: XmzAmount) -> Result<crate::bitcoin::Amount, AmountError> {
++        let product = u128::from(xmz.atoms()) * u128::from(self.bitcoin_sats.get());
++        let sats = product / u128::from(self.xmz_atoms.get());
++        u64::try_from(sats).map(crate::bitcoin::Amount::from_sat).map_err(|_| AmountError::Overflow)
++    }
++
++    /// Minimum whole XMZ atoms required for this Bitcoin amount (round up).
++    pub fn xmz_for_bitcoin(self, bitcoin: crate::bitcoin::Amount) -> Result<XmzAmount, AmountError> {
++        let product = u128::from(bitcoin.to_sat()) * u128::from(self.xmz_atoms.get());
++        let denominator = u128::from(self.bitcoin_sats.get());
++        let atoms = product / denominator + u128::from(product % denominator != 0);
++        u64::try_from(atoms).map(XmzAmount::from_atoms).map_err(|_| AmountError::Overflow)
++    }
++}
++
++impl XmzAmount {
++    pub const SCALE: u64 = 100_000_000_000;
++    pub const fn from_atoms(atoms: u64) -> Self { Self(atoms) }
++    pub const fn atoms(self) -> u64 { self.0 }
++    // Decimal strings avoid JSON/JavaScript number precision loss at the bridge.
++    pub fn atom_string(self) -> String { self.0.to_string() }
++    pub fn from_atom_string(value: &str) -> Result<Self, AmountError> {
++        if !canonical_digits(value) { return Err(AmountError::Invalid); }
++        value.parse::<u64>().map(Self).map_err(|_| AmountError::Overflow)
++    }
++    pub fn checked_add(self, other: Self) -> Option<Self> {
++        self.0.checked_add(other.0).map(Self)
++    }
++    pub fn checked_sub(self, other: Self) -> Option<Self> {
++        self.0.checked_sub(other.0).map(Self)
++    }
++}
++
++fn canonical_digits(value: &str) -> bool {
++    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
++        && (value.len() == 1 || !value.starts_with('0'))
++}
++
++impl FromStr for XmzAmount {
++    type Err = AmountError;
++    fn from_str(value: &str) -> Result<Self, Self::Err> {
++        let (whole, fraction) = match value.split_once('.') {
++            Some((w, f)) => {
++                if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
++                    return Err(AmountError::Invalid);
++                }
++                if f.len() > 11 { return Err(AmountError::Precision); }
++                (w, f)
++            }
++            None => (value, ""),
++        };
++        if !canonical_digits(whole) { return Err(AmountError::Invalid); }
++        let whole = whole.parse::<u64>().map_err(|_| AmountError::Overflow)?;
++        let fractional = if fraction.is_empty() { 0 } else {
++            fraction.parse::<u64>().map_err(|_| AmountError::Invalid)?
++                * 10u64.pow(11 - fraction.len() as u32)
++        };
++        whole.checked_mul(Self::SCALE).and_then(|w| w.checked_add(fractional))
++            .map(Self).ok_or(AmountError::Overflow)
++    }
++}
++
++impl fmt::Display for XmzAmount {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let whole = self.0 / Self::SCALE;
++        let fraction = self.0 % Self::SCALE;
++        if fraction == 0 { return write!(f, "{whole}"); }
++        let padded = format!("{fraction:011}");
++        write!(f, "{whole}.{}", padded.trim_end_matches('0'))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn exact_rate_rounding_and_sub_satoshi_prices() {
++        let rate = XmzBtcRate::new(XmzAmount::from_atoms(3 * XmzAmount::SCALE), crate::bitcoin::Amount::from_sat(2)).unwrap();
++        assert_eq!(rate.bitcoin_for_xmz(XmzAmount::from_atoms(XmzAmount::SCALE)).unwrap().to_sat(), 0);
++        assert_eq!(rate.xmz_for_bitcoin(crate::bitcoin::Amount::from_sat(1)).unwrap().atoms(), 150_000_000_000);
++        let rate = XmzBtcRate::new(XmzAmount::from_atoms(5), crate::bitcoin::Amount::from_sat(3)).unwrap();
++        for sats in 1..1000 {
++            let required = rate.xmz_for_bitcoin(crate::bitcoin::Amount::from_sat(sats)).unwrap();
++            assert!(rate.bitcoin_for_xmz(required).unwrap().to_sat() >= sats);
++            assert!(rate.bitcoin_for_xmz(XmzAmount::from_atoms(required.atoms() - 1)).unwrap().to_sat() < sats);
++        }
++    }
++    #[test]
++    fn rate_rejects_zero_and_overflow_without_truncation() {
++        use crate::bitcoin::Amount;
++        assert!(XmzBtcRate::new(XmzAmount::from_atoms(0), Amount::from_sat(1)).is_err());
++        assert!(XmzBtcRate::new(XmzAmount::from_atoms(1), Amount::ZERO).is_err());
++        let rate = XmzBtcRate::new(XmzAmount::from_atoms(u64::MAX), Amount::from_sat(u64::MAX)).unwrap();
++        assert_eq!(rate.bitcoin_for_xmz(XmzAmount::from_atoms(u64::MAX)).unwrap().to_sat(), u64::MAX);
++        let rate = XmzBtcRate::new(XmzAmount::from_atoms(1), Amount::from_sat(u64::MAX)).unwrap();
++        assert_eq!(rate.bitcoin_for_xmz(XmzAmount::from_atoms(2)), Err(AmountError::Overflow));
++        let inverse = XmzBtcRate::new(XmzAmount::from_atoms(u64::MAX), Amount::from_sat(1)).unwrap();
++        assert_eq!(inverse.xmz_for_bitcoin(Amount::from_sat(2)), Err(AmountError::Overflow));
++    }
++    #[test]
++    fn xmz_not_xmr_scale() {
++        assert_eq!("1".parse::<XmzAmount>().unwrap().atoms(), 100_000_000_000);
++        assert_eq!(XmzAmount::from_atoms(1_000_000_000_000).to_string(), "10");
++        assert_eq!(XmzAmount::from_atoms(3_000_000_000).to_string(), "0.03");
++        assert_eq!("0.00000000001".parse::<XmzAmount>().unwrap().atoms(), 1);
++    }
++    #[test]
++    fn strict_input_and_precision() {
++        for s in ["", ".1", "1.", "01", "+1", "-1", " 1", "1 ", "1e2", "NaN", "1.2.3", "１"] {
++            assert!(s.parse::<XmzAmount>().is_err(), "accepted {s:?}");
++        }
++        assert_eq!("0.000000000001".parse::<XmzAmount>(), Err(AmountError::Precision));
++        assert_eq!("1.000000000000".parse::<XmzAmount>(), Err(AmountError::Precision));
++    }
++    #[test]
++    fn full_u64_range_roundtrips_without_float() {
++        for atoms in [0, 1, 10, XmzAmount::SCALE, 9_007_199_254_740_993, u64::MAX] {
++            let amount = XmzAmount::from_atoms(atoms);
++            assert_eq!(amount.to_string().parse::<XmzAmount>(), Ok(amount));
++            assert_eq!(XmzAmount::from_atom_string(&amount.atom_string()), Ok(amount));
++        }
++        assert_eq!(XmzAmount::from_atoms(u64::MAX).to_string(), "184467440.73709551615");
++        assert_eq!("184467440.73709551616".parse::<XmzAmount>(), Err(AmountError::Overflow));
++        assert!(XmzAmount::from_atom_string("18446744073709551616").is_err());
++        assert!(XmzAmount::from_atom_string("01").is_err());
++    }
++    #[test]
++    fn checked_arithmetic_does_not_saturate() {
++        assert_eq!(XmzAmount::from_atoms(u64::MAX).checked_add(XmzAmount::from_atoms(1)), None);
++        assert_eq!(XmzAmount::from_atoms(0).checked_sub(XmzAmount::from_atoms(1)), None);
++        assert_eq!(XmzAmount::from_atoms(7).checked_sub(XmzAmount::from_atoms(2)).unwrap().atoms(), 5);
++    }
++}

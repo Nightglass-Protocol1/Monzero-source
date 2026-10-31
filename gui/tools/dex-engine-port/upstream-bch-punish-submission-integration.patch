@@ -1,0 +1,161 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/punish.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/punish.rs
+@@ -12,6 +12,7 @@
+         state.cancel=Some(cancel.clone());state.punishment_mature=true;}
+     ensure!(!fixture.incoming.load(Ordering::SeqCst) && !fixture.confirmed.load(Ordering::SeqCst),"unexpected native fixture state");
+     fixture.incoming.store(true,Ordering::SeqCst);fixture.confirmed.store(true,Ordering::SeqCst);
++    helper::exercise_submission(metadata,snapshots,setup,rpc,server,fixture,transaction).await?;
+     let relay=OwnedBchContractRelay::new(rpc);
+     let original_intent=server.state.lock().unwrap().relay_intent.clone();
+     let observer=fixture.funding_client()?;let block=Some(BlockHash::from_byte_array([6;32]));let txid=transaction.compute_txid();
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/punish/helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/punish/helper.rs
+@@ -1,4 +1,5 @@
+-//! Real helper cancellation relay against the owned loopback RPC fixture.
++//! Real helper punishment review and confirmation against owned RPC fixtures.
++mod submission;
+ use super::*;
+ use std::{path::PathBuf,process::{Command,Stdio},os::unix::fs::PermissionsExt};
+ use sha2::{Digest,Sha256};
+@@ -126,3 +127,9 @@
+     assert_eq!(contents(&original_snapshots.0)?,original_secrets);
+     Ok(())
+ }
++
++
++pub(super) async fn exercise_submission(metadata:&PrivateStore,snapshots:&PrivateStore,setup:&Setup,
++    rpc:&OwnedBchObserver,server:&Server,fixture:&Fixture,transaction:&Transaction)->Result<()> {
++    submission::exercise(metadata,snapshots,setup,rpc,server,fixture,transaction).await
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/punish/helper/submission.rs
+@@ -0,0 +1,129 @@
++//! Explicit helper/desktop submission using isolated owned RPC fixtures.
++use super::*;
++
++struct Restore<'a> {
++    server:&'a Server,fixture:&'a Fixture,punish:Option<Transaction>,intent:Option<PathBuf>,
++    mode:u8,mature:bool,spent:bool,confirmed:bool,
++}
++impl<'a> Restore<'a> {
++    fn new(server:&'a Server,fixture:&'a Fixture)->Self {
++        let state=server.state.lock().unwrap();
++        Self {server,fixture,punish:state.punish.clone(),intent:state.relay_intent.clone(),
++            mode:state.relay_mode,mature:state.punishment_mature,spent:state.recovery_output_spent,
++            confirmed:fixture.confirmed.load(Ordering::SeqCst)}
++    }
++}
++impl Drop for Restore<'_> {
++    fn drop(&mut self) {
++        let mut state=self.server.state.lock().unwrap();state.punish=self.punish.clone();
++        state.relay_intent=self.intent.clone();state.relay_mode=self.mode;
++        state.punishment_mature=self.mature;state.recovery_output_spent=self.spent;
++        self.fixture.confirmed.store(self.confirmed,Ordering::SeqCst);
++    }
++}
++
++async fn call(program:&std::path::Path,path:&std::path::Path,action:&str,
++    approval:Option<&str>,success:bool)->Result<Value> {
++    let program=program.to_owned();let path=path.to_owned();let action=action.to_owned();
++    let approval=approval.map(str::to_owned);
++    // Native fixture listeners run on Tokio; never block their executor waiting
++    // for a child that needs responses from those listeners.
++    tokio::task::spawn_blocking(move || invoke(&program,&path,&action,approval.as_deref(),success)).await?
++}
++
++pub(super) async fn exercise(metadata:&PrivateStore,snapshots:&PrivateStore,setup:&Setup,
++    rpc:&OwnedBchObserver,server:&Server,fixture:&Fixture,transaction:&Transaction)->Result<()> {
++    if std::env::var("MONZERO_BCH_PUNISH_SUBMISSION").as_deref()!=Ok("1") {return Ok(())}
++    let helper=PathBuf::from(std::env::var("MONZERO_BCH_PUNISH_HELPER")?);
++    let digest=std::env::var("MONZERO_BCH_PUNISH_HELPER_SHA256")?;
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper
++        && hex(&Sha256::digest(std::fs::read(&helper)?))==digest,"submission helper changed");
++    let mut programs=vec![helper.clone()];
++    match (std::env::var_os("MONZERO_BCH_QT_PUNISH_PROBE"),std::env::var("MONZERO_BCH_QT_PUNISH_PROBE_SHA256")) {
++        (None,Err(std::env::VarError::NotPresent))=>{},
++        (Some(path),Ok(pin))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && hex(&Sha256::digest(std::fs::read(&path)?))==pin,"submission probe changed");
++            programs.push(path);
++        },
++        _=>anyhow::bail!("incomplete submission probe pin"),
++    }
++    let originals=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    let _restore=Restore::new(server,fixture);
++    let native_calls=fixture.calls.lock().unwrap().len();
++    for program in programs {
++        for mode in [0,1,2] {
++            let copied=copy_store(metadata)?;let private=copy_store(snapshots)?;let config=PrivateStore::new()?;
++            let private_before=contents(&private.0)?;
++            let record=setup.quote.record()?;let quote:Value=serde_json::from_slice(&record)?;
++            let quote_path=config.0.join("quote.json");save(&quote_path,&record)?;
++            let name=format!("{}.bch-execution-admission-{}",setup.quote.terms()["swapId"],Role::NativeFunder.domain());
++            let retained:Value=serde_json::from_slice(&std::fs::read(copied.0.join(name))?)?;
++            let admission=config.0.join("admission.json");
++            save(&admission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-admission-v1",
++                "helper":helper,"helperDigest":digest,"quoteFile":quote_path,"quoteCommitment":hex(setup.quote.commitment()),
++                "admittedAt":quote["admittedAt"],"tradeId":setup.quote.terms()["swapId"],
++                "identityPins":[SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++                "policy":setup.policy,"role":"native-funder","metadataDirectory":copied.0,
++                "snapshotDirectory":private.0,"negotiationPins":retained["pins"]}))?)?;
++            let wrapper=config.0.join("punish.json");
++            save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-punish-v1",
++                "admissionConfigFile":admission,"deploymentCommitment":hex(&rpc.deployment_commitment()?)}))?)?;
++            let cookie=config.0.join("cookie");save(&cookie,b"user:pass\n")?;
++            let bch=config.0.join("bch.json");
++            save(&bch,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-observer-rpc-v1",
++                "port":server.port,"cookieFile":cookie,"checkpointHeight":1,"checkpoint":"07".repeat(32),
++                "subversion":"/Bitcoin Cash Node:29.0.0/"}))?)?;
++            let (daemon,wallet)=fixture.rpc_ports();let login=config.0.join("login");save(&login,b"fixture:fixture\n")?;
++            let native=config.0.join("native.json");
++            save(&native,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-rpc-v1",
++                "daemonPort":daemon,"walletPort":wallet,"loginFile":login}))?)?;
++            let submission=config.0.join("submit.json");
++            save(&submission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-punish-submission-v1",
++                "punishConfigFile":wrapper,"rpcFile":bch,"nativeRpcFile":native,"bchObserverKind":"owned-node"}))?)?;
++            let intent=copied.0.join(format!("{}.bch-punish-relay-intent",setup.quote.terms()["swapId"]));
++            let ack=copied.0.join(format!("{}.bch-punish-relay-ack",setup.quote.terms()["swapId"]));
++            {let mut state=server.state.lock().unwrap();state.punish=Some(transaction.clone());state.relay_intent=Some(intent.clone());state.relay_mode=mode;}
++            let count=server.state.lock().unwrap().punish_relay_calls;
++            let review=call(&program,&wrapper,"review",None,true).await?;
++            let approval=review["review"]["commitment"].as_str().context("missing review approval")?;
++            let before_native=fixture.calls.lock().unwrap().len();
++            call(&program,&submission,"submit",None,false).await?;
++            call(&program,&submission,"submit",Some(&"00".repeat(32)),false).await?;
++            assert_eq!(fixture.calls.lock().unwrap().len(),before_native);
++            if mode==0 {
++                fixture.confirmed.store(false,Ordering::SeqCst);
++                call(&program,&submission,"submit",Some(approval),false).await?;
++                fixture.confirmed.store(true,Ordering::SeqCst);
++                server.state.lock().unwrap().punishment_mature=false;
++                call(&program,&submission,"submit",Some(approval),false).await?;
++                server.state.lock().unwrap().punishment_mature=true;
++                server.state.lock().unwrap().recovery_output_spent=true;
++                call(&program,&submission,"submit",Some(approval),false).await?;
++                server.state.lock().unwrap().recovery_output_spent=false;
++            }
++            assert!(!intent.exists());assert!(!ack.exists());
++            assert_eq!(server.state.lock().unwrap().punish_relay_calls,count);
++            let result=call(&program,&submission,"submit",Some(approval),mode==0).await?;
++            assert!(intent.exists());assert_eq!(ack.exists(),mode==0);
++            let durable:Value=serde_json::from_slice(&std::fs::read(&intent)?)?;
++            let retained_approval:[u8;32]=serde_json::from_value(durable["review"].clone())?;
++            assert_eq!(hex(&retained_approval),approval);
++            assert_eq!(server.state.lock().unwrap().punish_relay_calls,count+1);
++            if mode==0 {assert_eq!(result["review"],review["review"]);assert_eq!(result["relay"]["state"],"acknowledged");}
++            // Fresh processes must consult durable history, even after a lost reply.
++            call(&program,&submission,"submit",Some(approval),false).await?;
++            let saved=call(&program,&wrapper,"status",None,true).await?;
++            assert_eq!(saved["review"],review["review"]);
++            assert_eq!(saved["relay"]["txid"],transaction.compute_txid().to_string());
++            assert_eq!(saved["relay"]["state"],if mode==0 {"acknowledged"} else {"attempted"});
++            assert_eq!(server.state.lock().unwrap().punish_relay_calls,count+1);
++            assert_eq!(contents(&private.0)?,private_before);
++        }
++    }
++    assert_eq!(contents(&metadata.0)?,originals);assert_eq!(contents(&snapshots.0)?,secrets);
++    assert!(fixture.calls.lock().unwrap()[native_calls..].iter().all(|s|matches!(s.as_str(),
++        "get_info"|"get_block_header_by_height"|"get_version"|"get_last_block_header"|"get_address"|"check_tx_key"|"get_transfer_by_txid")),"submission mutated native wallet");
++    Ok(())
++}

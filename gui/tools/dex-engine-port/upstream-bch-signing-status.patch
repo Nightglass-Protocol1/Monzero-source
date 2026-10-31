@@ -1,0 +1,93 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
+@@ -11,6 +11,13 @@
+ const SIGNED: &str = "monzero-bch-signed-funding-v1";
+ 
+ pub struct SigningReview { pub details: Value, pub commitment: [u8;32] }
++/// Historical intent only; no claim about current locks or chain inclusion.
++pub struct SavedSigningIntent { pub commitment: [u8;32], pub approved_at: u64 }
++pub struct SavedBchSigning {
++    pub review: SigningReview,
++    pub intent: Option<SavedSigningIntent>,
++    pub signed: Option<SignedFunding>,
++}
+ #[derive(Serialize,Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct Intent { schema: String, review: [u8;32], approved_at: u64 }
+@@ -54,11 +61,35 @@
+     /// Render this exact review in the approval UI. Preparing a review does not
+     /// approve anything or assert that advisory locks still exist in the wallet.
+     pub fn review_bch_funding_signing(&self, backend: &BchRpc, now: u64) -> Result<SigningReview> {
++        self.review_bch_funding_signing_for_deployment(&backend.deployment_commitment()?,now)
++    }
++
++    /// Offline review bound to the caller's independently pinned deployment.
++    pub fn review_bch_funding_signing_for_deployment(&self,deployment: &[u8;32],now: u64)
++        -> Result<SigningReview> {
+         self.quote.check_policy(self.policy,now)?;
+         let (review,_,locked) = self.signing_review()?;
+-        ensure!(now >= locked.admitted_at && backend.deployment_commitment()? == locked.deployment,
++        ensure!(now >= locked.admitted_at && *deployment == locked.deployment,
+             "BCH signing deployment or time differs from retained wallet lock intent");
+         Ok(review)
++    }
++
++    /// Read retained signing state without RPC, including after quote expiry.
++    /// An intent without signed funding requires explicit reconciliation, never
++    /// a signing retry. Absence of intent is not evidence of wallet/chain state.
++    pub fn saved_bch_signing(&self,deployment: &[u8;32]) -> Result<SavedBchSigning> {
++        let (review,_,locked) = self.signing_review()?;
++        ensure!(*deployment == locked.deployment,"saved BCH signing deployment changed");
++        let Some(_) = optional(&self.metadata,&record_name(self.quote,"signing-intent"))? else {
++            ensure!(optional(&self.metadata,&record_name(self.quote,"signed"))?.is_none()
++                && optional(&self.metadata,&record_name(self.quote,"reconciliation"))?.is_none(),
++                "BCH signing result or reconciliation lacks original intent");
++            return Ok(SavedBchSigning {review,intent:None,signed:None})
++        };
++        let (_,bytes,intent) = self.retained_signing_intent()?;
++        let signed = self.signed_bch_funding()?;
++        Ok(SavedBchSigning {review,intent:Some(SavedSigningIntent {
++            commitment:hash(ATTEMPT,&bytes),approved_at:intent.approved_at}),signed})
+     }
+ 
+     /// Restore exact signed funding after historical validation, including after
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -109,7 +109,35 @@
+     server.state.lock().unwrap().sign_intent=Some(metadata.0.join(
+         format!("{}.bch-funding-signing-intent",setup.quote.terms()["swapId"])));
+     let signing=execution.review_bch_funding_signing(&rpc,base+8)?;
++    let deployment=rpc.deployment_commitment()?;
++    assert_eq!(execution.review_bch_funding_signing_for_deployment(&deployment,base+8)?.commitment,signing.commitment);
++    assert!(execution.review_bch_funding_signing_for_deployment(&[0;32],base+8).is_err());
++    assert!(execution.review_bch_funding_signing_for_deployment(&deployment,base+6).is_err());
++    assert!(execution.review_bch_funding_signing_for_deployment(&deployment,base+3500).is_err());
++    let status=execution.saved_bch_signing(&deployment)?;
++    assert_eq!(status.review.commitment,signing.commitment);
++    assert!(status.intent.is_none() && status.signed.is_none());
++    assert!(execution.saved_bch_signing(&[0;32]).is_err());
+     let signed=execution.sign_bch_funding(&rpc,&signing.commitment,base+9).await?;
++    let status=execution.saved_bch_signing(&deployment)?;
++    let saved_intent=status.intent.context("missing saved signing intent")?;
++    assert_eq!(saved_intent.approved_at,base+9);
++    assert_ne!(saved_intent.commitment,[0;32]);
++    assert_eq!(status.signed.context("missing saved signed funding")?.lock_outpoint(),signed.lock_outpoint());
++    let signed_path=metadata.0.join(format!("{}.bch-funding-signed",setup.quote.terms()["swapId"]));
++    let signed_record=std::fs::read(&signed_path)?;
++    std::fs::remove_file(&signed_path)?;
++    let uncertain=execution.saved_bch_signing(&deployment)?;
++    assert_eq!(uncertain.intent.context("lost result lost signing intent")?.commitment,saved_intent.commitment);
++    assert!(uncertain.signed.is_none());
++    let calls=server.state.lock().unwrap().sign_calls;
++    assert!(execution.sign_bch_funding(&rpc,&signing.commitment,base+10).await.is_err());
++    assert_eq!(server.state.lock().unwrap().sign_calls,calls);
++    save(&signed_path,b"{}")?;
++    assert!(execution.saved_bch_signing(&deployment).is_err());
++    std::fs::remove_file(&signed_path)?;
++    save(&signed_path,&signed_record)?;
++    assert_eq!(execution.saved_bch_signing(&deployment)?.signed.unwrap().lock_outpoint(),signed.lock_outpoint());
+     let (native_wallet,native_received)=native_selected.retain_received_view(&snapshots.0,
+         &setup.quote,&setup.policy,base+3,peer.commitment(),own.frame(),own.signature())?;
+     let ack=native_wallet.acknowledgement(&setup.quote)?;

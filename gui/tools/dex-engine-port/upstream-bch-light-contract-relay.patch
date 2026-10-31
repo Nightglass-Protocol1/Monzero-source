@@ -1,0 +1,536 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel.rs
+@@ -131,9 +131,19 @@
+     /// No native payment is required to cancel a mature abandoned BCH lock.
+     /// Secret-bearing refund release remains a separate two-chain decision.
+     pub async fn relay_bch_cancel(&mut self,bch: &BchRpc,approved: &[u8;32],now: u64) -> Result<Txid> {
+-        let (review,cancel,funding,prepared_at,deployment)=self.cancel_relay_materials()?;
++        self.relay_bch_cancel_with_source(RecoveryRelay::Node(bch),approved,now).await
++    }
++    pub async fn relay_light_bch_cancel(&mut self,bch:&crate::bch_rpc::contract_relay::OwnedBchContractRelay<'_>,
++        approved:&[u8;32],now:u64)->Result<Txid> {
++        self.relay_bch_cancel_with_source(RecoveryRelay::Local(bch),approved,now).await
++    }
++    async fn relay_bch_cancel_with_source(&mut self,bch:RecoveryRelay<'_,'_>,approved:&[u8;32],now:u64)->Result<Txid> {
++        let (review,cancel,funding,prepared_at,deployment)=match bch.local_observer() {
++            Some(observer)=>self.funder_cancel_relay_materials(Some((observer,now)))?,
++            None=>self.cancel_relay_materials()?,
++        };
+         ensure!(*approved==review.commitment,"BCH cancellation approval is stale or mismatched");
+-        ensure!(now>=prepared_at && bch.deployment_commitment()?==deployment,"BCH cancellation predates preparation or changes observer");
++        ensure!(now>=prepared_at && bch.deployment()?==deployment,"BCH cancellation predates preparation or changes observer");
+         if let Some((attempt,_))=self.cancel_attempt(&review,prepared_at)? {ensure!(now>=attempt.approved_at,"BCH cancellation time moved backwards");}
+         match self.cancel_state(&review,prepared_at,cancel.compute_txid())? {
+             Some(CancelRelayState::Acknowledged {txid})=>return Ok(txid),
+@@ -141,8 +151,8 @@
+             None=>(),
+         }
+         let deadline=std::time::Instant::now().checked_add(std::time::Duration::from_secs(30)).context("BCH cancellation deadline overflow")?;
+-        let live=tokio::time::timeout_at(deadline.into(),bch.observe_funding(&funding)).await.context("BCH cancellation observation timed out")??;
+-        live.require_cancel_maturity(u64::from(self.policy.bch_confirmations),u32::from(self.policy.cancel_blocks))?;
++        tokio::time::timeout_at(deadline.into(),bch.require_cancel_maturity(&funding,u64::from(self.policy.bch_confirmations),u32::from(self.policy.cancel_blocks)))
++            .await.context("BCH cancellation observation timed out")??;
+         ensure!(std::time::Instant::now()<deadline,"BCH cancellation evidence expired before intent");
+         let bytes=serde_json::to_vec(&Attempt {schema:ATTEMPT.into(),review:*approved,approved_at:now})?;
+         self.metadata.retain(&slot(self.quote,"intent"),&bytes)?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay/observation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay/observation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay/observation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay/observation.rs
+@@ -31,3 +31,22 @@
+         Ok(ConfirmedRefund {quote:*self.quote.commitment(),admission,review:review.commitment,confirmation})
+     }
+ }
++
++impl AdmittedExecution<'_> {
++    /// Read-only reconciliation of the exact local refund, even after a lost
++    /// reply. Confirmation never fabricates an acknowledgement or grants retry.
++    pub async fn observe_light_bch_refund(&self,bch:&OwnedBchObserver,block:Option<BlockHash>,now:u64)->Result<ConfirmedRefund> {
++        let (attempt,_)=self.refund_attempt()?.context("missing BCH refund relay intent")?;
++        ensure!(now>=attempt.approved_at,"BCH refund observation predates dispatch");
++        let (review,recovery,deployment)=self.refund_relay_materials_for_source(attempt.safety_blocks,Some((bch,now)))?;
++        self.refund_state(&review,&recovery,attempt.safety_blocks)?.context("missing BCH refund relay state")?;
++        let admission=self.admission_digest()?;let txid=recovery.refund_txid()?;let minimum=u64::from(self.policy.bch_confirmations);
++        let confirmation=match block {
++            Some(block)=>bch.confirmed_transaction(txid,block,minimum).await?,
++            None=>bch.indexed_confirmed_transaction(txid,minimum).await?,
++        };
++        ensure!(confirmation.deployment()==&deployment && serialize(confirmation.transaction())==recovery.refund_bytes(),
++            "confirmed BCH refund differs from retained recovery");
++        Ok(ConfirmedRefund {quote:*self.quote.commitment(),admission,review:review.commitment,confirmation})
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs
+@@ -27,7 +27,7 @@
+         ensure!(attempt.schema==ATTEMPT && serde_json::to_vec(&attempt)?==bytes,"BCH refund intent changed");
+         Ok(Some((attempt,hash(ATTEMPT,&bytes))))
+     }
+-    fn refund_state(&self,review: &RefundRelayReview,recovery: &PrivateRecovery,margin: u32) -> Result<Option<RefundRelayState>> {
++    pub(super) fn refund_state(&self,review: &RefundRelayReview,recovery: &PrivateRecovery,margin: u32) -> Result<Option<RefundRelayState>> {
+         let ack=optional(&self.metadata,&slot(self.quote,"ack"))?;
+         let Some((attempt,digest))=self.refund_attempt()? else {
+             ensure!(ack.is_none(),"BCH refund acknowledgement lacks intent");return Ok(None)
+@@ -48,6 +48,14 @@
+         let (review,recovery,_)=self.refund_relay_materials(attempt.safety_blocks)?;
+         self.refund_state(&review,&recovery,attempt.safety_blocks)
+     }
++    pub fn light_bch_refund_relay_state(&self,bch:&OwnedBchObserver,now:u64)->Result<Option<RefundRelayState>> {
++        let Some((attempt,_))=self.refund_attempt()? else {
++            self.bound_light_bch_funding(bch,now)?;
++            ensure!(optional(&self.metadata,&slot(self.quote,"ack"))?.is_none(),"BCH refund acknowledgement lacks intent");return Ok(None)
++        };
++        let (review,recovery,_)=self.refund_relay_materials_for_source(attempt.safety_blocks,Some((bch,now)))?;
++        self.refund_state(&review,&recovery,attempt.safety_blocks)
++    }
+     /// Saved status validates the original attempt against the configured margin.
+     /// A changed margin must not silently display a different approved operation.
+     pub fn saved_bch_refund_relay_review(&self,expected: &[u8;32],safety_blocks: u32) -> Result<RefundRelayReview> {
+@@ -61,24 +69,34 @@
+     /// recovery output must still be unspent and safely before punishment.
+     pub async fn relay_bch_refund(&mut self,bch: &BchRpc,block: Option<BlockHash>,approved: &[u8;32],
+         now: u64,safety_blocks: u32) -> Result<Txid> {
+-        let (review,recovery,deployment)=self.refund_relay_materials(safety_blocks)?;
++        self.relay_bch_refund_with_source(RecoveryRelay::Node(bch),block,approved,now,safety_blocks).await
++    }
++    pub async fn relay_light_bch_refund(&mut self,bch:&crate::bch_rpc::contract_relay::OwnedBchContractRelay<'_>,
++        block:Option<BlockHash>,approved:&[u8;32],now:u64,safety_blocks:u32)->Result<Txid> {
++        self.relay_bch_refund_with_source(RecoveryRelay::Local(bch),block,approved,now,safety_blocks).await
++    }
++    async fn relay_bch_refund_with_source(&mut self,bch:RecoveryRelay<'_,'_>,block:Option<BlockHash>,approved:&[u8;32],
++        now:u64,safety_blocks:u32)->Result<Txid> {
++        let (review,recovery,deployment)=self.refund_relay_materials_for_source(safety_blocks,bch.local_observer().map(|observer|(observer,now)))?;
+         ensure!(*approved==review.commitment,"BCH refund approval is stale or mismatched");
+-        ensure!(now>=recovery.prepared_at() && bch.deployment_commitment()?==deployment,"BCH refund predates preparation or changes observer");
++        ensure!(now>=recovery.prepared_at() && bch.deployment()?==deployment,"BCH refund predates preparation or changes observer");
+         if let Some((attempt,_))=self.refund_attempt()? {ensure!(now>=attempt.approved_at,"BCH refund time moved backwards");}
+         match self.refund_state(&review,&recovery,safety_blocks)? {
+             Some(RefundRelayState::Acknowledged {txid})=>return Ok(txid),
+             Some(RefundRelayState::Attempted {..})=>anyhow::bail!("BCH refund result is uncertain; reconcile without retransmitting"),
+             None=>(),
+         }
+-        self.bch_cancel_relay_state()?; // Validate any local cancellation history before live checks.
++        // Validate any cancellation history before live checks; publication by
++        // the peer does not require a local cancellation dispatch attempt.
++        match bch.local_observer() {
++            Some(observer)=>{self.light_bch_cancel_relay_state(observer,now)?;},
++            None=>{self.bch_cancel_relay_state()?;},
++        }
+         let refund: Transaction=deserialize(recovery.refund_bytes())?;
+         let cancel=recovery.cancel();let minimum=u64::from(self.policy.bch_confirmations);
+         let deadline=std::time::Instant::now().checked_add(std::time::Duration::from_secs(30)).context("BCH refund deadline overflow")?;
+         tokio::time::timeout_at(deadline.into(),async {
+-            let confirmed=match block {
+-                Some(block)=>bch.confirmed_transaction(cancel.compute_txid(),block,minimum).await?,
+-                None=>bch.indexed_confirmed_transaction(cancel.compute_txid(),minimum).await?,
+-            };
++            let confirmed=bch.confirmed_transaction(cancel.compute_txid(),block,minimum).await?;
+             ensure!(confirmed.deployment()==&deployment && serialize(confirmed.transaction())==serialize(cancel),"BCH refund cancellation changed");
+             let output=bch.confirmed_unspent_output(&confirmed,0).await?;
+             ensure!(output.outpoint()==refund.input[0].previous_output,"BCH refund source changed");
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund.rs
+@@ -1,21 +1,32 @@
+ //! Public review of the exact privately retained refund. Returning a review
+ //! exposes neither the refund signature nor permission to publish it.
+ use super::*;
+-use crate::bch_rpc::BchRpc;
++use crate::bch_rpc::{BchRpc,observer::OwnedBchObserver};
+ use serde_json::{Value,json};
+ 
+ const REVIEW: &str="monzero-bch-refund-relay-review-v1";
+ pub struct RefundRelayReview {pub details: Value,pub commitment: [u8;32]}
+ impl AdmittedExecution<'_> {
+     fn refund_relay_materials(&self,safety_blocks: u32) -> Result<(RefundRelayReview,PrivateRecovery,[u8;32])> {
++        self.refund_relay_materials_for_source(safety_blocks,None)
++    }
++    fn refund_relay_materials_for_source(&self,safety_blocks:u32,local:Option<(&OwnedBchObserver,u64)>)
++        ->Result<(RefundRelayReview,PrivateRecovery,[u8;32])> {
+         ensure!(self.role==Role::BchFunder,"wrong BCH refund role");
+         let minimum=u64::from(self.policy.bch_confirmations);let delay=u64::from(self.policy.punish_blocks);
+         ensure!(minimum>0 && safety_blocks>0 && minimum.checked_add(u64::from(safety_blocks))
+             .is_some_and(|value|value<delay),"invalid BCH refund safety margin");
++        let (funding,deployment)=match local {
++            Some((observer,now))=>(self.bound_light_bch_funding(observer,now)?,observer.deployment_commitment()?),
++            None=>{
++                self.require_node_funding_source()?;
++                let funding=self.signed_bch_funding()?.context("missing exact BCH funding")?;
++                let prepared=self.prepared_bch_funding()?.context("missing BCH funding preparation")?;
++                let (locked,_)=self.funding_lock_intent(&prepared)?;(funding,locked.deployment)
++            },
++        };
+         let recovery=self.retained_bch_recovery()?.context("missing private BCH recovery")?;
+-        let funding=self.signed_bch_funding()?.context("missing exact BCH funding")?;
+-        let prepared=self.prepared_bch_funding()?.context("missing BCH funding preparation")?;
+-        let (locked,_)=self.funding_lock_intent(&prepared)?;
++        if let Some((_,now))=local {ensure!(now>=recovery.prepared_at(),"BCH refund predates recovery preparation");}
+         let refund: Transaction=deserialize(recovery.refund_bytes())?;
+         let source=OutPoint {txid:recovery.cancel().compute_txid(),vout:0};let plan=self.quote.recovery_plan();
+         ensure!(refund.input.len()==1 && refund.output.len()==1 && refund.input[0].previous_output==source,
+@@ -23,15 +34,23 @@
+         let output=&refund.output[0];let fee=plan.recovery_atoms().checked_sub(output.value.to_sat()).context("invalid BCH refund fee")?;
+         ensure!(output.value.to_sat()==plan.final_recovery_atoms() && fee==plan.terms().recovery_fee_atoms
+             && output.script_pubkey==plan.terms().bch_funder_refund,"BCH refund destination or accounting changed");
+-        let details=json!({"schema":REVIEW,"action":"broadcast-bch-refund","swapId":self.quote.terms()["swapId"],
++        let domain=if local.is_some() {"monzero-bch-light-refund-relay-review-v1"}else{REVIEW};
++        let mut details=json!({"schema":domain,"action":"broadcast-bch-refund","swapId":self.quote.terms()["swapId"],
+             "quote":self.quote.commitment(),"admission":self.admission_digest()?,"privateRecovery":recovery.commitment(),
+-            "bchDeployment":locked.deployment,"bchNetwork":self.quote.terms()["bchNetwork"],"bchGenesis":self.quote.terms()["bchGenesis"],
++            "bchDeployment":deployment,"bchNetwork":self.quote.terms()["bchNetwork"],"bchGenesis":self.quote.terms()["bchGenesis"],
+             "fundingOutpoint":funding.lock_outpoint(),"recoveryOutpoint":source,"txid":refund.compute_txid(),
+             "destinationScript":output.script_pubkey.to_hex_string(),"refundAtoms":output.value.to_sat().to_string(),"feeAtoms":fee.to_string(),
+             "preparedAt":recovery.prepared_at(),"minimumBchConfirmations":minimum,"punishDelayBlocks":delay,
+             "punishmentMarginBlocks":safety_blocks,"revealsNativeSpendShare":true});
+-        let commitment=hash(REVIEW,&serde_json::to_vec(&details)?);
+-        Ok((RefundRelayReview {details,commitment},recovery,locked.deployment))
++        if local.is_some() {details["fundingSource"]=json!("local-wallet");}
++        let commitment=hash(domain,&serde_json::to_vec(&details)?);
++        Ok((RefundRelayReview {details,commitment},recovery,deployment))
++    }
++    /// Public identifiers only; no private refund bytes or release authority.
++    pub fn review_light_bch_refund_relay(&self,bch:&OwnedBchObserver,now:u64,safety_blocks:u32)->Result<RefundRelayReview> {
++        let (review,recovery,_)=self.refund_relay_materials_for_source(safety_blocks,Some((bch,now)))?;
++        self.refund_state(&review,&recovery,safety_blocks)?;
++        Ok(review)
+     }
+     /// Historical review survives quote expiry. Publication must separately
+     /// revalidate the exact review and current recovery-output safety window.
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/transport.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/transport.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/transport.rs
+@@ -0,0 +1,36 @@
++//! Sealed source dispatch for the existing recovery approval state machines.
++use super::*;
++use crate::bch_rpc::{BchRpc,observer::OwnedBchObserver,contract_relay::OwnedBchContractRelay,
++    confirmed::ConfirmedTransaction,unspent::ConfirmedUnspentOutput};
++use swap_core::bch::funding::SignedFunding;
++use bitcoin::BlockHash;
++#[derive(Clone,Copy)]
++pub(super) enum RecoveryRelay<'a,'b> {Node(&'a BchRpc),Local(&'a OwnedBchContractRelay<'b>)}
++impl RecoveryRelay<'_,'_> {
++    pub fn local_observer(&self)->Option<&OwnedBchObserver> {match self {Self::Node(_)=>None,Self::Local(relay)=>Some(relay.observer())}}
++    pub fn deployment(&self)->Result<[u8;32]> {match self {Self::Node(rpc)=>rpc.deployment_commitment(),Self::Local(relay)=>relay.observer().deployment_commitment()}}
++    pub async fn require_cancel_maturity(&self,funding:&SignedFunding,minimum:u64,delay:u32)->Result<()> {
++        match self {
++            Self::Node(rpc)=>rpc.observe_funding(funding).await?.require_cancel_maturity(minimum,delay),
++            Self::Local(relay)=>{
++                let observer=relay.observer();observer.observe_funding(funding).await?.for_deployment(&observer.deployment_commitment()?)?
++                    .require_cancel_maturity(minimum,delay)
++            },
++        }
++    }
++    pub async fn confirmed_transaction(&self,txid:Txid,block:Option<BlockHash>,minimum:u64)->Result<ConfirmedTransaction> {
++        match self {
++            Self::Node(rpc)=>match block {Some(block)=>rpc.confirmed_transaction(txid,block,minimum).await,None=>rpc.indexed_confirmed_transaction(txid,minimum).await},
++            Self::Local(relay)=>match block {Some(block)=>relay.observer().confirmed_transaction(txid,block,minimum).await,None=>relay.observer().indexed_confirmed_transaction(txid,minimum).await},
++        }
++    }
++    pub async fn confirmed_unspent_output(&self,parent:&ConfirmedTransaction,vout:u32)->Result<ConfirmedUnspentOutput> {
++        match self {Self::Node(rpc)=>rpc.confirmed_unspent_output(parent,vout).await,Self::Local(relay)=>relay.observer().confirmed_unspent_output(parent,vout).await}
++    }
++    pub async fn relay_cancellation(&self,transaction:&Transaction,deadline:std::time::Instant)->Result<Txid> {
++        match self {Self::Node(rpc)=>rpc.relay_cancellation(transaction,deadline).await,Self::Local(relay)=>relay.relay_cancellation(transaction,deadline).await}
++    }
++    pub async fn relay_refund(&self,transaction:&Transaction,deadline:std::time::Instant)->Result<Txid> {
++        match self {Self::Node(rpc)=>rpc.relay_refund(transaction,deadline).await,Self::Local(relay)=>relay.relay_refund(transaction,deadline).await}
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery.rs
+@@ -155,3 +155,6 @@
+ pub mod native_refund;
+ 
+ pub mod punish;
++
++mod transport;
++use transport::RecoveryRelay;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs
+@@ -5,9 +5,11 @@
+ use serde_json::{Value,json};
+ use std::{net::TcpListener,io::{BufRead,BufReader,Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
+ 
++pub(super) struct RelayAttempt {pub transaction:Transaction,pub intent:std::path::PathBuf,pub schema:&'static str,pub lose_reply:bool,pub calls:usize}
+ pub(super) struct Fixture {
+     pub observer:OwnedBchObserver,pub depth:Arc<AtomicUsize>,stop:Arc<AtomicBool>,
+     pub calls:Arc<AtomicUsize>,pub recovery_output_mode:Arc<AtomicUsize>,pub recovery_outputs:Arc<AtomicBool>,
++    pub relay:Arc<std::sync::Mutex<Option<RelayAttempt>>>,
+     pub redemption:Arc<std::sync::Mutex<Option<Transaction>>>,pub redemption_mode:Arc<AtomicUsize>,
+     server:Option<std::thread::JoinHandle<Result<()>>>,
+ }
+@@ -115,6 +117,7 @@
+     let redemption_mode=Arc::new(AtomicUsize::new(0));let observed_redemption_mode=redemption_mode.clone();
+     let recovery_output_mode=Arc::new(AtomicUsize::new(0));let observed_recovery_mode=recovery_output_mode.clone();
+     let recovery_outputs=Arc::new(AtomicBool::new(false));let recovery_enabled=recovery_outputs.clone();
++    let relay=Arc::new(std::sync::Mutex::new(None::<RelayAttempt>));let relayed=relay.clone();
+     let txid=signed.compute_txid();let script=signed.output[0].script_pubkey.to_hex_string();
+     let server=std::thread::spawn(move ||->Result<()> {
+         while !signal.load(Ordering::Relaxed) {
+@@ -127,6 +130,7 @@
+             }
+             ensure!(auth,"missing observer authentication");let length=length.context("missing length")?;ensure!(length<4096,"oversized request");
+             let mut bytes=vec![0;length];reader.read_exact(&mut bytes)?;let request:Value=serde_json::from_slice(&bytes)?;
++            let mut lose_reply=false;
+             let result=match request["method"].as_str().context("missing method")? {
+                 "getnetworkinfo"=>json!({"subversion":"/Bitcoin Cash Node:29.0.0/","networkactive":true}),
+                 "getblockchaininfo"=>json!({"chain":"regtest","blocks":200,"headers":200,"initialblockdownload":false,"bestblockhash":"08".repeat(32)}),
+@@ -162,14 +166,22 @@
+                     let shallow=observed_redemption_mode.load(Ordering::SeqCst)==3;
+                     json!({"hash":"06".repeat(32),"height":if shallow {200}else{198},"confirmations":if shallow {1}else{3}})
+                 },
++                "sendrawtransaction"=>{
++                    let mut relay=relayed.lock().unwrap();let relay=relay.as_mut().context("contract relay not enabled")?;
++                    ensure!(request["params"]==json!([bitcoin::consensus::encode::serialize_hex(&relay.transaction),false]),"changed contract bytes or high-fee override");
++                    let intent:Value=serde_json::from_slice(&std::fs::read(&relay.intent)?)?;
++                    ensure!(intent["schema"]==relay.schema && relay.calls==0,"contract relay preceded intent or was repeated");
++                    relay.calls+=1;lose_reply=relay.lose_reply;json!(relay.transaction.compute_txid())
++                },
+                 _=>anyhow::bail!("wallet or mutating RPC forbidden"),
+             };
+-            counted.fetch_add(1,Ordering::Relaxed);let bytes=serde_json::to_vec(&json!({"id":request["id"],"error":null,"result":result}))?;
++            counted.fetch_add(1,Ordering::Relaxed);if lose_reply {continue;}
++            let bytes=serde_json::to_vec(&json!({"id":request["id"],"error":null,"result":result}))?;
+             write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len())?;socket.write_all(&bytes)?;
+         }
+         Ok(())
+     });
+-    let fixture=Fixture {observer,depth,stop,server:Some(server),redemption,redemption_mode,calls:calls.clone(),recovery_output_mode,recovery_outputs};
++    let fixture=Fixture {observer,depth,stop,server:Some(server),redemption,redemption_mode,calls:calls.clone(),recovery_output_mode,recovery_outputs,relay};
+     let observed=execution.observe_light_bch_funding(&fixture.observer,2002).await?;
+     let exact=observed.for_deployment(&fixture.observer.deployment_commitment()?)?;
+     assert_eq!(exact.txid(),signed.compute_txid());assert_eq!(exact.status(),FundingStatus::ConfirmedUnspent {confirmations:3});
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_recovery/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_recovery/relay.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_recovery/relay.rs
+@@ -0,0 +1,107 @@
++use super::*;
++use agreement::execution::funding::recovery::{PrivateRecovery,cancel::CancelRelayState,refund::relay::RefundRelayState};
++use crate::bch_rpc::contract_relay::OwnedBchContractRelay;
++use super::super::light_observer::{Fixture,RelayAttempt};
++fn alternate_endpoints(observer:&crate::bch_rpc::observer::OwnedBchObserver)
++    ->Result<(crate::bch_rpc::BchRpc,crate::bch_rpc::observer::OwnedBchObserver)> {
++    let port=u16::try_from(observer.deployment_context()?["port"].as_u64().context("missing fixture port")?)?;
++    let node=crate::bch_rpc::BchRpc::new(port,"user".into(),"pass".into(),observer.network(),"test".into(),
++        "bchreg:qanchor".into(),bitcoin::ScriptBuf::from_bytes(vec![0x51]),"/Bitcoin Cash Node:29.0.0/".into())?;
++    let changed=crate::bch_rpc::observer::OwnedBchObserver::new(if port==65535 {port-1}else{port+1},"user".into(),"pass".into(),
++        observer.network(),"/Bitcoin Cash Node:29.0.0/".into())?;
++    Ok((node,changed))
++}
++fn copied(path:&std::path::Path)->Result<PrivateStore> {
++    let target=PrivateStore::new()?;
++    for entry in std::fs::read_dir(path)? {let entry=entry?;if entry.file_type()?.is_file() {std::fs::copy(entry.path(),target.0.join(entry.file_name()))?;}}
++    Ok(target)
++}
++pub(super) async fn exercise(metadata:&std::path::Path,snapshots:&std::path::Path,setup:&Setup,fixture:&Fixture,recovery:&PrivateRecovery)->Result<()> {
++    let observer=&fixture.observer;let relay=OwnedBchContractRelay::new(observer);let block=Some(BlockHash::from_byte_array([6;32]));
++    let trade=&setup.quote.terms()["swapId"];
++    for lost in [false,true] {
++        let public=copied(metadata)?;let private=copied(snapshots)?;
++        let cancel_intent=public.0.join(format!("{trade}.bch-cancel-relay-intent"));let cancel_ack=public.0.join(format!("{trade}.bch-cancel-relay-ack"));
++        let mut execution=AdmittedExecution::resume(&public.0,&private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let review=execution.review_light_bch_cancel_relay(observer,12010)?;
++        *fixture.relay.lock().unwrap()=Some(RelayAttempt {transaction:recovery.cancel().clone(),intent:cancel_intent.clone(),
++            schema:"monzero-bch-cancel-relay-intent-v1",lose_reply:lost,calls:0});
++        let calls=fixture.calls.load(Ordering::Relaxed);
++        assert!(execution.relay_light_bch_cancel(&relay,&[0;32],12011).await.is_err());
++        let (node,changed)=alternate_endpoints(observer)?;
++        assert!(execution.relay_bch_cancel(&node,&review.commitment,12011).await.is_err());
++        assert!(execution.relay_light_bch_cancel(&OwnedBchContractRelay::new(&changed),&review.commitment,12011).await.is_err());
++        assert_eq!(fixture.calls.load(Ordering::Relaxed),calls);assert!(!cancel_intent.exists());
++        fixture.depth.store(usize::from(setup.policy.cancel_blocks)-1,Ordering::SeqCst);
++        assert!(execution.relay_light_bch_cancel(&relay,&review.commitment,12011).await.is_err());assert!(!cancel_intent.exists());
++        fixture.depth.store(usize::from(setup.policy.cancel_blocks),Ordering::SeqCst);
++        let sent=execution.relay_light_bch_cancel(&relay,&review.commitment,12011).await;
++        let txid=recovery.cancel().compute_txid();
++        let state=if lost {assert!(sent.is_err());assert!(!cancel_ack.exists());CancelRelayState::Attempted {txid}}
++            else {assert_eq!(sent?,txid);assert!(cancel_ack.exists());CancelRelayState::Acknowledged {txid}};
++        assert!(cancel_intent.exists());assert_eq!(fixture.relay.lock().unwrap().as_ref().unwrap().calls,1);
++        drop(execution);
++        let mut execution=AdmittedExecution::resume(&public.0,&private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let calls=fixture.calls.load(Ordering::Relaxed);
++        assert!(execution.relay_light_bch_cancel(&relay,&review.commitment,12010).await.is_err());
++        let retry=execution.relay_light_bch_cancel(&relay,&review.commitment,12012).await;
++        if lost {assert!(retry.is_err());}else{assert_eq!(retry?,txid);}
++        assert_eq!(fixture.calls.load(Ordering::Relaxed),calls);
++        assert_eq!(execution.light_bch_cancel_relay_state(observer,12012)?,Some(state.clone()));
++        *fixture.redemption.lock().unwrap()=Some(recovery.cancel().clone());
++        let confirmed=execution.observe_light_bch_cancel(observer,block,12013).await?;
++        assert_eq!(confirmed.confirmation().transaction(),recovery.cancel());
++        assert_eq!(execution.light_bch_cancel_relay_state(observer,12013)?,Some(state));
++        refund(&mut execution,&public.0,&private.0,setup,fixture,recovery,lost).await?;
++    }
++    *fixture.relay.lock().unwrap()=None;
++    fixture.depth.store(3,Ordering::SeqCst);
++    Ok(())
++}
++async fn refund(execution:&mut AdmittedExecution<'_>,metadata:&std::path::Path,snapshots:&std::path::Path,
++    setup:&Setup,fixture:&Fixture,recovery:&PrivateRecovery,lost:bool)->Result<()> {
++    let observer=&fixture.observer;let relay=OwnedBchContractRelay::new(observer);let block=Some(BlockHash::from_byte_array([6;32]));
++    let trade=&setup.quote.terms()["swapId"];let intent=metadata.join(format!("{trade}.bch-refund-relay-intent"));
++    let ack=metadata.join(format!("{trade}.bch-refund-relay-ack"));
++    let transaction:Transaction=bitcoin::consensus::deserialize(recovery.refund_bytes())?;let txid=transaction.compute_txid();
++    let review=execution.review_light_bch_refund_relay(observer,12014,5)?;
++    assert_eq!(review.details["schema"],"monzero-bch-light-refund-relay-review-v1");
++    assert_eq!(review.details["fundingSource"],"local-wallet");assert_eq!(review.details["revealsNativeSpendShare"],true);
++    assert!(execution.light_bch_refund_relay_state(observer,12014)?.is_none());
++    assert!(execution.observe_light_bch_refund(observer,block,12014).await.is_err());
++    *fixture.relay.lock().unwrap()=Some(RelayAttempt {transaction:transaction.clone(),intent:intent.clone(),
++        schema:"monzero-bch-refund-relay-intent-v1",lose_reply:lost,calls:0});
++    let calls=fixture.calls.load(Ordering::Relaxed);
++    assert!(execution.relay_light_bch_refund(&relay,block,&[0;32],12015,5).await.is_err());
++    let (node,changed)=alternate_endpoints(observer)?;
++    assert!(execution.review_bch_refund_relay(&node,12015,5).is_err());
++    assert!(execution.relay_bch_refund(&node,block,&review.commitment,12015,5).await.is_err());
++    assert!(execution.relay_light_bch_refund(&OwnedBchContractRelay::new(&changed),block,&review.commitment,12015,5).await.is_err());
++    assert!(execution.relay_light_bch_refund(&relay,block,&review.commitment,12015,0).await.is_err());
++    assert_eq!(fixture.calls.load(Ordering::Relaxed),calls);assert!(!intent.exists());
++    fixture.recovery_output_mode.store(1,Ordering::SeqCst);
++    assert!(execution.relay_light_bch_refund(&relay,block,&review.commitment,12015,5).await.is_err());assert!(!intent.exists());
++    fixture.recovery_output_mode.store(0,Ordering::SeqCst);
++    let sent=execution.relay_light_bch_refund(&relay,block,&review.commitment,12015,5).await;
++    let state=if lost {assert!(sent.is_err());assert!(!ack.exists());RefundRelayState::Attempted {txid}}
++        else {assert_eq!(sent?,txid);assert!(ack.exists());RefundRelayState::Acknowledged {txid}};
++    assert!(intent.exists());assert_eq!(fixture.relay.lock().unwrap().as_ref().unwrap().calls,1);
++    // Reopen a separate exact copy so the original execution keeps its lease.
++    let copied_public=copied(metadata)?;let copied_private=copied(snapshots)?;
++    let mut reopened=AdmittedExecution::resume(&copied_public.0,&copied_private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    let calls=fixture.calls.load(Ordering::Relaxed);
++    assert!(reopened.review_light_bch_refund_relay(observer,12016,6).is_err());
++    assert_eq!(reopened.review_light_bch_refund_relay(observer,12016,5)?.commitment,review.commitment);
++    assert!(reopened.observe_light_bch_refund(observer,block,12014).await.is_err());
++    assert!(reopened.relay_light_bch_refund(&relay,block,&review.commitment,12014,5).await.is_err());
++    let retry=reopened.relay_light_bch_refund(&relay,block,&review.commitment,12016,5).await;
++    if lost {assert!(retry.is_err());}else{assert_eq!(retry?,txid);}
++    assert_eq!(fixture.calls.load(Ordering::Relaxed),calls);
++    let public=hashes(&copied_public.0)?;let private=hashes(&copied_private.0)?;
++    *fixture.redemption.lock().unwrap()=Some(transaction.clone());
++    let observed=reopened.observe_light_bch_refund(observer,None,12017).await?;
++    assert_eq!(observed.confirmation().transaction(),&transaction);assert_eq!(observed.review(),&review.commitment);
++    assert_eq!(reopened.light_bch_refund_relay_state(observer,12017)?,Some(state));
++    assert_eq!(hashes(&copied_public.0)?,public);assert_eq!(hashes(&copied_private.0)?,private);
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_recovery.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_recovery.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_recovery.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_recovery.rs
+@@ -85,5 +85,9 @@
+         .err().context("punishment boundary must fail")?.to_string().contains("too close to punishment"));
+     assert!(execution.light_bch_cancel_relay_state(observer,late)?.is_none());
+     assert_eq!(hashes(metadata)?,public);assert_eq!(hashes(snapshots)?,private);
++    relay::exercise(metadata,snapshots,setup,fixture,&recovery).await?;
++    assert_eq!(hashes(metadata)?,public);assert_eq!(hashes(snapshots)?,private);
+     Ok(review.commitment)
+ }
++
++mod relay;
+diff --git a/swap-machine/src/bch_rpc/contract_relay/tests.rs b/swap-machine/src/bch_rpc/contract_relay/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/contract_relay/tests.rs
+@@ -0,0 +1,56 @@
++use super::*;
++use bitcoin::{absolute,transaction,Amount,OutPoint,Sequence,TxIn,Witness};
++use std::{io::{BufRead,BufReader,Read,Write},net::TcpListener,time::{Duration,Instant}};
++#[tokio::test]
++async fn owned_contract_relay_checks_deadline_exact_bytes_ack_and_lost_reply()->Result<()> {
++    let transaction=Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([1;32]),vout:0},script_sig:ScriptBuf::new(),
++            sequence:Sequence::ZERO,witness:Witness::new()}],output:vec![TxOut {value:Amount::from_sat(1000),script_pubkey:ScriptBuf::from_bytes(vec![0x51])}]};
++    for mode in 0..6 {
++        let listener=TcpListener::bind("127.0.0.1:0")?;listener.set_nonblocking(true)?;let port=listener.local_addr()?.port();
++        let observer=observer::OwnedBchObserver::new(port,"fixture".into(),"fixture".into(),
++            BchNetwork::Regtest {checkpoint_height:1,checkpoint:BlockHash::from_byte_array([7;32])},"/Bitcoin Cash Node:29.0.0/".into())?;
++        let relay=OwnedBchContractRelay::new(&observer);
++        if mode==3 {
++            assert!(relay.relay_refund(&transaction,Instant::now()).await.is_err());
++            assert!(listener.accept().is_err());continue;
++        }
++        let expected=transaction.clone();
++        let server=std::thread::spawn(move ||->Result<()> {
++            let deadline=Instant::now()+Duration::from_secs(5);
++            let (mut socket,_)=loop {match listener.accept() {
++                Ok(pair)=>break pair,
++                Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{ensure!(Instant::now()<deadline,"missing relay request");std::thread::sleep(Duration::from_millis(1));},
++                Err(e)=>return Err(e.into()),
++            }};
++            socket.set_read_timeout(Some(Duration::from_secs(5)))?;
++            let mut reader=BufReader::new(socket.try_clone()?);let mut line=String::new();reader.read_line(&mut line)?;
++            ensure!(line.starts_with("POST / HTTP/"),"contract relay must use root RPC");
++            let mut length=None;let mut auth=false;
++            loop {line.clear();ensure!(reader.read_line(&mut line)?>0,"missing relay headers");if line=="\r\n" {break;}
++                let lower=line.to_ascii_lowercase();
++                if let Some(value)=lower.strip_prefix("content-length:") {length=Some(value.trim().parse::<usize>()?);}
++                if lower.starts_with("authorization:") {auth=line.trim().ends_with("Basic Zml4dHVyZTpmaXh0dXJl");}
++            }
++            ensure!(auth,"wrong contract relay credentials");let length=length.context("missing relay length")?;ensure!(length<4096,"oversized fixture request");
++            let mut bytes=vec![0;length];reader.read_exact(&mut bytes)?;let request:Value=serde_json::from_slice(&bytes)?;
++            ensure!(request["method"]=="sendrawtransaction" && request["params"]==json!([serialize(&expected).to_lower_hex_string(),false]),"wrong contract relay bytes or fee policy");
++            if mode==2 {return Ok(());}
++            let txid=if mode==1 {Txid::all_zeros()}else{expected.compute_txid()};
++            let raw=serialize(&expected).to_lower_hex_string();
++            let envelope=if mode==4 {json!({"id":request["id"],"error":{"code":-26,"message":raw},"result":null})}
++                else if mode==5 {json!({"id":request["id"],"error":null,"result":raw})}
++                else {json!({"id":request["id"],"error":null,"result":txid})};
++            let body=serde_json::to_vec(&envelope)?;
++            write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;socket.write_all(&body)?;
++            Ok(())
++        });
++        let sent=relay.relay_cancellation(&transaction,Instant::now()+Duration::from_secs(5)).await;
++        server.join().unwrap()?;
++        if mode==0 {assert_eq!(sent?,transaction.compute_txid());}else{
++            let error=sent.err().context("unsafe reply must fail")?;
++            assert!(!format!("{error:#}").contains(&serialize(&transaction).to_lower_hex_string()));
++        }
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_rpc/contract_relay.rs b/swap-machine/src/bch_rpc/contract_relay.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/contract_relay.rs
+@@ -0,0 +1,30 @@
++//! Explicit dispatch capability, separate from read-only chain observation.
++//! Only admitted executors may publish exact, approved, retained contract bytes.
++use super::*;
++use bitcoin::{Transaction,Txid,hex::DisplayHex};
++
++pub struct OwnedBchContractRelay<'a> {observer:&'a observer::OwnedBchObserver}
++impl<'a> OwnedBchContractRelay<'a> {
++    /// Explicit API selection, not approval. The admitted executor validates
++    /// consent, current chain evidence and durable intent before dispatch.
++    pub fn new(observer:&'a observer::OwnedBchObserver)->Self {Self {observer}}
++    pub fn observer(&self)->&observer::OwnedBchObserver {self.observer}
++    pub(crate) async fn relay_cancellation(&self,transaction:&Transaction,deadline:std::time::Instant)->Result<Txid> {
++        self.dispatch(transaction,deadline).await
++    }
++    pub(crate) async fn relay_refund(&self,transaction:&Transaction,deadline:std::time::Instant)->Result<Txid> {
++        self.dispatch(transaction,deadline).await
++    }
++    async fn dispatch(&self,transaction:&Transaction,deadline:std::time::Instant)->Result<Txid> {
++        ensure!(std::time::Instant::now()<deadline,"BCH contract spend observations expired before dispatch");
++        let raw=Zeroizing::new(serialize(transaction).to_lower_hex_string());
++        let reply=tokio::time::timeout_at(deadline.into(),self.observer.rpc(None,"sendrawtransaction",json!([raw.as_str(),false])))
++            .await.context("BCH contract spend dispatch deadline exceeded; result is uncertain")??;
++        let txid:Txid=serde_json::from_str(reply.get()).map_err(|_|anyhow::anyhow!("invalid BCH contract relay acknowledgement"))?;
++        ensure!(txid==transaction.compute_txid(),"BCH contract spend relay returned another transaction ID");
++        Ok(txid)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/bch_rpc.rs b/swap-machine/src/bch_rpc.rs
+--- a/swap-machine/src/bch_rpc.rs
++++ b/swap-machine/src/bch_rpc.rs
+@@ -143,3 +143,5 @@
+ pub mod preparation;
+ 
+ pub mod observer;
++
++pub mod contract_relay;

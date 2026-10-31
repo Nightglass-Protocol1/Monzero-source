@@ -1,0 +1,247 @@
+diff --git a/swap-machine/src/native_funding_rpc/exact_net_journal.rs b/swap-machine/src/native_funding_rpc/exact_net_journal.rs
+index 1b9fdd0a9..30c4d2171 100644
+--- a/swap-machine/src/native_funding_rpc/exact_net_journal.rs
++++ b/swap-machine/src/native_funding_rpc/exact_net_journal.rs
+@@ -1,4 +1,4 @@
+-//! Write-once exact-net accounting. No relay authority or secret persistence.
++//! Write-once exact-net accounting and one-shot relay handoff. No secret persistence.
+ //! Caller owns the canonical private directory and reserves before construction.
+ use anyhow::{ensure, Result};
+ use serde_json::{json, Value};
+@@ -13,7 +13,30 @@ pub struct ExactNetJournal {
+     intent: Value,
+ }
+ 
++/// One-shot in-memory capability; constructed only after durable preparation.
++/// No decode, clone or restoration API. Retained files still require reconciliation.
++/// ```compile_fail
++/// use swap_machine::native_funding_rpc::{relay::NativeTransferRelay, full_proceeds::PreparedExactNet};
++/// async fn bypass_journal(relay: &mut NativeTransferRelay, prepared: PreparedExactNet) {
++///     relay.relay_exact_net(prepared).await.unwrap();
++/// }
++/// ```
++pub struct JournaledExactNet {
++    journal: ExactNetJournal,
++    prepared: PreparedExactNet,
++}
++impl JournaledExactNet {
++    pub(super) fn into_parts(self) -> (PreparedExactNet,ExactNetJournal) {
++        (self.prepared,self.journal)
++    }
++}
++
+ impl ExactNetJournal {
++    /// Consumes both objects; failed persistence never creates relay capability.
++    pub fn authorize_relay(self, prepared: PreparedExactNet) -> Result<JournaledExactNet> {
++        self.record_prepared(&prepared)?;
++        Ok(JournaledExactNet { journal:self,prepared })
++    }
+     #[cfg(unix)]
+     pub fn reserve(directory: &Path, genesis: &str, request: &ExactNetRequest,
+         top_up: &str) -> Result<Self> {
+diff --git a/swap-machine/src/native_funding_rpc/full_proceeds.rs b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+index 53d93a7f5..059cf6d3d 100644
+--- a/swap-machine/src/native_funding_rpc/full_proceeds.rs
++++ b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+@@ -1,8 +1,8 @@
+-//! Non-executable full-lock accounting experiment, not signed quote policy.
+-//! Constructs a single transaction with fees deducted from the destination.
+-//! No metadata, signing artifacts or relay-capable object is returned. The
+-//! trusted caller must exclusively own the restored wallet service. Native RPC
+-//! constructs/signs internally; this is not a read-only wallet operation.
++//! Full-lock/exact-net construction experiments, not signed quote policy.
++//! Previews export no signing artifacts. Preparation retains private metadata
++//! for a journal-backed native relay handoff; this module never broadcasts.
++//! The caller must exclusively own the wallet service. Native RPC constructs
++//! and signs internally; these are not read-only wallet operations.
+ use super::{number, NativeFundingRpc};
+ use crate::xmz_funding::{ChainSnapshot, FundingObserver};
+ use anyhow::{ensure, Context, Result};
+@@ -10,6 +10,7 @@ use serde_json::{json, Value};
+ use std::collections::BTreeSet;
+ use swap_core::{xmz::XmzAmount, xmz_address::XmzAddress};
+ 
++#[derive(Clone)]
+ pub struct FullProceedsRequest {
+     pub wallet: XmzAddress,
+     pub destination: XmzAddress,
+@@ -32,6 +33,7 @@ pub struct FullProceedsPreview {
+ 
+ /// Experimental exact-net accounting, not authority to fund or settle a quote.
+ /// The caller supplies the approved reserve owner; this module never chooses it.
++#[derive(Clone)]
+ pub struct ExactNetRequest {
+     pub source: FullProceedsRequest,
+     pub principal: XmzAmount,
+@@ -45,9 +47,9 @@ pub struct ExactNetPreview {
+ }
+ 
+ /// Engine-owned prepared transaction, not serializable and not relay authority.
+-/// There is deliberately no metadata accessor or broadcast method until a
+-/// durable two-source intent can bind this exact transaction before dispatch.
++/// Private metadata is accessible only to the native journal-backed relay path.
+ pub struct PreparedExactNet {
++    request: ExactNetRequest,
+     preview: ExactNetPreview,
+     terms: Value,
+     _metadata: zeroize::Zeroizing<String>,
+@@ -57,6 +59,9 @@ impl PreparedExactNet {
+     pub fn preview(&self) -> &ExactNetPreview { &self.preview }
+     /// Public accounting and transaction identity only; contains no signing data.
+     pub fn terms(&self) -> &Value { &self.terms }
++    pub(super) fn into_relay_parts(self) -> (ExactNetRequest, Value, zeroize::Zeroizing<String>) {
++        (self.request,self.terms,self._metadata)
++    }
+ }
+ 
+ /// Prepare once with relay disabled. Caller owns the dedicated wallet service
+@@ -126,7 +131,7 @@ fn check_prepared_exact_net(mut response: Value, request: &ExactNetRequest,
+         "feeAtoms":preview.network_fee.atom_string(),"maximumFeeAtoms":source.maximum_fee.atom_string(),
+         "account":source.account,"priority":source.priority,"txid":response["tx_hash"],
+         "weight":number(&response,"weight")?});
+-    Ok(PreparedExactNet { preview, terms, _metadata: metadata })
++    Ok(PreparedExactNet { request:request.clone(), preview, terms, _metadata: metadata })
+ }
+ 
+ /// Constructs but never exports or broadcasts a transaction. Fees are deducted
+@@ -168,7 +173,7 @@ async fn preview_exact_net_inner(client: &NativeFundingRpc, request: &ExactNetRe
+     Ok(preview)
+ }
+ 
+-fn top_up_inputs(incoming: &Value, request: &ExactNetRequest,
++pub(super) fn top_up_inputs(incoming: &Value, request: &ExactNetRequest,
+     top_up_txid: &str) -> Result<BTreeSet<String>> {
+     let source = &request.source;
+     ensure!(hash(top_up_txid) && top_up_txid != "0".repeat(64)
+diff --git a/swap-machine/src/native_funding_rpc/relay.rs b/swap-machine/src/native_funding_rpc/relay.rs
+index dac747533..b03be01f2 100644
+--- a/swap-machine/src/native_funding_rpc/relay.rs
++++ b/swap-machine/src/native_funding_rpc/relay.rs
+@@ -140,13 +140,34 @@ impl NativeTransferRelay {
+     pub async fn relay_prepared(&mut self, prepared: PreparedTransfer) -> Result<RelayedTransfer> {
+         self.preflight(&prepared.request, &prepared.genesis).await?;
+         self.dispatched = true;
+-        let response = self.client.rpc(self.client.wallet, "relay_tx",
+-            json!({"hex":prepared.metadata.as_str()})).await
+-            .map_err(|_| BroadcastOutcomeUnknown)?;
+-        if response.get("tx_hash").and_then(Value::as_str) != Some(prepared.summary.txid.as_str()) {
+-            return Err(BroadcastOutcomeUnknown.into());
+-        }
+-        Ok(prepared.summary)
++        classify_prepared_broadcast(self.client.rpc(self.client.wallet, "relay_tx",
++            json!({"hex":prepared.metadata.as_str()})).await, prepared.summary)
++    }
++
++    /// Relay the journal-bound exact transaction once. Caller establishes trade
++    /// consent/outcome and exclusively owns the wallet and retained journal.
++    /// Even a preflight failure consumes the capability; it does not clear intent.
++    pub async fn relay_exact_net(&mut self,
++        journaled: super::exact_net_journal::JournaledExactNet) -> Result<RelayedTransfer> {
++        ensure!(!self.dispatched,"relay instance already dispatched; reconcile before retrying");
++        let (prepared,_journal)=journaled.into_parts();
++        let summary=RelayedTransfer { txid:string(prepared.terms(),"txid")?,
++            fee:prepared.preview().network_fee,weight:number(prepared.terms(),"weight")? };
++        let (request,terms,metadata)=prepared.into_relay_parts();
++        let genesis=string(&terms,"genesis")?;
++        let before=self.client.snapshot().await?;
++        ensure!(before.genesis==genesis && canonical_hash(&before.tip_hash),"unexpected exact-net relay chain");
++        let policy=RelayRequest { wallet:request.source.wallet.clone(),destination:request.source.destination.clone(),
++            amount:request.source.locked,account:request.source.account,priority:request.source.priority };
++        self.preflight(&policy,&genesis).await?;
++        let incoming=self.client.rpc(self.client.wallet,"incoming_transfers",
++            json!({"transfer_type":"available","account_index":request.source.account})).await?;
++        super::full_proceeds::top_up_inputs(&incoming,&request,&string(&terms,"topUpTxid")?)?;
++        self.check_wallet(&policy).await?;
++        ensure!(self.client.snapshot().await?==before,"exact-net relay chain changed");
++        self.dispatched=true;
++        classify_prepared_broadcast(self.client.rpc(self.client.wallet,"relay_tx",
++            json!({"hex":metadata.as_str()})).await, summary)
+     }
+ 
+     async fn broadcast(&mut self, request: RelayRequest) -> Result<RelayedTransfer> {
+@@ -220,6 +241,15 @@ fn parse_prepared(mut response: Value, amount: XmzAmount, maximum_fee: XmzAmount
+     Ok((summary, metadata))
+ }
+ 
++// Called only after dispatch: an unusable acknowledgement is not proof of failure.
++fn classify_prepared_broadcast(response: Result<Value>, summary: RelayedTransfer) -> Result<RelayedTransfer> {
++    let response = response.map_err(|_| BroadcastOutcomeUnknown)?;
++    if response.get("tx_hash").and_then(Value::as_str) != Some(summary.txid.as_str()) {
++        return Err(BroadcastOutcomeUnknown.into());
++    }
++    Ok(summary)
++}
++
+ fn classify_broadcast(response: Result<Value>, amount: XmzAmount) -> Result<RelayedTransfer> {
+     // Even a malformed success reply may follow a completed broadcast. Keep
+     // pre-dispatch errors distinct, but never label a dispatch error "not sent".
+@@ -360,6 +390,25 @@ mod tests {
+         assert!(classify_broadcast(Ok(response()), amount).is_ok());
+     }
+ 
++    #[test]
++    fn prepared_broadcast_requires_exact_acknowledgement_and_redacts_errors() {
++        let summary = || RelayedTransfer { txid: "a".repeat(64),
++            fee: XmzAmount::from_atoms(123), weight: 456 };
++        for response in [Err(anyhow::anyhow!("private RPC credentials and metadata")),
++            Ok(Value::Null), Ok(json!({})), Ok(json!({"tx_hash":null})),
++            Ok(json!({"tx_hash":123})), Ok(json!({"tx_hash":"b".repeat(64)})),
++            Ok(json!({"tx_hash":"A".repeat(64)})), Ok(json!({"tx_hash":""}))] {
++            let error = classify_prepared_broadcast(response, summary()).err().expect("must reject");
++            assert!(error.downcast_ref::<BroadcastOutcomeUnknown>().is_some());
++            assert_eq!(format!("{error:#}"), "native broadcast outcome unknown; reconcile before retrying");
++        }
++        let accepted = classify_prepared_broadcast(Ok(json!({"tx_hash":"a".repeat(64)})), summary())
++            .expect("matching acknowledgement");
++        assert_eq!(accepted.txid, "a".repeat(64));
++        assert_eq!(accepted.fee.atoms(), 123);
++        assert_eq!(accepted.weight, 456);
++    }
++
+     #[test]
+     fn preparation_is_nonrelaying_and_enforces_fee_ceiling() -> Result<()> {
+         let request = RelayRequest { wallet: address(), destination: address(),
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 18378a5c1..ed1ca837f 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -294,6 +294,14 @@ async fn native_exact_net_top_up_preview() -> Result<()> {
+             anyhow::ensure!(recovered.reconcile(&client,&request.source.wallet,10).await.is_err(),
+                 "unbroadcast preparation reported confirmed");
+         }
++        if std::env::var("MONZERO_TEST_TOP_UP_CHECK_CONFIRMED").as_deref()==Ok("1") {
++            let client=native_rpc::authenticated_fixture()?;
++            anyhow::ensure!(recovered.reconcile(&client,&request.source.wallet,u64::MAX).await.is_err(),
++                "insufficient exact-net depth accepted");
++            let confirmed=recovered.reconcile(&client,&request.source.wallet,10).await?;
++            anyhow::ensure!(confirmed.confirmations>=10 && recovered.terms()["txid"]==confirmed.txid,
++                "incorrect confirmed exact-net transaction");
++        }
+         request.principal = XmzAmount::from_atoms(99_999_999_999);
+         anyhow::ensure!(swap_machine::native_funding_rpc::exact_net_recovery::ExactNetRecovery::load(
+             &directory,genesis,&request,&top_up).is_err(), "changed recovery context accepted");
+@@ -314,6 +322,24 @@ async fn native_exact_net_top_up_preview() -> Result<()> {
+         && prepared.terms()["lockTxid"] == request.source.lock_txid
+         && prepared.terms()["topUpTxid"] == top_up
+         && prepared.terms().get("tx_metadata").is_none(), "incorrect prepared two-source accounting");
++    if std::env::var("MONZERO_TEST_TOP_UP_RELAY").as_deref()==Ok("1") {
++        let txid=prepared.terms()["txid"].as_str().context("missing prepared hash")?.to_owned();
++        let journaled=journal.authorize_relay(prepared)?;
++        let mut relay=swap_machine::native_funding_rpc::relay::NativeTransferRelay::new(client);
++        let outcome=relay.relay_exact_net(journaled).await;
++        if std::env::var("MONZERO_TEST_TOP_UP_EXPECT_UNKNOWN").as_deref()==Ok("1") {
++            let error=outcome.err().context("lost acknowledgement reported success")?;
++            anyhow::ensure!(error.downcast_ref::<swap_machine::native_funding_rpc::relay::BroadcastOutcomeUnknown>().is_some(),
++                "lost acknowledgement was not classified as unknown");
++            anyhow::ensure!(format!("{error:#}")=="native broadcast outcome unknown; reconcile before retrying",
++                "unknown outcome leaked RPC details");
++        } else {
++            anyhow::ensure!(outcome?.txid==txid,"relayed exact-net hash differs from journal");
++        }
++        anyhow::ensure!(swap_machine::native_funding_rpc::exact_net_journal::ExactNetJournal::reserve(
++            &directory,genesis,&request,&top_up).is_err(),"relayed lock can be reserved again");
++        return Ok(());
++    }
+     journal.record_prepared(&prepared)?;
+     anyhow::ensure!(journal.record_prepared(&prepared).is_err(), "duplicate preparation record accepted");
+     drop(journal);

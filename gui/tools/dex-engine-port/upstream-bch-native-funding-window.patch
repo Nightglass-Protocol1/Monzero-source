@@ -1,0 +1,141 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message.rs
+@@ -20,6 +20,17 @@
+ #[serde(deny_unknown_fields)]
+ struct Record {
+     schema: String, admission: [u8;32], at: u64, frame: Value, signature: Option<Vec<u8>>,
++}
++/// BCH-side preflight only, not XMZ source-wallet validation or payment consent.
++/// Not serializable: stale observations must not become restored authorization.
++pub struct NativeFundingLockCheck {
++    observation: FundingObservation, destination: XmzAddress, amount: u64, maximum_fee: u64,
++}
++impl NativeFundingLockCheck {
++    pub fn observation(&self) -> &FundingObservation { &self.observation }
++    pub fn destination(&self) -> &XmzAddress { &self.destination }
++    pub fn amount_atoms(&self) -> u64 { self.amount }
++    pub fn maximum_fee_atoms(&self) -> u64 { self.maximum_fee }
+ }
+ pub struct AuthenticatedFunding { frame: Vec<u8>, signature: Vec<u8>, signed: SignedFunding }
+ impl AuthenticatedFunding {
+@@ -176,6 +187,32 @@
+         Ok(Some(AuthenticatedFunding {frame,signature:record.signature.context("missing BCH message signature")?,signed}))
+     }
+ 
++    /// Check the authenticated BCH lock before native payment preparation.
++    /// The caller selects a positive block margin; confirmation depth and the
++    /// cancellation delay come from the independently checked signed policy.
++    /// Native wallet checks and explicit payment approval remain separate, and
++    /// every later relay/release must independently recheck the chain window.
++    pub async fn check_bch_lock_for_native_funding(&self,backend: &BchRpc,now: u64,safety_blocks: u32)
++        -> Result<NativeFundingLockCheck> {
++        let started = std::time::Instant::now();
++        ensure!(self.role == Role::NativeFunder,"wrong native funding role");
++        let agreed = self.message_context(now)?;
++        let expires = self.quote.terms()["expiresAt"].parse::<u64>()?;
++        let deadline = started.checked_add(std::time::Duration::from_secs(expires.checked_sub(now)
++            .context("BCH native funding quote expired")?)).context("BCH native funding deadline overflow")?;
++        let amount = self.quote.terms()["xmzAtoms"].parse::<u64>()?;
++        let maximum_fee = self.quote.terms()["xmzFundingFeeMaxAtoms"].parse::<u64>()?;
++        let destination = agreed.owned().wallet().address().clone();
++        agreed.check_native_funding(self.quote,self.policy,now,&destination,amount,maximum_fee)?;
++        let (receipt,_,_) = self.message_record("message-received")?.context("missing BCH funding receipt")?;
++        ensure!(now >= receipt.at,"native funding check predates BCH funding receipt");
++        let observation = self.observe_received_bch_funding(backend).await?;
++        observation.require_funding_window(u64::from(self.policy.bch_confirmations),
++            u32::from(self.policy.cancel_blocks),safety_blocks)?;
++        ensure!(std::time::Instant::now() < deadline,"BCH quote expired during native funding check");
++        Ok(NativeFundingLockCheck {observation,destination,amount,maximum_fee})
++    }
++
+     pub async fn observe_received_bch_funding(&self,backend: &BchRpc) -> Result<FundingObservation> {
+         ensure!(backend.network().quote_name() == self.quote.terms()["bchNetwork"]
+             && backend.network().genesis() == self.quote.terms()["bchGenesis"],"BCH peer funding observer has another network");
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/observation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/observation.rs
+@@ -18,6 +18,8 @@
+         8 => output["bestblock"] = json!("09".repeat(32)),
+         18 => output["confirmations"] = json!(-1),
+         20 => output["confirmations"] = json!(999),
++        21 => output["confirmations"] = json!(1),
++        22 => output["confirmations"] = json!(15),
+         _ => (),
+     }
+     Ok(output)
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message.rs
+@@ -54,6 +54,20 @@
+     server.state.lock().unwrap().observation_mode = 0;
+     assert_eq!(native.observe_received_bch_funding(rpc).await?.status(),
+         crate::bch_rpc::observation::FundingStatus::ConfirmedUnspent {confirmations:3});
++    let checked = native.check_bch_lock_for_native_funding(rpc,1023,5).await?;
++    assert_eq!(checked.observation().txid(),txid);
++    assert_eq!(checked.amount_atoms(),101_000);
++    assert_eq!(checked.maximum_fee_atoms(),1000);
++    assert_eq!(checked.destination(),native.restore_agreement()?.owned().wallet().address());
++    assert!(sender.check_bch_lock_for_native_funding(rpc,1023,5).await.is_err());
++    assert!(native.check_bch_lock_for_native_funding(rpc,2000,5).await.is_err());
++    assert!(native.check_bch_lock_for_native_funding(rpc,1021,5).await.is_err());
++    assert!(native.check_bch_lock_for_native_funding(rpc,1023,0).await.is_err());
++    for mode in [1,2,3,21,22] {
++        server.state.lock().unwrap().observation_mode = mode;
++        assert!(native.check_bch_lock_for_native_funding(rpc,1023,5).await.is_err(),"unsafe funding window {mode}");
++    }
++    server.state.lock().unwrap().observation_mode = 0;
+     drop(native);
+     let native = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
+     assert_eq!(native.received_bch_funding_message()?.unwrap().frame(),frame);
+--- a/swap-machine/src/bch_rpc/observation.rs
++++ b/swap-machine/src/bch_rpc/observation.rs
+@@ -17,6 +17,22 @@
+     pub fn txid(&self) -> Txid { self.txid }
+     pub fn tip(&self) -> BlockHash { self.tip }
+     pub fn status(&self) -> FundingStatus { self.status }
++
++    /// Require confirmed, unspent funding with a strict cancellation margin.
++    /// This is point-in-time evidence only. Reobserve immediately before each
++    /// native preparation/release action; a block margin is not a time guarantee.
++    pub fn require_funding_window(&self,minimum: u64,cancel_blocks: u32,safety_blocks: u32) -> Result<()> {
++        ensure!(minimum > 0 && safety_blocks > 0 && cancel_blocks <= 0xffff
++            && minimum.checked_add(u64::from(safety_blocks)).is_some_and(|depth|depth < u64::from(cancel_blocks)),
++            "invalid BCH confirmation or cancellation safety policy");
++        let FundingStatus::ConfirmedUnspent {confirmations} = self.status else {
++            anyhow::bail!("BCH funding is not confirmed and unspent")
++        };
++        ensure!(confirmations >= minimum
++            && confirmations.checked_add(u64::from(safety_blocks)).is_some_and(|depth|depth < u64::from(cancel_blocks)),
++            "BCH funding is shallow or too close to cancellation");
++        Ok(())
++    }
+ }
+ #[derive(Deserialize)]
+ struct MempoolEntry { size: u64 }
+@@ -62,3 +78,28 @@
+         Ok(FundingObservation {txid:outpoint.txid,tip,status})
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn funding_window_rejects_shallow_spent_unobserved_and_cancellation_boundaries() {
++        let check = |status,minimum,cancel,safety| FundingObservation {
++            txid:Txid::all_zeros(),tip:BlockHash::all_zeros(),status,
++        }.require_funding_window(minimum,cancel,safety);
++        for confirmations in [2,3,14] {
++            assert!(check(FundingStatus::ConfirmedUnspent {confirmations},2,20,5).is_ok());
++        }
++        for confirmations in [0,1,15,19,20,21,u64::MAX] {
++            assert!(check(FundingStatus::ConfirmedUnspent {confirmations},2,20,5).is_err());
++        }
++        for status in [FundingStatus::Unobserved,FundingStatus::Mempool {lock_output_unspent:true},
++            FundingStatus::Mempool {lock_output_unspent:false}] {
++            assert!(check(status,2,20,5).is_err());
++        }
++        for (minimum,cancel,safety) in [(0,20,5),(2,20,0),(15,20,5),(2,0,5),
++            (2,65536,5),(u64::MAX,20,1),(2,20,u32::MAX)] {
++            assert!(check(FundingStatus::ConfirmedUnspent {confirmations:3},minimum,cancel,safety).is_err());
++        }
++    }
++}

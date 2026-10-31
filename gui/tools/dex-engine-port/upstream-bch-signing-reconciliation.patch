@@ -1,0 +1,202 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
+@@ -7,6 +7,7 @@
+ 
+ const REVIEW: &str = "monzero-bch-funding-signing-review-v1";
+ const ATTEMPT: &str = "monzero-bch-funding-signing-intent-v1";
++const RECONCILE: &str = "monzero-bch-signing-reconciliation-v1";
+ const SIGNED: &str = "monzero-bch-signed-funding-v1";
+ 
+ pub struct SigningReview { pub details: Value, pub commitment: [u8;32] }
+@@ -16,6 +17,9 @@
+ #[derive(Serialize,Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct Record { schema: String, intent: [u8;32], raw: Vec<u8> }
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Reconciliation { schema: String, review: [u8;32], reconciled_at: u64 }
+ 
+ fn optional(journal: &Journal, name: &str) -> Result<Option<Vec<u8>>> {
+     match journal.read(name) {
+@@ -66,6 +70,17 @@
+ 
+     pub(super) fn restore_signed_bch_funding(&self) -> Result<Option<(SignedFunding,u64)>> {
+         let Some(bytes) = optional(&self.metadata,&record_name(self.quote,"signed"))? else {return Ok(None)};
++        let (prepared,intent_bytes,intent) = self.retained_signing_intent()?;
++        let record: Record = serde_json::from_slice(&bytes)?;
++        ensure!(record.schema == SIGNED && record.intent == hash(ATTEMPT,&intent_bytes)
++            && serde_json::to_vec(&record)? == bytes,"BCH signed funding record changed");
++        let signed = prepared.preview().verify_signed(&record.raw)?;
++        let review = self.reconciliation_review(&record,&signed,intent.approved_at)?;
++        self.check_reconciliation(&review,intent.approved_at)?;
++        Ok(Some((signed,intent.approved_at)))
++    }
++
++    fn retained_signing_intent(&self) -> Result<(PreparedBchFunding,Vec<u8>,Intent)> {
+         let (review,prepared,locked) = self.signing_review()?;
+         let intent_bytes = self.metadata.read(&record_name(self.quote,"signing-intent"))?;
+         ensure!(intent_bytes.len() <= 4096,"oversized BCH signing intent");
+@@ -74,10 +89,66 @@
+             && intent.approved_at >= locked.admitted_at && serde_json::to_vec(&intent)? == intent_bytes,
+             "BCH signing intent differs from retained approval");
+         self.quote.check_policy(self.policy,intent.approved_at)?;
+-        let record: Record = serde_json::from_slice(&bytes)?;
+-        ensure!(record.schema == SIGNED && record.intent == hash(ATTEMPT,&intent_bytes)
+-            && serde_json::to_vec(&record)? == bytes,"BCH signed funding record changed");
+-        Ok(Some((prepared.preview().verify_signed(&record.raw)?,intent.approved_at)))
++        Ok((prepared,intent_bytes,intent))
++    }
++
++    fn reconciliation_review(&self,record: &Record,signed: &SignedFunding,approved_at: u64)
++        -> Result<SigningReview> {
++        let details = json!({"schema":RECONCILE,"action":"retain-recovered-signature-only",
++            "swapId":self.quote.terms()["swapId"],"admission":self.admission_digest()?,
++            "originalSigningIntent":record.intent,"originalApprovedAt":approved_at,
++            "signedBytes":hash(SIGNED,&record.raw),"fundingTxid":signed.lock_outpoint().txid,
++            "contractVout":signed.lock_outpoint().vout,"signingReview":self.signing_review()?.0.details});
++        Ok(SigningReview {commitment:hash(RECONCILE,&serde_json::to_vec(&details)?),details})
++    }
++
++    fn check_reconciliation(&self,review: &SigningReview,approved_at: u64) -> Result<Option<Reconciliation>> {
++        let Some(bytes) = optional(&self.metadata,&record_name(self.quote,"reconciliation"))? else {return Ok(None)};
++        ensure!(bytes.len() <= 4096,"oversized BCH reconciliation approval");
++        let retained: Reconciliation = serde_json::from_slice(&bytes)?;
++        ensure!(retained.schema == RECONCILE && retained.review == review.commitment
++            && retained.reconciled_at >= approved_at && serde_json::to_vec(&retained)? == bytes,
++            "BCH reconciliation differs from approved recovered transaction");
++        Ok(Some(retained))
++    }
++
++    fn recovered_candidate(&self,raw: &[u8]) -> Result<(SigningReview,Record,SignedFunding,u64)> {
++        ensure!(raw.len() <= 1_000_000,"oversized recovered BCH funding");
++        let (prepared,intent_bytes,intent) = self.retained_signing_intent()?;
++        let signed = prepared.preview().verify_signed(raw)?;
++        let record = Record {schema:SIGNED.into(),intent:hash(ATTEMPT,&intent_bytes),raw:raw.to_vec()};
++        let review = self.reconciliation_review(&record,&signed,intent.approved_at)?;
++        self.check_reconciliation(&review,intent.approved_at)?;
++        if let Some(existing) = optional(&self.metadata,&record_name(self.quote,"signed"))? {
++            ensure!(existing == serde_json::to_vec(&record)?,"cannot replace retained BCH signed funding");
++        }
++        Ok((review,record,signed,intent.approved_at))
++    }
++
++    /// Review externally recovered bytes against the original approved intent.
++    /// This proves a valid signature over the approved transaction, not that no
++    /// other signed variant exists or that these bytes were ever broadcast.
++    /// Historical recovery is allowed after expiry; no signing or relay grant.
++    pub fn review_bch_signing_reconciliation(&self,raw: &[u8]) -> Result<SigningReview> {
++        Ok(self.recovered_candidate(raw)?.0)
++    }
++
++    /// Explicitly approve retention of recovered bytes without contacting the
++    /// wallet. Freeze the candidate before writing signed funding so a restart
++    /// can finish only this same import. Never regenerate a legacy signature.
++    pub fn reconcile_bch_signing(&mut self,raw: &[u8],approved: &[u8;32],now: u64)
++        -> Result<SignedFunding> {
++        let (review,record,signed,approved_at) = self.recovered_candidate(raw)?;
++        ensure!(review.commitment == *approved,"BCH reconciliation approval is stale or mismatched");
++        ensure!(now >= approved_at,"BCH reconciliation predates original signing approval");
++        if let Some(existing) = self.check_reconciliation(&review,approved_at)? {
++            ensure!(now >= existing.reconciled_at,"BCH reconciliation time moved backwards");
++        } else {
++            let retained = Reconciliation {schema:RECONCILE.into(),review:*approved,reconciled_at:now};
++            self.metadata.retain(&record_name(self.quote,"reconciliation"),&serde_json::to_vec(&retained)?)?;
++        }
++        self.metadata.retain(&record_name(self.quote,"signed"),&serde_json::to_vec(&record)?)?;
++        Ok(signed)
+     }
+ 
+     /// The approved digest must come from an explicit user action over the
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing.rs
+@@ -28,6 +28,7 @@
+         bytes.push(if state.sign_mode == 7 {1} else {0x41}); bytes.push(33); bytes.extend(key);
+         tx.input[0].script_sig = bitcoin::ScriptBuf::from_bytes(bytes);
+     }
++    state.signed_candidate = serialize(&tx);
+     if state.sign_mode == 4 { return Ok(None); } // Signed, reply lost.
+     let mut reply = json!({"hex":serialize(&tx).to_lower_hex_string(),"complete":state.sign_mode!=1});
+     if state.sign_mode == 5 {reply["errors"] = json!([{"error":"fixture"}]);}
+@@ -97,6 +98,71 @@
+         let mut execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+         assert!(execution.sign_bch_funding(rpc,&review.commitment,1013).await.is_err());
+         assert_eq!(server.state.lock().unwrap().sign_calls,calls+1); // No signing retry after restart.
++        if mode == 4 {
++            let recovered = server.state.lock().unwrap().signed_candidate.clone();
++            assert_eq!(recovered,raw); // Exact transaction whose signing reply was lost.
++            let intent_path = metadata.0.join(&intent_name);
++            let original = std::fs::read(&intent_path)?;
++            std::fs::remove_file(&intent_path)?;
++            assert!(execution.review_bch_signing_reconciliation(&recovered).is_err());
++            std::fs::write(&intent_path,&original)?;
++            std::fs::set_permissions(&intent_path,std::fs::Permissions::from_mode(0o600))?;
++            assert!(execution.review_bch_signing_reconciliation(&[]).is_err());
++            let mut changed: Transaction = deserialize(&recovered)?;
++            changed.output[0].value -= Amount::from_sat(1);
++            assert!(execution.review_bch_signing_reconciliation(&serialize(&changed)).is_err());
++            let review = execution.review_bch_signing_reconciliation(&recovered)?;
++            assert_eq!(review.details["action"],"retain-recovered-signature-only");
++            assert!(execution.reconcile_bch_signing(&recovered,&[0;32],2000).is_err());
++            assert!(execution.reconcile_bch_signing(&recovered,&review.commitment,1011).is_err());
++            let pin = metadata.0.join(format!("{}.bch-funding-reconciliation",setup.quote.terms()["swapId"]));
++            assert!(!pin.exists());
++            // Recovery after quote expiry neither signs again nor authorizes relay.
++            assert_eq!(execution.reconcile_bch_signing(&recovered,&review.commitment,2000)?.lock_outpoint(),outpoint);
++            let pinned = std::fs::read(&pin)?;
++            // A second valid legacy signature has another txid; approval of
++            // one candidate must never permit replacing it with that variant.
++            let mut variant: Transaction = deserialize(&recovered)?;
++            let prepared = execution.prepared_bch_funding()?.unwrap();
++            let previous = &prepared.preview().previous_outputs()[0];
++            let mut preimage = Vec::new();
++            SighashCache::new(&variant).segwit_v0_encode_signing_data_to(&mut preimage,0,
++                &previous.script_pubkey,previous.value,EcdsaSighashType::All)?;
++            let end = preimage.len(); preimage[end-4..].copy_from_slice(&0x41u32.to_le_bytes());
++            let secp = secp256k1::Secp256k1::new();
++            let secret = secp256k1::SecretKey::from_slice(&[5;32])?;
++            let signature = secp.sign_ecdsa_with_noncedata(
++                &secp256k1::Message::from_digest(sha256d::Hash::hash(&preimage).to_byte_array()),
++                &secret,&[9;32]).serialize_der();
++            let mut bytes = vec![(signature.len()+1) as u8]; bytes.extend(signature.as_ref());
++            bytes.push(0x41); bytes.push(33);
++            bytes.extend(secp256k1::PublicKey::from_secret_key(&secp,&secret).serialize());
++            variant.input[0].script_sig = bitcoin::ScriptBuf::from_bytes(bytes);
++            let variant = serialize(&variant);
++            assert_ne!(prepared.preview().verify_signed(&variant)?.lock_outpoint(),outpoint);
++            assert!(execution.review_bch_signing_reconciliation(&variant).is_err());
++            assert_eq!(execution.reconcile_bch_signing(&recovered,&review.commitment,2001)?.lock_outpoint(),outpoint);
++            assert_eq!(std::fs::read(&pin)?,pinned);
++            assert!(execution.reconcile_bch_signing(&recovered,&review.commitment,1999).is_err());
++            let path = metadata.0.join(&signed_name);
++            let retained = std::fs::read(&path)?;
++            // Simulate interruption after approval retention, before signed bytes.
++            std::fs::remove_file(&path)?;
++            drop(execution);
++            let mut execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++            assert!(execution.signed_bch_funding()?.is_none());
++            assert!(execution.review_bch_signing_reconciliation(&variant).is_err());
++            assert!(execution.sign_bch_funding(rpc,&review.commitment,1013).await.is_err());
++            assert_eq!(execution.reconcile_bch_signing(&recovered,&review.commitment,2002)?.lock_outpoint(),outpoint);
++            assert_eq!(std::fs::read(&path)?,retained);
++            assert_eq!(std::fs::read(&pin)?,pinned);
++            std::fs::write(&pin,b"{}")?;
++            assert!(execution.signed_bch_funding().is_err());
++            assert!(execution.reconcile_bch_signing(&recovered,&review.commitment,2003).is_err());
++            std::fs::write(&pin,&pinned)?;
++            assert_eq!(execution.signed_bch_funding()?.unwrap().lock_outpoint(),outpoint);
++            assert_eq!(server.state.lock().unwrap().sign_calls,calls+1);
++        }
+     }
+     Ok(())
+ }
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+@@ -8,7 +8,7 @@
+ 
+ #[derive(Default)]
+ struct State { locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8,
+-    sign_calls: usize, sign_mode: u8, sign_intent: Option<std::path::PathBuf>, observed: Option<Transaction>, observed_vout: u32,
++    sign_calls: usize, sign_mode: u8, signed_candidate: Vec<u8>, sign_intent: Option<std::path::PathBuf>, observed: Option<Transaction>, observed_vout: u32,
+     observation_mode: u8, observation_chain_calls: usize }
+ struct Server {
+     port: u16, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>,

@@ -14,15 +14,17 @@ class PrivateQuoteChannel final : public QObject
 {
     Q_OBJECT
 public:
+    enum class Profile { Quotes, LitecoinNegotiation };
     PrivateQuoteChannel(QSslConfiguration configuration, QByteArray peerPin,
-                        QObject *parent = nullptr);
+                        QObject *parent = nullptr, Profile profile = Profile::Quotes);
     bool connectToPeer(const QString &host, quint16 port, const QString &peerName);
     // Adopts an accepted TCP descriptor. Configure a local certificate/key and
     // trusted client CA first; peerPin pins the client's leaf certificate.
     bool acceptPeer(qintptr socketDescriptor);
     bool send(const QByteArray &message);
     // Admission policy for both Qt TLS queues, excluding kernel/TLS overhead.
-    static bool hasWriteCapacity(qint64 plaintextBytes, qint64 encryptedBytes, int messageBytes);
+    static bool hasWriteCapacity(qint64 plaintextBytes, qint64 encryptedBytes, int messageBytes, Profile profile = Profile::Quotes);
+    Profile profile() const { return m_profile; }
     bool ready() const { return m_ready && !m_failed; }
     bool failed() const { return m_failed; }
     QHostAddress peerAddress() const { return m_socket.peerAddress(); }
@@ -35,6 +37,8 @@ signals:
 private:
     void reject();
     void read();
+    Profile m_profile;
+    int m_maximumMessage;
     QSslSocket m_socket;
     QTimer m_deadline;
     QElapsedTimer m_rateWindow;

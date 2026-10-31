@@ -1,0 +1,155 @@
+diff --git a/swap-machine/src/native_funding_rpc/relay.rs b/swap-machine/src/native_funding_rpc/relay.rs
+index 7d3736404..63a6f0aec 100644
+--- a/swap-machine/src/native_funding_rpc/relay.rs
++++ b/swap-machine/src/native_funding_rpc/relay.rs
+@@ -36,6 +36,7 @@ pub struct PreparedTransfer {
+     genesis: String,
+     summary: RelayedTransfer,
+     metadata: zeroize::Zeroizing<String>,
++    lock_txid: Option<String>,
+ }
+ 
+ impl PreparedTransfer {
+@@ -43,7 +44,7 @@ impl PreparedTransfer {
+     pub(crate) fn journal_terms(&self) -> Value {
+         json!({"genesis":self.genesis, "wallet":self.request.wallet.to_string(),
+             "destination":self.request.destination.to_string(), "amountAtoms":self.request.amount.atom_string(),
+-            "account":self.request.account, "priority":self.request.priority})
++            "account":self.request.account, "priority":self.request.priority, "lockTxid":self.lock_txid})
+     }
+ }
+ 
+@@ -102,12 +103,36 @@ impl NativeTransferRelay {
+     /// trusted local approval, not a peer quote or an arbitrary GUI field.
+     pub async fn prepare(&mut self, request: RelayRequest, expected_genesis: &str,
+         maximum_fee: XmzAmount) -> Result<PreparedTransfer> {
++        self.prepare_inner(request, expected_genesis, maximum_fee, None).await
++    }
++
++    /// Recovery preparation must select only outputs of the intended lock.
++    /// Relies on the dedicated trusted wallet RPC's key-image evidence; does not
++    /// freeze unrelated outputs or silently accept its default coin selection.
++    pub async fn prepare_from_lock(&mut self, request: RelayRequest, expected_genesis: &str,
++        maximum_fee: XmzAmount, lock_txid: &str) -> Result<PreparedTransfer> {
++        ensure!(canonical_hash(lock_txid), "invalid recovery source lock");
++        self.prepare_inner(request, expected_genesis, maximum_fee, Some(lock_txid)).await
++    }
++
++    async fn prepare_inner(&mut self, request: RelayRequest, expected_genesis: &str,
++        maximum_fee: XmzAmount, lock_txid: Option<&str>) -> Result<PreparedTransfer> {
+         ensure!(maximum_fee.atoms() > 0, "zero approved fee ceiling");
+         self.preflight(&request, expected_genesis).await?;
++        let incoming = if lock_txid.is_some() {
++            Some(self.client.rpc(self.client.wallet, "incoming_transfers",
++                json!({"transfer_type":"available", "account_index":request.account})).await?)
++        } else { None };
+         let response = self.client.rpc(self.client.wallet, "transfer", prepare_params(&request)).await?;
++        let selected = response["spent_key_images"]["key_images"].clone();
+         let (summary, metadata) = parse_prepared(response, request.amount, maximum_fee)?;
++        if let (Some(lock), Some(incoming)) = (lock_txid, incoming.as_ref()) {
++            verify_lock_inputs(incoming, &selected, lock, request.account,
++                request.amount, summary.fee)?;
++        }
+         self.check_wallet(&request).await?;
+-        Ok(PreparedTransfer { request, genesis: expected_genesis.into(), summary, metadata })
++        Ok(PreparedTransfer { request, genesis: expected_genesis.into(), summary, metadata,
++            lock_txid: lock_txid.map(str::to_owned) })
+     }
+ 
+     /// No transaction reconstruction here: relay exactly the previously
+@@ -146,6 +171,33 @@ impl NativeTransferRelay {
+     }
+ }
+ 
++fn verify_lock_inputs(incoming: &Value, selected: &Value, lock: &str, account: u32,
++    amount: XmzAmount, fee: XmzAmount) -> Result<()> {
++    let outputs = incoming["transfers"].as_array().context("missing recovery source outputs")?;
++    let keys = selected.as_array().context("missing prepared input key images")?;
++    ensure!(!keys.is_empty(), "empty prepared input set");
++    let mut seen = std::collections::BTreeSet::new();
++    let mut total = 0u128;
++    for key in keys {
++        let key = key.as_str().context("invalid prepared input key image")?;
++        ensure!(canonical_hash(key) && key != "0".repeat(64) && seen.insert(key),
++            "invalid or duplicate prepared input key image");
++        let matches: Vec<_> = outputs.iter().filter(|output| output["key_image"] == key).collect();
++        ensure!(matches.len() == 1, "prepared input is absent or ambiguous");
++        let output = matches[0];
++        ensure!(output["tx_hash"] == lock && output["spent"] == false
++            && output["unlocked"] == true && output["frozen"] == false
++            && number(&output["subaddr_index"], "major")? == u64::from(account),
++            "prepared input does not belong to the available recovery lock");
++        let value = number(output, "amount")?;
++        ensure!(value > 0, "zero recovery source amount");
++        total = total.checked_add(u128::from(value)).context("recovery input sum overflow")?;
++    }
++    ensure!(total >= u128::from(amount.atoms()) + u128::from(fee.atoms()),
++        "recovery lock inputs do not cover payment and fee");
++    Ok(())
++}
++
+ fn prepare_params(request: &RelayRequest) -> Value {
+     let mut params = relay_params(request);
+     params["do_not_relay"] = json!(true);
+@@ -238,6 +290,34 @@ mod tests {
+             "multisig_txset":"","unsigned_txset":""})
+     }
+ 
++    #[test]
++    fn recovery_inputs_are_bound_to_lock_account_and_exact_key_images() -> Result<()> {
++        let lock = "a".repeat(64);
++        let key = "b".repeat(64);
++        let output = json!({"tx_hash":lock,"key_image":key,"amount":102,
++            "spent":false,"unlocked":true,"frozen":false,"subaddr_index":{"major":0,"minor":0}});
++        let selected = json!([key]);
++        let check = |outputs: Value, keys: &Value| verify_lock_inputs(&outputs,keys,&lock,0,
++            XmzAmount::from_atoms(100),XmzAmount::from_atoms(2));
++        check(json!({"transfers":[output.clone()]}),&selected)?;
++        for (field,value) in [("tx_hash",json!("c".repeat(64))), ("spent",json!(true)),
++            ("unlocked",json!(false)), ("frozen",json!(true)), ("amount",json!(101)),
++            ("subaddr_index",json!({"major":1,"minor":0})), ("key_image",json!("c".repeat(64)))] {
++            let mut changed=output.clone(); changed[field]=value;
++            assert!(check(json!({"transfers":[changed]}),&selected).is_err());
++        }
++        for keys in [json!([]),json!([key,key]),json!(["0".repeat(64)]),json!([1]),Value::Null] {
++            assert!(check(json!({"transfers":[output.clone()]}),&keys).is_err());
++        }
++        assert!(check(json!({"transfers":[output.clone(),output.clone()]}),&selected).is_err());
++        let mut other=output.clone(); other["tx_hash"]=json!("c".repeat(64)); other["key_image"]=json!("d".repeat(64));
++        // Unselected extra deposits are harmless; selecting them must fail.
++        let mixed=json!({"transfers":[output,other]});
++        check(mixed.clone(),&selected)?;
++        assert!(check(mixed,&json!([key,"d".repeat(64)])).is_err());
++        Ok(())
++    }
++
+     #[test]
+     fn extracts_txid_fee_and_weight_from_a_valid_relay_response() -> Result<()> {
+         let relayed = parse_relay(&response(), XmzAmount::from_atoms(200000000000))?;
+diff --git a/swap-machine/src/native_funding_rpc/spend_journal.rs b/swap-machine/src/native_funding_rpc/spend_journal.rs
+index 975534621..3489ca09f 100644
+--- a/swap-machine/src/native_funding_rpc/spend_journal.rs
++++ b/swap-machine/src/native_funding_rpc/spend_journal.rs
+@@ -62,7 +62,7 @@ impl SpendJournal {
+     pub fn record_prepared(&self, prepared: &super::relay::PreparedTransfer) -> Result<()> {
+         let transfer = prepared.summary();
+         let terms = prepared.journal_terms();
+-        for field in ["genesis", "wallet", "destination", "amountAtoms", "account", "priority"] {
++        for field in ["genesis", "wallet", "destination", "amountAtoms", "account", "priority", "lockTxid"] {
+             ensure!(terms.get(field) == self.intent.get(field), "prepared transaction differs from durable intent");
+         }
+         let maximum_fee: u64 = self.intent["maximumFeeAtoms"].as_str()
+diff --git a/swap-machine/src/native_funding_rpc/spendable.rs b/swap-machine/src/native_funding_rpc/spendable.rs
+index 3b9e4fc2c..ebda353c6 100644
+--- a/swap-machine/src/native_funding_rpc/spendable.rs
++++ b/swap-machine/src/native_funding_rpc/spendable.rs
+@@ -129,7 +129,8 @@ async fn import_and_spend(session: &mut NativeWalletSession, daemon: u16, wallet
+         amount: request.amount, account: request.account, priority: request.priority };
+     let journal = super::spend_journal::SpendJournal::reserve(
+         &request.journal_directory, expected_genesis, request)?;
+-    let prepared = relay.prepare(spend, expected_genesis, request.maximum_fee).await?;
++    let prepared = relay.prepare_from_lock(spend, expected_genesis, request.maximum_fee,
++        &request.lock_txid).await?;
+     journal.record_prepared(&prepared)?;
+     let transfer = relay.relay_prepared(prepared).await?;
+     let receipt_persisted = journal.record_relay(&transfer).is_ok();

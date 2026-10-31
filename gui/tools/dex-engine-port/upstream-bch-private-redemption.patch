@@ -1,0 +1,175 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs
+@@ -0,0 +1,89 @@
++//! Private exact redemption construction. Publishing the transaction reveals
++//! the native funder's share; public methods therefore return metadata only.
++use super::*;
++use bitcoin::{consensus::{serialize,deserialize},Transaction,Txid};
++use ecdsa_fun::fun::{Point,Scalar};
++
++const RECORD: &str = "monzero-bch-private-redemption-v1";
++const PIN: &str = "monzero-bch-private-redemption-pin-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Record {
++    schema: String, admission: [u8;32], receipt: [u8;32], funding: [u8;32],
++    prepared_at: u64, transaction: Vec<u8>,
++}
++impl Drop for Record {fn drop(&mut self) {self.transaction.zeroize();}}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Pin {schema: String, admission: [u8;32], record: [u8;32]}
++/// Safe metadata only. Neither transaction bytes nor approval to publish them.
++pub struct PrivateRedemption {txid: Txid,commitment: [u8;32],prepared_at: u64}
++impl PrivateRedemption {
++    pub fn txid(&self) -> Txid {self.txid}
++    pub fn commitment(&self) -> &[u8;32] {&self.commitment}
++    pub fn prepared_at(&self) -> u64 {self.prepared_at}
++}
++fn name(quote: &VerifiedBchQuote) -> String {format!("{}.bch-private-redemption",quote.terms()["swapId"])}
++fn encode(record: &Record) -> Result<Zeroizing<Vec<u8>>> {
++    let mut bytes = Zeroizing::new(Vec::with_capacity(65536));
++    serde_json::to_writer(&mut *bytes,record)?;
++    ensure!(bytes.len() <= 65536,"oversized private BCH redemption");Ok(bytes)
++}
++fn summary(record: &Record) -> Result<PrivateRedemption> {
++    let transaction: Transaction = deserialize(&record.transaction)?;
++    Ok(PrivateRedemption {txid:transaction.compute_txid(),commitment:hash(RECORD,&encode(record)?),prepared_at:record.prepared_at})
++}
++impl AdmittedExecution<'_> {
++    fn private_redemption_record(&self,now: u64) -> Result<Record> {
++        let context = self.success_receipt_context()?;
++        let receipt = self.load_success_receipt(&context)?.context("missing authenticated BCH success receipt")?;
++        ensure!(now >= receipt.at,"BCH redemption predates success receipt");
++        let funding = self.received_bch_funding_message()?.context("missing authenticated BCH funding")?;
++        ensure!(funding.signed().lock_outpoint() == context.outpoint,"BCH redemption funding changed");
++        let encrypted = context.agreement.check_signed_success(self.quote,context.outpoint,
++            &context.native_txid,&receipt.frame,&receipt.signature)?;
++        let plan = self.quote.recovery_plan();
++        let mut secret = Zeroizing::new(context.agreement.owned().native_spend_share().as_bytes());secret.reverse();
++        let decrypt = Scalar::from_bytes(*secret).context("invalid native redemption scalar")?
++            .non_zero().context("zero native redemption scalar")?;
++        let signer = Point::from_bytes(plan.lock().terms().signing_key.serialize()).context("invalid BCH success signer")?;
++        let signature = Zeroizing::new(plan.lock().data_message().decrypt(&signer,&decrypt,encrypted)?);
++        let raw = serialize(funding.signed().transaction());
++        let transaction = plan.lock().prepare_redemption(&raw,&plan.lock_spend_terms(context.outpoint),&signature)?;
++        Ok(Record {schema:RECORD.into(),admission:context.admission,receipt:hash(super::RECORD,&super::encode(&receipt)?),
++            funding:hash("monzero-bch-exact-signed-funding-v1",&raw),prepared_at:now,transaction:serialize(&transaction)})
++    }
++    fn load_private_redemption(&self) -> Result<Option<Record>> {
++        ensure!(self.role == Role::NativeFunder,"wrong BCH redemption owner");
++        let slot = name(self.quote);
++        let private = optional(&Journal::open(&self.snapshots)?,&slot)?.map(Zeroizing::new);
++        let Some(pin_bytes) = optional(&self.metadata,&format!("{slot}-pin"))? else {
++            ensure!(private.is_none(),"private BCH redemption lacks trusted pin");return Ok(None)
++        };
++        ensure!(pin_bytes.len() <= 4096,"oversized BCH redemption pin");
++        let pin: Pin = serde_json::from_slice(&pin_bytes)?;
++        let bytes = private.context("private BCH redemption missing")?;
++        ensure!(bytes.len() <= 65536 && pin.schema == PIN && pin.admission == self.admission_digest()?
++            && pin.record == hash(RECORD,&bytes) && serde_json::to_vec(&pin)? == pin_bytes,"BCH redemption pin changed");
++        let record: Record = serde_json::from_slice(&bytes)?;
++        let expected = self.private_redemption_record(record.prepared_at)?;
++        ensure!(*encode(&expected)? == *bytes,"private BCH redemption differs from authenticated settlement");
++        Ok(Some(record))
++    }
++    /// Save exact private bytes without RPC, broadcast or native-share exposure.
++    /// Quote expiry does not prevent completion of an already funded exchange.
++    pub fn retain_bch_redemption(&mut self,now: u64) -> Result<PrivateRedemption> {
++        if let Some(record) = self.load_private_redemption()? {
++            ensure!(now >= record.prepared_at,"BCH redemption time moved backwards");return summary(&record)
++        }
++        let record = self.private_redemption_record(now)?;let bytes = encode(&record)?;
++        let slot = name(self.quote);
++        let pin = Pin {schema:PIN.into(),admission:record.admission,record:hash(RECORD,&bytes)};
++        self.metadata.retain(&format!("{slot}-pin"),&serde_json::to_vec(&pin)?)?;
++        Journal::open(&self.snapshots)?.retain(&slot,&bytes)?;summary(&record)
++    }
++    /// Restore and revalidate metadata; saved bytes never grant relay authority.
++    pub fn retained_bch_redemption(&self) -> Result<Option<PrivateRedemption>> {
++        self.load_private_redemption()?.as_ref().map(summary).transpose()
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt.rs
+@@ -85,3 +85,5 @@
+         Ok(self.load_success_receipt(&self.success_receipt_context()?)?.is_some())
+     }
+ }
++
++pub mod redemption;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
+@@ -0,0 +1,49 @@
++use super::*;
++use bitcoin::{consensus::{deserialize,serialize},Transaction};
++
++pub(super) fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
++    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,frame: &[u8]) -> Result<()> {
++    assert!(bch.retain_bch_redemption(2035).is_err());
++    assert!(bch.retained_bch_redemption().is_err());
++    assert!(native.retained_bch_redemption()?.is_none());
++    assert!(native.retain_bch_redemption(2032).is_err());
++    let prepared = native.retain_bch_redemption(2035)?;
++    assert_eq!(prepared.prepared_at(),2035);
++    assert_eq!(native.retain_bch_redemption(2036)?.commitment(),prepared.commitment());
++    assert!(native.retain_bch_redemption(2034).is_err());
++    let slot = format!("{}.bch-private-redemption",setup.quote.terms()["swapId"]);
++    let private = snapshots.0.join(&slot);
++    let bytes = zeroize::Zeroizing::new(std::fs::read(&private)?);
++    let record: Value = serde_json::from_slice(&bytes)?;
++    let raw: Vec<u8> = serde_json::from_value(record["transaction"].clone())?;
++    let transaction: Transaction = deserialize(&raw)?;
++    assert_eq!(transaction.compute_txid(),prepared.txid());
++    let funding = native.received_bch_funding_message()?.unwrap();
++    let plan = setup.quote.recovery_plan();let terms = plan.lock_spend_terms(funding.signed().lock_outpoint());
++    plan.lock().redemption_signature(&serialize(funding.signed().transaction()),&terms,&raw)?;
++    // Actual redemption reveals the native share needed by the BCH funder.
++    let message: Value = serde_json::from_slice(frame)?;
++    let encrypted = serde_json::from_value(message["encrypted"].clone())?;
++    let recovered = bch.restore_agreement()?.owned().recover_spend_key(&setup.quote,
++        &serialize(funding.signed().transaction()),funding.signed().lock_outpoint(),&raw,&encrypted)?;
++    let combined = setup.spend[0] + setup.spend[1];
++    assert_eq!(recovered.as_bytes(),combined.as_bytes());
++    let copied = copy_store(metadata)?;
++    let restored = AdmittedExecution::resume(&copied.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++    assert_eq!(restored.retained_bch_redemption()?.unwrap().txid(),prepared.txid());
++    std::fs::write(&private,b"{}")?;
++    assert!(native.retained_bch_redemption().is_err());
++    assert!(native.retain_bch_redemption(2036).is_err());
++    std::fs::write(&private,&*bytes)?;
++    let saved = snapshots.0.join("saved-private-redemption");std::fs::rename(&private,&saved)?;
++    assert!(native.retained_bch_redemption().is_err());
++    assert!(native.retain_bch_redemption(2036).is_err());
++    std::fs::rename(&saved,&private)?;
++    let pin = metadata.0.join(format!("{slot}-pin"));let saved_pin = metadata.0.join("saved-redemption-pin");
++    std::fs::rename(&pin,&saved_pin)?;
++    assert!(native.retained_bch_redemption().is_err());
++    assert!(native.retain_bch_redemption(2036).is_err());
++    std::fs::rename(&saved_pin,&pin)?;
++    assert_eq!(native.retained_bch_redemption()?.unwrap().commitment(),prepared.commitment());
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
+@@ -1,5 +1,6 @@
+ // Target: tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
+ use super::*;
++mod redemption;
+ 
+ pub(super) fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
+     setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,fixture: &Fixture,
+@@ -32,6 +33,7 @@
+     native.accept_bch_success(2034,frame,signature)?;
+     assert!(native.has_received_bch_success()?);
+     assert!(native.accept_bch_success(2032,frame,signature).is_err());
++    redemption::exercise(bch,native,setup,metadata,snapshots,frame)?;
+     let restored_metadata = copy_store(metadata)?;
+     let restored = AdmittedExecution::resume(&restored_metadata.0,&snapshots.0,
+         &setup.quote,&setup.policy,Role::NativeFunder)?;

@@ -1,0 +1,55 @@
+diff --git a/monero-sys/build.rs b/monero-sys/build.rs
+--- a/monero-sys/build.rs
++++ b/monero-sys/build.rs
+@@ -436,6 +436,26 @@
+     build.compile("monero-sys");
+ }
+ 
++/// Keep the pinned libiconv's pre-C23 declarations buildable on newer GCC.
++/// Patch the copied recipe, so its content hash selects a new dependency cache
++/// entry without deleting or changing previously built artifacts.
++fn patch_libiconv_recipe(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
++    let relative = "packages/libiconv.mk";
++    let original = fs::read_to_string(source.join(relative))?;
++    let patch = diffy::Patch::from_str(include_str!("patches/depends-libiconv-c17.patch"))?;
++    let expected = diffy::apply(&original, &patch)?;
++    let target = destination.join(relative);
++    let current = fs::read_to_string(&target)?;
++    if current == expected {
++        return Ok(());
++    }
++    if current != original {
++        return Err("Copied libiconv recipe differs from the pinned source and expected patch".into());
++    }
++    fs::write(target, expected)?;
++    Ok(())
++}
++
+ /// Compile the dependencies
+ fn compile_dependencies(
+     contrib_depends: std::path::PathBuf,
+@@ -482,6 +502,9 @@
+         }
+     }
+ 
++    patch_libiconv_recipe(&contrib_depends, &out_dir)
++        .expect("the pinned libiconv compatibility patch to apply");
++
+     let mut cmd = std::process::Command::new("env");
+     if target.contains("-apple-") {
+         cmd.arg("-i");
+diff --git a/monero-sys/patches/depends-libiconv-c17.patch b/monero-sys/patches/depends-libiconv-c17.patch
+new file mode 100644
+--- /dev/null
++++ b/monero-sys/patches/depends-libiconv-c17.patch
+@@ -0,0 +1,10 @@
++--- a/packages/libiconv.mk
+++++ b/packages/libiconv.mk
++@@ -9,6 +9,7 @@
++   $(package)_config_opts=--enable-static
++   $(package)_config_opts=--disable-shared
++   $(package)_config_opts_linux=--with-pic
+++  $(package)_cflags_linux=-std=gnu17
++   $(package)_config_opts_freebsd=--with-pic
++   $(package)_ar_ios=$($(package)_ar)
++   $(package)_ar_iossimulator=$($(package)_ar)

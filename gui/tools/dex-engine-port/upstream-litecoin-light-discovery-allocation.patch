@@ -1,0 +1,120 @@
+diff --git a/swap-machine/src/litecoin_light/account/allocation/tests.rs b/swap-machine/src/litecoin_light/account/allocation/tests.rs
+--- a/swap-machine/src/litecoin_light/account/allocation/tests.rs
++++ b/swap-machine/src/litecoin_light/account/allocation/tests.rs
+@@ -67,3 +67,29 @@
+     fs::write(dir.0.join(NAME),b"changed")?;assert!(book.reserve(Uuid::new_v4(),Branch::Receive).is_err());
+     fs::write(dir.0.join(NAME),&before)?;assert!(book.reserve(Uuid::new_v4(),Branch::Receive).is_err());Ok(())
+ }
++
++#[test]
++fn discovered_allocations_advance_monotonically_and_preserve_request_ids()->Result<()> {
++    let dir=Directory::new()?;let mut book=AddressBook::create(&dir.0,standard())?;
++    let request=Uuid::new_v4();let original=book.reserve(request,Branch::Receive)?.address().to_string();
++    book.retain_discovered([3,2])?;let bytes=fs::read(dir.0.join(NAME))?;
++    book.retain_discovered([1,1])?;assert_eq!(fs::read(dir.0.join(NAME))?,bytes);
++    assert_eq!(book.reserve(request,Branch::Receive)?.address().to_string(),original);drop(book);
++    let mut book=AddressBook::open(&dir.0,standard())?;
++    assert_eq!(book.allocated_count(Branch::Receive)?,3);assert_eq!(book.allocated_count(Branch::Change)?,2);
++    assert_eq!(book.reserve(Uuid::new_v4(),Branch::Change)?.path().to_string(),"84'/1'/0'/1/2");
++    let before=fs::read(dir.0.join(NAME))?;assert!(book.retain_discovered([10000,10000]).is_err());
++    assert_eq!(fs::read(dir.0.join(NAME))?,before);Ok(())
++}
++#[test]
++fn discovered_allocation_uncertain_publication_requires_reopen()->Result<()> {
++    let dir=Directory::new()?;let mut book=AddressBook::create(&dir.0,standard())?;
++    assert!(book.retain_discovered_with([2,3],|journal,before,after| {
++        journal.replace_record(NAME,before,after)?;anyhow::bail!("simulated lost discovery publication result")
++    }).is_err());
++    assert!(book.allocated_count(Branch::Change).is_err());
++    assert!(book.reserve(Uuid::new_v4(),Branch::Change).is_err());drop(book);
++    let mut book=AddressBook::open(&dir.0,standard())?;book.retain_discovered([2,3])?;
++    assert_eq!(book.allocated_count(Branch::Receive)?,2);assert_eq!(book.allocated_count(Branch::Change)?,3);
++    assert_eq!(book.reserve(Uuid::new_v4(),Branch::Change)?.path().to_string(),"84'/1'/0'/1/3");Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/account/allocation.rs b/swap-machine/src/litecoin_light/account/allocation.rs
+--- a/swap-machine/src/litecoin_light/account/allocation.rs
++++ b/swap-machine/src/litecoin_light/account/allocation.rs
+@@ -61,6 +61,33 @@
+             "Litecoin address book requires validated reopen");
+         Ok(self.record.entries.iter().filter(|entry|entry.branch==branch.index() as u8).count() as u32)
+     }
++    /// Persist inclusive discovery coverage as exclusive branch counts. Missing
++    /// indices get internal allocation IDs; existing request identities never
++    /// change. Counts only increase. This does not authenticate history or stop
++    /// rollback of an older valid backup. One atomic record replaces both branches.
++    pub fn retain_discovered(&mut self,minimum:[u32;2])->Result<()> {
++        self.retain_discovered_with(minimum,|journal,before,after|journal.replace_record(NAME,before,after))
++    }
++    fn retain_discovered_with(&mut self,minimum:[u32;2],
++        publish:impl FnOnce(&Journal,&[u8],&[u8])->Result<()>)->Result<()> {
++        ensure!(minimum.iter().all(|count|*count<=MAX_ENTRIES as u32),"Litecoin discovered allocation limit exceeded");
++        let current=[self.allocated_count(Branch::Receive)?,self.allocated_count(Branch::Change)?];
++        let target=[current[0].max(minimum[0]),current[1].max(minimum[1])];
++        ensure!(target[0] as usize+target[1] as usize<=MAX_ENTRIES,"Litecoin address journal capacity reached");
++        if target==current {return Ok(())}
++        let mut record=self.record.clone();
++        let mut requests=record.entries.iter().map(|entry|entry.request).collect::<BTreeSet<_>>();
++        for branch in 0..2 {
++            for index in current[branch]..target[branch] {
++                let request=Uuid::new_v4();
++                ensure!(!request.is_nil() && requests.insert(request),"Litecoin discovery allocation identity collision");
++                record.entries.push(Entry {request,branch:branch as u8,index});
++            }
++        }
++        let bytes=serde_json::to_vec(&record)?;
++        self.usable=false;publish(&self.journal,&self.bytes,&bytes)?;
++        self.record=record;self.bytes=bytes;self.usable=true;Ok(())
++    }
+     /// Request IDs are retry identities and must be retained by the caller.
+     /// Same ID/branch returns the original address without allocating another.
+     pub fn reserve(&mut self,request:Uuid,branch:Branch)->Result<DerivedAddress> {
+diff --git a/swap-machine/src/litecoin_light/session/wallet/payment.rs b/swap-machine/src/litecoin_light/session/wallet/payment.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/payment.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/payment.rs
+@@ -8,6 +8,22 @@
+ use std::path::Path;
+ use uuid::Uuid;
+ impl WalletObservation {
++    /// Conservatively retain every reported used address, including pending
++    /// history. Omissions remain possible. Never shrink an existing allocation.
++    pub fn retain_discovered_addresses(&self,chain:&HeaderSequence,book:&mut AddressBook)->Result<()> {
++        ensure!(chain.network()==self.account.network() && chain.height()==self.accounting.height()
++            && chain.contains(self.accounting.height(),self.accounting.tip()),"Litecoin discovery chain changed");
++        let (descriptor,_)=book.backup_parts()?;
++        ensure!(serde_json::to_vec(&descriptor)?==serde_json::to_vec(&self.account.descriptor())?,
++            "Litecoin discovery address book account mismatch");
++        let mut minimum=[0u32;2];
++        for (branch,scan) in [&self.receive,&self.change].into_iter().enumerate() {
++            for address in scan.reported() {
++                minimum[branch]=minimum[branch].max(address.index().checked_add(1).context("Litecoin discovered index overflow")?);
++            }
++        }
++        book.retain_discovered(minimum)
++    }
+     /// No caller-created prevouts or derivation metadata enter this path.
+     /// Reuses inclusion evidence and ownership paths from this account's scan;
+     /// pending receipts and observed spent outputs cannot enter selection.
+@@ -24,6 +40,7 @@
+             let (branch,index)=*self.origins.get(&output.script_pubkey).context("missing Litecoin scanned derivation")?;
+             inputs.push(IncludedInput {transaction,vout:outpoint.vout,branch,index});
+         }
++        self.retain_discovered_addresses(chain,book)?;
+         prepare_payment(chain,&self.accounting,&self.account,&inputs,payment,policy,book,directory,operation)
+     }
+ }
+diff --git a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+@@ -124,8 +124,11 @@
+     assert_eq!(prepared.transaction().input[0].previous_output,observation.accounting().coins()[0].outpoint());
+     assert_eq!(prepared.transaction().output[0],payment);assert_eq!(prepared.fee().to_sat(),1000);
+     assert_eq!(prepared.transaction().output[1].value.to_sat(),observation.accounting().observed_mature().to_sat()-41000);
++    let discovered_change=observation.change().reported().iter().map(|address|address.index()+1).max().unwrap_or(0);
++    assert_eq!(&prepared.transaction().output[1].script_pubkey,account.derive(Branch::Change,discovered_change)?.address().script_pubkey());
++    assert_eq!(book.allocated_count(Branch::Receive)?,1);
+     let commitment=prepared.signing_commitment();drop(prepared);drop(book);
+     let mut book=AddressBook::open(&addresses.0,PublicAccount::from_descriptor(&account.descriptor(),account.network())?)?;
+     let resumed=observation.prepare_payment(chain,&payment,&policy,&mut book,&claims.0,operation)?;
+-    assert_eq!(resumed.signing_commitment(),commitment);assert_eq!(book.allocated_count(Branch::Change)?,1);Ok(())
++    assert_eq!(resumed.signing_commitment(),commitment);assert_eq!(book.allocated_count(Branch::Change)?,discovered_change+1);Ok(())
+ }

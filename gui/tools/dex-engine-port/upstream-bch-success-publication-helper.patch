@@ -1,0 +1,190 @@
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -1251,6 +1251,8 @@
+             "review":{"details":review.details,"commitment":commitment},
+             "relay":{"state":state,"txid":txid,"confirmed":false},"observation":observation}))
+     }
++
++    mod publication {include!("native-bch-admission/publication.rs");}
+ 
+     pub fn run() -> Result<()> {
+         let args: Vec<_> = std::env::args_os().collect();
+@@ -1323,7 +1325,11 @@
+             "--native-proof-context-stdio-v1"=>Some("context"),
+             _=>None,
+         };
+-        let result = if action=="--success-preparation-status-stdio-v1" {
++        let result = if action=="--success-publication-repair-review-stdio-v1" {
++            publication::operation(Path::new(&args[2]),&bytes,false)?
++        } else if action=="--success-publication-repair-submit-stdio-v1" {
++            publication::operation(Path::new(&args[2]),&bytes,true)?
++        } else if action=="--success-preparation-status-stdio-v1" {
+             success_preparation_status_operation(Path::new(&args[2]),&bytes)?
+         } else if action=="--success-preparation-stdio-v1" {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+diff --git a/swap-machine/src/bin/native-bch-admission/publication.rs b/swap-machine/src/bin/native-bch-admission/publication.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-bch-admission/publication.rs
+@@ -0,0 +1,160 @@
++// Private, offline journal repair. No frame output or transaction dispatch.
++use super::*;
++use swap_machine::{bch_rpc::{BchNetwork,observer::OwnedBchObserver},
++    bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::success::publication::SuccessRecordStage};
++
++#[derive(Deserialize)]
++#[serde(rename_all="kebab-case")]
++enum Source {NodeWallet,LocalWallet}
++#[derive(Deserialize)]
++#[serde(rename_all="lowercase")]
++enum Stage {Prepared,Signed}
++impl Stage {fn engine(&self)->SuccessRecordStage {match self {Self::Prepared=>SuccessRecordStage::Prepared,Self::Signed=>SuccessRecordStage::Signed}}}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct RepairConfig {
++    schema:String,admission_config_file:PathBuf,rpc_file:PathBuf,
++    deployment_commitment:String,funding_source:Source,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct ReviewRequest {schema:String,request_id:uuid::Uuid,stage:Stage}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct SubmitRequest {schema:String,request_id:uuid::Uuid,stage:Stage,commitment:String}
++fn request(bytes:&[u8],submit:bool)->Result<(uuid::Uuid,Stage,Option<[u8;32]>)> {
++    ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid BCH publication repair request size");
++    let (schema,id,stage,approved)=if submit {
++        let request:SubmitRequest=serde_json::from_slice(bytes)?;
++        (request.schema,request.request_id,request.stage,Some(parse_digest(&request.commitment)?))
++    } else {
++        let request:ReviewRequest=serde_json::from_slice(bytes)?;
++        (request.schema,request.request_id,request.stage,None)
++    };
++    let action=if submit {"submit"}else{"review"};
++    ensure!(!id.is_nil() && schema==format!("monzero-bch-success-publication-repair-{action}-request-v1"),
++        "invalid BCH publication repair request");
++    Ok((id,stage,approved))
++}
++fn config(bytes:&[u8])->Result<RepairConfig> {
++    let wrapper:RepairConfig=serde_json::from_slice(bytes)?;
++    ensure!(wrapper.schema=="monzero-private-bch-success-publication-repair-v1"
++        && wrapper.admission_config_file.is_absolute() && wrapper.rpc_file.is_absolute(),
++        "invalid BCH publication repair configuration");
++    parse_digest(&wrapper.deployment_commitment)?;Ok(wrapper)
++}
++// A trusted caller must authenticate the owned local process before producing
++// this descriptor. It cannot be substituted with a wallet RPC descriptor.
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct ObserverRpc {
++    schema:String,port:u16,cookie_file:PathBuf,checkpoint_height:u64,checkpoint:String,subversion:String,
++}
++impl ObserverRpc {
++    fn backend(&self,cookie:&[u8])->Result<OwnedBchObserver> {
++        ensure!(self.schema=="monzero-private-bch-observer-rpc-v1" && self.cookie_file.is_absolute()
++            && self.checkpoint_height>0,"invalid BCH observer configuration");
++        parse_digest(&self.checkpoint)?;
++        let text=std::str::from_utf8(cookie)?;let text=text.strip_suffix('\n').unwrap_or(text);
++        ensure!(!text.bytes().any(|b|b.is_ascii_control()),"invalid BCH observer credential characters");
++        let (user,password)=text.split_once(':').context("invalid BCH observer credentials")?;
++        OwnedBchObserver::new(self.port,user.into(),password.into(),BchNetwork::Regtest {
++            checkpoint_height:self.checkpoint_height,checkpoint:self.checkpoint.parse()?},self.subversion.clone())
++    }
++}
++pub(super) fn operation(path:&Path,bytes:&[u8],submit:bool)->Result<serde_json::Value> {
++    let (request_id,stage,approved)=request(bytes,submit)?;
++    let (_wrapper_lease,bytes)=private_bytes(path)?;let wrapper=config(&bytes)?;
++    let (_admission_lease,config)=load(&wrapper.admission_config_file)?;
++    ensure!(matches!(config.role,Role::BchFunder),"publication repair requires BCH funder");
++    let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++    let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++        &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++    ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"BCH publication repair trade changed");
++    let execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,&quote,&config.policy,config.role)?;
++    execution.saved_admission_review(&config.negotiation_pins)?;
++    let deployment=parse_digest(&wrapper.deployment_commitment)?;
++    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    let (_rpc_lease,bytes)=private_bytes(&wrapper.rpc_file)?;
++    let review=match wrapper.funding_source {
++        Source::NodeWallet=>{
++            let descriptor:FundingRpc=serde_json::from_slice(&bytes)?;
++            let (_cookie_lease,cookie)=private_file(&descriptor.cookie_file,true)?;let backend=descriptor.backend(&cookie)?;
++            ensure!(backend.deployment_commitment()?==deployment,"BCH publication repair deployment changed");
++            let review=execution.review_bch_success_publication_repair(&backend,stage.engine(),now)?;
++            if let Some(approved)=approved {execution.repair_reviewed_bch_success_publication(&backend,stage.engine(),now,&approved)?;}
++            review
++        },
++        Source::LocalWallet=>{
++            let descriptor:ObserverRpc=serde_json::from_slice(&bytes)?;
++            let (_cookie_lease,cookie)=private_file(&descriptor.cookie_file,true)?;let backend=descriptor.backend(&cookie)?;
++            ensure!(backend.deployment_commitment()?==deployment,"BCH publication repair observer changed");
++            let review=execution.review_light_bch_success_publication_repair(&backend,stage.engine(),now)?;
++            if let Some(approved)=approved {execution.repair_reviewed_light_bch_success_publication(&backend,stage.engine(),now,&approved)?;}
++            review
++        },
++    };
++    let action=if submit {"submit"}else{"review"};
++    let commitment:String=review.commitment.iter().map(|b|format!("{b:02x}")).collect();
++    Ok(serde_json::json!({"schema":format!("monzero-bch-success-publication-repair-{action}-response-v1"),
++        "requestId":request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
++        "releasesPrivateMaterial":false,"state":if submit {"repaired"}else{"reviewed"},
++        "review":{"details":review.details,"commitment":commitment}}))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn repair_requests_require_exact_stage_schema_and_separate_consent()->Result<()> {
++        for stage in ["prepared","signed"] {for submit in [false,true] {
++            let action=if submit {"submit"}else{"review"};
++            let mut value=serde_json::json!({"schema":format!("monzero-bch-success-publication-repair-{action}-request-v1"),
++                "requestId":uuid::Uuid::new_v4(),"stage":stage});
++            if submit {value["commitment"]="ab".repeat(32).into();}
++            assert!(request(&serde_json::to_vec(&value)?,submit).is_ok());
++            assert!(request(&serde_json::to_vec(&value)?,!submit).is_err());
++            for field in ["frame","signature","outputFile","privateKey","chainApproval"] {
++                let mut invalid=value.clone();invalid[field]=serde_json::Value::Null;
++                assert!(request(&serde_json::to_vec(&invalid)?,submit).is_err());
++            }
++            for invalid_stage in ["", "all", "Prepared"] {
++                let mut invalid=value.clone();invalid["stage"]=invalid_stage.into();
++                assert!(request(&serde_json::to_vec(&invalid)?,submit).is_err());
++            }
++            for invalid_id in ["", "00000000-0000-0000-0000-000000000000"] {
++                let mut invalid=value.clone();invalid["requestId"]=invalid_id.into();
++                assert!(request(&serde_json::to_vec(&invalid)?,submit).is_err());
++            }
++            let mut invalid=value.clone();invalid["commitment"]=serde_json::Value::Null;
++            assert!(request(&serde_json::to_vec(&invalid)?,submit).is_err());
++            invalid["commitment"]="AB".repeat(32).into();
++            assert!(request(&serde_json::to_vec(&invalid)?,submit).is_err());
++        }}
++        assert!(request(&[],false).is_err());assert!(request(&[b' ';513],false).is_err());Ok(())
++    }
++    #[test]
++    fn repair_config_requires_explicit_source_and_observer_has_no_wallet()->Result<()> {
++        let value=serde_json::json!({"schema":"monzero-private-bch-success-publication-repair-v1",
++            "admissionConfigFile":"/private/admission","rpcFile":"/private/rpc",
++            "deploymentCommitment":"ab".repeat(32),"fundingSource":"local-wallet"});
++        assert!(config(&serde_json::to_vec(&value)?).is_ok());
++        for field in ["admissionConfigFile","rpcFile","deploymentCommitment","fundingSource"] {
++            let mut invalid=value.clone();invalid[field]="invalid".into();
++            assert!(config(&serde_json::to_vec(&invalid)?).is_err());
++        }
++        let observer=serde_json::json!({"schema":"monzero-private-bch-observer-rpc-v1","port":12345,
++            "cookieFile":"/private/cookie","checkpointHeight":1,"checkpoint":"ab".repeat(32),"subversion":"/Bitcoin Cash Node:29.0.0/"});
++        let descriptor:ObserverRpc=serde_json::from_value(observer.clone())?;
++        descriptor.backend(b"user:pass\n")?;
++        assert!(descriptor.backend(b"user:pass\r\n").is_err());
++        assert!(descriptor.backend(b"user:").is_err());
++        assert!(descriptor.backend(b":pass").is_err());
++        assert!(serde_json::from_value::<FundingRpc>(observer.clone()).is_err());
++        for field in ["wallet","anchor","anchorScript"] {
++            let mut invalid=observer.clone();invalid[field]="value".into();
++            assert!(serde_json::from_value::<ObserverRpc>(invalid).is_err());
++        }
++        Ok(())
++    }
++}

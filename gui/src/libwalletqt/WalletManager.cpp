@@ -28,6 +28,9 @@
 
 #include "WalletManager.h"
 #include "Wallet.h"
+#include "net/http_client.h"
+#include "storages/http_abstract_invoke.h"
+#include "rpc/core_rpc_server_commands_defs.h"
 #include "wallet/api/wallet2_api.h"
 #include "zxcvbn-c/zxcvbn.h"
 #include "QRCodeImageProvider.h"
@@ -368,6 +371,9 @@ void WalletManager::miningStatusAsync()
 
 bool WalletManager::startMining(const QString &address, quint32 threads, bool backgroundMining, bool ignoreBattery)
 {
+#ifdef MONZERO_NO_MINING
+    return false;
+#endif
     if(threads == 0)
         threads = 1;
     return m_pimpl->startMining(address.toStdString(), threads, backgroundMining, ignoreBattery);
@@ -376,6 +382,78 @@ bool WalletManager::startMining(const QString &address, quint32 threads, bool ba
 bool WalletManager::stopMining()
 {
     return m_pimpl->stopMining();
+}
+
+namespace {
+bool isLoopbackMiningEndpoint(const QString &endpoint)
+{
+    const QUrl url(QStringLiteral("http://") + endpoint);
+    return url.isValid() && url.scheme() == QStringLiteral("http") &&
+        (url.host() == QStringLiteral("localhost") || url.host() == QStringLiteral("127.0.0.1") || url.host() == QStringLiteral("::1")) &&
+        url.port() > 0 && url.port() <= 65535 && url.userInfo().isEmpty() &&
+        url.path().isEmpty() && !url.hasQuery() && !url.hasFragment();
+}
+}
+
+void WalletManager::localMiningCommandAsync(const QString &endpoint, const QString &address, quint32 threads, bool start, const QJSValue &callback)
+{
+    // A private client cannot follow a subsequent wallet/node selection change.
+    const auto task = m_scheduler.run([endpoint, address, threads, start] {
+        bool ok = false;
+        QString reason = QStringLiteral("invalid-request");
+        try {
+        if (isLoopbackMiningEndpoint(endpoint) && (!start || (threads > 0 && !address.isEmpty()))) {
+            epee::net_utils::http::http_simple_client client;
+            client.set_server(endpoint.toStdString(), boost::none);
+            bool received = false;
+            std::string status;
+            if (start) {
+                cryptonote::COMMAND_RPC_START_MINING::request request;
+                cryptonote::COMMAND_RPC_START_MINING::response response;
+                request.miner_address = address.toStdString();
+                request.threads_count = threads;
+                request.do_background_mining = false;
+                request.ignore_battery = false;
+                received = epee::net_utils::invoke_http_json("/start_mining", request, response, client, std::chrono::seconds(60));
+                status = response.status;
+            } else {
+                cryptonote::COMMAND_RPC_STOP_MINING::request request;
+                cryptonote::COMMAND_RPC_STOP_MINING::response response;
+                received = epee::net_utils::invoke_http_json("/stop_mining", request, response, client, std::chrono::seconds(30));
+                status = response.status;
+            }
+            ok = received && (status == CORE_RPC_STATUS_OK || (!start && status == "Mining never started"));
+            // Return/log only fixed categories, never daemon-supplied text or addresses.
+            if (!received) reason = QStringLiteral("no-response");
+            else if (ok) reason.clear();
+            else if (status == CORE_RPC_STATUS_BUSY) reason = QStringLiteral("node-busy");
+            else if (status == "Already mining") reason = QStringLiteral("already-mining");
+            else if (status == "Failed, too many threads relative to CPU cores.") reason = QStringLiteral("too-many-threads");
+            else if (status == "Failed, mining not started") reason = QStringLiteral("start-failed");
+            else if (status == "Failed, wrong address" || status == "Mining to subaddress isn't supported yet") reason = QStringLiteral("invalid-address");
+            else reason = QStringLiteral("node-rejected");
+        }
+        } catch (...) { ok = false; reason = QStringLiteral("request-error"); }
+        if (!ok) qWarning() << "Local mining command" << (start ? "start" : "stop") << "failed:" << reason;
+        return QJSValueList{QJSValue(ok), QJSValue(reason)};
+    }, callback);
+    if (!task.first) QJSValue(callback).call(QJSValueList{QJSValue(false), QJSValue(QStringLiteral("scheduler-stopping"))});
+}
+
+void WalletManager::localMiningStatusAsync(const QString &endpoint, const QJSValue &callback)
+{
+    const auto task = m_scheduler.run([endpoint] {
+        bool ok = false;
+        cryptonote::COMMAND_RPC_MINING_STATUS::response response;
+        if (isLoopbackMiningEndpoint(endpoint)) {
+            epee::net_utils::http::http_simple_client client;
+            client.set_server(endpoint.toStdString(), boost::none);
+            cryptonote::COMMAND_RPC_MINING_STATUS::request request;
+            ok = epee::net_utils::invoke_http_json("/mining_status", request, response, client, std::chrono::seconds(5)) && response.status == CORE_RPC_STATUS_OK;
+        }
+        return QJSValueList{QJSValue(ok), QJSValue(ok && response.active), QJSValue(ok ? double(response.speed) : 0.0), QJSValue(ok ? QString::fromStdString(response.address) : QString())};
+    }, callback);
+    if (!task.first) QJSValue(callback).call(QJSValueList{QJSValue(false), QJSValue(false), QJSValue(0.0)});
 }
 
 bool WalletManager::localDaemonSynced() const

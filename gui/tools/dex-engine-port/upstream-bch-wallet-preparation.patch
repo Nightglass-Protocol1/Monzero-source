@@ -1,0 +1,258 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ ## [Unreleased]
++
++- Private BCH/XMZ prototype: validate wallet-selected unsigned funding candidates against explicit change, fee and confirmation policy.
++  Preparation does not lock inputs, sign, retain a trade record or broadcast.
+ 
+ - Private BCH/XMZ prototype: expose read-only funding observation against the pinned BCH regtest backend, including after quote expiry.
+   Point-in-time chain evidence never resets a relay attempt or authorizes retransmission.
+diff --git a/swap-core/src/bch/covenant.rs b/swap-core/src/bch/covenant.rs
+--- a/swap-core/src/bch/covenant.rs
++++ b/swap-core/src/bch/covenant.rs
+@@ -96,7 +96,8 @@
+     }
+ }
+ 
+-pub(super) fn supported_destination(script: &Script) -> bool {
++/// Standard native BCH destinations supported by funding and recovery validation.
++pub fn supported_destination(script: &Script) -> bool {
+     let bytes = script.as_bytes();
+     script.is_p2pkh() || script.is_p2sh()
+         || (bytes.len() == 35 && bytes[..2] == [0xaa, 0x20] && bytes[34] == 0x87)
+diff --git a/swap-machine/src/bch_rpc.rs b/swap-machine/src/bch_rpc.rs
+--- a/swap-machine/src/bch_rpc.rs
++++ b/swap-machine/src/bch_rpc.rs
+@@ -186,3 +186,5 @@
+ pub mod confirmed;
+ 
+ pub mod unspent;
++
++pub mod preparation;
+diff --git a/swap-machine/src/bch_rpc/preparation.rs b/swap-machine/src/bch_rpc/preparation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/preparation.rs
+@@ -0,0 +1,98 @@
++//! Wallet-selected, independently validated unsigned funding. No locking,
++//! signing, journal retention or relay. The caller must retain the candidate
++//! through the admitted-execution controller before subsequent operations.
++use super::*;
++use bitcoin::{absolute,consensus::deserialize,transaction::Version,Amount,Script,Sequence,Transaction};
++use bitcoin::hex::FromHex;
++use swap_core::bch::covenant::{Covenant,supported_destination};
++
++pub struct FundingPreparationRequest<'a> {
++    pub covenant: &'a Covenant,
++    pub principal: u64,
++    pub change_address: &'a str,
++    pub change_script: &'a Script,
++    pub fee_rate_atoms_per_kb: u64,
++    pub maximum_fee: u64,
++    pub minimum_change: u64,
++    pub minimum_confirmations: u64,
++}
++pub struct WalletFundingCandidate {
++    unsigned: Vec<u8>, sources: Vec<Vec<u8>>, preview: FundingPreview,
++    observation: FundingInputsObservation,
++}
++impl WalletFundingCandidate {
++    pub fn unsigned(&self) -> &[u8] { &self.unsigned }
++    pub fn sources(&self) -> &[Vec<u8>] { &self.sources }
++    pub fn preview(&self) -> &FundingPreview { &self.preview }
++    pub fn observation(&self) -> &FundingInputsObservation { &self.observation }
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Funded { hex: String, fee: Box<RawValue>, changepos: i32 }
++#[derive(Deserialize)]
++struct Parent { hex: String }
++
++// Rust Bitcoin intentionally uses witness framing for empty inputs. BCHN
++// requires the legacy template: version, zero inputs, outputs, lock time.
++fn template(covenant: &Covenant,principal: u64) -> Vec<u8> {
++    let mut bytes=2i32.to_le_bytes().to_vec();bytes.push(0);
++    bytes.extend(serialize(&vec![TxOut {value:Amount::from_sat(principal),script_pubkey:covenant.script_pubkey()}]));
++    bytes.extend(0u32.to_le_bytes());bytes
++}
++fn hex(bytes: &[u8]) -> String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
++
++impl BchRpc {
++    pub async fn prepare_funding(&self,request: FundingPreparationRequest<'_>) -> Result<WalletFundingCandidate> {
++        const MAX_MONEY: u64=2_100_000_000_000_000;
++        ensure!([request.principal,request.maximum_fee,request.minimum_change,request.fee_rate_atoms_per_kb]
++            .iter().all(|v|*v>0 && *v<=MAX_MONEY) && request.minimum_confirmations>0,
++            "invalid BCH preparation policy");
++        ensure!(supported_destination(request.change_script)
++            && request.change_script!=request.covenant.script_pubkey().as_script(),"invalid BCH change script");
++        let tip=self.chain().await?;self.wallet_ready().await?;
++        self.owned_address(request.change_address,request.change_script).await?;
++        let fee_rate=format!("{}.{:08}",request.fee_rate_atoms_per_kb/100_000_000,request.fee_rate_atoms_per_kb%100_000_000);
++        let reply=self.rpc(true,"fundrawtransaction",json!([hex(&template(request.covenant,request.principal)),{
++            "changeAddress":request.change_address,"changePosition":1,"includeWatching":false,
++            "include_unsafe":false,"lockUnspents":false,"subtractFeeFromOutputs":[],"feeRate":fee_rate}])).await?;
++        let funded: Funded=serde_json::from_str(reply.get())?;
++        let fee=atoms(funded.fee.get())?;
++        ensure!(fee>0 && fee<=request.maximum_fee,"BCH wallet preparation fee exceeds policy");
++        let bytes=Vec::<u8>::from_hex(&funded.hex)?;
++        let mut transaction: Transaction=deserialize(&bytes)?;
++        ensure!(serialize(&transaction)==bytes && transaction.version==Version::TWO
++            && transaction.lock_time==absolute::LockTime::ZERO && !transaction.input.is_empty()
++            && transaction.input.len()<=128,"invalid BCH wallet preparation transaction");
++        ensure!((transaction.output.len()==1 && funded.changepos == -1)
++            || (transaction.output.len()==2 && funded.changepos==1),"unexpected BCH wallet change position");
++        for input in &mut transaction.input {
++            ensure!(input.script_sig.is_empty() && input.witness.is_empty()
++                && matches!(input.sequence.0,0xffff_ffff|0xffff_fffe),"unexpected BCH unsigned input");
++            // The pinned BCHN wallet selects MAX-1 for its own anti-fee-sniping
++            // header. Our original zero lock time stays unchanged; finalize only
++            // this unsigned sequence before preview, retention and any signature.
++            input.sequence=Sequence::MAX;
++        }
++        let unsigned=serialize(&transaction);
++        let mut sources=Vec::new();let mut total=0usize;
++        for input in &transaction.input {
++            let reply=self.rpc(true,"gettransaction",json!([input.previous_output.txid.to_string(),false])).await?;
++            let parent: Parent=serde_json::from_str(reply.get())?;
++            let bytes=Vec::<u8>::from_hex(&parent.hex)?;
++            total=total.checked_add(bytes.len()).context("BCH parent bundle overflow")?;
++            ensure!(total<=8_000_000,"BCH parent bundle exceeds preparation limit");
++            sources.push(bytes);
++        }
++        let refs: Vec<&[u8]>=sources.iter().map(Vec::as_slice).collect();
++        let preview=FundingPreview::verify(&unsigned,&refs,request.covenant,request.principal,
++            request.change_script,request.maximum_fee,request.minimum_change)?;
++        ensure!(preview.lock_vout()==0 && preview.fee().to_sat()==fee
++            && preview.previous_outputs().iter().all(|o|o.script_pubkey.is_p2pkh()),
++            "BCH wallet preparation differs from supported funding or reported fee");
++        let observation=self.observe_funding_inputs(&preview,request.change_address,request.minimum_confirmations).await?;
++        ensure!(observation.tip()==tip,"BCH tip changed during wallet preparation");
++        Ok(WalletFundingCandidate {unsigned,sources,preview,observation})
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/bch_rpc/preparation/tests.rs b/swap-machine/src/bch_rpc/preparation/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/preparation/tests.rs
+@@ -0,0 +1,115 @@
++use super::*;
++use bitcoin::{OutPoint,TxIn,Txid,Witness};
++use crate::bch_quote::tests::{fixture,signed};
++use std::{net::TcpListener,io::{BufRead,BufReader,Read,Write},sync::{Arc,atomic::AtomicBool}};
++
++#[tokio::test]
++async fn bch_wallet_preparation_validates_node_candidate_without_signing_locking_or_relay() -> Result<()> {
++    for case in ["valid","final-sequence","no-change","sequence","signed","witness","version","locktime",
++        "fee-mismatch","fee-cap","fee-string","change-position","principal","change-script","parent",
++        "missing-parent","duplicate","unconfirmed","token","watch-only","tip-change","zero-policy"] {
++        let (policy,terms)=fixture();let quote=signed(&terms,&policy,1000)?;
++        let script=quote.recovery_plan().recovery().terms().redeem_destination.clone();
++        let value=if case=="no-change" {101_000} else {120_000};
++        let parent=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++            input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
++                script_sig:ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++            output:vec![TxOut {value:Amount::from_sat(value),script_pubkey:script.clone()}]};
++        let outpoint=OutPoint {txid:parent.compute_txid(),vout:0};
++        let mut candidate=parent.clone();candidate.input[0].previous_output=outpoint;
++        candidate.input[0].sequence=Sequence(0xffff_fffe);
++        candidate.output=vec![TxOut {value:Amount::from_sat(100_000),script_pubkey:quote.recovery_plan().lock().script_pubkey()}];
++        if case!="no-change" {candidate.output.push(TxOut {value:Amount::from_sat(19_000),script_pubkey:script.clone()});}
++        match case {
++            "final-sequence" => candidate.input[0].sequence=Sequence::MAX,
++            "sequence" => candidate.input[0].sequence=Sequence(0),
++            "signed" => candidate.input[0].script_sig=ScriptBuf::from_bytes(vec![1,1]),
++            "witness" => candidate.input[0].witness.push([1]),
++            "version" => candidate.version=Version::ONE,
++            "locktime" => candidate.lock_time=absolute::LockTime::from_consensus(1),
++            "principal" => candidate.output[0].value=Amount::from_sat(99_999),
++            "change-script" => candidate.output[1].script_pubkey=ScriptBuf::from_bytes(vec![0x51]),
++            "duplicate" => candidate.input.push(candidate.input[0].clone()),
++            _ => (),
++        }
++        let network=BchNetwork::Regtest {checkpoint_height:1,checkpoint:BlockHash::from_byte_array([7;32])};
++        let listener=TcpListener::bind("127.0.0.1:0")?;listener.set_nonblocking(true)?;
++        let rpc=BchRpc::new(listener.local_addr()?.port(),"user".into(),"pass".into(),network,
++            "test".into(),"bchreg:qanchor".into(),script.clone(),"/Bitcoin Cash Node:29.0.0/".into())?;
++        let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();let observed_script=script.clone();
++        let lock_script=quote.recovery_plan().lock().script_pubkey();
++        let server=std::thread::spawn(move || -> Result<(usize,usize)> {
++            let mut calls=0;let mut funded=0;let mut chains=0;
++            while !signal.load(Ordering::Relaxed) {
++                let (mut socket,_)=match listener.accept() {Ok(v)=>v,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{
++                    std::thread::sleep(std::time::Duration::from_millis(2));continue},Err(e)=>return Err(e.into())};
++                socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
++                let mut reader=BufReader::new(socket.try_clone()?);let mut line=String::new();reader.read_line(&mut line)?;
++                let route=line.split_whitespace().nth(1).context("missing route")?.to_owned();
++                let mut length=None;let mut auth=false;
++                loop {line.clear();reader.read_line(&mut line)?;if line=="\r\n" {break;}
++                    let lower=line.to_ascii_lowercase();
++                    if lower.starts_with("content-length:") {length=Some(line.split(':').nth(1).unwrap().trim().parse::<usize>()?);}
++                    if lower.starts_with("authorization:") {auth=line.trim().ends_with("Basic dXNlcjpwYXNz");}
++                }
++                ensure!(auth,"missing RPC authentication");let length=length.context("missing length")?;
++                ensure!(length<=4096,"oversized fixture request");let mut bytes=vec![0;length];reader.read_exact(&mut bytes)?;
++                let request: Value=serde_json::from_slice(&bytes)?;let method=request["method"].as_str().context("missing method")?;
++                ensure!(route==if matches!(method,"getwalletinfo"|"getaddressinfo"|"gettransaction"|"fundrawtransaction") {"/wallet/test"} else {"/"},"wrong RPC route");
++                let result=match method {
++                    "getnetworkinfo" => json!({"subversion":"/Bitcoin Cash Node:29.0.0/","networkactive":true}),
++                    "getblockchaininfo" => {chains+=1;json!({"chain":"regtest","blocks":200,"headers":200,"initialblockdownload":false,
++                        "bestblockhash":if case=="tip-change" && chains>1 {"09".repeat(32)} else {"08".repeat(32)}})},
++                    "getblockhash" => json!(if request["params"][0]==0 {network.genesis().to_owned()} else {"07".repeat(32)}),
++                    "getwalletinfo" => json!({"walletname":"test","private_keys_enabled":true}),
++                    "getaddressinfo" => json!({"ismine":true,"iswatchonly":case=="watch-only","scriptPubKey":observed_script.to_hex_string()}),
++                    "fundrawtransaction" => {
++                        funded+=1;ensure!(funded==1,"preparation retried selection");
++                        let raw=Vec::<u8>::from_hex(request["params"][0].as_str().context("missing raw template")?)?;
++                        ensure!(&raw[..6]==[2,0,0,0,0,1],"BCH template must use legacy empty-input encoding");
++                        ensure!(&raw[6..14]==100_000u64.to_le_bytes() && raw[14] as usize==lock_script.len()
++                            && &raw[15..15+lock_script.len()]==lock_script.as_bytes()
++                            && raw[15+lock_script.len()..]==[0,0,0,0],"wrong template principal, contract or locktime");
++                        ensure!(request["params"][1]==json!({"changeAddress":"bchreg:qchange","changePosition":1,
++                            "includeWatching":false,"include_unsafe":false,"lockUnspents":false,"subtractFeeFromOutputs":[],
++                            "feeRate":"0.00001000"}),"unsafe preparation options");
++                        json!({"hex":hex(&serialize(&candidate)),"fee":if case=="fee-mismatch" {json!(0.00000999)}
++                            else if case=="fee-cap" {json!(0.00001001)} else if case=="fee-string" {json!("0.00001000")} else {json!(0.00001000)},
++                            "changepos":if case=="no-change" {-1} else if case=="change-position" {0} else {1}})
++                    },
++                    "gettransaction" => {
++                        ensure!(request["params"]==json!([outpoint.txid.to_string(),false]),"wrong parent lookup");
++                        let mut parent=parent.clone();if case=="parent" {parent.output[0].value=Amount::from_sat(120_001);}
++                        json!({"hex":if case=="missing-parent" {String::new()} else {hex(&serialize(&parent))}})
++                    },
++                    "gettxout" => {
++                        ensure!(request["params"]==json!([outpoint.txid.to_string(),0,true]),"input observation must include mempool spends");
++                        let mut output=json!({"bestblock":"08".repeat(32),"confirmations":if case=="unconfirmed" {0} else {10},
++                            "value":if case=="no-change" {0.00101} else {0.0012},"coinbase":false,
++                            "scriptPubKey":{"hex":observed_script.to_hex_string(),"addresses":["bchreg:qinput"]}});
++                        if case=="token" {output["tokenData"]=json!({"amount":"1"});}output
++                    },
++                    _ => anyhow::bail!("unexpected signing, locking, relay or other RPC: {method}"),
++                };
++                calls+=1;let body=serde_json::to_vec(&json!({"id":request["id"],"error":null,"result":result}))?;
++                write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;socket.write_all(&body)?;
++            }
++            Ok((calls,funded))
++        });
++        let result=rpc.prepare_funding(FundingPreparationRequest {covenant:quote.recovery_plan().lock(),principal:100_000,
++            change_address:"bchreg:qchange",change_script:&script,fee_rate_atoms_per_kb:1000,maximum_fee:1000,
++            minimum_change:546,minimum_confirmations:if case=="zero-policy" {0} else {3}}).await;
++        stop.store(true,Ordering::Relaxed);let (calls,funded)=server.join().unwrap()?;
++        if matches!(case,"valid"|"final-sequence"|"no-change") {
++            let candidate=result.with_context(||format!("preparation case {case}"))?;
++            assert_eq!(candidate.preview().fee().to_sat(),1000);assert_eq!(candidate.preview().lock_vout(),0);
++            assert_eq!(candidate.observation().tip(),BlockHash::from_byte_array([8;32]));
++            assert_eq!(candidate.preview().transaction().input[0].sequence,Sequence::MAX);
++            assert_eq!(candidate.unsigned(),serialize(candidate.preview().transaction()));assert_eq!(candidate.sources().len(),1);
++            assert_eq!(funded,1);
++        } else {assert!(result.is_err(),"case {case}");}
++        if case=="zero-policy" {assert_eq!(calls,0);}else {assert!(calls>0);}
++        if case=="watch-only" || case=="zero-policy" {assert_eq!(funded,0);}
++    }
++    Ok(())
++}

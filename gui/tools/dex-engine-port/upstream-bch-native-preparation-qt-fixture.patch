@@ -1,0 +1,39 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -162,6 +162,7 @@
+     save(&report,&serde_json::to_vec(&json!({"schema":"monzero-bch-node-executor-result-v1","executable":false,
+         "txid":txid.to_string(),"lockVout":signed.lock_outpoint().vout,"lockScript":setup.quote.recovery_plan().lock().script_pubkey().to_hex_string(),
+         "authenticatedHandoff":handoff,"fundingReceiptApprovalVerified":handoff,"fundingReceiptHelperVerified":helper_receipt,"fundingReceiptQtVerified":helper_receipt && std::env::var_os("MONZERO_BCH_QT_FUNDING_RECEIPT_PROBE").is_some(),"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff && !paired,"pairedNativeFunding":paired,
++        "nativePreparationQtVerified":paired && std::env::var_os("MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE").is_some(),
+         "nativePreparationHelperVerified":paired && std::env::var("MONZERO_BCH_NATIVE_PREPARATION_PAIRED").as_deref()==Ok("1"),
+         "principalAtoms":100000,"feeAtoms":fee,"productionWalletLockSignRelay":true,"restartSavedBytes":true,
+         "inputs":inputs.iter().map(|p|json!({"txid":p.txid.to_string(),"vout":p.vout})).collect::<Vec<_>>() }))?)?;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/preparation_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/preparation_helper.rs
+@@ -6,6 +6,17 @@
+     let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper
+         && hex(&Sha256::digest(std::fs::read(&helper)?))==digest,"native preparation helper changed");
++    let program=match (std::env::var_os("MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE"),
++        std::env::var_os("MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE_SHA256")) {
++        (None,None)=>helper.clone(),
++        (Some(path),Some(expected))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && expected.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),"paired native Qt probe changed");
++            path
++        },
++        _=>anyhow::bail!("incomplete paired native Qt probe pin"),
++    };
+     let files=PrivateStore::new()?;let quote=files.0.join("quote.json");save(&quote,&setup.quote.record()?)?;
+     let admission=files.0.join("admission.json");
+     save(&admission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-admission-v1",
+@@ -33,7 +44,7 @@
+         let id=uuid::Uuid::new_v4();
+         let mut request=json!({"schema":format!("monzero-bch-native-preparation-{action}-request-v1"),"requestId":id});
+         if let Some(approval)=approval {request["commitment"]=approval.into();}
+-        let mut child=Command::new(&helper).arg(format!("--native-preparation-{action}-stdio-v1")).arg(&wrapper)
++        let mut child=Command::new(&program).arg(format!("--native-preparation-{action}-stdio-v1")).arg(&wrapper)
+             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+         child.stdin.take().context("helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
+         let output=child.wait_with_output()?;

@@ -1,0 +1,249 @@
+diff --git a/swap-machine/src/litecoin_light/vault/setup/configuration.rs b/swap-machine/src/litecoin_light/vault/setup/configuration.rs
+--- a/swap-machine/src/litecoin_light/vault/setup/configuration.rs
++++ b/swap-machine/src/litecoin_light/vault/setup/configuration.rs
+@@ -43,14 +43,21 @@
+ /// Configuration contains only public account data and local storage paths.
+ pub fn initialize_configured(setup:&Path,paths:&SetupDirectories,network:impl Into<LightNetwork>,wallet:Uuid,
+     index:u32,password:&[u8],options:&ConfigurationOptions)->Result<ConfiguredWallet> {
+-    initialize_configured_mode(setup,paths,network.into(),wallet,index,password,options,false)
++    initialize_configured_mode(setup,paths,network.into(),wallet,index,password,options,SeedSource::Raw)
+ }
+ pub fn initialize_configured_mnemonic(setup:&Path,paths:&SetupDirectories,network:impl Into<LightNetwork>,wallet:Uuid,
+     index:u32,password:&[u8],options:&ConfigurationOptions)->Result<ConfiguredWallet> {
+-    initialize_configured_mode(setup,paths,network.into(),wallet,index,password,options,true)
++    initialize_configured_mode(setup,paths,network.into(),wallet,index,password,options,SeedSource::GeneratedMnemonic)
++}
++/// Publish a deliberately non-operational recovery configuration. The normal
++/// light-wallet schema is withheld until address discovery is implemented.
++pub fn initialize_configured_imported_mnemonic(setup:&Path,paths:&SetupDirectories,network:impl Into<LightNetwork>,wallet:Uuid,
++    index:u32,password:&[u8],options:&ConfigurationOptions,material:&MnemonicMaterial,passphrase:&str)->Result<ConfiguredWallet> {
++    initialize_configured_mode(setup,paths,network.into(),wallet,index,password,options,SeedSource::ImportedMnemonic(material,passphrase))
+ }
+ fn initialize_configured_mode(setup:&Path,paths:&SetupDirectories,network:LightNetwork,wallet:Uuid,
+-    index:u32,password:&[u8],options:&ConfigurationOptions,mnemonic:bool)->Result<ConfiguredWallet> {
++    index:u32,password:&[u8],options:&ConfigurationOptions,source:SeedSource<'_>)->Result<ConfiguredWallet> {
++    let mnemonic=source.mnemonic();
+     ensure!(!wallet.is_nil() && !password.is_empty() && password.len()<=1024,"invalid wallet creation identity or password");
+     bitcoin::bip32::ChildNumber::from_hardened_idx(index)?;
+     options.validate(setup,paths,network)?;
+@@ -58,6 +65,7 @@
+         "wallet":wallet,"account":index,"directories":paths,"cache":options.cache,"spends":options.spends,
+         "maximumHeight":options.maximum_height,"endpoint":options.endpoint_value()});
+     if mnemonic {settings["seedEncoding"]=json!(MnemonicMaterial::ENCODING);}
++    if source.imported() {settings["setupMode"]=json!("mnemonic-import-v1");}
+     let settings=serde_json::to_vec(&settings)?;
+     {
+         let journal=Journal::open(setup)?;
+@@ -71,13 +79,16 @@
+         }
+         journal.retain(SETTINGS,&settings)?;
+     }
+-    let created=if mnemonic {initialize_mnemonic(setup,paths,network,wallet,index,password)?}
+-        else {initialize(setup,paths,network,wallet,index,password)?};
++    let created=initialize_mode(setup,paths,network,wallet,index,password,source,|_|Ok(()))?;
+     let mut configuration=json!({"schema":format!("monzero-private-{}-light-v1",network.tag()),"network":network.name(),
+         "cacheDirectory":options.cache,"maximumHeight":options.maximum_height,
+         "wallet":{"account":created.account().descriptor(),"addressBookDirectory":paths.addresses,
+             "spendDirectory":options.spends,"vault":{"directory":paths.vault,"walletId":wallet}}});
+     if mnemonic {configuration["wallet"]["vault"]["seedEncoding"]=json!(MnemonicMaterial::ENCODING);}
++    if source.imported() {
++        configuration["schema"]=json!(format!("monzero-private-{}-light-recovery-pending-v1",network.tag()));
++        configuration["recovery"]=json!({"status":"discovery-required","addressRecordsRestored":false,"activeSwapRecovery":false});
++    }
+     if options.endpoint.is_some() {configuration["endpoint"]=options.endpoint_value();}
+     let bytes=serde_json::to_vec(&configuration)?;
+     ensure!(bytes.len()<=4096,"oversized generated Litecoin configuration");
+diff --git a/swap-machine/src/litecoin_light/vault/setup/tests.rs b/swap-machine/src/litecoin_light/vault/setup/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/setup/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/setup/tests.rs
+@@ -85,7 +85,7 @@
+         LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
+         for stage in [Publication::Intent,Publication::Vault,Publication::Addresses,Publication::Backup] {
+             let f=Fixture::new()?;
+-            assert!(initialize_mode(&f.setup,&f.paths,network,f.wallet,3,PASSWORD,true,|current| {
++            assert!(initialize_mode(&f.setup,&f.paths,network,f.wallet,3,PASSWORD,SeedSource::GeneratedMnemonic,|current| {
+                 ensure!(current!=stage,"injected publication interruption");Ok(())
+             }).is_err());
+             let intent=fs::read(f.setup.join(INTENT))?;
+@@ -109,3 +109,6 @@
+     }
+     Ok(())
+ }
++
++#[path="import_tests.rs"]
++mod import_tests;
+diff --git a/swap-machine/src/litecoin_light/vault/setup.rs b/swap-machine/src/litecoin_light/vault/setup.rs
+--- a/swap-machine/src/litecoin_light/vault/setup.rs
++++ b/swap-machine/src/litecoin_light/vault/setup.rs
+@@ -34,7 +34,8 @@
+ #[derive(Deserialize,Serialize,PartialEq,Eq)]
+ #[serde(deny_unknown_fields)]
+ struct ContextRecord {schema:String,network:String,wallet:Uuid,account:u32,directories:SetupDirectories,
+-    #[serde(default,skip_serializing_if="Option::is_none")] seed_encoding:Option<String>}
++    #[serde(default,skip_serializing_if="Option::is_none")] seed_encoding:Option<String>,
++    #[serde(default,skip_serializing_if="Option::is_none")] setup_mode:Option<String>}
+ #[derive(Deserialize,Serialize)]
+ #[serde(deny_unknown_fields)]
+ struct Intent {context:ContextRecord,encrypted_seed:Vec<u8>}
+@@ -48,6 +49,13 @@
+ }
+ #[derive(Clone,Copy,PartialEq,Eq)]
+ enum Publication {Intent,Vault,Addresses,Backup}
++#[derive(Clone,Copy)]
++enum SeedSource<'a> {Raw,GeneratedMnemonic,ImportedMnemonic(&'a MnemonicMaterial,&'a str)}
++impl SeedSource<'_> {
++    fn mnemonic(self)->bool {!matches!(self,Self::Raw)}
++    fn imported(self)->bool {matches!(self,Self::ImportedMnemonic(..))}
++}
++
+ 
+ /// All four directories must already exist, be canonical, private and distinct.
+ /// Setup retains an extra encrypted seed copy in its intent, never plaintext.
+@@ -61,7 +69,15 @@
+ /// BIP39 passphrase; the local encryption password remains independent.
+ pub fn initialize_mnemonic(setup:&Path,directories:&SetupDirectories,network:impl Into<LightNetwork>,wallet:Uuid,
+     account_index:u32,password:&[u8])->Result<CreatedWallet> {
+-    initialize_mode(setup,directories,network.into(),wallet,account_index,password,true,|_|Ok(()))
++    initialize_mode(setup,directories,network.into(),wallet,account_index,password,SeedSource::GeneratedMnemonic,|_|Ok(()))
++}
++/// Rebuild keys into fresh directories without the original configuration.
++/// Allocation history and active trades are NOT recovered. Callers must finish
++/// address discovery and review before enabling this account for normal use.
++pub fn initialize_imported_mnemonic(setup:&Path,directories:&SetupDirectories,network:impl Into<LightNetwork>,wallet:Uuid,
++    account_index:u32,password:&[u8],material:&MnemonicMaterial,passphrase:&str)->Result<CreatedWallet> {
++    initialize_mode(setup,directories,network.into(),wallet,account_index,password,
++        SeedSource::ImportedMnemonic(material,passphrase),|_|Ok(()))
+ }
+ fn missing(error:&anyhow::Error)->bool {
+     error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)
+@@ -72,10 +88,11 @@
+ }
+ fn initialize_with(setup:&Path,directories:&SetupDirectories,network:impl Into<LightNetwork>,wallet:Uuid,
+     account_index:u32,password:&[u8],published:impl FnMut(Publication)->Result<()>)->Result<CreatedWallet> {
+-    initialize_mode(setup,directories,network.into(),wallet,account_index,password,false,published)
++    initialize_mode(setup,directories,network.into(),wallet,account_index,password,SeedSource::Raw,published)
+ }
+ fn initialize_mode(setup:&Path,directories:&SetupDirectories,network:LightNetwork,wallet:Uuid,
+-    account_index:u32,password:&[u8],mnemonic:bool,mut published:impl FnMut(Publication)->Result<()>)->Result<CreatedWallet> {
++    account_index:u32,password:&[u8],source:SeedSource<'_>,mut published:impl FnMut(Publication)->Result<()>)->Result<CreatedWallet> {
++    let mnemonic=source.mnemonic();
+     ensure!(!wallet.is_nil() && !password.is_empty() && password.len()<=1024,"invalid Litecoin setup identity or password");
+     bitcoin::bip32::ChildNumber::from_hardened_idx(account_index)?;
+     let paths=[setup,directories.vault.as_path(),directories.addresses.as_path(),directories.backup.as_path()];
+@@ -85,7 +102,8 @@
+     }
+     let journal=Journal::open(setup)?;
+     let context=ContextRecord {schema:format!("monzero-{}-wallet-setup-v1",network.tag()),network:network.name().into(),
+-        wallet,account:account_index,directories:directories.clone(),seed_encoding:mnemonic.then(||MnemonicMaterial::ENCODING.into())};
++        wallet,account:account_index,directories:directories.clone(),seed_encoding:mnemonic.then(||MnemonicMaterial::ENCODING.into()),
++        setup_mode:source.imported().then(||"mnemonic-import-v1".into())};
+     let (intent,bytes)=match journal.read(INTENT) {
+         Ok(bytes)=>{
+             let intent:Intent=serde_json::from_slice(&bytes)?;
+@@ -98,17 +116,24 @@
+                 (directories.backup.as_path(),BACKUP)] {
+                 require_absent(&Journal::open(path)?,name)?;
+             }
+-            let encrypted_seed=if mnemonic {
+-                let material=MnemonicMaterial::generate()?;
+-                mnemonic_storage::seal_record(network,wallet,password,&material,"")?
+-            } else {let seed=SecretSeed::generate()?;seal_random(&seed,password,network,wallet)?};
++            let encrypted_seed=match source {
++                SeedSource::GeneratedMnemonic=>{let material=MnemonicMaterial::generate()?;
++                    mnemonic_storage::seal_record(network,wallet,password,&material,"")?},
++                SeedSource::ImportedMnemonic(material,passphrase)=>mnemonic_storage::seal_record(network,wallet,password,material,passphrase)?,
++                SeedSource::Raw=>{let seed=SecretSeed::generate()?;seal_random(&seed,password,network,wallet)?},
++            };
+             let intent=Intent {context,encrypted_seed};let bytes=serde_json::to_vec(&intent)?;
+             (intent,bytes)
+         },
+         Err(error)=>return Err(error),
+     };
+     let account=if mnemonic {
+-        mnemonic_storage::decode_record(&intent.encrypted_seed,password,network,wallet)?.public_account(network,account_index)?
++        let unlocked=mnemonic_storage::decode_record(&intent.encrypted_seed,password,network,wallet)?;
++        if let SeedSource::ImportedMnemonic(material,passphrase)=source {
++            ensure!(*unlocked.material().derive_seed(unlocked.passphrase())?==*material.derive_seed(passphrase)?,
++                "imported mnemonic differs from retained setup");
++        }
++        unlocked.public_account(network,account_index)?
+     } else {unlock(&intent.encrypted_seed,password,network,wallet)?.public_account(network,account_index)?};
+     journal.retain(INTENT,&bytes)?;published(Publication::Intent)?;
+     let vault=if mnemonic {CreatedVault::Mnemonic(MnemonicVault::restore_encrypted(&directories.vault,network,wallet,password,&intent.encrypted_seed)?)}
+diff --git a/swap-machine/src/litecoin_light/vault/setup/import_tests.rs b/swap-machine/src/litecoin_light/vault/setup/import_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/setup/import_tests.rs
+@@ -0,0 +1,72 @@
++use super::*;
++use crate::litecoin_light::network::{BtcNetwork,BchNetwork,DogeNetwork};
++fn networks()->[LightNetwork;4] {[
++    LightNetwork::Litecoin(LtcNetwork::Regtest),LightNetwork::Bitcoin(BtcNetwork::Regtest),
++    LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)]}
++
++#[test]
++fn imported_setup_resumes_every_publication_without_replacing_keys()->Result<()> {
++    let material=MnemonicMaterial::from_entropy(&[19;16])?;
++    let different=MnemonicMaterial::from_entropy(&[20;16])?;
++    let passphrase="public import fixture passphrase";
++    for network in networks() {
++        for stage in [Publication::Intent,Publication::Vault,Publication::Addresses,Publication::Backup] {
++            let f=Fixture::new()?;
++            assert!(initialize_mode(&f.setup,&f.paths,network,f.wallet,7,PASSWORD,
++                SeedSource::ImportedMnemonic(&material,passphrase),|at| {
++                    if at==stage {anyhow::bail!("interrupted import")}Ok(())
++                }).is_err());
++            let original=fs::read(f.setup.join(INTENT))?;
++            assert!(!f.setup.join(COMPLETE).exists());
++            assert!(initialize_mnemonic(&f.setup,&f.paths,network,f.wallet,7,PASSWORD).is_err());
++            assert!(initialize_imported_mnemonic(&f.setup,&f.paths,network,f.wallet,7,PASSWORD,&different,passphrase).is_err());
++            assert!(initialize_imported_mnemonic(&f.setup,&f.paths,network,f.wallet,7,PASSWORD,&material,"wrong passphrase").is_err());
++            assert!(initialize_imported_mnemonic(&f.setup,&f.paths,network,f.wallet,7,b"wrong password",&material,passphrase).is_err());
++            assert_eq!(fs::read(f.setup.join(INTENT))?,original);
++            assert!(!f.setup.join(COMPLETE).exists());
++            let ready=initialize_imported_mnemonic(&f.setup,&f.paths,network,f.wallet,7,PASSWORD,&material,passphrase)?;
++            let expected=material.public_account(network,7,passphrase)?;
++            assert_eq!(serde_json::to_vec(&ready.account().descriptor())?,serde_json::to_vec(&expected.descriptor())?);
++            assert_eq!(ready.backup().allocated(),[0,0]);
++            let digest=ready.backup().digest();
++            assert_eq!(initialize_imported_mnemonic(&f.setup,&f.paths,network,f.wallet,7,PASSWORD,&material,passphrase)?.backup().digest(),digest);
++            assert_eq!(fs::read(f.setup.join(INTENT))?,original);
++            let vault=MnemonicVault::open(&f.paths.vault,network,f.wallet)?;
++            let unlocked=vault.unlock_for_account(PASSWORD,&expected.descriptor())?;
++            assert_eq!(&*unlocked.material().reveal(),&*material.reveal());
++            assert_eq!(unlocked.passphrase(),passphrase);
++            for path in [&f.setup,&f.paths.vault,&f.paths.backup,&f.paths.addresses] {
++                for entry in fs::read_dir(path)? {
++                    let bytes=fs::read(entry?.path())?;
++                    for secret in [material.reveal().as_bytes(),passphrase.as_bytes()] {
++                        assert!(!bytes.windows(secret.len()).any(|window|window==secret));
++                    }
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++#[test]
++fn imported_configuration_stays_pending_and_cannot_be_adopted_as_new_wallet()->Result<()> {
++    use configuration::{ConfigurationOptions,initialize_configured_imported_mnemonic,initialize_configured_mnemonic};
++    let material=MnemonicMaterial::from_entropy(&[21;32])?;
++    for network in networks() {
++        let f=Fixture::new()?;
++        for name in ["cache","spends"] {let path=f.root.join(name);fs::create_dir(&path)?;fs::set_permissions(path,fs::Permissions::from_mode(0o700))?;}
++        let options=ConfigurationOptions {cache:f.root.join("cache"),spends:f.root.join("spends"),maximum_height:1000,endpoint:None};
++        let ready=initialize_configured_imported_mnemonic(&f.setup,&f.paths,network,f.wallet,2,PASSWORD,&options,&material,"")?;
++        let bytes=fs::read(ready.configuration_path())?;
++        let config:serde_json::Value=serde_json::from_slice(&bytes)?;
++        assert_eq!(config["schema"],format!("monzero-private-{}-light-recovery-pending-v1",network.tag()));
++        assert_eq!(config["recovery"]["status"],"discovery-required");
++        assert_eq!(config["recovery"]["activeSwapRecovery"],false);
++        assert_eq!(config["recovery"]["addressRecordsRestored"],false);
++        assert!(initialize_configured_mnemonic(&f.setup,&f.paths,network,f.wallet,2,PASSWORD,&options).is_err());
++        let retry=initialize_configured_imported_mnemonic(&f.setup,&f.paths,network,f.wallet,2,PASSWORD,&options,&material,"")?;
++        assert_eq!(retry.configuration_digest(),ready.configuration_digest());
++        assert_eq!(fs::read(ready.configuration_path())?,bytes);
++    }
++    Ok(())
++}

@@ -64,6 +64,7 @@ class SubaddressAccountModel;
 class Wallet : public QObject, public PassprasePrompter
 {
     Q_OBJECT
+    Q_PROPERTY(bool assetTransfersAvailable READ assetTransfersAvailable CONSTANT)
     Q_PROPERTY(bool disconnected READ disconnected NOTIFY disconnectedChanged)
     Q_PROPERTY(bool refreshing READ refreshing NOTIFY refreshingChanged)
     Q_PROPERTY(QString seed READ getSeed)
@@ -93,7 +94,7 @@ class Wallet : public QObject, public PassprasePrompter
     Q_PROPERTY(quint64 walletCreationHeight READ getWalletCreationHeight WRITE setWalletCreationHeight NOTIFY walletCreationHeightChanged)
 
 public:
-
+    bool assetTransfersAvailable() const;
 
     enum Status {
         Status_Ok       = Monero::Wallet::Status_Ok,
@@ -185,6 +186,9 @@ public:
     Q_INVOKABLE quint64 balance() const;
     Q_INVOKABLE quint64 balance(quint32 accountIndex) const;
     Q_INVOKABLE quint64 balanceAll() const;
+    // Decimal strings preserve atomic precision across the QML boundary.
+    Q_INVOKABLE QVariantMap publicProfileSnapshot() const;
+    Q_INVOKABLE bool requestPublicProfile(const QString &action, const QVariantMap &payload, const QJSValue &callback);
 
     //! Confirmed wallet-owned issued assets, grouped by public asset ID.
     //! Amounts are returned as decimal strings to avoid JavaScript precision
@@ -264,6 +268,19 @@ public:
         const QString &metadataReference,
         const QString &collectionId,
         const QString &recipientAddress,
+        quint32 mixinCount,
+        PendingTransaction::Priority priority);
+
+    //! Constructs an asset transfer or burn transaction asynchronously. Pass
+    //! a nonzero transferAmount with an empty burnAmount to transfer asset
+    //! units to recipientAddress, or a nonzero burnAmount with an empty
+    //! transferAmount to permanently destroy asset units. The resulting
+    //! pending transaction is never relayed before UI confirmation.
+    Q_INVOKABLE void createAssetTransferAsync(
+        const QString &assetId,
+        const QString &recipientAddress,
+        const QString &transferAmount,
+        const QString &burnAmount,
         quint32 mixinCount,
         PendingTransaction::Priority priority);
 
@@ -427,6 +444,8 @@ signals:
         quint32 mixinCount);
     void assetIssuanceCreated(PendingTransaction *transaction, const QString &assetId);
     void assetIssuanceFailed(const QString &message);
+    void assetTransferCreated(PendingTransaction *transaction);
+    void assetTransferFailed(const QString &message);
 
     void connectionStatusChanged(int status) const;
     void currentSubaddressAccountChanged() const;

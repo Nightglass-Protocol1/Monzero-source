@@ -1,0 +1,40 @@
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 6cd153466..8c999d058 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -365,6 +365,15 @@ async fn broadcast_confirm(env: &harness::TestEnv<'_>, tx: Transaction) -> Resul
+     mine(env, 1).await
+ }
+ 
++/// Fault injection at the client boundary, not a TCP-disconnection simulation.
++/// The node accepts the transaction, but the caller receives no success result.
++async fn submit_with_lost_ack(env: &harness::TestEnv<'_>, tx: Transaction) -> Result<()> {
++    let expected=tx.compute_txid().to_string();
++    let actual=env.bitcoind.sendrawtransaction(tx.into()).await?;
++    anyhow::ensure!(actual==expected,"fault fixture node returned wrong transaction");
++    anyhow::bail!("injected lost Bitcoin submission acknowledgement")
++}
++
+ #[tokio::test]
+ async fn engine_redeem_is_accepted_on_regtest() -> Result<()> { settlement(false).await }
+ 
+@@ -479,7 +488,18 @@ async fn settlement(refund: bool) -> Result<()> {
+         anyhow::ensure!(claim.prepare_bitcoin_submission(&store,&lock_tx)?.persist_with_pin_store(&store).is_err(),
+             "Bitcoin submission intent was overwritten");
+     }
+-    broadcast_confirm(&env, lock_tx).await?;
++    #[cfg(unix)]
++    if execution_claim.is_some() {
++        let error=submit_with_lost_ack(&env,lock_tx).await.err()
++            .context("fault fixture unexpectedly acknowledged submission")?;
++        anyhow::ensure!(error.to_string()=="injected lost Bitcoin submission acknowledgement",
++            "submission failed before acknowledgement injection");
++        // No retry or rebuilt lock: mine the accepted submission and later
++        // reconcile its retained bytes in the separately restarted child.
++        mine(&env,1).await?;
++    } else { broadcast_confirm(&env,lock_tx).await?; }
++    #[cfg(not(unix))]
++    broadcast_confirm(&env,lock_tx).await?;
+     let request = alice3.lock_xmr_transfer_request();
+     let address = swap_core::xmz_address::XmzAddress::new(
+         swap_core::xmz_address::XmzNetwork::Mainnet,

@@ -1,0 +1,186 @@
+--- a/swap-core/src/bch.rs
++++ b/swap-core/src/bch.rs
+@@ -73,3 +73,5 @@
+ 
+ #[cfg(test)]
+ mod tests;
++
++pub mod covenant;
+--- /dev/null
++++ b/swap-core/src/bch/covenant.rs
+@@ -0,0 +1,164 @@
++//! Bytecode construction only; no chain activation, funding or relay authority.
++//!
++//! Template adapted from BasicSwap BCHInterface.genScriptLockTxScript at
++//! 277b46b0278f1cc76199f7e847988647a1b36e38, based on swaplock.cash v4.1.0.
++//! Copyright (c) 2024-2026 The Basicswap developers. MIT license: REFERENCE-LICENSE.
++use anyhow::{Result, ensure};
++use bitcoin::{Script, ScriptBuf, hashes::{Hash, sha256d},
++    opcodes::{Opcode, all::*}, script::{Builder, PushBytesBuf}, secp256k1::PublicKey};
++use super::DataMessage;
++
++const MAX_MONEY_ATOMS: u64 = 2_100_000_000_000_000;
++
++/// Callers must authenticate these terms, use fresh per-trade keys and verify
++/// the connected output amount and chain. Fees are absolute atoms, not a rate.
++#[derive(Clone, Debug)]
++pub struct CovenantTerms {
++    pub fee_atoms: u64,
++    pub redeem_destination: ScriptBuf,
++    pub timeout_destination: ScriptBuf,
++    pub signing_key: PublicKey,
++    pub delay_blocks: u16,
++}
++
++/// One stage of the two-stage recovery construction. Its timeout destination
++/// must be bound to the negotiated next contract (or final recovery recipient).
++/// This type alone does not establish a complete swap or acceptable timelocks.
++pub struct Covenant {
++    terms: CovenantTerms,
++    script: ScriptBuf,
++}
++
++impl Covenant {
++    pub fn new(terms: CovenantTerms) -> Result<Self> {
++        ensure!(terms.fee_atoms > 0 && terms.fee_atoms <= MAX_MONEY_ATOMS,
++            "invalid BCH absolute covenant fee");
++        ensure!(terms.delay_blocks > 0, "zero BCH covenant recovery delay");
++        ensure!(supported_destination(&terms.redeem_destination)
++            && supported_destination(&terms.timeout_destination), "unsupported BCH covenant destination");
++        let redeem = PushBytesBuf::try_from(terms.redeem_destination.as_bytes().to_vec())?;
++        let timeout = PushBytesBuf::try_from(terms.timeout_destination.as_bytes().to_vec())?;
++        // BCH-specific opcodes intentionally use explicit byte values. Their
++        // meanings differ from the Bitcoin opcode namespace used by Builder.
++        let script = Builder::new()
++            .push_opcode(Opcode::from(0xc3)) // TXINPUTCOUNT
++            .push_int(1).push_opcode(OP_NUMEQUALVERIFY)
++            .push_opcode(Opcode::from(0xc4)) // TXOUTPUTCOUNT
++            .push_int(1).push_opcode(OP_NUMEQUALVERIFY)
++            .push_int(terms.fee_atoms as i64)
++            .push_int(0).push_opcode(Opcode::from(0xc6)) // UTXOVALUE
++            .push_int(0).push_opcode(Opcode::from(0xcc)) // OUTPUTVALUE
++            .push_opcode(OP_SUB).push_opcode(OP_NUMEQUALVERIFY)
++            // Preserve the reference's CashToken fields. This is not permission
++            // to fund token-bearing outputs; a native-BCH policy must reject them.
++            .push_int(0).push_opcode(Opcode::from(0xce)) // UTXOTOKENCATEGORY
++            .push_int(0).push_opcode(Opcode::from(0xd1)) // OUTPUTTOKENCATEGORY
++            .push_opcode(OP_EQUALVERIFY)
++            .push_int(0).push_opcode(Opcode::from(0xcf)) // UTXOTOKENCOMMITMENT
++            .push_int(0).push_opcode(Opcode::from(0xd2)) // OUTPUTTOKENCOMMITMENT
++            .push_opcode(OP_EQUALVERIFY)
++            .push_int(0).push_opcode(Opcode::from(0xd0)) // UTXOTOKENAMOUNT
++            .push_int(0).push_opcode(Opcode::from(0xd3)) // OUTPUTTOKENAMOUNT
++            .push_opcode(OP_NUMEQUALVERIFY)
++            .push_int(0).push_opcode(Opcode::from(0xcb)) // INPUTSEQUENCENUMBER
++            .push_opcode(OP_NOTIF)
++            .push_slice(redeem)
++            .push_int(0).push_opcode(Opcode::from(0xcd)) // OUTPUTBYTECODE
++            .push_opcode(OP_OVER).push_opcode(OP_EQUALVERIFY)
++            .push_slice(terms.signing_key.serialize())
++            .push_opcode(Opcode::from(0xba)) // CHECKDATASIG, not Bitcoin CHECKSIGADD
++            .push_opcode(OP_ELSE)
++            .push_int(i64::from(terms.delay_blocks)).push_opcode(OP_CSV).push_opcode(OP_DROP)
++            .push_slice(timeout)
++            .push_int(0).push_opcode(Opcode::from(0xcd)) // OUTPUTBYTECODE
++            .push_opcode(OP_EQUAL).push_opcode(OP_ENDIF).into_script();
++        Ok(Self { terms, script })
++    }
++
++    pub fn terms(&self) -> &CovenantTerms { &self.terms }
++    pub fn redeem_script(&self) -> &Script { &self.script }
++
++    /// Compare complete canonical bytecode, including token and fee predicates.
++    pub fn verify_script(&self, proposed: &Script) -> Result<()> {
++        ensure!(proposed == self.script.as_script(), "BCH covenant differs from authenticated terms");
++        Ok(())
++    }
++
++    /// BCH P2SH32 uses HASH256; Bitcoin's P2WSH address constructor is unrelated.
++    pub fn script_pubkey(&self) -> ScriptBuf {
++        Builder::new().push_opcode(OP_HASH256)
++            .push_slice(sha256d::Hash::hash(self.script.as_bytes()).to_byte_array())
++            .push_opcode(OP_EQUAL).into_script()
++    }
++
++    pub fn data_message(&self) -> DataMessage {
++        DataMessage::new(self.terms.redeem_destination.as_bytes())
++    }
++}
++
++fn supported_destination(script: &Script) -> bool {
++    let bytes = script.as_bytes();
++    script.is_p2pkh() || script.is_p2sh()
++        || (bytes.len() == 35 && bytes[..2] == [0xaa, 0x20] && bytes[34] == 0x87)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn reference() -> Result<(CovenantTerms, ScriptBuf, ScriptBuf)> {
++        let v: serde_json::Value = serde_json::from_str(include_str!("reference-covenant.json"))?;
++        let script = |name: &str| -> Result<ScriptBuf> {
++            Ok(ScriptBuf::from_bytes(hex::decode(v[name].as_str().unwrap())?))
++        };
++        let terms = CovenantTerms { fee_atoms: 1000, redeem_destination: script("redeemDestination")?,
++            timeout_destination: script("timeoutDestination")?,
++            signing_key: PublicKey::from_slice(&hex::decode(v["publicKey"].as_str().unwrap())?)?, delay_blocks: 2 };
++        Ok((terms, script("script")?, script("scriptPubKey")?))
++    }
++
++    #[test]
++    fn matches_pinned_covenant_and_p2sh32_vector() -> Result<()> {
++        let (terms, script, output) = reference()?;
++        let message = DataMessage::new(terms.redeem_destination.as_bytes());
++        let contract = Covenant::new(terms)?;
++        assert_eq!(contract.redeem_script(), script.as_script());
++        assert_eq!(contract.script_pubkey(), output);
++        assert_eq!(contract.data_message(), message);
++        contract.verify_script(&script)?;
++        for i in 0..script.len() {
++            let mut changed = script.as_bytes().to_vec(); changed[i] ^= 1;
++            assert!(contract.verify_script(&ScriptBuf::from_bytes(changed)).is_err());
++        }
++        let mut appended = script.into_bytes(); appended.push(0x61);
++        assert!(contract.verify_script(&ScriptBuf::from_bytes(appended)).is_err());
++        Ok(())
++    }
++
++    #[test]
++    fn fee_destinations_key_and_independent_delay_are_bound() -> Result<()> {
++        let (terms, _, _) = reference()?;
++        let original = Covenant::new(terms.clone())?;
++        let mut variants = Vec::new();
++        let mut changed = terms.clone(); changed.fee_atoms += 1; variants.push(changed);
++        let mut changed = terms.clone(); changed.delay_blocks = 5; variants.push(changed);
++        let mut changed = terms.clone(); changed.redeem_destination = terms.timeout_destination.clone(); variants.push(changed);
++        let mut changed = terms.clone(); changed.timeout_destination = terms.redeem_destination.clone(); variants.push(changed);
++        let mut changed = terms.clone();
++        changed.signing_key = PublicKey::from_secret_key(&bitcoin::secp256k1::Secp256k1::new(),
++            &bitcoin::secp256k1::SecretKey::from_slice(&[9;32])?); variants.push(changed);
++        for changed in variants {
++            let contract = Covenant::new(changed)?;
++            assert!(original.verify_script(contract.redeem_script()).is_err());
++            assert_ne!(contract.script_pubkey(), original.script_pubkey());
++        }
++        let mut invalid = terms.clone(); invalid.fee_atoms = 0; assert!(Covenant::new(invalid).is_err());
++        let mut invalid = terms.clone(); invalid.fee_atoms = MAX_MONEY_ATOMS+1; assert!(Covenant::new(invalid).is_err());
++        let mut invalid = terms.clone(); invalid.delay_blocks = 0; assert!(Covenant::new(invalid).is_err());
++        for bad in [ScriptBuf::new(), Builder::new().push_opcode(OP_RETURN).into_script(),
++            Builder::new().push_int(0).push_slice([0u8;32]).into_script()] {
++            let mut invalid = terms.clone(); invalid.redeem_destination = bad.clone(); assert!(Covenant::new(invalid).is_err());
++            let mut invalid = terms.clone(); invalid.timeout_destination = bad; assert!(Covenant::new(invalid).is_err());
++        }
++        Ok(())
++    }
++}
+--- /dev/null
++++ b/swap-core/src/bch/reference-covenant.json
+@@ -0,0 +1,8 @@
++{
++  "source": "https://github.com/basicswap/basicswap/blob/277b46b0278f1cc76199f7e847988647a1b36e38/tests/basicswap/test_bch_xmr.py",
++  "script": "c3519dc4519d02e80300c600cc949d00ce00d18800cf00d28800d000d39d00cb641976a91481ec21969399d15c26af089d5db437ead066c5ba88ac00cd788821024ffcc0481629866671d89f05f3da813a2aacec1b52e69b8c0c586b665f5d4574ba6752b27523aa20df65a90e9becc316ff5aca44d4e06dfaade56622f32bafa197aba706c5e589758700cd8768",
++  "redeemDestination": "76a91481ec21969399d15c26af089d5db437ead066c5ba88ac",
++  "timeoutDestination": "aa20df65a90e9becc316ff5aca44d4e06dfaade56622f32bafa197aba706c5e5897587",
++  "publicKey": "024ffcc0481629866671d89f05f3da813a2aacec1b52e69b8c0c586b665f5d4574",
++  "scriptPubKey": "aa205988ad2b568d85c62e5ebc56647cb136eb387a2e909ce6f79d0141bb4f30f94b87"
++}

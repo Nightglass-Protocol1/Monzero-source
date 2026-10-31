@@ -1,0 +1,107 @@
+diff --git a/swap-machine/src/native_funding_rpc/relay.rs b/swap-machine/src/native_funding_rpc/relay.rs
+index 1a7059d0e..0a45a54a9 100644
+--- a/swap-machine/src/native_funding_rpc/relay.rs
++++ b/swap-machine/src/native_funding_rpc/relay.rs
+@@ -30,8 +30,17 @@ pub struct RelayedTransfer {
+ 
+ pub struct NativeTransferRelay {
+     client: NativeFundingRpc,
++    dispatched: bool,
+ }
+ 
++/// The transfer call was entered; absence of a validated reply does not prove
++/// absence of broadcast. Do not retry with a new client or wallet identifier.
++/// The caller must reconcile its durable intent against wallet/chain history.
++/// Deliberately contains no RPC response, credentials or signing material.
++#[derive(Debug, thiserror::Error)]
++#[error("native broadcast outcome unknown; reconcile before retrying")]
++pub struct BroadcastOutcomeUnknown;
++
+ impl NativeTransferRelay {
+     /// Consumes the client; caller must guarantee exclusive wallet ownership.
+     /// This primitive is single-shot and holds no idempotency key of its own:
+@@ -42,7 +51,7 @@ impl NativeTransferRelay {
+     /// blindly can double-spend the wallet's remaining balance into a second
+     /// transaction. This module deliberately has no automatic retry.
+     pub fn new(client: NativeFundingRpc) -> Self {
+-        Self { client }
++        Self { client, dispatched: false }
+     }
+ 
+     /// Constructs, signs and broadcasts a single-destination transfer. The
+@@ -51,6 +60,7 @@ impl NativeTransferRelay {
+     /// with the same request shape and accepting its preview); this call does
+     /// not itself present anything for approval.
+     pub async fn relay(&mut self, request: RelayRequest, expected_genesis: &str) -> Result<RelayedTransfer> {
++        ensure!(!self.dispatched, "relay instance already dispatched; reconcile before retrying");
+         ensure!(canonical_hash(expected_genesis), "invalid relay chain policy");
+         ensure!(request.amount.atoms() > 0 && (1..=4).contains(&request.priority),
+             "invalid relay construction request");
+@@ -61,8 +71,16 @@ impl NativeTransferRelay {
+         self.check_wallet(&request).await?;
+         let balance = self.balance(request.account).await?;
+         ensure!(balance.1 >= request.amount.atoms(), "insufficient unlocked principal");
+-        let response = self.client.rpc(self.client.wallet, "transfer", relay_params(&request)).await?;
+-        parse_relay(&response, request.amount)
++        self.broadcast(request).await
++    }
++
++    async fn broadcast(&mut self, request: RelayRequest) -> Result<RelayedTransfer> {
++        ensure!(!self.dispatched, "relay instance already dispatched; reconcile before retrying");
++        // Set before the first await so dropping the future cannot reopen this
++        // instance for another transfer. This memory guard is not a journal.
++        self.dispatched = true;
++        classify_broadcast(self.client.rpc(self.client.wallet, "transfer", relay_params(&request)).await,
++            request.amount)
+     }
+ 
+     async fn check_wallet(&self, request: &RelayRequest) -> Result<()> {
+@@ -78,6 +96,13 @@ impl NativeTransferRelay {
+     }
+ }
+ 
++fn classify_broadcast(response: Result<Value>, amount: XmzAmount) -> Result<RelayedTransfer> {
++    // Even a malformed success reply may follow a completed broadcast. Keep
++    // pre-dispatch errors distinct, but never label a dispatch error "not sent".
++    response.and_then(|value| parse_relay(&value, amount))
++        .map_err(|_| BroadcastOutcomeUnknown.into())
++}
++
+ fn canonical_hash(value: &str) -> bool {
+     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+ }
+@@ -170,4 +195,34 @@ mod tests {
+         missing.as_object_mut().unwrap().remove("tx_hash");
+         assert!(parse_relay(&missing, amount).is_err());
+     }
++
++    #[test]
++    fn dispatch_errors_are_explicitly_unknown_and_redacted() {
++        let amount = XmzAmount::from_atoms(200000000000);
++        for response in [Err(anyhow::anyhow!("private RPC response")), Ok(json!({})),
++            Ok(json!({"tx_hash":"a".repeat(64), "tx_key":"private"}))] {
++            let error = classify_broadcast(response, amount).err().expect("must reject");
++            assert!(error.downcast_ref::<BroadcastOutcomeUnknown>().is_some());
++            assert_eq!(format!("{error:#}"), "native broadcast outcome unknown; reconcile before retrying");
++        }
++        assert!(classify_broadcast(Ok(response()), amount).is_ok());
++    }
++
++    #[tokio::test]
++    async fn cancellation_after_dispatch_prevents_second_submission() -> Result<()> {
++        let wallet = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++        let daemon = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++        let mut relay = NativeTransferRelay::new(NativeFundingRpc::new(
++            daemon.local_addr()?.port(), wallet.local_addr()?.port(), "fixture".into(), "fixture".into())?);
++        let request = || RelayRequest { wallet: address(), destination: address(),
++            amount: XmzAmount::from_atoms(200000000000), account: 0, priority: 1 };
++        // Owned listener deliberately never responds. No daemon or wallet is
++        // contacted. Exercise cancellation inside the actual dispatch path.
++        assert!(tokio::time::timeout(std::time::Duration::from_millis(20),
++            relay.broadcast(request())).await.is_err());
++        assert!(relay.dispatched);
++        let error = relay.relay(request(), &"a".repeat(64)).await.err().expect("retry rejected");
++        assert_eq!(error.to_string(), "relay instance already dispatched; reconcile before retrying");
++        Ok(())
++    }
+ }

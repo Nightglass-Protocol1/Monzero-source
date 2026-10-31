@@ -1,0 +1,287 @@
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index 8c1babc28..69f43e927 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -9,6 +9,7 @@ pub mod fee_estimation;
+ pub mod relay;
+ pub mod spendable;
+ pub mod spend_journal;
++pub mod spend_recovery;
+ pub mod wallet_session;
+ use anyhow::{Context, Result, ensure};
+ use serde_json::{Value, json};
+diff --git a/swap-machine/src/native_funding_rpc/spend_journal.rs b/swap-machine/src/native_funding_rpc/spend_journal.rs
+index 4aa5baff2..975534621 100644
+--- a/swap-machine/src/native_funding_rpc/spend_journal.rs
++++ b/swap-machine/src/native_funding_rpc/spend_journal.rs
+@@ -36,6 +36,7 @@ impl SpendJournal {
+         }
+         let identity = format!("{:x}", digest.finalize());
+         let intent = json!({"schema":"monzero-native-spend-intent-v1", "genesis":genesis,
++            "walletFile":request.id.filename(),
+             "wallet":wallet, "lockTxid":request.lock_txid,
+             "destination":request.destination.to_string(), "amountAtoms":request.amount.atom_string(),
+             "account":request.account, "priority":request.priority,
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index c564dcc71..4c8d3294c 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -151,6 +151,27 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+     Ok(())
+ }
+ 
++#[cfg(unix)]
++#[tokio::test]
++#[ignore = "requires the owned confirmed native spend fixture"]
++async fn native_recover_confirmed_spend() -> Result<()> {
++    use swap_machine::native_funding_rpc::spend_recovery::RecoveryRecord;
++    use swap_core::xmz_address::{XmzAddress, XmzNetwork};
++    let wallet = XmzAddress::parse(XmzNetwork::Mainnet, &std::env::var("MONZERO_TEST_RECOVERY_WALLET")?)?;
++    let directory = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RECOVERY_DIRECTORY")
++        .context("missing recovery directory")?);
++    let record = RecoveryRecord::load(&directory,
++        "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4", wallet,
++        &std::env::var("MONZERO_TEST_RECOVERY_LOCK")?)?;
++    anyhow::ensure!(record.txid() == std::env::var("MONZERO_TEST_RECOVERY_TXID")?, "wrong prepared recovery hash");
++    let rpc = native_rpc::authenticated_fixture()?;
++    anyhow::ensure!(record.reconcile(&rpc, u64::MAX).await.is_err(), "accepted insufficient confirmations");
++    let confirmed = record.reconcile(&rpc, 10).await?;
++    anyhow::ensure!(confirmed.txid == record.txid() && confirmed.confirmations >= 10, "unverified recovered spend");
++    anyhow::ensure!(export_fixture("MONZERO_TEST_RECOVERY_CHECKED", "native-recovery-confirmed\n")?, "missing recovery completion marker");
++    Ok(())
++}
++
+ #[cfg(unix)]
+ #[tokio::test]
+ #[ignore = "requires a disposable authenticated wallet RPC and private credential file"]
+diff --git a/swap-machine/src/native_funding_rpc/spend_recovery.rs b/swap-machine/src/native_funding_rpc/spend_recovery.rs
+new file mode 100644
+index 000000000..e9dcc9aca
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/spend_recovery.rs
+@@ -0,0 +1,225 @@
++//! Read-only recovery evidence, never retry authority. Trusts a dedicated local
++//! wallet/daemon and an exclusively controlled persistent journal directory.
++use super::{NativeFundingRpc, number, string};
++use crate::xmz_funding::{ChainSnapshot, FundingObserver};
++use anyhow::{Result, ensure};
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::{fs::{File, OpenOptions}, io::Read, path::Path};
++use swap_core::{xmz::XmzAmount, xmz_address::XmzAddress};
++
++pub struct RecoveryRecord {
++    genesis: String,
++    wallet: XmzAddress,
++    destination: XmzAddress,
++    wallet_file: String,
++    txid: String,
++    amount: u64,
++    fee: u64,
++    account: u64,
++}
++
++pub struct ConfirmedSpend {
++    pub txid: String,
++    pub confirmations: u64,
++}
++
++impl RecoveryRecord {
++    #[cfg(unix)]
++    pub fn load(directory: &Path, genesis: &str, wallet: XmzAddress, lock_txid: &str) -> Result<Self> {
++        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++        ensure!(canonical_hash(genesis) && canonical_hash(lock_txid), "invalid recovery identity");
++        ensure!(directory.is_absolute() && directory.canonicalize()? == directory, "noncanonical recovery directory");
++        let dir = OpenOptions::new().read(true)
++            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(directory)?;
++        let metadata = dir.metadata()?;
++        ensure!(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
++            "nonprivate recovery directory");
++        let mut hash = Sha256::new();
++        hash.update(b"monzero-native-spend-journal-v1\0");
++        let address = wallet.to_string();
++        for field in [genesis, address.as_str(), lock_txid] {
++            hash.update((field.len() as u64).to_be_bytes());
++            hash.update(field.as_bytes());
++        }
++        let identity = format!("{:x}", hash.finalize());
++        let intent = read_record(&dir, &format!("{identity}.intent"))?;
++        let prepared = read_record(&dir, &format!("{identity}.prepared"))?;
++        Self::decode(intent, prepared, genesis, wallet, lock_txid)
++    }
++
++    #[cfg(not(unix))]
++    pub fn load(_: &Path, _: &str, _: XmzAddress, _: &str) -> Result<Self> {
++        anyhow::bail!("native recovery reader not implemented on this platform")
++    }
++
++    fn decode(intent: Value, prepared: Value, genesis: &str, wallet: XmzAddress, lock_txid: &str) -> Result<Self> {
++        ensure!(intent.as_object().is_some_and(|v| v.len() == 10)
++            && intent["schema"] == "monzero-native-spend-intent-v1"
++            && intent["genesis"] == genesis && intent["wallet"] == wallet.to_string()
++            && intent["lockTxid"] == lock_txid, "recovery intent identity mismatch");
++        let wallet_file = string(&intent, "walletFile")?;
++        let suffix = wallet_file.strip_prefix("swap-").ok_or_else(|| anyhow::anyhow!("invalid recovery wallet file"))?;
++        ensure!(suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++            && suffix.bytes().any(|b| b != b'0'), "invalid recovery wallet file");
++        let destination = XmzAddress::parse(wallet.network(), &string(&intent, "destination")?)?;
++        let amount = atoms(&intent, "amountAtoms")?;
++        let maximum_fee = atoms(&intent, "maximumFeeAtoms")?;
++        let account = number(&intent, "account")?;
++        ensure!(account <= u32::MAX as u64 && (1..=4).contains(&number(&intent, "priority")?), "invalid recovery account/priority");
++        ensure!(prepared.as_object().is_some_and(|v| v.len() == 4)
++            && prepared["schema"] == "monzero-native-spend-prepared-v1", "invalid prepared recovery record");
++        let txid = string(&prepared, "txid")?;
++        let fee = atoms(&prepared, "feeAtoms")?;
++        ensure!(canonical_hash(&txid) && fee <= maximum_fee && amount.checked_add(fee).is_some()
++            && number(&prepared, "weight")? > 0, "invalid prepared recovery amounts/hash");
++        Ok(Self { genesis: genesis.into(), wallet, destination, wallet_file, txid, amount, fee, account })
++    }
++
++    pub fn wallet_filename(&self) -> &str { &self.wallet_file }
++    pub fn txid(&self) -> &str { &self.txid }
++
++    /// Errors, absence, pending transactions and changed tips are unresolved.
++    /// No wallet open/close, refresh, signing, broadcast or journal writes occur.
++    pub async fn reconcile(&self, client: &NativeFundingRpc, minimum_confirmations: u64) -> Result<ConfirmedSpend> {
++        ensure!(minimum_confirmations > 0, "zero recovery confirmation policy");
++        let before = client.snapshot().await?;
++        ensure!(before.genesis == self.genesis && canonical_hash(&before.tip_hash), "unexpected recovery chain");
++        ensure!(client.opened_wallet(self.wallet.network()).await?.as_ref() == Some(&self.wallet), "unexpected recovery wallet");
++        let response = client.rpc(client.wallet, "get_transfer_by_txid",
++            json!({"txid":self.txid, "account_index":self.account})).await?;
++        let confirmations = self.verify_transfer(&response["transfer"], &before, minimum_confirmations)?;
++        ensure!(client.opened_wallet(self.wallet.network()).await?.as_ref() == Some(&self.wallet), "recovery wallet changed");
++        ensure!(client.snapshot().await? == before, "recovery chain changed");
++        Ok(ConfirmedSpend { txid: self.txid.clone(), confirmations })
++    }
++
++    fn verify_transfer(&self, transfer: &Value, tip: &ChainSnapshot, minimum: u64) -> Result<u64> {
++        ensure!(transfer["txid"] == self.txid && transfer["type"] == "out"
++            && number(transfer, "amount")? == self.amount && number(transfer, "fee")? == self.fee
++            && number(transfer, "unlock_time")? == 0
++            && number(&transfer["subaddr_index"], "major")? == self.account, "recovered transfer differs from intent");
++        let destinations = transfer["destinations"].as_array().ok_or_else(|| anyhow::anyhow!("missing recovery destinations"))?;
++        ensure!(destinations.len() == 1 && destinations[0]["address"] == self.destination.to_string()
++            && number(&destinations[0], "amount")? == self.amount, "recovered destination mismatch");
++        let height = number(transfer, "height")?;
++        let confirmations = number(transfer, "confirmations")?;
++        ensure!(height > 0 && height <= tip.tip_height && confirmations >= minimum
++            && tip.tip_height.checked_sub(height).and_then(|v| v.checked_add(1)) == Some(confirmations),
++            "recovered transfer is not sufficiently confirmed at this tip");
++        Ok(confirmations)
++    }
++}
++
++fn atoms(value: &Value, field: &str) -> Result<u64> {
++    let text = string(value, field)?;
++    let amount = XmzAmount::from_atom_string(&text).map_err(|_| anyhow::anyhow!("invalid recovery amount"))?;
++    ensure!(amount.atoms() > 0, "zero recovery amount");
++    Ok(amount.atoms())
++}
++
++fn canonical_hash(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use swap_core::xmz_address::XmzNetwork;
++    fn wallet() -> XmzAddress {
++        XmzAddress::parse(XmzNetwork::Mainnet,
++            "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H").unwrap()
++    }
++    fn records() -> (Value, Value) {
++        (json!({"schema":"monzero-native-spend-intent-v1", "genesis":"a".repeat(64),
++            "wallet":wallet().to_string(), "destination":wallet().to_string(), "lockTxid":"b".repeat(64),
++            "walletFile":format!("swap-{}", "1".repeat(32)), "amountAtoms":"100", "maximumFeeAtoms":"10", "account":0,"priority":1}),
++        json!({"schema":"monzero-native-spend-prepared-v1", "txid":"c".repeat(64), "feeAtoms":"2", "weight":10}))
++    }
++    #[test]
++    fn recovery_rejects_altered_intent_and_prepared_record() -> Result<()> {
++        let (intent, prepared) = records();
++        for (field, value) in [("genesis",json!("0".repeat(64))), ("lockTxid",json!("0".repeat(64))),
++            ("walletFile",json!("../wallet")), ("amountAtoms",json!("0")), ("account",json!(-1)),
++            ("priority",json!(0)), ("maximumFeeAtoms",json!("1"))] {
++            let mut invalid = intent.clone(); invalid[field] = value;
++            assert!(RecoveryRecord::decode(invalid, prepared.clone(), &"a".repeat(64), wallet(), &"b".repeat(64)).is_err());
++        }
++        for (field, value) in [("txid",json!("invalid")), ("feeAtoms",json!("0")), ("weight",json!(0))] {
++            let mut invalid = prepared.clone(); invalid[field] = value;
++            assert!(RecoveryRecord::decode(intent.clone(), invalid, &"a".repeat(64), wallet(), &"b".repeat(64)).is_err());
++        }
++        RecoveryRecord::decode(intent, prepared, &"a".repeat(64), wallet(), &"b".repeat(64))?;
++        Ok(())
++    }
++    #[test]
++    fn confirmation_requires_exact_payment_and_current_tip() -> Result<()> {
++        let (intent, prepared) = records();
++        let record = RecoveryRecord::decode(intent, prepared, &"a".repeat(64), wallet(), &"b".repeat(64))?;
++        let tip = ChainSnapshot { genesis:"a".repeat(64), tip_hash:"d".repeat(64), tip_height:100 };
++        let value = json!({"txid":"c".repeat(64), "type":"out", "amount":100,"fee":2,"unlock_time":0,
++            "subaddr_index":{"major":0}, "height":91,"confirmations":10,
++            "destinations":[{"address":wallet().to_string(),"amount":100}]});
++        assert_eq!(record.verify_transfer(&value, &tip, 10)?, 10);
++        assert!(record.verify_transfer(&value, &tip, 11).is_err());
++        for (field, changed) in [("txid",json!("e".repeat(64))), ("type",json!("pending")),
++            ("amount",json!(101)), ("fee",json!(3)), ("height",json!(90)), ("confirmations",json!(11)),
++            ("unlock_time",json!(1)), ("destinations",json!([])), ("subaddr_index",json!({"major":1}))] {
++            let mut invalid = value.clone(); invalid[field] = changed;
++            assert!(record.verify_transfer(&invalid, &tip, 10).is_err());
++        }
++        Ok(())
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn reader_rejects_aliases_permissions_and_ambiguous_json() -> Result<()> {
++        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
++        struct Owned(std::path::PathBuf);
++        impl Drop for Owned { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
++        let root = Owned(std::env::temp_dir().join(format!("xmz-recovery-reader-{}", uuid::Uuid::new_v4())));
++        std::fs::DirBuilder::new().mode(0o700).create(&root.0)?;
++        let directory = File::open(&root.0)?;
++        let path = root.0.join("record");
++        OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
++        std::fs::write(&path, b"{\"a\":1}")?;
++        assert_eq!(read_record(&directory, "record")?, json!({"a":1}));
++        symlink("record", root.0.join("symlink"))?;
++        assert!(read_record(&directory, "symlink").is_err());
++        std::fs::hard_link(&path, root.0.join("hardlink"))?;
++        assert!(read_record(&directory, "record").is_err());
++        std::fs::remove_file(root.0.join("hardlink"))?;
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
++        assert!(read_record(&directory, "record").is_err());
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
++        for bytes in [b"{\"a\":1,\"a\":2}".as_slice(), b"{", b"", b"{ \"a\":1}"] {
++            std::fs::write(&path, bytes)?;
++            assert!(read_record(&directory, "record").is_err());
++        }
++        std::fs::write(&path, vec![b' '; 4097])?;
++        assert!(read_record(&directory, "record").is_err());
++        assert!(read_record(&directory, "missing").is_err());
++        Ok(())
++    }
++}
++
++#[cfg(unix)]
++fn read_record(directory: &File, name: &str) -> Result<Value> {
++    use std::os::{fd::{AsRawFd, FromRawFd}, unix::fs::MetadataExt};
++    let name = std::ffi::CString::new(name)?;
++    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
++    if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
++    let file = unsafe { File::from_raw_fd(fd) };
++    let before = file.metadata()?;
++    ensure!(before.is_file() && before.uid() == unsafe { libc::geteuid() } && before.nlink() == 1
++        && before.mode() & 0o077 == 0 && before.len() <= 4096, "unsafe recovery record");
++    let mut bytes = Vec::new();
++    (&file).take(4097).read_to_end(&mut bytes)?;
++    let after = file.metadata()?;
++    ensure!(bytes.len() <= 4096 && bytes.len() as u64 == before.len() && before.len() == after.len()
++        && (before.mtime(), before.mtime_nsec(), before.ctime(), before.ctime_nsec())
++        == (after.mtime(), after.mtime_nsec(), after.ctime(), after.ctime_nsec()), "recovery record changed");
++    let value: Value = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid recovery JSON"))?;
++    ensure!(serde_json::to_vec(&value)? == bytes, "noncanonical or duplicate-key recovery JSON");
++    Ok(value)
++}

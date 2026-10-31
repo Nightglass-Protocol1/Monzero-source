@@ -1,0 +1,164 @@
+diff --git a/swap-machine/src/litecoin_light/vault/backup.rs b/swap-machine/src/litecoin_light/vault/backup.rs
+--- a/swap-machine/src/litecoin_light/vault/backup.rs
++++ b/swap-machine/src/litecoin_light/vault/backup.rs
+@@ -76,3 +76,6 @@
+ mod tests;
+ 
+ pub mod storage;
++
++/// Authenticated backup identity recovery without a surviving configuration.
++pub mod discovery;
+diff --git a/swap-machine/src/litecoin_light/vault/backup/discovery.rs b/swap-machine/src/litecoin_light/vault/backup/discovery.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/backup/discovery.rs
+@@ -0,0 +1,76 @@
++//! Authenticate a backup without requiring a surviving wallet configuration.
++//! Header identities are untrusted until the existing format verifier succeeds.
++use super::*;
++use crate::litecoin_light::vault::mnemonic::storage::backup as mnemonic_backup;
++use bitcoin::hashes::{Hash, sha256};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum BackupFormat { RawSeed, Mnemonic }
++impl BackupFormat {
++    pub fn encoding(self) -> &'static str {
++        match self { Self::RawSeed => "raw-bip32-seed-hex-v1", Self::Mnemonic => "bip39-english-v1" }
++    }
++}
++/// Contains encrypted bytes and authenticated public metadata, never plaintext
++/// recovery material. Deliberately not deserializable: only inspection creates it.
++pub struct InspectedBackup {
++    encrypted: Vec<u8>,
++    format: BackupFormat,
++    network: LightNetwork,
++    wallet: Uuid,
++    account: PublicAccountDescriptor,
++    allocated: [u32; 2],
++    digest: sha256::Hash,
++}
++impl InspectedBackup {
++    pub fn format(&self) -> BackupFormat { self.format }
++    pub fn network(&self) -> LightNetwork { self.network }
++    pub fn wallet_id(&self) -> Uuid { self.wallet }
++    pub fn account(&self) -> &PublicAccountDescriptor { &self.account }
++    pub fn allocated(&self) -> [u32; 2] { self.allocated }
++    pub fn digest(&self) -> sha256::Hash { self.digest }
++
++    /// Explicit publication into separately chosen private directories. Existing
++    /// format restorers preflight both records and preserve exact retry bytes.
++    /// This does not publish a configuration or recover spend/trade journals.
++    pub fn restore_into(&self, vault: &Path, addresses: &Path, password: &[u8]) -> Result<()> {
++        match self.format {
++            BackupFormat::RawSeed => { drop(super::restore(vault, addresses, self.network, self.wallet, password, &self.encrypted)?); }
++            BackupFormat::Mnemonic => { drop(mnemonic_backup::restore(vault, addresses, self.network, self.wallet, password, &self.encrypted)?); }
++        }
++        Ok(())
++    }
++}
++/// The caller selects the coin/network. Never infer it from untrusted bytes or
++/// silently try another format after authentication fails. No filesystem writes.
++pub fn inspect(bundle: &[u8], password: &[u8], network: impl Into<LightNetwork>) -> Result<InspectedBackup> {
++    let network = network.into();
++    ensure!(bundle.len() > 144 && bundle.len() <= 2_000_000, "invalid recovery backup size");
++    let format = match &bundle[..8] {
++        b"MZLTCB01" => BackupFormat::RawSeed,
++        b"MZMNBK01" => BackupFormat::Mnemonic,
++        _ => anyhow::bail!("unsupported recovery backup format"),
++    };
++    let wallet = Uuid::from_slice(&bundle[72..88])?;
++    let (account, allocated) = match format {
++        BackupFormat::RawSeed => {
++            let verified = super::storage::inspect(bundle, password, network, wallet)?;
++            (verified.account().descriptor(), verified.allocated())
++        }
++        BackupFormat::Mnemonic => {
++            let verified = mnemonic_backup::inspect(bundle, password, network, wallet)?;
++            (verified.account().descriptor(), verified.allocated())
++        }
++    };
++    Ok(InspectedBackup { encrypted: bundle.to_vec(), format, network, wallet, account,
++        allocated, digest: sha256::Hash::hash(bundle) })
++}
++/// The backup remains local, bounded and read under the existing private-file
++/// journal checks. Successful inspection does not establish allocation freshness.
++pub fn load(directory: &Path, password: &[u8], network: impl Into<LightNetwork>) -> Result<InspectedBackup> {
++    let journal = Journal::open(directory)?;
++    inspect(&journal.read("litecoin-wallet.backup")?, password, network)
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/backup/discovery/tests.rs b/swap-machine/src/litecoin_light/vault/backup/discovery/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/backup/discovery/tests.rs
+@@ -0,0 +1,68 @@
++use super::*;
++use crate::litecoin_light::{account::{Branch, allocation::AddressBook}, network::{BtcNetwork,BchNetwork,DogeNetwork}, vault::mnemonic::{MnemonicMaterial,storage::MnemonicVault}};
++use std::{fs,os::unix::fs::PermissionsExt,path::PathBuf};
++const PASSWORD:&[u8]=b"disposable backup discovery password";
++struct Directory(PathBuf);
++impl Directory {
++    fn new()->Result<Self> {
++        let p=std::env::temp_dir().join(format!("monzero-backup-discovery-{}",Uuid::new_v4()));
++        fs::create_dir(&p)?;fs::set_permissions(&p,fs::Permissions::from_mode(0o700))?;Ok(Self(p.canonicalize()?))
++    }
++}
++impl Drop for Directory {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
++#[test]
++fn authenticated_backup_recovers_configuration_identity_for_all_coins_and_formats()->Result<()> {
++    for network in [LightNetwork::from(LtcNetwork::Regtest),BtcNetwork::Regtest.into(),BchNetwork::Regtest.into(),DogeNetwork::Regtest.into()] {
++        for format in [BackupFormat::RawSeed,BackupFormat::Mnemonic] {
++            let vault_dir=Directory::new()?;let book_dir=Directory::new()?;let wallet=Uuid::new_v4();
++            let (bundle,descriptor)=match format {
++                BackupFormat::RawSeed=>{
++                    let seed=SecretSeed::from_bytes(Zeroizing::new([42;32]));
++                    let vault=SeedVault::create(&vault_dir.0,network,wallet,PASSWORD,&seed)?;
++                    let account=seed.public_account(network,3)?;let descriptor=account.descriptor();
++                    let mut book=AddressBook::create(&book_dir.0,account)?;
++                    book.reserve(Uuid::new_v4(),Branch::Receive)?;book.reserve(Uuid::new_v4(),Branch::Change)?;
++                    (super::super::export(&vault,&book,PASSWORD)?,descriptor)
++                },
++                BackupFormat::Mnemonic=>{
++                    let material=MnemonicMaterial::from_entropy(&[17;32])?;
++                    let vault=MnemonicVault::create(&vault_dir.0,network,wallet,PASSWORD,&material,"separate passphrase")?;
++                    let account=vault.unlock(PASSWORD)?.public_account(network,3)?;let descriptor=account.descriptor();
++                    let mut book=AddressBook::create(&book_dir.0,account)?;
++                    book.reserve(Uuid::new_v4(),Branch::Receive)?;book.reserve(Uuid::new_v4(),Branch::Change)?;
++                    (mnemonic_backup::export(&vault,&book,PASSWORD)?,descriptor)
++                },
++            };
++            let found=inspect(&bundle,PASSWORD,network)?;
++            assert_eq!(found.wallet_id(),wallet);assert_eq!(found.network(),network);assert_eq!(found.format(),format);
++            assert_eq!(found.allocated(),[1,1]);assert_eq!(found.digest(),sha256::Hash::hash(&bundle));
++            assert_eq!(serde_json::to_vec(found.account())?,serde_json::to_vec(&descriptor)?);
++            assert!(inspect(&bundle,b"wrong",network).is_err());
++            let wrong=if network==LightNetwork::from(BtcNetwork::Regtest){LightNetwork::from(LtcNetwork::Regtest)}else{BtcNetwork::Regtest.into()};
++            assert!(inspect(&bundle,PASSWORD,wrong).is_err());
++            for position in [0,8,72,88,104,bundle.len()-1] {
++                let mut altered=bundle.clone();altered[position]^=1;
++                assert!(inspect(&altered,PASSWORD,network).is_err());
++            }
++            let backup=Directory::new()?;let path=backup.0.join("litecoin-wallet.backup");
++            fs::write(&path,&bundle)?;fs::set_permissions(&path,fs::Permissions::from_mode(0o600))?;
++            assert_eq!(load(&backup.0,PASSWORD,network)?.digest(),found.digest());
++            fs::set_permissions(&path,fs::Permissions::from_mode(0o644))?;
++            assert!(load(&backup.0,PASSWORD,network).is_err());
++            let restored_vault=Directory::new()?;let restored_book=Directory::new()?;
++            assert!(found.restore_into(&restored_vault.0,&restored_book.0,b"wrong").is_err());
++            assert!(!restored_vault.0.join("litecoin-seed.vault").exists());
++            found.restore_into(&restored_vault.0,&restored_book.0,PASSWORD)?;
++            let encrypted=fs::read(restored_vault.0.join("litecoin-seed.vault"))?;
++            found.restore_into(&restored_vault.0,&restored_book.0,PASSWORD)?;
++            assert_eq!(fs::read(restored_vault.0.join("litecoin-seed.vault"))?,encrypted);
++            let mut book=AddressBook::open(&restored_book.0,PublicAccount::from_descriptor(&descriptor,network)?)?;
++            book.reserve(Uuid::new_v4(),Branch::Receive)?;drop(book);
++            let advanced=fs::read(restored_book.0.join("litecoin-address-book.json"))?;
++            assert!(found.restore_into(&restored_vault.0,&restored_book.0,PASSWORD).is_err());
++            assert_eq!(fs::read(restored_book.0.join("litecoin-address-book.json"))?,advanced);
++        }
++    }
++    for size in [0,8,72,88,144,2_000_001] {assert!(inspect(&vec![0;size],PASSWORD,LtcNetwork::Regtest).is_err());}
++    Ok(())
++}

@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/bitcoin-cash-node/bitcoin-cash-node",
+  "commit": "89a591f7c5b1fd110c0819377ad8f2647d656800",
+  "tag": "v29.0.0",
+  "files": {
+    "COPYING": "1d606cb4aacab594c65c5dfe2f5891384d15ec86c8ded393e7ae18f0103213c3",
+    "src/chainparams.cpp": "ea0f83db99e8fdc2d149fe03ae9f82b5f96c2e335b30d8f663b12e2f67e05e1c",
+    "src/chainparamsbase.cpp": "f66e0f5e442b2a324f56a629fab6c664d56536f5e2e273e570873eb4cbf0aa55",
+    "src/rpc/blockchain.cpp": "5c223e18320dcf2b65263d30c622f28e0bba32c165f0a4a11fc80e3012a9502d",
+    "src/wallet/rpcwallet.cpp": "a69d9554892d80eb253b3ce1753432d9cadd6f1224c7060e21f47d8410ac84e6",
+    "src/consensus/consensus.h": "c5e807c612ec53d88cd76fdf401c548cfbbb198b179d0d44ebb5c3565bd662ca"
+  }
+}

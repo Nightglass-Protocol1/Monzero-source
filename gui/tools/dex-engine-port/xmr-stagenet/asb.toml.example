@@ -1,0 +1,31 @@
+# BTC<->XMR leg test: Bitcoin signet + Monero stagenet, local only (no Tor, no rendezvous)
+[data]
+dir = "/path/to/xmr-stagenet-test/asb"
+
+[network]
+listen = ["/ip4/127.0.0.1/tcp/39939"]
+rendezvous_point = []
+external_addresses = []
+
+[bitcoin]
+electrum_rpc_urls = ["ssl://mempool.space:60602", "ssl://signet-electrumx.wakiyamap.dev:50002"]
+target_block = 1
+finality_confirmations = 1
+network = "Signet"
+use_mempool_space_fee_estimation = false
+
+[monero]
+finality_confirmations = 10
+network = "Stagenet"
+
+[tor]
+register_hidden_service = false
+hidden_service_num_intro_points = 5
+wormhole_enabled = false
+
+[maker]
+min_buy_btc = 0.00003  # lowered from 0.001 so a 0.01 XMR faucet balance can quote
+max_buy_btc = 0.01
+ask_spread = 0.02
+developer_tip = 0
+hermes_enabled = false

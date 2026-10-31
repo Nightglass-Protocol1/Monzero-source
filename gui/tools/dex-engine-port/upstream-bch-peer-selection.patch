@@ -1,0 +1,267 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/local_keys.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/local_keys.rs
+@@ -6,6 +6,8 @@
+ use sha2::{Digest,Sha256};
+ use std::path::Path;
+ use zeroize::{Zeroize,Zeroizing};
++
++pub mod peer;
+ 
+ const SCHEMA: &str = "monzero-bch-local-keys-v1";
+ 
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet.rs
+@@ -75,7 +75,7 @@
+             role,view_share:share.0.as_bytes() })
+     }
+ 
+-    fn verify_view(&self, quote: &VerifiedBchQuote, bytes: &[u8], signature: &[u8], role: Role)
++    pub(super) fn verify_view(&self, quote: &VerifiedBchQuote, bytes: &[u8], signature: &[u8], role: Role)
+         -> Result<monero::PrivateKey> {
+         let message = view_signing_bytes(bytes,role)?;
+         // Suppress decoder diagnostics that could contain private material.
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -506,3 +506,85 @@
+     assert!(RetainedLocalKeys::restore(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&pin).is_err());
+     Ok(())
+ }
++
++#[cfg(target_os="linux")]
++#[test]
++fn retained_peer_views_restore_and_finish_both_roles() -> Result<()> {
++    use super::super::local_keys::{RetainedLocalKeys,peer::RetainedPeer};
++    let setup = Setup::new()?; let directory = PrivateStore::new()?;
++    let mut pins = Vec::new();
++    for (index,role) in [(0,Role::BchFunder),(1,Role::NativeFunder)] {
++        let local = RetainedLocalKeys::persist(&directory.0,&setup.quote,&setup.policy,1000,role,
++            bitcoin::secp256k1::SecretKey::from_slice(&[3+index as u8;32])?,setup.spend[index],setup.view[index],
++            &setup.frames[index],&setup.signatures[index])?;
++        let local_pin = *local.commitment();
++        let selected = local.select_peer(&directory.0,&setup.quote,&setup.policy,1001,
++            &setup.frames[1-index],&setup.signatures[1-index])?;
++        let signer = SigningKey::from_bytes(&[1+index as u8;32]);
++        let signature = signer.sign(&selected.view_signing_bytes(&setup.quote,&setup.policy,1002)?).to_bytes();
++        let message = selected.retain_signed_view(&directory.0,&setup.quote,&setup.policy,1002,&signature)?;
++        assert_eq!(selected.retain_signed_view(&directory.0,&setup.quote,&setup.policy,1002,&signature)?.commitment(),message.commitment());
++        assert!(selected.view_signing_bytes(&setup.quote,&setup.policy,1000).is_err());
++        assert!(selected.view_signing_bytes(&setup.quote,&setup.policy,2000).is_err());
++        assert!(selected.retain_signed_view(&directory.0,&setup.quote,&setup.policy,2000,&signature).is_err());
++        pins.push((local_pin,*selected.commitment(),*message.commitment()));
++    }
++    let restore = |index: usize,role| -> Result<RetainedPeer> {
++        let local = RetainedLocalKeys::restore(&directory.0,&setup.quote,&setup.policy,role,&pins[index].0)?;
++        RetainedPeer::restore(&directory.0,&setup.quote,&setup.policy,local,&pins[index].1)
++    };
++    let b = restore(0,Role::BchFunder)?; let n = restore(1,Role::NativeFunder)?;
++    let bv = b.restore_signed_view(&directory.0,&setup.quote,&setup.policy,&pins[0].2)?;
++    let nv = n.restore_signed_view(&directory.0,&setup.quote,&setup.policy,&pins[1].2)?;
++    assert!(restore(0,Role::BchFunder)?.finish(&setup.quote,&setup.policy,1001,&bv,nv.frame(),nv.signature()).is_err());
++    let b = b.finish(&setup.quote,&setup.policy,1003,&bv,nv.frame(),nv.signature())?;
++    let n = n.finish(&setup.quote,&setup.policy,1003,&nv,bv.frame(),bv.signature())?;
++    assert_eq!(b.wallet().address(),n.wallet().address());
++    assert_eq!(b.acknowledgement(&setup.quote)?,n.acknowledgement(&setup.quote)?);
++    for owned in [b,n] {
++        let ack = owned.acknowledgement(&setup.quote)?;
++        owned.accept_agreement(&setup.quote,&setup.policy,1004,&ack,
++            &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++    }
++    Ok(())
++}
++
++#[cfg(target_os="linux")]
++#[test]
++fn retained_peer_rejects_switches_wrong_signers_and_missing_records() -> Result<()> {
++    use super::super::local_keys::{RetainedLocalKeys,peer::RetainedPeer};
++    let mut setup = Setup::new()?; let directory = PrivateStore::new()?;
++    let local = RetainedLocalKeys::persist(&directory.0,&setup.quote,&setup.policy,1000,Role::BchFunder,
++        bitcoin::secp256k1::SecretKey::from_slice(&[3;32])?,setup.spend[0],setup.view[0],&setup.frames[0],&setup.signatures[0])?;
++    let local_pin = *local.commitment();
++    let load = || RetainedLocalKeys::restore(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&local_pin);
++    let other_directory = PrivateStore::new()?;
++    assert!(load()?.select_peer(&other_directory.0,&setup.quote,&setup.policy,1001,&setup.frames[1],&setup.signatures[1]).is_err());
++    assert!(load()?.select_peer(&directory.0,&setup.quote,&setup.policy,999,&setup.frames[1],&setup.signatures[1]).is_err());
++    assert!(load()?.select_peer(&directory.0,&setup.quote,&setup.policy,1001,&setup.frames[0],&setup.signatures[0]).is_err());
++    let selected = local.select_peer(&directory.0,&setup.quote,&setup.policy,1001,&setup.frames[1],&setup.signatures[1])?;
++    let pin = *selected.commitment();
++    let signing = selected.view_signing_bytes(&setup.quote,&setup.policy,1002)?;
++    assert!(selected.retain_signed_view(&directory.0,&setup.quote,&setup.policy,1002,
++        &SigningKey::from_bytes(&[2;32]).sign(&signing).to_bytes()).is_err());
++    let signature = SigningKey::from_bytes(&[1;32]).sign(&signing).to_bytes();
++    let message = selected.retain_signed_view(&directory.0,&setup.quote,&setup.policy,1002,&signature)?;
++    let mut wrong = *message.commitment(); wrong[0] ^= 1;
++    assert!(selected.restore_signed_view(&directory.0,&setup.quote,&setup.policy,&wrong).is_err());
++    // A new valid proof by the same peer cannot replace the selected proof.
++    let scalar = curve25519_dalek_ng::scalar::Scalar::from_canonical_bytes(setup.spend[1].as_bytes()).unwrap();
++    let (proof,(secp,edwards)) = CROSS_CURVE_PROOF_SYSTEM.prove(&scalar,&mut rand::thread_rng());
++    setup.frames[1] = super::super::frame(&setup.quote,Role::NativeFunder,secp.into(),edwards.compress().to_bytes(),proof)?;
++    setup.signatures[1] = sign(&setup.frames[1],Role::NativeFunder,false);
++    assert!(load()?.select_peer(&directory.0,&setup.quote,&setup.policy,1001,&setup.frames[1],&setup.signatures[1]).is_err());
++    let restored = RetainedPeer::restore(&directory.0,&setup.quote,&setup.policy,load()?,&pin)?;
++    assert_eq!(restored.restore_signed_view(&directory.0,&setup.quote,&setup.policy,message.commitment())?.frame(),message.frame());
++    let path = std::fs::read_dir(&directory.0)?.map(|e|e.unwrap().path())
++        .find(|p|p.file_name().unwrap().to_string_lossy().contains("peer-selection")).unwrap();
++    std::fs::write(&path,b"{")?;
++    assert!(RetainedPeer::restore(&directory.0,&setup.quote,&setup.policy,load()?,&pin).is_err());
++    assert!(selected.retain_signed_view(&directory.0,&setup.quote,&setup.policy,1002,&signature).is_err());
++    std::fs::remove_file(path)?;
++    assert!(RetainedPeer::restore(&directory.0,&setup.quote,&setup.policy,load()?,&pin).is_err());
++    Ok(())
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/local_keys/peer.rs
+@@ -0,0 +1,154 @@
++//! Immutable peer selection and exact outgoing private-view records. These
++//! records do not establish transport delivery, mutual agreement or funding.
++use super::*;
++use native_wallet::{NativePair,view_signing_bytes};
++
++const PEER_SCHEMA: &str = "monzero-bch-retained-peer-v1";
++const VIEW_SCHEMA: &str = "monzero-bch-outgoing-private-view-v1";
++
++pub struct RetainedPeer {
++    local: RetainedLocalKeys, pair: NativePair, state: PeerState, commitment: [u8;32],
++}
++
++/// Contains a private view scalar; no Debug or implicit serialization.
++/// Pin commitment independently before private authenticated transmission.
++pub struct OutgoingPrivateView {
++    selection: [u8;32], commitment: [u8;32], admitted_at: u64, frame: Zeroizing<Vec<u8>>, signature: Vec<u8>,
++}
++impl OutgoingPrivateView {
++    pub fn commitment(&self) -> &[u8;32] { &self.commitment }
++    pub fn frame(&self) -> &[u8] { &self.frame }
++    pub fn signature(&self) -> &[u8] { &self.signature }
++}
++
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct PeerState {
++    schema: String, local: [u8;32], peer: SignedFrame, view: Vec<u8>,
++}
++impl Drop for PeerState { fn drop(&mut self) { self.view.zeroize(); } }
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ViewState { schema: String, selection: [u8;32], admitted_at: u64, signature: Vec<u8> }
++
++fn record_name(quote: &VerifiedBchQuote, role: Role, suffix: &str) -> String {
++    format!("{}.bch-{suffix}-{}",quote.terms()["swapId"],role.domain())
++}
++fn commitment(schema: &str, bytes: &[u8]) -> Result<[u8;32]> {
++    ensure!(!bytes.is_empty() && bytes.len() <= 2_000_000,"invalid BCH negotiation record size");
++    let mut hash = Sha256::new(); hash.update(schema); hash.update([0]); hash.update(bytes);
++    Ok(hash.finalize().into())
++}
++fn pair(local: &RetainedLocalKeys, quote: &VerifiedBchQuote, policy: &Policy, peer: &SignedFrame) -> Result<NativePair> {
++    ensure!(peer.admitted_at >= local.state.admitted_at,"BCH peer selection predates local admission");
++    let own = validate(&local.state,quote,policy,local.state.role)?;
++    let other_role = match local.state.role {Role::BchFunder=>Role::NativeFunder,Role::NativeFunder=>Role::BchFunder};
++    let other = AuthenticatedNativeAdaptor::verify(&peer.bytes,&peer.signature,quote,policy,peer.admitted_at,other_role)?;
++    match local.state.role {Role::BchFunder=>NativePair::new(quote,own,other),Role::NativeFunder=>NativePair::new(quote,other,own)}
++}
++fn require_local(journal: &Journal, quote: &VerifiedBchQuote, local: &RetainedLocalKeys) -> Result<()> {
++    let bytes = Zeroizing::new(journal.read(&name(quote,local.state.role))?);
++    ensure!(digest(&bytes)? == local.digest,"BCH initial keys changed or are absent from this store");
++    Ok(())
++}
++
++impl RetainedLocalKeys {
++    /// Persist the exact peer before exposing view signing bytes. No replacement
++    /// if another valid proof from that identity was already selected.
++    pub fn select_peer(self, directory: &Path, quote: &VerifiedBchQuote, policy: &Policy,
++        now: u64, proof: &[u8], signature: &[u8]) -> Result<RetainedPeer> {
++        let peer = SignedFrame {bytes:proof.to_vec(),signature:signature.to_vec(),admitted_at:now};
++        let pair = pair(&self,quote,policy,&peer)?;
++        let view = pair.view_frame(self.state.role,&monero::PrivateViewKey(native_key(&self.state.view)?))?;
++        let state = PeerState {schema:PEER_SCHEMA.into(),local:self.digest,peer,view};
++        let bytes = Zeroizing::new(serde_json::to_vec(&state)?);
++        let commitment = commitment(PEER_SCHEMA,&bytes)?;
++        let journal = Journal::open(directory)?;
++        require_local(&journal,quote,&self)?;
++        journal.retain(&record_name(quote,self.state.role,"peer-selection"),&bytes)?;
++        Ok(RetainedPeer {local:self,pair,state,commitment})
++    }
++}
++
++impl RetainedPeer {
++    pub fn restore(directory: &Path, quote: &VerifiedBchQuote, policy: &Policy,
++        local: RetainedLocalKeys, expected: &[u8;32]) -> Result<Self> {
++        let journal = Journal::open(directory)?;
++        require_local(&journal,quote,&local)?;
++        let bytes = Zeroizing::new(journal.read(&record_name(quote,local.state.role,"peer-selection"))?);
++        ensure!(&commitment(PEER_SCHEMA,&bytes)? == expected,"BCH peer selection digest mismatch");
++        let state: PeerState = serde_json::from_slice(&bytes)
++            .map_err(|_|anyhow::anyhow!("invalid BCH peer selection encoding"))?;
++        ensure!(state.schema == PEER_SCHEMA && state.local == local.digest
++            && Zeroizing::new(serde_json::to_vec(&state)?).as_slice() == bytes.as_slice(),
++            "BCH peer selection admission mismatch");
++        let pair = pair(&local,quote,policy,&state.peer)?;
++        let view = Zeroizing::new(pair.view_frame(local.state.role,&monero::PrivateViewKey(native_key(&local.state.view)?))?);
++        ensure!(view.as_slice() == state.view,"BCH retained view differs from selected pair");
++        Ok(Self {local,pair,state,commitment:*expected})
++    }
++    pub fn commitment(&self) -> &[u8;32] { &self.commitment }
++    fn check_live(&self, quote: &VerifiedBchQuote, policy: &Policy, now: u64) -> Result<()> {
++        quote.check_policy(policy,now)?;
++        ensure!(self.local.proof.quote_commitment == *quote.commitment() && now >= self.state.peer.admitted_at,
++            "BCH outgoing view admission mismatch");
++        Ok(())
++    }
++    /// Private input to the local identity signer, not a public order-book frame.
++    pub fn view_signing_bytes(&self, quote: &VerifiedBchQuote, policy: &Policy, now: u64) -> Result<Zeroizing<Vec<u8>>> {
++        self.check_live(quote,policy,now)?;
++        Ok(Zeroizing::new(view_signing_bytes(&self.state.view,self.local.state.role)?))
++    }
++    fn message(&self, quote: &VerifiedBchQuote, policy: &Policy, state: ViewState, bytes: &[u8]) -> Result<OutgoingPrivateView> {
++        self.check_live(quote,policy,state.admitted_at)?;
++        ensure!(state.schema == VIEW_SCHEMA && state.selection == self.commitment,
++            "BCH outgoing view selection mismatch");
++        self.pair.verify_view(quote,&self.state.view,&state.signature,self.local.state.role)?;
++        Ok(OutgoingPrivateView {selection:self.commitment,commitment:commitment(VIEW_SCHEMA,bytes)?,admitted_at:state.admitted_at,
++            frame:Zeroizing::new(self.state.view.clone()),signature:state.signature})
++    }
++    /// Persist the exact signature before returning any outgoing frame. This
++    /// records preparation only; it does not claim that the peer received it.
++    pub fn retain_signed_view(&self, directory: &Path, quote: &VerifiedBchQuote, policy: &Policy,
++        now: u64, signature: &[u8]) -> Result<OutgoingPrivateView> {
++        self.check_live(quote,policy,now)?;
++        let state = ViewState {schema:VIEW_SCHEMA.into(),selection:self.commitment,admitted_at:now,signature:signature.to_vec()};
++        let bytes = serde_json::to_vec(&state)?;
++        let message = self.message(quote,policy,state,&bytes)?;
++        let journal = Journal::open(directory)?;
++        self.require_selection(&journal,quote)?;
++        journal.retain(&record_name(quote,self.local.state.role,"outgoing-view"),&bytes)?;
++        Ok(message)
++    }
++    fn require_selection(&self, journal: &Journal, quote: &VerifiedBchQuote) -> Result<()> {
++        require_local(journal,quote,&self.local)?;
++        let bytes = Zeroizing::new(journal.read(&record_name(quote,self.local.state.role,"peer-selection"))?);
++        ensure!(commitment(PEER_SCHEMA,&bytes)? == self.commitment,"BCH retained peer selection changed");
++        Ok(())
++    }
++    /// Historical restore is allowed for recovery. The transport must separately
++    /// enforce live quote/clock and its durable outgoing cursor before resending.
++    pub fn restore_signed_view(&self, directory: &Path, quote: &VerifiedBchQuote, policy: &Policy,
++        expected: &[u8;32]) -> Result<OutgoingPrivateView> {
++        let journal = Journal::open(directory)?;
++        self.require_selection(&journal,quote)?;
++        let bytes = journal.read(&record_name(quote,self.local.state.role,"outgoing-view"))?;
++        ensure!(&commitment(VIEW_SCHEMA,&bytes)? == expected,"BCH outgoing view digest mismatch");
++        let state: ViewState = serde_json::from_slice(&bytes)?;
++        ensure!(serde_json::to_vec(&state)? == bytes,"noncanonical BCH outgoing view record");
++        self.message(quote,policy,state,&bytes)
++    }
++    /// Finish only the retained peer exchange and exact locally retained view.
++    /// Peer view/agreement admission still needs its own durable execution step.
++    pub fn finish(self, quote: &VerifiedBchQuote, policy: &Policy, now: u64,
++        own: &OutgoingPrivateView, peer_frame: &[u8], peer_signature: &[u8]) -> Result<OwnedNativeWallet> {
++        self.check_live(quote,policy,now)?;
++        ensure!(own.selection == self.commitment && now >= own.admitted_at,"BCH finishing another peer selection");
++        let frames = match self.local.state.role {
++            Role::BchFunder=>[(own.frame(),own.signature()),(peer_frame,peer_signature)],
++            Role::NativeFunder=>[(peer_frame,peer_signature),(own.frame(),own.signature())],
++        };
++        let wallet = self.pair.finish(quote,policy,now,frames)?;
++        self.local.bind_wallet(quote,wallet)
++    }
++}

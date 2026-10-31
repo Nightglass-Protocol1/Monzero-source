@@ -1,0 +1,194 @@
+diff --git a/bitcoin-wallet/tests/harness/bitcoind.rs b/bitcoin-wallet/tests/harness/bitcoind.rs
+index 50e1d0896..e73200992 100644
+--- a/bitcoin-wallet/tests/harness/bitcoind.rs
++++ b/bitcoin-wallet/tests/harness/bitcoind.rs
+@@ -71,6 +71,8 @@ impl IntoIterator for BitcoindArgs {
+             "-regtest".to_string(),
+             "-listen=1".to_string(),
+             "-prune=0".to_string(),
++            // Disposable regtest: permit read-only lookup after lock mining.
++            "-txindex=1".to_string(),
+             "-rpcallowip=0.0.0.0/0".to_string(),
+             "-rpcbind=0.0.0.0".to_string(),
+             format!("-rpcuser={}", RPC_USER),
+diff --git a/swap-machine/src/native_execution_claim/checkpoint.rs b/swap-machine/src/native_execution_claim/checkpoint.rs
+index f80745645..304f62add 100644
+--- a/swap-machine/src/native_execution_claim/checkpoint.rs
++++ b/swap-machine/src/native_execution_claim/checkpoint.rs
+@@ -8,7 +8,8 @@ use anyhow::{ensure, Context, Result};
+ use sha2::{Digest, Sha256};
+ use zeroize::Zeroizing;
+ mod submission;
+-pub use submission::RecordedBitcoinSubmission;
++pub use submission::{RecordedBitcoinSubmission, BitcoinSubmissionObserver,
++    BitcoinSubmissionSnapshot, BitcoinSubmissionObservation};
+ 
+ const DOMAIN: &[u8] = b"monzero-native-bob-pending-checkpoint-v1\0";
+ const LOCK_DOMAIN: &[u8] = b"monzero-native-bob-bitcoin-lock-v1\0";
+diff --git a/swap-machine/src/native_execution_claim/checkpoint/submission.rs b/swap-machine/src/native_execution_claim/checkpoint/submission.rs
+index a6362e8fe..52ffce8e1 100644
+--- a/swap-machine/src/native_execution_claim/checkpoint/submission.rs
++++ b/swap-machine/src/native_execution_claim/checkpoint/submission.rs
+@@ -1,9 +1,43 @@
+-//! Exact Bitcoin lock submission intent. No RPC, signature validation, broadcast
++//! Exact Bitcoin lock submission intent and read-only observations. No signature validation, broadcast
+ //! authority or acceptance receipt. Never infer rejection from a missing receipt.
+ use super::*;
+ 
+ const SUBMISSION_DOMAIN: &[u8] = b"monzero-native-bitcoin-submission-v1\0";
+ 
++#[derive(Clone, PartialEq, Eq)]
++pub struct BitcoinSubmissionSnapshot {
++    pub genesis: bitcoin::BlockHash,
++    pub tip: bitcoin::BlockHash,
++}
++
++/// Read-only node interface. Errors must not be converted into absent results.
++#[async_trait::async_trait]
++pub trait BitcoinSubmissionObserver: Sync {
++    async fn snapshot(&self) -> Result<BitcoinSubmissionSnapshot>;
++    /// None means only that this observer did not find it, never proof of rejection.
++    async fn transaction(&self, id: bitcoin::Txid) -> Result<Option<bitcoin::Transaction>>;
++}
++
++/// Neither result authorizes another submission or proves confirmation/finality.
++#[derive(Debug, PartialEq, Eq)]
++pub enum BitcoinSubmissionObservation { NotObserved, ExactTransactionObserved }
++
++async fn observe(record: &RecordedBitcoinSubmission, expected_genesis: bitcoin::BlockHash,
++    observer: &impl BitcoinSubmissionObserver) -> Result<BitcoinSubmissionObservation> {
++    let before=observer.snapshot().await?;
++    ensure!(before.genesis==expected_genesis,"wrong Bitcoin submission chain");
++    let transaction=observer.transaction(record.transaction.compute_txid()).await?;
++    let after=observer.snapshot().await?;
++    ensure!(after==before,"Bitcoin submission chain changed during observation");
++    match transaction {
++        Some(transaction)=>{
++            ensure!(transaction==record.transaction,"observed Bitcoin submission bytes differ");
++            Ok(BitcoinSubmissionObservation::ExactTransactionObserved)
++        }
++        None=>Ok(BitcoinSubmissionObservation::NotObserved),
++    }
++}
++
+ /// Retained transaction bytes, not proof of script validity or chain acceptance.
+ pub struct RecordedBitcoinSubmission {
+     transaction: bitcoin::Transaction,
+@@ -63,6 +97,21 @@ impl ExecutionClaim {
+ }
+ 
+ impl RecoveryLease {
++    /// Read-only reconciliation under ownership. Does not persist an outcome,
++    /// broadcast, retry, or assert that any output remains spendable.
++    #[cfg(target_os = "linux")]
++    pub async fn reconcile_bitcoin_submission(&self, store: &CheckpointPinStore, expected_lock: bitcoin::Txid,
++        observer: &impl BitcoinSubmissionObserver) -> Result<BitcoinSubmissionObservation> {
++        let record=self.load_bitcoin_submission(store,expected_lock)?;
++        observe(&record,self.record.quote().terms()["btcGenesis"].parse()?,observer).await
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub async fn reconcile_bitcoin_submission(&self, _: &CheckpointPinStore, _: bitcoin::Txid,
++        _: &impl BitcoinSubmissionObserver) -> Result<BitcoinSubmissionObservation> {
++        anyhow::bail!("Bitcoin submission reconciliation is not implemented on this platform")
++    }
++
+     /// Restore intended bytes while owning recovery. Reconcile with the chain
+     /// before any decision; a stored intent does not authorize resubmission.
+     #[cfg(target_os = "linux")]
+@@ -88,6 +137,53 @@ impl RecoveryLease {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[tokio::test]
++    async fn reconciliation_never_turns_uncertainty_into_retry_authority() -> Result<()> {
++        use std::sync::atomic::{AtomicUsize,Ordering};
++        struct Observer {
++            first:BitcoinSubmissionSnapshot,last:BitcoinSubmissionSnapshot,
++            calls:AtomicUsize,queries:AtomicUsize,transaction:Option<bitcoin::Transaction>,fail:bool,
++        }
++        #[async_trait::async_trait]
++        impl BitcoinSubmissionObserver for Observer {
++            async fn snapshot(&self) -> Result<BitcoinSubmissionSnapshot> {
++                Ok(if self.calls.fetch_add(1,Ordering::SeqCst)==0 {self.first.clone()} else {self.last.clone()})
++            }
++            async fn transaction(&self, _:bitcoin::Txid) -> Result<Option<bitcoin::Transaction>> {
++                self.queries.fetch_add(1,Ordering::SeqCst);
++                ensure!(!self.fail,"fixture RPC failure");
++                Ok(self.transaction.clone())
++            }
++        }
++        let mut record=RecordedBitcoinSubmission {transaction:bitcoin::Transaction {
++            version:bitcoin::transaction::Version::TWO,lock_time:bitcoin::absolute::LockTime::ZERO,
++            input:vec![bitcoin::TxIn {previous_output:bitcoin::OutPoint::null(),
++                script_sig:bitcoin::ScriptBuf::new(),sequence:bitcoin::Sequence::MAX,witness:bitcoin::Witness::new()}],output:vec![],
++        }};
++        record.transaction.input[0].witness.push([1]);
++        let snapshot=BitcoinSubmissionSnapshot {genesis:"11".repeat(32).parse()?,tip:"22".repeat(32).parse()?};
++        for mode in 0..7 {
++            let mut observer=Observer {first:snapshot.clone(),last:snapshot.clone(),calls:AtomicUsize::new(0),
++                queries:AtomicUsize::new(0),transaction:Some(record.transaction.clone()),fail:false};
++            match mode {
++                1=>observer.transaction=None,
++                2=>observer.first.genesis="33".repeat(32).parse()?,
++                3=>observer.last.tip="44".repeat(32).parse()?,
++                4=>observer.transaction.as_mut().unwrap().version=bitcoin::transaction::Version::ONE,
++                5=>observer.fail=true,
++                6=>observer.transaction.as_mut().unwrap().input[0].witness.push([2]),
++                _=>{},
++            }
++            let result=observe(&record,snapshot.genesis,&observer).await;
++            match mode {
++                0=>assert_eq!(result?,BitcoinSubmissionObservation::ExactTransactionObserved),
++                1=>assert_eq!(result?,BitcoinSubmissionObservation::NotObserved),
++                _=>assert!(result.is_err()),
++            }
++            if mode==2 {assert_eq!(observer.queries.load(Ordering::SeqCst),0);}
++        }
++        Ok(())
++    }
+     #[test]
+     fn submission_preserves_every_non_witness_field() -> Result<()> {
+         let unsigned=bitcoin::Transaction {
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 7540a1aae..6cd153466 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -868,6 +868,10 @@ async fn resume_pending_in_child() -> Result<()> {
+             let pre_lock=lease.load_bitcoin_lock(&store,lock)?;
+             let submission=lease.load_bitcoin_submission(&store,lock)?;
+             anyhow::ensure!(submission.transaction().compute_txid()==lock,"restored submission has wrong identity");
++            let node=native_rpc::BitcoinRpc::new(std::env::var("MONZERO_TEST_CHILD_BITCOIN_RPC")?.parse()?)?;
++            anyhow::ensure!(lease.reconcile_bitcoin_submission(&store,lock,&node).await?
++                ==swap_machine::native_execution_claim::checkpoint::BitcoinSubmissionObservation::ExactTransactionObserved,
++                "retained Bitcoin submission was not observed");
+             pre_lock.check_recorded_quote(&association.verify_record(quote_fixture::now()?)?)?;
+             let pending=lease.load_pinned_pending(&store,lock,&policy)?;
+             anyhow::ensure!(pre_lock.cancel(swap_core::monero::BlockHeight {height:0})
+diff --git a/swap-machine/tests/native_rpc.rs b/swap-machine/tests/native_rpc.rs
+index e02458927..617c48823 100644
+--- a/swap-machine/tests/native_rpc.rs
++++ b/swap-machine/tests/native_rpc.rs
+@@ -40,6 +40,22 @@ impl BitcoinRpc {
+     }
+ }
+ 
++#[async_trait::async_trait]
++impl swap_machine::native_execution_claim::checkpoint::BitcoinSubmissionObserver for BitcoinRpc {
++    async fn snapshot(&self) -> Result<swap_machine::native_execution_claim::checkpoint::BitcoinSubmissionSnapshot> {
++        Ok(swap_machine::native_execution_claim::checkpoint::BitcoinSubmissionSnapshot {
++            genesis:serde_json::from_str(self.rpc("getblockhash",json!([0])).await?.get())?,
++            tip:serde_json::from_str(self.rpc("getbestblockhash",json!([])).await?.get())?,
++        })
++    }
++    async fn transaction(&self, id:bitcoin::Txid) -> Result<Option<bitcoin::Transaction>> {
++        // Conservative fixture adapter: every node error remains an error,
++        // including missing-index/not-found responses; never guess absence.
++        let hex:String=serde_json::from_str(self.rpc("getrawtransaction",json!([id.to_string(),false])).await?.get())?;
++        Ok(Some(bitcoin::consensus::encode::deserialize_hex(&hex)?))
++    }
++}
++
+ #[async_trait::async_trait]
+ impl swap_machine::xmz_funding::BitcoinLockObserver for BitcoinRpc {
+     async fn unspent(&self, outpoint: bitcoin::OutPoint) -> Result<Option<swap_machine::xmz_funding::BitcoinLockObservation>> {

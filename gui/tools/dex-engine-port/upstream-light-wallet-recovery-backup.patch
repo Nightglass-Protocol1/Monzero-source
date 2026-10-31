@@ -1,0 +1,106 @@
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup/tests.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup/tests.rs
+@@ -68,3 +68,55 @@
+     assert!(!destination.0.join(RECORD).exists());assert_eq!(fs::read(target.0.join("litecoin-address-book.json"))?,before);
+     Ok(())
+ }
++
++
++#[test]
++fn recovery_snapshot_binds_exact_records_and_retries_without_reencryption()->Result<()> {
++    for network in [LightNetwork::Litecoin(LtcNetwork::Regtest),LightNetwork::Bitcoin(BtcNetwork::Regtest),
++        LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
++        let source=Directory::new()?;let allocations=Directory::new()?;
++        let initial=Directory::new()?;let recovered=Directory::new()?;
++        let material=MnemonicMaterial::from_entropy(&[19;32])?;let wallet=Uuid::new_v4();
++        let vault=MnemonicVault::create(&source.0,network,wallet,PASSWORD,&material,"optional passphrase")?;
++        let mut book=AddressBook::create(&allocations.0,material.public_account(network,2,"optional passphrase")?)?;
++        let original=export(&vault,&book,PASSWORD)?;
++        save_verified(&initial.0,&original,PASSWORD,network,wallet)?;
++        verify_current(&original,&vault,&book,PASSWORD)?;
++        let request=Uuid::new_v4();book.reserve(request,Branch::Receive)?;
++        book.retain_discovered([4,3])?;
++        // Authenticated old backups are not sufficient after address discovery.
++        assert!(verify_current(&original,&vault,&book,PASSWORD).is_err());
++        assert!(retain_current(&initial.0,&vault,&book,PASSWORD).is_err());
++        assert_eq!(fs::read(initial.0.join(FILE))?,original);
++        let before=fs::read(allocations.0.join("litecoin-address-book.json"))?;
++        assert!(retain_current(&recovered.0,&vault,&book,b"wrong").is_err());
++        assert!(!recovered.0.join(FILE).exists());
++        let info=retain_current(&recovered.0,&vault,&book,PASSWORD)?;
++        assert_eq!(info.allocated(),[4,3]);
++        let snapshot=fs::read(recovered.0.join(FILE))?;
++        assert_eq!(sha256::Hash::hash(&snapshot),info.digest());
++        // Reopen every handle as after a crash before the caller saved a receipt.
++        drop(vault);drop(book);
++        let vault=MnemonicVault::open(&source.0,network,wallet)?;
++        let mut book=AddressBook::open(&allocations.0,material.public_account(network,2,"optional passphrase")?)?;
++        assert_eq!(retain_current(&recovered.0,&vault,&book,PASSWORD)?.digest(),info.digest());
++        assert_eq!(fs::read(recovered.0.join(FILE))?,snapshot);
++        assert_eq!(fs::read(allocations.0.join("litecoin-address-book.json"))?,before);
++        let duplicate=Directory::new()?;
++        let mut other=AddressBook::create(&duplicate.0,material.public_account(network,2,"optional passphrase")?)?;
++        other.retain_discovered([4,3])?;
++        // Equal counts but different request identities must not pass.
++        assert!(verify_current(&snapshot,&vault,&other,PASSWORD).is_err());
++        let resealed=Directory::new()?;
++        let different=MnemonicVault::create(&resealed.0,network,wallet,PASSWORD,&material,"optional passphrase")?;
++        assert!(verify_current(&snapshot,&different,&book,PASSWORD).is_err());
++        // The refreshed snapshot restores original reservation identities too.
++        let target=Directory::new()?;let target_book=Directory::new()?;
++        let (_,mut restored)=restore(&target.0,&target_book.0,network,wallet,PASSWORD,&snapshot)?;
++        assert_eq!(restored.reserve(request,Branch::Receive)?.address(),book.reserve(request,Branch::Receive)?.address());
++        book.reserve(Uuid::new_v4(),Branch::Receive)?;
++        assert!(retain_current(&recovered.0,&vault,&book,PASSWORD).is_err());
++        assert_eq!(fs::read(recovered.0.join(FILE))?,snapshot);
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup.rs
+--- a/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup.rs
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup.rs
+@@ -71,6 +71,43 @@
+     let journal=Journal::open(directory)?;let bundle=journal.read(FILE)?;
+     let info=inspect(&bundle,password,network,wallet)?;Ok((bundle,info))
+ }
++/// Authenticate a backup against the exact current vault and allocation record.
++/// Counts alone are insufficient: different reservation identities can have the
++/// same counts. This is point-in-time evidence, not proof of complete history.
++pub fn verify_current(bundle:&[u8],vault:&MnemonicVault,book:&AddressBook,password:&[u8])->Result<BackupInfo> {
++    let decoded=decode(bundle,password,vault.network,vault.wallet)?;
++    let (descriptor,record)=book.backup_parts()?;
++    drop(vault.unlock_for_account(password,&descriptor)?);
++    ensure!(decoded.vault==vault.bytes && decoded.book==record
++        && serde_json::to_vec(&decoded.account.descriptor())?==serde_json::to_vec(&descriptor)?,
++        "mnemonic backup does not match current wallet records");
++    Ok(BackupInfo {digest:sha256::Hash::hash(bundle),account:decoded.account,
++        wallet:vault.wallet,allocated:decoded.allocated})
++}
++
++/// Retain an immutable, authenticated snapshot in a caller-selected private
++/// directory. Recovery must use a separate directory from the initial backup.
++/// An interrupted publication can be retried without generating new ciphertext.
++/// An existing stale or conflicting backup is rejected, never overwritten.
++/// This does not activate a wallet or certify scan coverage or trade recovery.
++pub fn retain_current(directory:&Path,vault:&MnemonicVault,book:&AddressBook,password:&[u8])->Result<BackupInfo> {
++    // Authenticate before even opening a destination journal.
++    let (descriptor,_)=book.backup_parts()?;
++    drop(vault.unlock_for_account(password,&descriptor)?);
++    let journal=Journal::open(directory)?;
++    let bundle=match journal.read(FILE) {
++        Ok(bundle)=>bundle,
++        Err(error) if error.downcast_ref::<std::io::Error>()
++            .is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>export(vault,book,password)?,
++        Err(error)=>return Err(error),
++    };
++    verify_current(&bundle,vault,book,password)?;
++    journal.retain(FILE,&bundle)?;
++    let retained=journal.read(FILE)?;
++    ensure!(retained==bundle,"mnemonic recovery backup read-back mismatch");
++    verify_current(&retained,vault,book,password)
++}
++
+ /// Preflight both destinations before publishing either. An interruption may
+ /// leave the vault alone retained; retry the identical bundle to finish safely.
+ pub fn restore(vault_directory:&Path,book_directory:&Path,network:impl Into<LightNetwork>,wallet:Uuid,

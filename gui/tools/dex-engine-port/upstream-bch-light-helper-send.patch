@@ -1,0 +1,189 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_helper.rs
+@@ -38,24 +38,29 @@
+ }
+ #[test]
+ #[ignore="requires explicitly pinned MONZERO_BCH_LIGHT_HELPER and SHA256"]
+-fn bch_local_terms_helper_checks_quote_admission_and_refund_wallet()->Result<()> {helper_fixture(false,None,false)}
++fn bch_local_terms_helper_checks_quote_admission_and_refund_wallet()->Result<()> {helper_fixture(false,None,false,false)}
+ #[test]
+ #[ignore="requires pinned helper/preparation probe and owned BCH node"]
+-fn bch_local_preparation_helper_uses_real_confirmed_wallet_inputs()->Result<()> {helper_fixture(true,None,false)}
++fn bch_local_preparation_helper_uses_real_confirmed_wallet_inputs()->Result<()> {helper_fixture(true,None,false,false)}
+ #[derive(Clone,Copy)]
+ enum SigningFixture {Raw,Mnemonic}
+ #[test]
+ #[ignore="requires pinned signing helper/probe and owned BCH node"]
+ fn bch_local_signing_helper_checks_both_local_vault_formats()->Result<()> {
+-    helper_fixture(true,Some(SigningFixture::Raw),false)?;
+-    helper_fixture(true,Some(SigningFixture::Mnemonic),false)
++    helper_fixture(true,Some(SigningFixture::Raw),false,false)?;
++    helper_fixture(true,Some(SigningFixture::Mnemonic),false,false)
+ }
+ #[test]
+ #[ignore="requires pinned observation helper/probe, owned BCH node and real quote expiry wait"]
+ fn bch_local_observation_helper_tracks_publication_and_quote_expiry()->Result<()> {
+-    helper_fixture(true,Some(SigningFixture::Raw),true)
++    helper_fixture(true,Some(SigningFixture::Raw),true,false)
+ }
+-fn helper_fixture(preparation:bool,signing:Option<SigningFixture>,observation:bool)->Result<()> {
++#[test]
++#[ignore="requires pinned sending helper/probe and owned BCH node"]
++fn bch_local_send_helper_requires_recovery_and_explicit_approval()->Result<()> {
++    helper_fixture(true,Some(SigningFixture::Raw),false,true)
++}
++fn helper_fixture(preparation:bool,signing:Option<SigningFixture>,observation:bool,relay:bool)->Result<()> {
+     let helper=PathBuf::from(std::env::var("MONZERO_BCH_LIGHT_HELPER")?);
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper,"noncanonical helper fixture");
+     ensure!(sha256::Hash::hash(&std::fs::read(&helper)?).to_string()==std::env::var("MONZERO_BCH_LIGHT_HELPER_SHA256")?,
+@@ -102,6 +107,25 @@
+     let approval=agreement::execution::approval::review_admission(&setup.quote,&setup.policy,Role::BchFunder,&pins,base+5)?;
+     drop(AdmittedExecution::admit_reviewed(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder,
+         &approval.commitment,pins.clone(),base+5)?);
++    if relay {
++        let native_meta=PrivateStore::new()?;
++        let (native_peer,native_view,native_initial)=selected_with_outgoing_at(&setup,&snapshots.0,1,base)?;
++        let (native_wallet,native_received)=native_peer.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++            base+3,native_view.commitment(),own.frame(),own.signature())?;
++        let native_ack=native_wallet.acknowledgement(&setup.quote)?;
++        let native_agreed=native_wallet.accept_agreement(&setup.quote,&setup.policy,base+4,&native_ack,
++            &ack_sign(&native_ack,Role::BchFunder),&ack_sign(&native_ack,Role::NativeFunder))?;
++        let native_agreement=agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder,&native_agreed)?;
++        let mut native=AdmittedExecution::admit(&native_meta.0,&snapshots.0,&setup.quote,&setup.policy,
++            Role::NativeFunder,setup.quote.commitment(),NegotiationPins {initial:native_initial,
++                selection:*native_peer.commitment(),outgoing:*native_view.commitment(),received:native_received,
++                agreement:native_agreement},base+5)?;
++        let frame=native.prepare_bch_refund_adaptor(base+6)?;
++        let signature=SigningKey::from_bytes(&[2;32]).sign(&agreement::refund::signing_bytes(&frame)?).to_bytes();
++        let outgoing=native.retain_outgoing_bch_refund(base+7,&signature)?;
++        let mut execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        execution.accept_bch_refund_adaptor(base+8,outgoing.frame(),outgoing.signature())?;
++    }
+     drop(AddressBook::create(&addresses.0,crate::litecoin_light::account::PublicAccount::from_descriptor(&account.descriptor(),BchNetwork::Regtest)?)?);
+     let wallet_path=configs.0.join("wallet.json");let quote_path=configs.0.join("quote.json");let config_path=configs.0.join("dex.json");
+     let wallet=serde_json::json!({"schema":"monzero-private-bch-light-v1","network":"regtest",
+@@ -154,11 +178,17 @@
+         let mut command=Command::new("python");command.arg(probe).arg(&helper).arg(&config_path)
+             .arg(std::env::var("MONZERO_BCH_PREPARATION_NODE")?).arg(&report);
+         if observation {command.arg("--observe");}
++        if relay {command.arg("--send");}
+         let output=command.output()?;
+         ensure!(output.status.success(),"BCH preparation probe failed: {}",String::from_utf8_lossy(&output.stderr));
+         if signing.is_some() {
+             let report:serde_json::Value=serde_json::from_slice(&std::fs::read(report)?)?;
+-            let reopened=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++            let mut reopened=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++            if relay {
++                ensure!(matches!(reopened.bch_funding_relay_state()?,Some(agreement::execution::funding::relay::FundingRelayState::Acknowledged {..})),
++                    "helper send acknowledgement did not survive reopen");
++                reopened.prepare_bch_funding_message(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?;
++            }
+             assert_eq!(reopened.signed_bch_funding()?.context("missing locally signed trade funding")?.transaction().compute_txid().to_string(),
+                 report["signedTxid"].as_str().context("missing signed fixture txid")?);
+         }
+--- a/swap-machine/src/bin/native-ltc-light/bch_dex.rs
++++ b/swap-machine/src/bin/native-ltc-light/bch_dex.rs
+@@ -1,5 +1,5 @@
+ // Private local-wallet BCH DEX boundary. Isolated-chain terms and explicit
+-// preparation/review and separately approved local signing. No publication.
++// preparation/signing, private recovery and separately approved publication.
+ use super::*;
+ use swap_machine::{bch_quote::{Policy,VerifiedBchQuote},
+     bch_key_recovery::authenticated::{Role,native_wallet::agreement::execution::{AdmittedExecution,NegotiationPins}}};
+@@ -25,7 +25,7 @@
+ }
+ pub(super) fn mode(flag:&str)->Option<&str> {
+     let mode=flag.strip_prefix("--bch-dex-funding-")?.strip_suffix("-stdio-v1")?;
+-    ["terms","prepare","review","sign","observe"].contains(&mode).then_some(mode)
++    ["terms","prepare","review","sign","observe","recovery-review","recovery-retain","send-review","send"].contains(&mode).then_some(mode)
+ }
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields,rename_all="camelCase")]
+@@ -40,12 +40,24 @@
+     schema:String,request_id:uuid::Uuid,approved_config_digest:String,
+     maximum_download_headers:u32,maximum_history_entries:usize,payment:Payment,retained_review:RetainedReview,
+ }
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct RecoveryRequest {
++    schema:String,request_id:uuid::Uuid,approved_config_digest:String,approval:Option<String>,
++}
+ pub(super) fn run(path:&Path,mode:&str)->Result<()> {
+     let mut input=Zeroizing::new(Vec::new());std::io::stdin().take(4097).read_to_end(&mut input)?;
+     ensure!(!input.is_empty() && input.len()<=4096,"invalid BCH terms request size");
++    let recovery:Option<RecoveryRequest>=if mode.starts_with("recovery-") {Some(serde_json::from_slice(&input)?)}else{None};
+     let observation:Option<ObservationRequest>=if mode=="observe" {Some(serde_json::from_slice(&input)?)}else{None};
+-    let funding:Option<FundingRequest>=if matches!(mode,"terms"|"observe") {None}else{Some(serde_json::from_slice(&input)?)};
+-    let (request_id,approved)=if let Some(request)=&observation {
++    let funding:Option<FundingRequest>=if matches!(mode,"terms"|"observe") || recovery.is_some() {None}else{Some(serde_json::from_slice(&input)?)};
++    let (request_id,approved)=if let Some(request)=&recovery {
++        ensure!(!request.request_id.is_nil()
++            && request.schema==format!("monzero-bch-light-dex-funding-{mode}-request-v1")
++            && request.approval.is_some()==(mode=="recovery-retain"),"invalid BCH recovery request");
++        if let Some(approval)=&request.approval {digest(approval)?;}
++        (request.request_id,request.approved_config_digest.clone())
++    } else if let Some(request)=&observation {
+         ensure!(request.schema=="monzero-bch-light-dex-funding-observe-request-v1" && !request.request_id.is_nil()
+             && (1..=10_000_000).contains(&request.maximum_download_headers)
+             && (1..=1000).contains(&request.maximum_history_entries),"invalid BCH observation request");
+@@ -87,6 +99,19 @@
+         return output(&json!({"schema":"monzero-bch-light-dex-funding-observe-response-v1","requestId":request_id,
+             "tradeId":dex.trade_id,"configurationDigest":expected,"executable":false,"result":result}));
+     }
++    if let Some(request)=recovery {
++        let review=execution.review_bch_recovery(now()?)?;
++        let mut result=json!({"review":{"details":review.details,"commitment":sha256::Hash::from_byte_array(review.commitment)},
++            "broadcastAuthorized":false,"privateRecoveryRetained":false});
++        if mode=="recovery-retain" {
++            let approved=digest(request.approval.as_deref().context("missing BCH recovery approval")?)?.to_byte_array();
++            let retained=execution.retain_reviewed_bch_recovery(now()?,&approved)?;
++            result["privateRecoveryRetained"]=json!(true);
++            result["recoveryCommitment"]=json!(sha256::Hash::from_byte_array(*retained.commitment()));
++        }
++        return output(&json!({"schema":format!("monzero-bch-light-dex-funding-{mode}-response-v1"),
++            "requestId":request_id,"tradeId":dex.trade_id,"configurationDigest":expected,"executable":false,"result":result}));
++    }
+     let mut terms=execution.light_funding_terms(now()?)?;
+     let wallet=wallet_config.wallet.as_ref().context("missing BCH local wallet")?;
+     let account=PublicAccount::from_descriptor(&wallet.account,network)?;
+@@ -107,12 +132,12 @@
+ }
+ 
+ fn validate(request:&FundingRequest,mode:&str)->Result<()> {
+-    ensure!(matches!(mode,"prepare"|"review"|"sign") && !request.request_id.is_nil()
++    ensure!(matches!(mode,"prepare"|"review"|"sign"|"send-review"|"send") && !request.request_id.is_nil()
+         && request.schema==format!("monzero-bch-light-dex-funding-{mode}-request-v1")
+         && (1..=10_000_000).contains(&request.maximum_download_headers),"invalid BCH preparation request");
+     digest(&request.approved_config_digest)?;
+     ensure!(request.retained_review.is_some()==(mode!="prepare"),"invalid BCH retained review fields");
+-    ensure!(request.approval.is_some()==(mode=="sign") && request.password.is_some()==(mode=="sign"),
++    ensure!(request.approval.is_some()==matches!(mode,"sign"|"send") && request.password.is_some()==(mode=="sign"),
+         "BCH signing requires separate approval and password");
+     if let Some(approval)=&request.approval {digest(approval)?;}
+     if let Some(review)=&request.retained_review {digest(&review.signing_commitment)?;}
+@@ -168,6 +193,25 @@
+     result["unsignedTxid"]=result["txid"].take();result.as_object_mut().context("invalid BCH payment view")?.remove("txid");
+     result["operation"]=json!(mode);result["tradeId"]=json!(dex.trade_id);
+     result["selectedHeight"]=json!(state.chain()?.height());result["broadcastAuthorized"]=json!(false);
++    if matches!(mode,"send-review"|"send") {
++        let expected=prepared.signing_commitment();
++        let inputs=observation.funding_inputs_on(state.chain()?,&prepared,u64::from(dex.policy.bch_confirmations))?;
++        let review=execution.review_light_bch_funding_send(&prepared,state.chain()?,observation.accounting(),
++            &inputs,expected,&target,now()?)?;
++        let signed=prepared.retained_signed()?;
++        result["signed"]=json!(true);result["txid"]=json!(signed.compute_txid());
++        result["tradeFundingRetained"]=json!(true);
++        result["review"]=json!({"details":review.details,"commitment":sha256::Hash::from_byte_array(review.commitment)});
++        result["broadcast"]=json!(false);
++        if mode=="send" {
++            let approved=digest(request.approval.as_deref().context("missing BCH send approval")?)?.to_byte_array();
++            let txid=execution.send_light_bch_funding(&prepared,state.chain()?,observation.accounting(),
++                &inputs,expected,&target,&approved,now()?).await?;
++            ensure!(txid==signed.compute_txid(),"BCH send returned another transaction");
++            result["broadcast"]=json!(true);result["broadcastStatus"]=json!("server-acknowledged");
++            result["confirmationStatus"]=json!("not-confirmed");
++        }
++    }
+     if mode=="sign" {
+         let expected=prepared.signing_commitment();
+         ensure!(digest(request.approval.as_deref().context("missing BCH signing approval")?)?==expected,

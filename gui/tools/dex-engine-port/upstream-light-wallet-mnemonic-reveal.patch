@@ -1,0 +1,83 @@
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -426,6 +426,7 @@
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
+         if args[1]=="--wallet-recovery-stdio-v1" {return recovery::reveal(Path::new(&args[2]));}
++        if args[1]=="--wallet-mnemonic-recovery-stdio-v1" {return recovery::reveal_mnemonic(Path::new(&args[2]));}
+         if args[1]=="--wallet-key-restore-stdio-v1" {return recovery::restore(Path::new(&args[2]));}
+         let mode=match args[1].to_str() {Some("--wallet-create-stdio-v1")=>"wallet-create",Some("--wallet-restore-stdio-v1")=>"wallet-restore",Some("--wallet-backup-save-stdio-v1")=>"wallet-backup-save",Some("--wallet-backup-verify-stdio-v1")=>"wallet-backup-verify",Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
+             Some("--wallet-reconcile-stdio-v1")=>"wallet-reconcile",Some("--wallet-broadcast-stdio-v1")=>"wallet-broadcast",Some("--wallet-broadcast-status-stdio-v1")=>"wallet-broadcast-status",
+diff --git a/swap-machine/src/bin/native-ltc-light/recovery.rs b/swap-machine/src/bin/native-ltc-light/recovery.rs
+--- a/swap-machine/src/bin/native-ltc-light/recovery.rs
++++ b/swap-machine/src/bin/native-ltc-light/recovery.rs
+@@ -38,13 +38,16 @@
+     active_swap_recovery:bool,
+ }
+ 
+-pub(super) fn reveal(path:&Path)->Result<()> {
++pub(super) fn reveal(path:&Path)->Result<()> {reveal_mode(path,false)}
++pub(super) fn reveal_mnemonic(path:&Path)->Result<()> {reveal_mode(path,true)}
++fn reveal_mode(path:&Path,mnemonic:bool)->Result<()> {
++    let operation=if mnemonic {"wallet-mnemonic-recovery"} else {"wallet-recovery"};
+     let mut input=Zeroizing::new(Vec::with_capacity(8193));
+     std::io::stdin().take(8193).read_to_end(&mut input)?;
+     ensure!(!input.is_empty() && input.len()<=8192,"invalid recovery request size");
+     let request:RevealRequest=serde_json::from_slice(&input)?;
+     let tag=["ltc","btc","bch","doge"].into_iter()
+-        .find(|tag|request.schema==format!("monzero-{tag}-light-wallet-recovery-request-v1"))
++        .find(|tag|request.schema==format!("monzero-{tag}-light-{operation}-request-v1"))
+         .context("invalid recovery schema")?;
+     ensure!(!request.request_id.is_nil() && request.reveal_approved,"missing recovery reveal approval");
+     let (_lease,raw)=private_config(path)?;
+@@ -57,6 +60,21 @@
+     let wallet=config.wallet.as_ref().context("missing recovery wallet")?;
+     let public=PublicAccount::from_descriptor(&wallet.account,network)?;
+     let vault_config=wallet.vault.as_ref().context("missing recovery vault")?;
++    if mnemonic {
++        ensure!(matches!(vault_config.seed_encoding,vault_format::VaultFormat::Mnemonic),"wrong recovery format");
++        let vault=swap_machine::litecoin_light::vault::mnemonic::storage::MnemonicVault::open(&vault_config.directory,network,vault_config.wallet_id)?;
++        let unlocked=vault.unlock_for_account(request.password.0.as_bytes(),&wallet.account)?;
++        let phrase=unlocked.material().reveal();
++        let response=MnemonicResponse {schema:format!("monzero-{tag}-light-wallet-mnemonic-recovery-response-v1"),
++            request_id:request.request_id,coin:tag,network:&config.network,wallet_id:vault_config.wallet_id,
++            account:public.account_index(),seed_encoding:"bip39-english-v1",phrase_hex:PrivateHex(phrase.as_bytes()),
++            passphrase_hex:PrivateHex(unlocked.passphrase().as_bytes()),active_swap_recovery:false};
++        let mut output=Zeroizing::new(Vec::with_capacity(4096));
++        serde_json::to_writer(&mut *output,&response)?;
++        ensure!(output.len()<=4096,"oversized private mnemonic response");
++        std::io::stdout().write_all(&output)?;return Ok(());
++    }
++    ensure!(matches!(vault_config.seed_encoding,vault_format::VaultFormat::Raw),"wrong recovery format");
+     let vault=SeedVault::open(&vault_config.directory,network,vault_config.wallet_id)?;
+     let seed=material::reveal(&vault,request.password.0.as_bytes(),&wallet.account)?;
+     let response=RevealResponse {schema:format!("monzero-{tag}-light-wallet-recovery-response-v1"),
+@@ -105,6 +123,7 @@
+     let wallet = config.wallet.as_ref().context("missing recovery wallet")?;
+     let public = PublicAccount::from_descriptor(&wallet.account, network)?;
+     let vault_config = wallet.vault.as_ref().context("missing recovery vault")?;
++    ensure!(matches!(vault_config.seed_encoding,vault_format::VaultFormat::Raw),"wrong recovery format");
+     let seed = RecoverySeed::from_hex(&request.seed_hex.0)?;
+     let vault = seed.restore_vault(&vault_config.directory, network, vault_config.wallet_id,
+         request.password.0.as_bytes(), &wallet.account)?;
+@@ -116,3 +135,19 @@
+     std::io::stdout().write_all(&serde_json::to_vec(&response)?)?;
+     Ok(())
+ }
++
++struct PrivateHex<'a>(&'a [u8]);
++impl std::fmt::Display for PrivateHex<'_> {
++    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
++        for byte in self.0 {write!(f,"{byte:02x}")?;} Ok(())
++    }
++}
++impl Serialize for PrivateHex<'_> {
++    fn serialize<S:serde::Serializer>(&self,serializer:S)->std::result::Result<S::Ok,S::Error> {serializer.collect_str(self)}
++}
++#[derive(Serialize)]
++#[serde(rename_all="camelCase")]
++struct MnemonicResponse<'a> {
++    schema:String,request_id:uuid::Uuid,coin:&'a str,network:&'a str,wallet_id:uuid::Uuid,account:u32,
++    seed_encoding:&'static str,phrase_hex:PrivateHex<'a>,passphrase_hex:PrivateHex<'a>,active_swap_recovery:bool,
++}

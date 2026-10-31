@@ -1,0 +1,141 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index b6d746bcf..1a8ce34c5 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -233,18 +233,20 @@ mod linux {
+         use swap_machine::litecoin_negotiation::execution::recovery_relay::RecoverySpend;
+         let request:Request=serde_json::from_slice(input)?;
+         let recovery=match mode {
+-            "--recovery-cancel-review-stdio-v1"=>Some((RecoverySpend::Cancel,false,"cancel")),
+-            "--recovery-cancel-submit-stdio-v1"=>Some((RecoverySpend::Cancel,true,"cancel")),
+-            "--recovery-refund-review-stdio-v1"=>Some((RecoverySpend::Refund,false,"refund")),
+-            "--recovery-refund-submit-stdio-v1"=>Some((RecoverySpend::Refund,true,"refund")),
++            "--recovery-cancel-review-stdio-v1"=>Some((RecoverySpend::Cancel,"review","cancel")),
++            "--recovery-cancel-submit-stdio-v1"=>Some((RecoverySpend::Cancel,"submit","cancel")),
++            "--recovery-refund-review-stdio-v1"=>Some((RecoverySpend::Refund,"review","refund")),
++            "--recovery-refund-submit-stdio-v1"=>Some((RecoverySpend::Refund,"submit","refund")),
++            "--recovery-cancel-check-stdio-v1"=>Some((RecoverySpend::Cancel,"check","cancel")),
++            "--recovery-refund-check-stdio-v1"=>Some((RecoverySpend::Refund,"check","refund")),
+             _=>None,
+         };
+         let review=mode=="--lock-funding-review-stdio-v1";let submit=mode=="--lock-funding-submit-stdio-v1";
+-        let recovery_schema=recovery.map(|(_,sending,name)|format!("monzero-ltc-recovery-{name}-{}-request-v1",if sending {"submit"} else {"review"}));
++        let recovery_schema=recovery.map(|(_,operation,name)|format!("monzero-ltc-recovery-{name}-{operation}-request-v1"));
+         ensure!(request.schema==if let Some(schema)=recovery_schema.as_deref() {schema} else if review {"monzero-ltc-lock-funding-review-request-v1"}
+             else if submit {"monzero-ltc-lock-funding-submit-request-v1"} else {"monzero-ltc-reservation-prepare-request-v1"}
+             && !request.request_id.is_nil() && request.action.is_none() && request.safety_blocks.is_none()
+-            && request.commitment.is_some()==(submit || recovery.is_some_and(|(_,s,_)|s)) && request.priority.is_none(),"invalid reservation/funding request");
++            && request.commitment.is_some()==(submit || recovery.is_some_and(|(_,s,_)|s=="submit")) && request.priority.is_none(),"invalid reservation/funding request");
+         let (_wrapper,bytes)=private_bytes(path,false)?;
+         let wrapper:ReservationConfig=serde_json::from_slice(&bytes)?;
+         ensure!(wrapper.schema=="monzero-private-ltc-reservation-v1","invalid reservation configuration");
+@@ -261,8 +263,13 @@ mod linux {
+         let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+         let adapter=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
+             LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
+-        if let Some((kind,sending,name))=recovery {
+-            if sending {
++        if let Some((kind,operation,name))=recovery {
++            if operation=="check" {
++                let observation=execution.check_recovery_spend(&adapter,kind).await?;
++                return Ok(serde_json::json!({"schema":format!("monzero-ltc-recovery-{name}-check-response-v1"),
++                    "requestId":request.request_id,"snapshot":execution.saved_status()?,"observation":observation}));
++            }
++            if operation=="submit" {
+                 let approved=parse_commitment(request.commitment.as_deref().context("missing recovery approval")?)?;
+                 let outcome=execution.submit_reviewed_recovery_spend(&adapter,kind,approved).await?;
+                 return Ok(serde_json::json!({"schema":format!("monzero-ltc-recovery-{name}-submit-response-v1"),
+@@ -816,7 +823,7 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
+-        if args.len()==4 && ["--reservation-prepare-stdio-v1","--lock-funding-review-stdio-v1","--lock-funding-submit-stdio-v1","--recovery-cancel-review-stdio-v1","--recovery-cancel-submit-stdio-v1","--recovery-refund-review-stdio-v1","--recovery-refund-submit-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
++        if args.len()==4 && ["--reservation-prepare-stdio-v1","--lock-funding-review-stdio-v1","--lock-funding-submit-stdio-v1","--recovery-cancel-review-stdio-v1","--recovery-cancel-submit-stdio-v1","--recovery-refund-review-stdio-v1","--recovery-refund-submit-stdio-v1","--recovery-cancel-check-stdio-v1","--recovery-refund-check-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
+             let mut input=Vec::new();std::io::stdin().take(513).read_to_end(&mut input)?;
+             ensure!(input.len()<=512,"oversized reservation request");
+             let response=tokio::runtime::Builder::new_current_thread().enable_all().build()?
+diff --git a/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs b/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs
+index 0d42c89af..458e05bea 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs
+@@ -154,6 +154,20 @@ impl Execution {
+         self.metadata.replace_execution_head(self.claim.trade,&dispatched,&serde_json::to_vec(&head)?)?;
+         Ok(RecoveryRelayOutcome::Acknowledged {txid})
+     }
++    /// Fresh indexed observation of the agreed recovery effect. A peer may
++    /// have published the shared cancellation; a local dispatch is not required.
++    pub async fn check_recovery_spend(&mut self,ltc:&LitecoinRpc,kind:RecoverySpend)->Result<serde_json::Value> {
++        let transaction=self.recovery_transaction(kind)?;
++        let (head,_,quote,_,_)=self.load()?;
++        ensure!(ltc.network()==self.policy.ltc_network,"wrong recovery observation network");
++        let minimum=quote.terms()["ltcConfirmations"].parse::<u64>()?.max(u64::from(self.policy.ltc_confirmations));
++        let observed=ltc.indexed_confirmed_transaction(transaction.compute_txid(),minimum).await?;
++        ensure!(super::redeem::same_redemption_effect(&transaction,observed.transaction()),"observed recovery differs from agreement");
++        Ok(serde_json::json!({"schema":"monzero-ltc-recovery-confirmation-v1","tradeId":head.trade,
++            "quoteCommitment":hex(&head.quote),"operation":kind.label(),"txid":transaction.compute_txid(),
++            "wtxid":observed.transaction().compute_wtxid(),"block":observed.block(),"tip":observed.tip(),
++            "confirmations":observed.confirmations().to_string(),"requiredConfirmations":minimum.to_string(),"chainObserved":true}))
++    }
+     /// Fresh chain evidence, including when the peer broadcast the shared
+     /// cancellation first. An acknowledgement or saved depth never suffices.
+     pub async fn observe_recovery_spend(&mut self,ltc:&LitecoinRpc,kind:RecoverySpend,block:BlockHash)->Result<u64> {
+diff --git a/swap-machine/src/litecoin_rpc/confirmed.rs b/swap-machine/src/litecoin_rpc/confirmed.rs
+index 3a1b57ca9..16bde3bd6 100644
+--- a/swap-machine/src/litecoin_rpc/confirmed.rs
++++ b/swap-machine/src/litecoin_rpc/confirmed.rs
+@@ -30,6 +30,17 @@ fn validate(raw:RawTransaction,header:Header,txid:Txid,block:BlockHash,minimum:u
+     Ok(transaction)
+ }
+ impl LitecoinRpc {
++    /// Resolve a block hint using the node transaction index, then perform the
++    /// same active-chain and byte validation as an explicit block lookup.
++    /// Missing index, unconfirmed transactions and stale hints are errors.
++    pub async fn indexed_confirmed_transaction(&self,txid:Txid,minimum:u64)->Result<ConfirmedTransaction> {
++        ensure!(minimum>0,"zero Litecoin transaction confirmation requirement");
++        #[derive(Deserialize)] struct Location {txid:Txid,blockhash:BlockHash}
++        let location:Location=serde_json::from_str(self.rpc(false,"getrawtransaction",
++            json!([txid.to_string(),true])).await?.get())?;
++        ensure!(location.txid==txid,"indexed Litecoin transaction identity differs");
++        self.confirmed_transaction(txid,location.blockhash,minimum).await
++    }
+     /// Explicit block lookup avoids requiring a transaction index. The supplied
+     /// block is only a search hint; active-chain membership is checked by RPC.
+     pub async fn confirmed_transaction(&self,txid:Txid,block:BlockHash,minimum:u64)->Result<ConfirmedTransaction> {
+@@ -77,13 +88,14 @@ mod tests {
+     #[tokio::test]
+     async fn confirmed_transaction_checks_rpc_sequence_and_stable_tip()->Result<()> {
+         use std::{net::TcpListener,io::{BufRead,BufReader,Read,Write}};
+-        for changed in [false,true] {
++        for (indexed,changed) in [(false,false),(false,true),(true,false),(true,true)] {
+             let tx=super::super::validation_tests::fixture().unsigned_tx;
+             let txid=tx.compute_txid();let block=BlockHash::from_byte_array([7;32]);
+             let anchor=LtcSegwitAddress::from_script(LtcNetwork::Regtest,&tx.output[1].script_pubkey)?;
+             let listener=TcpListener::bind("127.0.0.1:0")?;let port=listener.local_addr()?.port();
+             let server=std::thread::spawn(move ||->Result<()> {
+-                let methods=["getblockchaininfo","getblockhash","getrawtransaction","getblockheader","getblockchaininfo","getblockhash"];
++                let mut methods=vec!["getblockchaininfo","getblockhash","getrawtransaction","getblockheader","getblockchaininfo","getblockhash"];
++                if indexed {methods.insert(0,"getrawtransaction");}
+                 for (i,method) in methods.iter().enumerate() {
+                     let (mut socket,_)=listener.accept()?;
+                     socket.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+@@ -97,9 +109,10 @@ mod tests {
+                     let mut body=vec![0;length];reader.read_exact(&mut body)?;let request:Value=serde_json::from_slice(&body)?;
+                     ensure!(request["method"]==*method,"unexpected observation RPC sequence");
+                     let result=match *method {
+-                        "getblockchaininfo"=>json!({"chain":"regtest","bestblockhash":if changed && i==4 {"09".repeat(32)} else {"08".repeat(32)},
++                        "getblockchaininfo"=>json!({"chain":"regtest","bestblockhash":if changed && i==4+usize::from(indexed) {"09".repeat(32)} else {"08".repeat(32)},
+                             "initialblockdownload":false,"softforks":{"csv":{"active":true},"segwit":{"active":true}}}),
+                         "getblockhash"=>{ensure!(request["params"]==json!([0]),"wrong genesis request");json!(LtcNetwork::Regtest.genesis())},
++                        "getrawtransaction" if indexed && i==0=>{ensure!(request["params"]==json!([txid.to_string(),true]),"wrong index lookup");json!({"txid":txid,"blockhash":block})},
+                         "getrawtransaction"=>{ensure!(request["params"]==json!([txid.to_string(),true,block.to_string()]),"wrong transaction lookup");
+                             json!({"in_active_chain":true,"hex":serialize_hex(&tx),"txid":txid,"hash":tx.compute_wtxid(),"blockhash":block,"confirmations":3})},
+                         _=>{ensure!(request["params"]==json!([block.to_string(),true]),"wrong header lookup");json!({"hash":block,"confirmations":3})},
+@@ -110,7 +123,7 @@ mod tests {
+                 Ok(())
+             });
+             let rpc=LitecoinRpc::new(port,"fixture".into(),"fixture".into(),LtcNetwork::Regtest,"fixture".into(),anchor)?;
+-            let result=rpc.confirmed_transaction(txid,block,3).await;
++            let result=if indexed {rpc.indexed_confirmed_transaction(txid,3).await} else {rpc.confirmed_transaction(txid,block,3).await};
+             server.join().unwrap()?;
+             if changed {assert!(result.is_err());} else {
+                 let observed=result?;assert_eq!(observed.transaction().compute_txid(),txid);assert_eq!(observed.confirmations(),3);

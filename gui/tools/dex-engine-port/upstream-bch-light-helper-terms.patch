@@ -1,0 +1,220 @@
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_helper.rs
+@@ -0,0 +1,107 @@
++//! Actual private helper subprocess over an authenticated, admitted BCH exchange.
++use super::*;
++use agreement::execution::{AdmittedExecution,NegotiationPins};
++use crate::litecoin_light::{network::BchNetwork,account::{Branch,allocation::AddressBook},vault::SecretSeed};
++use bitcoin::hashes::sha256;
++use std::{collections::BTreeMap,io::Write,os::unix::fs::OpenOptionsExt,path::{Path,PathBuf},process::{Command,Stdio}};
++fn write_new(path:&Path,bytes:&[u8])->Result<()> {
++    let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
++    file.write_all(bytes)?;file.sync_all()?;Ok(())
++}
++fn inventory(paths:&[&Path])->Result<BTreeMap<PathBuf,sha256::Hash>> {
++    let mut files=BTreeMap::new();
++    for path in paths {for entry in std::fs::read_dir(path)? {
++        let path=entry?.path();files.insert(path.clone(),sha256::Hash::hash(&std::fs::read(path)?));
++    }}Ok(files)
++}
++fn context(config:&[u8],wallet:&[u8],quote:&[u8])->Result<String> {
++    Ok(sha256::Hash::hash(&serde_json::to_vec(&serde_json::json!({"schema":"monzero-bch-light-dex-context-v1",
++        "dexDigest":sha256::Hash::hash(config),"walletDigest":sha256::Hash::hash(wallet),
++        "quoteDigest":sha256::Hash::hash(quote)}))?).to_string())
++}
++fn invoke(helper:&Path,path:&Path,request:&serde_json::Value,success:bool)->Result<serde_json::Value> {
++    let mut child=Command::new(helper).arg("--bch-dex-funding-terms-stdio-v1").arg(path)
++        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++    child.stdin.take().context("missing helper stdin")?.write_all(&serde_json::to_vec(request)?)?;
++    let output=child.wait_with_output()?;
++    ensure!(output.status.success()==success,"unexpected BCH light terms helper outcome");
++    if !success {
++        ensure!(output.stdout.is_empty() && output.stderr==b"Litecoin light-chain request failed; reload validated state before retrying\n",
++            "failed BCH terms disclosed unexpected output");
++        return Ok(serde_json::Value::Null)
++    }
++    ensure!(output.stderr.is_empty() && output.stdout.len()<=4096,"unexpected BCH terms output");
++    let response:serde_json::Value=serde_json::from_slice(&output.stdout)?;
++    assert_eq!(response["schema"],"monzero-bch-light-dex-funding-terms-response-v1");
++    assert_eq!(response["requestId"],request["requestId"]);assert_eq!(response["executable"],false);
++    Ok(response)
++}
++#[test]
++#[ignore="requires explicitly pinned MONZERO_BCH_LIGHT_HELPER and SHA256"]
++fn bch_local_terms_helper_checks_quote_admission_and_refund_wallet()->Result<()> {
++    let helper=PathBuf::from(std::env::var("MONZERO_BCH_LIGHT_HELPER")?);
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper,"noncanonical helper fixture");
++    ensure!(sha256::Hash::hash(&std::fs::read(&helper)?).to_string()==std::env::var("MONZERO_BCH_LIGHT_HELPER_SHA256")?,
++        "BCH light helper fixture digest mismatch");
++    let clock=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();let base=clock-30;
++    let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([44;32]));
++    let account=seed.public_account(BchNetwork::Regtest,0)?;
++    let refund=account.derive(Branch::Receive,0)?;
++    let network=crate::bch_rpc::BchNetwork::Regtest {checkpoint_height:1,checkpoint:bitcoin::BlockHash::from_byte_array([7;32])};
++    let setup=Setup::with_context_and_refund(Some(network),base,base+3500,None,Some(refund.address().script_pubkey()))?;
++    let snapshots=PrivateStore::new()?;let metadata=PrivateStore::new()?;let addresses=PrivateStore::new()?;let configs=PrivateStore::new()?;
++    let (selected,own,initial)=selected_with_outgoing_at(&setup,&snapshots.0,0,base)?;
++    let (_,peer,_)=selected_with_outgoing_at(&setup,&snapshots.0,1,base)?;
++    let (wallet,received)=selected.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++        base+3,own.commitment(),peer.frame(),peer.signature())?;
++    let ack=wallet.acknowledgement(&setup.quote)?;
++    let agreed=wallet.accept_agreement(&setup.quote,&setup.policy,base+4,&ack,
++        &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++    let agreement=agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder,&agreed)?;
++    let pins=NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
++    let approval=agreement::execution::approval::review_admission(&setup.quote,&setup.policy,Role::BchFunder,&pins,base+5)?;
++    drop(AdmittedExecution::admit_reviewed(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder,
++        &approval.commitment,pins.clone(),base+5)?);
++    drop(AddressBook::create(&addresses.0,seed.public_account(BchNetwork::Regtest,0)?)?);
++    let wallet_path=configs.0.join("wallet.json");let quote_path=configs.0.join("quote.json");let config_path=configs.0.join("dex.json");
++    let wallet=serde_json::json!({"schema":"monzero-private-bch-light-v1","network":"regtest",
++        "cacheDirectory":configs.0.join("unused-cache"),"maximumHeight":10000,"endpoint":null,
++        "wallet":{"account":account.descriptor(),"addressBookDirectory":addresses.0,"spendDirectory":null,"vault":null}});
++    let mut config=serde_json::json!({"schema":"monzero-private-bch-light-dex-v1","walletConfigFile":wallet_path,
++        "quoteFile":quote_path,"quoteCommitment":hex(setup.quote.commitment()),"admittedAt":base,
++        "identityPins":[SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++        "policy":setup.policy,"tradeId":setup.quote.terms()["swapId"],"metadataDirectory":metadata.0,
++        "snapshotDirectory":snapshots.0,"negotiationPins":pins});
++    let wallet_bytes=serde_json::to_vec(&wallet)?;let quote_bytes=setup.quote.record()?;let config_bytes=serde_json::to_vec(&config)?;
++    write_new(&wallet_path,&wallet_bytes)?;write_new(&quote_path,&quote_bytes)?;write_new(&config_path,&config_bytes)?;
++    let mut request=serde_json::json!({"schema":"monzero-bch-light-dex-funding-terms-request-v1",
++        "requestId":uuid::Uuid::new_v4(),"approvedConfigDigest":context(&config_bytes,&wallet_bytes,&quote_bytes)?});
++    let stores=[snapshots.0.as_path(),metadata.0.as_path(),addresses.0.as_path()];
++    let before=inventory(&stores)?;invoke(&helper,&config_path,&request,false)?;assert_eq!(inventory(&stores)?,before);
++    let mut book=AddressBook::open(&addresses.0,seed.public_account(BchNetwork::Regtest,0)?)?;
++    book.reserve(uuid::Uuid::new_v4(),Branch::Receive)?;drop(book);
++    let before=inventory(&stores)?;
++    let response=invoke(&helper,&config_path,&request,true).context("allocated BCH wallet terms")?;
++    assert_eq!(response["configurationDigest"],request["approvedConfigDigest"]);
++    assert_eq!(response["result"]["refundAddress"],refund.address().to_string());
++    assert_eq!(response["result"]["amountAtomic"],setup.quote.recovery_plan().terms().locked_atoms.to_string());
++    let contract=crate::litecoin_light::network::LightAddress::parse(BchNetwork::Regtest,response["result"]["contractAddress"].as_str().unwrap())?;
++    assert_eq!(contract.script_pubkey(),&setup.quote.recovery_plan().lock().script_pubkey());
++    assert_eq!(response["result"]["broadcastAuthorized"],false);assert_eq!(response["result"]["watchOnly"],true);
++    assert_eq!(inventory(&stores)?,before);assert!(!configs.0.join("unused-cache").exists());
++    let good=request.clone();request["approvedConfigDigest"]=serde_json::json!("00".repeat(32));
++    invoke(&helper,&config_path,&request,false)?;request=good.clone();
++    request["password"]=serde_json::json!("unexpected secret field");invoke(&helper,&config_path,&request,false)?;request=good;
++    // Flip, do not assume the saved commitment's first byte was nonzero.
++    config["negotiationPins"]["initial"][0]=serde_json::json!(pins.initial[0]^1);
++    let bad=serde_json::to_vec(&config)?;std::fs::write(&config_path,&bad)?;
++    request["approvedConfigDigest"]=serde_json::json!(context(&bad,&wallet_bytes,&quote_bytes)?);
++    invoke(&helper,&config_path,&request,false)?;std::fs::write(&config_path,&config_bytes)?;
++    request["approvedConfigDigest"]=serde_json::json!(context(&config_bytes,&wallet_bytes,&quote_bytes)?);
++    let mut wrong_wallet=wallet.clone();wrong_wallet["network"]=serde_json::json!("main");
++    let wrong=serde_json::to_vec(&wrong_wallet)?;std::fs::write(&wallet_path,&wrong)?;
++    request["approvedConfigDigest"]=serde_json::json!(context(&config_bytes,&wrong,&quote_bytes)?);
++    invoke(&helper,&config_path,&request,false)?;std::fs::write(&wallet_path,&wallet_bytes)?;
++    assert_eq!(inventory(&stores)?,before);assert!(!configs.0.join("unused-cache").exists());
++    Ok(())
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -1029,3 +1029,6 @@
+ 
+ #[cfg(target_os="linux")]
+ mod light_send;
++
++#[cfg(target_os="linux")]
++mod light_helper;
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/bch_dex.rs
+@@ -0,0 +1,60 @@
++// Private local-wallet BCH DEX boundary. Terms are read-only and isolated-chain
++// only; they cannot reserve inputs, unlock keys, sign or authorize publication.
++use super::*;
++use swap_machine::{bch_quote::{Policy,VerifiedBchQuote},
++    bch_key_recovery::authenticated::{Role,native_wallet::agreement::execution::{AdmittedExecution,NegotiationPins}}};
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct DexConfig {
++    schema:String,wallet_config_file:PathBuf,quote_file:PathBuf,quote_commitment:String,
++    admitted_at:u64,identity_pins:[[u8;32];2],policy:Policy,trade_id:uuid::Uuid,
++    metadata_directory:PathBuf,snapshot_directory:PathBuf,negotiation_pins:NegotiationPins,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct TermsRequest {schema:String,request_id:uuid::Uuid,approved_config_digest:String}
++fn digest(value:&str)->Result<sha256::Hash> {
++    let digest:sha256::Hash=value.parse()?;
++    ensure!(digest.to_string()==value,"noncanonical BCH DEX digest");Ok(digest)
++}
++fn context_digest(dex:&[u8],wallet:&[u8],quote:&[u8])->Result<sha256::Hash> {
++    Ok(sha256::Hash::hash(&serde_json::to_vec(&json!({"schema":"monzero-bch-light-dex-context-v1",
++        "dexDigest":sha256::Hash::hash(dex),"walletDigest":sha256::Hash::hash(wallet),
++        "quoteDigest":sha256::Hash::hash(quote)}))?))
++}
++pub(super) fn terms(path:&Path)->Result<()> {
++    let mut input=Zeroizing::new(Vec::new());std::io::stdin().take(4097).read_to_end(&mut input)?;
++    ensure!(!input.is_empty() && input.len()<=4096,"invalid BCH terms request size");
++    let request:TermsRequest=serde_json::from_slice(&input)?;drop(input);
++    ensure!(request.schema=="monzero-bch-light-dex-funding-terms-request-v1" && !request.request_id.is_nil(),
++        "invalid BCH funding terms request");
++    let (_dex_lease,dex_bytes)=private_config(path)?;
++    let dex:DexConfig=serde_json::from_slice(&dex_bytes)?;
++    ensure!(dex.schema=="monzero-private-bch-light-dex-v1" && !dex.trade_id.is_nil()
++        && dex.policy.bch_network=="bch-regtest","BCH light DEX requires isolated regtest");
++    let (_wallet_lease,wallet_bytes)=private_config(&dex.wallet_config_file)?;
++    let (_quote_lease,quote_bytes)=private_config_limit(&dex.quote_file,16384)?;
++    let expected=context_digest(&dex_bytes,&wallet_bytes,&quote_bytes)?;
++    ensure!(expected==digest(&request.approved_config_digest)?,"BCH light DEX configuration changed");
++    let wallet_config=parse_config(&wallet_bytes,"bch")?;
++    let network=network_for("bch",&wallet_config.network)?;
++    ensure!(network==LightNetwork::from(BchNetwork::Regtest),"wrong BCH DEX wallet network");
++    let quote=VerifiedBchQuote::restore_record(&quote_bytes,&dex.policy,dex.admitted_at,
++        &dex.identity_pins[0],&dex.identity_pins[1],&digest(&dex.quote_commitment)?.to_byte_array())?;
++    ensure!(quote.terms()["bchGenesis"]==network.genesis(),"BCH DEX quote has another genesis");
++    ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==dex.trade_id,"BCH DEX quote belongs to another trade");
++    let execution=AdmittedExecution::resume(&dex.metadata_directory,&dex.snapshot_directory,
++        &quote,&dex.policy,Role::BchFunder)?;
++    execution.saved_admission_review(&dex.negotiation_pins)?;
++    let mut terms=execution.light_funding_terms(now()?)?;
++    let wallet=wallet_config.wallet.as_ref().context("missing BCH local wallet")?;
++    let account=PublicAccount::from_descriptor(&wallet.account,network)?;
++    let book=AddressBook::open(&wallet.address_book_directory,PublicAccount::from_descriptor(&wallet.account,network)?)?;
++    let refund=LightAddress::from_script(network,&quote.recovery_plan().terms().bch_funder_refund)?;
++    book.require_allocated_address(&account,&refund)?;
++    terms["refundAddress"]=json!(refund.to_string());
++    terms["contractAddress"]=json!(LightAddress::from_script(network,&quote.recovery_plan().lock().script_pubkey())?.to_string());
++    output(&json!({"schema":"monzero-bch-light-dex-funding-terms-response-v1","requestId":request.request_id,
++        "tradeId":dex.trade_id,"configurationDigest":expected,"executable":false,"result":terms}))
++}
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -84,13 +84,17 @@
+     struct WalletScan {gap:u32,addresses_per_branch:u32,history_entries_per_branch:usize}
+     fn now() -> Result<u64> {Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())}
+     fn private_config(path: &Path) -> Result<(File,Vec<u8>)> {
++        private_config_limit(path,4096)
++    }
++    fn private_config_limit(path:&Path,limit:u64)->Result<(File,Vec<u8>)> {
++        ensure!((1..=16384).contains(&limit),"invalid private configuration limit");
+         ensure!(path.is_absolute() && path.canonicalize()?==path,"noncanonical light-chain configuration");
+         let file=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC|libc::O_NONBLOCK).open(path)?;
+         let before=file.metadata()?;
+         ensure!(before.is_file() && before.uid()==unsafe {libc::geteuid()} && before.nlink()==1
+-            && before.mode()&0o7777==0o600 && before.len()>0 && before.len()<=4096,"unsafe light-chain configuration");
++            && before.mode()&0o7777==0o600 && before.len()>0 && before.len()<=limit,"unsafe light-chain configuration");
+         file.try_lock()?;
+-        let mut bytes=Vec::new();(&file).take(4097).read_to_end(&mut bytes)?;
++        let mut bytes=Vec::new();(&file).take(limit+1).read_to_end(&mut bytes)?;
+         let after=file.metadata()?;let named=std::fs::symlink_metadata(path)?;
+         ensure!(named.is_file() && (named.dev(),named.ino())==(before.dev(),before.ino())
+             && bytes.len() as u64==before.len() && after.len()==before.len()
+@@ -420,6 +424,7 @@
+             "allocationFreshness":"unassessed","activeSwapRecovery":false}))
+     }
+     mod dex { include!("native-ltc-light/dex.rs"); }
++    mod bch_dex { include!("native-ltc-light/bch_dex.rs"); }
+     mod backup_import { include!("native-ltc-light/backup_import.rs"); }
+     mod vault_format { include!("native-ltc-light/vault_format.rs"); }
+     mod recovery { include!("native-ltc-light/recovery.rs"); }
+@@ -434,6 +439,7 @@
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
++        if args[1]=="--bch-dex-funding-terms-stdio-v1" {return bch_dex::terms(Path::new(&args[2]));}
+         if let Some(mode)=args[1].to_str().and_then(dex::mode) {return dex::run(Path::new(&args[2]),mode);}
+         if args[1]=="--wallet-backup-preview-stdio-v1" {return backup_import::run(Path::new(&args[2]),false);}
+         if args[1]=="--wallet-backup-import-stdio-v1" {return backup_import::run(Path::new(&args[2]),true);}

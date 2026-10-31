@@ -1,0 +1,53 @@
+--- a/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs
++++ b/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs
+@@ -197,6 +197,7 @@
+     }
+     impl Drop for Fixture { fn drop(&mut self) { for task in &self.tasks { task.abort(); } } }
+     impl Fixture {
++        pub(crate) fn rpc_ports(&self)->(u16,u16) { (self.ports[0],self.ports[1]) }
+         pub(crate) fn funding_client(&self)->Result<NativeFundingRpc> {
+             NativeFundingRpc::new(self.ports[0],self.ports[1],"fixture".into(),"fixture".into())
+         }
+@@ -248,6 +249,11 @@
+                         let method=request["method"].as_str().context("missing native fixture method")?;
+                         calls.lock().unwrap().push(method.into());
+                         let result=match method {
++                            "get_info"=>{
++                                ensure!(!authenticated,"isolation query requires daemon endpoint");
++                                json!({"nettype":"fakechain","offline":true,
++                                    "incoming_connections_count":0,"outgoing_connections_count":0})
++                            },
+                             "get_block_header_by_height"=>json!({"block_header":{"hash":genesis}}),
+                             "get_version"=>json!({"version":(3u64<<16)|7}),
+                             "get_last_block_header"=>json!({"block_header":{"hash":"ef".repeat(32),"height":109}}),
+@@ -292,7 +298,7 @@
+                         };
+                         if method=="relay_tx" && lose_reply.swap(false,Ordering::SeqCst) { continue; }
+                         if method=="transfer" && lose_preparation_reply.swap(false,Ordering::SeqCst) { continue; }
+-                        let body=serde_json::to_vec(&json!({"jsonrpc":"2.0","id":"native-funding","result":result}))?;
++                        let body=serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"result":result}))?;
+                         let header=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                         stream.write_all(header.as_bytes()).await?;stream.write_all(&body).await?;
+                     }
+@@ -301,6 +307,21 @@
+             let relay=NativeTransferRelay::new(NativeFundingRpc::new(ports[0],ports[1],"fixture".into(),"fixture".into())?);
+             Ok(Self {relay,calls,confirmed,incoming,incoming_unlock,lose_reply,lose_preparation_reply,preparation_intent,relay_intent,balance_available,ports,tasks})
+         }
++    }
++
++    #[tokio::test]
++    async fn native_fixture_exposes_isolated_daemon_without_wallet_calls()->Result<()> {
++        let wallet=super::super::tests::address();
++        let fixture=Fixture::new(wallet.clone(),wallet,"a".repeat(64),100,2).await?;
++        let (daemon,wallet)=fixture.rpc_ports();assert_ne!(daemon,wallet);
++        let response:Value=reqwest::Client::builder().no_proxy().build()?
++            .post(format!("http://127.0.0.1:{daemon}/json_rpc"))
++            .json(&json!({"jsonrpc":"2.0","id":"bch-native-isolation","method":"get_info"}))
++            .send().await?.error_for_status()?.json().await?;
++        assert_eq!(response,json!({"jsonrpc":"2.0","id":"bch-native-isolation","result":{
++            "nettype":"fakechain","offline":true,"incoming_connections_count":0,"outgoing_connections_count":0}}));
++        assert_eq!(*fixture.calls.lock().unwrap(),vec!["get_info"]);
++        Ok(())
+     }
+ 
+     #[tokio::test]

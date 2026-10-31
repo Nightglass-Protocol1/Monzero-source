@@ -1,0 +1,342 @@
+--- a/swap-machine/src/bch_rpc.rs
++++ b/swap-machine/src/bch_rpc.rs
+@@ -1,4 +1,4 @@
+-//! Read-only RPC for a caller-authenticated, owned loopback Bitcoin Cash Node.
++//! RPC for a caller-authenticated, owned loopback Bitcoin Cash Node.
+ //! Authenticate the local process before supplying credentials. RPC identity
+ //! checks cannot authenticate a port or prove consensus activation/settlement.
+ //! Reviewed against BCHN v29.0.0, commit 89a591f7c5b1fd110c0819377ad8f2647d656800.
+@@ -13,7 +13,7 @@
+ #[derive(Clone,Copy)]
+ pub enum BchNetwork { Mainnet, Testnet, Regtest { checkpoint_height: u64, checkpoint: BlockHash } }
+ impl BchNetwork {
+-    pub fn quote_name(self) -> &'static str {match self {Self::Mainnet=>"mainnet",Self::Testnet=>"testnet",Self::Regtest{..}=>"regtest"}}
++    pub fn quote_name(self) -> &'static str {match self {Self::Mainnet=>"bch-mainnet",Self::Testnet=>"bch-testnet",Self::Regtest{..}=>"bch-regtest"}}
+     fn chain(self) -> &'static str {match self {Self::Mainnet=>"main",Self::Testnet=>"test",Self::Regtest{..}=>"regtest"}}
+     fn prefix(self) -> &'static str {match self {Self::Mainnet=>"bitcoincash:",Self::Testnet=>"bchtest:",Self::Regtest{..}=>"bchreg:"}}
+     pub fn genesis(self) -> &'static str {match self {
+@@ -161,5 +161,6 @@
+         && ScriptBuf::from_hex(&output.script.hex)?==expected.script_pubkey,"BCH input observation differs from retained source or maturity policy");
+     Ok(())
+ }
++mod locks;
+ #[cfg(test)]
+ mod tests;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
+@@ -1,9 +1,11 @@
+-//! Retained unsigned funding preparation and local input claims, not wallet locking, approval,
+-//! signing permission or relay state. Snapshot publication precedes metadata.
++//! Retained unsigned funding preparation and local input claims. Advisory wallet
++//! locking lives in `locks`; neither path grants approval, signing or relay rights.
++//! Snapshot publication precedes metadata.
+ use super::*;
+ use swap_core::bch::funding::FundingPreview;
+ 
+ mod claims;
++mod locks;
+ 
+ const TEMPLATE: &str = "monzero-bch-funding-template-v1";
+ const PIN: &str = "monzero-bch-funding-pin-v2";
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -16,7 +16,16 @@
+ }
+ impl Setup {
+     fn new() -> Result<Self> {
+-        let (policy,terms) = fixture(); let quote = signed(&terms,&policy,1000)?;
++        Self::with_network(None)
++    }
++    fn with_network(network: Option<crate::bch_rpc::BchNetwork>) -> Result<Self> {
++        let (mut policy,mut terms) = fixture();
++        if let Some(network) = network {
++            policy.bch_network = network.quote_name().into(); policy.bch_genesis = network.genesis().into();
++            terms.insert("bchNetwork".into(),policy.bch_network.clone());
++            terms.insert("bchGenesis".into(),policy.bch_genesis.clone());
++        }
++        let quote = signed(&terms,&policy,1000)?;
+         let mut setup = Self {policy,quote,spend:vec![],view:vec![],frames:vec![],signatures:vec![]};
+         for role in [Role::BchFunder,Role::NativeFunder] {
+             let scalar = monero::Scalar::random(&mut rand::thread_rng());
+@@ -803,3 +812,6 @@
+     }
+     Ok(())
+ }
++
++#[cfg(target_os="linux")]
++mod wallet_locks;
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/locks.rs
+@@ -0,0 +1,43 @@
++//! Advisory wallet locks; no signing, relay, unlock or implicit RPC retry.
++use super::*;
++use bitcoin::OutPoint;
++use std::collections::BTreeSet;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct RpcOutPoint { txid: bitcoin::Txid, vout: u32 }
++
++impl BchRpc {
++    /// Stable deployment binding, deliberately excluding rotatable credentials.
++    pub(crate) fn deployment_commitment(&self) -> Result<[u8;32]> {
++        let (height, checkpoint) = self.network.checkpoint()?;
++        let bytes = serde_json::to_vec(&json!({
++            "schema":"monzero-bch-wallet-deployment-v1", "host":"127.0.0.1", "port":self.port,
++            "network":self.network.quote_name(), "genesis":self.network.genesis(),
++            "checkpointHeight":height, "checkpoint":checkpoint, "wallet":self.wallet,
++            "anchor":self.anchor_address, "script":self.anchor_script.to_hex_string(), "subversion":self.subversion
++        }))?;
++        Ok(sha256::Hash::hash(&bytes).to_byte_array())
++    }
++
++    pub(crate) async fn locked_outpoints(&self) -> Result<BTreeSet<OutPoint>> {
++        let raw = self.rpc(true,"listlockunspent",json!([])).await?;
++        let parsed: Vec<RpcOutPoint> = serde_json::from_str(raw.get())?;
++        let outputs: Vec<_> = parsed.into_iter().map(|p|OutPoint {txid:p.txid,vout:p.vout}).collect();
++        let unique: BTreeSet<_> = outputs.iter().copied().collect();
++        ensure!(unique.len() == outputs.len() && outputs.iter().all(|p| !p.is_null()),
++            "invalid or duplicate BCH wallet locks");
++        Ok(unique)
++    }
++
++    pub(crate) async fn lock_inputs(&self, outputs: &[OutPoint]) -> Result<()> {
++        ensure!(!outputs.is_empty() && outputs.len() <= 128
++            && outputs.iter().all(|p| !p.is_null())
++            && outputs.iter().copied().collect::<BTreeSet<_>>().len() == outputs.len(),
++            "invalid BCH wallet lock request");
++        let outputs: Vec<_> = outputs.iter().map(|p|json!({"txid":p.txid,"vout":p.vout})).collect();
++        let raw = self.rpc(true,"lockunspent",json!([false,outputs])).await?;
++        ensure!(serde_json::from_str::<bool>(raw.get())?,"BCH wallet did not acknowledge input locks");
++        Ok(())
++    }
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/locks.rs
+@@ -0,0 +1,59 @@
++//! An immutable intent precedes wallet mutation. Failed/ambiguous operations
++//! leave it intact for explicit reconciliation, never unlock or input reselection.
++use super::*;
++use crate::bch_rpc::{BchRpc,FundingInputsObservation};
++
++const LOCK: &str = "monzero-bch-wallet-lock-intent-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Intent {
++    schema: String, admission: [u8;32], preparation: [u8;32], deployment: [u8;32],
++    change_address: String, minimum_confirmations: u64, admitted_at: u64,
++}
++
++impl AdmittedExecution<'_> {
++    /// The caller must exclusively control the wallet and use one metadata
++    /// directory for all trades. BCHN locks are advisory and disappear on node
++    /// restart; another wallet controller can override them. A returned snapshot
++    /// is not signing/relay authority. Call again explicitly to reconcile after
++    /// an ambiguous result; only missing original inputs are ever locked.
++    pub async fn lock_bch_funding_inputs(&mut self, backend: &BchRpc, now: u64,
++        change_address: &str, minimum_confirmations: u64) -> Result<FundingInputsObservation> {
++        self.quote.check_policy(self.policy,now)?;
++        ensure!(backend.network().quote_name() == self.quote.terms()["bchNetwork"]
++            && backend.network().genesis() == self.quote.terms()["bchGenesis"],
++            "BCH backend differs from admitted quote chain");
++        let prepared = self.prepared_bch_funding()?.context("BCH funding preparation is absent")?;
++        ensure!(now >= prepared.prepared_at,"BCH wallet locking predates preparation");
++        ensure!(minimum_confirmations > 0 && change_address.len() <= 200,"invalid BCH wallet lock policy");
++        let mut intent = Intent {schema:LOCK.into(),admission:self.admission_digest()?,
++            preparation:prepared.commitment,deployment:backend.deployment_commitment()?,
++            change_address:change_address.into(),minimum_confirmations,admitted_at:now};
++        let name = record_name(self.quote,"wallet-lock-intent");
++        let existing = match self.metadata.read(&name) {
++            Ok(bytes) => {
++                ensure!(bytes.len() <= 4096,"oversized BCH wallet lock intent");
++                let retained: Intent = serde_json::from_slice(&bytes)?;
++                ensure!(retained.admitted_at >= prepared.prepared_at && now >= retained.admitted_at,
++                    "BCH wallet lock time moved backwards");
++                intent.admitted_at = retained.admitted_at;
++                ensure!(serde_json::to_vec(&intent)? == bytes,"BCH wallet lock intent changed");
++                true
++            },
++            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound) => false,
++            Err(error) => return Err(error),
++        };
++        backend.observe_funding_inputs(prepared.preview(),change_address,minimum_confirmations).await?;
++        let selected: Vec<_> = prepared.preview().transaction().input.iter().map(|i|i.previous_output).collect();
++        let locked = backend.locked_outpoints().await?;
++        ensure!(existing || selected.iter().all(|p| !locked.contains(p)),
++            "BCH inputs are already locked without this trade's wallet lock intent");
++        self.metadata.retain(&name,&serde_json::to_vec(&intent)?)?;
++        let missing: Vec<_> = selected.iter().filter(|p| !locked.contains(p)).copied().collect();
++        if !missing.is_empty() { backend.lock_inputs(&missing).await?; }
++        let observed = backend.observe_funding_inputs(prepared.preview(),change_address,minimum_confirmations).await?;
++        let locked = backend.locked_outpoints().await?;
++        ensure!(selected.iter().all(|p| locked.contains(p)),"BCH wallet locks were not retained");
++        Ok(observed)
++    }
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+@@ -0,0 +1,164 @@
++use super::*;
++use agreement::execution::{AdmittedExecution,NegotiationPins};
++use crate::bch_rpc::{BchNetwork,BchRpc};
++use bitcoin::BlockHash;
++use serde_json::{json,Value};
++use std::{io::{BufRead,BufReader,Read,Write},net::TcpListener,
++    sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
++
++#[derive(Default)]
++struct State { locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8 }
++struct Server {
++    port: u16, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>,
++    thread: Option<std::thread::JoinHandle<Result<()>>>,
++}
++impl Drop for Server {
++    fn drop(&mut self) {
++        self.stop.store(true,Ordering::Relaxed);
++        self.thread.take().unwrap().join().unwrap().unwrap();
++    }
++}
++impl Server {
++    fn start(script: bitcoin::ScriptBuf, outpoint: OutPoint, intent: std::path::PathBuf,
++        network: BchNetwork) -> Result<Self> {
++        let listener = TcpListener::bind("127.0.0.1:0")?;
++        listener.set_nonblocking(true)?;
++        let port = listener.local_addr()?.port();
++        let state = Arc::new(Mutex::new(State::default())); let shared = state.clone();
++        let stop = Arc::new(AtomicBool::new(false)); let signal = stop.clone();
++        let thread = std::thread::spawn(move || -> Result<()> {
++            while !signal.load(Ordering::Relaxed) {
++                let (mut socket,_) = match listener.accept() {
++                    Ok(pair) => pair,
++                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
++                        std::thread::sleep(std::time::Duration::from_millis(2)); continue;
++                    }, Err(e) => return Err(e.into()),
++                };
++                socket.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
++                socket.set_write_timeout(Some(std::time::Duration::from_secs(3)))?;
++                let mut reader = BufReader::new(socket.try_clone()?);
++                let mut line = String::new(); reader.read_line(&mut line)?;
++                let path = line.split_whitespace().nth(1).context("missing path")?.to_owned();
++                let mut length = None;
++                loop {
++                    line.clear(); ensure!(reader.read_line(&mut line)? > 0,"missing headers");
++                    if line == "\r\n" { break; }
++                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
++                        length = Some(v.trim().parse::<usize>()?);
++                    }
++                }
++                let length = length.context("missing length")?; ensure!(length < 4096,"large request");
++                let mut body = vec![0;length]; reader.read_exact(&mut body)?;
++                let request: Value = serde_json::from_slice(&body)?;
++                let method = request["method"].as_str().context("missing method")?;
++                let wallet = matches!(method,"getwalletinfo"|"getaddressinfo"|"listlockunspent"|"lockunspent");
++                ensure!(path == if wallet {"/wallet/test"} else {"/"},"incorrect wallet path");
++                let mut state = shared.lock().unwrap();
++                let point = json!({"txid":outpoint.txid,"vout":outpoint.vout});
++                let result = match method {
++                    "getnetworkinfo" => json!({"subversion":"/Bitcoin Cash Node:29.0.0/","networkactive":true}),
++                    "getblockchaininfo" => json!({"chain":"regtest","blocks":200,"headers":200,
++                        "initialblockdownload":false,"bestblockhash":"08".repeat(32)}),
++                    "getblockhash" => json!(if request["params"][0] == 0 {network.genesis().into()} else {"07".repeat(32)}),
++                    "getwalletinfo" => json!({"walletname":"test","private_keys_enabled":true}),
++                    "getaddressinfo" => json!({"ismine":true,"iswatchonly":false,"scriptPubKey":script.to_hex_string()}),
++                    "gettxout" => {
++                        ensure!(request["params"] == json!([outpoint.txid,outpoint.vout,true]),"wrong funding input");
++                        json!({"bestblock":"08".repeat(32),"confirmations":100,"value":0.00111,"coinbase":false,
++                            "scriptPubKey":{"hex":script.to_hex_string(),"addresses":["bchreg:qinput"]}})
++                    },
++                    "listlockunspent" => match state.malformed {
++                        1 => Value::Null, 2 => json!([point.clone(),point]),
++                        3 => json!([{"txid":"00".repeat(32),"vout":4294967295u32}]),
++                        4 => json!([outpoint.to_string()]),
++                        _ => if state.locked {json!([point])} else {json!([])},
++                    },
++                    "lockunspent" => {
++                        ensure!(request["params"] == json!([false,[point]]),"unlock or changed lock inputs");
++                        ensure!(!state.locked && intent.is_file(),"intent must precede wallet mutation");
++                        let retained: Value = serde_json::from_slice(&std::fs::read(&intent)?)?;
++                        ensure!(retained["schema"] == "monzero-bch-wallet-lock-intent-v1","invalid intent");
++                        state.calls += 1;
++                        if !state.ignore { state.locked = true; }
++                        if state.ambiguous { state.ambiguous = false; continue; } // Applied, reply lost.
++                        json!(true)
++                    },
++                    _ => anyhow::bail!("unexpected method: {method}"),
++                };
++                let body = serde_json::to_vec(&json!({"id":request["id"],"error":null,"result":result}))?;
++                write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;
++                socket.write_all(&body)?;
++            }
++            Ok(())
++        });
++        Ok(Self {port,state,stop,thread:Some(thread)})
++    }
++}
++
++#[tokio::test]
++async fn durable_bch_wallet_locks_reconcile_ambiguous_results_and_wallet_restart() -> Result<()> {
++    let network = BchNetwork::Regtest {checkpoint_height:1,checkpoint:BlockHash::from_byte_array([7;32])};
++    let setup = Setup::with_network(Some(network))?;
++    let snapshots = PrivateStore::new()?; let metadata = PrivateStore::new()?;
++    let (selected,own,initial) = selected_with_outgoing(&setup,&snapshots.0,0)?;
++    let (_,peer,_) = selected_with_outgoing(&setup,&snapshots.0,1)?;
++    let (wallet,received) = selected.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++        1003,own.commitment(),peer.frame(),peer.signature())?;
++    let ack = wallet.acknowledgement(&setup.quote)?;
++    let agreed = wallet.accept_agreement(&setup.quote,&setup.policy,1004,&ack,
++        &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++    let agreement = agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder,&agreed)?;
++    let pins = NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
++    let mut execution = AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++        Role::BchFunder,setup.quote.commitment(),pins,1005)?;
++    let script = setup.quote.recovery_plan().recovery().terms().redeem_destination.clone();
++    let parent = Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
++            script_sig:bitcoin::ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++        output:vec![TxOut {value:Amount::from_sat(111_000),script_pubkey:script.clone()}]};
++    let outpoint = OutPoint {txid:parent.compute_txid(),vout:0};
++    let mut funding = parent.clone(); funding.input[0].previous_output = outpoint;
++    funding.output = vec![TxOut {value:Amount::from_sat(100_000),script_pubkey:setup.quote.recovery_plan().lock().script_pubkey()},
++        TxOut {value:Amount::from_sat(10_000),script_pubkey:script.clone()}];
++    execution.retain_bch_funding_preparation(1006,&serialize(&funding),&[&serialize(&parent)],&script,1000,546)?;
++    let intent = metadata.0.join(format!("{}.bch-funding-wallet-lock-intent",setup.quote.terms()["swapId"]));
++    let server = Server::start(script.clone(),outpoint,intent.clone(),network)?;
++    let backend = |wallet: &str,password: &str| BchRpc::new(server.port,"user".into(),password.into(),network,
++        wallet.into(),"bchreg:qanchor".into(),script.clone(),"/Bitcoin Cash Node:29.0.0/".into());
++    let rpc = backend("test","pass")?;
++    assert_eq!(BchNetwork::Mainnet.quote_name(),"bch-mainnet");
++    assert_eq!(BchNetwork::Testnet.quote_name(),"bch-testnet");
++    execution.observe_bch_funding_inputs(&rpc,1007,"bchreg:qchange",3).await?;
++    // Refuse unrelated pre-existing locks and malformed wallet responses before retaining intent.
++    server.state.lock().unwrap().locked = true;
++    assert!(execution.lock_bch_funding_inputs(&rpc,1007,"bchreg:qchange",3).await.is_err());
++    server.state.lock().unwrap().locked = false;
++    for malformed in 1..=4 {
++        server.state.lock().unwrap().malformed = malformed;
++        assert!(execution.lock_bch_funding_inputs(&rpc,1007,"bchreg:qchange",3).await.is_err());
++    }
++    server.state.lock().unwrap().malformed = 0;
++    assert!(!intent.exists()); assert_eq!(server.state.lock().unwrap().calls,0);
++    server.state.lock().unwrap().ambiguous = true;
++    assert!(execution.lock_bch_funding_inputs(&rpc,1007,"bchreg:qchange",3).await.is_err());
++    assert!(intent.exists()); assert_eq!(server.state.lock().unwrap().calls,1);
++    let original = std::fs::read(&intent)?;
++    drop(execution);
++    let mut execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    execution.lock_bch_funding_inputs(&rpc,1008,"bchreg:qchange",3).await?;
++    assert_eq!(server.state.lock().unwrap().calls,1); // Already applied: no second mutation.
++    assert!(execution.lock_bch_funding_inputs(&backend("other","pass")?,1008,"bchreg:qchange",3).await.is_err());
++    assert!(execution.lock_bch_funding_inputs(&rpc,1008,"bchreg:qother",3).await.is_err());
++    assert!(execution.lock_bch_funding_inputs(&rpc,1008,"bchreg:qchange",4).await.is_err());
++    assert!(execution.lock_bch_funding_inputs(&rpc,1006,"bchreg:qchange",3).await.is_err());
++    assert!(execution.lock_bch_funding_inputs(&rpc,2000,"bchreg:qchange",3).await.is_err());
++    // Wallet restart drops advisory locks; credential rotation does not change deployment.
++    server.state.lock().unwrap().locked = false;
++    execution.lock_bch_funding_inputs(&backend("test","rotated")?,1009,"bchreg:qchange",3).await?;
++    assert_eq!(server.state.lock().unwrap().calls,2);
++    server.state.lock().unwrap().locked = false; server.state.lock().unwrap().ignore = true;
++    assert!(execution.lock_bch_funding_inputs(&rpc,1010,"bchreg:qchange",3).await.is_err());
++    assert_eq!(server.state.lock().unwrap().calls,3); // Acknowledgement alone is insufficient.
++    assert_eq!(std::fs::read(&intent)?,original);
++    Ok(())
++}

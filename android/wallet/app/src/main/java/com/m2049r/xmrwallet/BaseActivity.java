@@ -177,7 +177,12 @@ public class BaseActivity extends SecureActivity
             Network network = connectivityManager.getActiveNetwork();
             if (network == null) return false;
             NetworkCapabilities networkCapabilities = connectivityManager.getNetworkCapabilities(network);
-            return networkCapabilities != null && (networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) || networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) || networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH));
+            // Any network with internet access counts, VPNs included: a VPN reports only
+            // TRANSPORT_VPN, and treating it as offline left the app without a node
+            return networkCapabilities != null && (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    || networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+                    || networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) || networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH)
+                    || networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN));
         } else {
             NetworkInfo networkInfo = connectivityManager.getActiveNetworkInfo();
             return networkInfo != null && networkInfo.isConnected();

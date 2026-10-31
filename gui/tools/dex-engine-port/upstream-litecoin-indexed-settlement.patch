@@ -1,0 +1,188 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index e4b5f8500..dc11d0b9e 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -401,15 +401,23 @@ mod linux {
+     fn preparation_config_valid(schema:&str,prefix:&str,observer:Option<&PreparationObserver>,
+         ltc:u16,daemon:u16,wallet:u16)->bool {
+         let version=if schema==format!("{prefix}-v1") {observer.is_none()}
+-            else if schema==format!("{prefix}-v2") || schema==format!("{prefix}-v3") {observer.is_some_and(|o|
++            else if schema==format!("{prefix}-v2") || schema==format!("{prefix}-v3") || schema==format!("{prefix}-v4") {observer.is_some_and(|o|
+                 o.wallet_port!=0 && ![ltc,daemon,wallet].contains(&o.wallet_port))} else {false};
+         version && ltc!=0 && daemon!=0 && wallet!=0 && ltc!=daemon && ltc!=wallet && daemon!=wallet
+     }
++    fn payment_location_valid(schema:&str,prefix:&str,block:Option<bitcoin::BlockHash>,password:bool)->bool {
++        match schema.strip_prefix(prefix) {
++            Some("-v1"|"-v2")=>block.is_some() && !password,
++            Some("-v3")=>block.is_some() && password,
++            Some("-v4")=>block.is_none() && password,
++            _=>false,
++        }
++    }
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct RefundRpc {
+         schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
+-        native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,ltc_refund_block:bitcoin::BlockHash,
++        native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,#[serde(default)] ltc_refund_block:Option<bitcoin::BlockHash>,
+         #[serde(default)] preparation_observer:Option<PreparationObserver>,
+         #[serde(default)] wallet_password_file:Option<PathBuf>,
+     }
+@@ -417,7 +425,7 @@ mod linux {
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct PayoutRpc {
+         schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
+-        native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,ltc_redeem_block:bitcoin::BlockHash,
++        native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,#[serde(default)] ltc_redeem_block:Option<bitcoin::BlockHash>,
+         #[serde(default)] preparation_observer:Option<PreparationObserver>,
+         #[serde(default)] wallet_password_file:Option<PathBuf>,
+     }
+@@ -501,7 +509,9 @@ mod linux {
+         };
+         let purpose=if payout {"payout"} else {"refund"};
+         let prefix=format!("monzero-private-ltc-{purpose}-rpc");
+-        ensure!(schema==format!("{prefix}-v3") && preparation_config_valid(&schema,&prefix,observer.as_ref(),port,daemon,wallet_port),
++        ensure!((schema==format!("{prefix}-v3") || schema==format!("{prefix}-v4"))
++            && payment_location_valid(&schema,&prefix,block,password_file.is_some())
++            && preparation_config_valid(&schema,&prefix,observer.as_ref(),port,daemon,wallet_port),
+             "wallet recovery requires explicit observer and password configuration");
+         let password_file=password_file.context("missing recovered wallet password file")?;
+         let observer=observer.context("missing recovered wallet observer")?;
+@@ -515,6 +525,7 @@ mod linux {
+         isolated_native(daemon).await?;
+         let (_ltc_lease,user,secret)=credentials(&cookie)?;
+         let ltc=LitecoinRpc::new(port,user,secret,LtcNetwork::Regtest,wallet,LtcSegwitAddress::parse(LtcNetwork::Regtest,&anchor)?)?;
++        let block=match block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
+         let (_observer_lease,user,secret)=credentials(&observer.login_file)?;
+         let observer=NativeFundingRpc::new(daemon,observer.wallet_port,user,secret)?;
+         let (_wallet_lease,user,secret)=credentials(&login)?;
+@@ -565,11 +576,12 @@ mod linux {
+         let rpc:RefundRpc=serde_json::from_slice(&bytes)?;
+         ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-refund-rpc",rpc.preparation_observer.as_ref(),
+             rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
+-            && rpc.wallet_password_file.is_some()==(rpc.schema=="monzero-private-ltc-refund-rpc-v3"),"invalid refund RPC configuration");
++            && payment_location_valid(&rpc.schema,"monzero-private-ltc-refund-rpc",rpc.ltc_refund_block,rpc.wallet_password_file.is_some()),"invalid refund RPC configuration");
+         isolated_native(rpc.native_daemon_port).await?;
+         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+         let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
+             LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let block=match rpc.ltc_refund_block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
+         let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
+         if preparing {
+             let observer=rpc.preparation_observer.as_ref().context("preparation observer is not configured")?;
+@@ -577,7 +589,7 @@ mod linux {
+             let (_observer_file,user,password)=credentials(&observer.login_file)?;
+             let observer_client=NativeFundingRpc::new(rpc.native_daemon_port,observer.wallet_port,user,password)?;
+             let native=NativeTransferRelay::new(observer_client);
+-            execution.prepare_native_refund_payout(&native,&ltc,rpc.ltc_refund_block,&client,
++            execution.prepare_native_refund_payout(&native,&ltc,block,&client,
+                 request.priority.context("missing preparation priority")?).await?;
+             let review=execution.review_native_refund_payment(RefundAction::Send)?;
+             return Ok(serde_json::json!({"schema":"monzero-ltc-refund-prepare-response-v1","requestId":request.request_id,
+@@ -588,7 +600,7 @@ mod linux {
+         if checking {
+             // Reconciliation observes both chains and may retain a receipt. It
+             // never relays a transaction, even when a prior reply was lost.
+-            let depth=execution.reconcile_native_refund_payout(&native,&ltc,rpc.ltc_refund_block).await?;
++            let depth=execution.reconcile_native_refund_payout(&native,&ltc,block).await?;
+             let review=execution.review_native_refund_payment(RefundAction::Retransmit)?;
+             let commitment=review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>();
+             return Ok(serde_json::json!({"schema":"monzero-ltc-refund-check-response-v1","requestId":request.request_id,
+@@ -597,7 +609,7 @@ mod linux {
+                 "review":{"details":review.details,"commitment":commitment}}));
+         }
+         let (action,approved)=approval.context("missing submission approval")?;
+-        let payment=execution.relay_reviewed_native_refund(action,approved,&mut native,&ltc,rpc.ltc_refund_block).await?;
++        let payment=execution.relay_reviewed_native_refund(action,approved,&mut native,&ltc,block).await?;
+         Ok(serde_json::json!({"schema":"monzero-ltc-refund-submit-response-v1","requestId":request.request_id,
+             "snapshot":execution.saved_status()?,"outcome":{"state":"acknowledged","txid":payment.txid,
+                 "feeAtoms":payment.fee.atom_string(),"chainObserved":false,"executable":false}}))
+@@ -624,11 +636,12 @@ mod linux {
+         let rpc:PayoutRpc=serde_json::from_slice(&bytes)?;
+         ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-payout-rpc",rpc.preparation_observer.as_ref(),
+             rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
+-            && rpc.wallet_password_file.is_some()==(rpc.schema=="monzero-private-ltc-payout-rpc-v3"),"invalid payout RPC configuration");
++            && payment_location_valid(&rpc.schema,"monzero-private-ltc-payout-rpc",rpc.ltc_redeem_block,rpc.wallet_password_file.is_some()),"invalid payout RPC configuration");
+         isolated_native(rpc.native_daemon_port).await?;
+         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+         let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
+             LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let block=match rpc.ltc_redeem_block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
+         let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
+         if preparing {
+             let observer=rpc.preparation_observer.as_ref().context("preparation observer is not configured")?;
+@@ -636,7 +649,7 @@ mod linux {
+             let (_observer_file,user,password)=credentials(&observer.login_file)?;
+             let observer_client=NativeFundingRpc::new(rpc.native_daemon_port,observer.wallet_port,user,password)?;
+             let native=observer_client;
+-            execution.prepare_native_payout(&native,&ltc,rpc.ltc_redeem_block,&client,
++            execution.prepare_native_payout(&native,&ltc,block,&client,
+                 request.priority.context("missing preparation priority")?).await?;
+             let review=execution.review_native_payout_payment(PayoutAction::Send)?;
+             return Ok(serde_json::json!({"schema":"monzero-ltc-payout-prepare-response-v1","requestId":request.request_id,
+@@ -647,7 +660,7 @@ mod linux {
+         if checking {
+             // Reconciliation observes both chains and may retain a receipt. It
+             // never relays a transaction, even when a prior reply was lost.
+-            let depth=execution.reconcile_native_payout(&native,&ltc,rpc.ltc_redeem_block).await?;
++            let depth=execution.reconcile_native_payout(&native,&ltc,block).await?;
+             let review=execution.review_native_payout_payment(PayoutAction::Retransmit)?;
+             let commitment=review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>();
+             return Ok(serde_json::json!({"schema":"monzero-ltc-payout-check-response-v1","requestId":request.request_id,
+@@ -656,7 +669,7 @@ mod linux {
+                 "review":{"details":review.details,"commitment":commitment}}));
+         }
+         let (action,approved)=approval.context("missing submission approval")?;
+-        let payment=execution.relay_reviewed_native_payout(action,approved,&mut native,&ltc,rpc.ltc_redeem_block).await?;
++        let payment=execution.relay_reviewed_native_payout(action,approved,&mut native,&ltc,block).await?;
+         Ok(serde_json::json!({"schema":"monzero-ltc-payout-submit-response-v1","requestId":request.request_id,
+             "snapshot":execution.saved_status()?,"outcome":{"state":"acknowledged","txid":payment.txid,
+                 "feeAtoms":payment.fee.atom_string(),"chainObserved":false,"executable":false}}))
+@@ -786,6 +799,22 @@ mod linux {
+         struct OwnedDirectory(PathBuf);
+         impl Drop for OwnedDirectory {fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);}}
+         #[test]
++        fn payment_configuration_never_silently_falls_back_from_a_block_hint()->Result<()> {
++            use bitcoin::hashes::Hash;
++            let block=bitcoin::BlockHash::from_byte_array([1;32]);
++            for purpose in ["payout","refund"] {
++                let prefix=format!("monzero-private-ltc-{purpose}-rpc");
++                for version in 0..=5 {for located in [false,true] {for password in [false,true] {
++                    assert_eq!(payment_location_valid(&format!("{prefix}-v{version}"),&prefix,located.then_some(block),password),
++                        match version {1|2=>located && !password,3=>located && password,4=>!located && password,_=>false});
++                }}}
++                let observer=PreparationObserver {wallet_port:4,login_file:PathBuf::from("/observer")};
++                assert!(preparation_config_valid(&format!("{prefix}-v4"),&prefix,Some(&observer),1,2,3));
++                assert!(!preparation_config_valid(&format!("{prefix}-v4"),&prefix,None,1,2,3));
++            }
++            Ok(())
++        }
++        #[test]
+         fn redemption_requests_separate_review_submission_and_confirmation()->Result<()> {
+             for operation in ["review","submit","check"] {
+                 let mode=format!("--redemption-{operation}-stdio-v1");
+diff --git a/swap-machine/src/litecoin_negotiation/execution/recovery.rs b/swap-machine/src/litecoin_negotiation/execution/recovery.rs
+index a4fa24dcf..c3f14fff6 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/recovery.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/recovery.rs
+@@ -219,3 +219,20 @@ impl Execution {
+         self.accept_recovery(&peer.bytes,&peer.signature)
+     }
+ }
++
++impl Execution {
++    /// Find a current confirmed block for the role's already-agreed settlement
++    /// transaction. This returns a search hint, not native-payment authority:
++    /// claim/refund preparation and reconciliation still verify both chains.
++    pub async fn locate_native_settlement_block(&mut self,ltc:&crate::litecoin_rpc::LitecoinRpc)->Result<bitcoin::BlockHash> {
++        ensure!(ltc.network()==self.policy.ltc_network,"wrong settlement lookup network");
++        let (plan,_)=self.recovery_plan()?;
++        let (_,_,quote,_,_)=self.load()?;
++        let txid=match self.role {
++            LocalRole::LitecoinFunder=>plan.redeem_txid(),
++            LocalRole::NativeFunder=>plan.refund_txid(),
++        };
++        let minimum=quote.terms()["ltcConfirmations"].parse::<u64>()?.max(u64::from(self.policy.ltc_confirmations));
++        Ok(ltc.indexed_confirmed_transaction(txid,minimum).await?.block())
++    }
++}

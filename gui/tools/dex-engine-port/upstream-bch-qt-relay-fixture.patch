@@ -1,0 +1,35 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -127,7 +127,7 @@
+     save(&funding_path,&serde_json::to_vec(&config)?)?;
+     if let Some(case)=submit_case {
+         return submit::exercise(case,&setup,&metadata,&snapshots,server,&rpc,&signed,&expected,
+-            &helper,&funding_path,&config_store,base+12,&script).await;
++            &program,&funding_path,&config_store,base+12,&script,program!=helper).await;
+     }
+     // Stop the mock before review: successful helper execution cannot rely on RPC.
+     assert_eq!(server.state.lock().unwrap().relay_calls,0);
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs
+@@ -30,7 +30,7 @@
+ pub(super) async fn exercise(case: Case,setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
+     server: Server,rpc: &BchRpc,signed: &SignedFunding,review: &FundingRelayReview,
+     helper: &std::path::Path,funding_path: &std::path::Path,config_store: &PrivateStore,
+-    historical_time: u64,script: &bitcoin::Script) -> Result<()> {
++    historical_time: u64,script: &bitcoin::Script,via_qt: bool) -> Result<()> {
+     let approved=hex(&review.commitment);let txid=signed.lock_outpoint().txid.to_string();
+     let trade=&setup.quote.terms()["swapId"];
+     let intent=metadata.0.join(format!("{trade}.bch-funding-relay-intent"));
+@@ -104,7 +104,9 @@
+     assert!(intent.is_file());assert_eq!(ack.exists(),acknowledged);
+     assert_eq!(server.state.lock().unwrap().relay_calls,1);
+     let retained=contents(&metadata.0)?;
+-    invoke(helper,&submit_path,"submit",Some(&approved),acknowledged)?;
++    // A fresh Qt job reads the recorded attempt and refuses to submit again;
++    // the lower-level helper may return its original acknowledgement without RPC.
++    invoke(helper,&submit_path,"submit",Some(&approved),acknowledged && !via_qt)?;
+     assert_eq!(server.state.lock().unwrap().relay_calls,1);
+     assert_eq!(contents(&metadata.0)?,retained);assert_eq!(contents(&snapshots.0)?,secrets);
+     // Status cannot contact the node: even its descriptor and cookie are gone.

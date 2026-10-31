@@ -1,0 +1,364 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -9249,6 +9249,15 @@
+ ]
+ 
+ [[package]]
++name = "salsa20"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
++dependencies = [
++ "cipher",
++]
++
++[[package]]
+ name = "same-file"
+ version = "1.0.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -9343,6 +9352,17 @@
+ version = "1.0.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
++
++[[package]]
++name = "scrypt"
++version = "0.11.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
++dependencies = [
++ "pbkdf2",
++ "salsa20",
++ "sha2",
++]
+ 
+ [[package]]
+ name = "sct"
+@@ -10893,6 +10913,7 @@
+  "reqwest 0.12.28",
+  "rust_decimal",
+  "rustls-native-certs 0.8.3",
++ "scrypt",
+  "serde",
+  "serde_json",
+  "sha2",
+diff --git a/swap-machine/Cargo.toml b/swap-machine/Cargo.toml
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -4,6 +4,7 @@
+ edition = "2024"
+ 
+ [dependencies]
++scrypt = { version = "=0.11.0", default-features = false }
+ tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+ rustls-native-certs = "=0.8.3"
+ num-bigint = "=0.4.6"
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -113,3 +113,5 @@
+ pub mod session;
+ 
+ pub mod tls;
++
++pub mod headers;
+diff --git a/swap-machine/src/litecoin_light/headers.rs b/swap-machine/src/litecoin_light/headers.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/headers.rs
+@@ -0,0 +1,132 @@
++//! Genesis-rooted Litecoin header sequence, pinned to Core v0.21.5.8 rules.
++//! This validates one branch, not best-chain selection, freshness, checkpoints,
++//! block bodies, MWEB consensus or current UTXO state. No spending authority.
++use anyhow::{Context, Result, ensure};
++use bitcoin::{BlockHash, TxMerkleNode, block::{Header, Version}, CompactTarget,
++    consensus::{serialize, deserialize}, hashes::Hash};
++use num_bigint::BigUint;
++use swap_core::litecoin_address::LtcNetwork;
++
++pub struct HeaderSequence {
++    network: LtcNetwork,
++    headers: Vec<Header>,
++    work: BigUint,
++}
++impl HeaderSequence {
++    pub fn new(network: LtcNetwork) -> Result<Self> {
++        let (time, nonce, bits) = match network {
++            LtcNetwork::Mainnet => (1317972665,2084524493,0x1e0ffff0),
++            LtcNetwork::Testnet => (1486949366,293345,0x1e0ffff0),
++            LtcNetwork::Regtest => (1296688602,0,0x207fffff),
++        };
++        let genesis = Header { version: Version::from_consensus(1), prev_blockhash: BlockHash::all_zeros(),
++            merkle_root: "97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9".parse::<TxMerkleNode>()?,
++            time, bits: CompactTarget::from_consensus(bits), nonce };
++        ensure!(genesis.block_hash().to_string()==network.genesis(), "Litecoin genesis constants changed");
++        // Core special-cases the independently pinned genesis identity.
++        let work = block_work(&target(bits,network)?);
++        Ok(Self {network, headers:vec![genesis], work})
++    }
++    pub fn network(&self) -> LtcNetwork { self.network }
++    pub fn height(&self) -> u32 { (self.headers.len()-1) as u32 }
++    pub fn header(&self,height: u32) -> Option<Header> { self.headers.get(height as usize).copied() }
++    pub fn chain_work(&self) -> &BigUint { &self.work }
++
++    /// `now` must be supplied by the caller's clock, not a server timestamp.
++    /// Validation is completed before either headers or cumulative work change.
++    pub fn append(&mut self,bytes: &[u8],now: u64) -> Result<BlockHash> {
++        ensure!(bytes.len()==80, "invalid Litecoin header size");
++        let header: Header = deserialize(bytes)?;
++        let height = u32::try_from(self.headers.len()).context("Litecoin header height exhausted")?;
++        let previous = self.headers.last().context("missing Litecoin genesis")?;
++        ensure!(header.prev_blockhash==previous.block_hash(), "disconnected Litecoin header");
++        ensure!(header.bits.to_consensus()==next_bits(self.network,&self.headers,header.time)?,
++            "incorrect Litecoin difficulty");
++        let mut times: Vec<_> = self.headers.iter().rev().take(11).map(|h|h.time).collect();
++        times.sort_unstable();
++        ensure!(header.time>times[times.len()/2], "Litecoin timestamp does not exceed median past time");
++        ensure!(u64::from(header.time)<=now.checked_add(7200).context("invalid local header clock")?,
++            "Litecoin header timestamp too far in future");
++        check_version(self.network,height,header.version.to_consensus())?;
++        let target = target(header.bits.to_consensus(),self.network)?;
++        ensure!(BigUint::from_bytes_le(&scrypt_hash(bytes)?)<=target, "insufficient Litecoin Scrypt work");
++        let hash = header.block_hash();
++        self.work += block_work(&target);
++        self.headers.push(header);
++        Ok(hash)
++    }
++}
++
++/// Fixed Litecoin N=1024, r=1, p=1, 32-byte output. Never Bitcoin SHA256d work.
++fn scrypt_hash(header: &[u8]) -> Result<[u8;32]> {
++    ensure!(header.len()==80, "invalid Scrypt header length");
++    let params = scrypt::Params::new(10,1,1,32).map_err(|_|anyhow::anyhow!("invalid Litecoin Scrypt parameters"))?;
++    let mut output = [0;32];
++    scrypt::scrypt(header,header,&params,&mut output).map_err(|_|anyhow::anyhow!("Litecoin Scrypt failed"))?;
++    Ok(output)
++}
++fn limit(network: LtcNetwork) -> BigUint {
++    let bits = if network==LtcNetwork::Regtest {255} else {236};
++    (BigUint::from(1u8)<<bits)-BigUint::from(1u8)
++}
++fn target(bits: u32,network: LtcNetwork) -> Result<BigUint> {
++    let size = bits>>24; let word = bits&0x007fffff;
++    ensure!(bits&0x00800000==0 && word!=0 && size<=34
++        && !(word>0xff && size>33) && !(word>0xffff && size>32), "invalid Litecoin compact target");
++    let value = if size<=3 {BigUint::from(word>>(8*(3-size)))}
++        else {BigUint::from(word)<<(8*(size-3)) as usize};
++    ensure!(value!=BigUint::from(0u8) && value<=limit(network), "Litecoin target outside network limit");
++    Ok(value)
++}
++fn compact(value: &BigUint) -> u32 {
++    let mut size = value.bits().div_ceil(8) as u32;
++    let shifted = if size<=3 {value<<(8*(3-size)) as usize} else {value>>(8*(size-3)) as usize};
++    let mut word = shifted.to_bytes_be().iter().fold(0u32, |word,byte| (word<<8)|u32::from(*byte));
++    if word&0x00800000!=0 {word>>=8;size+=1;}
++    word | (size<<24)
++}
++fn block_work(target: &BigUint) -> BigUint {
++    (BigUint::from(1u8)<<256usize)/(target+BigUint::from(1u8))
++}
++fn next_bits(network: LtcNetwork,headers: &[Header],time: u32) -> Result<u32> {
++    let previous = headers.last().context("missing difficulty history")?;
++    let height = headers.len();
++    let easiest = compact(&limit(network));
++    if height%2016!=0 {
++        if network!=LtcNetwork::Mainnet {
++            if u64::from(time)>u64::from(previous.time)+300 {return Ok(easiest)}
++            let mut index = height-1;
++            while index>0 && index%2016!=0 && headers[index].bits.to_consensus()==easiest {index-=1;}
++            return Ok(headers[index].bits.to_consensus())
++        }
++        return Ok(previous.bits.to_consensus())
++    }
++    if network==LtcNetwork::Regtest {return Ok(previous.bits.to_consensus())}
++    // Litecoin uses an extra ancestor after the first adjustment interval.
++    let first = if height==2016 {0} else {height-2017};
++    retarget(network,previous.bits.to_consensus(),i64::from(previous.time)-i64::from(headers[first].time))
++}
++fn retarget(network: LtcNetwork,bits: u32,elapsed: i64) -> Result<u32> {
++    let mut value = target(bits,network)?;
++    let limit = limit(network);
++    let shift = value.bits()>limit.bits()-1;
++    if shift {value>>=1usize;}
++    value *= elapsed.clamp(302400/4,302400*4) as u64;
++    value /= 302400u64;
++    if shift {value<<=1usize;}
++    Ok(compact(&value.min(limit)))
++}
++fn check_version(network: LtcNetwork,height: u32,version: i32) -> Result<()> {
++    let (bip34,bip66,bip65,segwit) = match network {
++        LtcNetwork::Mainnet => (710000,811879,918684,1201536),
++        LtcNetwork::Testnet => (76,76,76,6048),
++        LtcNetwork::Regtest => (500,1251,1351,0),
++    };
++    ensure!(!(height>=bip34 && version<2) && !(height>=bip66 && version<3)
++        && !(height>=bip65 && version<4) && !(height>=segwit && version<0x20000000),
++        "outdated Litecoin header version");
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/headers/tests.rs b/swap-machine/src/litecoin_light/headers/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/headers/tests.rs
+@@ -0,0 +1,157 @@
++use super::*;
++fn bytes(hex: &str) -> Vec<u8> {
++    (0..hex.len()).step_by(2).map(|i|u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect()
++}
++fn child() -> Header {
++    deserialize(&bytes("00000020f916c456fc51df627885d7d674ed02dc88a225adb3f02ad13eb4938ff3270853111111111111111111111111111111111111111111111111111111111111111170e6494dffff7f202a000000")).unwrap()
++}
++#[test]
++fn headers_pin_genesis_and_match_independent_scrypt_vectors() -> Result<()> {
++    // Expected work hashes independently calculated with Python hashlib.scrypt.
++    for (network,expected,work) in [
++        (LtcNetwork::Mainnet,"001e67b013726fd7382e9acb69165b4b6316227fb3156b5b414ba6340c050000",1048592u64),
++        (LtcNetwork::Testnet,"64de605b080d5c80ef6bf8460faf954bffb170d64d6087c3b4c42502cc060000",1048592),
++        (LtcNetwork::Regtest,"79345ad2e07692285c0f68b135d356bb3a8a23ad784f34f2b02e039534cadb5a",2)] {
++        let sequence = HeaderSequence::new(network)?;
++        let genesis = sequence.header(0).unwrap();
++        assert_eq!(sequence.network(),network); assert_eq!(sequence.height(),0);
++        assert_eq!(genesis.block_hash().to_string(),network.genesis());
++        assert_eq!(scrypt_hash(&serialize(&genesis))?.as_slice(),bytes(expected));
++        assert_eq!(sequence.chain_work(),&BigUint::from(work));
++    }
++    assert!(scrypt_hash(&[0;79]).is_err()); assert!(scrypt_hash(&[0;81]).is_err());
++    Ok(())
++}
++#[test]
++fn headers_accept_fixed_offline_header_and_accumulate_work() -> Result<()> {
++    // Static synthetic header: no node, nonce search or mining is run by tests.
++    let mut sequence = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let header = child();
++    assert_eq!(sequence.append(&serialize(&header),u64::from(header.time))?,header.block_hash());
++    assert_eq!(sequence.height(),1); assert_eq!(sequence.header(1),Some(header));
++    assert_eq!(sequence.chain_work(),&BigUint::from(4u8));
++    assert!(sequence.append(&serialize(&header),u64::from(header.time)).is_err());
++    assert_eq!(sequence.height(),1); assert_eq!(sequence.chain_work(),&BigUint::from(4u8));
++    Ok(())
++}
++#[test]
++fn headers_reject_invalid_context_without_mutation() -> Result<()> {
++    let mut sequence = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let original = sequence.header(0).unwrap(); let work = sequence.chain_work().clone();
++    for case in 0..6 {
++        let mut header = child(); let mut now = u64::from(header.time);
++        match case {
++            0 => header.prev_blockhash = BlockHash::all_zeros(),
++            1 => header.bits = CompactTarget::from_consensus(0x207ffffe),
++            2 => header.time = original.time,
++            3 => now -= 7201,
++            4 => header.version = Version::from_consensus(4),
++            5 => header.version = Version::from_consensus(-1),
++            _ => unreachable!(),
++        }
++        assert!(sequence.append(&serialize(&header),now).is_err());
++        assert_eq!(sequence.height(),0); assert_eq!(sequence.header(0),Some(original));
++        assert_eq!(sequence.chain_work(),&work);
++    }
++    assert!(sequence.append(&[0;79],0).is_err());
++    assert!(sequence.append(&serialize(&child()),u64::MAX).is_err());
++    let mut main = HeaderSequence::new(LtcNetwork::Mainnet)?;
++    let mut low_work = child(); let genesis = main.header(0).unwrap();
++    low_work.prev_blockhash = genesis.block_hash(); low_work.bits = genesis.bits;
++    low_work.time = genesis.time+150;
++    assert_eq!(main.append(&serialize(&low_work),u64::from(low_work.time)).unwrap_err().to_string(),
++        "insufficient Litecoin Scrypt work");
++    assert_eq!(main.height(),0);
++    Ok(())
++}
++#[test]
++fn headers_compact_targets_reject_sign_overflow_zero_and_wrong_network_limit() -> Result<()> {
++    for bits in [0,0x01003456,0x01810000,0x23000001,0x22000100,0x21010000,0x207fffff] {
++        assert!(target(bits,LtcNetwork::Mainnet).is_err(),"{bits:x}");
++    }
++    for bits in [0x01010000,0x02008000,0x03008000,0x1c0ac141,0x1e0ffff0,0x1e0fffff] {
++        assert_eq!(compact(&target(bits,LtcNetwork::Mainnet)?),bits);
++    }
++    assert!(target(0x207fffff,LtcNetwork::Regtest).is_ok());
++    assert!(target(0x2100ffff,LtcNetwork::Regtest).is_err());
++    Ok(())
++}
++#[test]
++fn headers_retarget_matches_litecoin_core_vectors() -> Result<()> {
++    // Numeric vectors from MIT-licensed Litecoin Core v0.21.5.8 src/test/pow_tests.cpp.
++    for (bits,elapsed,expected) in [(0x1c0ac141,1358378777-1358118740,0x1c093f8d),
++        (0x1e0ffff0,1318480354-1317972665,0x1e0fffff),
++        (0x1b075cf1,1401757934-1401682934,0x1b01d73c),
++        (0x1b015318,1464900315-1463690315,0x1b054c60)] {
++        assert_eq!(retarget(LtcNetwork::Mainnet,bits,elapsed)?,expected);
++    }
++    assert_eq!(retarget(LtcNetwork::Mainnet,0x1b075cf1,-1)?,0x1b01d73c);
++    Ok(())
++}
++#[test]
++fn headers_adjustment_uses_litecoin_extra_ancestor_after_first_interval() -> Result<()> {
++    // Synthetic history tests difficulty arithmetic only, not chain validity.
++    let mut headers = vec![child();4032];
++    for (height,header) in headers.iter_mut().enumerate() {
++        header.time = 1000000 + height as u32*150;
++        header.bits = CompactTarget::from_consensus(0x1c0ac141);
++    }
++    assert_eq!(next_bits(LtcNetwork::Mainnet,&headers[..2016],2000000)?,0x1c0abfe3);
++    assert_eq!(next_bits(LtcNetwork::Mainnet,&headers,2000000)?,0x1c0ac141);
++    assert_eq!(next_bits(LtcNetwork::Regtest,&headers[..2016],2000000)?,0x1c0ac141);
++    Ok(())
++}
++#[test]
++fn headers_testnet_minimum_difficulty_restores_last_nonminimum_target() -> Result<()> {
++    let mut headers = vec![child();3];
++    headers[0].bits = CompactTarget::from_consensus(0x1c0ac141);
++    for (i,header) in headers.iter_mut().enumerate() {
++        header.time = 1000000+i as u32*150;
++        if i>0 {header.bits=CompactTarget::from_consensus(0x1e0fffff);}
++    }
++    assert_eq!(next_bits(LtcNetwork::Testnet,&headers,1000600)?,0x1c0ac141);
++    assert_eq!(next_bits(LtcNetwork::Testnet,&headers,1000601)?,0x1e0fffff);
++    assert_eq!(next_bits(LtcNetwork::Mainnet,&headers,1000601)?,0x1e0fffff);
++    Ok(())
++}
++#[test]
++fn headers_enforce_activation_version_boundaries() -> Result<()> {
++    for (network,bip34,bip66,bip65,segwit) in [(LtcNetwork::Mainnet,710000,811879,918684,1201536),
++        (LtcNetwork::Testnet,76,76,76,6048)] {
++        assert!(check_version(network,bip34-1,1).is_ok());
++        assert!(check_version(network,bip34,1).is_err());
++        assert!(check_version(network,bip66,2).is_err());
++        assert!(check_version(network,bip65,3).is_err());
++        assert!(check_version(network,segwit-1,4).is_ok());
++        assert!(check_version(network,segwit,4).is_err());
++        check_version(network,segwit,0x20000000)?;
++    }
++    assert!(check_version(LtcNetwork::Regtest,1,4).is_err());
++    check_version(LtcNetwork::Regtest,1,0x20000000)?;
++    Ok(())
++}
++
++#[test]
++fn headers_median_past_time_uses_eleven_ancestors_not_just_tip() -> Result<()> {
++    let mut sequence = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let original = sequence.header(0).unwrap();
++    // Synthetic context for this timing check; no claim of validated ancestry.
++    sequence.headers = [10,11,12,13,14,15,16,17,18,19,1].iter().map(|offset| {
++        let mut header = original; header.time = 1000000+offset; header
++    }).collect();
++    let mut proposed = child(); proposed.prev_blockhash=sequence.headers.last().unwrap().block_hash();
++    proposed.time=1000014;
++    let before=sequence.headers.clone(); let work=sequence.chain_work().clone();
++    assert_eq!(sequence.append(&serialize(&proposed),1000020).unwrap_err().to_string(),
++        "Litecoin timestamp does not exceed median past time");
++    assert_eq!(sequence.headers,before); assert_eq!(sequence.chain_work(),&work);
++    Ok(())
++}
++#[test]
++fn headers_future_time_boundary_is_inclusive() -> Result<()> {
++    let mut sequence = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let header = child();
++    sequence.append(&serialize(&header),u64::from(header.time)-7200)?;
++    assert_eq!(sequence.height(),1);
++    Ok(())
++}

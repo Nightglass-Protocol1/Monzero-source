@@ -1,0 +1,82 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund.rs
+@@ -0,0 +1,44 @@
++//! Public review of the exact privately retained refund. Returning a review
++//! exposes neither the refund signature nor permission to publish it.
++use super::*;
++use crate::bch_rpc::BchRpc;
++use serde_json::{Value,json};
++
++const REVIEW: &str="monzero-bch-refund-relay-review-v1";
++pub struct RefundRelayReview {pub details: Value,pub commitment: [u8;32]}
++impl AdmittedExecution<'_> {
++    fn refund_relay_materials(&self,safety_blocks: u32) -> Result<(RefundRelayReview,PrivateRecovery,[u8;32])> {
++        ensure!(self.role==Role::BchFunder,"wrong BCH refund role");
++        let minimum=u64::from(self.policy.bch_confirmations);let delay=u64::from(self.policy.punish_blocks);
++        ensure!(minimum>0 && safety_blocks>0 && minimum.checked_add(u64::from(safety_blocks))
++            .is_some_and(|value|value<delay),"invalid BCH refund safety margin");
++        let recovery=self.retained_bch_recovery()?.context("missing private BCH recovery")?;
++        let funding=self.signed_bch_funding()?.context("missing exact BCH funding")?;
++        let prepared=self.prepared_bch_funding()?.context("missing BCH funding preparation")?;
++        let (locked,_)=self.funding_lock_intent(&prepared)?;
++        let refund: Transaction=deserialize(recovery.refund_bytes())?;
++        let source=OutPoint {txid:recovery.cancel().compute_txid(),vout:0};let plan=self.quote.recovery_plan();
++        ensure!(refund.input.len()==1 && refund.output.len()==1 && refund.input[0].previous_output==source,
++            "BCH refund recovery source changed");
++        let output=&refund.output[0];let fee=plan.recovery_atoms().checked_sub(output.value.to_sat()).context("invalid BCH refund fee")?;
++        ensure!(output.value.to_sat()==plan.final_recovery_atoms() && fee==plan.terms().recovery_fee_atoms
++            && output.script_pubkey==plan.terms().bch_funder_refund,"BCH refund destination or accounting changed");
++        let details=json!({"schema":REVIEW,"action":"broadcast-bch-refund","swapId":self.quote.terms()["swapId"],
++            "quote":self.quote.commitment(),"admission":self.admission_digest()?,"privateRecovery":recovery.commitment(),
++            "bchDeployment":locked.deployment,"bchNetwork":self.quote.terms()["bchNetwork"],"bchGenesis":self.quote.terms()["bchGenesis"],
++            "fundingOutpoint":funding.lock_outpoint(),"recoveryOutpoint":source,"txid":refund.compute_txid(),
++            "destinationScript":output.script_pubkey.to_hex_string(),"refundAtoms":output.value.to_sat().to_string(),"feeAtoms":fee.to_string(),
++            "preparedAt":recovery.prepared_at(),"minimumBchConfirmations":minimum,"punishDelayBlocks":delay,
++            "punishmentMarginBlocks":safety_blocks,"revealsNativeSpendShare":true});
++        let commitment=hash(REVIEW,&serde_json::to_vec(&details)?);
++        Ok((RefundRelayReview {details,commitment},recovery,locked.deployment))
++    }
++    /// Historical review survives quote expiry. Publication must separately
++    /// revalidate the exact review and current recovery-output safety window.
++    pub fn review_bch_refund_relay(&self,bch: &BchRpc,now: u64,safety_blocks: u32) -> Result<RefundRelayReview> {
++        let (review,recovery,deployment)=self.refund_relay_materials(safety_blocks)?;
++        ensure!(now>=recovery.prepared_at() && bch.deployment_commitment()?==deployment,
++            "BCH refund review predates preparation or changes observer");
++        Ok(review)
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery.rs
+@@ -117,3 +117,5 @@
+ }
+ 
+ pub mod cancel;
++
++pub mod refund;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel.rs
+@@ -28,6 +28,20 @@
+         let mut bad=review.commitment;bad[0]^=1;
+         assert!(execution.relay_bch_cancel(rpc,&bad,2041).await.is_err());assert!(!intent.exists());
+         if mode==0 {
++            let refund=execution.review_bch_refund_relay(rpc,2040,5)?;
++            assert_eq!(refund.details["action"],"broadcast-bch-refund");
++            assert_eq!(refund.details["refundAtoms"],"97000");assert_eq!(refund.details["feeAtoms"],"2000");
++            assert_eq!(refund.details["destinationScript"],setup.quote.recovery_plan().terms().bch_funder_refund.to_hex_string());
++            assert_eq!(refund.details["recoveryOutpoint"],serde_json::to_value(bitcoin::OutPoint {txid,vout:0})?);
++            assert_eq!(refund.details["txid"],recovery.refund_txid()?.to_string());
++            assert_eq!(refund.details["punishmentMarginBlocks"],5);assert_eq!(refund.details["revealsNativeSpendShare"],true);
++            for private in ["transaction","refund","signature","nativeSpendShare","spendKey","viewKey"] {assert!(refund.details.get(private).is_none());}
++            assert_eq!(execution.review_bch_refund_relay(rpc,2041,5)?.commitment,refund.commitment);
++            assert_ne!(execution.review_bch_refund_relay(rpc,2041,6)?.commitment,refund.commitment);
++            assert!(execution.review_bch_refund_relay(rpc,recovery.prepared_at()-1,5).is_err());
++            for margin in [0,28,30,u32::MAX] {assert!(execution.review_bch_refund_relay(rpc,2040,margin).is_err());}
++            assert!(!intent.exists() && !ack.exists());
++            assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls);
+             assert!(rpc.relay_cancellation(cancel,std::time::Instant::now()).await.is_err());
+             for observed in [0,1,2,3,24] {
+                 server.state.lock().unwrap().observation_mode=observed;

@@ -1,0 +1,34 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs
+@@ -78,7 +78,7 @@
+         drop(historical);
+         invoke(helper,&submit_path,"submit",Some(&approved),false)?;
+         assert_eq!(server.state.lock().unwrap().relay_calls,1);
+-        if !via_qt {observe(helper,&submit_path,&server,metadata,snapshots,&txid,"acknowledged",&[0,2])?;}
++        {observe(helper,&submit_path,&server,metadata,snapshots,&txid,"acknowledged",&[0,2])?;}
+         drop(server);status("acknowledged")?;
+         return Ok(())
+     }
+@@ -95,7 +95,7 @@
+     std::fs::set_permissions(&cookie,std::fs::Permissions::from_mode(0o400))?;
+     assert_eq!(contents(&metadata.0)?,before);assert!(!intent.exists());assert!(!ack.exists());
+     assert_eq!(server.state.lock().unwrap().relay_calls,0);
+-    if !via_qt {
++    {
+         let before=contents(&metadata.0)?;
+         invoke(helper,&submit_path,"observe",Some(&approved),false)?;
+         let mut wrong=descriptor.clone();wrong["wallet"]=json!("other");
+@@ -119,10 +119,10 @@
+     invoke(helper,&submit_path,"submit",Some(&approved),acknowledged && !via_qt)?;
+     assert_eq!(server.state.lock().unwrap().relay_calls,1);
+     assert_eq!(contents(&metadata.0)?,retained);assert_eq!(contents(&snapshots.0)?,secrets);
+-    if !via_qt {
++    {
+         let modes: &[u8]=if acknowledged {&[0,1,3,4,8,11,2]} else {&[0,2]};
+         observe(helper,&submit_path,&server,metadata,snapshots,&txid,state,modes)?;
+-        invoke(helper,&submit_path,"submit",Some(&approved),acknowledged)?;
++        invoke(helper,&submit_path,"submit",Some(&approved),acknowledged && !via_qt)?;
+         assert_eq!(server.state.lock().unwrap().relay_calls,1);
+     }
+     // Status cannot contact the node: even its descriptor and cookie are gone.

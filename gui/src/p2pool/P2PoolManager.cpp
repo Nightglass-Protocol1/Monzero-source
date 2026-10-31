@@ -49,6 +49,14 @@
 #define Q_OS_MACOS_AARCH64
 #endif
 
+#ifdef MONZERO_NO_MINING
+// Wallet-only build: no P2Pool binary is ever downloaded or started.
+void P2PoolManager::download() { emit p2poolDownloadFailure(BinaryNotAvailable); }
+bool P2PoolManager::isInstalled() { return false; }
+void P2PoolManager::getStatus() { emit p2poolStatus(false, 0); }
+bool P2PoolManager::start(const QString &, const QString &, const QString &, const QString &) { return false; }
+void P2PoolManager::exit() {}
+#else
 void P2PoolManager::download() {
     m_scheduler.run([this] {
         QUrl url;
@@ -235,6 +243,7 @@ void P2PoolManager::exit()
         dir.removeRecursively();
     }
 }
+#endif // MONZERO_NO_MINING
 
 P2PoolManager::P2PoolManager(QObject *parent)
     : QObject(parent)
@@ -249,9 +258,11 @@ P2PoolManager::P2PoolManager(QObject *parent)
         m_p2poolPath = QApplication::applicationDirPath() + "/p2pool";
     }
 
+#ifndef MONZERO_NO_MINING
     if (!QDir(m_p2poolPath).exists()) {
         QDir().mkpath(m_p2poolPath);
     }
+#endif
     m_p2pool = m_p2poolPath + "/p2pool.exe";
 #elif defined(Q_OS_UNIX)
     m_p2poolPath = QApplication::applicationDirPath();

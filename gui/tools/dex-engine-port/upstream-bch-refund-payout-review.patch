@@ -1,0 +1,85 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval.rs
+@@ -0,0 +1,40 @@
++//! Public review of the exact private refund payout. No broadcast or chain grant.
++use super::*;
++use serde_json::json;
++
++const REVIEW: &str="monzero-bch-native-refund-payout-relay-review-v1";
++pub struct NativeRefundPayoutRelayReview {pub details: Value,pub commitment: [u8;32]}
++impl AdmittedExecution<'_> {
++    fn native_refund_payout_relay_materials(&self) -> Result<(NativeRefundPayoutRelayReview,PreparedLockPayout,Intent,[u8;32])> {
++        let (intent,bytes)=self.refund_payout_intent()?.context("missing BCH native refund payout intent")?;
++        let prepared=self.load_bch_native_refund_payout()?;
++        let binding=hash(INTENT,&bytes);
++        let checkpoint: [u8;32]=Sha256::digest(&*prepared.encode(binding)?).into();
++        let funding=self.received_bch_funding_message()?.context("missing authenticated BCH funding")?;
++        let (deployment,_)=self.native_bch_observation_policy()?;
++        let accounting=prepared.terms();
++        let amount=|field: &str| -> Result<u64> {
++            Ok(accounting[field].as_str().context("missing refund payout accounting amount")?.parse()?)
++        };
++        let refund_atoms=amount("lockedAtoms")?.checked_sub(amount("feeAtoms")?).context("refund payout fee exceeds lock")?;
++        let details=json!({"schema":REVIEW,"action":"broadcast-bch-native-refund-payout",
++            "swapId":self.quote.terms()["swapId"],"quote":self.quote.commitment(),"admission":intent.admission,
++            "nativePayment":intent.payment,"walletIntent":intent.wallet_intent,
++            "payoutIntent":binding,"privateCheckpoint":checkpoint,"preparedAt":intent.at,
++            "refund":intent.refund,"bchFundingOutpoint":funding.signed().lock_outpoint(),
++            "bchDeployment":deployment,"bchNetwork":self.quote.terms()["bchNetwork"],
++            "bchGenesis":self.quote.terms()["bchGenesis"],"xmzNetwork":self.quote.terms()["xmzNetwork"],
++            "minimumBchConfirmations":self.policy.bch_confirmations,
++            "minimumXmzConfirmations":self.policy.xmz_confirmations,
++            "refundAtoms":refund_atoms.to_string(),"payout":accounting});
++        let commitment=hash(REVIEW,&serde_json::to_vec(&details)?);
++        Ok((NativeRefundPayoutRelayReview {details,commitment},prepared,intent,deployment))
++    }
++    /// Historical review does not renew commercial terms or establish confirmation.
++    pub fn review_bch_native_refund_payout_relay(&self,bch: &BchRpc,now: u64) -> Result<NativeRefundPayoutRelayReview> {
++        let (review,_,intent,deployment)=self.native_refund_payout_relay_materials()?;
++        ensure!(now>=intent.at,"BCH native refund payout review predates preparation");
++        ensure!(bch.deployment_commitment()?==deployment,"BCH native refund payout observer changed");
++        Ok(review)
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation.rs
+@@ -84,3 +84,5 @@
+     }
+ }
+ 
++
++pub mod approval;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs
+@@ -49,10 +49,19 @@
+         let restored=execution.prepare_bch_native_refund_payout(&observer,rpc,refund,block,2049,&mut restarted,1).await;
+         if let Some(expected)=expected {
+             assert_eq!(restored?,expected);assert_eq!(execution.recover_prepared_bch_native_refund_payout()?,expected);
++            let review=execution.review_bch_native_refund_payout_relay(rpc,2049)?;
++            assert_eq!(review.details["action"],"broadcast-bch-native-refund-payout");
++            assert_eq!(review.details["refundAtoms"],"100100");
++            assert_eq!(review.details["payout"],expected);
++            assert_eq!(review.details["refund"],serde_json::to_value(refund)?);
++            for secret in ["tx_metadata","tx_key","spendKey","viewKey"] {assert!(review.details.get(secret).is_none());}
++            assert!(execution.review_bch_native_refund_payout_relay(rpc,2047).is_err());
++            assert_eq!(execution.review_bch_native_refund_payout_relay(rpc,2050)?.commitment,review.commitment);
+             assert!(execution.prepare_bch_native_refund_payout(&observer,rpc,refund,block,2049,&mut restarted,2).await.is_err());
+             // Every incomplete/corrupt checkpoint must reject offline recovery.
+             let saved=std::fs::read(&prepared)?;std::fs::write(&prepared,b"{}")?;
+             assert!(execution.recover_prepared_bch_native_refund_payout().is_err());
++            assert!(execution.review_bch_native_refund_payout_relay(rpc,2049).is_err());
+             std::fs::write(&prepared,&saved)?;
+             let held=copied.0.join("held-payout-pin");std::fs::rename(&pin,&held)?;
+             assert!(execution.recover_prepared_bch_native_refund_payout().is_err());std::fs::rename(&held,&pin)?;
+@@ -62,6 +71,7 @@
+             assert_eq!(std::fs::read(&prepared)?,saved);
+         } else {
+             assert!(restored.is_err());assert!(execution.recover_prepared_bch_native_refund_payout().is_err());
++            assert!(execution.review_bch_native_refund_payout_relay(rpc,2049).is_err());
+         }
+         assert_eq!(wallet.state.lock().unwrap().calls.len(),calls,"saved or uncertain payout performed another wallet operation");
+         assert_eq!(observer_fixture.calls.lock().unwrap().len(),observations,"offline recovery performed chain observations");

@@ -1,0 +1,166 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 935b75170..b26ee8657 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -47,6 +47,7 @@ mod linux {
+             "--payout-check-stdio-v1"=>("monzero-ltc-payout-check-request-v1",false,false,false),
+             "--funding-prepare-stdio-v1"=>("monzero-ltc-funding-prepare-request-v1",false,false,true),
+             "--funding-review-stdio-v1"=>("monzero-ltc-funding-review-request-v1",true,false,true),
++            "--funding-proof-stdio-v1"=>("monzero-ltc-funding-proof-request-v1",false,false,true),
+             "--funding-check-stdio-v1"=>("monzero-ltc-funding-check-request-v1",false,false,true),
+             "--funding-submit-stdio-v1"=>("monzero-ltc-funding-submit-request-v1",true,true,true),
+             _=>return false,
+@@ -327,14 +328,25 @@ mod linux {
+         schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
+         native_daemon_port:u16,observer_wallet_port:u16,observer_login_file:PathBuf,safety_blocks:u32,
+     }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct FundingProofRequest {schema:String,request_id:uuid::Uuid,proof_hex:String}
++    impl Drop for FundingProofRequest {fn drop(&mut self) {use zeroize::Zeroize;self.proof_hex.zeroize();}}
+     async fn release_litecoin(path:&Path,input:&[u8],mode:&str)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::NativeFundingRpc};
+         use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
+         let reviewing=mode=="--redeem-review-stdio-v1";
+-        let (request_id,incoming)=if reviewing {
++        let (request_id,incoming,proof)=if mode=="--funding-proof-accept-stdio-v1" {
++            let request:FundingProofRequest=serde_json::from_slice(input)?;
++            ensure!(request.schema=="monzero-ltc-funding-proof-accept-request-v1" && !request.request_id.is_nil(),"invalid funding proof request");
++            let bytes=zeroize::Zeroizing::new(decode_peer_hex(&request.proof_hex,16_384)?);
++            let proof:swap_core::monero::TransferProof=serde_json::from_slice(&bytes)?;
++            ensure!(*zeroize::Zeroizing::new(serde_json::to_vec(&proof)?)==*bytes,"noncanonical funding proof");
++            (request.request_id,None,Some(proof))
++        } else if reviewing {
+             let request:Request=serde_json::from_slice(input)?;
+             ensure!(valid_request(&request,mode),"invalid redeem review request");
+-            (request.request_id,None)
++            (request.request_id,None,None)
+         } else {
+             ensure!(mode=="--redeem-submit-stdio-v1","invalid redeem release mode");
+             let request:PeerRequest=serde_json::from_slice(input)?;
+@@ -342,7 +354,7 @@ mod linux {
+             let frame=zeroize::Zeroizing::new(decode_peer_hex(&request.frame_hex,16_384)?);
+             let signature=decode_peer_hex(&request.signature_hex,64)?;
+             ensure!(signature.len()==64,"invalid redeem signature size");
+-            (request.request_id,Some((frame,signature)))
++            (request.request_id,Some((frame,signature)),None)
+         };
+         let (_wrapper,bytes)=private_bytes(path,false)?;
+         let wrapper:ReservationConfig=serde_json::from_slice(&bytes)?;
+@@ -362,6 +374,13 @@ mod linux {
+             LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
+         let (_login,user,password)=credentials(&rpc.observer_login_file)?;
+         let native=NativeFundingRpc::new(rpc.native_daemon_port,rpc.observer_wallet_port,user,password)?;
++        if let Some(proof)=proof {
++            let txid=proof.tx_hash.0.clone();
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            execution.admit_native_funding(&native,proof,now).await?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-funding-proof-accept-response-v1","requestId":request_id,
++                "fundingTxid":txid,"snapshot":execution.saved_status()?}));
++        }
+         if let Some((frame,signature))=incoming {
+             let retained=execution.submit_redeem_signature(&native,&ltc,rpc.safety_blocks,&frame,&signature).await?;
+             return Ok(serde_json::json!({"schema":"monzero-ltc-redeem-submit-response-v1","requestId":request_id,
+@@ -427,7 +446,7 @@ mod linux {
+                 && review["priority"].as_u64()==Some(u64::from(s.priority)))
+         }
+     }
+-    enum FundingOperation {Prepare,Submit,Check}
++    enum FundingOperation {Prepare,Submit,Check,Proof}
+ 
+     fn credentials(path:&Path)->Result<(File,String,String)> {
+         let (lease,bytes)=private_bytes(path,true)?;
+@@ -640,7 +659,8 @@ mod linux {
+                 "feeAtoms":payment.fee.atom_string(),"chainObserved":false,"executable":false}}))
+     }
+     async fn funding_rpc(config:&Config,execution:&mut Execution,request:&Request,operation:FundingOperation)->Result<serde_json::Value> {
+-        let checking=matches!(operation,FundingOperation::Check);
++        let exporting=matches!(operation,FundingOperation::Proof);
++        let checking=matches!(operation,FundingOperation::Check|FundingOperation::Proof);
+         let preparing=matches!(operation,FundingOperation::Prepare);
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             litecoin_negotiation::execution::{funding_approval::FundingAction,lock_funding::NativeFundingSource}};
+@@ -680,6 +700,14 @@ mod linux {
+         isolated_native(rpc.native_daemon_port).await?;
+         let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
+         let mut native=NativeTransferRelay::new(NativeFundingRpc::new(rpc.native_daemon_port,rpc.native_wallet_port,user,password)?);
++        if exporting {
++            let proof=execution.reconcile_native_lock(&native).await?;
++            let bytes=zeroize::Zeroizing::new(serde_json::to_vec(&proof)?);
++            ensure!(bytes.len()<=16_384,"oversized native transfer proof");
++            return Ok(serde_json::json!({"schema":"monzero-ltc-funding-proof-response-v1","requestId":request.request_id,
++                "fundingTxid":proof.tx_hash.0,"proofHex":bytes.iter().map(|b|format!("{b:02x}")).collect::<String>(),
++                "snapshot":execution.saved_status()?}));
++        }
+         if checking {
+             // This observes native funding only, not the current Litecoin lock.
+             // The engine may retain an acknowledgement receipt; it never sends.
+@@ -843,6 +871,20 @@ mod linux {
+             }
+         }
+         #[test]
++        fn funding_proof_request_cannot_authorize_a_payment()->Result<()> {
++            let base=serde_json::json!({"schema":"monzero-ltc-funding-proof-request-v1","requestId":uuid::Uuid::new_v4(),"safetyBlocks":2});
++            assert!(valid_request(&serde_json::from_value(base.clone())?,"--funding-proof-stdio-v1"));
++            for (key,value) in [("action",serde_json::json!("send")),("commitment",serde_json::json!("00".repeat(32))),
++                ("priority",serde_json::json!(1)),("safetyBlocks",serde_json::json!(0))] {
++                let mut request=base.clone();request[key]=value;
++                assert!(!valid_request(&serde_json::from_value(request)?,"--funding-proof-stdio-v1"));
++            }
++            let mut request=serde_json::json!({"schema":"monzero-ltc-funding-proof-accept-request-v1","requestId":uuid::Uuid::new_v4(),"proofHex":"00"});
++            assert!(serde_json::from_value::<FundingProofRequest>(request.clone()).is_ok());
++            request["action"]=serde_json::json!("send");
++            assert!(serde_json::from_value::<FundingProofRequest>(request).is_err());Ok(())
++        }
++        #[test]
+         fn redeem_review_cannot_supply_keys_or_send_authority()->Result<()> {
+             let base=serde_json::json!({"schema":"monzero-ltc-redeem-review-request-v1","requestId":uuid::Uuid::new_v4()});
+             assert!(valid_request(&serde_json::from_value(base.clone())?,"--redeem-review-stdio-v1"));
+@@ -898,7 +940,7 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
+-        if args.len()==4 && ["--redeem-review-stdio-v1","--redeem-submit-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
++        if args.len()==4 && ["--redeem-review-stdio-v1","--redeem-submit-stdio-v1","--funding-proof-accept-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
+             let mut input=zeroize::Zeroizing::new(Vec::new());std::io::stdin().take(34001).read_to_end(&mut input)?;
+             ensure!(input.len()<=34000,"oversized redeem release request");
+             let response=tokio::runtime::Builder::new_current_thread().enable_all().build()?
+@@ -917,7 +959,7 @@ mod linux {
+         let wallet_mode=args.get(1).and_then(|a|a.to_str()).and_then(|mode|
+             ["payout","refund"].into_iter().flat_map(|p|["restore","open","check"].into_iter().map(move |o|(p,o)))
+                 .find(|(p,o)|mode==format!("--{p}-wallet-{o}-stdio-v1")));
+-        ensure!(args.len()==4 && (wallet_mode.is_some() || args[1]=="--snapshot-stdio-v1" || args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--redeem-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-prepare-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-prepare-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
++        ensure!(args.len()==4 && (wallet_mode.is_some() || args[1]=="--snapshot-stdio-v1" || args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--redeem-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-prepare-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-prepare-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1" || args[1]=="--funding-proof-stdio-v1")
+             && args[2]=="--config-file","invalid journal helper arguments");
+         let refund_prepare_mode=args[1]=="--refund-prepare-stdio-v1";
+         let payout_prepare_mode=args[1]=="--payout-prepare-stdio-v1";
+@@ -926,6 +968,7 @@ mod linux {
+         let funding_prepare_mode=args[1]=="--funding-prepare-stdio-v1";
+         let funding_review_mode=args[1]=="--funding-review-stdio-v1";
+         let funding_check_mode=args[1]=="--funding-check-stdio-v1";
++        let funding_proof_mode=args[1]=="--funding-proof-stdio-v1";
+         let funding_submit_mode=args[1]=="--funding-submit-stdio-v1";
+         let submit_mode=args[1]=="--refund-submit-stdio-v1";
+         let check_mode=args[1]=="--refund-check-stdio-v1";
+@@ -970,8 +1013,8 @@ mod linux {
+             let commitment=review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>();
+             serde_json::json!({"schema":"monzero-ltc-funding-review-response-v1","requestId":request.request_id,
+                 "snapshot":execution.saved_status()?,"review":{"details":review.details,"commitment":commitment}})
+-        } else if funding_prepare_mode || funding_submit_mode || funding_check_mode {
+-            tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(funding_rpc(&config,&mut execution,&request,if funding_prepare_mode {FundingOperation::Prepare} else if funding_check_mode {FundingOperation::Check} else {FundingOperation::Submit}))?
++        } else if funding_prepare_mode || funding_submit_mode || funding_check_mode || funding_proof_mode {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(funding_rpc(&config,&mut execution,&request,if funding_proof_mode {FundingOperation::Proof} else if funding_prepare_mode {FundingOperation::Prepare} else if funding_check_mode {FundingOperation::Check} else {FundingOperation::Submit}))?
+         } else if payout_prepare_mode || payout_submit_mode || payout_check_mode {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(payout_rpc(&config,&mut execution,&request,if payout_prepare_mode {PaymentOperation::Prepare} else if payout_check_mode {PaymentOperation::Check} else {PaymentOperation::Submit}))?
+         } else if refund_prepare_mode || submit_mode || check_mode {
+@@ -994,8 +1037,8 @@ mod linux {
+                 "snapshot":execution.saved_status()?,"review":{"details":review.details,"commitment":commitment}})
+         } else {serde_json::json!({"schema":"monzero-ltc-journal-response-v1",
+             "requestId":request.request_id,"snapshot":execution.saved_status()?})};
+-        let result=serde_json::to_vec(&response)?;
+-        ensure!(result.len()<=8192,"oversized journal response");
++        let result=zeroize::Zeroizing::new(serde_json::to_vec(&response)?);
++        ensure!(result.len()<=if funding_proof_mode {40000} else {8192},"oversized journal response");
+         std::io::stdout().write_all(&result)?;
+         Ok(())
+     }

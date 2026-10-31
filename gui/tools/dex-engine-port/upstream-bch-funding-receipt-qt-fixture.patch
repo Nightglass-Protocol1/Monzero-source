@@ -1,0 +1,52 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -154,7 +154,7 @@
+     let report=PathBuf::from(field("report")?);ensure!(!report.exists(),"fixture report exists");
+     save(&report,&serde_json::to_vec(&json!({"schema":"monzero-bch-node-executor-result-v1","executable":false,
+         "txid":txid.to_string(),"lockVout":signed.lock_outpoint().vout,"lockScript":setup.quote.recovery_plan().lock().script_pubkey().to_hex_string(),
+-        "authenticatedHandoff":handoff,"fundingReceiptApprovalVerified":handoff,"fundingReceiptHelperVerified":helper_receipt,"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff && !paired,"pairedNativeFunding":paired,
++        "authenticatedHandoff":handoff,"fundingReceiptApprovalVerified":handoff,"fundingReceiptHelperVerified":helper_receipt,"fundingReceiptQtVerified":helper_receipt && std::env::var_os("MONZERO_BCH_QT_FUNDING_RECEIPT_PROBE").is_some(),"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff && !paired,"pairedNativeFunding":paired,
+         "principalAtoms":100000,"feeAtoms":fee,"productionWalletLockSignRelay":true,"restartSavedBytes":true,
+         "inputs":inputs.iter().map(|p|json!({"txid":p.txid.to_string(),"vout":p.vout})).collect::<Vec<_>>() }))?)?;
+     Ok(())
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/receipt_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/receipt_helper.rs
+@@ -8,6 +8,18 @@
+     let helper_digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper
+         && hex(&Sha256::digest(std::fs::read(&helper)?))==helper_digest,"receipt helper changed");
++    let program=match (std::env::var_os("MONZERO_BCH_QT_FUNDING_RECEIPT_PROBE"),
++        std::env::var_os("MONZERO_BCH_QT_FUNDING_RECEIPT_PROBE_SHA256")) {
++        (None,None)=>helper.clone(),
++        (Some(path),Some(digest))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && digest.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),"Qt receipt probe changed");
++            path
++        },
++        _=>anyhow::bail!("incomplete Qt receipt probe pin"),
++    };
++    let through_qt=program!=helper;
+     let metadata=PrivateStore::new()?;let config=PrivateStore::new()?;
+     for (name,bytes) in original {save(&metadata.0.join(name),bytes)?;}
+     let quote_path=config.0.join("quote.json");save(&quote_path,&setup.quote.record()?)?;
+@@ -30,7 +42,7 @@
+         let id=uuid::Uuid::new_v4();
+         let mut request=json!({"schema":format!("monzero-bch-funding-receipt-{action}-request-v1"),"requestId":id});
+         if let Some(approval)=approval {request["commitment"]=approval.into();}
+-        let mut child=Command::new(&helper).arg(format!("--funding-receipt-{action}-stdio-v1")).arg(&wrapper)
++        let mut child=Command::new(&program).arg(format!("--funding-receipt-{action}-stdio-v1")).arg(&wrapper)
+             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+         child.stdin.take().context("helper stdin missing")?.write_all(&serde_json::to_vec(&request)?)?;
+         let output=child.wait_with_output()?;
+@@ -54,7 +66,9 @@
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     let accepted=invoke("submit",Some(&hex(expected)),true)?;assert!(!accepted["receipt"].is_null());
+     let retained=contents(&metadata.0)?;
+-    let again=invoke("submit",Some(&hex(expected)),true)?;
++    let again=if through_qt {
++        invoke("submit",Some(&hex(expected)),false)?;invoke("status",None,true)?
++    } else {invoke("submit",Some(&hex(expected)),true)?};
+     assert_eq!(again["receipt"],accepted["receipt"]);assert_eq!(again["review"],accepted["review"]);
+     assert_eq!(contents(&metadata.0)?,retained);
+     std::fs::remove_file(&peer)?;

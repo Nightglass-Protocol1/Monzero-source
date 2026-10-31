@@ -1,0 +1,99 @@
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -546,6 +546,77 @@
+             "review":review,"recovery":saved}))
+     }
+ 
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct CancelSubmission {schema: String,cancel_config_file: PathBuf,rpc_file: PathBuf}
++    async fn cancellation_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
++        use swap_machine::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::recovery::cancel::CancelRelayState;
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid BCH cancellation request size");
++        let request: Request=serde_json::from_slice(bytes)?;
++        ensure!(!request.request_id.is_nil() && matches!(action,"review"|"status"|"submit"|"observe")
++            && request.schema==format!("monzero-bch-cancel-{action}-request-v1"),"invalid BCH cancellation request");
++        let approved=if action=="submit" {
++            Some(parse_digest(request.commitment.as_deref().context("missing cancellation approval")?)?)
++        } else {
++            ensure!(request.commitment.is_none(),"unexpected cancellation approval");None
++        };
++        let submission=if matches!(action,"submit"|"observe") {
++            let (lease,bytes)=private_bytes(path)?;
++            let config: CancelSubmission=serde_json::from_slice(&bytes)?;
++            ensure!(config.schema=="monzero-private-bch-cancel-submission-v1"
++                && config.cancel_config_file.is_absolute() && config.rpc_file.is_absolute(),"invalid cancellation submission configuration");
++            Some((lease,config))
++        } else {None};
++        let path=submission.as_ref().map_or(path,|(_,config)|config.cancel_config_file.as_path());
++        let (_wrapper_lease,bytes)=private_bytes(path)?;
++        let wrapper: FundingConfig=serde_json::from_slice(&bytes)?;
++        ensure!(wrapper.schema=="monzero-private-bch-cancel-v1"
++            && wrapper.admission_config_file.is_absolute(),"invalid cancellation configuration");
++        let deployment=parse_digest(&wrapper.deployment_commitment)?;
++        let (_config_lease,config)=load(&wrapper.admission_config_file)?;
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"cancellation trade changed");
++        let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        let review=if matches!(action,"status"|"observe") {execution.saved_bch_cancel_relay_review(&deployment)?}
++            else {execution.review_bch_cancel_relay_for_deployment(&deployment,now)?};
++        let mut observation=serde_json::Value::Null;
++        if let Some((_,submission))=&submission {
++            if let Some(approved)=approved {ensure!(approved==review.commitment,"cancellation approval changed");}
++            let (_rpc_lease,bytes)=private_bytes(&submission.rpc_file)?;
++            let rpc: FundingRpc=serde_json::from_slice(&bytes)?;
++            let (_cookie_lease,cookie)=private_file(&rpc.cookie_file,true)?;
++            let backend=rpc.backend(&cookie)?;
++            ensure!(backend.deployment_commitment()?==deployment,"cancellation RPC deployment changed");
++            if action=="observe" {
++                let observed=execution.observe_bch_cancel(&backend,None).await?;
++                let confirmed=observed.confirmation();
++                let observed_at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                observation=serde_json::json!({"state":"confirmed","txid":confirmed.transaction().compute_txid().to_string(),
++                    "block":confirmed.block().to_string(),"height":confirmed.height().to_string(),
++                    "confirmations":confirmed.confirmations().to_string(),"tip":confirmed.tip().to_string(),
++                    "observedAt":observed_at.to_string()});
++            } else {
++                let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                execution.relay_bch_cancel(&backend,&approved.context("missing cancellation approval")?,dispatch).await?;
++            }
++        }
++        let (state,txid)=match execution.bch_cancel_relay_state()? {
++            None=>("not-attempted",review.details["txid"].as_str().context("missing cancellation txid")?.to_owned()),
++            Some(CancelRelayState::Attempted {txid})=>("attempted",txid.to_string()),
++            Some(CancelRelayState::Acknowledged {txid})=>("acknowledged",txid.to_string()),
++        };
++        let commitment: String=review.commitment.iter().map(|b|format!("{b:02x}")).collect();
++        Ok(serde_json::json!({"schema":format!("monzero-bch-cancel-{action}-response-v1"),
++            "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":action=="observe",
++            "review":{"details":review.details,"commitment":commitment},
++            "relay":{"state":state,"txid":txid,"confirmed":false},"observation":observation}))
++    }
++
+     pub fn run() -> Result<()> {
+         let args: Vec<_> = std::env::args_os().collect();
+         ensure!(args.len() == 3,"expected mode and private configuration path");
+@@ -578,7 +649,17 @@
+             "--recovery-retention-status-stdio-v1"=>Some("status"),
+             _=>None,
+         };
+-        let result = if let Some(operation)=recovery_action {
++        let cancel_action=match action {
++            "--cancel-review-stdio-v1"=>Some("review"),
++            "--cancel-status-stdio-v1"=>Some("status"),
++            "--cancel-submit-stdio-v1"=>Some("submit"),
++            "--cancel-observe-stdio-v1"=>Some("observe"),
++            _=>None,
++        };
++        let result = if let Some(operation)=cancel_action {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(cancellation_operation(Path::new(&args[2]),&bytes,operation))?
++        } else if let Some(operation)=recovery_action {
+             recovery_retention_operation(Path::new(&args[2]),&bytes,operation)?
+         } else if let Some(operation)=protection_action {
+             refund_protection_operation(Path::new(&args[2]),&bytes,operation)?

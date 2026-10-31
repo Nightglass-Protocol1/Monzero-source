@@ -1,0 +1,248 @@
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index 46d381c28..fa31ef585 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -8,6 +8,7 @@
+ pub mod fee_estimation;
+ pub mod full_proceeds;
+ pub mod exact_net_journal;
++pub mod exact_net_recovery;
+ pub mod relay;
+ pub mod spendable;
+ pub mod spend_journal;
+diff --git a/swap-machine/src/native_funding_rpc/exact_net_journal.rs b/swap-machine/src/native_funding_rpc/exact_net_journal.rs
+index 4b42f0fcc..1b9fdd0a9 100644
+--- a/swap-machine/src/native_funding_rpc/exact_net_journal.rs
++++ b/swap-machine/src/native_funding_rpc/exact_net_journal.rs
+@@ -17,18 +17,9 @@ impl ExactNetJournal {
+     #[cfg(unix)]
+     pub fn reserve(directory: &Path, genesis: &str, request: &ExactNetRequest,
+         top_up: &str) -> Result<Self> {
+-        super::full_proceeds::exact_net_params(request)?;
+         let source = &request.source;
+-        ensure!(top_up.len() == 64 && top_up.bytes().all(|b| b.is_ascii_digit()
+-            || (b'a'..=b'f').contains(&b)) && top_up != "0".repeat(64)
+-            && top_up != source.lock_txid, "invalid exact-net journal top-up");
+         let wallet = source.wallet.to_string();
+-        let intent = json!({"schema":"monzero-exact-net-spend-intent-v1", "genesis":genesis,
+-            "wallet":wallet,"lockTxid":source.lock_txid,"topUpTxid":top_up,
+-            "totalAtoms":source.locked.atom_string(),"principalAtoms":request.principal.atom_string(),
+-            "destination":source.destination.to_string(),
+-            "reserveReturnDestination":request.reserve_return.to_string(),
+-            "maximumFeeAtoms":source.maximum_fee.atom_string(),"account":source.account,"priority":source.priority});
++        let intent = intent_terms(genesis,request,top_up)?;
+         let (directory,identity) = super::spend_journal::reserve_intent(
+             directory,genesis,&wallet,&source.lock_txid,&intent)?;
+         Ok(Self { directory,identity,intent })
+@@ -59,7 +50,20 @@ impl ExactNetJournal {
+     }
+ }
+ 
+-fn check_terms(intent: &Value, terms: &Value) -> Result<()> {
++pub(super) fn intent_terms(genesis: &str, request: &ExactNetRequest, top_up: &str) -> Result<Value> {
++    super::full_proceeds::exact_net_params(request)?;
++    let source = &request.source;
++    ensure!(top_up.len() == 64 && top_up.bytes().all(|b| b.is_ascii_digit()
++        || (b'a'..=b'f').contains(&b)) && top_up != "0".repeat(64)
++        && top_up != source.lock_txid, "invalid exact-net journal top-up");
++    Ok(json!({"schema":"monzero-exact-net-spend-intent-v1", "genesis":genesis,
++        "wallet":source.wallet.to_string(),"lockTxid":source.lock_txid,"topUpTxid":top_up,
++        "totalAtoms":source.locked.atom_string(),"principalAtoms":request.principal.atom_string(),
++        "destination":source.destination.to_string(),"reserveReturnDestination":request.reserve_return.to_string(),
++        "maximumFeeAtoms":source.maximum_fee.atom_string(),"account":source.account,"priority":source.priority}))
++}
++
++pub(super) fn check_terms(intent: &Value, terms: &Value) -> Result<()> {
+     for (field,value) in intent.as_object().expect("internal intent object") {
+         if field != "schema" {
+             ensure!(terms.get(field) == Some(value), "exact-net prepared terms differ from intent");
+diff --git a/swap-machine/src/native_funding_rpc/exact_net_recovery.rs b/swap-machine/src/native_funding_rpc/exact_net_recovery.rs
+new file mode 100644
+index 000000000..bc203c3b2
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/exact_net_recovery.rs
+@@ -0,0 +1,96 @@
++//! Read-only historical preparation evidence, not broadcast or retry authority.
++use anyhow::{ensure, Result};
++use serde_json::Value;
++use std::path::Path;
++use super::{full_proceeds::ExactNetRequest, number, string};
++use swap_core::xmz::XmzAmount;
++
++pub struct ExactNetRecovery {
++    terms: Value,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++    fn fixture() -> (Value,Value) {
++        let intent=json!({"schema":"monzero-exact-net-spend-intent-v1","genesis":"a".repeat(64),
++            "wallet":"fixture","lockTxid":"b".repeat(64),"topUpTxid":"c".repeat(64),
++            "totalAtoms":"110","principalAtoms":"100","destination":"buyer",
++            "reserveReturnDestination":"reserve","maximumFeeAtoms":"3","account":0,"priority":1});
++        let mut prepared=intent.clone();
++        prepared["schema"]=json!("monzero-exact-net-prepared-accounting-v1");
++        prepared["txid"]=json!("d".repeat(64));prepared["weight"]=json!(10);
++        prepared["reserveReturnAtoms"]=json!("8");prepared["feeAtoms"]=json!("2");
++        (intent,prepared)
++    }
++    #[test]
++    fn recovery_rejects_changed_context_and_prepared_terms() -> Result<()> {
++        let (intent,prepared)=fixture();
++        let loaded=ExactNetRecovery::decode(intent.clone(),prepared.clone(),&intent)?;
++        assert_eq!(loaded.terms(),&prepared);
++        for field in intent.as_object().unwrap().keys() {
++            let mut changed=intent.clone();changed[field]=json!(null);
++            assert!(ExactNetRecovery::decode(changed,prepared.clone(),&intent).is_err());
++            let mut changed=prepared.clone();changed[field]=json!(null);
++            assert!(ExactNetRecovery::decode(intent.clone(),changed,&intent).is_err());
++        }
++        let mut extra=prepared.clone();extra["tx_metadata"]=json!("secret");
++        assert!(ExactNetRecovery::decode(intent.clone(),extra,&intent).is_err());
++        Ok(())
++    }
++    #[test]
++    fn recovery_requires_exact_bounded_accounting_and_identity() {
++        let (intent,prepared)=fixture();
++        for (field,value) in [("feeAtoms",json!("0")),("feeAtoms",json!("4")),
++            ("feeAtoms",json!("02")),("feeAtoms",json!(2)),("reserveReturnAtoms",json!("9")),
++            ("reserveReturnAtoms",json!("0")),("reserveReturnAtoms",json!(u64::MAX.to_string())),
++            ("weight",json!(0)),("txid",json!("0".repeat(64))),("txid",json!("D".repeat(64)))] {
++            let mut changed=prepared.clone();changed[field]=value;
++            assert!(ExactNetRecovery::decode(intent.clone(),changed,&intent).is_err(),"accepted {field}");
++        }
++    }
++}
++
++impl ExactNetRecovery {
++    /// Expected terms come from retained trusted trade context, not these files.
++    /// Neither a successful load nor an absent receipt proves chain settlement.
++    #[cfg(unix)]
++    pub fn load(directory: &Path, genesis: &str, request: &ExactNetRequest,
++        top_up: &str) -> Result<Self> {
++        let expected=super::exact_net_journal::intent_terms(genesis,request,top_up)?;
++        let (intent,prepared)=super::spend_recovery::load_records(directory,genesis,
++            &request.source.wallet,&request.source.lock_txid)?;
++        Self::decode(intent,prepared,&expected)
++    }
++
++    #[cfg(not(unix))]
++    pub fn load(_: &Path, _: &str, _: &ExactNetRequest, _: &str) -> Result<Self> {
++        anyhow::bail!("exact-net recovery reader not implemented on this platform")
++    }
++
++    fn decode(intent: Value, prepared: Value, expected: &Value) -> Result<Self> {
++        ensure!(&intent == expected, "exact-net recovery intent differs from trusted terms");
++        ensure!(prepared.as_object().is_some_and(|value| value.len()==16)
++            && prepared["schema"]=="monzero-exact-net-prepared-accounting-v1",
++            "invalid exact-net prepared record");
++        super::exact_net_journal::check_terms(&intent,&prepared)?;
++        let txid=string(&prepared,"txid")?;
++        ensure!(txid.len()==64 && txid != "0".repeat(64)
++            && txid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
++            "invalid exact-net prepared transaction identity");
++        let atoms=|field| -> Result<u64> {
++            let amount=XmzAmount::from_atom_string(&string(&prepared,field)?)
++                .map_err(|_| anyhow::anyhow!("invalid exact-net recovery amount"))?;
++            ensure!(amount.atoms()>0,"zero exact-net recovery amount");Ok(amount.atoms())
++        };
++        let fee=atoms("feeAtoms")?;
++        ensure!(fee<=atoms("maximumFeeAtoms")? && number(&prepared,"weight")?>0
++            && atoms("principalAtoms")?.checked_add(atoms("reserveReturnAtoms")?)
++                .and_then(|total| total.checked_add(fee))==Some(atoms("totalAtoms")?),
++            "inconsistent exact-net recovery accounting");
++        Ok(Self { terms:prepared })
++    }
++
++    pub fn terms(&self) -> &Value { &self.terms }
++}
+diff --git a/swap-machine/src/native_funding_rpc/spend_recovery.rs b/swap-machine/src/native_funding_rpc/spend_recovery.rs
+index 83fa90fe4..4553a7d29 100644
+--- a/swap-machine/src/native_funding_rpc/spend_recovery.rs
++++ b/swap-machine/src/native_funding_rpc/spend_recovery.rs
+@@ -71,24 +71,7 @@ pub async fn execute_recovery(client: &NativeFundingRpc, directory: &Path,
+ impl RecoveryRecord {
+     #[cfg(unix)]
+     pub fn load(directory: &Path, genesis: &str, wallet: XmzAddress, lock_txid: &str) -> Result<Self> {
+-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+-        ensure!(canonical_hash(genesis) && canonical_hash(lock_txid), "invalid recovery identity");
+-        ensure!(directory.is_absolute() && directory.canonicalize()? == directory, "noncanonical recovery directory");
+-        let dir = OpenOptions::new().read(true)
+-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(directory)?;
+-        let metadata = dir.metadata()?;
+-        ensure!(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+-            "nonprivate recovery directory");
+-        let mut hash = Sha256::new();
+-        hash.update(b"monzero-native-spend-journal-v1\0");
+-        let address = wallet.to_string();
+-        for field in [genesis, address.as_str(), lock_txid] {
+-            hash.update((field.len() as u64).to_be_bytes());
+-            hash.update(field.as_bytes());
+-        }
+-        let identity = format!("{:x}", hash.finalize());
+-        let intent = read_record(&dir, &format!("{identity}.intent"))?;
+-        let prepared = read_record(&dir, &format!("{identity}.prepared"))?;
++        let (intent, prepared) = load_records(directory,genesis,&wallet,lock_txid)?;
+         Self::decode(intent, prepared, genesis, wallet, lock_txid)
+     }
+ 
+@@ -155,6 +138,29 @@ impl RecoveryRecord {
+     }
+ }
+ 
++#[cfg(unix)]
++pub(super) fn load_records(directory: &Path, genesis: &str, wallet: &XmzAddress,
++    lock_txid: &str) -> Result<(Value,Value)> {
++    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++    ensure!(canonical_hash(genesis) && canonical_hash(lock_txid), "invalid recovery identity");
++    ensure!(directory.is_absolute() && directory.canonicalize()? == directory, "noncanonical recovery directory");
++    let dir = OpenOptions::new().read(true)
++        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(directory)?;
++    let metadata = dir.metadata()?;
++    ensure!(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
++        "nonprivate recovery directory");
++    let mut hash = Sha256::new();
++    hash.update(b"monzero-native-spend-journal-v1\0");
++    let address = wallet.to_string();
++    for field in [genesis, address.as_str(), lock_txid] {
++        hash.update((field.len() as u64).to_be_bytes());
++        hash.update(field.as_bytes());
++    }
++    let identity = format!("{:x}", hash.finalize());
++    Ok((read_record(&dir, &format!("{identity}.intent"))?,
++        read_record(&dir, &format!("{identity}.prepared"))?))
++}
++
+ fn atoms(value: &Value, field: &str) -> Result<u64> {
+     let text = string(value, field)?;
+     let amount = XmzAmount::from_atom_string(&text).map_err(|_| anyhow::anyhow!("invalid recovery amount"))?;
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 8337d81bf..35940f265 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -281,12 +281,22 @@ async fn native_exact_net_top_up_preview() -> Result<()> {
+     };
+     let top_up = std::env::var("MONZERO_TEST_TOP_UP_TXID")?;
+     let genesis = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
++    let directory = std::path::PathBuf::from(std::env::var("MONZERO_TEST_TOP_UP_JOURNAL")?);
++    if std::env::var("MONZERO_TEST_TOP_UP_RECOVER_ONLY").as_deref() == Ok("1") {
++        let recovered=swap_machine::native_funding_rpc::exact_net_recovery::ExactNetRecovery::load(
++            &directory,genesis,&request,&top_up)?;
++        anyhow::ensure!(recovered.terms()["txid"] == std::env::var("MONZERO_TEST_TOP_UP_EXPECTED_TXID")?,
++            "unexpected recovered preparation identity");
++        request.principal = XmzAmount::from_atoms(99_999_999_999);
++        anyhow::ensure!(swap_machine::native_funding_rpc::exact_net_recovery::ExactNetRecovery::load(
++            &directory,genesis,&request,&top_up).is_err(), "changed recovery context accepted");
++        return Ok(()); // No RPC, restoration, construction or relay in this branch.
++    }
+     let client = native_rpc::authenticated_fixture()?;
+     let checked = preview_exact_net_with_top_up(&client,&request,genesis,&top_up).await?;
+     anyhow::ensure!(checked.recipient == request.principal
+         && checked.reserve_return.checked_add(checked.network_fee)
+             == Some(XmzAmount::from_atoms(10_000_000_000)), "incorrect two-source accounting");
+-    let directory = std::path::PathBuf::from(std::env::var("MONZERO_TEST_TOP_UP_JOURNAL")?);
+     let journal = swap_machine::native_funding_rpc::exact_net_journal::ExactNetJournal::reserve(
+         &directory,genesis,&request,&top_up)?;
+     let prepared = swap_machine::native_funding_rpc::full_proceeds::prepare_exact_net_with_top_up(

@@ -1,0 +1,180 @@
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -804,6 +804,8 @@
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct NativePreparationConfig {
++        #[serde(default,deserialize_with="native_observer::required_kind")]
++        bch_observer_kind: Option<native_observer::Kind>,
+         schema: String,admission_config_file: PathBuf,bch_rpc_file: PathBuf,native_rpc_file: PathBuf,
+         deployment_commitment: String,wallet: String,account: u32,priority: u32,safety_blocks: u32,
+     }
+@@ -814,8 +816,12 @@
+     }
+     fn native_preparation_config(bytes: &[u8]) -> Result<NativePreparationConfig> {
+         let config: NativePreparationConfig=serde_json::from_slice(bytes)?;
+-        ensure!(config.schema=="monzero-private-bch-native-preparation-v1"
+-            && config.admission_config_file.is_absolute() && config.bch_rpc_file.is_absolute()
++        let valid_kind=match config.schema.as_str() {
++            "monzero-private-bch-native-preparation-v1"=>config.bch_observer_kind.is_none(),
++            "monzero-private-bch-native-preparation-v2"=>config.bch_observer_kind==Some(native_observer::Kind::OwnedNode),
++            _=>false,
++        };
++        ensure!(valid_kind && config.admission_config_file.is_absolute() && config.bch_rpc_file.is_absolute()
+             && config.native_rpc_file.is_absolute() && (1..=4).contains(&config.priority)
+             && config.safety_blocks>0,"invalid native preparation configuration");
+         parse_digest(&config.deployment_commitment)?;
+@@ -894,8 +900,8 @@
+             ensure!(approved==checked.commitment,"native relay consent changed");
+             // Approval precedes credentials; descriptor leases cover dispatch.
+                 let (_bch_lease,bytes)=private_bytes(&wrapper.bch_rpc_file)?;
+-                let descriptor: FundingRpc=serde_json::from_slice(&bytes)?;
+-                let (_cookie_lease,cookie)=private_file(&descriptor.cookie_file,true)?;
++                let descriptor=native_observer::Descriptor::parse(wrapper.bch_observer_kind,&bytes)?;
++                let (_cookie_lease,cookie)=private_file(descriptor.cookie_file(),true)?;
+                 let bch=descriptor.backend(&cookie)?;
+                 ensure!(bch.deployment_commitment()?==deployment,"native preparation BCH observer changed");
+                 let (_native_lease,bytes)=private_bytes(&wrapper.native_rpc_file)?;
+@@ -911,7 +917,7 @@
+                 ensure!(!user.is_empty() && !password.is_empty() && !text.bytes().any(|b|b.is_ascii_control()),"invalid native RPC login");
+                 let mut relay=NativeTransferRelay::new(NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?);
+                 let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+-                execution.relay_bch_native_funding(&mut relay,&bch,&approved,dispatch).await?;
++                bch.relay(&mut execution,&mut relay,&approved,dispatch).await?;
+         }
+         let relay=execution.bch_native_relay_state()?.map(|state|match state {
+             NativeRelayState::Attempted {txid}=>serde_json::json!({"state":"attempted","txid":txid}),
+@@ -956,8 +962,8 @@
+                 // Consent is checked before credentials are opened. The shared
+                 // native descriptor lease remains held through wallet construction.
+                 let (_bch_lease,bytes)=private_bytes(&wrapper.bch_rpc_file)?;
+-                let descriptor: FundingRpc=serde_json::from_slice(&bytes)?;
+-                let (_cookie_lease,cookie)=private_file(&descriptor.cookie_file,true)?;
++                let descriptor=native_observer::Descriptor::parse(wrapper.bch_observer_kind,&bytes)?;
++                let (_cookie_lease,cookie)=private_file(descriptor.cookie_file(),true)?;
+                 let bch=descriptor.backend(&cookie)?;
+                 ensure!(bch.deployment_commitment()?==deployment,"native preparation BCH observer changed");
+                 let (_native_lease,bytes)=private_bytes(&wrapper.native_rpc_file)?;
+@@ -973,7 +979,7 @@
+                 ensure!(!user.is_empty() && !password.is_empty() && !text.bytes().any(|b|b.is_ascii_control()),"invalid native RPC login");
+                 let mut relay=NativeTransferRelay::new(NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?);
+                 let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+-                execution.prepare_reviewed_bch_native_funding(&mut relay,&bch,source,wrapper.safety_blocks,dispatch,&approved).await?;
++                bch.prepare(&mut execution,&mut relay,source,wrapper.safety_blocks,dispatch,&approved).await?;
+             }
+             review=serde_json::json!({"details":checked.details,"commitment":checked.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
+         }
+@@ -1253,6 +1259,7 @@
+     }
+ 
+     mod publication {include!("native-bch-admission/publication.rs");}
++    mod native_observer {include!("native-bch-admission/native_observer.rs");}
+ 
+     pub fn run() -> Result<()> {
+         let args: Vec<_> = std::env::args_os().collect();
+diff --git a/swap-machine/src/bin/native-bch-admission/publication.rs b/swap-machine/src/bin/native-bch-admission/publication.rs
+--- a/swap-machine/src/bin/native-bch-admission/publication.rs
++++ b/swap-machine/src/bin/native-bch-admission/publication.rs
+@@ -47,11 +47,11 @@
+ // this descriptor. It cannot be substituted with a wallet RPC descriptor.
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields,rename_all="camelCase")]
+-struct ObserverRpc {
+-    schema:String,port:u16,cookie_file:PathBuf,checkpoint_height:u64,checkpoint:String,subversion:String,
++pub(super) struct ObserverRpc {
++    pub(super) schema:String,port:u16,pub(super) cookie_file:PathBuf,checkpoint_height:u64,checkpoint:String,subversion:String,
+ }
+ impl ObserverRpc {
+-    fn backend(&self,cookie:&[u8])->Result<OwnedBchObserver> {
++    pub(super) fn backend(&self,cookie:&[u8])->Result<OwnedBchObserver> {
+         ensure!(self.schema=="monzero-private-bch-observer-rpc-v1" && self.cookie_file.is_absolute()
+             && self.checkpoint_height>0,"invalid BCH observer configuration");
+         parse_digest(&self.checkpoint)?;
+diff --git a/swap-machine/src/bin/native-bch-admission/native_observer.rs b/swap-machine/src/bin/native-bch-admission/native_observer.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-bch-admission/native_observer.rs
+@@ -0,0 +1,82 @@
++// Explicit private helper backend selection. No automatic descriptor fallback.
++use super::*;
++use swap_machine::{bch_rpc::{BchRpc,observer::OwnedBchObserver},
++    native_funding_rpc::relay::{NativeTransferRelay,RelayedTransfer},
++    bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::native::NativeFundingSource};
++#[derive(Clone,Copy,PartialEq,Eq,Deserialize)]
++#[serde(rename_all="kebab-case")]
++pub(super) enum Kind {OwnedNode}
++pub(super) fn required_kind<'de,D:serde::Deserializer<'de>>(deserializer:D)->std::result::Result<Option<Kind>,D::Error> {
++    Kind::deserialize(deserializer).map(Some)
++}
++pub(super) enum Descriptor {Node(FundingRpc),Owned(publication::ObserverRpc)}
++impl Descriptor {
++    pub(super) fn parse(kind:Option<Kind>,bytes:&[u8])->Result<Self> {
++        match kind {
++            None=>{let descriptor:FundingRpc=serde_json::from_slice(bytes)?;
++                ensure!(descriptor.schema=="monzero-private-bch-funding-rpc-v1","wrong node-wallet descriptor schema");Ok(Self::Node(descriptor))},
++            Some(Kind::OwnedNode)=>{let descriptor:publication::ObserverRpc=serde_json::from_slice(bytes)?;
++                ensure!(descriptor.schema=="monzero-private-bch-observer-rpc-v1","wrong owned observer descriptor schema");Ok(Self::Owned(descriptor))},
++        }
++    }
++    pub(super) fn cookie_file(&self)->&Path {match self {Self::Node(d)=>&d.cookie_file,Self::Owned(d)=>&d.cookie_file}}
++    pub(super) fn backend(&self,cookie:&[u8])->Result<Backend> {
++        match self {Self::Node(d)=>Ok(Backend::Node(d.backend(cookie)?)),Self::Owned(d)=>Ok(Backend::Owned(d.backend(cookie)?))}
++    }
++}
++pub(super) enum Backend {Node(BchRpc),Owned(OwnedBchObserver)}
++impl Backend {
++    pub(super) fn deployment_commitment(&self)->Result<[u8;32]> {
++        match self {Self::Node(bch)=>bch.deployment_commitment(),Self::Owned(bch)=>bch.deployment_commitment()}
++    }
++    pub(super) async fn prepare(&self,execution:&mut AdmittedExecution<'_>,native:&mut NativeTransferRelay,
++        source:NativeFundingSource,safety:u32,now:u64,approved:&[u8;32])->Result<RelayedTransfer> {
++        match self {
++            Self::Node(bch)=>execution.prepare_reviewed_bch_native_funding(native,bch,source,safety,now,approved).await,
++            Self::Owned(bch)=>execution.prepare_reviewed_light_bch_native_funding(native,bch,source,safety,now,approved).await,
++        }
++    }
++    pub(super) async fn relay(&self,execution:&mut AdmittedExecution<'_>,native:&mut NativeTransferRelay,
++        approved:&[u8;32],now:u64)->Result<RelayedTransfer> {
++        match self {
++            Self::Node(bch)=>execution.relay_bch_native_funding(native,bch,approved,now).await,
++            Self::Owned(bch)=>execution.relay_light_bch_native_funding(native,bch,approved,now).await,
++        }
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn config_requires_explicit_versioned_observer_kind()->Result<()> {
++        let base=serde_json::json!({"schema":"monzero-private-bch-native-preparation-v1",
++            "admissionConfigFile":"/private/admission","bchRpcFile":"/private/bch","nativeRpcFile":"/private/native",
++            "deploymentCommitment":"ab".repeat(32),"wallet":"checked-at-load","account":0,"priority":1,"safetyBlocks":5});
++        assert!(native_preparation_config(&serde_json::to_vec(&base)?).is_ok());
++        for (version,kind,valid) in [("v1",Some(serde_json::json!("owned-node")),false),("v1",Some(serde_json::Value::Null),false),
++            ("v2",None,false),("v2",Some(serde_json::Value::Null),false),("v2",Some(serde_json::json!("owned-node")),true),
++            ("v2",Some(serde_json::json!("node-wallet")),false),("v3",Some(serde_json::json!("owned-node")),false)] {
++            let mut value=base.clone();value["schema"]=serde_json::json!(format!("monzero-private-bch-native-preparation-{version}"));
++            if let Some(kind)=kind {value["bchObserverKind"]=kind;}
++            assert_eq!(native_preparation_config(&serde_json::to_vec(&value)?).is_ok(),valid);
++        }
++        Ok(())
++    }
++    #[test]
++    fn descriptor_cannot_fall_back_to_another_backend()->Result<()> {
++        let owned=serde_json::json!({"schema":"monzero-private-bch-observer-rpc-v1","port":12345,
++            "cookieFile":"/private/cookie","checkpointHeight":1,"checkpoint":"07".repeat(32),"subversion":"/Bitcoin Cash Node:29.0.0/"});
++        let bytes=serde_json::to_vec(&owned)?;
++        let observer=Descriptor::parse(Some(Kind::OwnedNode),&bytes)?.backend(b"user:pass")?;
++        assert!(Descriptor::parse(None,&bytes).is_err());
++        let mut node=owned.clone();node["schema"]=serde_json::json!("monzero-private-bch-funding-rpc-v1");
++        node["wallet"]=serde_json::json!("test");node["anchor"]=serde_json::json!("bchreg:qanchor");node["anchorScript"]=serde_json::json!("51");
++        let bytes=serde_json::to_vec(&node)?;
++        assert!(Descriptor::parse(Some(Kind::OwnedNode),&bytes).is_err());
++        let wallet=Descriptor::parse(None,&bytes)?.backend(b"user:pass")?;
++        assert_ne!(observer.deployment_commitment()?,wallet.deployment_commitment()?);
++        let mut wrong=owned;wrong["schema"]=serde_json::json!("wrong");
++        assert!(Descriptor::parse(Some(Kind::OwnedNode),&serde_json::to_vec(&wrong)?).is_err());
++        Ok(())
++    }
++}

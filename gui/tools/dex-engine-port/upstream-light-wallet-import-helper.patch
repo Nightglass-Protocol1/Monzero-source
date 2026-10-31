@@ -1,0 +1,109 @@
+diff --git a/swap-machine/src/bin/native-ltc-light/recovery.rs b/swap-machine/src/bin/native-ltc-light/recovery.rs
+--- a/swap-machine/src/bin/native-ltc-light/recovery.rs
++++ b/swap-machine/src/bin/native-ltc-light/recovery.rs
+@@ -153,7 +153,7 @@
+ }
+ 
+ // BIP39 permits an empty additional passphrase; the vault password does not.
+-struct RecoveryPassphrase(Zeroizing<String>);
++pub(super) struct RecoveryPassphrase(pub(super) Zeroizing<String>);
+ impl<'de> Deserialize<'de> for RecoveryPassphrase {
+     fn deserialize<D:serde::Deserializer<'de>>(deserializer:D)->std::result::Result<Self,D::Error> {
+         let value=Zeroizing::new(String::deserialize(deserializer)?);
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -418,6 +418,7 @@
+     }
+     mod vault_format { include!("native-ltc-light/vault_format.rs"); }
+     mod recovery { include!("native-ltc-light/recovery.rs"); }
++    mod import { include!("native-ltc-light/import.rs"); }
+     fn output(response:&Value)->Result<()> {
+         let bytes=serde_json::to_vec(response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
+         std::io::stdout().write_all(&bytes)?;Ok(())
+@@ -425,6 +426,8 @@
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
++        if args[1]=="--wallet-import-preview-stdio-v1" {return import::run(Path::new(&args[2]),false);}
++        if args[1]=="--wallet-import-stdio-v1" {return import::run(Path::new(&args[2]),true);}
+         if args[1]=="--wallet-recovery-stdio-v1" {return recovery::reveal(Path::new(&args[2]));}
+         if args[1]=="--wallet-mnemonic-recovery-stdio-v1" {return recovery::reveal_mnemonic(Path::new(&args[2]));}
+         if args[1]=="--wallet-key-restore-stdio-v1" {return recovery::restore(Path::new(&args[2]));}
+diff --git a/swap-machine/src/bin/native-ltc-light/import.rs b/swap-machine/src/bin/native-ltc-light/import.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/import.rs
+@@ -0,0 +1,72 @@
++// Private recovery words in; reviewed public account out. Import remains
++// discovery-pending and cannot be loaded by normal payment operations.
++use super::*;
++use super::recovery::RecoveryPassphrase;
++use swap_machine::litecoin_light::vault::{mnemonic::MnemonicMaterial,
++    setup::{SetupDirectories,configuration::{ConfigurationOptions,initialize_configured_imported_mnemonic}}};
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct ImportRequest {
++    schema:String,request_id:uuid::Uuid,approved_config_digest:String,
++    seed_encoding:String,phrase:Password,recovery_passphrase:RecoveryPassphrase,
++    password:Option<Password>,approved_review:Option<String>,import_approved:Option<bool>,
++}
++
++pub(super) fn run(path:&Path,commit:bool)->Result<()> {
++    let operation=if commit {"wallet-import"} else {"wallet-import-preview"};
++    let mut input=Zeroizing::new(Vec::with_capacity(8193));
++    std::io::stdin().take(8193).read_to_end(&mut input)?;
++    ensure!(!input.is_empty() && input.len()<=8192,"invalid wallet import request size");
++    let request:ImportRequest=serde_json::from_slice(&input)?;
++    let tag=["ltc","btc","bch","doge"].into_iter()
++        .find(|tag|request.schema==format!("monzero-{tag}-light-{operation}-request-v1"))
++        .context("invalid wallet import schema")?;
++    ensure!(!request.request_id.is_nil() && request.seed_encoding==MnemonicMaterial::ENCODING,
++        "invalid wallet import identity or format");
++    if commit {
++        ensure!(request.import_approved==Some(true) && request.password.is_some() && request.approved_review.is_some(),
++            "missing wallet import approval");
++    } else {
++        ensure!(request.import_approved.is_none() && request.password.is_none() && request.approved_review.is_none(),
++            "preview cannot carry import approval or vault password");
++    }
++    let (_lease,bytes)=private_config(path)?;
++    let approved:sha256::Hash=request.approved_config_digest.parse()?;
++    ensure!(approved.to_string()==request.approved_config_digest && sha256::Hash::hash(&bytes)==approved,
++        "wallet import settings differ from approval");
++    let config:SetupConfig=serde_json::from_slice(&bytes)?;
++    ensure!(config.schema==format!("monzero-private-{tag}-setup-v1") && !config.wallet_id.is_nil()
++        && matches!(config.seed_encoding,vault_format::VaultFormat::Mnemonic)
++        && config.maximum_height<=10_000_000,"invalid mnemonic import settings");
++    let network=network_for(tag,&config.network)?;
++    let material=MnemonicMaterial::parse(&request.phrase.0)?;
++    let account=material.public_account(network,config.account_index,&request.recovery_passphrase.0)?;
++    let first=account.derive(Branch::Receive,0)?;
++    let review=json!({"schema":format!("monzero-{tag}-light-wallet-import-review-v1"),
++        "coin":tag,"network":config.network,"walletId":config.wallet_id,"account":account.descriptor(),
++        "receiveAddress":first.address().to_string(),"receivePath":first.path().to_string(),
++        "configurationDigest":approved.to_string(),"seedEncoding":MnemonicMaterial::ENCODING,
++        "wordCount":material.word_count(),"additionalPassphraseUsed":!request.recovery_passphrase.0.is_empty(),
++        "scope":"keys-only","discoveryRequired":true,"activeSwapRecovery":false});
++    let review_digest=sha256::Hash::hash(&serde_json::to_vec(&review)?).to_string();
++    if !commit {
++        return output(&json!({"schema":format!("monzero-{tag}-light-wallet-import-preview-response-v1"),
++            "requestId":request.request_id,"review":review,"reviewDigest":review_digest}));
++    }
++    ensure!(request.approved_review.as_deref()==Some(review_digest.as_str()),"imported account differs from approved review");
++    let endpoint=config.endpoint.map(|e|TlsEndpoint::new(e.host,e.port,network)).transpose()?;
++    let directories=SetupDirectories {vault:config.vault_directory,addresses:config.address_book_directory,backup:config.backup_directory};
++    let options=ConfigurationOptions {cache:config.cache_directory,spends:config.spend_directory,
++        maximum_height:config.maximum_height,endpoint};
++    let password=request.password.as_ref().context("missing import password")?;
++    let imported=initialize_configured_imported_mnemonic(&config.setup_directory,&directories,network,config.wallet_id,
++        config.account_index,password.0.as_bytes(),&options,&material,&request.recovery_passphrase.0)?;
++    ensure!(serde_json::to_vec(&imported.wallet().account().descriptor())?==serde_json::to_vec(&account.descriptor())?,
++        "imported wallet account differs from review");
++    output(&json!({"schema":format!("monzero-{tag}-light-wallet-import-response-v1"),"requestId":request.request_id,
++        "reviewDigest":review_digest,"wallet":{"imported":true,"spendable":false,"discoveryRequired":true,
++        "configurationFile":imported.configuration_path(),"configurationDigest":imported.configuration_digest().to_string(),
++        "backupVerified":true,"backupDigest":imported.wallet().backup().digest().to_string(),
++        "walletId":config.wallet_id,"addressRecordsRestored":false,"activeSwapRecovery":false}}))
++}

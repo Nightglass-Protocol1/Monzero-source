@@ -1,0 +1,86 @@
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+index f4aa74fa5..2aeaf928e 100644
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -3,6 +3,7 @@ pub mod bob;
+ pub mod common;
+ pub mod xmz_funding;
+ pub mod native_funding_rpc;
++pub mod native_quote_destinations;
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/swap-machine/src/native_quote_destinations.rs b/swap-machine/src/native_quote_destinations.rs
+new file mode 100644
+index 000000000..af6ae054f
+--- /dev/null
++++ b/swap-machine/src/native_quote_destinations.rs
+@@ -0,0 +1,68 @@
++//! Destination decoding only. Does not verify quotes, ownership, genesis or funds.
++use anyhow::{Result, ensure};
++use bitcoin::{Address, Network, address::NetworkUnchecked};
++use swap_core::xmz_address::{XmzAddress, XmzNetwork};
++
++pub struct QuoteDestinations {
++    pub btc_payout: Address,
++    pub btc_refund: Address,
++    pub xmz_payout: XmzAddress,
++    pub xmz_refund: XmzAddress,
++}
++
++impl QuoteDestinations {
++    /// Networks must come from trusted deployment configuration, not the quote.
++    /// Some Bitcoin networks share legacy prefixes; genesis is checked separately.
++    pub fn parse(
++        bitcoin_network: Network,
++        xmz_network: XmzNetwork,
++        btc_payout: &str,
++        btc_refund: &str,
++        xmz_payout: &str,
++        xmz_refund: &str,
++    ) -> Result<Self> {
++        fn bitcoin(value: &str, network: Network) -> Result<Address> {
++            ensure!(value.len() <= 128, "Bitcoin destination too long");
++            let address = value.parse::<Address<NetworkUnchecked>>()?.require_network(network)?;
++            ensure!(address.to_string() == value, "Noncanonical Bitcoin destination");
++            Ok(address)
++        }
++        Ok(Self {
++            btc_payout: bitcoin(btc_payout, bitcoin_network)?,
++            btc_refund: bitcoin(btc_refund, bitcoin_network)?,
++            xmz_payout: XmzAddress::parse(xmz_network, xmz_payout)?,
++            xmz_refund: XmzAddress::parse(xmz_network, xmz_refund)?,
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn decodes_all_destinations_and_rejects_wrong_networks() {
++        let btc = Address::p2wsh(&bitcoin::ScriptBuf::new(), Network::Regtest).to_string();
++        let vectors: Vec<_> = include_str!("../../swap-core/src/xmz_address_vectors.txt").lines().collect();
++        let xmz = vectors[0];
++        let decoded = QuoteDestinations::parse(Network::Regtest, XmzNetwork::Mainnet,
++            &btc, &btc, xmz, xmz).unwrap();
++        assert_eq!(decoded.btc_payout.to_string(), btc);
++        assert_eq!(decoded.btc_refund.to_string(), btc);
++        assert_eq!(decoded.xmz_payout.to_string(), xmz);
++        assert_eq!(decoded.xmz_refund.to_string(), xmz);
++        assert!(QuoteDestinations::parse(Network::Bitcoin, XmzNetwork::Mainnet,
++            &btc, &btc, xmz, xmz).is_err());
++        assert!(QuoteDestinations::parse(Network::Regtest, XmzNetwork::Testnet,
++            &btc, &btc, xmz, xmz).is_err());
++        for position in 0..4 {
++            let mut destinations = [btc.as_str(), btc.as_str(), xmz, xmz];
++            destinations[position] = "not-an-address";
++            assert!(QuoteDestinations::parse(Network::Regtest, XmzNetwork::Mainnet,
++                destinations[0], destinations[1], destinations[2], destinations[3]).is_err());
++        }
++        assert!(QuoteDestinations::parse(Network::Regtest, XmzNetwork::Mainnet,
++            &btc.to_uppercase(), &btc, xmz, xmz).is_err());
++        assert!(QuoteDestinations::parse(Network::Regtest, XmzNetwork::Mainnet,
++            &btc, &btc, vectors[3], xmz).is_err());
++    }
++}

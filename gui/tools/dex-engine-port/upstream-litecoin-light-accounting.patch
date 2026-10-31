@@ -1,0 +1,175 @@
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -129,3 +129,5 @@
+ pub mod account;
+ 
+ pub mod transaction;
++
++pub mod accounting;
+diff --git a/swap-machine/src/litecoin_light/transaction.rs b/swap-machine/src/litecoin_light/transaction.rs
+--- a/swap-machine/src/litecoin_light/transaction.rs
++++ b/swap-machine/src/litecoin_light/transaction.rs
+@@ -25,6 +25,7 @@
+     /// Coinbase receipts additionally require maturity handling before spending.
+     pub fn is_coinbase(&self)->bool {self.coinbase}
+     pub fn inputs(&self)->&[OutPoint] {&self.inputs}
++    pub(super) fn outputs(&self)->&[TxOut] {&self.outputs}
+     /// Exact script equality; callers derive their own wallet scripts.
+     /// Values are committed output amounts, never a spendable-balance assertion.
+     pub fn outputs_to<'a>(&'a self,script:&'a Script)->impl Iterator<Item=(OutPoint,Amount)>+'a {
+diff --git a/swap-machine/src/litecoin_light/accounting.rs b/swap-machine/src/litecoin_light/accounting.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/accounting.rs
+@@ -0,0 +1,85 @@
++//! Recomputed accounting for an explicitly supplied observation set.
++//! Omitted spends can inflate this snapshot. It is neither a complete balance
++//! nor a capability to fund/sign a swap. No persistent unspentness is asserted.
++use super::*;
++use super::transaction::IncludedTransaction;
++use bitcoin::{Amount,OutPoint,ScriptBuf};
++use std::collections::{BTreeMap,BTreeSet};
++
++pub struct ObservedCoin {
++    outpoint:OutPoint,
++    amount:Amount,
++    confirmations:u64,
++    coinbase:bool,
++}
++impl ObservedCoin {
++    pub fn outpoint(&self)->OutPoint {self.outpoint}
++    pub fn amount(&self)->Amount {self.amount}
++    pub fn confirmations(&self)->u64 {self.confirmations}
++    pub fn is_coinbase(&self)->bool {self.coinbase}
++    /// Maturity for a spend in the next block, not general spendability.
++    pub fn maturity_satisfied(&self)->bool {!self.coinbase || self.confirmations>=100}
++}
++pub struct ObservedWallet {
++    tip:BlockHash,
++    height:u32,
++    coins:Vec<ObservedCoin>,
++    mature:Amount,
++    immature:Amount,
++}
++impl ObservedWallet {
++    /// Recompute after every chain/observation change; old snapshots stay old.
++    /// Duplicate identities and conflicting observed spends are errors.
++    pub fn reconcile(chain:&headers::HeaderSequence,scripts:&[ScriptBuf],
++        transactions:&[IncludedTransaction])->Result<Self> {
++        ensure!(!scripts.is_empty() && scripts.len()<=1000 && transactions.len()<=10_000,
++            "Litecoin accounting input limit exceeded");
++        ensure!(scripts.iter().all(|script|!script.is_empty() && script.len()<=10_000),
++            "invalid Litecoin accounting script");
++        let scripts:BTreeSet<_>=scripts.iter().collect();
++        let mut active=BTreeMap::new();
++        for transaction in transactions {
++            if let Some(depth)=transaction.confirmations_on(chain) {
++                ensure!(active.insert(transaction.txid(),(transaction,depth)).is_none(),
++                    "duplicate Litecoin transaction observation");
++            }
++        }
++        let mut spends=BTreeSet::new();
++        let mut output_count=0usize;
++        for (transaction,_) in active.values() {
++            output_count=output_count.checked_add(transaction.outputs().len()).context("Litecoin output count overflow")?;
++            ensure!(output_count<=100_000,"Litecoin accounting output limit exceeded");
++            if transaction.is_coinbase() {continue}
++            for input in transaction.inputs() {
++                ensure!(!input.is_null() && spends.insert(*input),"conflicting Litecoin observed spend");
++                if let Some((parent,_))=active.get(&input.txid) {
++                    ensure!(parent.txid()!=transaction.txid() && parent.height()<=transaction.height()
++                        && (input.vout as usize)<parent.outputs().len(),"invalid Litecoin observed dependency");
++                    ensure!(!parent.is_coinbase() || transaction.height()-parent.height()>=100,
++                        "observed immature Litecoin coinbase spend");
++                }
++            }
++        }
++        let mut coins=Vec::new();let mut mature=0u64;let mut immature=0u64;
++        for (transaction,depth) in active.values() {
++            for (index,output) in transaction.outputs().iter().enumerate() {
++                let outpoint=OutPoint {txid:transaction.txid(),vout:index as u32};
++                if !scripts.contains(&output.script_pubkey) || spends.contains(&outpoint) {continue}
++                let coin=ObservedCoin {outpoint,amount:output.value,confirmations:*depth,coinbase:transaction.is_coinbase()};
++                let total=if coin.maturity_satisfied() {&mut mature} else {&mut immature};
++                *total=total.checked_add(output.value.to_sat()).context("Litecoin observed amount overflow")?;
++                coins.push(coin);
++            }
++        }
++        mature.checked_add(immature).context("Litecoin combined observed amount overflow")?;
++        Ok(Self {tip:chain.header(chain.height()).context("missing Litecoin selected tip")?.block_hash(),
++            height:chain.height(),coins,mature:Amount::from_sat(mature),immature:Amount::from_sat(immature)})
++    }
++    pub fn tip(&self)->BlockHash {self.tip}
++    pub fn height(&self)->u32 {self.height}
++    pub fn coins(&self)->&[ObservedCoin] {&self.coins}
++    pub fn observed_mature(&self)->Amount {self.mature}
++    pub fn observed_immature(&self)->Amount {self.immature}
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/accounting/tests.rs b/swap-machine/src/litecoin_light/accounting/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/accounting/tests.rs
+@@ -0,0 +1,60 @@
++use super::*;
++use bitcoin::{TxIn,TxOut,absolute,transaction::Version};
++use swap_core::litecoin_address::LtcNetwork;
++fn script()->ScriptBuf {ScriptBuf::from_bytes(vec![0x51])}
++fn chain()->Result<headers::HeaderSequence> {
++    let mut chain=headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    let header=crate::litecoin_light::headers::tests::child();
++    chain.append(&serialize(&header),header.time as u64)?;Ok(chain)
++}
++// Accounting-only fixture injection: these transactions are NOT proven to be
++// committed by the fixed header. Merkle verification has separate tests.
++fn included(chain:&headers::HeaderSequence,height:u32,input:OutPoint,amount:u64)->IncludedTransaction {
++    let tx=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:input,..Default::default()}],
++        output:vec![TxOut {value:Amount::from_sat(amount),script_pubkey:script()}]};
++    IncludedTransaction::new(MerkleMatch {txid:tx.compute_txid(),block_hash:chain.header(height).unwrap().block_hash(),claimed_height:height},&tx).unwrap()
++}
++fn external()->OutPoint {OutPoint {txid:Txid::from_byte_array([9;32]),vout:0}}
++#[test]
++fn accounting_subtracts_spends_independent_of_order_and_deduplicates_scripts()->Result<()> {
++    let chain=chain()?;let receipt=included(&chain,0,external(),100);
++    let spend=included(&chain,1,OutPoint {txid:receipt.txid(),vout:0},60);
++    let observed=ObservedWallet::reconcile(&chain,&[script(),script()],&[spend,receipt])?;
++    assert_eq!(observed.observed_mature().to_sat(),60);assert_eq!(observed.coins().len(),1);
++    assert_eq!(observed.height(),1);assert_eq!(observed.tip(),chain.header(1).unwrap().block_hash());
++    Ok(())
++}
++#[test]
++fn accounting_recomputes_after_orphaning_spend()->Result<()> {
++    let chain=chain()?;let receipt=included(&chain,0,external(),100);
++    let spend=included(&chain,1,OutPoint {txid:receipt.txid(),vout:0},60);let transactions=[receipt,spend];
++    let old=ObservedWallet::reconcile(&chain,&[script()],&transactions)?;
++    let selected=headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    let new=ObservedWallet::reconcile(&selected,&[script()],&transactions)?;
++    assert_eq!(old.observed_mature().to_sat(),60);assert_eq!(new.observed_mature().to_sat(),100);
++    assert_eq!(new.coins()[0].confirmations(),1);Ok(())
++}
++#[test]
++fn accounting_rejects_conflicts_duplicates_and_amount_overflow()->Result<()> {
++    let chain=chain()?;
++    assert!(ObservedWallet::reconcile(&chain,&[script()],&[included(&chain,1,external(),100),included(&chain,1,external(),90)]).is_err());
++    assert!(ObservedWallet::reconcile(&chain,&[script()],&[included(&chain,1,external(),100),included(&chain,1,external(),100)]).is_err());
++    let other=OutPoint {vout:1,..external()};
++    assert!(ObservedWallet::reconcile(&chain,&[script()],&[included(&chain,1,external(),u64::MAX),included(&chain,1,other,1)]).is_err());
++    Ok(())
++}
++#[test]
++fn accounting_separates_coinbase_maturity_and_rejects_early_spend()->Result<()> {
++    let chain=chain()?;let receipt=included(&chain,0,OutPoint::null(),100);
++    let spend=included(&chain,1,OutPoint {txid:receipt.txid(),vout:0},60);
++    let observed=ObservedWallet::reconcile(&chain,&[script()],&[receipt])?;
++    assert_eq!(observed.observed_mature().to_sat(),0);assert_eq!(observed.observed_immature().to_sat(),100);
++    assert!(!observed.coins()[0].maturity_satisfied());
++    assert!(ObservedWallet::reconcile(&chain,&[script()],&[included(&chain,0,OutPoint::null(),100),spend]).is_err());
++    for (depth,expected) in [(99,false),(100,true),(101,true)] {
++        let coin=ObservedCoin {outpoint:external(),amount:Amount::from_sat(1),confirmations:depth,coinbase:true};
++        assert_eq!(coin.maturity_satisfied(),expected);
++    }
++    Ok(())
++}

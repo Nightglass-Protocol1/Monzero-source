@@ -1,0 +1,64 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -361,3 +361,61 @@
+     std::fs::remove_file(&path)?; assert!(fails());
+     Ok(())
+ }
++
++/// Writer and reader are separate executable processes: the reader cannot use
++/// the writer's original keys, proof objects or accepted in-memory agreement.
++#[cfg(target_os="linux")]
++#[test]
++fn private_storage_restores_after_writer_process_exits() -> Result<()> {
++    use agreement::storage;
++    const MODE: &str = "MONZERO_BCH_STORAGE_TEST_MODE";
++    const DIRECTORY: &str = "MONZERO_BCH_STORAGE_TEST_DIRECTORY";
++    const PINS: &str = "MONZERO_BCH_STORAGE_TEST_PUBLIC_PINS";
++    type PublicPin = ([u8;32],[u8;32],String);
++    let roles = [Role::BchFunder,Role::NativeFunder];
++    if let Ok(mode) = std::env::var(MODE) {
++        let directory = std::path::PathBuf::from(std::env::var(DIRECTORY)?);
++        if mode == "write" {
++            let setup = Setup::new()?;
++            let mut pins: Vec<PublicPin> = Vec::new();
++            for role in roles {
++                let context = agreed(&setup,role)?;
++                let digest = storage::persist(&directory,&setup.quote,&setup.policy,role,&context)?;
++                pins.push((digest,*context.commitment(),context.owned().wallet().address().to_string()));
++            }
++            // Test-only public metadata; no spending/view keys leave the store.
++            std::fs::write(directory.join("public-pins.json"),serde_json::to_vec(&pins)?)?;
++            return Ok(());
++        }
++        ensure!(mode == "read","unknown BCH storage test mode");
++        let pins: Vec<PublicPin> = serde_json::from_str(&std::env::var(PINS)?)?;
++        assert_eq!(pins.len(),roles.len());
++        let (policy,terms) = fixture();
++        let quote = signed(&terms,&policy,1000)?;
++        for (role,(digest,commitment,address)) in roles.into_iter().zip(pins) {
++            let restored = storage::restore(&directory,&quote,&policy,role,&digest)?;
++            assert_eq!(restored.commitment(),&commitment);
++            assert_eq!(restored.owned().wallet().address().to_string(),address);
++            // The restored local signing share remains usable for its branch.
++            restored.owned().prepare_encrypted_signature(&quote)?;
++            let checkpoint = restored.secret_checkpoint(&quote)?;
++            assert_eq!(agreement::checkpoint::commitment(&checkpoint)?,digest);
++        }
++        return Ok(());
++    }
++    let directory = PrivateStore::new()?;
++    let test = "bch_key_recovery::authenticated::native_wallet::tests::private_storage_restores_after_writer_process_exits";
++    let run = |mode: &str, pins: &str| -> Result<()> {
++        let status = std::process::Command::new(std::env::current_exe()?)
++            .args(["--exact",test,"--nocapture"])
++            .env(MODE,mode).env(DIRECTORY,&directory.0).env(PINS,pins).status()?;
++        ensure!(status.success(),"BCH checkpoint {mode} subprocess failed");
++        Ok(())
++    };
++    run("write","")?;
++    let pin_path = directory.0.join("public-pins.json");
++    let pins = std::fs::read_to_string(&pin_path)?;
++    std::fs::remove_file(pin_path)?;
++    run("read",&pins)?;
++    Ok(())
++}

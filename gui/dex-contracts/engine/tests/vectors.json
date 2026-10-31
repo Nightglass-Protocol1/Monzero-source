@@ -1,0 +1,36 @@
+{
+  "note": "Computed by XmzSwap.sol under Hardhat; regenerate with npx hardhat run scripts/vectors.js",
+  "commitments": [
+    {
+      "secret": "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "commitment": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+    },
+    {
+      "secret": "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+      "commitment": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+    },
+    {
+      "secret": "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140",
+      "commitment": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2"
+    }
+  ],
+  "swap": [
+    "0x1111111111111111111111111111111111111111",
+    "0x2222222222222222222222222222222222222222",
+    "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23",
+    "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+    "1793300000",
+    "1793321600",
+    "0x0000000000000000000000000000000000000000",
+    "1500000000000000000",
+    "42"
+  ],
+  "swapId": "0xc09b41a71aba2be4af03e093cb322addb78fd930fdb26f5774991567e294b82b",
+  "relay": {
+    "chainId": "31337",
+    "contract": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+    "fee": "1000000000000000",
+    "relayer": "0x3333333333333333333333333333333333333333",
+    "digest": "0xba3fd953b4b3b2e557d0909b791da12a79625f0a4f784948cad4667dd5266b6f"
+  }
+}

@@ -1,0 +1,966 @@
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -2,6 +2,7 @@
+ pub mod bob;
+ pub mod common;
+ pub mod xmz_funding;
++pub mod native_funding_rpc;
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+new file mode 100644
+index 0000000..c2b97fd
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -0,0 +1,213 @@
++//! Experimental read-only XMZ funding observer for caller-owned loopback services.
++//! This does not create wallets, sign, broadcast, or authorize live execution.
++//! Credentials are required and intentionally have no Debug or serialization API.
++pub mod fee_estimation;
++pub mod wallet_session;
++use anyhow::{Context, Result, ensure};
++use serde_json::{Value, json};
++use zeroize::Zeroizing;
++use crate::xmz_funding::{ChainSnapshot, FundingObserver, FundingObservation, FundingRequest};
++
++pub struct NativeFundingRpc {
++    client: reqwest::Client,
++    daemon: u16,
++    wallet: u16,
++    credentials: (Zeroizing<String>, Zeroizing<String>),
++    auth_lock: tokio::sync::Mutex<()>,
++}
++
++impl NativeFundingRpc {
++    pub fn new(daemon: u16, wallet: u16, username: String, password: String) -> Result<Self> {
++        // Take ownership before validation so rejection also clears these buffers.
++        let username = Zeroizing::new(username);
++        let password = Zeroizing::new(password);
++        ensure!(!username.is_empty() && !password.is_empty() && username.len() + password.len() <= 1024,
++            "invalid native RPC credentials");
++        ensure!(daemon != 0 && wallet != 0 && daemon != wallet, "invalid local RPC ports");
++        Ok(Self {
++            client: reqwest::Client::builder().no_proxy()
++                .redirect(reqwest::redirect::Policy::none())
++                .timeout(std::time::Duration::from_secs(15)).build()?,
++            daemon, wallet, credentials: (username, password), auth_lock: tokio::sync::Mutex::new(()),
++        })
++    }
++
++    pub async fn wallet_version(&self) -> Result<u64> {
++        number(&self.rpc(self.wallet, "get_version", json!({})).await?, "version")
++    }
++
++    /// Read-only observation, not a lease or permission to switch wallets.
++    /// Only the native NOT_OPEN error means empty; other failures propagate.
++    pub async fn opened_wallet(&self, network: swap_core::xmz_address::XmzNetwork)
++        -> Result<Option<swap_core::xmz_address::XmzAddress>> {
++        opened_wallet_response(&self.rpc_response(self.wallet, "get_address", json!({"account_index":0})).await?, network)
++    }
++
++    /// Replace caller-owned credentials and discard the old connection pool.
++    /// Exclusive access prevents a request from racing this replacement.
++    /// Invalid replacement leaves the existing client intact.
++    pub fn replace_credentials(&mut self, username: String, password: String) -> Result<()> {
++        let replacement = Self::new(self.daemon, self.wallet, username, password)?;
++        *self = replacement;
++        Ok(())
++    }
++
++    async fn rpc(&self, port: u16, method: &str, params: Value) -> Result<Value> {
++        let response = self.rpc_response(port, method, params).await?;
++        ensure!(response.get("error").is_none(), "native RPC rejected request");
++        response.get("result").cloned().context("missing native RPC result")
++    }
++
++    async fn rpc_response(&self, port: u16, method: &str, params: Value) -> Result<Value> {
++        // Keep challenge and response on an uncontended pooled connection.
++        let _guard = self.auth_lock.lock().await;
++        let url = format!("http://127.0.0.1:{port}/json_rpc");
++        let body = serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":"native-funding", "method":method, "params":params}))?;
++        let send = || self.client.post(&url).header("Content-Type", "application/json").body(body.clone());
++        let mut response = send().send().await.context("native local RPC transport")?;
++        ensure!(port != self.wallet || response.status() == reqwest::StatusCode::UNAUTHORIZED,
++            "wallet RPC did not require authentication");
++        if response.status() == reqwest::StatusCode::UNAUTHORIZED && port == self.wallet {
++            {
++                let (username, password) = &self.credentials;
++                let challenge = response.headers().get(reqwest::header::WWW_AUTHENTICATE)
++                    .context("missing Digest challenge")?.to_str()?.to_owned();
++                ensure!(challenge.len() <= 8192, "oversized Digest challenge");
++                let mut prompt = digest_auth::parse(&challenge).context("unsupported Digest challenge")?;
++                let mut drained = 0usize;
++                while let Some(chunk) = response.chunk().await? {
++                    drained += chunk.len();
++                    ensure!(drained <= 65536, "oversized Digest challenge body");
++                }
++                let context = digest_auth::AuthContext::new_post(username.as_str(), password.as_str(),
++                    "/json_rpc", Some(body.as_slice()));
++                let authorization = sensitive_authorization(
++                    prompt.respond(&context).context("Digest response construction")?.to_string())?;
++                response = send().header(reqwest::header::AUTHORIZATION, authorization).send().await?;
++            }
++        }
++        response = response.error_for_status()?;
++        let mut bytes = Vec::new();
++        while let Some(chunk) = response.chunk().await? {
++            ensure!(bytes.len() + chunk.len() <= 1_048_576, "oversized native RPC response");
++            bytes.extend_from_slice(&chunk);
++        }
++        let result: Value = serde_json::from_slice(&bytes).context("native RPC JSON")?;
++        ensure!(result["id"] == "native-funding", "native RPC response identity mismatch");
++        Ok(result)
++    }
++}
++
++fn opened_wallet_response(response: &Value, network: swap_core::xmz_address::XmzNetwork)
++    -> Result<Option<swap_core::xmz_address::XmzAddress>> {
++    if let Some(error) = response.get("error") {
++        ensure!(response.get("result").is_none() && error.get("code").and_then(Value::as_i64) == Some(-13),
++            "native wallet status failed");
++        return Ok(None);
++    }
++    let address = response.get("result").and_then(|result| result.get("address"))
++        .and_then(Value::as_str).context("missing native wallet address")?;
++    Ok(Some(swap_core::xmz_address::XmzAddress::parse(network, address)?))
++}
++
++fn sensitive_authorization(value: String) -> Result<reqwest::header::HeaderValue> {
++    let value = Zeroizing::new(value);
++    let mut header = reqwest::header::HeaderValue::from_str(value.as_str())?;
++    header.set_sensitive(true);
++    Ok(header)
++}
++
++fn number(value: &Value, field: &str) -> Result<u64> { value[field].as_u64().context("missing native integer") }
++fn string(value: &Value, field: &str) -> Result<String> { value[field].as_str().map(str::to_owned).context("missing native string") }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn wallet_status_does_not_treat_errors_as_empty() -> Result<()> {
++        use swap_core::xmz_address::XmzNetwork;
++        assert!(opened_wallet_response(&json!({"error":{"code":-13}}),XmzNetwork::Mainnet)?.is_none());
++        for response in [json!({}),json!({"error":null}),json!({"error":{"code":-1}}),
++            json!({"error":{"code":"-13"}}),json!({"error":{"code":-13},"result":{}}),
++            json!({"result":{"address":"not-an-address"}})] {
++            assert!(opened_wallet_response(&response,XmzNetwork::Mainnet).is_err());
++        }
++        let address = "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H";
++        let response = json!({"result":{"address":address}});
++        assert_eq!(opened_wallet_response(&response,XmzNetwork::Mainnet)?.unwrap().to_string(),address);
++        assert!(opened_wallet_response(&response,XmzNetwork::Testnet).is_err());
++        Ok(())
++    }
++
++    #[test]
++    fn authorization_header_is_redacted() -> Result<()> {
++        let header = sensitive_authorization("Digest private-fixture-marker".into())?;
++        assert!(header.is_sensitive());
++        assert!(!format!("{header:?}").contains("private-fixture-marker"));
++        Ok(())
++    }
++
++    #[test]
++    fn rejects_invalid_ports_and_credentials() {
++        for (daemon, wallet, username, password) in [
++            (0, 2, "user".into(), "password".into()),
++            (1, 0, "user".into(), "password".into()),
++            (1, 1, "user".into(), "password".into()),
++            (1, 2, String::new(), "password".into()),
++            (1, 2, "user".into(), String::new()),
++            (1, 2, "user".into(), "x".repeat(1025)),
++        ] {
++            assert!(NativeFundingRpc::new(daemon, wallet, username, password).is_err());
++        }
++    }
++
++    #[tokio::test]
++    async fn refuses_wallet_with_authentication_disabled() -> Result<()> {
++        use std::io::{Read, Write};
++        let server = std::net::TcpListener::bind(("127.0.0.1", 0))?;
++        let port = server.local_addr()?.port();
++        let thread = std::thread::spawn(move || -> std::io::Result<()> {
++            let (mut stream, _) = server.accept()?;
++            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
++            let mut request = [0u8; 4096];
++            stream.read(&mut request)?;
++            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
++        });
++        let client = NativeFundingRpc::new(if port == 1 { 2 } else { 1 }, port,
++            "fixture-user".into(), "fixture-password".into())?;
++        let result = client.wallet_version().await;
++        thread.join().map_err(|_| anyhow::anyhow!("fixture thread failed"))??;
++        assert_eq!(result.err().context("accepted unauthenticated wallet")?.to_string(),
++            "wallet RPC did not require authentication");
++        Ok(())
++    }
++}
++
++#[async_trait::async_trait]
++impl FundingObserver for NativeFundingRpc {
++    async fn snapshot(&self) -> Result<ChainSnapshot> {
++        let genesis = self.rpc(self.daemon, "get_block_header_by_height", json!({"height":0})).await?;
++        let tip = self.rpc(self.daemon, "get_last_block_header", json!({})).await?;
++        Ok(ChainSnapshot { genesis: string(&genesis["block_header"], "hash")?,
++            tip_hash: string(&tip["block_header"], "hash")?, tip_height: number(&tip["block_header"], "height")? })
++    }
++
++    async fn observe(&self, request: &FundingRequest) -> Result<FundingObservation> {
++        let address = self.rpc(self.wallet, "get_address", json!({})).await?;
++        let checked = self.rpc(self.wallet, "check_tx_key", json!({
++            "txid": request.proof.tx_hash.0, "tx_key": request.proof.tx_key.to_string(),
++            "address": request.address.to_string(),
++        })).await?;
++        let result = self.rpc(self.wallet, "get_transfer_by_txid", json!({"txid":request.proof.tx_hash.0})).await?;
++        let transfer = &result["transfer"];
++        ensure!(transfer["type"] == "in", "native transfer is not incoming");
++        let received = number(&checked, "received")?;
++        let confirmations = number(&checked, "confirmations")?;
++        ensure!(number(transfer, "amount")? == received && number(transfer, "confirmations")? == confirmations,
++            "native wallet observations disagree");
++        Ok(FundingObservation { txid: string(transfer, "txid")?, address: string(&address, "address")?,
++            received_atoms: received, in_pool: checked["in_pool"].as_bool().context("missing native pool status")?,
++            height: number(transfer, "height")?, confirmations })
++    }
++}
+diff --git a/swap-machine/src/native_funding_rpc/fee_estimation.rs b/swap-machine/src/native_funding_rpc/fee_estimation.rs
+new file mode 100644
+index 0000000..a929aa6
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/fee_estimation.rs
+@@ -0,0 +1,445 @@
++//! Explicit transaction construction, separate from the read-only observer.
++//! Requires exclusive caller ownership of the wallet service, not just this object.
++//! No relay or exported signing artifacts; not an executable quote.
++use super::{NativeFundingRpc, number, string};
++use crate::xmz_funding::{ChainSnapshot, FundingObserver};
++use anyhow::{Context, Result, ensure};
++use serde_json::{Value, json};
++use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
++use std::time::{Duration, Instant};
++
++pub struct FeeRequest {
++    pub wallet: XmzAddress,
++    pub destination: XmzAddress,
++    pub amount: XmzAmount,
++    pub account: u32,
++    pub priority: u32,
++}
++
++/// Decode public request data only. Network/genesis policy comes from the caller's
++/// trusted session, never from an endpoint or credential embedded in this input.
++pub fn decode_preview_request(bytes: &[u8], network: XmzNetwork, expected_genesis: &str)
++    -> Result<(uuid::Uuid, FeeRequest)> {
++    ensure!(bytes.len() <= 2048, "oversized fee preview request");
++    ensure!(canonical_hash(expected_genesis), "invalid fee preview session chain");
++    #[derive(serde::Deserialize)]
++    #[serde(deny_unknown_fields, rename_all = "camelCase")]
++    struct Wire {
++        schema: String, request_id: String, wallet: String, destination: String,
++        amount_atoms: String, account: String, priority: String, genesis: String,
++    }
++    // Deserialize directly into a struct: duplicate fields must not be overwritten.
++    let wire: Wire = serde_json::from_slice(bytes).context("invalid fee preview request JSON")?;
++    ensure!(wire.schema == "monzero-native-fee-request-v1" && wire.genesis == expected_genesis,
++        "fee preview request policy mismatch");
++    let id: uuid::Uuid = wire.request_id.parse()?;
++    ensure!(!id.is_nil() && id.to_string() == wire.request_id, "noncanonical fee request identity");
++    let atoms = |text: &str| XmzAmount::from_atom_string(text)
++        .map_err(|_| anyhow::anyhow!("invalid fee request integer"));
++    let amount = atoms(&wire.amount_atoms)?;
++    let account = u32::try_from(atoms(&wire.account)?.atoms())?;
++    let priority = u32::try_from(atoms(&wire.priority)?.atoms())?;
++    ensure!(amount.atoms() > 0 && (1..=4).contains(&priority), "invalid fee request amount or priority");
++    Ok((id, FeeRequest {
++        wallet: XmzAddress::parse(network, &wire.wallet)?,
++        destination: XmzAddress::parse(network, &wire.destination)?,
++        amount, account, priority,
++    }))
++}
++
++pub struct FeeEstimate {
++    request: FeeRequest,
++    fee: XmzAmount,
++    weight: u64,
++    snapshot: ChainSnapshot,
++    balance: (u64, u64),
++    started: Instant,
++}
++
++impl FeeEstimate {
++    pub fn request(&self) -> &FeeRequest { &self.request }
++    pub fn fee(&self) -> XmzAmount { self.fee }
++    pub fn weight(&self) -> u64 { self.weight }
++    pub fn snapshot(&self) -> &ChainSnapshot { &self.snapshot }
++}
++
++pub struct NativeFeeEstimator {
++    client: NativeFundingRpc,
++}
++
++impl NativeFeeEstimator {
++    /// Consumes the client; caller must prevent other users of the wallet service.
++    pub fn new(client: NativeFundingRpc) -> Self { Self { client } }
++
++    /// One EOF-framed request on caller-owned pipes; session secrets never enter
++    /// the request. Failure may leave partial output, so consumers require a
++    /// successful process exit as well as a complete, validated response.
++    pub async fn serve_preview<R, W>(&mut self, reader: R, mut writer: W,
++        network: XmzNetwork, expected_genesis: &str, budget: Duration) -> Result<()>
++    where R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin {
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        ensure!(!budget.is_zero() && budget <= Duration::from_secs(30), "invalid fee request time budget");
++        tokio::time::timeout(budget, async {
++            let mut bytes = Vec::new();
++            reader.take(2049).read_to_end(&mut bytes).await.context("fee request pipe read")?;
++            ensure!(bytes.len() <= 2048, "oversized fee preview request");
++            let response = self.preview_request(&bytes, network, expected_genesis, budget).await?;
++            let output = serde_json::to_vec(&response)?;
++            ensure!(output.len() <= 2048, "oversized fee preview response");
++            writer.write_all(&output).await.context("fee response pipe write")?;
++            writer.flush().await.context("fee response pipe flush")?;
++            Ok(())
++        }).await.context("fee preview pipe operation timed out")?
++    }
++
++    /// One bounded operation for a trusted stdio/session wrapper. A timeout drops
++    /// the client future; it cannot roll back server-side construction already begun.
++    pub async fn preview_request(&mut self, bytes: &[u8], network: XmzNetwork,
++        expected_genesis: &str, budget: Duration) -> Result<Value> {
++        ensure!(!budget.is_zero() && budget <= Duration::from_secs(30), "invalid fee request time budget");
++        let (id, request) = decode_preview_request(bytes, network, expected_genesis)?;
++        tokio::time::timeout(budget, async {
++            let estimate = self.estimate(request, expected_genesis).await?;
++            self.preview_for_display(id, &estimate, budget).await
++        }).await.context("fee preview request timed out")?
++    }
++
++    pub async fn estimate(&mut self, request: FeeRequest, expected_genesis: &str) -> Result<FeeEstimate> {
++        let started = Instant::now();
++        ensure!(canonical_hash(expected_genesis), "invalid fee-estimation chain policy");
++        ensure!(request.amount.atoms() > 0 && (1..=4).contains(&request.priority),
++            "invalid fee construction request");
++        ensure!(request.wallet.network() == request.destination.network(), "fee address network mismatch");
++        let before = self.client.snapshot().await?;
++        ensure!(before.genesis == expected_genesis && canonical_hash(&before.tip_hash),
++            "unexpected fee-estimation chain");
++        self.check_wallet(&request).await?;
++        let balance = self.balance(request.account).await?;
++        ensure!(balance.1 >= request.amount.atoms(), "insufficient unlocked principal");
++        let response = self.client.rpc(self.client.wallet, "transfer", construction_params(&request)).await?;
++        let (fee, weight) = parse_construction(&response, request.amount)?;
++        let debit = request.amount.checked_add(fee).context("fee debit overflow")?;
++        ensure!(balance.1 >= debit.atoms(), "insufficient unlocked funds for fee");
++        self.check_wallet(&request).await?;
++        ensure!(self.balance(request.account).await? == balance, "wallet changed during fee construction");
++        ensure!(self.client.snapshot().await? == before, "chain changed during fee construction");
++        Ok(FeeEstimate { request, fee, weight, snapshot: before, balance, started })
++    }
++
++    /// Recheck display freshness only. Equal balances do not prove identical inputs.
++    /// Never use this as signing, reservation or broadcast authorization.
++    pub async fn revalidate_for_display(&mut self, estimate: &FeeEstimate, maximum_age: Duration) -> Result<()> {
++        revalidate(self, estimate, maximum_age).await
++    }
++
++    /// Caller must correlate this request ID and enforce its own receive deadline.
++    /// Export is display-only; transport, persistence or replay never grants authority.
++    pub async fn preview_for_display(&mut self, request_id: uuid::Uuid,
++        estimate: &FeeEstimate, maximum_age: Duration) -> Result<Value> {
++        ensure!(!request_id.is_nil(), "missing fee preview request identity");
++        self.revalidate_for_display(estimate, maximum_age).await?;
++        Ok(display_payload(request_id, estimate))
++    }
++
++    async fn check_wallet(&self, request: &FeeRequest) -> Result<()> {
++        // Primary address binds wallet identity; account selection is separately explicit.
++        let response = self.client.rpc(self.client.wallet, "get_address", json!({"account_index":0})).await?;
++        ensure!(string(&response, "address")? == request.wallet.to_string(), "unexpected estimation wallet");
++        Ok(())
++    }
++
++    async fn balance(&self, account: u32) -> Result<(u64, u64)> {
++        let response = self.client.rpc(self.client.wallet, "get_balance", json!({"account_index":account})).await?;
++        Ok((number(&response, "balance")?, number(&response, "unlocked_balance")?))
++    }
++}
++
++fn display_payload(request_id: uuid::Uuid, estimate: &FeeEstimate) -> Value {
++    json!({
++        "schema":"monzero-native-fee-preview-v1",
++        "requestId":request_id.to_string(),
++        "source":"native-nonrelayed-construction",
++        "executable":false,
++        "wallet":estimate.request.wallet.to_string(),
++        "destination":estimate.request.destination.to_string(),
++        "amountAtoms":estimate.request.amount.atom_string(),
++        "feeAtoms":estimate.fee.atom_string(),
++        "weight":estimate.weight.to_string(),
++        "account":estimate.request.account.to_string(),
++        "priority":estimate.request.priority.to_string(),
++        "genesis":estimate.snapshot.genesis,
++        "tipHash":estimate.snapshot.tip_hash,
++        "tipHeight":estimate.snapshot.tip_height.to_string()
++    })
++}
++
++// Private testing seam: peer data cannot supply an implementation to the public API.
++#[async_trait::async_trait]
++trait DisplayContext: Sync {
++    async fn snapshot(&self) -> Result<ChainSnapshot>;
++    async fn wallet(&self, request: &FeeRequest) -> Result<()>;
++    async fn balance(&self, account: u32) -> Result<(u64, u64)>;
++}
++
++#[async_trait::async_trait]
++impl DisplayContext for NativeFeeEstimator {
++    async fn snapshot(&self) -> Result<ChainSnapshot> { self.client.snapshot().await }
++    async fn wallet(&self, request: &FeeRequest) -> Result<()> { self.check_wallet(request).await }
++    async fn balance(&self, account: u32) -> Result<(u64, u64)> { NativeFeeEstimator::balance(self, account).await }
++}
++
++async fn revalidate(source: &impl DisplayContext, estimate: &FeeEstimate, maximum_age: Duration) -> Result<()> {
++    check_age(estimate.started, Instant::now(), maximum_age)?;
++    ensure!(source.snapshot().await? == estimate.snapshot, "fee estimate chain is stale");
++    source.wallet(&estimate.request).await?;
++    ensure!(source.balance(estimate.request.account).await? == estimate.balance, "fee estimate balance is stale");
++    ensure!(source.snapshot().await? == estimate.snapshot, "fee estimate chain is stale");
++    check_age(estimate.started, Instant::now(), maximum_age)
++}
++
++fn canonical_hash(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
++fn check_age(started: Instant, now: Instant, maximum: Duration) -> Result<()> {
++    ensure!(!maximum.is_zero(), "fee estimate age limit must be positive");
++    let age = now.checked_duration_since(started).context("fee estimate clock mismatch")?;
++    ensure!(age < maximum, "fee estimate expired");
++    Ok(())
++}
++
++fn construction_params(request: &FeeRequest) -> Value {
++    json!({
++        "destinations":[{"address":request.destination.to_string(), "amount":request.amount.atoms()}],
++        "account_index":request.account, "priority":request.priority,
++        "do_not_relay":true, "get_tx_key":false, "get_tx_hex":false, "get_tx_metadata":false,
++        "unlock_time":0, "subtract_fee_from_outputs":[]
++    })
++}
++
++fn parse_construction(response: &Value, amount: XmzAmount) -> Result<(XmzAmount, u64)> {
++    ensure!(number(response, "amount")? == amount.atoms(), "fee construction principal mismatch");
++    let fee = number(response, "fee")?;
++    let weight = number(response, "weight")?;
++    ensure!(fee > 0 && weight > 0, "invalid constructed fee or weight");
++    for field in ["tx_key", "tx_blob", "tx_metadata", "multisig_txset", "unsigned_txset"] {
++        ensure!(response.get(field).and_then(Value::as_str) == Some(""),
++            "unexpected signing artifacts in fee response");
++    }
++    ensure!(amount.checked_add(XmzAmount::from_atoms(fee)).is_some(), "fee debit overflow");
++    Ok((XmzAmount::from_atoms(fee), weight))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn pipe_rejects_invalid_oversized_and_stalled_input_without_output() -> Result<()> {
++        let mut estimator = NativeFeeEstimator::new(NativeFundingRpc::new(1, 2, "test".into(), "test".into())?);
++        for input in [b"{}".to_vec(), vec![b' ';2049]] {
++            let mut output = Vec::new();
++            assert!(estimator.serve_preview(input.as_slice(), &mut output, XmzNetwork::Mainnet,
++                &"1".repeat(64), Duration::from_secs(1)).await.is_err());
++            assert!(output.is_empty());
++        }
++        let (reader, _held_open) = tokio::io::duplex(64);
++        let mut output = Vec::new();
++        let error = estimator.serve_preview(reader, &mut output, XmzNetwork::Mainnet,
++            &"1".repeat(64), Duration::from_millis(10)).await.unwrap_err();
++        assert_eq!(error.to_string(), "fee preview pipe operation timed out");
++        assert!(output.is_empty());
++        Ok(())
++    }
++    fn wire_fixture() -> Value {
++        let address = "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H";
++        json!({"schema":"monzero-native-fee-request-v1","requestId":uuid::Uuid::from_u128(1).to_string(),
++            "wallet":address,"destination":address,"amountAtoms":"9007199254740993",
++            "account":"0","priority":"1","genesis":"1".repeat(64)})
++    }
++    #[test]
++    fn decodes_exact_request_under_local_policy() -> Result<()> {
++        let bytes = serde_json::to_vec(&wire_fixture())?;
++        let (id,request) = decode_preview_request(&bytes,XmzNetwork::Mainnet,&"1".repeat(64))?;
++        assert_eq!(id,uuid::Uuid::from_u128(1));
++        assert_eq!(request.amount.atoms(),9007199254740993);
++        assert_eq!(request.account,0);
++        assert_eq!(request.priority,1);
++        assert!(decode_preview_request(&bytes,XmzNetwork::Testnet,&"1".repeat(64)).is_err());
++        assert!(decode_preview_request(&bytes,XmzNetwork::Mainnet,&"2".repeat(64)).is_err());
++        Ok(())
++    }
++    #[test]
++    fn rejects_untrusted_request_fields_and_encodings() -> Result<()> {
++        for (field,value) in [
++            ("amountAtoms",json!(1)),("amountAtoms",json!("0")),("amountAtoms",json!("01")),
++            ("account",json!("4294967296")),("priority",json!("0")),("priority",json!("5")),
++            ("requestId",json!(uuid::Uuid::nil().to_string())),("requestId",json!("bad")),
++            ("wallet",json!("bad")),("destination",json!("bad")),("schema",json!("other")),
++            ("rpcUrl",json!("http://example.invalid")),("password",json!("not-allowed")),
++        ] {
++            let mut wire = wire_fixture();
++            wire[field] = value;
++            assert!(decode_preview_request(&serde_json::to_vec(&wire)?,XmzNetwork::Mainnet,&"1".repeat(64)).is_err());
++        }
++        let mut duplicate = serde_json::to_vec(&wire_fixture())?;
++        duplicate.pop();
++        duplicate.extend_from_slice(b",\"priority\":\"1\"}");
++        assert!(decode_preview_request(&duplicate,XmzNetwork::Mainnet,&"1".repeat(64)).is_err());
++        assert!(decode_preview_request(&vec![b' ';2049],XmzNetwork::Mainnet,&"1".repeat(64)).is_err());
++        Ok(())
++    }
++    struct ContextFixture {
++        snapshots: std::sync::Mutex<std::collections::VecDeque<ChainSnapshot>>,
++        balance: (u64, u64),
++        wallet_ok: bool,
++    }
++    #[async_trait::async_trait]
++    impl DisplayContext for ContextFixture {
++        async fn snapshot(&self) -> Result<ChainSnapshot> {
++            self.snapshots.lock().map_err(|_| anyhow::anyhow!("fixture lock"))?
++                .pop_front().context("snapshot unavailable")
++        }
++        async fn wallet(&self, _: &FeeRequest) -> Result<()> {
++            ensure!(self.wallet_ok, "unexpected estimation wallet");
++            Ok(())
++        }
++        async fn balance(&self, account: u32) -> Result<(u64,u64)> {
++            ensure!(account == 0, "wrong fixture account");
++            Ok(self.balance)
++        }
++    }
++    fn estimate_fixture() -> Result<FeeEstimate> {
++        let address = XmzAddress::parse(swap_core::xmz_address::XmzNetwork::Mainnet,
++            "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H")?;
++        Ok(FeeEstimate {
++            request: FeeRequest { wallet: address.clone(), destination: address,
++                amount: XmzAmount::from_atoms(100), account:0, priority:1 },
++            fee:XmzAmount::from_atoms(1), weight:2000,
++            snapshot:ChainSnapshot { genesis:"1".repeat(64), tip_hash:"2".repeat(64), tip_height:100 },
++            balance:(1000,900), started:Instant::now(),
++        })
++    }
++    #[test]
++    fn display_payload_preserves_large_integers_and_excludes_signing_material() -> Result<()> {
++        let mut estimate = estimate_fixture()?;
++        estimate.request.amount = XmzAmount::from_atoms(9007199254740993);
++        estimate.fee = XmzAmount::from_atoms(9007199254740995);
++        estimate.weight = u64::MAX;
++        estimate.snapshot.tip_height = u64::MAX;
++        let id = uuid::Uuid::from_u128(1);
++        let payload = display_payload(id, &estimate);
++        let roundtrip: Value = serde_json::from_slice(&serde_json::to_vec(&payload)?)?;
++        assert_eq!(roundtrip["amountAtoms"], json!("9007199254740993"));
++        assert_eq!(roundtrip["feeAtoms"], json!("9007199254740995"));
++        assert_eq!(roundtrip["weight"], json!(u64::MAX.to_string()));
++        assert_eq!(roundtrip["tipHeight"], json!(u64::MAX.to_string()));
++        assert_eq!(roundtrip["requestId"], json!(id.to_string()));
++        assert_eq!(roundtrip["executable"], json!(false));
++        assert_eq!(roundtrip.as_object().unwrap().len(), 14);
++        for field in ["password","tx_key","tx_blob","tx_metadata","signature","spendkey","viewkey"] {
++            assert!(roundtrip.get(field).is_none());
++        }
++        Ok(())
++    }
++    #[tokio::test]
++    async fn rejects_changed_context_and_missing_observations() -> Result<()> {
++        let estimate = estimate_fixture()?;
++        let make = |snapshots: Vec<ChainSnapshot>, balance, wallet_ok| ContextFixture {
++            snapshots:std::sync::Mutex::new(snapshots.into()), balance, wallet_ok };
++        let unchanged = || vec![estimate.snapshot.clone(), estimate.snapshot.clone()];
++        revalidate(&make(unchanged(), estimate.balance, true), &estimate, Duration::from_secs(30)).await?;
++        for balance in [(1001,900),(1000,899)] {
++            let source = make(unchanged(), balance, true);
++            let error = revalidate(&source, &estimate, Duration::from_secs(30)).await.unwrap_err();
++            assert_eq!(error.to_string(), "fee estimate balance is stale");
++            assert_eq!(source.snapshots.lock().unwrap().len(), 1);
++        }
++        for (source, expected) in [
++            (make(unchanged(),estimate.balance,false), "unexpected estimation wallet"),
++            (make(vec![],estimate.balance,true), "snapshot unavailable"),
++            (make(vec![estimate.snapshot.clone()],estimate.balance,true), "snapshot unavailable"),
++        ] {
++            assert_eq!(revalidate(&source,&estimate,Duration::from_secs(30)).await.unwrap_err().to_string(), expected);
++        }
++        Ok(())
++    }
++    #[tokio::test]
++    async fn rejects_chain_changes_before_and_during_revalidation() -> Result<()> {
++        let estimate = estimate_fixture()?;
++        for field in 0..3 {
++            let mut changed = estimate.snapshot.clone();
++            match field {
++                0 => changed.genesis = "3".repeat(64),
++                1 => changed.tip_hash = "4".repeat(64),
++                _ => changed.tip_height += 1,
++            }
++            for snapshots in [vec![changed.clone()], vec![estimate.snapshot.clone(),changed]] {
++                let source = ContextFixture { snapshots:std::sync::Mutex::new(snapshots.into()),
++                    balance:estimate.balance, wallet_ok:true };
++                assert_eq!(revalidate(&source,&estimate,Duration::from_secs(30)).await.unwrap_err().to_string(),
++                    "fee estimate chain is stale");
++            }
++        }
++        Ok(())
++    }
++    #[test]
++    fn freshness_expires_at_boundary_without_sleeping() {
++        let start = Instant::now();
++        let maximum = Duration::from_secs(30);
++        assert!(check_age(start, start, maximum).is_ok());
++        assert!(check_age(start, start + maximum - Duration::from_nanos(1), maximum).is_ok());
++        assert!(check_age(start, start + maximum, maximum).is_err());
++        assert!(check_age(start, start + maximum + Duration::from_nanos(1), maximum).is_err());
++        assert!(check_age(start, start, Duration::ZERO).is_err());
++        assert!(check_age(start + Duration::from_secs(1), start, maximum).is_err());
++    }
++    fn response() -> Value {
++        json!({"amount":200000000000u64,"fee":250000000u64,"weight":2000,
++            "tx_key":"","tx_blob":"","tx_metadata":"","multisig_txset":"","unsigned_txset":""})
++    }
++    #[test]
++    fn construction_explicitly_disables_relay_and_artifact_export() -> Result<()> {
++        let address = XmzAddress::parse(swap_core::xmz_address::XmzNetwork::Mainnet,
++            "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H")?;
++        let request = FeeRequest { wallet: address.clone(), destination: address,
++            amount: XmzAmount::from_atoms(200000000001), account: 2, priority: 1 };
++        let params = construction_params(&request);
++        assert_eq!(params["do_not_relay"], json!(true));
++        for field in ["get_tx_key", "get_tx_hex", "get_tx_metadata"] {
++            assert_eq!(params[field], json!(false));
++        }
++        assert_eq!(params["destinations"][0]["amount"], json!(200000000001u64));
++        assert_eq!(params["destinations"][0]["address"], json!(request.destination.to_string()));
++        assert_eq!(params["account_index"], json!(2));
++        assert_eq!(params["priority"], json!(1));
++        assert_eq!(params["unlock_time"], json!(0));
++        assert_eq!(params["subtract_fee_from_outputs"], json!([]));
++        Ok(())
++    }
++    #[test]
++    fn validates_exact_fee_construction() -> Result<()> {
++        let (fee, weight) = parse_construction(&response(), XmzAmount::from_atoms(200000000000))?;
++        assert_eq!(fee.atoms(), 250000000);
++        assert_eq!(weight, 2000);
++        Ok(())
++    }
++    #[test]
++    fn rejects_bad_fee_evidence() {
++        let amount = XmzAmount::from_atoms(200000000000);
++        for (field, value) in [
++            ("amount", json!(1)), ("fee", json!(0)), ("fee", json!("250000000")),
++            ("fee", json!(-1)), ("fee", json!(u64::MAX)), ("weight", json!(0)),
++            ("weight", json!(true)), ("tx_key", json!("private")), ("tx_blob", json!("signed")),
++            ("tx_metadata", json!("relay")), ("multisig_txset", json!("set")),
++            ("unsigned_txset", json!("set")),
++        ] {
++            let mut candidate = response();
++            candidate[field] = value;
++            assert!(parse_construction(&candidate, amount).is_err());
++        }
++        let mut missing = response();
++        missing.as_object_mut().unwrap().remove("tx_metadata");
++        assert!(parse_construction(&missing, amount).is_err());
++    }
++}
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session.rs b/swap-machine/src/native_funding_rpc/wallet_session.rs
+new file mode 100644
+index 0000000..4bdcb67
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/wallet_session.rs
+@@ -0,0 +1,177 @@
++//! Wallet lifecycle operations, separate from funding observation and fee preview.
++//! Caller must exclusively own a dedicated RPC service and serialize all users.
++//! No transaction creation, signing or broadcast. No automatic error retry.
++use super::NativeFundingRpc;
++use anyhow::{Context, Result, ensure};
++use serde_json::json;
++use swap_core::xmz_address::{XmzAddress, XmzNetwork};
++use zeroize::{Zeroize, Zeroizing};
++
++pub struct SwapWalletId(uuid::Uuid);
++
++impl SwapWalletId {
++    pub fn new(id: uuid::Uuid) -> Result<Self> {
++        ensure!(!id.is_nil(), "nil swap wallet identity");
++        Ok(Self(id))
++    }
++    pub fn filename(&self) -> String { format!("swap-{}", self.0.simple()) }
++}
++
++pub struct NativeWalletSession {
++    client: NativeFundingRpc,
++    network: XmzNetwork,
++    uncertain: bool,
++}
++
++impl NativeWalletSession {
++    pub fn new(client: NativeFundingRpc, network: XmzNetwork) -> Self {
++        Self { client, network, uncertain: false }
++    }
++
++    /// Private local command data, NOT peer/offer JSON. The caller owns and must
++    /// clear its input buffer. Timeout cannot undo server-side wallet operations.
++    pub async fn execute_control(&mut self, bytes: &[u8], budget: std::time::Duration) -> Result<serde_json::Value> {
++        ensure!(!budget.is_zero() && budget <= std::time::Duration::from_secs(30), "invalid wallet command budget");
++        let (request_id, command) = decode_control(bytes, self.network)?;
++        tokio::time::timeout(budget, async {
++            let (operation, address) = match command {
++                Control::Create(id, mut password) => ("create", self.create(&id, std::mem::take(&mut *password)).await?),
++                Control::Open(id, mut password, address) => {
++                    self.open(&id, std::mem::take(&mut *password), &address).await?;
++                    ("open", address)
++                }
++                Control::Close(address) => { self.close(&address).await?; ("close", address) }
++            };
++            Ok(json!({"schema":"monzero-wallet-control-result-v1","requestId":request_id.to_string(),
++                "operation":operation,"address":address.to_string(),"readyForTrading":false}))
++        }).await.context("wallet command timed out")?
++    }
++
++    async fn require_empty(&self) -> Result<()> {
++        ensure!(!self.uncertain, "wallet session requires reconciliation");
++        ensure!(self.client.opened_wallet(self.network).await?.is_none(), "wallet already open");
++        Ok(())
++    }
++
++    pub async fn create(&mut self, id: &SwapWalletId, password: String) -> Result<XmzAddress> {
++        let password = checked_password(password)?;
++        self.require_empty().await?;
++        self.uncertain = true; // Cancellation/error after dispatch must not permit blind retry.
++        self.client.rpc(self.client.wallet, "create_wallet", json!({
++            "filename":id.filename(), "password":password.as_str(), "language":"English"})).await?;
++        let address = self.client.opened_wallet(self.network).await?.context("created wallet not open")?;
++        self.uncertain = false;
++        Ok(address)
++    }
++
++    pub async fn open(&mut self, id: &SwapWalletId, password: String, expected: &XmzAddress) -> Result<()> {
++        let password = checked_password(password)?;
++        ensure!(expected.network() == self.network, "wallet network mismatch");
++        self.require_empty().await?;
++        self.uncertain = true;
++        self.client.rpc(self.client.wallet, "open_wallet", json!({
++            "filename":id.filename(), "password":password.as_str(), "autosave_current":true})).await?;
++        ensure!(self.client.opened_wallet(self.network).await?.as_ref() == Some(expected), "opened wallet identity mismatch");
++        self.uncertain = false;
++        Ok(())
++    }
++
++    pub async fn close(&mut self, expected: &XmzAddress) -> Result<()> {
++        ensure!(!self.uncertain, "wallet session requires reconciliation");
++        ensure!(self.client.opened_wallet(self.network).await?.as_ref() == Some(expected), "unexpected wallet before close");
++        self.uncertain = true;
++        self.client.rpc(self.client.wallet, "close_wallet", json!({"autosave_current":true})).await?;
++        ensure!(self.client.opened_wallet(self.network).await?.is_none(), "wallet still open after close");
++        self.uncertain = false;
++        Ok(())
++    }
++}
++
++enum Control {
++    Create(SwapWalletId, Zeroizing<String>),
++    Open(SwapWalletId, Zeroizing<String>, XmzAddress),
++    Close(XmzAddress),
++}
++
++fn decode_control(bytes: &[u8], network: XmzNetwork) -> Result<(uuid::Uuid, Control)> {
++    ensure!(bytes.len() <= 4096, "oversized wallet command");
++    #[derive(serde::Deserialize)]
++    #[serde(deny_unknown_fields, rename_all="camelCase")]
++    struct Wire { schema:String, request_id:String, operation:String, wallet_id:String, password:String, expected_address:String }
++    impl Drop for Wire { fn drop(&mut self) { self.password.zeroize(); } }
++    // Parser diagnostics may quote an unknown field supplied in private input.
++    // Do not retain them as an anyhow source that callers might log.
++    let mut wire: Wire = serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!("invalid wallet command"))?;
++    ensure!(wire.schema == "monzero-wallet-control-v1", "unsupported wallet command");
++    let canonical_id = |text: &str| -> Result<uuid::Uuid> {
++        let id: uuid::Uuid = text.parse()?;
++        ensure!(!id.is_nil() && id.to_string() == text, "noncanonical wallet command identity");
++        Ok(id)
++    };
++    let request_id = canonical_id(&wire.request_id)?;
++    let command = match wire.operation.as_str() {
++        "create" => {
++            ensure!(wire.expected_address.is_empty(), "create must not supply an address");
++            Control::Create(SwapWalletId::new(canonical_id(&wire.wallet_id)?)?, checked_password(std::mem::take(&mut wire.password))?)
++        }
++        "open" => Control::Open(SwapWalletId::new(canonical_id(&wire.wallet_id)?)?,
++            checked_password(std::mem::take(&mut wire.password))?, XmzAddress::parse(network, &wire.expected_address)?),
++        "close" => {
++            ensure!(wire.wallet_id.is_empty() && wire.password.is_empty(), "unexpected close credentials");
++            Control::Close(XmzAddress::parse(network, &wire.expected_address)?)
++        }
++        _ => anyhow::bail!("unsupported wallet operation"),
++    };
++    Ok((request_id, command))
++}
++
++fn checked_password(value: String) -> Result<Zeroizing<String>> {
++    let value = Zeroizing::new(value);
++    ensure!(!value.is_empty() && value.len() <= 1024 && !value.contains('\0'), "invalid wallet password");
++    Ok(value)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn malformed_control_diagnostics_do_not_echo_private_input() {
++        let marker = "private-password-marker";
++        let bytes = format!("{{\"{marker}\":\"{marker}\"}}");
++        let error = match decode_control(bytes.as_bytes(),XmzNetwork::Mainnet) {
++            Err(error) => error,
++            Ok(_) => panic!("accepted malformed private command"),
++        };
++        assert_eq!(error.to_string(), "invalid wallet command");
++        assert_eq!(error.chain().count(),1);
++        assert!(!format!("{error:?}").contains(marker));
++    }
++    #[test]
++    fn control_schema_rejects_ambiguous_and_external_inputs() -> Result<()> {
++        let valid = json!({"schema":"monzero-wallet-control-v1","requestId":"12345678-1234-1234-1234-123456789abc",
++            "operation":"create","walletId":"23456789-1234-1234-1234-123456789abc","password":"fixture","expectedAddress":""});
++        assert!(decode_control(&serde_json::to_vec(&valid)?,XmzNetwork::Mainnet).is_ok());
++        for (key,value) in [("rpcUrl","http://example.invalid"),("operation","transfer"),
++            ("walletId","../wallet"),("password",""),("expectedAddress","unexpected"),("requestId","")] {
++            let mut changed = valid.clone();
++            changed[key] = json!(value);
++            assert!(decode_control(&serde_json::to_vec(&changed)?,XmzNetwork::Mainnet).is_err());
++        }
++        let text = serde_json::to_string(&valid)?;
++        let duplicate = format!("{},\"operation\":\"create\"}}", &text[..text.len()-1]);
++        assert!(decode_control(duplicate.as_bytes(),XmzNetwork::Mainnet).is_err());
++        assert!(decode_control(&vec![b' ';4097],XmzNetwork::Mainnet).is_err());
++        Ok(())
++    }
++    #[test]
++    fn lifecycle_inputs_are_bounded_and_path_free() -> Result<()> {
++        assert!(SwapWalletId::new(uuid::Uuid::nil()).is_err());
++        let id = SwapWalletId::new(uuid::Uuid::parse_str("12345678-1234-1234-1234-123456789abc")?)?;
++        assert_eq!(id.filename(), "swap-12345678123412341234123456789abc");
++        for password in [String::new(), "x".repeat(1025), "a\0b".into()] {
++            assert!(checked_password(password).is_err());
++        }
++        assert!(checked_password("fixture-password".into()).is_ok());
++        Ok(())
++    }
++}
+diff --git a/swap-machine/src/bin/native-fee-preview.rs b/swap-machine/src/bin/native-fee-preview.rs
+new file mode 100644
+index 0000000..fa7566f
+--- /dev/null
++++ b/swap-machine/src/bin/native-fee-preview.rs
+@@ -0,0 +1,96 @@
++//! Experimental Linux pipe helper. Never accepts session secrets in request JSON.
++//! The launcher must own the wallet service exclusively; the session-file lock
++//! only serializes helpers sharing that file, not arbitrary RPC clients.
++#[cfg(target_os = "linux")]
++mod linux {
++    use anyhow::{Result, ensure};
++    use std::{fs::{File, OpenOptions}, io::Read, os::{fd::AsFd, unix::fs::{MetadataExt, OpenOptionsExt}}, path::Path};
++    use swap_core::xmz_address::XmzNetwork;
++    use swap_machine::native_funding_rpc::{NativeFundingRpc, fee_estimation::NativeFeeEstimator};
++    use zeroize::{Zeroize, Zeroizing};
++
++    #[derive(serde::Deserialize)]
++    #[serde(deny_unknown_fields, rename_all = "camelCase")]
++    struct Session {
++        schema: String, network: String, genesis: String,
++        daemon_port: u16, wallet_port: u16, username: String, password: String,
++    }
++
++    impl Drop for Session {
++        fn drop(&mut self) { self.username.zeroize(); self.password.zeroize(); }
++    }
++
++    fn load(path: &Path) -> Result<(File, Session)> {
++        ensure!(path.is_absolute(), "session path must be absolute");
++        let file = OpenOptions::new().read(true)
++            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)?;
++        let metadata = file.metadata()?;
++        // SAFETY: geteuid takes no arguments and has no memory-safety preconditions.
++        let uid = unsafe { libc::geteuid() };
++        ensure!(metadata.is_file() && metadata.uid() == uid && metadata.mode() & 0o7777 == 0o600
++            && metadata.nlink() == 1 && metadata.len() <= 2048, "unsafe session file");
++        file.try_lock()?;
++        let mut bytes = Zeroizing::new(Vec::new());
++        (&file).take(2049).read_to_end(&mut bytes)?;
++        ensure!(bytes.len() <= 2048, "oversized session file");
++        let session: Session = serde_json::from_slice(&bytes)?;
++        ensure!(session.schema == "monzero-native-fee-session-v1", "unsupported session schema");
++        Ok((file, session))
++    }
++
++    pub async fn run() -> Result<()> {
++        let args: Vec<_> = std::env::args_os().collect();
++        ensure!(args.len() == 4 && (args[1] == "--fee-preview-stdio-v1" || args[1] == "--wallet-control-stdio-v1") && args[2] == "--session-file",
++            "invalid helper arguments");
++        let (_session_lock, mut session) = load(Path::new(&args[3]))?;
++        let network = match session.network.as_str() {
++            "mainnet" => XmzNetwork::Mainnet, "testnet" => XmzNetwork::Testnet,
++            "stagenet" => XmzNetwork::Stagenet, _ => anyhow::bail!("invalid session network"),
++        };
++        let client = NativeFundingRpc::new(session.daemon_port, session.wallet_port,
++            std::mem::take(&mut session.username), std::mem::take(&mut session.password))?;
++        // Real nonblocking pipes: unlike blocking stdin tasks these can time out
++        // without leaving runtime shutdown waiting for a sender to close stdin.
++        let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)?;
++        let mut writer = tokio::net::unix::pipe::Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)?;
++        if args[1] == "--wallet-control-stdio-v1" {
++            use tokio::io::{AsyncReadExt, AsyncWriteExt};
++            use swap_machine::native_funding_rpc::wallet_session::NativeWalletSession;
++            // The process owner must record operation-pending before launch and
++            // require reconciliation on failure, timeout or an unverified reply.
++            return tokio::time::timeout(std::time::Duration::from_secs(30), async {
++                let mut bytes = Zeroizing::new(Vec::new());
++                reader.take(4097).read_to_end(&mut bytes).await?;
++                ensure!(bytes.len() <= 4096, "oversized private command");
++                let reply = NativeWalletSession::new(client, network).execute_control(&bytes,
++                    std::time::Duration::from_secs(30)).await?;
++                let output = serde_json::to_vec(&reply)?;
++                ensure!(output.len() <= 2048, "oversized wallet control reply");
++                writer.write_all(&output).await?;
++                writer.flush().await?;
++                Ok(())
++            }).await?;
++        }
++        NativeFeeEstimator::new(client).serve_preview(reader, writer, network, &session.genesis,
++            std::time::Duration::from_secs(30)).await
++    }
++}
++
++fn main() {
++    #[cfg(target_os = "linux")]
++    let success = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
++        Ok(runtime) => runtime.block_on(linux::run()).is_ok(),
++        Err(_) => false,
++    };
++    #[cfg(not(target_os = "linux"))]
++    let success = false;
++    if !success {
++        // Never expose credentials, raw RPC responses or session contents.
++        if std::env::args_os().nth(1).is_some_and(|arg| arg == "--wallet-control-stdio-v1") {
++            eprintln!("Native wallet control failed");
++        } else {
++            eprintln!("Native fee preview failed");
++        }
++        std::process::exit(1);
++    }
++}

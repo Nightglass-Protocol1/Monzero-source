@@ -1,0 +1,243 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 2cfea6d4b..5dc41f95d 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -30,6 +30,12 @@ mod linux {
+             "--snapshot-stdio-v1"=>("monzero-ltc-journal-request-v1",false,false,false),
+             "--start-review-stdio-v1"=>("monzero-ltc-start-review-request-v1",false,false,false),
+             "--start-submit-stdio-v1"=>("monzero-ltc-start-submit-request-v1",false,true,false),
++            "--payout-wallet-restore-stdio-v1"=>("monzero-ltc-payout-wallet-restore-request-v1",false,false,false),
++            "--payout-wallet-open-stdio-v1"=>("monzero-ltc-payout-wallet-open-request-v1",false,false,false),
++            "--payout-wallet-check-stdio-v1"=>("monzero-ltc-payout-wallet-check-request-v1",false,false,false),
++            "--refund-wallet-restore-stdio-v1"=>("monzero-ltc-refund-wallet-restore-request-v1",false,false,false),
++            "--refund-wallet-open-stdio-v1"=>("monzero-ltc-refund-wallet-open-request-v1",false,false,false),
++            "--refund-wallet-check-stdio-v1"=>("monzero-ltc-refund-wallet-check-request-v1",false,false,false),
+             "--refund-prepare-stdio-v1"=>("monzero-ltc-refund-prepare-request-v1",false,false,false),
+             "--refund-review-stdio-v1"=>("monzero-ltc-refund-review-request-v1",true,false,false),
+             "--refund-submit-stdio-v1"=>("monzero-ltc-refund-submit-request-v1",true,true,false),
+@@ -282,7 +288,7 @@ mod linux {
+     fn preparation_config_valid(schema:&str,prefix:&str,observer:Option<&PreparationObserver>,
+         ltc:u16,daemon:u16,wallet:u16)->bool {
+         let version=if schema==format!("{prefix}-v1") {observer.is_none()}
+-            else if schema==format!("{prefix}-v2") {observer.is_some_and(|o|
++            else if schema==format!("{prefix}-v2") || schema==format!("{prefix}-v3") {observer.is_some_and(|o|
+                 o.wallet_port!=0 && ![ltc,daemon,wallet].contains(&o.wallet_port))} else {false};
+         version && ltc!=0 && daemon!=0 && wallet!=0 && ltc!=daemon && ltc!=wallet && daemon!=wallet
+     }
+@@ -292,6 +298,7 @@ mod linux {
+         schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
+         native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,ltc_refund_block:bitcoin::BlockHash,
+         #[serde(default)] preparation_observer:Option<PreparationObserver>,
++        #[serde(default)] wallet_password_file:Option<PathBuf>,
+     }
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+@@ -299,6 +306,7 @@ mod linux {
+         schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
+         native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,ltc_redeem_block:bitcoin::BlockHash,
+         #[serde(default)] preparation_observer:Option<PreparationObserver>,
++        #[serde(default)] wallet_password_file:Option<PathBuf>,
+     }
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+@@ -359,6 +367,68 @@ mod linux {
+             && info["outgoing_connections_count"].as_u64()==Some(0),"refund GUI requires offline native fakechain");
+         Ok(())
+     }
++    async fn recovered_wallet(config:&Config,execution:&mut Execution,request:&Request,payout:bool,operation:&str)->Result<serde_json::Value> {
++        use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,
++            relay::NativeTransferRelay,wallet_session::NativeWalletSession}};
++        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        ensure!(config.role==if payout {"litecoin-funder"} else {"native-funder"}
++            && config.policy.ltc_network==LtcNetwork::Regtest,"invalid recovered wallet role or deployment");
++        ensure!(matches!(operation,"restore"|"open"|"check"),"invalid recovered wallet operation");
++        let rpc_path=if payout {config.payout_rpc_file.as_deref()} else {config.refund_rpc_file.as_deref()}
++            .context("recovered wallet configuration missing")?;
++        let (_rpc_lease,bytes)=private_bytes(rpc_path,false)?;
++        let (schema,port,wallet,anchor,cookie,daemon,wallet_port,login,block,observer,password_file)=if payout {
++            let r:PayoutRpc=serde_json::from_slice(&bytes)?;
++            (r.schema,r.ltc_port,r.ltc_wallet,r.ltc_anchor,r.ltc_cookie_file,r.native_daemon_port,r.native_wallet_port,
++                r.native_login_file,r.ltc_redeem_block,r.preparation_observer,r.wallet_password_file)
++        } else {
++            let r:RefundRpc=serde_json::from_slice(&bytes)?;
++            (r.schema,r.ltc_port,r.ltc_wallet,r.ltc_anchor,r.ltc_cookie_file,r.native_daemon_port,r.native_wallet_port,
++                r.native_login_file,r.ltc_refund_block,r.preparation_observer,r.wallet_password_file)
++        };
++        let purpose=if payout {"payout"} else {"refund"};
++        let prefix=format!("monzero-private-ltc-{purpose}-rpc");
++        ensure!(schema==format!("{prefix}-v3") && preparation_config_valid(&schema,&prefix,observer.as_ref(),port,daemon,wallet_port),
++            "wallet recovery requires explicit observer and password configuration");
++        let password_file=password_file.context("missing recovered wallet password file")?;
++        let observer=observer.context("missing recovered wallet observer")?;
++        // Password bytes stay in the native helper and are never sent through Qt/QML.
++        let password=if operation=="check" {None} else {
++            let (_lease,bytes)=private_bytes(&password_file,false)?;
++            let bytes=zeroize::Zeroizing::new(bytes);
++            ensure!(bytes.len()<=1024 && !bytes.contains(&0),"invalid recovered wallet password");
++            Some(zeroize::Zeroizing::new(std::str::from_utf8(&bytes)?.to_owned()))
++        };
++        isolated_native(daemon).await?;
++        let (_ltc_lease,user,secret)=credentials(&cookie)?;
++        let ltc=LitecoinRpc::new(port,user,secret,LtcNetwork::Regtest,wallet,LtcSegwitAddress::parse(LtcNetwork::Regtest,&anchor)?)?;
++        let (_observer_lease,user,secret)=credentials(&observer.login_file)?;
++        let observer=NativeFundingRpc::new(daemon,observer.wallet_port,user,secret)?;
++        let (_wallet_lease,user,secret)=credentials(&login)?;
++        let mut session=NativeWalletSession::new(NativeFundingRpc::new(daemon,wallet_port,user,secret)?,config.policy.xmz_network);
++        let (address,filename)=if payout {
++            let claim=execution.prepare_native_claim(&observer,&ltc,block).await?;
++            match operation {
++                "restore"=>claim.restore_wallet(&mut session,std::mem::take(&mut *password.context("missing password")?)).await?,
++                "open"=>claim.open_wallet(&mut session,std::mem::take(&mut *password.context("missing password")?)).await?,
++                "check"=>claim.check_wallet(&mut session).await?,
++                _=>anyhow::bail!("invalid wallet operation"),
++            }
++            (claim.address().to_string(),claim.wallet_filename())
++        } else {
++            let refund=execution.prepare_native_refund(&NativeTransferRelay::new(observer),&ltc,block).await?;
++            match operation {
++                "restore"=>refund.restore_wallet(&mut session,std::mem::take(&mut *password.context("missing password")?)).await?,
++                "open"=>refund.open_wallet(&mut session,std::mem::take(&mut *password.context("missing password")?)).await?,
++                "check"=>refund.check_wallet(&mut session).await?,
++                _=>anyhow::bail!("invalid wallet operation"),
++            }
++            (refund.address().to_string(),refund.wallet_filename())
++        };
++        Ok(serde_json::json!({"schema":format!("monzero-ltc-{purpose}-wallet-{operation}-response-v1"),"requestId":request.request_id,
++            "snapshot":execution.saved_status()?,"wallet":{"schema":"monzero-ltc-recovered-wallet-v1","operation":operation,
++                "purpose":purpose,"filename":filename,"address":address,"spendKeyVerified":true,"fundingImported":true,"executable":false}}))
++    }
+     enum PaymentOperation {Prepare,Submit,Check}
+     async fn refund_rpc(config:&Config,execution:&mut Execution,request:&Request,operation:PaymentOperation)->Result<serde_json::Value> {
+         let checking=matches!(operation,PaymentOperation::Check);
+@@ -381,7 +451,8 @@ mod linux {
+         let (_rpc_lease,bytes)=private_bytes(config.refund_rpc_file.as_deref().context("refund execution not configured")?,false)?;
+         let rpc:RefundRpc=serde_json::from_slice(&bytes)?;
+         ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-refund-rpc",rpc.preparation_observer.as_ref(),
+-            rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port),"invalid refund RPC configuration");
++            rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
++            && rpc.wallet_password_file.is_some()==(rpc.schema=="monzero-private-ltc-refund-rpc-v3"),"invalid refund RPC configuration");
+         isolated_native(rpc.native_daemon_port).await?;
+         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+         let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
+@@ -439,7 +510,8 @@ mod linux {
+         let (_rpc_lease,bytes)=private_bytes(config.payout_rpc_file.as_deref().context("payout execution not configured")?,false)?;
+         let rpc:PayoutRpc=serde_json::from_slice(&bytes)?;
+         ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-payout-rpc",rpc.preparation_observer.as_ref(),
+-            rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port),"invalid payout RPC configuration");
++            rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
++            && rpc.wallet_password_file.is_some()==(rpc.schema=="monzero-private-ltc-payout-rpc-v3"),"invalid payout RPC configuration");
+         isolated_native(rpc.native_daemon_port).await?;
+         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+         let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
+@@ -627,6 +699,29 @@ mod linux {
+             Ok(())
+         }
+         #[test]
++        fn recovered_wallet_requests_cannot_grant_payment_or_key_authority()->Result<()> {
++            for purpose in ["payout","refund"] {for operation in ["restore","open","check"] {
++                let mode=format!("--{purpose}-wallet-{operation}-stdio-v1");
++                let value=serde_json::json!({"schema":format!("monzero-ltc-{purpose}-wallet-{operation}-request-v1"),"requestId":uuid::Uuid::new_v4()});
++                let request:Request=serde_json::from_value(value.clone())?;
++                assert!(valid_request(&request,&mode));
++                for other in ["restore","open","check"] {
++                    assert_eq!(valid_request(&request,&format!("--{purpose}-wallet-{other}-stdio-v1")),operation==other);
++                }
++                for (key,extra) in [("action",serde_json::json!("send")),("commitment",serde_json::json!("a".repeat(64))),
++                    ("priority",serde_json::json!(1)),("safetyBlocks",serde_json::json!(2))] {
++                    let mut changed=value.clone();changed[key]=extra;
++                    assert!(!valid_request(&serde_json::from_value(changed)?,&mode));
++                }
++                for key in ["password","spendKey","walletFile"] {
++                    let mut changed=value.clone();changed[key]=serde_json::json!("forbidden");
++                    assert!(serde_json::from_value::<Request>(changed).is_err());
++                }
++                assert!(!valid_request(&request,&format!("--{purpose}-submit-stdio-v1")));
++            }}
++            Ok(())
++        }
++        #[test]
+         fn preparation_requests_require_priority_and_no_send_authority()->Result<()> {
+             for name in ["refund","payout"] {
+                 let mode=format!("--{name}-prepare-stdio-v1");
+@@ -708,7 +803,10 @@ mod linux {
+             let output=serde_json::to_vec(&response)?;ensure!(output.len()<=110000,"oversized reservation response");
+             std::io::stdout().write_all(&output)?;return Ok(());
+         }
+-        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-prepare-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-prepare-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
++        let wallet_mode=args.get(1).and_then(|a|a.to_str()).and_then(|mode|
++            ["payout","refund"].into_iter().flat_map(|p|["restore","open","check"].into_iter().map(move |o|(p,o)))
++                .find(|(p,o)|mode==format!("--{p}-wallet-{o}-stdio-v1")));
++        ensure!(args.len()==4 && (wallet_mode.is_some() || args[1]=="--snapshot-stdio-v1" || args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-prepare-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-prepare-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
+             && args[2]=="--config-file","invalid journal helper arguments");
+         let refund_prepare_mode=args[1]=="--refund-prepare-stdio-v1";
+         let payout_prepare_mode=args[1]=="--payout-prepare-stdio-v1";
+@@ -750,7 +848,10 @@ mod linux {
+         }
+         let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
+             config.trade_id,&config.policy,role,config.pins)?;
+-        let response=if funding_review_mode {
++        let response=if let Some((purpose,operation))=wallet_mode {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(
++                recovered_wallet(&config,&mut execution,&request,purpose=="payout",operation))?
++        } else if funding_review_mode {
+             use swap_machine::litecoin_negotiation::execution::funding_approval::FundingAction;
+             ensure!(config.role=="native-funder","funding review requires native funder");
+             let action=match request.action.unwrap() {Action::Send=>FundingAction::Send,Action::Retransmit=>FundingAction::Retransmit};
+diff --git a/swap-machine/src/litecoin_negotiation/execution/native_claim_wallet.rs b/swap-machine/src/litecoin_negotiation/execution/native_claim_wallet.rs
+index 0bbfbf934..84d1cc0a2 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/native_claim_wallet.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/native_claim_wallet.rs
+@@ -40,18 +40,24 @@ impl PreparedNativeClaim {
+     /// Scanning from zero preserves recovery across native reorganisations.
+     pub async fn restore_wallet(&self,session:&mut NativeWalletSession,password:String)->Result<()> {
+         session.restore(&self.id,hex(self.keys.spend_key()),hex(self.keys.view_key()),0,password,&self.address).await?;
+-        session.verify_spend_key(self.keys.spend_key(),&self.address).await?;
+-        session.import_transaction(&self.txid,&self.address).await
++        self.check_wallet(session).await
+     }
+ 
+     /// Explicit recovery after an uncertain restore, or a later process restart.
+     /// Never replaces a failed open with a fresh wallet or different key material.
+     pub async fn open_wallet(&self,session:&mut NativeWalletSession,password:String)->Result<()> {
+         session.open(&self.id,password,&self.address).await?;
++        self.check_wallet(session).await
++    }
++
++    /// Reconcile an already-open wallet after a lost reply. This cannot create,
++    /// replace or open a wallet, and never returns recovered key material.
++    pub async fn check_wallet(&self,session:&mut NativeWalletSession)->Result<()> {
+         session.verify_spend_key(self.keys.spend_key(),&self.address).await?;
+         session.import_transaction(&self.txid,&self.address).await
+     }
+ 
++
+     // Low-level isolated-wallet fixture only. Production construction goes
+     // through Execution::prepare_native_payout and its immutable intent.
+     #[cfg(test)]
+diff --git a/swap-machine/src/litecoin_negotiation/execution/native_refund.rs b/swap-machine/src/litecoin_negotiation/execution/native_refund.rs
+index 8f70639ce..d6995146d 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/native_refund.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/native_refund.rs
+@@ -33,14 +33,20 @@ impl PreparedNativeRefund {
+     pub fn wallet_filename(&self)->String {self.id.filename()}
+     pub async fn restore_wallet(&self,session:&mut NativeWalletSession,password:String)->Result<()> {
+         session.restore(&self.id,hex(self.keys.spend_key()),hex(self.keys.view_key()),0,password,&self.address).await?;
+-        session.verify_spend_key(self.keys.spend_key(),&self.address).await?;
+-        session.import_transaction(&self.txid,&self.address).await
++        self.check_wallet(session).await
+     }
+     pub async fn open_wallet(&self,session:&mut NativeWalletSession,password:String)->Result<()> {
+         session.open(&self.id,password,&self.address).await?;
++        self.check_wallet(session).await
++    }
++
++    /// Reconcile an already-open wallet after a lost reply. This cannot create,
++    /// replace or open a wallet, and never returns recovered key material.
++    pub async fn check_wallet(&self,session:&mut NativeWalletSession)->Result<()> {
+         session.verify_spend_key(self.keys.spend_key(),&self.address).await?;
+         session.import_transaction(&self.txid,&self.address).await
+     }
++
+ }
+ #[derive(Serialize,Deserialize)]
+ #[serde(deny_unknown_fields)]

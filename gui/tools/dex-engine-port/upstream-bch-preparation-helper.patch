@@ -1,0 +1,224 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ ## [Unreleased]
++
++- Private BCH/XMZ prototype: add preparation and offline saved-preparation helper commands.
++  Both bind original admission, policy and deployment; neither signs nor broadcasts.
+ 
+ - Private BCH/XMZ prototype: expose a read-only saved wallet preparation review with exact inputs, outputs and fee.
+   Candidate, template and input claims must agree; historical review grants no signing or relay permission.
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs
+@@ -56,3 +56,47 @@
+         assert_eq!(state.sign_calls,0);assert_eq!(state.relay_calls,0);assert!(!state.locked);}
+     Ok(execution)
+ }
++
++
++pub(super) fn helper_status(setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
++    rpc: &BchRpc,program: &std::path::Path,funding: &std::path::Path,config: &PrivateStore,
++    script: &bitcoin::Script) -> Result<()> {
++    let policy=WalletPreparationPolicy {change_address:"bchreg:qchange".into(),change_script:script.to_owned(),
++        fee_rate_atoms_per_kb:1000,maximum_fee:1000,minimum_change:546,minimum_confirmations:3};
++    let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    let expected=execution.saved_bch_wallet_preparation_review(&rpc.deployment_commitment()?,&policy)?;
++    drop(execution);
++    let path=config.0.join("preparation.json");
++    let wrapper=json!({"schema":"monzero-private-bch-preparation-v1","fundingConfigFile":funding,
++        "rpcFile":config.0.join("absent-rpc.json"),"policy":policy});
++    save(&path,&serde_json::to_vec(&wrapper)?)?;
++    let invoke=|success: bool| -> Result<()> {
++        let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++        let id=uuid::Uuid::new_v4();
++        let mut child=Command::new(program).arg("--funding-preparation-status-stdio-v1").arg(&path)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("missing preparation stdin")?.write_all(&serde_json::to_vec(&json!({
++            "schema":"monzero-bch-funding-preparation-status-request-v1","requestId":id}))?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++        assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++        if !success {assert!(output.stdout.is_empty());return Ok(())}
++        assert!(output.stderr.is_empty());assert!(output.stdout.len()<=65536);
++        let response: Value=serde_json::from_slice(&output.stdout)?;
++        assert_eq!(response.as_object().unwrap().len(),6);
++        assert_eq!(response["schema"],"monzero-bch-funding-preparation-status-response-v1");
++        assert_eq!(response["requestId"],id.to_string());assert_eq!(response["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(response["executable"],false);assert_eq!(response["chainObserved"],false);
++        assert_eq!(response["review"]["details"],expected.details);
++        assert_eq!(response["review"]["commitment"],hex(&expected.commitment));
++        Ok(())
++    };
++    invoke(true)?;
++    let mut wrong=wrapper.clone();wrong["policy"]["minimum_confirmations"]=json!(4);
++    save(&path,&serde_json::to_vec(&wrong)?)?;invoke(false)?;
++    save(&path,&serde_json::to_vec(&wrapper)?)?;
++    let consent=metadata.0.join(format!("{}.bch-execution-approval-bch-funder",setup.quote.terms()["swapId"]));
++    let bytes=std::fs::read(&consent)?;std::fs::remove_file(&consent)?;invoke(false)?;
++    save(&consent,&bytes)?;invoke(true)?;
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -144,6 +144,7 @@
+     // Stop the mock before review: successful helper execution cannot rely on RPC.
+     assert_eq!(server.state.lock().unwrap().relay_calls,0);
+     drop(server);
++    if wallet_preparation { preparation::helper_status(&setup,&metadata,&snapshots,&rpc,&program,&funding_path,&config_store,&script)?; }
+     let invoke=|success: bool| -> Result<Value> {
+         let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
+         let id=uuid::Uuid::new_v4();
+diff --git a/swap-machine/src/bch_rpc/locks.rs b/swap-machine/src/bch_rpc/locks.rs
+--- a/swap-machine/src/bch_rpc/locks.rs
++++ b/swap-machine/src/bch_rpc/locks.rs
+@@ -9,7 +9,9 @@
+ 
+ impl BchRpc {
+     /// Stable deployment binding, deliberately excluding rotatable credentials.
+-    pub(crate) fn deployment_commitment(&self) -> Result<[u8;32]> {
++    /// Digest of configured deployment identity; this performs no RPC and does
++    /// not authenticate the process or establish current chain evidence.
++    pub fn deployment_commitment(&self) -> Result<[u8;32]> {
+         let (height, checkpoint) = self.network.checkpoint()?;
+         let bytes = serde_json::to_vec(&json!({
+             "schema":"monzero-bch-wallet-deployment-v1", "host":"127.0.0.1", "port":self.port,
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -143,7 +143,7 @@
+     fn funding_request(bytes: &[u8], action: &str) -> Result<Request> {
+         ensure!(!bytes.is_empty() && bytes.len() <= 512,"invalid BCH funding request size");
+         let request: Request = serde_json::from_slice(bytes)?;
+-        ensure!(matches!(action,"review"|"submit"|"status"|"observe")
++        ensure!(matches!(action,"review"|"submit"|"status"|"observe"|"prepare"|"preparation-status")
+             && request.schema == format!("monzero-bch-funding-{action}-request-v1")
+             && !request.request_id.is_nil(),"invalid BCH funding request");
+         if action == "submit" {
+@@ -268,6 +268,61 @@
+                 ScriptBuf::from_bytes(Vec::<u8>::from_hex(&self.anchor_script)?),self.subversion.clone())
+         }
+     }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields, rename_all="camelCase")]
++    struct PreparationConfig {
++        schema: String, funding_config_file: PathBuf, rpc_file: PathBuf,
++        policy: swap_machine::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::preparation::WalletPreparationPolicy,
++    }
++    fn preparation_config(bytes: &[u8]) -> Result<PreparationConfig> {
++        let config: PreparationConfig=serde_json::from_slice(bytes)?;
++        ensure!(config.schema=="monzero-private-bch-preparation-v1"
++            && config.funding_config_file.is_absolute() && config.rpc_file.is_absolute(),
++            "invalid BCH preparation configuration");
++        let policy=&config.policy;
++        ensure!(!policy.change_address.is_empty() && policy.change_address.len()<=128
++            && policy.change_address.bytes().all(|b|b.is_ascii_graphic())
++            && policy.minimum_confirmations>0
++            && [policy.fee_rate_atoms_per_kb,policy.maximum_fee,policy.minimum_change].iter()
++                .all(|v|*v>0 && *v<=2_100_000_000_000_000)
++            && swap_core::bch::covenant::supported_destination(&policy.change_script),
++            "invalid BCH preparation policy");
++        Ok(config)
++    }
++    async fn preparation_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
++        ensure!(matches!(action,"prepare"|"preparation-status"),"invalid preparation action");
++        let request=funding_request(bytes,action)?;
++        let (_preparation_lease,bytes)=private_bytes(path)?;
++        let preparation=preparation_config(&bytes)?;
++        let (_funding_lease,bytes)=private_bytes(&preparation.funding_config_file)?;
++        let funding=funding_config(&bytes)?;
++        let deployment=parse_digest(&funding.deployment_commitment)?;
++        let (_admission_lease,config)=load(&funding.admission_config_file)?;
++        ensure!(matches!(config.role,Role::BchFunder),"BCH preparation requires the BCH funder");
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,
++            "BCH preparation quote belongs to another trade");
++        let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        if action=="prepare" {
++            let (_rpc_lease,bytes)=private_bytes(&preparation.rpc_file)?;
++            let rpc: FundingRpc=serde_json::from_slice(&bytes)?;
++            let (_cookie_lease,bytes)=private_file(&rpc.cookie_file,true)?;
++            let backend=rpc.backend(&bytes)?;
++            ensure!(backend.deployment_commitment()?==deployment,"BCH preparation backend differs from pinned deployment");
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            execution.prepare_bch_funding_from_wallet(&backend,now,&preparation.policy).await?;
++        }
++        let review=execution.saved_bch_wallet_preparation_review(&deployment,&preparation.policy)?;
++        let commitment: String=review.commitment.iter().map(|b|format!("{b:02x}")).collect();
++        Ok(serde_json::json!({"schema":format!("monzero-bch-funding-{action}-response-v1"),
++            "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
++            "review":{"details":review.details,"commitment":commitment}}))
++    }
++
+     pub fn run() -> Result<()> {
+         let args: Vec<_> = std::env::args_os().collect();
+         ensure!(args.len() == 3,"expected mode and private configuration path");
+@@ -275,7 +330,15 @@
+         let mut bytes = Vec::new();
+         std::io::stdin().take(513).read_to_end(&mut bytes)?;
+         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+-        let result = if let Some(operation) = match action {
++        let preparation_action=match action {
++            "--funding-prepare-stdio-v1"=>Some("prepare"),
++            "--funding-preparation-status-stdio-v1"=>Some("preparation-status"),
++            _=>None,
++        };
++        let result = if let Some(operation)=preparation_action {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(preparation_operation(Path::new(&args[2]),&bytes,operation))?
++        } else if let Some(operation) = match action {
+             "--funding-review-stdio-v1" => Some("review"),
+             "--funding-submit-stdio-v1" => Some("submit"),
+             "--funding-status-stdio-v1" => Some("status"),
+@@ -291,13 +354,42 @@
+             handle(&config,&request,mode,now)?
+         };
+         let output = serde_json::to_vec(&result)?;
+-        ensure!(output.len() <= 16384,"oversized BCH admission response");
++        // All 128 reviewed inputs must fit; never silently omit inputs.
++        let limit=if preparation_action.is_some() {65536} else {16384};
++        ensure!(output.len() <= limit,"oversized BCH admission response");
+         std::io::stdout().write_all(&output)?;
+         Ok(())
+     }
+ 
+     #[cfg(test)]
+     mod tests {
++        #[test]
++        fn preparation_protocol_rejects_approval_and_invalid_policy() -> Result<()> {
++            let policy=serde_json::json!({"change_address":"bchreg:qchange",
++                "change_script":format!("76a914{}88ac","03".repeat(20)),
++                "fee_rate_atoms_per_kb":1000,"maximum_fee":1000,"minimum_change":546,"minimum_confirmations":3});
++            let valid=serde_json::json!({"schema":"monzero-private-bch-preparation-v1",
++                "fundingConfigFile":"/private/funding.json","rpcFile":"/private/rpc.json","policy":policy});
++            preparation_config(&serde_json::to_vec(&valid)?)?;
++            for field in ["fee_rate_atoms_per_kb","maximum_fee","minimum_change","minimum_confirmations"] {
++                let mut bad=valid.clone();bad["policy"][field]=serde_json::json!(0);
++                assert!(preparation_config(&serde_json::to_vec(&bad)?).is_err());
++            }
++            for field in ["fundingConfigFile","rpcFile"] {
++                let mut bad=valid.clone();bad[field]=serde_json::json!("relative");
++                assert!(preparation_config(&serde_json::to_vec(&bad)?).is_err());
++            }
++            let mut bad=valid.clone();bad["policy"]["broadcast"]=serde_json::json!(true);
++            assert!(preparation_config(&serde_json::to_vec(&bad)?).is_err());
++            for action in ["prepare","preparation-status"] {
++                let mut request=serde_json::json!({"schema":format!("monzero-bch-funding-{action}-request-v1"),
++                    "requestId":uuid::Uuid::new_v4()});
++                funding_request(&serde_json::to_vec(&request)?,action)?;
++                request["commitment"]=serde_json::json!("11".repeat(32));
++                assert!(funding_request(&serde_json::to_vec(&request)?,action).is_err());
++            }
++            Ok(())
++        }
+ use super::*;
+ #[test]
+ fn funding_observation_requires_read_only_request() {

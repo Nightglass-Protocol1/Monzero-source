@@ -1,0 +1,90 @@
+diff --git a/swap-machine/src/native_funding_rpc/relay.rs b/swap-machine/src/native_funding_rpc/relay.rs
+index 63a6f0aec..dac747533 100644
+--- a/swap-machine/src/native_funding_rpc/relay.rs
++++ b/swap-machine/src/native_funding_rpc/relay.rs
+@@ -381,6 +381,85 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn recovery_preparation_rejects_unrelated_rpc_inputs_without_relay() -> Result<()> {
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        use std::sync::{Arc, Mutex};
++        struct Server(tokio::task::JoinHandle<Result<()>>);
++        impl Drop for Server { fn drop(&mut self) { self.0.abort(); } }
++        let selected = Arc::new(Mutex::new(Value::Null));
++        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
++        let mut ports = Vec::new();
++        let mut servers = Vec::new();
++        for wallet in [false, true] {
++            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++            ports.push(listener.local_addr()?.port());
++            let selected = selected.clone(); let calls = calls.clone();
++            servers.push(Server(tokio::spawn(async move {
++                loop {
++                    let (mut stream, _) = listener.accept().await?;
++                    let mut bytes = Vec::new();
++                    let (headers, body) = loop {
++                        let mut buffer = [0; 4096];
++                        let count = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buffer)).await??;
++                        ensure!(count > 0 && bytes.len()+count <= 16384,"invalid fixture HTTP request");
++                        bytes.extend_from_slice(&buffer[..count]);
++                        if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
++                            let headers = String::from_utf8(bytes[..end].to_vec())?.to_ascii_lowercase();
++                            let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:"))
++                                .context("missing fixture HTTP length")?.trim().parse()?;
++                            if bytes.len() >= end+4+length { break (headers, bytes[end+4..end+4+length].to_vec()); }
++                        }
++                    };
++                    if wallet && !headers.lines().any(|line| line.starts_with("authorization:")) {
++                        stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"fixture\", nonce=\"fixture-nonce\", qop=\"auth\", algorithm=MD5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
++                        continue;
++                    }
++                    let request: Value = serde_json::from_slice(&body)?;
++                    let method = request["method"].as_str().context("missing fixture method")?;
++                    calls.lock().unwrap().push(method.to_owned());
++                    let result = match method {
++                        "get_block_header_by_height" => json!({"block_header":{"hash":"a".repeat(64)}}),
++                        "get_last_block_header" => json!({"block_header":{"hash":"e".repeat(64),"height":100}}),
++                        "get_address" => json!({"address":address().to_string()}),
++                        "get_balance" => json!({"balance":204,"unlocked_balance":204}),
++                        "incoming_transfers" => json!({"transfers":[
++                            {"tx_hash":"a".repeat(64),"key_image":"b".repeat(64),"amount":102,
++                             "spent":false,"unlocked":true,"frozen":false,"subaddr_index":{"major":0}},
++                            {"tx_hash":"c".repeat(64),"key_image":"d".repeat(64),"amount":102,
++                             "spent":false,"unlocked":true,"frozen":false,"subaddr_index":{"major":0}}]}),
++                        "transfer" => {
++                            ensure!(request["params"]["do_not_relay"] == true,"fixture attempted broadcast");
++                            let mut reply=response(); reply["amount"]=json!(100); reply["fee"]=json!(2);
++                            reply["tx_metadata"]=json!("abcd");
++                            reply["spent_key_images"]=json!({"key_images":selected.lock().unwrap().clone()});
++                            reply
++                        }
++                        _ => anyhow::bail!("unexpected fixture RPC method"),
++                    };
++                    let body=serde_json::to_vec(&json!({"id":"native-funding","jsonrpc":"2.0","result":result}))?;
++                    let header=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
++                    stream.write_all(header.as_bytes()).await?; stream.write_all(&body).await?;
++                }
++            })));
++        }
++        let mut relay=NativeTransferRelay::new(NativeFundingRpc::new(ports[0],ports[1],"fixture".into(),"fixture".into())?);
++        for keys in [Value::Null,json!([]),json!(["d".repeat(64)]),
++            json!(["b".repeat(64),"d".repeat(64)]),json!(["b".repeat(64),"b".repeat(64)])] {
++            *selected.lock().unwrap()=keys;
++            let request=RelayRequest {wallet:address(),destination:address(),amount:XmzAmount::from_atoms(100),account:0,priority:1};
++            let result=tokio::time::timeout(std::time::Duration::from_secs(5),
++                relay.prepare_from_lock(request,&"a".repeat(64),XmzAmount::from_atoms(10),&"a".repeat(64))).await?;
++            let error=result.err().context("accepted unrelated or missing inputs")?;
++            ensure!(error.to_string().contains("input"),"unexpected fixture rejection: {error}");
++            assert!(!relay.dispatched);
++        }
++        let history=calls.lock().unwrap();
++        assert_eq!(history.iter().filter(|method| method.as_str()=="transfer").count(),5);
++        assert!(!history.iter().any(|method| method=="relay_tx"));
++        Ok(())
++    }
++
+     #[tokio::test]
+     async fn cancellation_after_dispatch_prevents_second_submission() -> Result<()> {
+         let wallet = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

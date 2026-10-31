@@ -1,0 +1,36 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs
+@@ -49,26 +49,27 @@
+         if lose_preparation {continue}
+         drop(execution);
+         for lose_reply in [false,true] {
++            let mut client=fixture.relay_client()?;
+             let relay_metadata=copy_store(&metadata)?;
+             let mut execution=AdmittedExecution::resume(&relay_metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
+             let relay_intent=relay_metadata.0.join(slot("relay-intent"));
+             *fixture.relay_intent.lock().unwrap()=Some(relay_intent.clone());
+             let review=execution.review_bch_native_relay_for_deployment(&deployment,1025)?;
+             let before=fixture.calls.lock().unwrap().len();
+-            assert!(execution.relay_bch_native_funding(&mut fixture.relay,rpc,&review.commitment,1025).await.is_err());
+-            assert!(execution.relay_light_bch_native_funding(&mut fixture.relay,&observer,&[0;32],1025).await.is_err());
+-            assert!(execution.relay_light_bch_native_funding(&mut fixture.relay,&observer,&review.commitment,2000).await.is_err());
++            assert!(execution.relay_bch_native_funding(&mut client,rpc,&review.commitment,1025).await.is_err());
++            assert!(execution.relay_light_bch_native_funding(&mut client,&observer,&[0;32],1025).await.is_err());
++            assert!(execution.relay_light_bch_native_funding(&mut client,&observer,&review.commitment,2000).await.is_err());
+             assert_eq!(fixture.calls.lock().unwrap().len(),before);
+             for mode in [1,3,21,22] {
+                 server.state.lock().unwrap().observation_mode=mode;
+-                assert!(execution.relay_light_bch_native_funding(&mut fixture.relay,&observer,&review.commitment,1025).await.is_err());
++                assert!(execution.relay_light_bch_native_funding(&mut client,&observer,&review.commitment,1025).await.is_err());
+                 assert!(!relay_intent.exists());
+             }
+             server.state.lock().unwrap().observation_mode=0;
+             fixture.balance_available.store(false,Ordering::SeqCst);
+             fixture.lose_reply.store(lose_reply,Ordering::SeqCst);
+             let relays=fixture.calls.lock().unwrap().iter().filter(|v|v.as_str()=="relay_tx").count();
+-            let result=execution.relay_light_bch_native_funding(&mut fixture.relay,&observer,&review.commitment,1025).await;
++            let result=execution.relay_light_bch_native_funding(&mut client,&observer,&review.commitment,1025).await;
+             let expected=if lose_reply {assert!(result.is_err());NativeRelayState::Attempted {txid:"ab".repeat(32)}}
+                 else {assert_eq!(result?.txid,"ab".repeat(32));NativeRelayState::Acknowledged {txid:"ab".repeat(32)}};
+             assert_eq!(execution.bch_native_relay_state()?,Some(expected.clone()));

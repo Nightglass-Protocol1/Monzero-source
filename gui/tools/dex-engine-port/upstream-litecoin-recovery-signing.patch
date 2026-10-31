@@ -1,0 +1,273 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 2284e327f..ba46c94a3 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -126,6 +126,41 @@ mod linux {
+         (0..value.len()).step_by(2).map(|offset|
+             u8::from_str_radix(&value[offset..offset+2],16).map_err(Into::into)).collect()
+     }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct RecoveryRequest {schema:String,request_id:uuid::Uuid,psbt:String}
++
++    fn recovery_message(execution:&mut Execution,input:&[u8],now:u64,mode:&str)->Result<serde_json::Value> {
++        if mode=="--recovery-review-stdio-v1" {
++            let request:RecoveryRequest=serde_json::from_slice(input)?;
++            ensure!(request.schema=="monzero-ltc-recovery-review-request-v1" && !request.request_id.is_nil()
++                && !request.psbt.is_empty() && request.psbt.len()<=100_000,"invalid recovery preparation request");
++            let psbt:bitcoin::psbt::Psbt=request.psbt.parse()?;
++            ensure!(psbt.to_string()==request.psbt,"noncanonical recovery PSBT");
++            let frame=execution.recovery_signing_frame(&psbt,now)?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-recovery-review-response-v1",
++                "requestId":request.request_id,"frameHex":frame.iter().map(|b|format!("{b:02x}")).collect::<String>(),
++                "snapshot":execution.saved_status()?}));
++        }
++        let request:PeerRequest=serde_json::from_slice(input)?;
++        let outgoing=mode=="--recovery-submit-stdio-v1";
++        ensure!(request.schema==if outgoing {"monzero-ltc-recovery-submit-request-v1"}
++            else {"monzero-ltc-recovery-accept-request-v1"} && !request.request_id.is_nil(),"invalid recovery request");
++        let frame=decode_peer_hex(&request.frame_hex,16_384)?;
++        let signature=decode_peer_hex(&request.signature_hex,64)?;
++        ensure!(signature.len()==64,"invalid recovery signature size");
++        if outgoing {
++            let retained=execution.submit_recovery_signature(&frame,&signature,now)?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-recovery-submit-response-v1",
++                "requestId":request.request_id,"frameHex":request.frame_hex,
++                "signatureHex":retained.signature().iter().map(|b|format!("{b:02x}")).collect::<String>(),
++                "snapshot":execution.saved_status()?}));
++        }
++        execution.accept_recovery(&frame,&signature)?;
++        Ok(serde_json::json!({"schema":"monzero-ltc-recovery-accept-response-v1",
++            "requestId":request.request_id,"snapshot":execution.saved_status()?}))
++    }
++
+     fn negotiate(config:&Config,input:&[u8],now:u64,mode:&str)->Result<serde_json::Value> {
+         ensure!(config.schema=="monzero-private-ltc-journal-v5"
+             && config.policy.ltc_network==swap_core::litecoin_address::LtcNetwork::Regtest,
+@@ -134,6 +169,9 @@ mod linux {
+             "native-funder"=>LocalRole::NativeFunder,_=>anyhow::bail!("invalid peer admission role")};
+         let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
+             config.trade_id,&config.policy,role,config.pins)?;
++        if ["--recovery-review-stdio-v1","--recovery-submit-stdio-v1","--recovery-accept-stdio-v1"].contains(&mode) {
++            return recovery_message(&mut execution,input,now,mode);
++        }
+         if mode=="--negotiation-status-stdio-v1" {
+             let request:Request=serde_json::from_slice(input)?;
+             ensure!(valid_request(&request,mode),"invalid negotiation status request");
+@@ -520,7 +558,7 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
+-        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
++        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
+             && args[2]=="--config-file","invalid journal helper arguments");
+         let review_mode=args[1]=="--refund-review-stdio-v1";
+         let payout_review_mode=args[1]=="--payout-review-stdio-v1";
+@@ -533,7 +571,7 @@ mod linux {
+         let payout_submit_mode=args[1]=="--payout-submit-stdio-v1";
+         let payout_check_mode=args[1]=="--payout-check-stdio-v1";
+         let (_lease,config)=load(Path::new(&args[3]))?;
+-        if args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" {
++        if args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" {
+             let mut input=zeroize::Zeroizing::new(Vec::new());
+             std::io::stdin().take(401025).read_to_end(&mut input)?;
+             ensure!(input.len()<=401024,"oversized peer admission request");
+diff --git a/swap-machine/src/litecoin_negotiation/execution/recovery.rs b/swap-machine/src/litecoin_negotiation/execution/recovery.rs
+index 75a21128d..a4fa24dcf 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/recovery.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/recovery.rs
+@@ -55,6 +55,15 @@ impl Execution {
+     pub fn prepare_recovery(&mut self,psbt:&Psbt,identity:&ed25519_dalek::SigningKey,now:u64)->Result<SignedRecovery> {
+         ensure!(identity.verifying_key().to_bytes()==self.claim.pins[usize::from(self.claim.role)],
+             "wrong local recovery identity");
++        use ed25519_dalek::Signer;
++        let frame=self.recovery_signing_frame(psbt,now)?;
++        let signature=identity.sign(&crate::litecoin_negotiation::recovery::signing_bytes(&frame)?).to_bytes();
++        self.submit_recovery_signature(&frame,&signature,now)
++    }
++
++    /// Retain the lock agreement and exact local contract signatures for an
++    /// external identity signer. This never signs or relays the funding lock.
++    pub fn recovery_signing_frame(&mut self,psbt:&Psbt,now:u64)->Result<Vec<u8>> {
+         let (mut head,previous,_,_,_)=self.load()?;
+         let intent_name=name(self.claim.trade,"intent");
+         match self.metadata.read(&intent_name) {
+@@ -84,7 +93,7 @@ impl Execution {
+         }
+         let outgoing_name=name(self.claim.trade,"outgoing");
+         match self.metadata.read(&outgoing_name) {
+-            Ok(_)=>return self.recover_recovery_outgoing(),
++            Ok(_)=>return Ok(self.recover_recovery_outgoing()?.bytes().to_vec()),
+             Err(e) if missing(&e)=>(),
+             Err(e)=>return Err(e),
+         }
+@@ -94,10 +103,40 @@ impl Execution {
+         let intent:Intent=serde_json::from_slice(&retained)?;
+         ensure!(now>=intent.admitted_at,"recovery signing predates admission");
+         let (plan,local)=self.recovery_plan()?;
+-        let signed=plan.sign(&local,identity)?;
+-        let message=Message { bytes:signed.bytes().to_vec(),signature:signed.signature().to_vec() };
+-        self.metadata.retain(&outgoing_name,&serde_json::to_vec(&message)?)?;
+-        Ok(signed)
++        let pending=name(self.claim.trade,"unsigned");
++        let bytes=match self.metadata.read(&pending) {
++            Ok(bytes)=>{plan.verify_local_frame(&bytes)?;bytes},
++            Err(e) if missing(&e)=>plan.local_signing_frame(&local)?,
++            Err(e)=>return Err(e),
++        };
++        self.metadata.retain(&pending,&bytes)?;
++        Ok(bytes)
++    }
++
++    /// Admit only the exact reviewed frame with the pinned local identity.
++    /// Retained signed messages remain idempotent after quote expiry.
++    pub fn submit_recovery_signature(&mut self,bytes:&[u8],signature:&[u8],now:u64)->Result<SignedRecovery> {
++        let outgoing=name(self.claim.trade,"outgoing");
++        match self.metadata.read(&outgoing) {
++            Ok(_)=>{
++                let saved=self.recover_recovery_outgoing()?;
++                ensure!(saved.bytes()==bytes && saved.signature().as_slice()==signature,"conflicting retained recovery message");
++                return Ok(saved);
++            },
++            Err(e) if missing(&e)=>(),
++            Err(e)=>return Err(e),
++        }
++        let (_,_,quote,_,_)=self.load()?;
++        quote.check_policy(&self.policy,now)?;
++        let intent:Intent=serde_json::from_slice(&self.metadata.read(&name(self.claim.trade,"intent"))?)?;
++        ensure!(now>=intent.admitted_at,"recovery signing predates admission");
++        let pending=self.metadata.read(&name(self.claim.trade,"unsigned"))?;
++        ensure!(pending==bytes,"recovery signature differs from reviewed frame");
++        let (plan,_)=self.recovery_plan()?;
++        plan.verify_local_message(bytes,signature)?;
++        let message=Message {bytes:bytes.to_vec(),signature:signature.to_vec()};
++        self.metadata.retain(&outgoing,&serde_json::to_vec(&message)?)?;
++        self.recover_recovery_outgoing()
+     }
+ 
+     /// Recover identical signed bytes without needing the identity signing key.
+diff --git a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+index fdd82cb89..c02da6d86 100644
+--- a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
++++ b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+@@ -101,19 +101,27 @@ async fn actual_paired_chain_execution()->Result<()> {
+             result["frameHex"]=serde_json::json!(hex(frame.bytes()));
+             result["signatureHex"]=serde_json::json!(hex(frame.signature()));
+         },
+-        "ltc_lock"=>{
++        "ltc_lock"|"ltc_reserve"|"ltc_lock_recovered"=>{
+             let rpc=litecoin(&root,&request)?;let keys=bob.completed_keys()?;
+             let amount=bitcoin::Amount::from_sat(request.terms["ltcAtoms"].parse()?);
+             let ceiling=bitcoin::Amount::from_sat(request.terms["ltcFundingFeeMaxAtoms"].parse()?);
+-            let preview=rpc.preview_lock(keys.contract_address(),amount,1000,ceiling).await?;
+-            let saved=rpc.reserve_lock(&reservations,trade,keys.contract_address(),amount,ceiling,&preview).await?;
+-            let b=bob.prepare_recovery(saved.psbt(),&bob_identity,now)?;
+-            let a=alice.prepare_recovery(saved.psbt(),&alice_identity,now)?;
+-            bob.accept_recovery(a.bytes(),a.signature())?;alice.accept_recovery(b.bytes(),b.signature())?;
++            let saved=if request.action=="ltc_lock_recovered" {rpc.resume_lock(&reservations,trade).await?} else {
++                let preview=rpc.preview_lock(keys.contract_address(),amount,1000,ceiling).await?;
++                rpc.reserve_lock(&reservations,trade,keys.contract_address(),amount,ceiling,&preview).await?
++            };
++            if request.action=="ltc_reserve" {
++                result["psbt"]=serde_json::json!(saved.psbt().to_string());
++            } else {
++                if request.action=="ltc_lock" {
++                    let b=bob.prepare_recovery(saved.psbt(),&bob_identity,now)?;
++                    let a=alice.prepare_recovery(saved.psbt(),&alice_identity,now)?;
++                    bob.accept_recovery(a.bytes(),a.signature())?;alice.accept_recovery(b.bytes(),b.signature())?;
++                } else {bob.recover_recovery()?;alice.recover_recovery()?;}
+             let signed=bob.sign_recovered_lock(&rpc,&reservations,now).await?;
+             let txid=signed.transaction().compute_txid();
+             result["relay"]=serde_json::to_value(rpc.relay_reserved_lock(&reservations,trade,txid).await?)?;
+             result["txid"]=serde_json::json!(txid);
++            }
+         },
+         "native_lock"|"native_prepare"=>{
+             let rpc=litecoin(&root,&request)?;
+diff --git a/swap-machine/src/litecoin_negotiation/recovery.rs b/swap-machine/src/litecoin_negotiation/recovery.rs
+index 3913bcd68..7e2da3959 100644
+--- a/swap-machine/src/litecoin_negotiation/recovery.rs
++++ b/swap-machine/src/litecoin_negotiation/recovery.rs
+@@ -137,18 +137,28 @@ impl RecoveryPlan {
+     pub fn sign(&self, local: &LocalKeys, identity: &SigningKey) -> Result<SignedRecovery> {
+         self.check_local(local,self.role)?;
+         ensure!(identity.verifying_key()==self.pins[usize::from(self.role)], "wrong recovery identity");
++        let bytes=self.local_signing_frame(local)?;
++        let signature=identity.sign(&signing_bytes(&bytes)?).to_bytes();
++        Ok(SignedRecovery { bytes,signature })
++    }
++
++    pub(crate) fn local_signing_frame(&self,local:&LocalKeys)->Result<Vec<u8>> {
++        self.check_local(local,self.role)?;
+         let frame=Frame { binding:self.binding.clone(),role:self.role,
+             cancel:local.contract_secret().sign(self.cancel.digest()),
+             refund:if self.role==1 { Some(local.contract_secret().encsign(self.adaptors[0],self.refund.digest())) } else { None },
+             punish:if self.role==0 { Some(local.contract_secret().sign(self.punish.digest())) } else { None } };
+-        let bytes=canonical(&frame)?;
+-        let signature=identity.sign(&signing_bytes(&bytes)?).to_bytes();
+-        Ok(SignedRecovery { bytes,signature })
++        canonical(&frame)
+     }
+ 
+     fn verify_peer(&self, bytes: &[u8], signature: &[u8], role: u8) -> Result<Frame> {
+         self.pins[usize::from(role)].verify_strict(&signing_bytes(bytes)?,
+             &ed25519_dalek::Signature::from_slice(signature)?)?;
++        self.verify_frame(bytes,role)
++    }
++
++    fn verify_frame(&self,bytes:&[u8],role:u8)->Result<Frame> {
++        ensure!(bytes.len()<=MAX_FRAME,"oversized recovery frame");
+         let frame: Frame=serde_json::from_slice(bytes)?;
+         ensure!(canonical(&frame)?==bytes && frame.binding==self.binding && frame.role==role,
+             "wrong recovery transcript or noncanonical frame");
+@@ -159,7 +169,12 @@ impl RecoveryPlan {
+     }
+ 
+     pub(super) fn verify_local_message(&self,bytes:&[u8],signature:&[u8])->Result<()> {
+-        let frame=self.verify_peer(bytes,signature,self.role)?;
++        self.verify_peer(bytes,signature,self.role)?;
++        self.verify_local_frame(bytes)
++    }
++
++    pub(crate) fn verify_local_frame(&self,bytes:&[u8])->Result<()> {
++        let frame=self.verify_frame(bytes,self.role)?;
+         if let Some(encrypted)=frame.refund {
+             contract::verify_encsig(self.keys[1],self.adaptors[0],&self.refund.digest(),&encrypted)?;
+         }
+@@ -193,7 +208,7 @@ impl RecoveryPlan {
+     }
+ }
+ 
+-fn signing_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
++pub(crate) fn signing_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+     ensure!(!bytes.is_empty() && bytes.len()<=MAX_FRAME,"invalid recovery frame size");
+     let mut result=DOMAIN.as_bytes().to_vec();
+     result.push(0);
+diff --git a/swap-machine/src/litecoin_negotiation/tests.rs b/swap-machine/src/litecoin_negotiation/tests.rs
+index 931b99f37..5d3100f55 100644
+--- a/swap-machine/src/litecoin_negotiation/tests.rs
++++ b/swap-machine/src/litecoin_negotiation/tests.rs
+@@ -369,7 +369,22 @@ fn owned_execution_lifecycle(payout_v2:bool,payout_relay:bool) -> Result<()> {
+     let mut psbt=bitcoin::psbt::Psbt::from_unsigned_tx(tx)?;
+     psbt.inputs[0].witness_utxo=Some(bitcoin::TxOut { value:bitcoin::Amount::from_sat(100_001_000),
+         script_pubkey:bitcoin::ScriptBuf::from_bytes([vec![0,20],vec![9;20]].concat()) });
+-    let bm_message=bob.prepare_recovery(&psbt,&ltc,base+2)?;
++    let unsigned=bob.recovery_signing_frame(&psbt,base+2)?;
++    assert_eq!(unsigned,bob.recovery_signing_frame(&psbt,base+3)?);
++    let signed=ltc.sign(&recovery::signing_bytes(&unsigned)?).to_bytes();
++    assert!(bob.submit_recovery_signature(&unsigned,&[0;64],base+2).is_err());
++    let wrong_domain=ltc.sign(&signing_bytes(&unsigned)?).to_bytes();
++    assert!(bob.submit_recovery_signature(&unsigned,&wrong_domain,base+2).is_err());
++    assert!(bob.submit_recovery_signature(&unsigned,&signed,base+3501).is_err());
++    assert!(!bm.join(format!("{trade}.ltc-recovery-outgoing")).exists());
++    drop(bob);
++    let mut bob=Execution::resume(&bm,&bs,trade,&policy,LocalRole::LitecoinFunder,pins)?;
++    assert_eq!(unsigned,bob.recovery_signing_frame(&psbt,base+3)?);
++    let mut changed=unsigned.clone();changed.push(b' ');
++    assert!(bob.submit_recovery_signature(&changed,&signed,base+3).is_err());
++    let bm_message=bob.submit_recovery_signature(&unsigned,&signed,base+3)?;
++    assert_eq!(bob.submit_recovery_signature(&unsigned,&signed,base+3501)?.bytes(),unsigned);
++
+     let am_message=alice.prepare_recovery(&psbt,&native,base+2)?;
+     let retry=bob.prepare_recovery(&psbt,&ltc,base+3500)?;
+     assert_eq!(retry.bytes(),bm_message.bytes());

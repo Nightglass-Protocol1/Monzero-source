@@ -1,0 +1,76 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet/helper/mutation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet/helper/mutation.rs
+@@ -29,8 +29,10 @@
+     }).await?
+ }
+ fn saved(metadata:&PrivateStore,snapshots:&PrivateStore,setup:&Setup,refund:Txid)->Result<Value> {
+-    let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
+-    execution.bch_native_refund_wallet_status(refund,std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())
++    let before=contents(&metadata.0)?;
++    let value={let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        execution.bch_native_refund_wallet_status(refund,std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())?};
++    assert_eq!(contents(&metadata.0)?,before);Ok(value)
+ }
+ fn submitted(value:&Value,setup:&Setup,action:&str,commitment:&str,wallet:&Value) {
+     assert_eq!(*value,json!({"schema":"monzero-bch-native-refund-wallet-submit-response-v1",
+@@ -40,6 +42,8 @@
+ pub(super) async fn exercise(original_config:&Path,original_status:&Path,source:&PrivateStore,secrets:&PrivateStore,
+     setup:&Setup,rpc:&OwnedBchObserver,refund:Txid,fixture:&Fixture,server:&Server,helper:&Path,digest:&str)->Result<()> {
+     let original=contents(&source.0)?;let original_secrets=contents(&secrets.0)?;let original_files=contents(original_config)?;
++    assert_eq!(hex(&Sha256::digest(std::fs::read(helper)?)),digest);
++    let observer_start=fixture.calls.lock().unwrap().len();
+     let observer=fixture.funding_client()?;
+     for lost in [0,1,2] {
+         let metadata=PrivateStore::new()?;let snapshots=PrivateStore::new()?;let config=PrivateStore::new()?;
+@@ -49,6 +53,7 @@
+             let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
+             let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+             let recovered=execution.recover_light_bch_native_refund(&observer,rpc,refund,None,now).await?;
++            assert_eq!(recovered.spend_key(),&(setup.spend[0]+setup.spend[1]).as_bytes());
+             let id=SwapWalletId::new(setup.quote.terms()["swapId"].parse()?)?;
+             (WalletFixture::new(&id,recovered.address(),recovered.spend_key(),recovered.view_key(),recovered.native_txid()).await?,
+                 recovered.address().clone())
+@@ -77,6 +82,7 @@
+         let review=call(helper,&review_file,"review","restore",None,true).await?;
+         assert!(wallet.state.lock().unwrap().calls.is_empty());
+         let approved=review["review"]["commitment"].as_str().context("missing restore approval")?;
++        ensure!(approved.len()==64 && approved.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"non-canonical fixture commitment");
+         let wrong=if approved.starts_with('a') {format!("b{}",&approved[1..])} else {format!("a{}",&approved[1..])};
+         call(helper,&review_file,"submit","restore",Some(&wrong),false).await?;
+         assert!(wallet.state.lock().unwrap().calls.is_empty());assert!(!intent.exists());assert!(!ready.exists());
+@@ -99,15 +105,34 @@
+             let review=call(helper,&review_file,"review",action,None,true).await?;
+             assert_eq!(wallet.state.lock().unwrap().calls,calls);
+             let approved=review["review"]["commitment"].as_str().context("missing reconciliation approval")?;
++            if action=="check" && lost>0 {
++                let before=contents(&metadata.0)?;
++                wallet.state.lock().unwrap().wrong_key=true;
++                let rejected=call(helper,&review_file,"submit",action,Some(approved),false).await;
++                wallet.state.lock().unwrap().wrong_key=false;rejected?;
++                assert!(!ready.exists());assert_eq!(contents(&metadata.0)?,before);
++            }
++            let calls=wallet.state.lock().unwrap().calls.clone();
+             let response=call(helper,&review_file,"submit",action,Some(approved),true).await?;
+-            let record=saved(&metadata,&snapshots,setup,refund)?;assert_eq!(record["state"],"ready");
++            let record=saved(&metadata,&snapshots,setup,refund)?;assert_eq!(record["state"],"ready");assert!(ready.exists());
+             submitted(&response,setup,action,approved,&record);
++            let state=wallet.state.lock().unwrap();let delta=&state.calls[calls.len()..];
++            assert!(state.opened);
++            for method in ["query_key","scan_tx"] {assert_eq!(delta.iter().filter(|v|v.as_str()==method).count(),1);}
++            assert_eq!(delta.iter().filter(|v|v.as_str()=="open_wallet").count(),usize::from(action=="open"));
++            assert!(!delta.iter().any(|v|v=="generate_from_keys" || v=="close_wallet"));
+         }
+         let calls=wallet.state.lock().unwrap().calls.clone();
+         assert_eq!(calls.iter().filter(|call|call.as_str()=="generate_from_keys").count(),1);
+         assert!(calls.iter().all(|call|matches!(call.as_str(),"get_address"|"generate_from_keys"|"query_key"|"scan_tx"|"open_wallet"|"close_wallet")));
+         assert_eq!(contents(&snapshots.0)?,original_secrets);assert_eq!(contents(&config.0)?,config_before);
+         assert_eq!(hex(&Sha256::digest(std::fs::read(helper)?)),digest);
++        let mut expected=original.clone();
++        expected.insert(intent.file_name().context("intent filename")?.to_os_string(),std::fs::read(&intent)?);
++        expected.insert(ready.file_name().context("ready filename")?.to_os_string(),std::fs::read(&ready)?);
++        assert_eq!(contents(&metadata.0)?,expected);assert_eq!(contents(original_config)?,original_files);
++        assert!(fixture.calls.lock().unwrap()[observer_start..].iter().all(|method|matches!(method.as_str(),
++            "get_info"|"get_block_header_by_height"|"get_last_block_header"|"get_address"|"check_tx_key"|"get_transfer_by_txid")));
+     }
+     assert_eq!(contents(&source.0)?,original);assert_eq!(contents(&secrets.0)?,original_secrets);
+     assert_eq!(contents(original_config)?,original_files);Ok(())

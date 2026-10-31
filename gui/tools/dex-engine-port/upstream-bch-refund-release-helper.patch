@@ -1,0 +1,322 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs
+@@ -48,6 +48,14 @@
+         let (review,recovery,_)=self.refund_relay_materials(attempt.safety_blocks)?;
+         self.refund_state(&review,&recovery,attempt.safety_blocks)
+     }
++    /// Saved status validates the original attempt against the configured margin.
++    /// A changed margin must not silently display a different approved operation.
++    pub fn saved_bch_refund_relay_review(&self,expected: &[u8;32],safety_blocks: u32) -> Result<RefundRelayReview> {
++        let (review,recovery,deployment)=self.refund_relay_materials(safety_blocks)?;
++        ensure!(expected==&deployment,"BCH refund saved observer changed");
++        self.refund_state(&review,&recovery,safety_blocks)?;
++        Ok(review)
++    }
+     /// Confirmed cancellation removes the original success branch. Refund can
+     /// therefore return BCH even when no native payment was made. The exact
+     /// recovery output must still be unspent and safely before punishment.
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund.rs
+@@ -36,8 +36,13 @@
+     /// Historical review survives quote expiry. Publication must separately
+     /// revalidate the exact review and current recovery-output safety window.
+     pub fn review_bch_refund_relay(&self,bch: &BchRpc,now: u64,safety_blocks: u32) -> Result<RefundRelayReview> {
++        self.review_bch_refund_relay_for_deployment(&bch.deployment_commitment()?,now,safety_blocks)
++    }
++    /// Public app review requires the pinned deployment, not wallet credentials.
++    /// It does not release private refund bytes or establish the live safety window.
++    pub fn review_bch_refund_relay_for_deployment(&self,expected: &[u8;32],now: u64,safety_blocks: u32) -> Result<RefundRelayReview> {
+         let (review,recovery,deployment)=self.refund_relay_materials(safety_blocks)?;
+-        ensure!(now>=recovery.prepared_at() && bch.deployment_commitment()?==deployment,
++        ensure!(now>=recovery.prepared_at() && expected==&deployment,
+             "BCH refund review predates preparation or changes observer");
+         Ok(review)
+     }
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/refund_release.rs
+@@ -0,0 +1,109 @@
++//! Real helper refund relay against the owned loopback RPC fixture.
++use super::*;
++use swap_core::bch::funding::SignedFunding;
++fn invoke(helper: &std::path::Path,path: &std::path::Path,action: &str,
++    commitment: Option<&str>,success: bool) -> Result<Value> {
++    let id=uuid::Uuid::new_v4();
++    let mut request=json!({"schema":format!("monzero-bch-refund-{action}-request-v1"),"requestId":id});
++    if let Some(commitment)=commitment {request["commitment"]=json!(commitment);}
++    let mut child=Command::new(helper).arg(format!("--refund-{action}-stdio-v1")).arg(path)
++        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++    child.stdin.take().context("missing helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++    let output=child.wait_with_output()?;
++    assert_eq!(output.status.success(),success,"unexpected refund {action}: {}",String::from_utf8_lossy(&output.stderr));
++    if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++    assert!(output.stderr.is_empty());assert!(output.stdout.len()<=16384);
++    let response:Value=serde_json::from_slice(&output.stdout)?;
++    assert_eq!(response.as_object().unwrap().len(),8);
++    assert_eq!(response["schema"],format!("monzero-bch-refund-{action}-response-v1"));
++    assert_eq!(response["requestId"],id.to_string());assert_eq!(response["executable"],false);
++    assert_eq!(response["chainObserved"],action=="observe");
++    Ok(response)
++}
++pub(super) fn exercise(setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
++    server: &Server,rpc: &BchRpc,signed: &SignedFunding,helper: &std::path::Path,
++    admission: &std::path::Path,script: &bitcoin::Script) -> Result<()> {
++    let program=match (std::env::var_os("MONZERO_BCH_QT_REFUND_PROBE"),std::env::var_os("MONZERO_BCH_QT_REFUND_PROBE_SHA256")) {
++        (None,None)=>helper.to_path_buf(),
++        (Some(path),Some(expected))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && expected.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),"invalid Qt refund probe pin");
++            path
++        }
++        _=>anyhow::bail!("incomplete Qt refund probe configuration"),
++    };
++    let via_qt=program!=helper;
++    let secrets=contents(&snapshots.0)?;
++    let original:Value=serde_json::from_slice(&std::fs::read(admission)?)?;
++    for mode in [0,1] {
++        let copied=PrivateStore::new()?;let config=PrivateStore::new()?;
++        for entry in std::fs::read_dir(&metadata.0)? {
++            let entry=entry?;std::fs::copy(entry.path(),copied.0.join(entry.file_name()))?;
++        }
++        let mut value=original.clone();value["metadataDirectory"]=json!(copied.0);
++        let admission=config.0.join("admission.json");save(&admission,&serde_json::to_vec(&value)?)?;
++        let wrapper=config.0.join("refund.json");
++        save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-refund-v1",
++            "admissionConfigFile":admission,"deploymentCommitment":hex(&rpc.deployment_commitment()?),"safetyBlocks":5}))?)?;
++        let cookie=config.0.join("cookie");save(&cookie,b"user:pass\n")?;
++        let rpc_path=config.0.join("rpc.json");
++        save(&rpc_path,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-funding-rpc-v1",
++            "port":server.port,"wallet":"test","anchor":"bchreg:qanchor","anchorScript":script.to_hex_string(),
++            "cookieFile":cookie,"checkpointHeight":1,"checkpoint":"07".repeat(32),"subversion":"/Bitcoin Cash Node:29.0.0/"}))?)?;
++        let submission=config.0.join("submission.json");
++        save(&submission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-refund-submission-v1",
++            "refundConfigFile":wrapper,"rpcFile":rpc_path}))?)?;
++        let execution=AdmittedExecution::resume(&copied.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let recovery=execution.retained_bch_recovery()?.context("missing recovery")?;
++        let cancel=recovery.cancel().clone();
++        let refund: Transaction=bitcoin::consensus::deserialize(recovery.refund_bytes())?;drop(execution);
++        let txid=refund.compute_txid().to_string();let trade=&setup.quote.terms()["swapId"];
++        let intent=copied.0.join(format!("{trade}.bch-refund-relay-intent"));
++        {
++            let mut state=server.state.lock().unwrap();state.cancel=Some(cancel);state.refund=Some(refund);state.relay_mode=mode;
++            state.observed=Some(signed.transaction().clone());state.observed_vout=signed.lock_outpoint().vout;
++            state.observation_mode=23;state.observation_chain_calls=0;state.relay_intent=Some(intent.clone());state.locked=true;
++        }
++        let calls=server.state.lock().unwrap().refund_relay_calls;
++        let before=contents(&copied.0)?;
++        let reviewed=invoke(&program,&wrapper,"review",None,true)?;
++        let approval=reviewed["review"]["commitment"].as_str().context("missing commitment")?;
++        assert_eq!(reviewed["review"]["details"]["txid"],txid);
++        assert_eq!(invoke(&program,&wrapper,"status",None,true)?["relay"]["state"],"not-attempted");
++        invoke(&program,&submission,"submit",Some(&"00".repeat(32)),false)?;
++        assert_eq!(contents(&copied.0)?,before);
++        server.state.lock().unwrap().recovery_output_spent=true;
++        invoke(&program,&submission,"submit",Some(approval),false)?;
++        assert!(!intent.exists());assert_eq!(server.state.lock().unwrap().refund_relay_calls,calls);
++        server.state.lock().unwrap().recovery_output_spent=false;
++        server.state.lock().unwrap().redemption_confirmation_mode=1;
++        invoke(&program,&submission,"submit",Some(approval),false)?;
++        assert!(!intent.exists());assert_eq!(server.state.lock().unwrap().refund_relay_calls,calls);
++        server.state.lock().unwrap().redemption_confirmation_mode=0;
++        invoke(&program,&submission,"submit",Some(approval),mode==0)?;
++        assert!(intent.exists());assert_eq!(server.state.lock().unwrap().refund_relay_calls,calls+1);
++        let state=if mode==0 {"acknowledged"} else {"attempted"};
++        assert_eq!(invoke(&program,&wrapper,"status",None,true)?["relay"],json!({"state":state,"txid":txid,"confirmed":false}));
++        // An acknowledged helper retry returns the saved result without another relay.
++        invoke(&program,&submission,"submit",Some(approval),mode==0 && !via_qt)?;
++        assert_eq!(server.state.lock().unwrap().refund_relay_calls,calls+1);
++        let original_wrapper=std::fs::read(&wrapper)?;
++        let mut changed:Value=serde_json::from_slice(&original_wrapper)?;changed["safetyBlocks"]=json!(6);
++        std::fs::write(&wrapper,serde_json::to_vec(&changed)?)?;
++        invoke(&program,&wrapper,"status",None,false)?;
++        invoke(&program,&submission,"observe",None,false)?;
++        invoke(&program,&submission,"submit",Some(approval),false)?;
++        std::fs::write(&wrapper,&original_wrapper)?;
++        let observed=invoke(&program,&submission,"observe",None,true)?;
++        assert_eq!(observed["observation"]["txid"],txid);assert_eq!(observed["observation"]["confirmations"],"3");
++        assert_eq!(observed["relay"]["state"],state);
++        server.state.lock().unwrap().redemption_confirmation_mode=1;
++        invoke(&program,&submission,"observe",None,false)?;
++        server.state.lock().unwrap().redemption_confirmation_mode=0;
++        assert_eq!(invoke(&program,&wrapper,"status",None,true)?["relay"]["state"],state);
++        assert_eq!(server.state.lock().unwrap().refund_relay_calls,calls+1);
++        assert_eq!(contents(&snapshots.0)?,secrets);
++    }
++    Ok(())
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -16,39 +16,45 @@
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+ async fn bch_funding_helper_reviews_retained_transaction_without_rpc_or_writes() -> Result<()> {
+-    roundtrip(None,false,false,false).await
+-}
+-#[tokio::test]
+-#[ignore = "requires a separately built and digest-pinned BCH helper"]
+-async fn bch_funding_helper_submit_acknowledged_once() -> Result<()> {roundtrip(Some(submit::Case::Acknowledged),false,false,false).await}
+-#[tokio::test]
+-#[ignore = "requires a separately built and digest-pinned BCH helper"]
+-async fn bch_funding_helper_submit_lost_reply_is_not_retried() -> Result<()> {roundtrip(Some(submit::Case::Lost),false,false,false).await}
+-#[tokio::test]
+-#[ignore = "requires a separately built and digest-pinned BCH helper"]
+-async fn bch_funding_helper_status_survives_expiry_without_relay() -> Result<()> {roundtrip(Some(submit::Case::Expired),false,false,false).await}
++    roundtrip(None,false,false,false,false).await
++}
++#[tokio::test]
++#[ignore = "requires a separately built and digest-pinned BCH helper"]
++async fn bch_funding_helper_submit_acknowledged_once() -> Result<()> {roundtrip(Some(submit::Case::Acknowledged),false,false,false,false).await}
++#[tokio::test]
++#[ignore = "requires a separately built and digest-pinned BCH helper"]
++async fn bch_funding_helper_submit_lost_reply_is_not_retried() -> Result<()> {roundtrip(Some(submit::Case::Lost),false,false,false,false).await}
++#[tokio::test]
++#[ignore = "requires a separately built and digest-pinned BCH helper"]
++async fn bch_funding_helper_status_survives_expiry_without_relay() -> Result<()> {roundtrip(Some(submit::Case::Expired),false,false,false,false).await}
+ 
+ mod preparation;
+ mod refund_protection;
+ mod cancellation;
++mod refund_release;
++#[tokio::test]
++#[ignore = "requires a separately built and digest-pinned BCH helper"]
++async fn bch_refund_helper_relay_and_observation_preserve_uncertain_results() -> Result<()> {
++    roundtrip(None,false,false,false,true).await
++}
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+ async fn bch_cancellation_helper_relay_and_observation_preserve_uncertain_results() -> Result<()> {
+-    roundtrip(None,false,false,true).await
++    roundtrip(None,false,false,true,false).await
+ }
+ 
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+ async fn bch_wallet_preparation_retains_candidate_before_funding_and_resumes_without_rpc() -> Result<()> {
+-    roundtrip(None,true,false,false).await
++    roundtrip(None,true,false,false,false).await
+ }
+ mod initial_preparation;
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+ async fn bch_wallet_preparation_helper_selects_once_and_restores_offline_status() -> Result<()> {
+-    roundtrip(None,true,true,false).await
+-}
+-async fn roundtrip(submit_case: Option<submit::Case>,wallet_preparation: bool,initial_helper: bool,cancellation_helper: bool) -> Result<()> {
++    roundtrip(None,true,true,false,false).await
++}
++async fn roundtrip(submit_case: Option<submit::Case>,wallet_preparation: bool,initial_helper: bool,cancellation_helper: bool,refund_helper: bool) -> Result<()> {
+     let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
+     let helper_digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper
+@@ -231,6 +237,9 @@
+     let config=json!({"schema":"monzero-private-bch-funding-v1",
+         "admissionConfigFile":config_path,"deploymentCommitment":hex(&deployment)});
+     save(&funding_path,&serde_json::to_vec(&config)?)?;
++    if refund_helper {
++        return refund_release::exercise(&setup,&metadata,&snapshots,&server,&rpc,&signed,&helper,&config_path,&script);
++    }
+     if cancellation_helper {
+         return cancellation::exercise(&setup,&metadata,&snapshots,&server,&rpc,&signed,&helper,&config_path,&script);
+     }
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -617,6 +617,80 @@
+             "relay":{"state":state,"txid":txid,"confirmed":false},"observation":observation}))
+     }
+ 
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct RefundConfig {schema: String,admission_config_file: PathBuf,deployment_commitment: String,safety_blocks: u32}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct RefundSubmission {schema: String,refund_config_file: PathBuf,rpc_file: PathBuf}
++    async fn refund_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
++        use swap_machine::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::recovery::refund::relay::RefundRelayState;
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid BCH refund request size");
++        let request: Request=serde_json::from_slice(bytes)?;
++        ensure!(!request.request_id.is_nil() && matches!(action,"review"|"status"|"submit"|"observe")
++            && request.schema==format!("monzero-bch-refund-{action}-request-v1"),"invalid BCH refund request");
++        let approved=if action=="submit" {
++            Some(parse_digest(request.commitment.as_deref().context("missing refund approval")?)?)
++        } else {
++            ensure!(request.commitment.is_none(),"unexpected refund approval");None
++        };
++        let submission=if matches!(action,"submit"|"observe") {
++            let (lease,bytes)=private_bytes(path)?;
++            let config: RefundSubmission=serde_json::from_slice(&bytes)?;
++            ensure!(config.schema=="monzero-private-bch-refund-submission-v1"
++                && config.refund_config_file.is_absolute() && config.rpc_file.is_absolute(),"invalid refund submission configuration");
++            Some((lease,config))
++        } else {None};
++        let path=submission.as_ref().map_or(path,|(_,config)|config.refund_config_file.as_path());
++        let (_wrapper_lease,bytes)=private_bytes(path)?;
++        let wrapper: RefundConfig=serde_json::from_slice(&bytes)?;
++        ensure!(wrapper.schema=="monzero-private-bch-refund-v1"
++            && wrapper.admission_config_file.is_absolute(),"invalid refund configuration");
++        let deployment=parse_digest(&wrapper.deployment_commitment)?;
++        let (_config_lease,config)=load(&wrapper.admission_config_file)?;
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"refund trade changed");
++        let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        let review=if matches!(action,"status"|"observe") {execution.saved_bch_refund_relay_review(&deployment,wrapper.safety_blocks)?}
++            else {execution.review_bch_refund_relay_for_deployment(&deployment,now,wrapper.safety_blocks)?};
++        let mut observation=serde_json::Value::Null;
++        if let Some((_,submission))=&submission {
++            if let Some(approved)=approved {ensure!(approved==review.commitment,"refund approval changed");}
++            let (_rpc_lease,bytes)=private_bytes(&submission.rpc_file)?;
++            let rpc: FundingRpc=serde_json::from_slice(&bytes)?;
++            let (_cookie_lease,cookie)=private_file(&rpc.cookie_file,true)?;
++            let backend=rpc.backend(&cookie)?;
++            ensure!(backend.deployment_commitment()?==deployment,"refund RPC deployment changed");
++            if action=="observe" {
++                let observed=execution.observe_bch_refund(&backend,None).await?;
++                let confirmed=observed.confirmation();
++                let observed_at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                observation=serde_json::json!({"state":"confirmed","txid":confirmed.transaction().compute_txid().to_string(),
++                    "block":confirmed.block().to_string(),"height":confirmed.height().to_string(),
++                    "confirmations":confirmed.confirmations().to_string(),"tip":confirmed.tip().to_string(),
++                    "observedAt":observed_at.to_string()});
++            } else {
++                let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                execution.relay_bch_refund(&backend,None,&approved.context("missing refund approval")?,dispatch,wrapper.safety_blocks).await?;
++            }
++        }
++        let (state,txid)=match execution.bch_refund_relay_state()? {
++            None=>("not-attempted",review.details["txid"].as_str().context("missing refund txid")?.to_owned()),
++            Some(RefundRelayState::Attempted {txid})=>("attempted",txid.to_string()),
++            Some(RefundRelayState::Acknowledged {txid})=>("acknowledged",txid.to_string()),
++        };
++        let commitment: String=review.commitment.iter().map(|b|format!("{b:02x}")).collect();
++        Ok(serde_json::json!({"schema":format!("monzero-bch-refund-{action}-response-v1"),
++            "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":action=="observe",
++            "review":{"details":review.details,"commitment":commitment},
++            "relay":{"state":state,"txid":txid,"confirmed":false},"observation":observation}))
++    }
++
+     pub fn run() -> Result<()> {
+         let args: Vec<_> = std::env::args_os().collect();
+         ensure!(args.len() == 3,"expected mode and private configuration path");
+@@ -656,7 +730,17 @@
+             "--cancel-observe-stdio-v1"=>Some("observe"),
+             _=>None,
+         };
+-        let result = if let Some(operation)=cancel_action {
++        let refund_action=match action {
++            "--refund-review-stdio-v1"=>Some("review"),
++            "--refund-status-stdio-v1"=>Some("status"),
++            "--refund-submit-stdio-v1"=>Some("submit"),
++            "--refund-observe-stdio-v1"=>Some("observe"),
++            _=>None,
++        };
++        let result = if let Some(operation)=refund_action {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(refund_operation(Path::new(&args[2]),&bytes,operation))?
++        } else if let Some(operation)=cancel_action {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(cancellation_operation(Path::new(&args[2]),&bytes,operation))?
+         } else if let Some(operation)=recovery_action {

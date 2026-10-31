@@ -1,0 +1,106 @@
+--- a/swap-machine/src/bin/native-bch-admission/refund_wallet/review.rs
++++ b/swap-machine/src/bin/native-bch-admission/refund_wallet/review.rs
+@@ -18,12 +18,28 @@
+ }
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields,rename_all="camelCase")]
+-struct ReviewConfig {schema:String,status_config_file:PathBuf,bch_rpc_file:PathBuf,native_rpc_file:PathBuf}
++struct ReviewConfig {schema:String,status_config_file:PathBuf,bch_rpc_file:PathBuf,native_rpc_file:PathBuf,observer_rpc_file:PathBuf}
+ fn config(bytes:&[u8])->Result<ReviewConfig> {
+     let value:ReviewConfig=serde_json::from_slice(bytes)?;
+     ensure!(value.schema=="monzero-private-bch-native-refund-wallet-review-v1"
+-        && value.status_config_file.is_absolute() && value.bch_rpc_file.is_absolute() && value.native_rpc_file.is_absolute(),
++        && value.status_config_file.is_absolute() && value.bch_rpc_file.is_absolute() && value.native_rpc_file.is_absolute() && value.observer_rpc_file.is_absolute()
++        && value.observer_rpc_file!=value.native_rpc_file,
+         "invalid refund wallet review configuration");Ok(value)
++}
++fn separate_connections(target:&NativePreparationRpc,observer:&NativePreparationRpc)->Result<()> {
++    for native in [target,observer] {
++        ensure!(native.schema=="monzero-private-bch-native-rpc-v1" && native.daemon_port>0 && native.wallet_port>0
++            && native.daemon_port!=native.wallet_port && native.login_file.is_absolute(),"invalid refund wallet connection");
++    }
++    ensure!(target.daemon_port==observer.daemon_port && target.wallet_port!=observer.wallet_port,
++        "refund observer and recovery target must use distinct wallets on the same daemon");Ok(())
++}
++fn connection(native:&NativePreparationRpc)->Result<(File,NativeFundingRpc)> {
++    let (lease,login)=private_file(&native.login_file,true)?;
++    let text=std::str::from_utf8(&login)?;let text=text.strip_suffix('\n').unwrap_or(text);
++    let (user,password)=text.split_once(':').context("invalid refund wallet login")?;
++    ensure!(!user.is_empty() && !password.is_empty() && !text.bytes().any(|b|b.is_ascii_control()),"invalid refund wallet credentials");
++    Ok((lease,NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?))
+ }
+ fn public_review(value:serde_json::Value,action:&Action,trade:uuid::Uuid,deployment:&[u8;32],refund:&str)->Result<serde_json::Value> {
+     let fields=["schema","action","state","swapId","quote","admission","walletFile","address","nativePayment","refund",
+@@ -86,16 +102,15 @@
+     ensure!(bch.deployment_commitment()?==deployment,"wallet review observer changed");
+     let (_native_lease,bytes)=private_bytes(&review_config.native_rpc_file)?;
+     let native:NativePreparationRpc=serde_json::from_slice(&bytes)?;
+-    ensure!(native.schema=="monzero-private-bch-native-rpc-v1" && native.daemon_port>0 && native.wallet_port>0
+-        && native.daemon_port!=native.wallet_port && native.login_file.is_absolute(),"invalid wallet review native connection");
++    let (_observer_lease,bytes)=private_bytes(&review_config.observer_rpc_file)?;
++    let observation:NativePreparationRpc=serde_json::from_slice(&bytes)?;
++    separate_connections(&native,&observation)?;
+     isolated_native_preparation(native.daemon_port).await?;
+-    let (_login_lease,login)=private_file(&native.login_file,true)?;
+-    let text=std::str::from_utf8(&login)?;let text=text.strip_suffix('\n').unwrap_or(text);
+-    let (user,password)=text.split_once(':').context("invalid wallet review login")?;
+-    ensure!(!user.is_empty() && !password.is_empty() && !text.bytes().any(|b|b.is_ascii_control()),"invalid wallet review credentials");
+-    let observer=NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?;
+-    // Review uses only this descriptor. Submit may use wallet methods after approval.
+-    let mut session=NativeWalletSession::new(NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?,config.policy.xmz_network);
++    let (_observer_login_lease,observer)=connection(&observation)?;
++    let (_target_login_lease,target)=connection(&native)?;
++    // Payment observation reads its existing wallet. The target is descriptor-only
++    // during review; only approved submit operations may call its wallet methods.
++    let mut session=NativeWalletSession::new(target,config.policy.xmz_network);
+     let observed=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+     let recovered=execution.recover_light_bch_native_refund(&observer,&bch,refund,None,observed).await?;
+     let review=execution.review_recovered_bch_refund_wallet(&recovered,request.action.engine(),&session,observed)?;
+@@ -184,10 +199,28 @@
+         } Ok(())
+     }
+     #[test]
++    fn observer_and_recovery_wallet_connections_must_be_separate()->Result<()> {
++        let target=json!({"schema":"monzero-private-bch-native-rpc-v1","daemonPort":18081,"walletPort":18083,"loginFile":"/private/target-login"});
++        let mut observer=target.clone();observer["walletPort"]=json!(18084);
++        let native:NativePreparationRpc=serde_json::from_value(target.clone())?;
++        assert!(separate_connections(&native,&serde_json::from_value(observer.clone())?).is_ok());
++        assert!(separate_connections(&native,&native).is_err());
++        for (field,bad) in [("daemonPort",json!(18082)),("walletPort",json!(18081)),("walletPort",json!(0)),
++            ("schema",json!("wrong")),("loginFile",json!("relative"))] {
++            let mut changed=observer.clone();changed[field]=bad;
++            assert!(separate_connections(&native,&serde_json::from_value(changed)?).is_err());
++        }
++        Ok(())
++    }
++    #[test]
+     fn review_config_requires_private_explicit_connections()->Result<()> {
+-        let base=json!({"schema":"monzero-private-bch-native-refund-wallet-review-v1","statusConfigFile":"/private/status","bchRpcFile":"/private/bch","nativeRpcFile":"/private/native"});
++        let base=json!({"schema":"monzero-private-bch-native-refund-wallet-review-v1","statusConfigFile":"/private/status","bchRpcFile":"/private/bch","nativeRpcFile":"/private/native","observerRpcFile":"/private/observer"});
+         assert!(config(&serde_json::to_vec(&base)?).is_ok());
+-        for field in ["statusConfigFile","bchRpcFile","nativeRpcFile"] {let mut v=base.clone();v[field]=json!("relative");assert!(config(&serde_json::to_vec(&v)?).is_err());}
++        for field in ["statusConfigFile","bchRpcFile","nativeRpcFile","observerRpcFile"] {let mut v=base.clone();v[field]=json!("relative");assert!(config(&serde_json::to_vec(&v)?).is_err());}
++        let mut missing=base.clone();missing.as_object_mut().unwrap().remove("observerRpcFile");
++        assert!(config(&serde_json::to_vec(&missing)?).is_err());
++        let mut same=base.clone();same["observerRpcFile"]=same["nativeRpcFile"].clone();
++        assert!(config(&serde_json::to_vec(&same)?).is_err());
+         let mut v=base;v["password"]=json!("unexpected");assert!(config(&serde_json::to_vec(&v)?).is_err());Ok(())
+     }
+ }
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet/helper/review.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet/helper/review.rs
+@@ -44,9 +44,13 @@
+     let native=config.join("native.json");
+     save(&native,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-rpc-v1",
+         "daemonPort":endpoint["daemonPort"],"walletPort":endpoint["walletPort"],"loginFile":login}))?)?;
++    let (daemon,observer_wallet)=fixture.rpc_ports();
++    let observation=config.join("observer.json");
++    save(&observation,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-rpc-v1",
++        "daemonPort":daemon,"walletPort":observer_wallet,"loginFile":login}))?)?;
+     let wrapper=config.join("review.json");
+     save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-refund-wallet-review-v1",
+-        "statusConfigFile":status,"bchRpcFile":bch,"nativeRpcFile":native}))?)?;
++        "statusConfigFile":status,"bchRpcFile":bch,"nativeRpcFile":native,"observerRpcFile":observation}))?)?;
+     let before=contents(config)?;let records=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
+     let wallet_calls=wallet.state.lock().unwrap().calls.clone();
+     let actions=if saved["state"]=="not-attempted" {vec![("restore",RefundWalletAction::Restore)]}

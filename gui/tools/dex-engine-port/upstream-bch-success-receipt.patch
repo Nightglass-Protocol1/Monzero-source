@@ -1,0 +1,220 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs
+@@ -51,6 +51,16 @@
+ fn slot(quote: &VerifiedBchQuote,stage: &str) -> String {record_name(quote,&format!("native-proof-{stage}"))}
+ 
+ impl AdmittedExecution<'_> {
++    // Insert inside native/proof.rs's AdmittedExecution implementation.
++    // Keep this accessor private to the funding subtree.
++    pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
++    fn outgoing_native_payment_binding(&self) -> Result<(String,[u8;32],u64)> {
++        ensure!(self.role == Role::NativeFunder,"wrong outgoing native payment binding role");
++        let (record,pin) = self.retained_native_proof("outgoing")?.context("missing outgoing native payment proof")?;
++        let frame: Frame = serde_json::from_slice(&record.frame)?;
++        Ok((frame.proof.tx_hash.0,pin.record,pin.at))
++    }
++
+     // Insert into the existing AdmittedExecution implementation in native/proof.rs.
+     // retained_native_proof already validates the exact frame, pinned identity,
+     // agreement and receipt. Reparse those same validated bytes without restoring
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt.rs
+@@ -0,0 +1,87 @@
++//! Native-funder receipt of an authenticated success adaptor. Receipt alone is
++//! neither confirmation, permission to reveal the native share, nor relay.
++use super::*;
++use zeroize::{Zeroize,Zeroizing};
++
++const RECORD: &str = "monzero-bch-success-receipt-v1";
++const PIN: &str = "monzero-bch-success-receipt-pin-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Record {
++    schema: String, admission: [u8;32], payment: [u8;32], at: u64,
++    frame: Vec<u8>, signature: Vec<u8>,
++}
++impl Drop for Record {fn drop(&mut self) {self.frame.zeroize();}}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Pin {schema: String, admission: [u8;32], record: [u8;32]}
++struct ReceiptContext {
++    agreement: AgreedNativeWallet, outpoint: bitcoin::OutPoint,
++    native_txid: String, payment: [u8;32], sent_at: u64, admission: [u8;32],
++}
++fn name(quote: &VerifiedBchQuote) -> String {format!("{}.bch-success-received",quote.terms()["swapId"])}
++fn optional(journal: &Journal,name: &str) -> Result<Option<Vec<u8>>> {
++    match journal.read(name) {
++        Ok(bytes) => Ok(Some(bytes)),
++        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound) => Ok(None),
++        Err(e) => Err(e),
++    }
++}
++fn encode(record: &Record) -> Result<Zeroizing<Vec<u8>>> {
++    let mut bytes = Zeroizing::new(Vec::with_capacity(65536));
++    serde_json::to_writer(&mut *bytes,record)?;
++    ensure!(bytes.len() <= 65536,"oversized BCH success receipt");Ok(bytes)
++}
++impl AdmittedExecution<'_> {
++    fn success_receipt_context(&self) -> Result<ReceiptContext> {
++        ensure!(self.role == Role::NativeFunder,"wrong BCH success receiver");
++        // Accessor must validate the original outgoing payment-proof record,
++        // acknowledged relay and exact prepared payment, returning no secrets.
++        let (native_txid,payment,sent_at) = self.outgoing_native_payment_binding()?;
++        let agreement = self.restore_agreement()?;
++        let funding = self.received_bch_funding_message()?.context("missing authenticated BCH funding")?;
++        Ok(ReceiptContext {agreement,outpoint:funding.signed().lock_outpoint(),native_txid,
++            payment,sent_at,admission:self.admission_digest()?})
++    }
++    fn load_success_receipt(&self,context: &ReceiptContext) -> Result<Option<Record>> {
++        let slot = name(self.quote);
++        let private = optional(&Journal::open(&self.snapshots)?,&slot)?.map(Zeroizing::new);
++        let Some(pin_bytes) = optional(&self.metadata,&format!("{slot}-pin"))? else {
++            ensure!(private.is_none(),"BCH success receipt lacks trusted pin");return Ok(None)
++        };
++        ensure!(pin_bytes.len() <= 4096,"oversized BCH success receipt pin");
++        let pin: Pin = serde_json::from_slice(&pin_bytes)?;
++        let bytes = private.context("BCH success receipt private record missing")?;
++        ensure!(bytes.len() <= 65536 && pin.schema == PIN && pin.admission == context.admission
++            && pin.record == hash(RECORD,&bytes) && serde_json::to_vec(&pin)? == pin_bytes,
++            "BCH success receipt pin changed");
++        let record: Record = serde_json::from_slice(&bytes)?;
++        ensure!(*encode(&record)? == *bytes && record.schema == RECORD
++            && record.admission == context.admission && record.payment == context.payment
++            && record.at >= context.sent_at,"BCH success receipt context changed");
++        context.agreement.check_signed_success(self.quote,context.outpoint,&context.native_txid,
++            &record.frame,&record.signature)?;
++        Ok(Some(record))
++    }
++    /// Retain exact peer evidence after authenticating both funding bindings.
++    /// Settlement may finish after quote expiry; this grants no funding rights.
++    pub fn accept_bch_success(&mut self,now: u64,frame: &[u8],signature: &[u8]) -> Result<()> {
++        let context = self.success_receipt_context()?;
++        ensure!(now >= context.sent_at,"BCH success predates outgoing payment proof");
++        context.agreement.check_signed_success(self.quote,context.outpoint,&context.native_txid,frame,signature)?;
++        if let Some(record) = self.load_success_receipt(&context)? {
++            ensure!(now >= record.at && record.frame == frame && record.signature == signature,
++                "BCH success receipt already retained differently");return Ok(())
++        }
++        let record = Record {schema:RECORD.into(),admission:context.admission,payment:context.payment,
++            at:now,frame:frame.to_vec(),signature:signature.to_vec()};
++        let bytes = encode(&record)?;let slot = name(self.quote);
++        let pin = Pin {schema:PIN.into(),admission:context.admission,record:hash(RECORD,&bytes)};
++        self.metadata.retain(&format!("{slot}-pin"),&serde_json::to_vec(&pin)?)?;
++        Journal::open(&self.snapshots)?.retain(&slot,&bytes)?;Ok(())
++    }
++    /// Validate retained receipt without returning adaptor or redemption bytes.
++    pub fn has_received_bch_success(&self) -> Result<bool> {
++        Ok(self.load_success_receipt(&self.success_receipt_context()?)?.is_some())
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+@@ -148,3 +148,5 @@
+         Ok(SignedSuccess {frame:Zeroizing::new(release.frame.clone()),signature:release.signature.clone().context("missing signature")?})
+     }
+ }
++
++pub mod receipt;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
+@@ -0,0 +1,60 @@
++// Target: tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
++use super::*;
++
++pub(super) fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
++    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,fixture: &Fixture,
++    frame: &[u8],signature: &[u8]) -> Result<()> {
++    let before = fixture.calls.lock().unwrap().len();
++    assert!(bch.accept_bch_success(2033,frame,signature).is_err());
++    assert!(bch.has_received_bch_success().is_err());
++    assert!(!native.has_received_bch_success()?);
++    // The original outgoing proof was retained at 2026.
++    assert!(native.accept_bch_success(2025,frame,signature).is_err());
++    let wrong = SigningKey::from_bytes(&[2;32]);
++    assert!(native.accept_bch_success(2033,frame,&wrong.sign(&signing_bytes(frame)?).to_bytes()).is_err());
++    let key = SigningKey::from_bytes(&[1;32]);
++    let original: Value = serde_json::from_slice(frame)?;
++    for (field,value) in [("schema",json!("changed")),("swap",json!("changed")),
++        ("native_txid",json!("cd".repeat(32))),
++        ("bch_outpoint",serde_json::to_value(bitcoin::OutPoint::null())?),
++        ("quote",serde_json::to_value([0u8;32])?),
++        ("agreement",serde_json::to_value([0u8;32])?)] {
++        let old = format!("\"{field}\":{}",serde_json::to_string(&original[field])?);
++        let new = format!("\"{field}\":{}",serde_json::to_string(&value)?);
++        let changed = zeroize::Zeroizing::new(std::str::from_utf8(frame)?.replacen(&old,&new,1).into_bytes());
++        assert_ne!(&*changed,frame);
++        let sig = key.sign(&signing_bytes(&changed)?).to_bytes();
++        assert!(native.accept_bch_success(2033,&changed,&sig).is_err(),"changed {field}");
++    }
++    let mut spaced = zeroize::Zeroizing::new(frame.to_vec());spaced.push(b' ');
++    assert!(native.accept_bch_success(2033,&spaced,&key.sign(&signing_bytes(&spaced)?).to_bytes()).is_err());
++    native.accept_bch_success(2033,frame,signature)?;
++    native.accept_bch_success(2034,frame,signature)?;
++    assert!(native.has_received_bch_success()?);
++    assert!(native.accept_bch_success(2032,frame,signature).is_err());
++    let restored_metadata = copy_store(metadata)?;
++    let restored = AdmittedExecution::resume(&restored_metadata.0,&snapshots.0,
++        &setup.quote,&setup.policy,Role::NativeFunder)?;
++    assert!(restored.has_received_bch_success()?);
++    let slot = format!("{}.bch-success-received",setup.quote.terms()["swapId"]);
++    let private = snapshots.0.join(&slot);
++    let bytes = zeroize::Zeroizing::new(std::fs::read(&private)?);
++    std::fs::write(&private,b"{}")?;
++    assert!(native.has_received_bch_success().is_err());
++    assert!(native.accept_bch_success(2034,frame,signature).is_err());
++    std::fs::write(&private,&*bytes)?;
++    let missing = snapshots.0.join("saved-success-receipt");
++    std::fs::rename(&private,&missing)?;
++    assert!(native.has_received_bch_success().is_err());
++    assert!(native.accept_bch_success(2034,frame,signature).is_err());
++    std::fs::rename(&missing,&private)?;
++    let pin = metadata.0.join(format!("{slot}-pin"));
++    let missing_pin = metadata.0.join("saved-success-receipt-pin");
++    std::fs::rename(&pin,&missing_pin)?;
++    assert!(native.has_received_bch_success().is_err());
++    assert!(native.accept_bch_success(2034,frame,signature).is_err());
++    std::fs::rename(&missing_pin,&pin)?;
++    assert!(native.has_received_bch_success()?);
++    assert_eq!(fixture.calls.lock().unwrap().len(),before);
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs
+@@ -1,8 +1,9 @@
+ use super::*;
+ use agreement::success::signing_bytes;
++mod receipt;
+ 
+ pub(super) async fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
+-    setup: &Setup,snapshots: &PrivateStore,fixture: &Fixture,rpc: &BchRpc,server: &Server) -> Result<()> {
++    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,fixture: &Fixture,rpc: &BchRpc,server: &Server) -> Result<()> {
+     let observer = fixture.funding_client()?;
+     let prepared = snapshots.0.join(format!("{}.bch-success-prepared",setup.quote.terms()["swapId"]));
+     assert!(native.bch_success_signing_frame(&observer,rpc,5,2030).await.is_err());
+@@ -51,6 +52,7 @@
+     assert!(bch.recover_bch_success_release(&observer,rpc,5,2032).await.is_err());
+     std::fs::write(&prepared,&*saved)?;
+     assert_eq!(bch.recover_bch_success_release(&observer,rpc,5,2032).await?.signature(),sig);
++    receipt::exercise(bch,native,setup,metadata,snapshots,fixture,&frame,&sig)?;
+     fixture.confirmed.store(false,Ordering::SeqCst);
+     Ok(())
+ }
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof.rs
+@@ -68,7 +68,7 @@
+     fixture.incoming_unlock.store(0,Ordering::SeqCst);
+     fixture.confirmed.store(false,Ordering::SeqCst);
+     assert!(bch.observe_bch_native_payment(&observer).await.is_err());
+-    success::exercise(bch,native,setup,snapshots,fixture,rpc,server).await?;
++    success::exercise(bch,native,setup,metadata,snapshots,fixture,rpc,server).await?;
+     fixture.incoming.store(false,Ordering::SeqCst);
+     assert_eq!(fixture.calls.lock().unwrap().iter().filter(|v|v.as_str()=="transfer").count(),1);
+     assert_eq!(fixture.calls.lock().unwrap().iter().filter(|v|v.as_str()=="relay_tx").count(),1);

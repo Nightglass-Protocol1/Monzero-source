@@ -1,0 +1,200 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_helper.rs
+@@ -38,18 +38,48 @@
+ }
+ #[test]
+ #[ignore="requires explicitly pinned MONZERO_BCH_LIGHT_HELPER and SHA256"]
+-fn bch_local_terms_helper_checks_quote_admission_and_refund_wallet()->Result<()> {helper_fixture(false)}
++fn bch_local_terms_helper_checks_quote_admission_and_refund_wallet()->Result<()> {helper_fixture(false,None)}
+ #[test]
+ #[ignore="requires pinned helper/preparation probe and owned BCH node"]
+-fn bch_local_preparation_helper_uses_real_confirmed_wallet_inputs()->Result<()> {helper_fixture(true)}
+-fn helper_fixture(preparation:bool)->Result<()> {
++fn bch_local_preparation_helper_uses_real_confirmed_wallet_inputs()->Result<()> {helper_fixture(true,None)}
++#[derive(Clone,Copy)]
++enum SigningFixture {Raw,Mnemonic}
++#[test]
++#[ignore="requires pinned signing helper/probe and owned BCH node"]
++fn bch_local_signing_helper_checks_both_local_vault_formats()->Result<()> {
++    helper_fixture(true,Some(SigningFixture::Raw))?;
++    helper_fixture(true,Some(SigningFixture::Mnemonic))
++}
++fn helper_fixture(preparation:bool,signing:Option<SigningFixture>)->Result<()> {
+     let helper=PathBuf::from(std::env::var("MONZERO_BCH_LIGHT_HELPER")?);
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper,"noncanonical helper fixture");
+     ensure!(sha256::Hash::hash(&std::fs::read(&helper)?).to_string()==std::env::var("MONZERO_BCH_LIGHT_HELPER_SHA256")?,
+         "BCH light helper fixture digest mismatch");
+     let clock=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();let base=clock-30;
+     let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([44;32]));
+-    let account=seed.public_account(BchNetwork::Regtest,0)?;
++    let mnemonic=crate::litecoin_light::vault::mnemonic::MnemonicMaterial::from_entropy(&[45;32])?;
++    let account=if matches!(signing,Some(SigningFixture::Mnemonic)) {
++        mnemonic.public_account(BchNetwork::Regtest,0,"BCH fixture BIP39 passphrase")?
++    } else {seed.public_account(BchNetwork::Regtest,0)?};
++    let vault_store=PrivateStore::new()?;let wallet_id=uuid::Uuid::new_v4();
++    let vault=match signing {
++        None=>serde_json::Value::Null,
++        Some(format)=>{
++            let encoding=match format {
++                SigningFixture::Raw=>{
++                    drop(crate::litecoin_light::vault::SeedVault::create(&vault_store.0,BchNetwork::Regtest,wallet_id,
++                        b"disposable BCH signing fixture password",&seed)?);
++                    "raw-bip32-seed-hex-v1"
++                },
++                SigningFixture::Mnemonic=>{
++                    drop(crate::litecoin_light::vault::mnemonic::storage::MnemonicVault::create(&vault_store.0,
++                        BchNetwork::Regtest,wallet_id,b"disposable BCH signing fixture password",&mnemonic,"BCH fixture BIP39 passphrase")?);
++                    "bip39-english-v1"
++                },
++            };
++            serde_json::json!({"directory":vault_store.0,"walletId":wallet_id,"seedEncoding":encoding})
++        },
++    };
+     let refund=account.derive(Branch::Receive,0)?;
+     let network=crate::bch_rpc::BchNetwork::Regtest {checkpoint_height:1,checkpoint:bitcoin::BlockHash::from_byte_array([7;32])};
+     let setup=Setup::with_context_and_refund(Some(network),base,base+3500,None,Some(refund.address().script_pubkey()))?;
+@@ -66,11 +96,11 @@
+     let approval=agreement::execution::approval::review_admission(&setup.quote,&setup.policy,Role::BchFunder,&pins,base+5)?;
+     drop(AdmittedExecution::admit_reviewed(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder,
+         &approval.commitment,pins.clone(),base+5)?);
+-    drop(AddressBook::create(&addresses.0,seed.public_account(BchNetwork::Regtest,0)?)?);
++    drop(AddressBook::create(&addresses.0,crate::litecoin_light::account::PublicAccount::from_descriptor(&account.descriptor(),BchNetwork::Regtest)?)?);
+     let wallet_path=configs.0.join("wallet.json");let quote_path=configs.0.join("quote.json");let config_path=configs.0.join("dex.json");
+     let wallet=serde_json::json!({"schema":"monzero-private-bch-light-v1","network":"regtest",
+         "cacheDirectory":configs.0.join("unused-cache"),"maximumHeight":10000,"endpoint":null,
+-        "wallet":{"account":account.descriptor(),"addressBookDirectory":addresses.0,"spendDirectory":null,"vault":null}});
++        "wallet":{"account":account.descriptor(),"addressBookDirectory":addresses.0,"spendDirectory":null,"vault":vault}});
+     let mut config=serde_json::json!({"schema":"monzero-private-bch-light-dex-v1","walletConfigFile":wallet_path,
+         "quoteFile":quote_path,"quoteCommitment":hex(setup.quote.commitment()),"admittedAt":base,
+         "identityPins":[SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
+@@ -82,7 +112,7 @@
+         "requestId":uuid::Uuid::new_v4(),"approvedConfigDigest":context(&config_bytes,&wallet_bytes,&quote_bytes)?});
+     let stores=[snapshots.0.as_path(),metadata.0.as_path(),addresses.0.as_path()];
+     let before=inventory(&stores)?;invoke(&helper,&config_path,&request,false)?;assert_eq!(inventory(&stores)?,before);
+-    let mut book=AddressBook::open(&addresses.0,seed.public_account(BchNetwork::Regtest,0)?)?;
++    let mut book=AddressBook::open(&addresses.0,crate::litecoin_light::account::PublicAccount::from_descriptor(&account.descriptor(),BchNetwork::Regtest)?)?;
+     book.reserve(uuid::Uuid::new_v4(),Branch::Receive)?;drop(book);
+     let before=inventory(&stores)?;
+     let response=invoke(&helper,&config_path,&request,true).context("allocated BCH wallet terms")?;
+@@ -112,9 +142,18 @@
+         ensure!(probe.is_absolute() && probe.canonicalize()?==probe,"noncanonical BCH preparation probe");
+         ensure!(sha256::Hash::hash(&std::fs::read(&probe)?).to_string()==std::env::var("MONZERO_BCH_PREPARATION_PROBE_SHA256")?,
+             "BCH preparation probe digest mismatch");
++        let report=PathBuf::from(std::env::var("MONZERO_BCH_PREPARATION_REPORT")?);
++        let report=match signing {None=>report,Some(SigningFixture::Raw)=>report.with_extension("raw.json"),
++            Some(SigningFixture::Mnemonic)=>report.with_extension("bip39.json")};
+         let output=Command::new("python").arg(probe).arg(&helper).arg(&config_path)
+-            .arg(std::env::var("MONZERO_BCH_PREPARATION_NODE")?).arg(std::env::var("MONZERO_BCH_PREPARATION_REPORT")?).output()?;
++            .arg(std::env::var("MONZERO_BCH_PREPARATION_NODE")?).arg(&report).output()?;
+         ensure!(output.status.success(),"BCH preparation probe failed: {}",String::from_utf8_lossy(&output.stderr));
++        if signing.is_some() {
++            let report:serde_json::Value=serde_json::from_slice(&std::fs::read(report)?)?;
++            let reopened=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++            assert_eq!(reopened.signed_bch_funding()?.context("missing locally signed trade funding")?.transaction().compute_txid().to_string(),
++                report["signedTxid"].as_str().context("missing signed fixture txid")?);
++        }
+     }
+     Ok(())
+ }
+--- a/swap-machine/src/bin/native-ltc-light/bch_dex.rs
++++ b/swap-machine/src/bin/native-ltc-light/bch_dex.rs
+@@ -1,5 +1,5 @@
+ // Private local-wallet BCH DEX boundary. Isolated-chain terms and explicit
+-// preparation/review. No key unlock, signing or publication authorization.
++// preparation/review and separately approved local signing. No publication.
+ use super::*;
+ use swap_machine::{bch_quote::{Policy,VerifiedBchQuote},
+     bch_key_recovery::authenticated::{Role,native_wallet::agreement::execution::{AdmittedExecution,NegotiationPins}}};
+@@ -25,14 +25,14 @@
+ }
+ pub(super) fn mode(flag:&str)->Option<&str> {
+     let mode=flag.strip_prefix("--bch-dex-funding-")?.strip_suffix("-stdio-v1")?;
+-    ["terms","prepare","review"].contains(&mode).then_some(mode)
++    ["terms","prepare","review","sign"].contains(&mode).then_some(mode)
+ }
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields,rename_all="camelCase")]
+ struct FundingRequest {
+     schema:String,request_id:uuid::Uuid,approved_config_digest:String,
+     maximum_download_headers:u32,wallet_scan:WalletScan,payment:Payment,
+-    retained_review:Option<RetainedReview>,
++    retained_review:Option<RetainedReview>,approval:Option<String>,password:Option<Password>,
+ }
+ pub(super) fn run(path:&Path,mode:&str)->Result<()> {
+     let mut input=Zeroizing::new(Vec::new());std::io::stdin().take(4097).read_to_end(&mut input)?;
+@@ -61,7 +61,7 @@
+         &dex.identity_pins[0],&dex.identity_pins[1],&digest(&dex.quote_commitment)?.to_byte_array())?;
+     ensure!(quote.terms()["bchGenesis"]==network.genesis(),"BCH DEX quote has another genesis");
+     ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==dex.trade_id,"BCH DEX quote belongs to another trade");
+-    let execution=AdmittedExecution::resume(&dex.metadata_directory,&dex.snapshot_directory,
++    let mut execution=AdmittedExecution::resume(&dex.metadata_directory,&dex.snapshot_directory,
+         &quote,&dex.policy,Role::BchFunder)?;
+     execution.saved_admission_review(&dex.negotiation_pins)?;
+     let mut terms=execution.light_funding_terms(now()?)?;
+@@ -76,7 +76,7 @@
+     let result=if let Some(request)=funding {
+         tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+             tokio::time::timeout(std::time::Duration::from_secs(3600),
+-                prepare(&wallet_config,network,&dex,&execution,&request,mode)).await.context("BCH preparation deadline exceeded")?
++                execute_funding(&wallet_config,network,&dex,&mut execution,&request,mode)).await.context("BCH funding operation deadline exceeded")?
+         })?
+     } else {terms};
+     output(&json!({"schema":format!("monzero-bch-light-dex-funding-{mode}-response-v1"),"requestId":request_id,
+@@ -84,11 +84,14 @@
+ }
+ 
+ fn validate(request:&FundingRequest,mode:&str)->Result<()> {
+-    ensure!(matches!(mode,"prepare"|"review") && !request.request_id.is_nil()
++    ensure!(matches!(mode,"prepare"|"review"|"sign") && !request.request_id.is_nil()
+         && request.schema==format!("monzero-bch-light-dex-funding-{mode}-request-v1")
+         && (1..=10_000_000).contains(&request.maximum_download_headers),"invalid BCH preparation request");
+     digest(&request.approved_config_digest)?;
+-    ensure!(request.retained_review.is_some()==(mode=="review"),"invalid BCH retained review fields");
++    ensure!(request.retained_review.is_some()==(mode!="prepare"),"invalid BCH retained review fields");
++    ensure!(request.approval.is_some()==(mode=="sign") && request.password.is_some()==(mode=="sign"),
++        "BCH signing requires separate approval and password");
++    if let Some(approval)=&request.approval {digest(approval)?;}
+     if let Some(review)=&request.retained_review {digest(&review.signing_commitment)?;}
+     ensure!((1..=500).contains(&request.wallet_scan.gap)
+         && (1..=500).contains(&request.wallet_scan.addresses_per_branch)
+@@ -96,7 +99,7 @@
+         && (1..=1000).contains(&request.payment.minimum_confirmations),"invalid BCH scan/confirmation limits");
+     Ok(())
+ }
+-async fn prepare(config:&Config,network:LightNetwork,dex:&DexConfig,execution:&AdmittedExecution<'_>,
++async fn execute_funding(config:&Config,network:LightNetwork,dex:&DexConfig,execution:&mut AdmittedExecution<'_>,
+     request:&FundingRequest,mode:&str)->Result<Value> {
+     let payment=&request.payment;let address=LightAddress::parse(network,&payment.address)?;
+     let output=TxOut {value:atomic(&payment.amount_atomic)?,script_pubkey:address.script_pubkey().clone()};
+@@ -142,5 +145,19 @@
+     result["unsignedTxid"]=result["txid"].take();result.as_object_mut().context("invalid BCH payment view")?.remove("txid");
+     result["operation"]=json!(mode);result["tradeId"]=json!(dex.trade_id);
+     result["selectedHeight"]=json!(state.chain()?.height());result["broadcastAuthorized"]=json!(false);
++    if mode=="sign" {
++        let expected=prepared.signing_commitment();
++        ensure!(digest(request.approval.as_deref().context("missing BCH signing approval")?)?==expected,
++            "BCH signing approval differs from retained review");
++        let vault=wallet.vault.as_ref().context("missing BCH local vault")?;
++        let password=request.password.as_ref().context("missing BCH vault password")?.0.as_bytes();
++        let signed=vault_format::sign(vault,network,password,expected,&prepared,state.chain()?,observation.accounting())?;
++        let claim=prepared.into_retained_claim();
++        let retained=execution.retain_light_signed_funding(&claim,&book,network,expected,&source_refs,now()?)?;
++        ensure!(retained.transaction()==&signed,"BCH trade retention differs from locally signed funding");
++        result["signed"]=json!(true);result["watchOnly"]=json!(false);
++        result["txid"]=json!(signed.compute_txid());result["broadcast"]=json!(false);
++        result["tradeFundingRetained"]=json!(true);
++    }
+     Ok(result)
+ }
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+@@ -38,6 +38,9 @@
+ impl ObservedClaimedSpend {
+     /// Internal readback under the same wallet lease; no freshness authority.
+     pub(crate) fn retained_claim(&self)->&ClaimedSpend {&self.claimed}
++    /// Discard the observation wrapper without releasing the durable claim lease.
++    /// The returned claim grants no fresh chain evidence or new signing/relay consent.
++    pub fn into_retained_claim(self)->ClaimedSpend {self.claimed}
+     /// Re-anchor an existing claimed transaction after a refresh/restart, without
+     /// selecting replacement inputs, changing records or granting signing consent.
+     pub fn revalidate(claimed:ClaimedSpend,chain:&HeaderSequence,observed:&ObservedWallet,

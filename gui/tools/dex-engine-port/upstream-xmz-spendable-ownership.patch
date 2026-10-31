@@ -1,0 +1,80 @@
+diff --git a/swap-machine/src/native_funding_rpc/spendable.rs b/swap-machine/src/native_funding_rpc/spendable.rs
+index 9d08e08a2..4cc78bd59 100644
+--- a/swap-machine/src/native_funding_rpc/spendable.rs
++++ b/swap-machine/src/native_funding_rpc/spendable.rs
+@@ -1,10 +1,10 @@
+ //! One orchestration entry point mirroring upstream's `Wallets::swap_wallet_spendable`:
+ //! restore a wallet from a swap's recovered keys, import its lock transaction so
+-//! the wallet knows about that specific output, preview the intended spend, and
+-//! -- only if the preview matches exactly what will be relayed -- broadcast it.
+-//! This is the shape both Alice's initial lock to the shared address and Bob's
+-//! final sweep of the recovered output reduce to; nothing else protocol-specific
+-//! is needed once `restore`, `import_transaction` and `relay` all exist.
++//! the wallet knows about that specific output, estimate the intended spend, and
++//! broadcast a separately constructed transfer with the same principal and
++//! destination. The estimate is advisory: fee/weight equality is not enforced.
++//! This is a fixed-principal recovery primitive, not a sweep, a negotiated lock
++//! driver, or a complete swap execution/recovery protocol.
+ //!
+ //! Unlike every other function in this module, the exact shape of this one is
+ //! this codebase's own design choice, not a direct mechanical port of an
+@@ -45,8 +45,10 @@ pub struct SpendRequest {
+ /// still guarantee exclusive service ownership across all three calls this
+ /// makes -- this function does not add that guarantee, only compose across it.
+ ///
+-/// Always attempts to close the restored wallet before returning, success or
+-/// failure, so one failed or completed call doesn't leave the wallet-rpc
++/// After a successful restore, attempts to close that wallet on normal return,
++/// success or failure. A failed restore must not close a pre-existing wallet.
++/// Cancellation can skip cleanup and requires caller-owned reconciliation.
++/// This prevents an ordinarily completed call from leaving the wallet-rpc
+ /// service wedged with a wallet open for every later caller (including a
+ /// caller's own next attempt). A close failure is deliberately never allowed
+ /// to override the real outcome: if the relay already succeeded, the funds
+@@ -62,17 +64,17 @@ pub async fn swap_wallet_spendable(daemon: u16, wallet_port: u16, username: Stri
+         "spendable request network mismatch");
+     let mut session = NativeWalletSession::new(
+         NativeFundingRpc::new(daemon, wallet_port, username.clone(), password.clone())?, network);
+-    let result = restore_and_spend(&mut session, daemon, wallet_port, username, password,
++    session.restore(&request.id, request.spend_key.clone(), request.view_key.clone(), request.restore_height,
++        request.password.clone(), &request.wallet).await?;
++    let result = import_and_spend(&mut session, daemon, wallet_port, username, password,
+         expected_genesis, &request).await;
+     let _ = session.close(&request.wallet).await;
+     result
+ }
+ 
+-async fn restore_and_spend(session: &mut NativeWalletSession, daemon: u16, wallet_port: u16,
++async fn import_and_spend(session: &mut NativeWalletSession, daemon: u16, wallet_port: u16,
+     username: String, password: String, expected_genesis: &str,
+     request: &SpendRequest) -> Result<RelayedTransfer> {
+-    session.restore(&request.id, request.spend_key.clone(), request.view_key.clone(), request.restore_height,
+-        request.password.clone(), &request.wallet).await?;
+     session.import_transaction(&request.lock_txid, &request.wallet).await?;
+ 
+     let mut estimator = NativeFeeEstimator::new(
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 885736d5d..c8f15d006 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -112,6 +112,20 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+         amount, account: 0, priority: 1,
+     };
+ 
++    // Rejected restoration must not close a wallet that was already open,
++    // even when its address happens to match the requested swap wallet.
++    let mut existing = swap_machine::native_funding_rpc::wallet_session::NativeWalletSession::new(
++        native_rpc::authenticated_fixture()?, XmzNetwork::Mainnet);
++    existing.restore(&SwapWalletId::new(Uuid::new_v4())?, spend_key.clone(), view_key.clone(),
++        restore_height, "fixture-password".into(), &wallet).await?;
++    let error = swap_wallet_spendable(daemon, wallet_port, username.clone(), password.clone(),
++        XmzNetwork::Mainnet, genesis, request(SwapWalletId::new(Uuid::new_v4())?)).await
++        .err().context("accepted already-open wallet")?;
++    anyhow::ensure!(error.to_string() == "wallet already open", "unexpected ownership rejection");
++    anyhow::ensure!(native_rpc::authenticated_fixture()?.opened_wallet(XmzNetwork::Mainnet).await?
++        .as_ref() == Some(&wallet), "rejected restore closed a pre-existing wallet");
++    existing.close(&wallet).await?;
++
+     // Restore and import must succeed even under a chain-policy mismatch that
+     // only the later fee-estimate step can detect; nothing should be relayed,
+     // and the wallet this leaves open must not block the next attempt.

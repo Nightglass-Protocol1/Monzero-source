@@ -63,7 +63,10 @@ Rectangle {
     property Keys keysView: Keys { }
     property Account accountView: Account { }
     property Assets assetsView: Assets { }
-    property Dex dexView: Dex { }
+    // The DEX page exists only when the private DEX prototype is enabled; release builds have no
+    // dexEngine and never create it (main.qml refuses to switch to the Dex state without it).
+    Component { id: dexComponent; Dex { } }
+    property Item dexView: dexPrototypeEnabled ? dexComponent.createObject(root) : null
 
     signal paymentClicked(var recipients, string paymentId, int mixinCount, int priority, string description)
     signal sweepUnmixableClicked()
@@ -164,7 +167,7 @@ Rectangle {
             }, State {
                 name: "Dex"
                 PropertyChanges { target: root; currentView: dexView }
-                PropertyChanges { target: mainFlickable; contentHeight: dexView.dexHeight + 80 }
+                PropertyChanges { target: mainFlickable; contentHeight: (dexView ? dexView.dexHeight : 0) + 80 }
             }, State {
                 name: "Account"
                 PropertyChanges { target: root; currentView: accountView }

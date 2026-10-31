@@ -1,0 +1,223 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs
+@@ -5,6 +5,9 @@
+ pub mod relay;
+ pub mod proof;
+ pub mod approval;
++mod observer;
++use observer::NativeFundingObserver;
++use crate::bch_rpc::observer::OwnedBchObserver;
+ use crate::{bch_rpc::BchRpc,native_funding_rpc::relay::{NativeTransferRelay,RelayRequest,RelayedTransfer,
+     lock_checkpoint::PreparedNativeLock}};
+ use serde_json::json;
+@@ -92,6 +95,18 @@
+     /// another transaction automatically. No consent for later relay is implied.
+     pub async fn prepare_bch_native_funding(&mut self,native: &mut NativeTransferRelay,bch: &BchRpc,
+         source: NativeFundingSource,safety_blocks: u32,now: u64) -> Result<RelayedTransfer> {
++        self.prepare_bch_native_funding_with_observer(native,NativeFundingObserver::Node(bch),source,safety_blocks,now).await
++    }
++
++    /// Prepare through an owned observer without accessing a BCH wallet.
++    /// The observer identity is retained immutably with the payment intent.
++    pub async fn prepare_light_bch_native_funding(&mut self,native:&mut NativeTransferRelay,bch:&OwnedBchObserver,
++        source:NativeFundingSource,safety_blocks:u32,now:u64)->Result<RelayedTransfer> {
++        self.prepare_bch_native_funding_with_observer(native,NativeFundingObserver::Walletless(bch),source,safety_blocks,now).await
++    }
++
++    async fn prepare_bch_native_funding_with_observer(&mut self,native:&mut NativeTransferRelay,bch:NativeFundingObserver<'_>,
++        source:NativeFundingSource,safety_blocks:u32,now:u64)->Result<RelayedTransfer> {
+         let started = std::time::Instant::now();
+         let intent_name = record_name(self.quote,"native-intent");
+         if optional(&self.metadata,&intent_name)?.is_some() {
+@@ -113,7 +128,7 @@
+             amount:XmzAmount::from_atoms(intent.amount),account:intent.account,priority:intent.priority};
+         // Reject wrong/unfunded source wallets before committing an unusable one.
+         native.preflight(&request,&intent.genesis).await?;
+-        self.check_bch_lock_for_native_funding(bch,now,safety_blocks).await?;
++        bch.check(self,now,safety_blocks).await?;
+         ensure!(std::time::Instant::now() < deadline,"BCH native quote expired during preflight");
+         let bytes = serde_json::to_vec(&intent)?;
+         self.metadata.retain(&intent_name,&bytes)?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/approval.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/approval.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/approval.rs
+@@ -55,4 +55,12 @@
+         ensure!(*approved==review.commitment,"BCH native preparation approval changed");
+         self.prepare_bch_native_funding(native,bch,source,safety_blocks,now).await
+     }
++    pub async fn prepare_reviewed_light_bch_native_funding(&mut self,native:&mut NativeTransferRelay,
++        bch:&OwnedBchObserver,source:NativeFundingSource,safety_blocks:u32,now:u64,approved:&[u8;32])
++        ->Result<RelayedTransfer> {
++        let review=self.review_bch_native_preparation(&source,bch.deployment_commitment()?,safety_blocks,now)?;
++        ensure!(*approved==review.commitment,"BCH native preparation approval changed");
++        self.prepare_light_bch_native_funding(native,bch,source,safety_blocks,now).await
++    }
++
+ }
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/relay.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/relay.rs
+@@ -106,8 +106,20 @@
+     /// wallet checks. Any unresolved attempt refuses automatic retransmission.
+     pub async fn relay_bch_native_funding(&mut self,native: &mut NativeTransferRelay,bch: &BchRpc,
+         approved: &[u8;32],now: u64) -> Result<RelayedTransfer> {
++        self.relay_bch_native_funding_with_observer(native,NativeFundingObserver::Node(bch),approved,now).await
++    }
++
++    /// Exact approved relay using the observer pinned during preparation.
++    /// This performs a fresh chain check; an old preflight result is insufficient.
++    pub async fn relay_light_bch_native_funding(&mut self,native:&mut NativeTransferRelay,bch:&OwnedBchObserver,
++        approved:&[u8;32],now:u64)->Result<RelayedTransfer> {
++        self.relay_bch_native_funding_with_observer(native,NativeFundingObserver::Walletless(bch),approved,now).await
++    }
++
++    async fn relay_bch_native_funding_with_observer(&mut self,native:&mut NativeTransferRelay,bch:NativeFundingObserver<'_>,
++        approved:&[u8;32],now:u64)->Result<RelayedTransfer> {
+         let started = std::time::Instant::now();
+-        let review = self.review_bch_native_relay(bch,now)?;
++        let review = self.review_bch_native_relay_for_deployment(&bch.deployment_commitment()?,now)?;
+         ensure!(review.commitment == *approved,"native payment relay approval is stale or mismatched");
+         let (original,intent,prepared) = self.native_relay_materials()?;
+         ensure!(original.commitment == *approved,"native payment changed after review");
+@@ -123,7 +135,7 @@
+             None => (),
+         }
+         native.preflight_native_lock(&prepared).await?;
+-        self.check_bch_lock_for_native_funding(bch,now,intent.safety_blocks).await?;
++        bch.check(self,now,intent.safety_blocks).await?;
+         ensure!(std::time::Instant::now() < deadline,"native quote expired during relay preflight");
+         let attempt = Attempt {schema:ATTEMPT.into(),review:*approved,approved_at:now};
+         let bytes = serde_json::to_vec(&attempt)?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native.rs
+@@ -1,5 +1,6 @@
+ use super::*;
+ mod relay;
++mod walletless;
+ use agreement::execution::funding::native::NativeFundingSource;
+ use crate::native_funding_rpc::relay::lock_checkpoint::tests::Fixture;
+ use std::sync::atomic::Ordering;
+@@ -18,6 +19,7 @@
+ }
+ pub(super) async fn exercise(sender: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,setup: &Setup,
+     metadata: &PrivateStore,snapshots: &PrivateStore,rpc: &BchRpc,server: &Server) -> Result<()> {
++    walletless::exercise(setup,metadata,snapshots,rpc,server).await?;
+     let wallet = XmzAddress::parse(setup.policy.xmz_network,&setup.quote.terms()["xmzPayout"])?;
+     let destination = native.restore_agreement()?.owned().wallet().address().clone();
+     let mut fixture = Fixture::new(wallet.clone(),destination.clone(),setup.policy.xmz_genesis.clone(),101_000,900).await?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/observer.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/observer.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/observer.rs
+@@ -0,0 +1,18 @@
++//! Internal dispatch only; no persisted schema or authority migration.
++use super::*;
++pub(super) enum NativeFundingObserver<'a> {
++    Node(&'a BchRpc),
++    Walletless(&'a OwnedBchObserver),
++}
++impl NativeFundingObserver<'_> {
++    pub(super) fn deployment_commitment(&self)->Result<[u8;32]> {
++        match self {Self::Node(rpc)=>rpc.deployment_commitment(),Self::Walletless(observer)=>observer.deployment_commitment()}
++    }
++    pub(super) async fn check(&self,execution:&AdmittedExecution<'_>,now:u64,safety_blocks:u32)->Result<()> {
++        match self {
++            Self::Node(rpc)=>{execution.check_bch_lock_for_native_funding(rpc,now,safety_blocks).await?;},
++            Self::Walletless(observer)=>{execution.check_light_bch_lock_for_native_funding(observer,now,safety_blocks).await?;},
++        }
++        Ok(())
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs
+@@ -0,0 +1,86 @@
++//! Native wallet fixture with BCH reads through the distinct owned observer.
++use super::*;
++use crate::bch_rpc::observer::OwnedBchObserver;
++use agreement::execution::funding::native::relay::NativeRelayState;
++
++pub(super) async fn exercise(setup:&Setup,original_metadata:&PrivateStore,original_snapshots:&PrivateStore,
++    rpc:&BchRpc,server:&Server)->Result<()> {
++    let observer=OwnedBchObserver::new(server.port,"user".into(),"pass".into(),rpc.network(),"/Bitcoin Cash Node:29.0.0/".into())?;
++    let deployment=observer.deployment_commitment()?;
++    let wallet=XmzAddress::parse(setup.policy.xmz_network,&setup.quote.terms()["xmzPayout"])?;
++    let slot=|suffix:&str|format!("{}.bch-funding-native-{suffix}",setup.quote.terms()["swapId"]);
++    for lose_preparation in [true,false] {
++        let metadata=copy_store(original_metadata)?;let snapshots=copy_store(original_snapshots)?;
++        let mut execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        let destination=execution.restore_agreement()?.owned().wallet().address().clone();
++        let mut fixture=Fixture::new(wallet.clone(),destination,setup.policy.xmz_genesis.clone(),101_000,900).await?;
++        let intent=metadata.0.join(slot("intent"));
++        *fixture.preparation_intent.lock().unwrap()=Some(intent.clone());
++        let review=execution.review_bch_native_preparation(&source(&wallet),deployment,5,1024)?;
++        let wrong=execution.review_bch_native_preparation(&source(&wallet),rpc.deployment_commitment()?,5,1024)?;
++        assert_ne!(wrong.commitment,review.commitment);
++        assert!(execution.prepare_reviewed_light_bch_native_funding(&mut fixture.relay,&observer,source(&wallet),5,1024,&wrong.commitment).await.is_err());
++        assert!(fixture.calls.lock().unwrap().is_empty());assert!(!intent.exists());
++        fixture.balance_available.store(false,Ordering::SeqCst);
++        assert!(execution.prepare_reviewed_light_bch_native_funding(&mut fixture.relay,&observer,source(&wallet),5,1024,&review.commitment).await.is_err());
++        assert!(!intent.exists());fixture.balance_available.store(true,Ordering::SeqCst);
++        server.state.lock().unwrap().observation_mode=21;
++        assert!(execution.prepare_reviewed_light_bch_native_funding(&mut fixture.relay,&observer,source(&wallet),5,1024,&review.commitment).await.is_err());
++        assert!(!intent.exists());server.state.lock().unwrap().observation_mode=0;
++        assert!(!fixture.calls.lock().unwrap().iter().any(|v|v=="transfer" || v=="relay_tx"));
++        fixture.lose_preparation_reply.store(lose_preparation,Ordering::SeqCst);
++        let prepared=execution.prepare_reviewed_light_bch_native_funding(&mut fixture.relay,&observer,source(&wallet),5,1024,&review.commitment).await;
++        assert!(intent.is_file());
++        if lose_preparation {assert!(prepared.is_err());}else{assert_eq!(prepared?.txid,"ab".repeat(32));}
++        drop(execution);
++        let mut execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        let before=fixture.calls.lock().unwrap().len();
++        assert!(execution.prepare_bch_native_funding(&mut fixture.relay,rpc,source(&wallet),5,1025).await.is_err());
++        let restored=execution.prepare_light_bch_native_funding(&mut fixture.relay,&observer,source(&wallet),5,2000).await;
++        if lose_preparation {
++            assert!(restored.is_err());assert!(execution.saved_bch_native_preparation()?.unwrap().payment.is_none());
++        }else{
++            assert_eq!(restored?.txid,"ab".repeat(32));
++            assert_eq!(execution.saved_bch_native_preparation()?.unwrap().review.commitment,review.commitment);
++        }
++        assert_eq!(fixture.calls.lock().unwrap().len(),before);
++        assert_eq!(fixture.calls.lock().unwrap().iter().filter(|v|v.as_str()=="transfer").count(),1);
++        if lose_preparation {continue}
++        drop(execution);
++        for lose_reply in [false,true] {
++            let relay_metadata=copy_store(&metadata)?;
++            let mut execution=AdmittedExecution::resume(&relay_metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++            let relay_intent=relay_metadata.0.join(slot("relay-intent"));
++            *fixture.relay_intent.lock().unwrap()=Some(relay_intent.clone());
++            let review=execution.review_bch_native_relay_for_deployment(&deployment,1025)?;
++            let before=fixture.calls.lock().unwrap().len();
++            assert!(execution.relay_bch_native_funding(&mut fixture.relay,rpc,&review.commitment,1025).await.is_err());
++            assert!(execution.relay_light_bch_native_funding(&mut fixture.relay,&observer,&[0;32],1025).await.is_err());
++            assert!(execution.relay_light_bch_native_funding(&mut fixture.relay,&observer,&review.commitment,2000).await.is_err());
++            assert_eq!(fixture.calls.lock().unwrap().len(),before);
++            for mode in [1,3,21,22] {
++                server.state.lock().unwrap().observation_mode=mode;
++                assert!(execution.relay_light_bch_native_funding(&mut fixture.relay,&observer,&review.commitment,1025).await.is_err());
++                assert!(!relay_intent.exists());
++            }
++            server.state.lock().unwrap().observation_mode=0;
++            fixture.balance_available.store(false,Ordering::SeqCst);
++            fixture.lose_reply.store(lose_reply,Ordering::SeqCst);
++            let relays=fixture.calls.lock().unwrap().iter().filter(|v|v.as_str()=="relay_tx").count();
++            let result=execution.relay_light_bch_native_funding(&mut fixture.relay,&observer,&review.commitment,1025).await;
++            let expected=if lose_reply {assert!(result.is_err());NativeRelayState::Attempted {txid:"ab".repeat(32)}}
++                else {assert_eq!(result?.txid,"ab".repeat(32));NativeRelayState::Acknowledged {txid:"ab".repeat(32)}};
++            assert_eq!(execution.bch_native_relay_state()?,Some(expected.clone()));
++            drop(execution);
++            let mut execution=AdmittedExecution::resume(&relay_metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++            assert_eq!(execution.bch_native_relay_state()?,Some(expected));
++            let before=fixture.calls.lock().unwrap().len();
++            let repeated=execution.relay_light_bch_native_funding(&mut fixture.relay_client()?,&observer,&review.commitment,1026).await;
++            if lose_reply {assert!(repeated.is_err());}else{assert_eq!(repeated?.txid,"ab".repeat(32));}
++            assert_eq!(fixture.calls.lock().unwrap().len(),before);
++            assert_eq!(fixture.calls.lock().unwrap().iter().filter(|v|v.as_str()=="relay_tx").count(),relays+1);
++            assert_eq!(fixture.calls.lock().unwrap().iter().filter(|v|v.as_str()=="transfer").count(),1);
++        }
++    }
++    Ok(())
++}

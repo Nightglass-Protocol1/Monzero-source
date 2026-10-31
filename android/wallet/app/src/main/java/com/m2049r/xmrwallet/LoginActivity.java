@@ -342,8 +342,9 @@ public class LoginActivity extends BaseActivity
 
     @Override
     public boolean onWalletSelected(String walletName, boolean streetmode) {
-        if (isNetworkAvailable() && (node == null)) {
-            Toast.makeText(this, getString(R.string.prompt_daemon_missing), Toast.LENGTH_SHORT).show();
+        // Without a node the wallet cannot start (opening it anyway crashed the app)
+        if (node == null) {
+            Toast.makeText(this, getString(isNetworkAvailable() ? R.string.prompt_daemon_missing : R.string.prompt_no_network), Toast.LENGTH_LONG).show();
             return false;
         }
         if (checkServiceRunning()) return false;
@@ -1188,6 +1189,7 @@ public class LoginActivity extends BaseActivity
 
         @Override
         protected Boolean doInBackground(Void... params) {
+            if (node == null) return false;
             Timber.d("checking %s", node.getAddress());
             return node.testRpcService();
         }
@@ -1203,7 +1205,9 @@ public class LoginActivity extends BaseActivity
                 // now it's getting real, onValidateFields if wallet exists
                 promptAndStart(walletName, streetmode ? StartMode.Street : StartMode.Normal);
             } else {
-                if (node.getResponseCode() == 0) { // IOException
+                if (node == null) {
+                    Toast.makeText(LoginActivity.this, getString(R.string.prompt_daemon_missing), Toast.LENGTH_LONG).show();
+                } else if (node.getResponseCode() == 0) { // IOException
                     Toast.makeText(LoginActivity.this, getString(R.string.status_wallet_node_invalid), Toast.LENGTH_LONG).show();
                 } else { // connected but broken
                     Toast.makeText(LoginActivity.this, getString(R.string.status_wallet_connect_ioex), Toast.LENGTH_LONG).show();

@@ -1,0 +1,19 @@
+[package]
+name = "monzero-evm-keys"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Keys for XMZ <-> EVM swaps derived from a wallet seed: the swap seed and the EVM account key. Shared by the swap engine and the wallet vault helper so both derive the same keys."
+publish = false
+
+[workspace]
+
+[dependencies]
+hmac = "0.12"
+k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+sha2 = "0.10"
+sha3 = "0.10"
+zeroize = "1"
+
+[dev-dependencies]
+hex = "0.4"

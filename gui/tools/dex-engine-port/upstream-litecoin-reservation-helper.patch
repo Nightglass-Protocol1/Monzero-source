@@ -1,0 +1,119 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index ba46c94a3..f703bf1d5 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -209,6 +209,53 @@ mod linux {
+             "snapshot":execution.saved_status()?}))
+     }
+ 
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct ReservationConfig {schema:String,journal_config_file:PathBuf,rpc_file:PathBuf}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct ReservationRpc {schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,
++        ltc_cookie_file:PathBuf,reservation_directory:PathBuf,fee_rate_atoms_per_kb:u64}
++    async fn reserve_litecoin(path:&Path,input:&[u8])->Result<serde_json::Value> {
++        use swap_machine::{litecoin_quote::VerifiedLtcQuote,litecoin_rpc::LitecoinRpc};
++        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        let request:Request=serde_json::from_slice(input)?;
++        ensure!(request.schema=="monzero-ltc-reservation-prepare-request-v1" && !request.request_id.is_nil()
++            && request.action.is_none() && request.commitment.is_none() && request.safety_blocks.is_none(),"invalid reservation request");
++        let (_wrapper,bytes)=private_bytes(path,false)?;
++        let wrapper:ReservationConfig=serde_json::from_slice(&bytes)?;
++        ensure!(wrapper.schema=="monzero-private-ltc-reservation-v1","invalid reservation configuration");
++        let (_journal,config)=load(&wrapper.journal_config_file)?;
++        ensure!(config.schema=="monzero-private-ltc-journal-v5" && config.role=="litecoin-funder"
++            && config.policy.ltc_network==LtcNetwork::Regtest,"reservation requires isolated Litecoin funder startup configuration");
++        let (_rpc,bytes)=private_bytes(&wrapper.rpc_file,false)?;
++        let rpc:ReservationRpc=serde_json::from_slice(&bytes)?;
++        ensure!(rpc.schema=="monzero-private-ltc-reservation-rpc-v1" && rpc.ltc_port>0
++            && rpc.fee_rate_atoms_per_kb>0,"invalid reservation RPC configuration");
++        let (_quote,bytes)=private_bytes(config.start_quote_file.as_deref().context("missing reservation quote")?,false)?;
++        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        let quote=VerifiedLtcQuote::from_envelope(&bytes,now,&config.policy,config.pins)?;
++        let execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
++            config.trade_id,&config.policy,LocalRole::LitecoinFunder,config.pins)?;
++        let snapshot=execution.saved_status()?;
++        let commitment=quote.commitment().iter().map(|b|format!("{b:02x}")).collect::<String>();
++        ensure!(snapshot["quoteCommitment"]==commitment,"reservation quote differs from saved trade");
++        let keys=execution.completed_keys()?;
++        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
++        let adapter=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
++            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let amount=bitcoin::Amount::from_sat(quote.terms()["ltcAtoms"].parse()?);
++        let maximum_fee=bitcoin::Amount::from_sat(quote.terms()["ltcFundingFeeMaxAtoms"].parse()?);
++        let saved=adapter.prepare_or_resume_lock(&rpc.reservation_directory,config.trade_id,
++            keys.contract_address(),amount,maximum_fee,rpc.fee_rate_atoms_per_kb).await?;
++        ensure!(saved.psbt().to_string().len()<=100_000,"reservation too large for private coordinator");
++        Ok(serde_json::json!({"schema":"monzero-ltc-reservation-prepare-response-v1","requestId":request.request_id,
++            "snapshot":snapshot,"reservation":{"psbt":saved.psbt().to_string(),"txid":saved.psbt().unsigned_tx.compute_txid(),
++                "contract":keys.contract_address().to_string(),"amountAtoms":amount.to_sat().to_string(),
++                "feeAtoms":saved.fee().to_sat().to_string(),"maximumFeeAtoms":maximum_fee.to_sat().to_string(),
++                "wallet":rpc.ltc_wallet,"anchor":rpc.ltc_anchor,"reserved":true,"signed":false,"broadcast":false}}))
++    }
++
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct RefundRpc {
+@@ -558,6 +605,14 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
++        if args.len()==4 && args[1]=="--reservation-prepare-stdio-v1" && args[2]=="--config-file" {
++            let mut input=Vec::new();std::io::stdin().take(513).read_to_end(&mut input)?;
++            ensure!(input.len()<=512,"oversized reservation request");
++            let response=tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(reserve_litecoin(Path::new(&args[3]),&input))?;
++            let output=serde_json::to_vec(&response)?;ensure!(output.len()<=110000,"oversized reservation response");
++            std::io::stdout().write_all(&output)?;return Ok(());
++        }
+         ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
+             && args[2]=="--config-file","invalid journal helper arguments");
+         let review_mode=args[1]=="--refund-review-stdio-v1";
+diff --git a/swap-machine/src/litecoin_rpc/reservation.rs b/swap-machine/src/litecoin_rpc/reservation.rs
+index fdca10684..2e0f8b1f1 100644
+--- a/swap-machine/src/litecoin_rpc/reservation.rs
++++ b/swap-machine/src/litecoin_rpc/reservation.rs
+@@ -34,6 +34,7 @@ pub enum LockObservation {
+ pub struct ReservedLock { preview: LockPreview }
+ impl ReservedLock {
+     pub fn psbt(&self) -> &Psbt { &self.preview.psbt }
++    pub fn fee(&self) -> Amount { self.preview.fee }
+ }
+ 
+ /// Holds a nonblocking process lock over the complete journal/RPC operation.
+@@ -157,6 +158,33 @@ impl LitecoinRpc {
+         self.restore_reservation(&journal, &intent, validated).await
+     }
+ 
++    /// Resume an existing reservation before considering new inputs. Only an
++    /// absent intent permits construction; corruption or a different deployment
++    /// never falls back to another transaction. Concurrent publication still
++    /// fails closed in reserve_lock under the journal lease.
++    pub async fn prepare_or_resume_lock(&self,directory:&Path,trade:uuid::Uuid,
++        contract:&LtcSegwitAddress,amount:Amount,maximum_fee:Amount,fee_rate:u64)->Result<ReservedLock> {
++        ensure!(!trade.is_nil(),"invalid Litecoin reservation trade");
++        let journal=Journal::open(directory)?;
++        match journal.read(&format!("{trade}.intent")) {
++            Ok(bytes)=>{
++                let intent:Intent=serde_json::from_slice(&bytes)?;
++                ensure!(intent.trade==trade && intent.contract==contract.to_string()
++                    && intent.amount==amount.to_sat() && intent.maximum_fee==maximum_fee.to_sat(),
++                    "reservation differs from requested trade terms");
++                self.validate_intent(&intent)?;
++                drop(journal);
++                self.resume_lock(directory,trade).await
++            },
++            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
++                drop(journal);
++                let preview=self.preview_lock(contract,amount,fee_rate,maximum_fee).await?;
++                self.reserve_lock(directory,trade,contract,amount,maximum_fee,&preview).await
++            },
++            Err(error)=>Err(error),
++        }
++    }
++
+     /// Reopen only the original immutable intent. Wallet restart cannot approve
+     /// new inputs, fees or outputs. Missing/spent inputs require reconciliation.
+     pub async fn resume_lock(&self, directory: &Path, trade: uuid::Uuid) -> Result<ReservedLock> {

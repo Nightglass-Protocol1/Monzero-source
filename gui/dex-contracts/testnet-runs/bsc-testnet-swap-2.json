@@ -1,0 +1,69 @@
+{
+  "bnb": {
+    "claimerAfter": "39995587000000000",
+    "claimerBefore": "20000000000000000",
+    "ownerAfter": "59989550000000000",
+    "ownerBefore": "79997900000000000"
+  },
+  "claimer": {
+    "bnbTxs": {
+      "claim": [
+        "0x383ae8c00ce49252d891bfd4a3b676f50f9bd511e28e516dc3eb20b11241303f"
+      ]
+    },
+    "final": "Done(Swapped)",
+    "xmzLock": "27d2d746a313edccfd0e3eb0f1220022b788a690d4276a4d3459624af332fee5",
+    "xmzSweep": null
+  },
+  "contract": "0xf7c19f735C3494b356091eFBeFf3ab53617190b7",
+  "mode": "swap",
+  "owner": {
+    "bnbTxs": {
+      "new_swap": [
+        "0x3e1d9e813133f794bac5ed438a6094ad0c9724c277b97e3feba8f47e6c0de58f"
+      ],
+      "set_ready": [
+        "0xadee4c562ad5c6498cee19d281e5b44dadcd8040ea85ed66a72ab4f3169e1c4f"
+      ]
+    },
+    "final": "Done(Swapped)",
+    "xmz": [
+      {
+        "tx_hash": "9c9117dc36fcea76cfc45730295b4f2c182e7a35fd5f9a3d7b1e7c3c3b4cb317"
+      }
+    ]
+  },
+  "ownerXmzAddress": "Kj6eS5NDL6CXnv6piLerbiKnUmYx7kP7PXdqPsL5voNgLNnNqnVPPPTXDxfVqfvBRo6sJWxgRRATBJzuUGsr9taGB5NqWX9",
+  "sharedXmzAddress": "KiyQ6L4tJ8mL5H6MKQPPg8MzBK6QFyW4XD7UzFpWSj3VY2dkCr513Qj5p2FUrmZxivaGjSFXJbiM69jzwG2drTPLTqYfZDt",
+  "tradeId": "0xc630f448da7a261475d1f18e83fc9925fd560169cccb40c6139bc60a9c6d2d1f",
+  "offer": {
+    "tradeId": "0xc630f448da7a261475d1f18e83fc9925fd560169cccb40c6139bc60a9c6d2d1f",
+    "chainId": 97,
+    "contract": "0xf7c19f735c3494b356091efbeff3ab53617190b7",
+    "owner": "0xc70a2570d28a1e270f167da56967e37c0efd1863",
+    "claimer": "0x6dfd9aa975d8662407437379a55c8bf42756f728",
+    "asset": "0x0000000000000000000000000000000000000000",
+    "value": "0x470de4df820000",
+    "duration1": 7200,
+    "duration2": 7200,
+    "xmzAmount": 2000000000000,
+    "xmzNetwork": "testnet",
+    "expiresAt": 1793363879
+  },
+  "timing": {
+    "xmz_confirmations": 10,
+    "xmz_lock_budget": 3600,
+    "owner_refund_margin": 1800,
+    "claim_margin": 1800
+  },
+  "verified": {
+    "ownerXmzWalletBalance": "19.9903296 tXMZ unlocked (in-transfer 9c9117dc\u2026 at XMZ testnet height 2663)",
+    "claimerBnbGain": "0.019995587 tBNB (0.02 minus claim gas)",
+    "bothFinal": "Done(Swapped)"
+  },
+  "notes": [
+    "Accounts #2 (owner) and #3 (claimer) of the test phrase",
+    "Resumed three times from run.json + journals while endpoint problems were fixed (drpc, onfinality); no funds at risk at any stop",
+    "BNB lock 11:38 UTC, XMZ lock 11:43, setReady 12:03, claim 12:03, owner sweep confirmed 12:13 (10 XMZ confirmations)"
+  ]
+}

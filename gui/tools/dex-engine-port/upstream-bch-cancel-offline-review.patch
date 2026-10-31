@@ -1,0 +1,42 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel.rs
+@@ -67,8 +67,20 @@
+     }
+     /// Offline review is not maturity evidence or refund release authority.
+     pub fn review_bch_cancel_relay(&self,bch: &BchRpc,now: u64) -> Result<CancelRelayReview> {
++        self.review_bch_cancel_relay_for_deployment(&bch.deployment_commitment()?,now)
++    }
++    /// Offline app review needs only the pinned deployment, not wallet credentials.
++    /// This is not confirmation, maturity evidence or relay permission.
++    pub fn review_bch_cancel_relay_for_deployment(&self,expected: &[u8;32],now: u64) -> Result<CancelRelayReview> {
+         let (review,_,_,prepared_at,deployment)=self.cancel_relay_materials()?;
+-        ensure!(now>=prepared_at && bch.deployment_commitment()?==deployment,"BCH cancellation review predates preparation or changes observer");
++        ensure!(now>=prepared_at && expected==&deployment,"BCH cancellation review predates preparation or changes observer");
++        Ok(review)
++    }
++    /// Historical saved review remains available after quote expiry without RPC.
++    pub fn saved_bch_cancel_relay_review(&self,expected: &[u8;32]) -> Result<CancelRelayReview> {
++        let (review,cancel,_,prepared_at,deployment)=self.cancel_relay_materials()?;
++        ensure!(expected==&deployment,"BCH cancellation saved observer changed");
++        self.cancel_state(&review,prepared_at,cancel.compute_txid())?;
+         Ok(review)
+     }
+     fn cancel_attempt(&self,review: &CancelRelayReview,prepared_at: u64) -> Result<Option<(Attempt,[u8;32])>> {
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -193,6 +193,15 @@
+     assert_eq!(retried.commitment(),retained.commitment());
+     assert_eq!(contents(&metadata.0)?,after_recovery);
+     assert_eq!(contents(&snapshots.0)?,after_private);
++    let cancellation=execution.review_bch_cancel_relay(&rpc,base+12)?;
++    assert_eq!(execution.review_bch_cancel_relay_for_deployment(&deployment,base+12)?.commitment,cancellation.commitment);
++    assert_eq!(execution.saved_bch_cancel_relay_review(&deployment)?.details,cancellation.details);
++    assert!(execution.review_bch_cancel_relay_for_deployment(&[0;32],base+12).is_err());
++    assert!(execution.saved_bch_cancel_relay_review(&[0;32]).is_err());
++    assert!(execution.review_bch_cancel_relay_for_deployment(&deployment,base+10).is_err());
++    assert_eq!(execution.review_bch_cancel_relay_for_deployment(&deployment,base+3600)?.commitment,cancellation.commitment);
++    assert_eq!(contents(&metadata.0)?,after_recovery);
++    assert_eq!(contents(&snapshots.0)?,after_private);
+     let reviewed_at=if submit_case==Some(submit::Case::Expired) {base+12} else {clock};
+     let expected=execution.review_bch_funding_relay(&rpc,reviewed_at)?;
+     let deployment=rpc.deployment_commitment()?;

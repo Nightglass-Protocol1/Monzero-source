@@ -1,0 +1,425 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/observer.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/observer.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/observer.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/observer.rs
+@@ -62,6 +62,12 @@
+         let (binding,_,_)=self.light_observer_materials(observer,now)?;
+         self.metadata.retain(&record_name(self.quote,"local-observer"),&serde_json::to_vec(&binding)?)
+     }
++    pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
++    fn bound_light_bch_funding(&self,observer:&OwnedBchObserver,now:u64)->Result<SignedFunding> {
++        let (_,signed,existing)=self.light_observer_materials(observer,now)?;
++        ensure!(existing,"approve and retain the BCH chain observer first");
++        Ok(signed)
++    }
+     /// Read the exact signed funding through the retained chain observer. No
+     /// node-wallet lock records, signing, relay or inference from absence.
+     pub async fn observe_light_bch_funding(&self,observer:&OwnedBchObserver,now:u64)->Result<BoundFundingObservation> {
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs
+@@ -16,10 +16,14 @@
+     }
+     pub fn saved_bch_success_preparation(&self,deployment: &[u8;32],safety_blocks: u32,now: u64)
+         -> Result<SavedSuccessPreparation> {
++        let context=self.success_context_for_deployment(deployment,now)?;
++        self.saved_success_for_context(context,deployment,safety_blocks,now)
++    }
++    pub(super) fn saved_success_for_context(&self,context:ReleaseContext,deployment:&[u8;32],safety_blocks:u32,now:u64)
++        ->Result<SavedSuccessPreparation> {
+         ensure!(self.policy.bch_confirmations>0 && self.policy.xmz_confirmations>0 && safety_blocks>0
+             && u64::from(self.policy.bch_confirmations)+u64::from(safety_blocks)<u64::from(self.policy.cancel_blocks),
+             "invalid BCH success release margin");
+-        let context=self.success_context_for_deployment(deployment,now)?;
+         let prepared=self.load_success("prepared",&context)?;
+         let signed=self.load_success("signed",&context)?;
+         ensure!(signed.is_none() || prepared.is_some(),"signed BCH success lacks preparation");
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/light.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/light.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/light.rs
+@@ -0,0 +1,54 @@
++//! Explicit local-wallet success release using the retained chain observer.
++//! All exposures share the node path's live native/BCH checks and private journal.
++use super::*;
++use crate::bch_rpc::observer::OwnedBchObserver;
++use super::approval::{SuccessReleaseReview,SavedSuccessPreparation};
++const REVIEW:&str="monzero-bch-light-success-release-review-v1";
++impl AdmittedExecution<'_> {
++    pub fn saved_light_bch_success_preparation(&self,bch:&OwnedBchObserver,safety:u32,now:u64)->Result<SavedSuccessPreparation> {
++        let context=self.success_context_for_observer(&SuccessObserver::Local(bch),now)?;
++        let mut saved=self.saved_success_for_context(context,&bch.deployment_commitment()?,safety,now)?;
++        saved.review=action_review(saved.review,"prepare-bch-success-release")?;
++        Ok(saved)
++    }
++    pub fn review_light_bch_success_release(&self,bch:&OwnedBchObserver,safety:u32,now:u64)->Result<SuccessReleaseReview> {
++        Ok(self.saved_light_bch_success_preparation(bch,safety,now)?.review)
++    }
++    pub fn review_light_bch_success_signature_retention(&self,bch:&OwnedBchObserver,safety:u32,now:u64)->Result<SuccessReleaseReview> {
++        let saved=self.saved_light_bch_success_preparation(bch,safety,now)?;
++        ensure!(saved.prepared_at.is_some(),"missing BCH success signing preparation");
++        action_review(saved.review,"retain-bch-success-signature")
++    }
++    pub fn review_signed_light_bch_success_release(&self,bch:&OwnedBchObserver,safety:u32,now:u64)->Result<SuccessReleaseReview> {
++        let saved=self.saved_light_bch_success_preparation(bch,safety,now)?;
++        ensure!(saved.signature_retained,"missing signed BCH success release");
++        action_review(saved.review,"release-signed-bch-success")
++    }
++    /// Public review is not chain evidence. Fresh checks precede every exposure,
++    /// including identical retries after commercial expiry or process restart.
++    pub async fn prepare_reviewed_light_bch_success_release(&mut self,native:&impl FundingObserver,bch:&OwnedBchObserver,
++        safety:u32,now:u64,approved:&[u8;32])->Result<Zeroizing<Vec<u8>>> {
++        ensure!(self.review_light_bch_success_release(bch,safety,now)?.commitment==*approved,"BCH light success release consent changed");
++        let release=self.checked_success(native,SuccessObserver::Local(bch),safety,now,Action::Prepare).await?;
++        Ok(Zeroizing::new(release.frame.clone()))
++    }
++    pub async fn retain_reviewed_light_bch_success_signature(&mut self,native:&impl FundingObserver,bch:&OwnedBchObserver,
++        safety:u32,now:u64,frame:&[u8],signature:&[u8],approved:&[u8;32])->Result<SignedSuccess> {
++        ensure!(self.review_light_bch_success_signature_retention(bch,safety,now)?.commitment==*approved,"BCH light success signature consent changed");
++        let release=self.checked_success(native,SuccessObserver::Local(bch),safety,now,Action::Submit(frame,signature)).await?;
++        Ok(SignedSuccess {frame:Zeroizing::new(release.frame.clone()),signature:release.signature.clone().context("missing signature")?})
++    }
++    pub async fn recover_reviewed_light_bch_success_release(&mut self,native:&impl FundingObserver,bch:&OwnedBchObserver,
++        safety:u32,now:u64,approved:&[u8;32])->Result<SignedSuccess> {
++        ensure!(self.review_signed_light_bch_success_release(bch,safety,now)?.commitment==*approved,"signed BCH light success consent changed");
++        let release=self.checked_success(native,SuccessObserver::Local(bch),safety,now,Action::Recover).await?;
++        Ok(SignedSuccess {frame:Zeroizing::new(release.frame.clone()),signature:release.signature.clone().context("missing signature")?})
++    }
++}
++fn action_review(mut review:SuccessReleaseReview,action:&str)->Result<SuccessReleaseReview> {
++    review.details["schema"]=serde_json::json!(REVIEW);
++    review.details["fundingSource"]=serde_json::json!("local-wallet");
++    review.details["action"]=serde_json::json!(action);
++    review.commitment=hash(REVIEW,&serde_json::to_vec(&review.details)?);
++    Ok(review)
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+@@ -23,6 +23,20 @@
+     pub fn frame(&self) -> &[u8] {&self.frame}
+     pub fn signature(&self) -> &[u8] {&self.signature}
+ }
++enum SuccessObserver<'a> {Node(&'a BchRpc),Local(&'a crate::bch_rpc::observer::OwnedBchObserver)}
++impl SuccessObserver<'_> {
++    fn deployment(&self)->Result<[u8;32]> {
++        match self {Self::Node(rpc)=>rpc.deployment_commitment(),Self::Local(observer)=>observer.deployment_commitment()}
++    }
++    async fn require_window(&self,funding:&SignedFunding,deployment:&[u8;32],minimum:u64,cancel:u32,safety:u32)->Result<()> {
++        ensure!(self.deployment()?==*deployment,"BCH success observer changed");
++        match self {
++            Self::Node(rpc)=>rpc.observe_funding(funding).await?.require_funding_window(minimum,cancel,safety),
++            Self::Local(observer)=>observer.observe_funding(funding).await?.for_deployment(deployment)?
++                .require_funding_window(minimum,cancel,safety),
++        }
++    }
++}
+ enum Action<'a> {Prepare,Submit(&'a [u8],&'a [u8]),Recover}
+ struct ReleaseContext {
+     agreement: AgreedNativeWallet, funding: SignedFunding, request: FundingRequest,
+@@ -41,20 +55,32 @@
+     ensure!(bytes.len() <= 65536,"oversized BCH success release");Ok(bytes)
+ }
+ impl AdmittedExecution<'_> {
+-    fn success_context(&self,bch: &BchRpc,now: u64) -> Result<ReleaseContext> {
++    fn success_context(&self,bch:&BchRpc,now:u64)->Result<ReleaseContext> {
+         self.success_context_for_deployment(&bch.deployment_commitment()?,now)
+     }
+-    fn success_context_for_deployment(&self,deployment: &[u8;32],now: u64) -> Result<ReleaseContext> {
+-        ensure!(self.role == Role::BchFunder,"wrong BCH success release role");
+-        // The receipt accessor is supplied by the native proof module and must
+-        // revalidate its private record, signature, quote and agreement binding.
+-        let (request,receipt,received_at) = self.native_payment_release_binding()?;
+-        ensure!(now >= received_at,"BCH success release predates native proof receipt");
+-        let agreement = self.restore_agreement()?;
+-        let funding = self.signed_bch_funding()?.context("missing exact BCH funding")?;
+-        let prepared = self.prepared_bch_funding()?.context("missing BCH funding preparation")?;
+-        let (locked,_) = self.funding_lock_intent(&prepared)?;
+-        ensure!(*deployment == locked.deployment,"BCH success observer changed");
++    fn success_context_for_observer(&self,bch:&SuccessObserver<'_>,now:u64)->Result<ReleaseContext> {
++        match bch {
++            SuccessObserver::Node(rpc)=>self.success_context_for_deployment(&rpc.deployment_commitment()?,now),
++            SuccessObserver::Local(observer)=>{
++                let funding=self.bound_light_bch_funding(observer,now)?;
++                self.success_context_for_funding(funding,now)
++            },
++        }
++    }
++    fn success_context_for_deployment(&self,deployment:&[u8;32],now:u64)->Result<ReleaseContext> {
++        self.require_node_funding_source()?;
++        let funding=self.signed_bch_funding()?.context("missing exact BCH funding")?;
++        let prepared=self.prepared_bch_funding()?.context("missing BCH funding preparation")?;
++        let (locked,_)=self.funding_lock_intent(&prepared)?;
++        ensure!(*deployment==locked.deployment,"BCH success observer changed");
++        self.success_context_for_funding(funding,now)
++    }
++    fn success_context_for_funding(&self,funding:SignedFunding,now:u64)->Result<ReleaseContext> {
++        ensure!(self.role==Role::BchFunder,"wrong BCH success release role");
++        // Revalidate private proof, peer signature, quote and agreement binding.
++        let (request,receipt,received_at)=self.native_payment_release_binding()?;
++        ensure!(now>=received_at,"BCH success release predates native proof receipt");
++        let agreement=self.restore_agreement()?;
+         self.retained_bch_recovery()?.context("missing retained BCH recovery")?;
+         Ok(ReleaseContext {agreement,funding,request,receipt,received_at,admission:self.admission_digest()?})
+     }
+@@ -89,10 +115,11 @@
+         self.metadata.retain(&format!("{slot}-pin"),&serde_json::to_vec(&pin)?)?;
+         Journal::open(&self.snapshots)?.retain(&slot,&bytes)?;Ok(())
+     }
+-    async fn checked_success(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++    async fn checked_success(&mut self,native: &impl FundingObserver,bch: SuccessObserver<'_>,
+         safety_blocks: u32,now: u64,action: Action<'_>) -> Result<Release> {
+         // Finish slow retained-state and signature validation before live RPCs.
+-        let context = self.success_context(bch,now)?;
++        let context = self.success_context_for_observer(&bch,now)?;
++        let deployment=bch.deployment()?;
+         let retained = self.load_success("prepared",&context)?;
+         let signed = self.load_success("signed",&context)?;
+         ensure!(signed.is_none() || retained.is_some(),"signed BCH success lacks original preparation");
+@@ -126,8 +153,8 @@
+         };
+         let evidence = xmz_funding::verify(native,context.request,&self.policy.xmz_genesis,
+             u64::from(self.policy.xmz_confirmations)).await?;
+-        let live = bch.observe_funding(&context.funding).await?;
+-        live.require_funding_window(u64::from(self.policy.bch_confirmations),u32::from(self.policy.cancel_blocks),safety_blocks)?;
++        bch.require_window(&context.funding,&deployment,u64::from(self.policy.bch_confirmations),
++            u32::from(self.policy.cancel_blocks),safety_blocks).await?;
+         ensure!(native.snapshot().await? == *evidence.snapshot(),"native chain changed before BCH success release");
+         // Records are not cached chain approval. Every path above, including a
+         // retry or external signer submission, repeats both-chain observation.
+@@ -137,17 +164,17 @@
+     }
+     pub async fn bch_success_signing_frame(&mut self,native: &impl FundingObserver,bch: &BchRpc,
+         safety_blocks: u32,now: u64) -> Result<Zeroizing<Vec<u8>>> {
+-        let release = self.checked_success(native,bch,safety_blocks,now,Action::Prepare).await?;
++        let release = self.checked_success(native,SuccessObserver::Node(bch),safety_blocks,now,Action::Prepare).await?;
+         Ok(Zeroizing::new(release.frame.clone()))
+     }
+     pub async fn retain_bch_success_signature(&mut self,native: &impl FundingObserver,bch: &BchRpc,
+         safety_blocks: u32,now: u64,frame: &[u8],signature: &[u8]) -> Result<SignedSuccess> {
+-        let release = self.checked_success(native,bch,safety_blocks,now,Action::Submit(frame,signature)).await?;
++        let release = self.checked_success(native,SuccessObserver::Node(bch),safety_blocks,now,Action::Submit(frame,signature)).await?;
+         Ok(SignedSuccess {frame:Zeroizing::new(release.frame.clone()),signature:release.signature.clone().context("missing signature")?})
+     }
+     pub async fn recover_bch_success_release(&mut self,native: &impl FundingObserver,bch: &BchRpc,
+         safety_blocks: u32,now: u64) -> Result<SignedSuccess> {
+-        let release = self.checked_success(native,bch,safety_blocks,now,Action::Recover).await?;
++        let release = self.checked_success(native,SuccessObserver::Node(bch),safety_blocks,now,Action::Recover).await?;
+         Ok(SignedSuccess {frame:Zeroizing::new(release.frame.clone()),signature:release.signature.clone().context("missing signature")?})
+     }
+ }
+@@ -157,3 +184,5 @@
+ pub mod native_claim;
+ 
+ pub mod approval;
++
++pub mod light;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs
+@@ -5,8 +5,24 @@
+ use serde_json::{Value,json};
+ use std::{net::TcpListener,io::{BufRead,BufReader,Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
+ 
++pub(super) struct Fixture {
++    pub observer:OwnedBchObserver,pub depth:Arc<AtomicUsize>,stop:Arc<AtomicBool>,
++    server:Option<std::thread::JoinHandle<Result<()>>>,
++}
++impl Fixture {
++    pub fn finish(mut self)->Result<()> {
++        self.stop.store(true,Ordering::Relaxed);
++        self.server.take().context("missing observer fixture")?.join().unwrap()
++    }
++}
++impl Drop for Fixture {
++    fn drop(&mut self) {
++        self.stop.store(true,Ordering::Relaxed);
++        if let Some(server)=self.server.take() {let _=server.join();}
++    }
++}
+ pub(super) async fn exercise(execution:&mut AdmittedExecution<'_>,metadata:&std::path::Path,
+-    signed:&Transaction,network:BchNetwork,wallet:sha256::Hash,trade:uuid::Uuid)->Result<OwnedBchObserver> {
++    signed:&Transaction,network:BchNetwork,wallet:sha256::Hash,trade:uuid::Uuid)->Result<Fixture> {
+     let listener=TcpListener::bind("127.0.0.1:0")?;listener.set_nonblocking(true)?;let port=listener.local_addr()?.port();
+     let make=|port,network,password:&str|OwnedBchObserver::new(port,"user".into(),password.into(),network,"/Bitcoin Cash Node:29.0.0/".into());
+     let observer=make(port,network,"pass")?;
+@@ -92,6 +108,7 @@
+     use std::os::unix::fs::PermissionsExt;
+     for path in [&source,&local,&slot] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;}
+     let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();let calls=Arc::new(AtomicUsize::new(0));let counted=calls.clone();
++    let depth=Arc::new(AtomicUsize::new(3));let observed_depth=depth.clone();
+     let txid=signed.compute_txid();let script=signed.output[0].script_pubkey.to_hex_string();
+     let server=std::thread::spawn(move ||->Result<()> {
+         while !signal.load(Ordering::Relaxed) {
+@@ -108,7 +125,7 @@
+                 "getnetworkinfo"=>json!({"subversion":"/Bitcoin Cash Node:29.0.0/","networkactive":true}),
+                 "getblockchaininfo"=>json!({"chain":"regtest","blocks":200,"headers":200,"initialblockdownload":false,"bestblockhash":"08".repeat(32)}),
+                 "getblockhash"=>json!(if request["params"][0]==0 {network.genesis().to_owned()}else{"07".repeat(32)}),
+-                "gettxout"=>{ensure!(request["params"]==json!([txid,0,true]),"wrong exact funding output");json!({"bestblock":"08".repeat(32),"confirmations":3,
++                "gettxout"=>{ensure!(request["params"]==json!([txid,0,true]),"wrong exact funding output");json!({"bestblock":"08".repeat(32),"confirmations":observed_depth.load(Ordering::Relaxed),
+                     "value":0.001,"coinbase":false,"scriptPubKey":{"hex":script,"addresses":[]}})},
+                 _=>anyhow::bail!("wallet or mutating RPC forbidden"),
+             };
+@@ -117,10 +134,10 @@
+         }
+         Ok(())
+     });
+-    let observed=execution.observe_light_bch_funding(&observer,2002).await;
+-    stop.store(true,Ordering::Relaxed);server.join().unwrap()?;
+-    let observed=observed?;let exact=observed.for_deployment(&observer.deployment_commitment()?)?;
++    let fixture=Fixture {observer,depth,stop,server:Some(server)};
++    let observed=execution.observe_light_bch_funding(&fixture.observer,2002).await?;
++    let exact=observed.for_deployment(&fixture.observer.deployment_commitment()?)?;
+     assert_eq!(exact.txid(),signed.compute_txid());assert_eq!(exact.status(),FundingStatus::ConfirmedUnspent {confirmations:3});
+     assert!(calls.load(Ordering::Relaxed)>0);assert_eq!(std::fs::read(&slot)?,saved);
+-    Ok(observer)
++    Ok(fixture)
+ }
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
+@@ -0,0 +1,114 @@
++use super::*;
++use agreement::execution::{AdmittedExecution,funding::success::SignedSuccess};
++use crate::xmz_funding::{FundingObserver,FundingRequest,FundingObservation,ChainSnapshot};
++use std::sync::atomic::{AtomicUsize,Ordering};
++use swap_core::monero::{TransferProof,TxHash,PrivateKey,Scalar};
++use zeroize::Zeroizing;
++
++struct Native {genesis:String,address:String,amount:u64,mode:AtomicUsize,snapshots:AtomicUsize}
++impl Native {
++    fn new(execution:&AdmittedExecution<'_>,setup:&Setup)->Result<Self> {
++        Ok(Self {genesis:setup.policy.xmz_genesis.clone(),
++            address:execution.restore_agreement()?.owned().wallet().address().to_string(),
++            amount:setup.quote.terms()["xmzAtoms"].parse()?,mode:AtomicUsize::new(0),snapshots:AtomicUsize::new(0)})
++    }
++    fn mode(&self,mode:usize) {self.mode.store(mode,Ordering::SeqCst);self.snapshots.store(0,Ordering::SeqCst);}
++}
++#[async_trait::async_trait]
++impl FundingObserver for Native {
++    async fn snapshot(&self)->Result<ChainSnapshot> {
++        let call=self.snapshots.fetch_add(1,Ordering::SeqCst);
++        Ok(ChainSnapshot {genesis:self.genesis.clone(),tip_height:110,
++            tip_hash:if self.mode.load(Ordering::SeqCst)==3 && call>=2 {"09"}else{"08"}.repeat(32)})
++    }
++    async fn observe(&self,request:&FundingRequest)->Result<FundingObservation> {
++        ensure!(request.proof.tx_hash.0=="ab".repeat(32) && request.proof.tx_key==PrivateKey::from_scalar(Scalar::ONE),
++            "unexpected fixture payment proof");
++        let mode=self.mode.load(Ordering::SeqCst);
++        Ok(FundingObservation {txid:"ab".repeat(32),address:self.address.clone(),
++            received_atoms:self.amount+u64::from(mode==2),in_pool:mode==1,height:100,confirmations:11})
++    }
++}
++#[derive(serde::Serialize)]
++struct Proof {
++    schema:String,quote:[u8;32],agreement:[u8;32],swap:String,bch_txid:String,bch_vout:u32,
++    genesis:String,destination:String,amount:u64,proof:TransferProof,
++}
++pub(super) async fn exercise(execution:&mut AdmittedExecution<'_>,setup:&Setup,snapshots:&std::path::Path,
++    metadata:&std::path::Path,fixture:&super::light_observer::Fixture,signed:&Transaction)->Result<SignedSuccess> {
++    let bch=&fixture.observer;let native=Native::new(execution,setup)?;
++    let trade=&setup.quote.terms()["swapId"];
++    let prepared=snapshots.join(format!("{trade}.bch-success-prepared"));
++    let signed_slot=snapshots.join(format!("{trade}.bch-success-signed"));
++    assert!(!prepared.exists());assert!(!signed_slot.exists());
++    assert!(execution.review_light_bch_success_release(bch,5,2010).is_err());
++    let proof=Proof {schema:"monzero-bch-native-payment-proof-v1".into(),quote:*setup.quote.commitment(),
++        agreement:*execution.restore_agreement()?.commitment(),swap:trade.clone(),
++        bch_txid:signed.compute_txid().to_string(),bch_vout:0,genesis:setup.policy.xmz_genesis.clone(),
++        destination:native.address.clone(),amount:native.amount,
++        proof:TransferProof::new(TxHash("ab".repeat(32)),PrivateKey::from_scalar(Scalar::ONE))};
++    let bytes=Zeroizing::new(serde_json::to_vec(&proof)?);
++    let signature=SigningKey::from_bytes(&[2;32]).sign(&agreement::execution::funding::native::proof::signing_bytes(&bytes)?).to_bytes();
++    execution.accept_bch_native_proof(2004,&bytes,&signature)?;
++    assert!(execution.review_bch_success_release(&bch.deployment_commitment()?,5,2010).is_err());
++    for margin in [0,u32::from(setup.policy.cancel_blocks)] {assert!(execution.review_light_bch_success_release(bch,margin,2010).is_err());}
++    let review=execution.review_light_bch_success_release(bch,5,2010)?;
++    assert_eq!(review.details["fundingSource"],"local-wallet");
++    assert_eq!(native.snapshots.load(Ordering::SeqCst),0);
++    assert!(execution.prepare_reviewed_light_bch_success_release(&native,bch,5,2010,&[0;32]).await.is_err());
++    assert_eq!(native.snapshots.load(Ordering::SeqCst),0);
++    for mode in [1,2,3] {
++        native.mode(mode);
++        assert!(execution.prepare_reviewed_light_bch_success_release(&native,bch,5,2010,&review.commitment).await.is_err(),"unsafe native mode {mode}");
++        assert!(!prepared.exists());
++    }
++    native.mode(0);
++    for depth in [usize::try_from(setup.policy.bch_confirmations)?-1,usize::from(setup.policy.cancel_blocks)-5,usize::from(setup.policy.cancel_blocks)] {
++        fixture.depth.store(depth,Ordering::SeqCst);
++        assert!(execution.prepare_reviewed_light_bch_success_release(&native,bch,5,2010,&review.commitment).await.is_err(),"unsafe BCH depth {depth}");
++        assert!(!prepared.exists());
++    }
++    fixture.depth.store(3,Ordering::SeqCst);
++    let frame=execution.prepare_reviewed_light_bch_success_release(&native,bch,5,2010,&review.commitment).await?;
++    assert!(prepared.exists());assert!(!signed_slot.exists());
++    let original=Zeroizing::new(std::fs::read(&prepared)?);
++    assert_eq!(*execution.prepare_reviewed_light_bch_success_release(&native,bch,5,2011,&review.commitment).await?,*frame);
++    assert_eq!(*Zeroizing::new(std::fs::read(&prepared)?),*original);
++    assert!(execution.review_signed_light_bch_success_release(bch,5,2011).is_err());
++    let signing=execution.review_light_bch_success_signature_retention(bch,5,2011)?;
++    assert_ne!(signing.commitment,review.commitment);
++    let signing_bytes=agreement::success::signing_bytes(&frame)?;
++    let sig=SigningKey::from_bytes(&[1;32]).sign(&signing_bytes).to_bytes();
++    let wrong=SigningKey::from_bytes(&[2;32]).sign(&signing_bytes).to_bytes();
++    assert!(execution.retain_reviewed_light_bch_success_signature(&native,bch,5,2011,&frame,&sig,&review.commitment).await.is_err());
++    assert!(execution.retain_reviewed_light_bch_success_signature(&native,bch,5,2011,&frame,&wrong,&signing.commitment).await.is_err());
++    assert!(!signed_slot.exists());
++    native.mode(1);
++    assert!(execution.retain_reviewed_light_bch_success_signature(&native,bch,5,2011,&frame,&sig,&signing.commitment).await.is_err());
++    assert!(!signed_slot.exists());native.mode(0);
++    let release=execution.retain_reviewed_light_bch_success_signature(&native,bch,5,2011,&frame,&sig,&signing.commitment).await?;
++    assert_eq!(release.frame(),&*frame);assert_eq!(release.signature(),sig);
++    let recovery=execution.review_signed_light_bch_success_release(bch,5,2012)?;
++    assert_ne!(recovery.commitment,signing.commitment);
++    fixture.depth.store(usize::from(setup.policy.cancel_blocks)-5,Ordering::SeqCst);
++    assert!(execution.recover_reviewed_light_bch_success_release(&native,bch,5,2012,&recovery.commitment).await.is_err());
++    fixture.depth.store(3,Ordering::SeqCst);native.mode(3);
++    assert!(execution.recover_reviewed_light_bch_success_release(&native,bch,5,2012,&recovery.commitment).await.is_err());
++    native.mode(0);
++    assert_eq!(execution.recover_reviewed_light_bch_success_release(&native,bch,5,2012,&recovery.commitment).await?.frame(),release.frame());
++    assert!(!metadata.join(format!("{trade}.bch-funding-wallet-lock-intent")).exists());
++    Ok(release)
++}
++pub(super) async fn reopen(execution:&mut AdmittedExecution<'_>,setup:&Setup,fixture:&super::light_observer::Fixture,
++    original:&SignedSuccess)->Result<()> {
++    let native=Native::new(execution,setup)?;let bch=&fixture.observer;
++    let saved=execution.saved_light_bch_success_preparation(bch,5,2020)?;
++    assert_eq!(saved.prepared_at,Some(2010));assert!(saved.signature_retained);
++    let review=execution.review_signed_light_bch_success_release(bch,5,2020)?;
++    native.mode(1);
++    assert!(execution.recover_reviewed_light_bch_success_release(&native,bch,5,2020,&review.commitment).await.is_err());
++    native.mode(0);
++    let recovered=execution.recover_reviewed_light_bch_success_release(&native,bch,5,2020,&review.commitment).await?;
++    assert_eq!(recovered.frame(),original.frame());assert_eq!(recovered.signature(),original.signature());
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -1024,13 +1024,17 @@
+         drop(execution);
+         let mut resumed=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+         assert_eq!(resumed.outgoing_bch_funding_message()?.unwrap().frame(),frame);
+-        let observer=light_observer::exercise(&mut resumed,&metadata.0,&signed,rpc_network,observer_wallet,operation).await?;
++        let fixture=light_observer::exercise(&mut resumed,&metadata.0,&signed,rpc_network,observer_wallet,operation).await?;
++        let observer=&fixture.observer;
++        let release=light_success::exercise(&mut resumed,&setup,&snapshots.0,&metadata.0,&fixture,&signed).await?;
+         let bound_path=metadata.0.join(format!("{operation}.bch-funding-local-observer"));let bound=std::fs::read(&bound_path)?;
+         drop(resumed);
+-        let cold=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let mut cold=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+         let review=cold.review_light_bch_observer(&observer,2003)?;
+         cold.bind_reviewed_light_bch_observer(&observer,2003,&review.commitment)?;
+         assert_eq!(std::fs::read(bound_path)?,bound);
++        light_success::reopen(&mut cold,&setup,&fixture,&release).await?;
++        fixture.finish()?;
+     }
+     }
+     Ok(())
+@@ -1044,3 +1048,6 @@
+ 
+ #[cfg(target_os="linux")]
+ mod light_observer;
++
++#[cfg(target_os="linux")]
++mod light_success;

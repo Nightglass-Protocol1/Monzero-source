@@ -1,0 +1,100 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet.rs
+@@ -27,6 +27,8 @@
+         assert_eq!(initial["chainObserved"],false);assert_eq!(initial["executable"],false);
+         assert_eq!(observer_fixture.calls.lock().unwrap().len(),calls);
+         assert!(wallet.state.lock().unwrap().calls.is_empty());
++        helper::exercise(&copied.0,snapshots,setup,rpc,txid,&initial)?;
++        assert!(wallet.state.lock().unwrap().calls.is_empty());
+         let mut session=wallet.session()?;
+         let recovered=execution.recover_light_bch_native_refund(&observer,rpc,txid,block,2043).await?;
+         let review=execution.review_recovered_bch_refund_wallet(&recovered,RefundWalletAction::Restore,&session,2043)?;
+@@ -46,6 +48,7 @@
+         let wallet_calls=wallet.state.lock().unwrap().calls.len();
+         let recorded=execution.bch_native_refund_wallet_status(txid,2044)?;
+         assert_eq!(recorded["state"],if lost==0 {"ready"} else {"attempted"});
++        helper::exercise(&copied.0,snapshots,setup,rpc,txid,&recorded)?;
+         assert_eq!(recorded["walletBinding"],initial["walletBinding"]);
+         assert!(!recorded["walletIntent"].is_null());
+         assert!(execution.bch_native_refund_wallet_status(Txid::from_byte_array([0;32]),2044).is_err());
+@@ -94,3 +97,5 @@
+ }
+ 
+ mod payout;
++
++mod helper;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet/helper.rs
+@@ -0,0 +1,72 @@
++//! Real helper and production desktop worker checks for historical wallet status.
++use super::*;
++use sha2::{Digest,Sha256};
++use std::{path::{Path,PathBuf},process::{Command,Stdio},os::unix::fs::PermissionsExt};
++fn hex(bytes:&[u8])->String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
++fn contents(path:&Path)->Result<std::collections::BTreeMap<std::ffi::OsString,Vec<u8>>> {
++    std::fs::read_dir(path)?.map(|entry| {let entry=entry?;
++        ensure!(entry.file_type()?.is_file(),"unexpected status fixture entry");
++        Ok((entry.file_name(),std::fs::read(entry.path())?))}).collect()
++}
++fn save(path:&Path,bytes:&[u8])->Result<()> {
++    std::fs::write(path,bytes)?;std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;Ok(())
++}
++fn pinned(name:&str)->Result<(PathBuf,String)> {
++    let path=PathBuf::from(std::env::var_os(name).context("missing status executable")?);
++    let digest=std::env::var(format!("{name}_SHA256"))?;
++    ensure!(path.is_absolute() && path.canonicalize()?==path
++        && hex(&Sha256::digest(std::fs::read(&path)?))==digest,"status executable pin changed");
++    Ok((path,digest))
++}
++pub(super) fn exercise(metadata:&Path,snapshots:&PrivateStore,setup:&Setup,rpc:&OwnedBchObserver,
++    refund:Txid,expected:&Value)->Result<()> {
++    const HELPER:&str="MONZERO_BCH_REFUND_WALLET_HELPER";
++    const PROBE:&str="MONZERO_BCH_QT_REFUND_WALLET_PROBE";
++    if std::env::var_os(HELPER).is_none() {
++        ensure!([format!("{HELPER}_SHA256"),PROBE.into(),format!("{PROBE}_SHA256")]
++            .iter().all(|key|std::env::var_os(key).is_none()),"incomplete status integration pins");
++        return Ok(())
++    }
++    let (helper,digest)=pinned(HELPER)?;let (probe,probe_digest)=pinned(PROBE)?;
++    let original=contents(metadata)?;let secrets=contents(&snapshots.0)?;
++    // The calling execution owns its journal lock. Use independent private copies.
++    let copied=PrivateStore::new()?;let private=PrivateStore::new()?;
++    for (name,bytes) in &original {save(&copied.0.join(name),bytes)?;}
++    for (name,bytes) in &secrets {save(&private.0.join(name),bytes)?;}
++    let config=PrivateStore::new()?;let quote_path=config.0.join("quote.json");
++    let record=setup.quote.record()?;save(&quote_path,&record)?;
++    let quote:Value=serde_json::from_slice(&record)?;
++    let name=format!("{}.bch-execution-admission-{}",setup.quote.terms()["swapId"],Role::NativeFunder.domain());
++    let retained:Value=serde_json::from_slice(&std::fs::read(copied.0.join(name))?)?;
++    let admission=config.0.join("admission.json");
++    save(&admission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-admission-v1",
++        "helper":helper,"helperDigest":digest,"quoteFile":quote_path,"quoteCommitment":hex(setup.quote.commitment()),
++        "admittedAt":quote["admittedAt"],"tradeId":setup.quote.terms()["swapId"],
++        "identityPins":[SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++        "policy":setup.policy,"role":"native-funder","metadataDirectory":copied.0,
++        "snapshotDirectory":private.0,"negotiationPins":retained["pins"]}))?)?;
++    let wrapper=config.0.join("status.json");
++    save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-refund-wallet-v1",
++        "admissionConfigFile":admission,"refundTxid":refund.to_string(),"deploymentCommitment":hex(&rpc.deployment_commitment()?)}))?)?;
++    for (program,pin) in [(&helper,&digest),(&probe,&probe_digest)] {
++        let id=uuid::Uuid::new_v4();
++        let request=json!({"schema":"monzero-bch-native-refund-wallet-status-request-v1","requestId":id});
++        let mut child=Command::new(program).env_clear()
++            .envs(std::env::vars_os().filter(|(key,_)|matches!(key.to_str(),Some("PATH"|"LD_LIBRARY_PATH"))))
++            .arg("--native-refund-wallet-status-stdio-v1").arg(&wrapper)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        if let Err(error)=child.stdin.take().context("missing status stdin")?.write_all(&serde_json::to_vec(&request)?) {
++            let _=child.kill();let _=child.wait();return Err(error.into())
++        }
++        let output=child.wait_with_output()?;
++        assert!(output.status.success(),"status adapter failed: {}",String::from_utf8_lossy(&output.stderr));
++        assert!(output.stderr.is_empty());assert!(output.stdout.len()<=16384);
++        let response:Value=serde_json::from_slice(&output.stdout)?;
++        assert_eq!(response,json!({"schema":"monzero-bch-native-refund-wallet-status-response-v1",
++            "requestId":id,"tradeId":setup.quote.terms()["swapId"],"chainObserved":false,"executable":false,"wallet":expected}));
++        assert_eq!(hex(&Sha256::digest(std::fs::read(program)?)),*pin);
++        assert_eq!(contents(&copied.0)?,original);assert_eq!(contents(&private.0)?,secrets);
++    }
++    assert_eq!(contents(metadata)?,original);assert_eq!(contents(&snapshots.0)?,secrets);
++    Ok(())
++}

@@ -53,29 +53,47 @@ if [[ -n $reference_gui ]]; then
   "$script_dir/verify-windows-gui-package.sh" "$reproduced_gui" >/dev/null
 fi
 
+# A code-signed reference is compared through its unsigned form: independent
+# builders reproduce the unsigned package, and unsign-windows-package.sh proves
+# the signed one differs from it only by Authenticode signatures.
+signing_dir=$(mktemp -d "${TMPDIR:-/tmp}/monzero-reproduction-unsign.XXXXXX")
+trap 'rm -rf -- "$signing_dir"' EXIT
+unsigned_hash() {
+  if unzip -Z1 "$1" | grep '/CODE-SIGNING\.txt$' >/dev/null; then
+    local out
+    out="$signing_dir/$(sha256sum "$1" | cut -c1-16)-$(basename "$1")"
+    "$script_dir/unsign-windows-package.sh" "$1" "$out" >/dev/null
+    sha256sum "$out" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
 reference_linux_hash=$(sha256sum "$reference_linux" | awk '{print $1}')
 reproduced_linux_hash=$(sha256sum "$reproduced_linux" | awk '{print $1}')
 reference_windows_hash=$(sha256sum "$reference_windows" | awk '{print $1}')
 reproduced_windows_hash=$(sha256sum "$reproduced_windows" | awk '{print $1}')
+reference_windows_unsigned=$(unsigned_hash "$reference_windows")
 reference_gui_hash=
 reproduced_gui_hash=
 if [[ -n $reference_gui ]]; then
   reference_gui_hash=$(sha256sum "$reference_gui" | awk '{print $1}')
   reproduced_gui_hash=$(sha256sum "$reproduced_gui" | awk '{print $1}')
+  reference_gui_unsigned=$(unsigned_hash "$reference_gui")
 fi
 
 [[ $reference_linux_hash == "$reproduced_linux_hash" ]] || {
   echo "Linux packages are not byte-for-byte reproducible" >&2; exit 1;
 }
-[[ $reference_windows_hash == "$reproduced_windows_hash" ]] || {
+[[ $reference_windows_unsigned == "$reproduced_windows_hash" ]] || {
   echo "Windows packages are not byte-for-byte reproducible" >&2; exit 1;
 }
-if [[ -n $reference_gui && $reference_gui_hash != "$reproduced_gui_hash" ]]; then
+if [[ -n $reference_gui && $reference_gui_unsigned != "$reproduced_gui_hash" ]]; then
   echo "Windows GUI packages are not byte-for-byte reproducible" >&2; exit 1
 fi
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/monzero-reproduction.XXXXXX")
-trap 'rm -rf -- "$work_dir"' EXIT
+trap 'rm -rf -- "$work_dir" "$signing_dir"' EXIT
 mkdir "$work_dir/linux" "$work_dir/windows"
 tar -xzf "$reference_linux" -C "$work_dir/linux"
 unzip -q "$reference_windows" -d "$work_dir/windows"

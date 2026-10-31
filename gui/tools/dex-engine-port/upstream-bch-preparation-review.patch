@@ -1,0 +1,119 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ ## [Unreleased]
++
++- Private BCH/XMZ prototype: expose a read-only saved wallet preparation review with exact inputs, outputs and fee.
++  Candidate, template and input claims must agree; historical review grants no signing or relay permission.
+ 
+ - Private BCH/XMZ prototype: retain a pinned wallet funding candidate before publishing preparation and input claims.
+   Restart reuses the same candidate; changed policy/deployment and unpinned partial candidates block reselection.
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
+@@ -7,6 +7,10 @@
+ 
+ const RECORD: &str="monzero-bch-wallet-preparation-record-v1";
+ const PIN: &str="monzero-bch-wallet-preparation-pin-v1";
++const REVIEW: &str="monzero-bch-wallet-preparation-review-v1";
++
++/// Historical preparation details only; not a signing or relay approval.
++pub struct WalletPreparationReview { pub details: serde_json::Value, pub commitment: [u8;32] }
+ #[derive(Clone,PartialEq,Eq,Serialize,Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct WalletPreparationPolicy {
+@@ -93,6 +97,39 @@
+             &candidate.policy.change_script,candidate.policy.maximum_fee,candidate.policy.minimum_change)
+     }
+ 
++    /// Read the fully published candidate without RPC or journal mutation, even
++    /// after quote expiry. Cross-check the candidate against the template and
++    /// cooperative claims; a partial publication is not a completed preparation.
++    pub fn saved_bch_wallet_preparation_review(&self,deployment: &[u8;32],
++        policy: &WalletPreparationPolicy) -> Result<WalletPreparationReview> {
++        let candidate=self.wallet_preparation_candidate()?.context("BCH wallet candidate is absent")?;
++        ensure!(&candidate.deployment==deployment && candidate.policy==*policy,
++            "BCH preparation review deployment or policy changed");
++        let prepared=self.prepared_bch_funding()?.context("BCH preparation publication is incomplete")?;
++        let template=Template {schema:TEMPLATE.into(),admission:candidate.admission,
++            prepared_at:candidate.prepared_at,unsigned:candidate.unsigned.clone(),sources:candidate.sources.clone(),
++            change:policy.change_script.as_bytes().to_vec(),maximum_fee:policy.maximum_fee,
++            minimum_change:policy.minimum_change};
++        ensure!(prepared.commitment()==&hash(TEMPLATE,&serde_json::to_vec(&template)?),
++            "BCH wallet candidate differs from published preparation");
++        let preview=prepared.preview();
++        let inputs: Vec<_>=preview.transaction().input.iter().zip(preview.previous_outputs()).map(|(input,previous)|
++            serde_json::json!({"outpoint":input.previous_output.to_string(),"valueAtoms":previous.value.to_sat().to_string(),
++                "script":hex(previous.script_pubkey.as_bytes())})).collect();
++        let outputs: Vec<_>=preview.transaction().output.iter().enumerate().map(|(index,output)|
++            serde_json::json!({"vout":index,"valueAtoms":output.value.to_sat().to_string(),
++                "script":hex(output.script_pubkey.as_bytes())})).collect();
++        let details=serde_json::json!({"schema":REVIEW,"action":"inspect-unsigned-preparation",
++            "swapId":self.quote.terms()["swapId"],"quote":hex(self.quote.commitment()),
++            "admission":hex(&candidate.admission),"deployment":hex(deployment),
++            "network":self.quote.terms()["bchNetwork"],"genesis":self.quote.terms()["bchGenesis"],
++            "expiresAt":self.quote.terms()["expiresAt"],"preparedAt":candidate.prepared_at.to_string(),
++            "preparation":hex(prepared.commitment()),"policy":policy,"inputs":inputs,"outputs":outputs,
++            "feeAtoms":preview.fee().to_sat().to_string(),"contractVout":preview.lock_vout()});
++        let commitment=hash(REVIEW,&serde_json::to_vec(&details)?);
++        Ok(WalletPreparationReview {details,commitment})
++    }
++
+     pub(super) fn require_wallet_preparation_backend(&self,backend: &BchRpc,change: &str,minimum: u64) -> Result<()> {
+         if let Some(candidate)=self.wallet_preparation_candidate()? {
+             ensure!(candidate.deployment==backend.deployment_commitment()? && candidate.policy.change_address==change
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs
+@@ -11,29 +11,45 @@
+     {let state=server.state.lock().unwrap();assert_eq!(state.preparation_calls,1);assert_eq!(state.calls,0);
+         assert_eq!(state.sign_calls,0);assert_eq!(state.relay_calls,0);assert!(!state.locked);}
+     let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    let deployment=rpc.deployment_commitment()?;
++    let review=execution.saved_bch_wallet_preparation_review(&deployment,&policy)?;
++    assert_eq!(review.details["feeAtoms"],"1000");
++    assert_eq!(review.details["inputs"].as_array().unwrap().len(),1);
++    assert_eq!(review.details["outputs"].as_array().unwrap().len(),2);
++    assert_eq!(review.details["preparation"],hex(&commitment));
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     drop(execution);
+     let mut execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+     assert_eq!(execution.prepare_bch_funding_from_wallet(rpc,now+1,&policy).await?.commitment(),&commitment);
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     let mut changed=policy.clone();changed.fee_rate_atoms_per_kb+=1;
++    assert!(execution.saved_bch_wallet_preparation_review(&deployment,&changed).is_err());
++    assert!(execution.saved_bch_wallet_preparation_review(&wrong.deployment_commitment()?,&policy).is_err());
++    assert_eq!(execution.saved_bch_wallet_preparation_review(&deployment,&policy)?.commitment,review.commitment);
+     assert!(execution.prepare_bch_funding_from_wallet(rpc,now+1,&changed).await.is_err());
+     assert!(execution.prepare_bch_funding_from_wallet(wrong,now+1,&policy).await.is_err());
+     assert!(execution.prepare_bch_funding_from_wallet(rpc,now-1,&policy).await.is_err());
+     let expiry=setup.quote.terms()["expiresAt"].parse::<u64>()?;
+     assert!(execution.prepare_bch_funding_from_wallet(rpc,expiry,&policy).await.is_err());
++    // Saved status has no current-time gate and remains available after expiry.
++    assert_eq!(execution.saved_bch_wallet_preparation_review(&deployment,&policy)?.details,review.details);
+     assert!(execution.lock_bch_funding_inputs(wrong,now+1,"bchreg:qchange",3).await.is_err());
+     assert!(execution.lock_bch_funding_inputs(rpc,now+1,"bchreg:qchange",4).await.is_err());
+     let trade=&setup.quote.terms()["swapId"];
+     let record=snapshots.0.join(format!("{trade}.bch-funding-wallet-preparation"));
+     let pin=metadata.0.join(format!("{trade}.bch-funding-wallet-preparation-pin"));
+     let record_bytes=std::fs::read(&record)?;let pin_bytes=std::fs::read(&pin)?;
+-    save(&record,b"{}")?;assert!(execution.prepare_bch_funding_from_wallet(rpc,now+1,&policy).await.is_err());save(&record,&record_bytes)?;
+-    std::fs::remove_file(&record)?;assert!(execution.prepare_bch_funding_from_wallet(rpc,now+1,&policy).await.is_err());save(&record,&record_bytes)?;
+-    std::fs::remove_file(&pin)?;assert!(execution.prepare_bch_funding_from_wallet(rpc,now+1,&policy).await.is_err());save(&pin,&pin_bytes)?;
++    save(&record,b"{}")?;assert!(execution.prepare_bch_funding_from_wallet(rpc,now+1,&policy).await.is_err());
++    assert!(execution.saved_bch_wallet_preparation_review(&deployment,&policy).is_err());save(&record,&record_bytes)?;
++    std::fs::remove_file(&record)?;assert!(execution.prepare_bch_funding_from_wallet(rpc,now+1,&policy).await.is_err());
++    assert!(execution.saved_bch_wallet_preparation_review(&deployment,&policy).is_err());save(&record,&record_bytes)?;
++    std::fs::remove_file(&pin)?;assert!(execution.prepare_bch_funding_from_wallet(rpc,now+1,&policy).await.is_err());
++    assert!(execution.saved_bch_wallet_preparation_review(&deployment,&policy).is_err());save(&pin,&pin_bytes)?;
+     // A pinned candidate repairs interrupted publication using the original
+     // bytes and time; it never asks the wallet to select a replacement.
+     let preparation_pin=metadata.0.join(format!("{trade}.bch-funding-pin"));
+     std::fs::remove_file(&preparation_pin)?;
++    assert!(execution.saved_bch_wallet_preparation_review(&deployment,&policy).is_err());
+     assert_eq!(execution.prepare_bch_funding_from_wallet(rpc,now+1,&policy).await?.commitment(),&commitment);
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     {let state=server.state.lock().unwrap();assert_eq!(state.preparation_calls,1);assert_eq!(state.calls,0);

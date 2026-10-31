@@ -1,0 +1,64 @@
+diff --color -ru /home/tripo/projects/Monzero-App/core/build/dex-cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/simple-request-0.2.0/src/lib.rs vendor/simple-request/src/lib.rs
+--- /home/tripo/projects/Monzero-App/core/build/dex-cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/simple-request-0.2.0/src/lib.rs	2006-07-24 02:21:28.000000000 +0100
++++ vendor/simple-request/src/lib.rs	2026-10-29 14:47:38.735771793 +0000
+@@ -84,6 +84,9 @@
+       connection: Connection::ConnectionPool(
+         HyperClient::builder(TokioExecutor::new())
+           .pool_idle_timeout(core::time::Duration::from_secs(60))
++          // Some Monero nodes (and proxies in front of them) reset requests whose header
++          // names are lowercase, which hyper sends by default.
++          .http1_title_case_headers(true)
+           .build(Self::connector()?),
+       ),
+     })
+@@ -119,9 +122,7 @@
+       }
+     } else {
+       let host = match &self.connection {
+-        Connection::ConnectionPool(_) => {
+-          request.uri().host().ok_or(Error::MissingHost)?.to_string()
+-        }
++        Connection::ConnectionPool(_) => host_header(request.uri())?,
+         Connection::Connection { host, .. } => {
+           let host_str = host.host().unwrap();
+           if let Some(uri_host) = request.uri().host() {
+@@ -129,7 +130,7 @@
+               Err(Error::InconsistentHost)?;
+             }
+           }
+-          host_str.to_string()
++          host_header(host)?
+         }
+       };
+       request
+@@ -151,8 +152,11 @@
+           let call_res = call_res.map_err(|e| Error::ConnectionError(format!("{e:?}").into()));
+           #[cfg(feature = "tls")]
+           let call_res = call_res.map_err(Error::ConnectionError);
+-          let (requester, connection) =
+-            hyper::client::conn::http1::handshake(call_res?).await.map_err(Error::Hyper)?;
++          let (requester, connection) = hyper::client::conn::http1::Builder::new()
++            .title_case_headers(true)
++            .handshake(call_res?)
++            .await
++            .map_err(Error::Hyper)?;
+           // This will die when we drop the requester, so we don't need to track an AbortHandle
+           // for it
+           tokio::spawn(connection);
+@@ -178,3 +182,16 @@
+     Ok(Response { response, size_limit: response_size_limit, client: self })
+   }
+ }
++
++/// The Host header value for a URI: the host, plus the port when it is not the scheme's default.
++fn host_header(uri: &Uri) -> Result<String, Error> {
++  let host = uri.host().ok_or(Error::MissingHost)?;
++  let default_port = match uri.scheme_str() {
++    Some("https") => 443,
++    _ => 80,
++  };
++  Ok(match uri.port_u16() {
++    Some(port) if port != default_port => format!("{host}:{port}"),
++    _ => host.to_string(),
++  })
++}

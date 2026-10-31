@@ -40,6 +40,7 @@ Rectangle {
     property alias pageHeight: pageRoot.height
     property alias wizardNav: wizardNav
     property string viewName: "wizardCreateWallet5"
+    onVisibleChanged: if (visible) disclosure.currentIndex = 0
 
     ColumnLayout {
         id: pageRoot
@@ -63,6 +64,10 @@ Rectangle {
             }
 
             WizardSummary {}
+            MonzeroComponents.TextPlain { Layout.fillWidth:true; wrapMode:Text.Wrap; text:qsTr("Wallet disclosure preference (private by default)") }
+            ComboBox { id:disclosure; Layout.fillWidth:true; model:[qsTr("Private"),qsTr("Share address"),qsTr("Share address and balance")] }
+            MonzeroComponents.TextPlain { Layout.fillWidth:true; wrapMode:Text.Wrap; text:qsTr("Nothing is published during creation. To confirm sharing after your wallet opens, use Settings → Wallet → Public wallet profile. Public information may be copied and cannot be made secret again.") }
+
 
             WizardNav {
                 id: wizardNav
@@ -82,6 +87,7 @@ Rectangle {
                     btnNext.enabled = false;
                     wizardController.wizardStateView.wizardCreateWallet3View.pwField = "";
                     wizardController.wizardStateView.wizardCreateWallet3View.pwConfirmField = "";
+                    wizardController.m_wallet.setCacheAttribute("monzero.publicProfile.mode", disclosure.currentIndex === 2 ? "balance" : disclosure.currentIndex === 1 ? "address" : "private");
                     wizardController.writeWallet(function() {
                         wizardController.useMonzeroClicked();
                         wizardController.walletOptionsIsRecoveringFromDevice = false;

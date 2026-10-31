@@ -43,6 +43,23 @@ Rectangle {
         ListElement { column1: "CC0 (public domain)"; value: "CC0 1.0" }
     }
 
+    readonly property bool assetTransfersAvailable: !!currentWallet && currentWallet.assetTransfersAvailable === true
+    property string actionAssetId: ""
+    property string actionMode: ""
+
+    function startAssetAction(assetId, mode) {
+        if (!root.assetTransfersAvailable) return
+        root.actionAssetId = assetId
+        root.actionMode = mode
+        actionAmountInput.text = ""
+        actionDestinationInput.text = ""
+    }
+
+    function cancelAssetAction() {
+        root.actionAssetId = ""
+        root.actionMode = ""
+    }
+
     function shorten(value) {
         if (!value || value.length <= 24) return value
         return value.substring(0, 12) + "…" + value.substring(value.length - 10)
@@ -372,8 +389,14 @@ Rectangle {
         }
 
         MonzeroComponents.WarningBox {
+            Layout.fillWidth: true
+            visible: currentWallet && !root.assetTransfersAvailable
+            text: qsTr("This wallet version does not support asset transfers or burns.") + translationManager.emptyString
+        }
+
+        MonzeroComponents.WarningBox {
             visible: !root.assetProtocolActive
-            text: qsTr("Assets are not active on this network yet (hard fork 17). You can design assets and save their metadata now; issuing unlocks when the upgrade activates.") + translationManager.emptyString
+            text: qsTr("Assets are not active on this network yet (hard fork 17). You can design assets and save their metadata now; issuing, transfers and burns unlock when the upgrade activates.") + translationManager.emptyString
         }
 
         MonzeroComponents.Label {
@@ -455,6 +478,29 @@ Rectangle {
 
                             ColumnLayout {
                                 Layout.alignment: Qt.AlignRight
+                                spacing: 6
+                                MonzeroComponents.StandardButton {
+                                    Layout.alignment: Qt.AlignRight
+                                    text: qsTr("Transfer") + translationManager.emptyString
+                                    primary: false
+                                    small: true
+                                    enabled: root.assetProtocolActive && root.assetTransfersAvailable && currentWallet
+                                             && !currentWallet.viewOnly && spendableOutputCount > 0
+                                    onClicked: root.startAssetAction(assetId, "transfer")
+                                }
+                                MonzeroComponents.StandardButton {
+                                    Layout.alignment: Qt.AlignRight
+                                    text: qsTr("Burn") + translationManager.emptyString
+                                    primary: false
+                                    small: true
+                                    enabled: root.assetProtocolActive && root.assetTransfersAvailable && currentWallet
+                                             && !currentWallet.viewOnly && spendableOutputCount > 0
+                                    onClicked: root.startAssetAction(assetId, "burn")
+                                }
+                            }
+
+                            ColumnLayout {
+                                Layout.alignment: Qt.AlignRight
                                 spacing: 3
                                 MonzeroComponents.TextPlain {
                                     Layout.alignment: Qt.AlignRight
@@ -471,6 +517,88 @@ Rectangle {
                                     text: qsTr("atomic units · ") + spendableOutputCount + qsTr(" spendable") + translationManager.emptyString
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            Layout.fillWidth: true
+            visible: root.actionAssetId !== ""
+            Layout.preferredHeight: visible ? actionLayout.height + 30 : 0
+            radius: 10
+            color: MonzeroComponents.Style.titleBarButtonHoverColor
+            border.width: 1
+            border.color: MonzeroComponents.Style.inputBorderColorInActive
+
+            ColumnLayout {
+                id: actionLayout
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: 15
+                spacing: 13
+
+                MonzeroComponents.Label {
+                    fontSize: 16
+                    text: (root.actionMode === "burn" ? qsTr("Burn asset ") : qsTr("Transfer asset "))
+                          + root.shorten(root.actionAssetId) + translationManager.emptyString
+                }
+
+                MonzeroComponents.LineEdit {
+                    id: actionDestinationInput
+                    Layout.fillWidth: true
+                    visible: root.actionMode === "transfer"
+                    labelText: qsTr("Recipient address") + translationManager.emptyString
+                    placeholderText: qsTr("Monzero address") + translationManager.emptyString
+                }
+
+                MonzeroComponents.LineEdit {
+                    id: actionAmountInput
+                    Layout.fillWidth: true
+                    labelText: qsTr("Atomic amount") + translationManager.emptyString
+                    placeholderText: "1000000"
+                }
+
+                MonzeroComponents.WarningBox {
+                    visible: root.actionMode === "burn"
+                    text: qsTr("Burning permanently destroys these asset units. This cannot be undone.") + translationManager.emptyString
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    MonzeroComponents.TextPlain {
+                        Layout.fillWidth: true
+                        color: MonzeroComponents.Style.defaultFontColor
+                        opacity: 0.65
+                        wrapMode: Text.Wrap
+                        font.pixelSize: 13
+                        text: qsTr("This will always show a transaction confirmation before signing or relaying.") + translationManager.emptyString
+                    }
+                    MonzeroComponents.StandardButton {
+                        text: qsTr("Cancel") + translationManager.emptyString
+                        primary: false
+                        onClicked: root.cancelAssetAction()
+                    }
+                    MonzeroComponents.StandardButton {
+                        text: (root.actionMode === "burn" ? qsTr("Burn") : qsTr("Transfer")) + translationManager.emptyString
+                        enabled: root.assetTransfersAvailable && actionAmountInput.text.length > 0
+                                 && (root.actionMode === "burn" || actionDestinationInput.text.length > 0)
+                        onClicked: {
+                            if (!root.assetTransfersAvailable) return
+                            var amount = actionAmountInput.text.trim()
+                            var assetId = root.actionAssetId
+                            if (root.actionMode === "burn") {
+                                appWindow.handleAssetBurn({"assetId": assetId, "atomicAmount": amount})
+                            } else {
+                                appWindow.handleAssetTransfer({
+                                    "assetId": assetId,
+                                    "recipientAddress": actionDestinationInput.text.trim(),
+                                    "atomicAmount": amount
+                                })
+                            }
+                            root.cancelAssetAction()
                         }
                     }
                 }
@@ -835,7 +963,7 @@ Rectangle {
                             readOnly: true
                             selectByMouse: true
                             wrapMode: TextEdit.WrapAnywhere
-                            font.family: isWindows ? "Consolas" : "monospace"
+                            font.family: MonzeroComponents.Style.fontMonoRegular.name
                             font.pixelSize: 13
                             color: MonzeroComponents.Style.accentBright
                             text: root.metadataHash
@@ -884,7 +1012,7 @@ Rectangle {
                             }
                             MonzeroComponents.StandardButton {
                                 text: qsTr("Issue on chain") + translationManager.emptyString
-                                enabled: root.assetProtocolActive && currentWallet && !currentWallet.viewOnly && !root.blocking
+                                enabled: root.assetProtocolActive && root.assetTransfersAvailable && currentWallet && !currentWallet.viewOnly && !root.blocking
                                 tooltip: root.assetProtocolActive ? qsTr("Build the issuance transaction for review")
                                                                   : qsTr("Requires hard fork 17")
                                 onClicked: root.issueOnChain()
@@ -1018,7 +1146,7 @@ Rectangle {
                             }
                             MonzeroComponents.TextPlain {
                                 text: root.metadataHash ? root.metadataHash.substring(0, 8) + "…" + root.metadataHash.substring(56) : "—"
-                                font.family: isWindows ? "Consolas" : "monospace"
+                                font.family: MonzeroComponents.Style.fontMonoRegular.name
                                 font.pixelSize: 11
                                 color: MonzeroComponents.Style.accentBright
                             }

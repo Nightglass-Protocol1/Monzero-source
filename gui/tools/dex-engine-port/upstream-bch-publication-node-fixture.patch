@@ -1,0 +1,29 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs
+@@ -39,12 +39,19 @@
+     }
+     let signed=format!("{}.bch-success-signed",setup.quote.terms()["swapId"]);
+     std::fs::remove_file(copied.0.join(format!("{signed}-pin")))?;
+-    let private=snapshots.0.join(&signed);let held=snapshots.0.join("held-signed-success-for-claim-test");
+-    std::fs::rename(&private,&held)?;
+-    let restored=AdmittedExecution::resume(&copied.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+-    let recovered=restored.recover_bch_native_claim(&observer,rpc,txid,None,2041).await;
+-    std::fs::rename(&held,&private)?;
+-    let recovered=recovered?;
++    let private=PrivateStore::new()?;
++    for entry in std::fs::read_dir(&snapshots.0)? {
++        let entry=entry?;if entry.file_type()?.is_file() {std::fs::copy(entry.path(),private.0.join(entry.file_name()))?;}
++    }
++    std::fs::remove_file(private.0.join(&signed))?;
++    let restored=AdmittedExecution::resume(&copied.0,&private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    // A retained candidate is an interrupted publication, not evidence that
++    // signing never happened. Keep the fail-closed distinction explicit.
++    let pending=restored.recover_bch_native_claim(&observer,rpc,txid,None,2041).await.err()
++        .context("pending signed publication must not be treated as absent")?;
++    assert!(pending.to_string().contains("publication is pending"));
++    std::fs::remove_file(private.0.join(format!("{signed}-candidate")))?;
++    let recovered=restored.recover_bch_native_claim(&observer,rpc,txid,None,2041).await?;
+     assert_eq!(recovered.spend_key(),claim.spend_key());assert_eq!(recovered.view_key(),claim.view_key());
+     assert_eq!(recovered.commitment(),claim.commitment());
+     wallet::exercise(bch_metadata,setup,snapshots,fixture,rpc,txid,claim.address(),claim.spend_key(),claim.view_key()).await?;

@@ -1,0 +1,1002 @@
+diff --git a/swap-machine/src/litecoin_light/funding_tests.rs b/swap-machine/src/litecoin_light/funding_tests.rs
+index 79a1c40ce..428631760 100644
+--- a/swap-machine/src/litecoin_light/funding_tests.rs
++++ b/swap-machine/src/litecoin_light/funding_tests.rs
+@@ -62,7 +62,7 @@ async fn funding_approval(mnemonic:bool)->Result<()> {
+         else {LightFundingVault::Seed(seed_vault.as_ref().unwrap())};
+     let owned=account.derive(Branch::Receive,0)?;
+     let prevout=TxOut {value:Amount::from_sat(100_001_000),script_pubkey:owned.address().script_pubkey().clone()};
+-    let chain=HeaderSequence::new(policy.ltc_network)?;
++    let chain=HeaderSequence::from_genesis(policy.ltc_network)?;
+     let credit=Transaction {version:Version::TWO,lock_time:LockTime::ZERO,
+         input:vec![TxIn {previous_output:OutPoint::new(Txid::from_byte_array([7;32]),0),script_sig:Default::default(),sequence:Sequence::MAX,witness:Default::default()}],output:vec![prevout.clone()]};
+     // Injected genesis inclusion for policy tests, not Merkle/consensus evidence.
+diff --git a/swap-machine/src/litecoin_light/funding_tests/relay.rs b/swap-machine/src/litecoin_light/funding_tests/relay.rs
+index 5df204460..97cfc71d3 100644
+--- a/swap-machine/src/litecoin_light/funding_tests/relay.rs
++++ b/swap-machine/src/litecoin_light/funding_tests/relay.rs
+@@ -73,12 +73,12 @@ pub(super) async fn cold_retry(bob:&mut Execution,claim:&ClaimedSpend,chain:&Hea
+     // An old observation cannot approve a retry against an extended chain.
+     use bitcoin::hex::FromHex;
+     let fixture:serde_json::Value=serde_json::from_str(include_str!("../session/wallet/fixture.json"))?;
+-    let mut extended=HeaderSequence::new(chain.network())?;
++    let mut extended=HeaderSequence::from_genesis(chain.network())?;
+     extended.append(&Vec::from_hex(fixture["blocks"][0]["header"].as_str().unwrap())?,u64::MAX-7200)?;
+     assert!(bob.review_light_funding_retry(claim,&extended,expected,endpoint,&absent).is_err());
+     // Synthetic SPV inclusion for this exact transaction, not full-block
+     // consensus evidence. A bounded regtest header search supplies real PoW.
+-    let mut included_chain=HeaderSequence::new(chain.network())?;
++    let mut included_chain=HeaderSequence::from_genesis(chain.network())?;
+     let mut header=included_chain.header(0).unwrap();header.prev_blockhash=header.block_hash();
+     header.merkle_root=bitcoin::TxMerkleNode::from_raw_hash(signed.compute_txid().to_raw_hash());
+     header.time+=1;header.version=bitcoin::block::Version::from_consensus(0x20000000);
+diff --git a/swap-machine/src/litecoin_light/headers.rs b/swap-machine/src/litecoin_light/headers.rs
+index 72e817bb6..c3accda37 100644
+--- a/swap-machine/src/litecoin_light/headers.rs
++++ b/swap-machine/src/litecoin_light/headers.rs
+@@ -9,6 +9,12 @@ use super::network::{LightNetwork, block_work};
+ 
+ pub struct HeaderSequence {
+     network: LightNetwork,
++    /// Height of `headers[0]`: 0 from genesis, below the checkpoint otherwise.
++    base: u32,
++    /// Index of the trusted root (genesis or the pinned checkpoint) in `headers`.
++    anchor: usize,
++    /// Cumulative work at the trusted root.
++    anchor_work: BigUint,
+     headers: Vec<Header>,
+     work: BigUint,
+ }
+@@ -20,13 +26,44 @@ pub struct ChainChange {
+     pub new_tip: (u32, BlockHash),
+ }
+ impl HeaderSequence {
++    /// Starts at the network's pinned checkpoint when it has one, else genesis.
+     pub fn new(network: impl Into<LightNetwork>) -> Result<Self> {
++        let network = network.into();
++        match network.checkpoint() {
++            Some(checkpoint) => Self::from_checkpoint(network, &checkpoint),
++            None => Self::from_genesis(network),
++        }
++    }
++    pub fn from_genesis(network: impl Into<LightNetwork>) -> Result<Self> {
+         let network = network.into();
+         let genesis = network.genesis_header()?;
+         // Core special-cases the independently pinned genesis identity.
+         let work = block_work(&network.target(genesis.bits.to_consensus())?);
+-        Ok(Self {network, headers:vec![genesis], work})
++        Ok(Self {network, base:0, anchor:0, anchor_work:work.clone(), headers:vec![genesis], work})
++    }
++    /// The window is trusted because it is pinned in code, but it must still be
++    /// one linked run ending at the pinned hash on a difficulty-period boundary.
++    fn from_checkpoint(network: LightNetwork, checkpoint: &super::network::Checkpoint) -> Result<Self> {
++        let coin = network.coin();
++        ensure!(checkpoint.window.len()>=11 && checkpoint.height%2016==0
++            && checkpoint.height as usize>=checkpoint.window.len()-1, "invalid {coin} checkpoint");
++        let mut headers = Vec::with_capacity(checkpoint.window.len());
++        for raw in checkpoint.window {
++            let header: Header = deserialize(&hex_bytes(raw)?)?;
++            if let Some(previous) = headers.last() {
++                ensure!(header.prev_blockhash==Header::block_hash(previous), "disconnected {coin} checkpoint");
++            }
++            headers.push(header);
++        }
++        ensure!(headers.last().map(Header::block_hash)==Some(checkpoint.hash.parse()?), "{coin} checkpoint hash mismatch");
++        let work = BigUint::parse_bytes(checkpoint.chain_work.as_bytes(),16).context("invalid checkpoint work")?;
++        let base = checkpoint.height-(headers.len() as u32-1);
++        Ok(Self {network, base, anchor:headers.len()-1, anchor_work:work.clone(), headers, work})
+     }
++    /// Height of the trusted root: 0, or the pinned checkpoint. Nothing below it
++    /// is retained, so evidence below it cannot be checked against this chain.
++    pub fn root_height(&self) -> u32 { self.base+self.anchor as u32 }
++    fn index(&self,height: u32) -> Option<usize> { height.checked_sub(self.base).map(|i|i as usize) }
+     /// Atomic bounded extension. A bad suffix cannot leave a trusted prefix
+     /// installed from a rejected response. No async work occurs during mutation.
+     pub fn append_batch(&mut self,bytes: &[u8],now: u64) -> Result<u32> {
+@@ -42,17 +79,18 @@ impl HeaderSequence {
+         Ok((bytes.len()/80) as u32)
+     }
+     pub fn network(&self) -> LightNetwork { self.network }
+-    pub fn height(&self) -> u32 { (self.headers.len()-1) as u32 }
+-    pub fn header(&self,height: u32) -> Option<Header> { self.headers.get(height as usize).copied() }
++    pub fn height(&self) -> u32 { self.base+(self.headers.len()-1) as u32 }
++    pub fn header(&self,height: u32) -> Option<Header> { self.headers.get(self.index(height)?).copied() }
+     pub fn chain_work(&self) -> &BigUint { &self.work }
+ 
+     /// Independently extend a previously validated prefix when investigating a fork.
+     pub fn fork(&self,height: u32) -> Result<Self> {
+-        ensure!(height<=self.height(), "{} fork height outside retained chain", self.network.coin());
+-        let headers = self.headers[..=height as usize].to_vec();
+-        let mut work = BigUint::from(0u8);
+-        for header in &headers { work += block_work(&self.network.target(header.bits.to_consensus())?); }
+-        Ok(Self {network:self.network,headers,work})
++        ensure!(height<=self.height() && height>=self.root_height(),
++            "{} fork height outside retained chain", self.network.coin());
++        let headers = self.headers[..=self.index(height).unwrap()].to_vec();
++        let mut work = self.anchor_work.clone();
++        for header in &headers[self.anchor+1..] { work += block_work(&self.network.target(header.bits.to_consensus())?); }
++        Ok(Self {network:self.network,base:self.base,anchor:self.anchor,anchor_work:self.anchor_work.clone(),headers,work})
+     }
+ 
+     /// Ties retain the current branch. Candidates cannot bypass header validation:
+@@ -60,15 +98,17 @@ impl HeaderSequence {
+     /// This chooses among supplied branches, not necessarily the network's best tip.
+     pub fn adopt(&mut self,candidate: Self) -> Result<Option<ChainChange>> {
+         ensure!(candidate.network==self.network, "{} candidate network mismatch", self.network.coin());
++        ensure!(candidate.base==self.base && candidate.anchor==self.anchor,
++            "{} candidate starts from a different root", self.network.coin());
+         if candidate.work<=self.work {return Ok(None)}
+         let common = self.headers.iter().zip(&candidate.headers)
+             .take_while(|(left,right)|left.block_hash()==right.block_hash()).count();
+         ensure!(common>0, "{} candidate genesis mismatch", self.network.coin());
+         let old_height = self.height(); let new_height = candidate.height();
+         let change = ChainChange {
+-            common_ancestor:(common-1) as u32,
+-            old_tip:(old_height,self.headers[old_height as usize].block_hash()),
+-            new_tip:(new_height,candidate.headers[new_height as usize].block_hash()),
++            common_ancestor:self.base+(common-1) as u32,
++            old_tip:(old_height,self.headers[self.headers.len()-1].block_hash()),
++            new_tip:(new_height,candidate.headers[candidate.headers.len()-1].block_hash()),
+         };
+         *self = candidate;
+         Ok(Some(change))
+@@ -81,14 +121,24 @@ impl HeaderSequence {
+ 
+     /// `now` must be supplied by the caller's clock, not a server timestamp.
+     /// Validation is completed before either headers or cumulative work change.
+-    pub fn append(&mut self,bytes: &[u8],now: u64) -> Result<BlockHash> {
++    pub fn append(&mut self,bytes: &[u8],now: u64) -> Result<BlockHash> {self.append_checked(bytes,now,true)}
++
++    /// Every rule except the proof-of-work hash itself, for reloading this
++    /// process's own cache below a fully rechecked tail (see `cache::load`).
++    /// Never for headers received from a server.
++    pub(super) fn append_cached(&mut self,bytes: &[u8],now: u64,check_work: bool) -> Result<BlockHash> {
++        self.append_checked(bytes,now,check_work)
++    }
++
++    fn append_checked(&mut self,bytes: &[u8],now: u64,check_work: bool) -> Result<BlockHash> {
+         let coin = self.network.coin();
+         ensure!(bytes.len()==80, "invalid {coin} header size");
+         let header: Header = deserialize(bytes)?;
+-        let height = u32::try_from(self.headers.len()).with_context(|| format!("{coin} header height exhausted"))?;
++        let height = u32::try_from(self.headers.len()).ok().and_then(|n|self.base.checked_add(n))
++            .with_context(|| format!("{coin} header height exhausted"))?;
+         let previous = self.headers.last().with_context(|| format!("missing {coin} genesis"))?;
+         ensure!(header.prev_blockhash==previous.block_hash(), "disconnected {coin} header");
+-        ensure!(header.bits.to_consensus()==self.network.next_bits(&self.headers,header.time)?,
++        ensure!(header.bits.to_consensus()==self.network.next_bits(&self.headers,self.base,header.time)?,
+             "incorrect {coin} difficulty");
+         let mut times: Vec<_> = self.headers.iter().rev().take(11).map(|h|h.time).collect();
+         times.sort_unstable();
+@@ -97,7 +147,9 @@ impl HeaderSequence {
+             "{coin} header timestamp too far in future");
+         self.network.check_version(height,header.version.to_consensus())?;
+         let target = self.network.target(header.bits.to_consensus())?;
+-        ensure!(self.network.pow_value(bytes)?<=target, "{}", insufficient_work(self.network));
++        if check_work {
++            ensure!(self.network.pow_value(bytes)?<=target, "{}", insufficient_work(self.network));
++        }
+         let hash = header.block_hash();
+         self.work += block_work(&target);
+         self.headers.push(header);
+@@ -116,7 +168,7 @@ fn scrypt_hash(header: &[u8]) -> Result<[u8;32]> { super::network::scrypt_hash(h
+ fn target(bits: u32,network: LtcNetwork) -> Result<BigUint> { LightNetwork::from(network).target(bits) }
+ #[cfg(test)]
+ fn next_bits(network: LtcNetwork,headers: &[Header],time: u32) -> Result<u32> {
+-    LightNetwork::from(network).next_bits(headers,time)
++    LightNetwork::from(network).next_bits(headers,0,time)
+ }
+ #[cfg(test)]
+ fn retarget(network: LtcNetwork,bits: u32,elapsed: i64) -> Result<u32> {
+@@ -127,6 +179,11 @@ fn check_version(network: LtcNetwork,height: u32,version: i32) -> Result<()> {
+     LightNetwork::from(network).check_version(height,version)
+ }
+ 
++fn hex_bytes(text: &str) -> Result<Vec<u8>> {
++    ensure!(text.len()%2==0, "invalid hex");
++    (0..text.len()).step_by(2).map(|i|u8::from_str_radix(&text[i..i+2],16).context("invalid hex")).collect()
++}
++
+ fn insufficient_work(network: LightNetwork) -> &'static str {
+     match network {
+         LightNetwork::Litecoin(_) => "insufficient Litecoin Scrypt work",
+diff --git a/swap-machine/src/litecoin_light/headers/cache.rs b/swap-machine/src/litecoin_light/headers/cache.rs
+index cb62ed97f..9e9225a4a 100644
+--- a/swap-machine/src/litecoin_light/headers/cache.rs
++++ b/swap-machine/src/litecoin_light/headers/cache.rs
+@@ -1,4 +1,9 @@
+-//! Raw-header restart cache. Every load replays validation from pinned genesis.
++//! Raw-header restart cache. Every load replays validation from pinned genesis:
++//! linkage, difficulty schedule, timestamps and versions for every header, and
++//! the proof-of-work hash for the newest `RECHECK_WORK` headers. Older headers
++//! are fixed by the hash chain under that tail, so replacing them would need
++//! the tail's real work redone on top. (A full Scrypt replay of Litecoin
++//! testnet took 18.5 minutes on every helper start.)
+ //! No cached work, validation flags, wallet keys or confirmation authority.
+ //! Blocking disk/Scrypt work belongs on a caller-owned blocking worker.
+ use super::*;
+@@ -7,7 +12,13 @@ use std::{ffi::CString, fs::{File, OpenOptions}, io::{BufReader, BufWriter, Read
+ 
+ const MAGIC: &[u8;8] = b"MZLTC001";
+ const PREFIX: u64 = 44; // magic, genesis identity, post-genesis header count
++/// Checkpoint-rooted chains: magic, genesis identity, checkpoint height, count
++/// of headers after the checkpoint. The checkpoint window always comes from code.
++const MAGIC_CHECKPOINT: &[u8;8] = b"MZLTC002";
++const PREFIX_CHECKPOINT: u64 = 48;
+ const NAME: &str = "headers.bin";
++/// Two difficulty periods: always fully rechecked on load.
++const RECHECK_WORK: u32 = 4032;
+ 
+ /// Exclusive cooperative-process lease, following the wallet journal pattern.
+ /// Directory must already exist, be canonical, owned and private. One network
+@@ -43,27 +54,43 @@ impl HeaderCache {
+             && metadata.mode()&0o077==0 && metadata.nlink()==1,"invalid Litecoin header cache record");
+         Ok(Some(file))
+     }
+-    fn prefix(&self,file: &mut File) -> Result<u32> {
+-        let mut prefix=[0u8;44]; file.read_exact(&mut prefix)?;
+-        ensure!(&prefix[..8]==MAGIC,"unknown Litecoin header cache format");
++    /// Headers stored after the root, and the stored length of that framing.
++    fn prefix(&self,file: &mut File) -> Result<(u32,u64)> {
++        let mut magic=[0u8;8]; file.read_exact(&mut magic)?;
++        let checkpoint=self.network.checkpoint();
++        let length=match (&magic,&checkpoint) {
++            (m,None) if m==MAGIC => PREFIX,
++            (m,Some(_)) if m==MAGIC_CHECKPOINT => PREFIX_CHECKPOINT,
++            (m,Some(_)) if m==MAGIC => anyhow::bail!("Litecoin header cache predates this network's checkpoint"),
++            _ => anyhow::bail!("unknown Litecoin header cache format"),
++        };
++        let mut rest=vec![0u8;length as usize-8]; file.read_exact(&mut rest)?;
+         let genesis: BlockHash=self.network.genesis().parse()?;
+-        ensure!(prefix[8..40]==genesis.to_byte_array(),"Litecoin header cache network mismatch");
+-        let count=u32::from_le_bytes(prefix[40..44].try_into()?);
+-        ensure!(file.metadata()?.len()==PREFIX+u64::from(count)*80,"invalid Litecoin header cache length");
+-        Ok(count)
++        ensure!(rest[..32]==genesis.to_byte_array(),"Litecoin header cache network mismatch");
++        if let Some(checkpoint)=checkpoint {
++            ensure!(u32::from_le_bytes(rest[32..36].try_into()?)==checkpoint.height,"Litecoin header cache checkpoint mismatch");
++        }
++        let count=u32::from_le_bytes(rest[length as usize-12..].try_into()?);
++        ensure!(file.metadata()?.len()==length+u64::from(count)*80,"invalid Litecoin header cache length");
++        Ok((count,length))
+     }
+     /// Caller supplies a resource ceiling and its own clock, never server time.
+     /// No trusted state escapes if any cached header or trailing byte is invalid.
+     pub fn load(&self,maximum_height: u32,now: u64) -> Result<Option<HeaderSequence>> {
++        self.load_checking(maximum_height,now,RECHECK_WORK)
++    }
++    fn load_checking(&self,maximum_height: u32,now: u64,recheck_work: u32) -> Result<Option<HeaderSequence>> {
+         let Some(mut file)=self.record()? else {return Ok(None)};
+-        ensure!(file.metadata()?.len()<=PREFIX+u64::from(maximum_height)*80,"Litecoin header cache exceeds limit");
+-        let count=self.prefix(&mut file)?;
+-        ensure!(count<=maximum_height,"Litecoin header cache height exceeds limit");
+-        let mut reader=BufReader::new(file);
++        ensure!(file.metadata()?.len()<=PREFIX_CHECKPOINT+u64::from(maximum_height)*80,"Litecoin header cache exceeds limit");
++        let (count,_)=self.prefix(&mut file)?;
+         let mut sequence=HeaderSequence::new(self.network)?;
+-        for _ in 0..count {
++        ensure!(sequence.root_height().checked_add(count).is_some_and(|height|height<=maximum_height),
++            "Litecoin header cache height exceeds limit");
++        let mut reader=BufReader::new(file);
++        let full_from=count.saturating_sub(recheck_work);
++        for index in 0..count {
+             let mut bytes=[0u8;80];reader.read_exact(&mut bytes)?;
+-            sequence.append(&bytes,now)?;
++            sequence.append_cached(&bytes,now,index>=full_from)?;
+         }
+         let mut extra=[0u8;1];ensure!(reader.read(&mut extra)?==0,"trailing Litecoin header cache data");
+         Ok(Some(sequence))
+@@ -74,15 +101,24 @@ impl HeaderCache {
+     pub fn save(&self,sequence: &HeaderSequence) -> Result<()> {
+         ensure!(sequence.network()==self.network,"Litecoin cache save network mismatch");
+         if let Some(mut existing)=self.record()? {self.prefix(&mut existing)?;}
++        let checkpoint=self.network.checkpoint();
++        ensure!(sequence.root_height()==checkpoint.as_ref().map_or(0,|c|c.height),
++            "Litecoin cache save root mismatch");
+         let temporary=CString::new(format!("{}.headers.tmp",uuid::Uuid::new_v4()))?;
+         let target=CString::new(NAME)?;
+         let file=self.file(temporary.to_str()?,libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL)?;
+         let outcome=(|| -> Result<()> {
+             let mut writer=BufWriter::new(file);
+-            writer.write_all(MAGIC)?;
+-            writer.write_all(&sequence.headers[0].block_hash().to_byte_array())?;
+-            writer.write_all(&sequence.height().to_le_bytes())?;
+-            for header in sequence.headers.iter().skip(1) {writer.write_all(&serialize(header))?;}
++            let genesis: BlockHash=self.network.genesis().parse()?;
++            let count=sequence.height()-sequence.root_height();
++            if let Some(checkpoint)=&checkpoint {
++                writer.write_all(MAGIC_CHECKPOINT)?;writer.write_all(&genesis.to_byte_array())?;
++                writer.write_all(&checkpoint.height.to_le_bytes())?;
++            } else {
++                writer.write_all(MAGIC)?;writer.write_all(&genesis.to_byte_array())?;
++            }
++            writer.write_all(&count.to_le_bytes())?;
++            for header in sequence.headers.iter().skip(sequence.anchor+1) {writer.write_all(&serialize(header))?;}
+             writer.flush()?;writer.get_ref().sync_all()?;
+             if unsafe {libc::renameat(self.directory.as_raw_fd(),temporary.as_ptr(),
+                 self.directory.as_raw_fd(),target.as_ptr())}!=0 {
+diff --git a/swap-machine/src/litecoin_light/headers/cache/tests.rs b/swap-machine/src/litecoin_light/headers/cache/tests.rs
+index 569fb9edd..5840954ee 100644
+--- a/swap-machine/src/litecoin_light/headers/cache/tests.rs
++++ b/swap-machine/src/litecoin_light/headers/cache/tests.rs
+@@ -95,3 +95,64 @@ fn cache_lease_permissions_links_and_network_are_enforced() -> Result<()> {
+     assert!(HeaderCache::open(&dir.0,LtcNetwork::Regtest).is_err());
+     Ok(())
+ }
++
++/// A regtest header on `previous`, mined until its work check gives `valid`.
++fn mined(previous: &Header,valid: bool) -> Result<Header> {
++    let network=LightNetwork::from(LtcNetwork::Regtest);
++    let target=network.target(0x207fffff)?;
++    for nonce in 0u32.. {
++        let header=Header {version:previous.version,prev_blockhash:previous.block_hash(),
++            merkle_root:previous.merkle_root,time:previous.time+10,bits:previous.bits,nonce};
++        if (network.pow_value(&serialize(&header))?<=target)==valid {return Ok(header)}
++    }
++    unreachable!()
++}
++#[test]
++fn cache_reload_rechecks_work_on_the_tail_and_linkage_everywhere() -> Result<()> {
++    // Heights 1..=4; height 2 carries no valid work but every other rule holds.
++    let mut chain=chain()?;
++    for valid in [false,true,true] {
++        let header=mined(&chain.header(chain.height()).unwrap(),valid)?;
++        chain.append_cached(&serialize(&header),1296688902,false)?;
++    }
++    let dir=Directory::new()?;let cache=HeaderCache::open(&dir.0,LtcNetwork::Regtest)?;
++    cache.save(&chain)?;let path=dir.0.join(NAME);let original=fs::read(&path)?;
++    // Work below a two-header tail is fixed by the hash chain, not rechecked.
++    assert_eq!(cache.load_checking(4,1296688902,2)?.unwrap().height(),4);
++    // Once the bad header is inside the rechecked tail, the load fails.
++    assert!(cache.load_checking(4,1296688902,3).is_err());
++    // Short chains are always rechecked in full by the public load.
++    assert!(cache.load(4,1296688902).is_err());
++    // Changing an old header breaks its child's link even without a work check.
++    let mut tampered=original.clone();
++    tampered[PREFIX as usize+80+76]^=1; // nonce of height 2
++    fs::write(&path,&tampered)?;
++    assert!(cache.load_checking(4,1296688902,2).is_err());
++    Ok(())
++}
++
++#[test]
++fn checkpoint_cache_round_trip_and_older_format_is_refused() -> Result<()> {
++    use super::super::tests::{TESTNET_AFTER_CHECKPOINT,TESTNET_AFTER_CHECKPOINT_TIME};
++    let dir=Directory::new()?;let cache=HeaderCache::open(&dir.0,LtcNetwork::Testnet)?;
++    let mut chain=HeaderSequence::new(LtcNetwork::Testnet)?;
++    for raw in TESTNET_AFTER_CHECKPOINT {
++        chain.append(&(0..raw.len()).step_by(2).map(|i|u8::from_str_radix(&raw[i..i+2],16).unwrap()).collect::<Vec<_>>(),
++            TESTNET_AFTER_CHECKPOINT_TIME)?;
++    }
++    cache.save(&chain)?;
++    let path=dir.0.join(NAME);let saved=fs::read(&path)?;
++    assert_eq!(&saved[..8],MAGIC_CHECKPOINT);assert_eq!(saved.len() as u64,PREFIX_CHECKPOINT+20*80);
++    // Only the cap on height matters: the root counts toward it.
++    assert!(cache.load(4923091,TESTNET_AFTER_CHECKPOINT_TIME).is_err());
++    let restored=cache.load(4923092,TESTNET_AFTER_CHECKPOINT_TIME)?.unwrap();
++    assert_eq!(restored.height(),chain.height());assert_eq!(restored.chain_work(),chain.chain_work());
++    assert_eq!(restored.root_height(),4923072);
++    // A genesis-format cache on a checkpoint network is an error, not genesis.
++    let mut old=saved.clone();old[..8].copy_from_slice(MAGIC);old.drain(40..44);
++    fs::write(&path,&old)?;assert!(cache.load(10_000_000,TESTNET_AFTER_CHECKPOINT_TIME).is_err());
++    // The stored checkpoint height must be the pinned one.
++    let mut moved=saved.clone();moved[40]^=1;
++    fs::write(&path,&moved)?;assert!(cache.load(10_000_000,TESTNET_AFTER_CHECKPOINT_TIME).is_err());
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/headers/tests.rs b/swap-machine/src/litecoin_light/headers/tests.rs
+index 8ee628b8f..6195dd4ff 100644
+--- a/swap-machine/src/litecoin_light/headers/tests.rs
++++ b/swap-machine/src/litecoin_light/headers/tests.rs
+@@ -12,7 +12,7 @@ fn headers_pin_genesis_and_match_independent_scrypt_vectors() -> Result<()> {
+         (LtcNetwork::Mainnet,"001e67b013726fd7382e9acb69165b4b6316227fb3156b5b414ba6340c050000",1048592u64),
+         (LtcNetwork::Testnet,"64de605b080d5c80ef6bf8460faf954bffb170d64d6087c3b4c42502cc060000",1048592),
+         (LtcNetwork::Regtest,"79345ad2e07692285c0f68b135d356bb3a8a23ad784f34f2b02e039534cadb5a",2)] {
+-        let sequence = HeaderSequence::new(network)?;
++        let sequence = HeaderSequence::from_genesis(network)?;
+         let genesis = sequence.header(0).unwrap();
+         assert_eq!(sequence.network(),network); assert_eq!(sequence.height(),0);
+         assert_eq!(genesis.block_hash().to_string(),network.genesis());
+@@ -25,7 +25,7 @@ fn headers_pin_genesis_and_match_independent_scrypt_vectors() -> Result<()> {
+ #[test]
+ fn headers_accept_fixed_offline_header_and_accumulate_work() -> Result<()> {
+     // Static synthetic header: no node, nonce search or mining is run by tests.
+-    let mut sequence = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut sequence = HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let header = child();
+     assert_eq!(sequence.append(&serialize(&header),u64::from(header.time))?,header.block_hash());
+     assert_eq!(sequence.height(),1); assert_eq!(sequence.header(1),Some(header));
+@@ -36,7 +36,7 @@ fn headers_accept_fixed_offline_header_and_accumulate_work() -> Result<()> {
+ }
+ #[test]
+ fn headers_reject_invalid_context_without_mutation() -> Result<()> {
+-    let mut sequence = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut sequence = HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let original = sequence.header(0).unwrap(); let work = sequence.chain_work().clone();
+     for case in 0..6 {
+         let mut header = child(); let mut now = u64::from(header.time);
+@@ -55,7 +55,7 @@ fn headers_reject_invalid_context_without_mutation() -> Result<()> {
+     }
+     assert!(sequence.append(&[0;79],0).is_err());
+     assert!(sequence.append(&serialize(&child()),u64::MAX).is_err());
+-    let mut main = HeaderSequence::new(LtcNetwork::Mainnet)?;
++    let mut main = HeaderSequence::from_genesis(LtcNetwork::Mainnet)?;
+     let mut low_work = child(); let genesis = main.header(0).unwrap();
+     low_work.prev_blockhash = genesis.block_hash(); low_work.bits = genesis.bits;
+     low_work.time = genesis.time+150;
+@@ -133,7 +133,7 @@ fn headers_enforce_activation_version_boundaries() -> Result<()> {
+ 
+ #[test]
+ fn headers_median_past_time_uses_eleven_ancestors_not_just_tip() -> Result<()> {
+-    let mut sequence = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut sequence = HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let original = sequence.header(0).unwrap();
+     // Synthetic context for this timing check; no claim of validated ancestry.
+     sequence.headers = [10,11,12,13,14,15,16,17,18,19,1].iter().map(|offset| {
+@@ -149,7 +149,7 @@ fn headers_median_past_time_uses_eleven_ancestors_not_just_tip() -> Result<()> {
+ }
+ #[test]
+ fn headers_future_time_boundary_is_inclusive() -> Result<()> {
+-    let mut sequence = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut sequence = HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let header = child();
+     sequence.append(&serialize(&header),u64::from(header.time)-7200)?;
+     assert_eq!(sequence.height(),1);
+@@ -158,7 +158,7 @@ fn headers_future_time_boundary_is_inclusive() -> Result<()> {
+ 
+ #[test]
+ fn headers_batch_rejection_restores_prefix_and_work() -> Result<()> {
+-    let mut sequence=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut sequence=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let original=sequence.header(0); let work=sequence.chain_work().clone();
+     let header=child(); let raw=serialize(&header); let mut invalid=raw.clone();invalid.extend(&raw);
+     assert!(sequence.append_batch(&invalid,u64::from(header.time)).is_err());
+@@ -174,7 +174,7 @@ fn headers_batch_rejection_restores_prefix_and_work() -> Result<()> {
+ 
+ #[test]
+ fn forks_select_validated_work_and_report_disconnected_evidence() -> Result<()> {
+-    let mut selected = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut selected = HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     selected.append(&serialize(&child()),1296688902)?;
+     let old = child().block_hash();
+     let mut candidate = selected.fork(0)?;
+@@ -200,7 +200,7 @@ fn forks_select_validated_work_and_report_disconnected_evidence() -> Result<()>
+ }
+ #[test]
+ fn forks_extension_and_wrong_network_are_distinct() -> Result<()> {
+-    let mut selected = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut selected = HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let genesis = selected.header(0).unwrap().block_hash();
+     let mut candidate = selected.fork(0)?;
+     candidate.append(&serialize(&child()),1296688752)?;
+@@ -208,7 +208,63 @@ fn forks_extension_and_wrong_network_are_distinct() -> Result<()> {
+     assert_eq!(selected.adopt(candidate)?.unwrap(),ChainChange {
+         common_ancestor:0,old_tip:(0,genesis),new_tip:(1,child().block_hash())});
+     let work = selected.chain_work().clone();
+-    assert!(selected.adopt(HeaderSequence::new(LtcNetwork::Mainnet)?).is_err());
++    assert!(selected.adopt(HeaderSequence::from_genesis(LtcNetwork::Mainnet)?).is_err());
+     assert_eq!(selected.chain_work(),&work); assert!(selected.contains(1,child().block_hash()));
+     Ok(())
+ }
++
++/// Litecoin testnet heights 4,923,073..=4,923,092, the first 20 blocks after the
++/// pinned checkpoint, exported from the project's litecoind 0.21.5.8.
++pub(in crate::litecoin_light) const TESTNET_AFTER_CHECKPOINT: [&str;20] = [
++    "00000020270ff7550fabeada42180096a7cd46d4767ec7c65e221bf3825d0849f6c6a823866b8ba35eef8ac40711bdffc84fe73022c0ca86539a8c608c2decbd6f32f83ae70bd16affe9001d8cf2ff39",
++    "00000020eb2760ab0266fa388631e85bd04d43bbe4b39967ba9a09d1cb00af049676f7af70239a3b4aaf499bc556b27d204cc81fa6f3360146cf5c4a1b56e122522fc122e80bd16affe9001daedb9c50",
++    "00000020bfb90c7e942d6e92bb0b351fd840b0e5120af91c73404a4b6cccd62c46a3ab523969be8c06f3314b7cad25c54524de6d22880cb4eea8fa4443de5f62f9c4930ded0bd16affe9001d0e658d1f",
++    "000000209947af0bdac9a284da7a6d63990bae1936b52370b7270654a333f985aa94f68b20ca5f84be35db4ee88b7d63d3eb7855ee1ce47ffc2f561a988ea99252da5f75ef0bd16affe9001dbc327a68",
++    "0000002071ca325fa737fc75c781d7e41793e50f53295acd420cb7c61db6c947ec62cdd9eaba13a0d2293893438f1fbcfb6cbe7dd6d1be19910b21f9dc6054533b029965f00bd16affe9001dca50944b",
++    "0000002023ec950446c14863805ec111f318bb5bc7d4722570b82f61f82973c2c9ae97ee31f544f279f1c73b8c6a159cea0ab046cdb9778cf8cd21ad25a779a314b6c02df10bd16affe9001d21c1f7f4",
++    "000000203364e1837f3124fe96007a4c91ee2060bb4633706fc1c6a675a41ccba66f5674af16d4fe350280745fa300e8b953852c9d57379331818b6510f9ba885c90d398f70bd16affe9001d33df4aa4",
++    "0000002029ddbf0a585312e8a98136a23392d3ac04f39dec70f310935540a6acf2d3bf2f7cf9729e5c3af1b736bba86f14fd95e78ff12c738abf5cebf693e7d41dfd1c45fb0bd16affe9001d224721d0",
++    "000000202149aeeee3da0b4f513568e10b7deab6579161170a1405c5570f87e3911e27961d3ac745e12da8dadc2090d154ea7e46dd5ba476d5aeeaf0623e98b579ea23fffd0bd16affe9001d03642acc",
++    "00000020c74898d6f36359c64bf2632d4b565988fcdfbbec87a3415fc85b858751e0c27818504b6e3477e068c887a04639f3cae1ea32f8481ab1d1de14b36f9af1574f5bff0bd16affe9001dcfe861a1",
++    "0000002046d02367fd50f043fbe43304210b31128eccba23a08ca284a41f3833d764de6589b4e3c9f29510d03dd43c5236cf4cba3952fd0464d964961fc306ed48b5a0c4000cd16affe9001d43980996",
++    "00000020690e1092cec9ea5e94591474be3b1e5ed025f85252a1f7eeea463123c236d8b304b011e206be8408f63a00503c13a6b543a14b24550cf2294efc4ebf826d00fb010cd16affe9001dfc19b9de",
++    "00000020696b598873cd6ea52754f53c1056cd8792ae748d10001c02054f04bf680e63637005d33e09492dae5c526bbfeafa2b10d42edcddf6d96e6e6324ea0b31810c96030cd16affe9001d46c28426",
++    "000000205bf63eb2b15a6ff44a5fd98c91f54b6911f2c7ce667ce31136d42694d6f8ee82c17287b2c933239d274b96f482d4cf21b421a929f67d88ffa0177665d7846353060cd16affe9001dac53c6e7",
++    "00000020036430d9920865cd36f8605602ca745d76ab9ff29f1c3afa93e1a3f3b900bd989ac3eda551690afa773a430a0c818e2bdd323d521adf0c5bea950ce8312a827a080cd16affe9001d03f417f8",
++    "00000020eca797fbef64f4ab99e2539511561770559143b95acafebc0cf7e495e49ff5f5ab62fcf24efaf9418f746259e8c844ac7cb0de6b2f5ff8277967cf868a92631e090cd16affe9001d8cc1237a",
++    "0000002007410e365c4fd96d30c2e1826deb83e1260e138ae2f2eee262961f3250583e6a77932d1973953938dde4faf773dcec1e00901c3f9f5a87d5ea7e29539ebe11450a0cd16affe9001dd1241d2f",
++    "0000002017ffe209537238f53d9bedf8d17469f582a4c482b6ddbf0339fe9991e1e13efb3a2ffdd5e60911f4f0d273d77a19a213033383caeae157bf57c3b5aec61cda1f0c0cd16affe9001dc570657c",
++    "00000020649ce8452e744332c4102bcaba89a0fa72e9b4f6e9463ab39d06f63f10bbe653d767a971d8e60daa6d0d82405bcd367f3684c3c8fb378a2ce47d0bceef730b040d0cd16affe9001ddb711e86",
++    "000000208d5f876ec57d784bb9489396ffa68a136ca68172f0b0162f7f5f5c356478c72217251350fb9b55639a40650722aa634bed44ea3d218cb6cb109851833653e6d60d0cd16affe9001d81b3d241",
++];
++pub(in crate::litecoin_light) const TESTNET_AFTER_CHECKPOINT_TIME: u64 = 1792085005;
++#[test]
++fn testnet_starts_at_its_checkpoint_and_validates_real_headers_on_top() -> Result<()> {
++    let mut chain = HeaderSequence::new(LtcNetwork::Testnet)?;
++    assert_eq!((chain.height(),chain.root_height()),(4923072,4923072));
++    assert_eq!(chain.header(4923072).unwrap().block_hash().to_string(),
++        "23a8c6f649085d82f31b225ec6c77e76d446cda796001842daeaab0f55f70f27");
++    assert_eq!(chain.chain_work(),&BigUint::parse_bytes(b"06a86ddaf7625419",16).unwrap());
++    assert!(chain.header(0).is_none() && chain.header(4923061).is_none() && chain.header(4923062).is_some());
++    let start = chain.chain_work().clone();
++    for (offset,raw) in TESTNET_AFTER_CHECKPOINT.iter().enumerate() {
++        chain.append(&bytes(raw),TESTNET_AFTER_CHECKPOINT_TIME)?;
++        assert_eq!(chain.height(),4923073+offset as u32);
++    }
++    assert!(chain.chain_work()>&start);
++    // Real Scrypt work is required on top of the checkpoint.
++    let mut forged = HeaderSequence::new(LtcNetwork::Testnet)?;
++    let mut raw = bytes(TESTNET_AFTER_CHECKPOINT[0]); raw[76]^=1;
++    assert!(forged.append(&raw,TESTNET_AFTER_CHECKPOINT_TIME).is_err());
++    // A fork is only possible at or above the trusted root.
++    assert!(chain.fork(4923071).is_err());
++    let fork = chain.fork(4923080)?;
++    assert_eq!(fork.height(),4923080);assert!(fork.chain_work()<chain.chain_work());
++    // A branch rooted at genesis cannot replace a checkpoint-rooted one, or the reverse.
++    assert!(chain.adopt(HeaderSequence::from_genesis(LtcNetwork::Testnet)?).is_err());
++    assert!(HeaderSequence::from_genesis(LtcNetwork::Testnet)?.adopt(fork).is_err());
++    // Networks without a checkpoint still start at genesis.
++    assert_eq!(HeaderSequence::new(LtcNetwork::Mainnet)?.root_height(),0);
++    assert_eq!(HeaderSequence::new(LtcNetwork::Regtest)?.root_height(),0);
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/network.rs b/swap-machine/src/litecoin_light/network.rs
+index fa9dd72f5..664285697 100644
+--- a/swap-machine/src/litecoin_light/network.rs
++++ b/swap-machine/src/litecoin_light/network.rs
+@@ -137,6 +137,38 @@ impl LightNetwork {
+         Ok(())
+     }
+ 
++    /// A sync starting point pinned in code: the 11 raw headers ending at a
++    /// difficulty-period boundary (enough for median time and the next
++    /// retarget) and the cumulative work at that boundary. Headers below it are
++    /// not kept, so payments mined earlier cannot be proved from this chain.
++    /// Only networks whose checkpoint was taken from a node we run have one.
++    pub(super) fn checkpoint(self) -> Option<Checkpoint> {
++        match self {
++            // Litecoin testnet block 4,923,072 (23a8c6f6…0f27), taken 2026-10-16 from the
++            // project's synced litecoind 0.21.5.8; cumulative work independently summed
++            // from every header since genesis.
++            Self::Litecoin(LtcNetwork::Testnet) => Some(Checkpoint {
++                height: 4923072,
++                hash: "23a8c6f649085d82f31b225ec6c77e76d446cda796001842daeaab0f55f70f27",
++                chain_work: "06a86ddaf7625419",
++                window: &[
++        "00000020a4c36c51c116c0e4ccbd93ce2aa4d8f53c10f97aa431a47814e025542fc9083dfddff59434c485c0f6676eb1a506dd6fad5c4e7eda987d7105e7dd360028cdb7df0bd16afca7031d7430d61c",
++        "00000020c1f3d2682df934831c038f50d8f0a25dc98ba47e95f14189a4aaab8757025ea1db0ed5fe59e8a6d0e544578596c40ab3324d4cf274fd6f11e597ba7a474bb4dadf0bd16afca7031db6906165",
++        "0000002030c0759ccca7c28de7eb60f0dc55709311c2a9bdd4dfc6ec0789f801482738cce5159ccfb7188e1352be8fb52e7a00ba45d69104cd5d0ebb11b624ed188039d5e00bd16afca7031d148485d0",
++        "0000002017838735654aab4415bbbddf6ea18082ca8748a7d0b352f3d8ff9d9696b7c1ecc53eed868f6bb3239591040e465a812f5f693357eb9a67a1ddc30aabe3bff83de20bd16afca7031d3c600f88",
++        "00000020cef81ee94cd26dad811c2ea6119cd3f5d2514fa4acfd8812d09b08c8e651d67cb72da0a0f82a2e48f775af736bb94be75a357967603ad1565c37d2c2e1aee2eee20bd16afca7031db3905157",
++        "000000201d63c2a29cca7f93b1f0417a6c163cd4fdf166e0aa77c85d89be1cb0973a8a9606f3162fc1df8774b85026a3c5c11cb6cef8eec5facc99eaa7bb1bad1e108a3ae20bd16afca7031d86210817",
++        "00000020e6a594832281c322118f84f1fccdcd8c74a3ec482c008518ce14e330339eba6884d06164c352ef172ec54df7628c65458e48338c10445455e6837a0b92224814e30bd16afca7031d45d03d31",
++        "000000207e6d7a1209b206f5233f72f17cc481c2686e65a7c90f99ef0338027ee46b3a419b3348a5ab32f600c7b804c950745fa4568911470bbd5bb696891c966f0cfdfee30bd16afca7031d6dcf9c5a",
++        "00000020141824bc6b52a0f72da298f592385bb88df92f464a4a49854c83e415ac1c59ea83074464441f779b62fda8a0e1b0446e451fcc945fc326da71ff33f986054acde30bd16afca7031d5a206454",
++        "000000201577d7bc041dbc74e0c59430f659244e1a5e1a67ed7574e37f2d189b241d75a3922211d1faaae82dc04bc94ed8a60e635a0eb071965426b675ad0c3d50c54263e40bd16afca7031db5d15f5f",
++        "000000209357147c559a9d399ec876f83532f6ee826386483a09fb6a614ebaae1eb45ab12a4f07767cfdcbfea144f4013e0477e6e1a31d33f7039045e1c4ac9148a06aefe50bd16affe9001ddc34b8f5",
++                ],
++            }),
++            _ => None,
++        }
++    }
++
+     pub(super) fn genesis_header(self) -> Result<Header> {
+         self.ensure_header_rules()?;
+         let (merkle, time, nonce, bits) = match self {
+@@ -210,13 +242,17 @@ impl LightNetwork {
+         Ok(value)
+     }
+ 
+-    pub(super) fn next_bits(self, headers: &[Header], time: u32) -> Result<u32> {
++    /// `headers[0]` is at height `base` (0 from genesis, or below a checkpoint).
++    pub(super) fn next_bits(self, headers: &[Header], base: u32, time: u32) -> Result<u32> {
+         self.ensure_header_rules()?;
+         let previous = headers.last().context("missing difficulty history")?;
++        let base = base as usize;
++        let at = |height: usize| height.checked_sub(base).and_then(|i|headers.get(i))
++            .context("difficulty history starts after the required ancestor");
+         // Implemented Bitcoin Cash and Dogecoin deployments are regtest only, where
+         // every block keeps the minimum difficulty and nodes never retarget.
+         if matches!(self, Self::BitcoinCash(_) | Self::Dogecoin(_)) { return Ok(previous.bits.to_consensus()) }
+-        let height = headers.len();
++        let height = base + headers.len();
+         let easiest = compact(&self.limit());
+         // Minimum-difficulty blocks on test networks: twice the target spacing.
+         let (min_difficulty_gap, timespan) = match self {
+@@ -227,8 +263,8 @@ impl LightNetwork {
+             if !self.is_mainnet() {
+                 if u64::from(time) > u64::from(previous.time) + min_difficulty_gap { return Ok(easiest) }
+                 let mut index = height - 1;
+-                while index > 0 && index % 2016 != 0 && headers[index].bits.to_consensus() == easiest { index -= 1; }
+-                return Ok(headers[index].bits.to_consensus())
++                while index > 0 && index % 2016 != 0 && at(index)?.bits.to_consensus() == easiest { index -= 1; }
++                return Ok(at(index)?.bits.to_consensus())
+             }
+             return Ok(previous.bits.to_consensus())
+         }
+@@ -240,7 +276,7 @@ impl LightNetwork {
+             Self::Litecoin(_) => if height == 2016 { 0 } else { height - 2017 },
+             _ => height - 2016,
+         };
+-        let elapsed = i64::from(previous.time) - i64::from(headers[first].time);
++        let elapsed = i64::from(previous.time) - i64::from(at(first)?.time);
+         self.retarget(previous.bits.to_consensus(), elapsed, timespan)
+     }
+ 
+@@ -511,3 +547,11 @@ impl fmt::Display for LightAddress {
+ 
+ #[cfg(test)]
+ mod tests;
++
++/// See `LightNetwork::checkpoint`.
++pub(super) struct Checkpoint {
++    pub height: u32,
++    pub hash: &'static str,
++    pub chain_work: &'static str,
++    pub window: &'static [&'static str],
++}
+diff --git a/swap-machine/src/litecoin_light/network/tests.rs b/swap-machine/src/litecoin_light/network/tests.rs
+index c3b635b1d..9cb3b7b2a 100644
+--- a/swap-machine/src/litecoin_light/network/tests.rs
++++ b/swap-machine/src/litecoin_light/network/tests.rs
+@@ -24,7 +24,7 @@ const LTC_NETWORKS: [LtcNetwork; 3] = [LtcNetwork::Mainnet, LtcNetwork::Testnet,
+ #[test]
+ fn every_network_builds_its_pinned_genesis() {
+     for network in BTC_NETWORKS.map(LightNetwork::from).into_iter().chain(LTC_NETWORKS.map(LightNetwork::from)) {
+-        let chain = HeaderSequence::new(network).unwrap();
++        let chain = HeaderSequence::from_genesis(network).unwrap();
+         assert_eq!(chain.height(), 0);
+         assert_eq!(chain.header(0).unwrap().block_hash().to_string(), network.genesis());
+         assert_eq!(chain.network(), network);
+@@ -59,7 +59,7 @@ fn bitcoin_identity() {
+ 
+ #[test]
+ fn bitcoin_mainnet_headers_extend_genesis_with_sha256d_work() {
+-    let mut chain = HeaderSequence::new(BtcNetwork::Mainnet).unwrap();
++    let mut chain = HeaderSequence::from_genesis(BtcNetwork::Mainnet).unwrap();
+     let genesis_work = chain.chain_work().clone();
+     let first = chain.append(&bytes(BTC_1), NOW).unwrap();
+     assert_eq!(first.to_string(), "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048");
+@@ -71,14 +71,14 @@ fn bitcoin_mainnet_headers_extend_genesis_with_sha256d_work() {
+ 
+ #[test]
+ fn bitcoin_headers_are_rejected_when_work_link_or_clock_is_wrong() {
+-    let mut chain = HeaderSequence::new(BtcNetwork::Mainnet).unwrap();
++    let mut chain = HeaderSequence::from_genesis(BtcNetwork::Mainnet).unwrap();
+     let mut tampered = bytes(BTC_1);
+     tampered[76] ^= 1;
+     assert!(chain.append(&tampered, NOW).unwrap_err().to_string().contains("insufficient Bitcoin SHA256d work"));
+     assert!(chain.append(&bytes(BTC_2), NOW).unwrap_err().to_string().contains("disconnected Bitcoin header"));
+     assert!(chain.append(&bytes(BTC_1), 1231469665 - 7201).unwrap_err().to_string().contains("too far in future"));
+     // A Litecoin chain never accepts Bitcoin work.
+-    let mut litecoin = HeaderSequence::new(LtcNetwork::Mainnet).unwrap();
++    let mut litecoin = HeaderSequence::from_genesis(LtcNetwork::Mainnet).unwrap();
+     assert!(litecoin.append(&bytes(BTC_1), NOW).is_err());
+     assert_eq!((chain.height(), litecoin.height()), (0, 0));
+ }
+@@ -89,10 +89,10 @@ fn bitcoin_first_mainnet_retarget_matches_block_32256() {
+     let mut history = vec![header(BTC_32255); 32256];
+     history[30240] = header(BTC_30240);
+     let expected = header(BTC_32256);
+-    assert_eq!(network.next_bits(&history, expected.time).unwrap(), expected.bits.to_consensus());
++    assert_eq!(network.next_bits(&history, 0, expected.time).unwrap(), expected.bits.to_consensus());
+     assert_eq!(expected.bits.to_consensus(), 0x1d00d86a);
+     // Inside an interval mainnet keeps the previous difficulty.
+-    assert_eq!(network.next_bits(&history[..32255], expected.time).unwrap(), 0x1d00ffff);
++    assert_eq!(network.next_bits(&history[..32255], 0, expected.time).unwrap(), 0x1d00ffff);
+ }
+ 
+ #[test]
+@@ -106,13 +106,13 @@ fn bitcoin_difficulty_limits_and_test_network_rules() {
+     let mut parent = header(BTC_32255);
+     parent.bits = CompactTarget::from_consensus(0x1c0fffff);
+     let history = vec![parent; 5];
+-    assert_eq!(test.next_bits(&history, parent.time + 1201).unwrap(), 0x1d00ffff);
+-    assert_eq!(test.next_bits(&history, parent.time + 1200).unwrap(), 0x1c0fffff);
++    assert_eq!(test.next_bits(&history, 0, parent.time + 1201).unwrap(), 0x1d00ffff);
++    assert_eq!(test.next_bits(&history, 0, parent.time + 1200).unwrap(), 0x1c0fffff);
+     // regtest never retargets.
+     let regtest = LightNetwork::from(BtcNetwork::Regtest);
+     let mut easy = header(BTC_32255);
+     easy.bits = CompactTarget::from_consensus(0x207fffff);
+-    assert_eq!(regtest.next_bits(&vec![easy; 2016], easy.time + 1).unwrap(), 0x207fffff);
++    assert_eq!(regtest.next_bits(&vec![easy; 2016], 0, easy.time + 1).unwrap(), 0x207fffff);
+ }
+ 
+ #[test]
+@@ -185,9 +185,9 @@ const DOGE_SCRIPT: &str = "76a914f152a426460a09138a0159450b158005d4e338be88ac";
+ 
+ #[test]
+ fn bitcoin_cash_and_dogecoin_regtest_genesis_match_the_nodes() {
+-    let bch = HeaderSequence::new(BchNetwork::Regtest).unwrap();
++    let bch = HeaderSequence::from_genesis(BchNetwork::Regtest).unwrap();
+     assert_eq!(bch.header(0).unwrap().block_hash().to_string(), "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206");
+-    let doge = HeaderSequence::new(DogeNetwork::Regtest).unwrap();
++    let doge = HeaderSequence::from_genesis(DogeNetwork::Regtest).unwrap();
+     assert_eq!(bitcoin::consensus::serialize(&doge.header(0).unwrap()),
+         bytes("010000000000000000000000000000000000000000000000000000000000000000000000696ad20e2dd4365c7459b4a4a5af743d5e92c6da3229e6532cd605f6533f2a5bdae5494dffff7f2002000000"));
+     assert_eq!(doge.header(0).unwrap().block_hash().to_string(), "3d2160a3b5dc4a9d62e7e66a295f70313ac808440ef7400d6c0772171ce973a5");
+@@ -196,7 +196,7 @@ fn bitcoin_cash_and_dogecoin_regtest_genesis_match_the_nodes() {
+ #[test]
+ fn unimplemented_bitcoin_cash_and_dogecoin_deployments_are_refused() {
+     for network in [LightNetwork::from(BchNetwork::Mainnet), BchNetwork::Testnet.into(), DogeNetwork::Mainnet.into(), DogeNetwork::Testnet.into()] {
+-        let error = HeaderSequence::new(network).err().expect("must refuse").to_string();
++        let error = HeaderSequence::from_genesis(network).err().expect("must refuse").to_string();
+         assert!(error.contains("not implemented"), "{error}");
+     }
+ }
+diff --git a/swap-machine/src/litecoin_light/session/sync.rs b/swap-machine/src/litecoin_light/session/sync.rs
+index 24275fd2e..92cf54e50 100644
+--- a/swap-machine/src/litecoin_light/session/sync.rs
++++ b/swap-machine/src/litecoin_light/session/sync.rs
+@@ -75,7 +75,18 @@ impl<S: AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
+     }
+     async fn begin_sync_inner(&mut self,selected: &HeaderSequence,tip: ReportedTip) -> Result<SyncCandidate> {
+         ensure!(self.usable,"Electrum session requires a new connection");
+-        let mut low=0u32;let mut high=selected.height().min(tip.height);
++        // The root (genesis, or the pinned checkpoint) is shared by definition only
++        // if the server's chain contains it; a checkpoint is checked explicitly.
++        let mut low=selected.root_height();
++        ensure!(tip.height>=low,"Electrum reported tip is below the trusted checkpoint");
++        if low>0 {
++            let (_,bytes)=self.exchange("blockchain.block.header",json!([low]),1024).await?;
++            let raw=decode_hex(&result::<String>(&bytes)?,80)?;
++            ensure!(raw.len()==80,"invalid Electrum checkpoint header length");
++            let header: Header=deserialize(&raw)?;
++            ensure!(selected.contains(low,header.block_hash()),"Electrum chain does not contain the trusted checkpoint");
++        }
++        let mut high=selected.height().min(tip.height);
+         while low<high {
+             let middle=low+((u64::from(high)-u64::from(low)+1)/2) as u32;
+             let (_,bytes)=self.exchange("blockchain.block.header",json!([middle]),1024).await?;
+diff --git a/swap-machine/src/litecoin_light/session/sync/tests.rs b/swap-machine/src/litecoin_light/session/sync/tests.rs
+index fb4bf1ef6..e73b4b6ca 100644
+--- a/swap-machine/src/litecoin_light/session/sync/tests.rs
++++ b/swap-machine/src/litecoin_light/session/sync/tests.rs
+@@ -30,7 +30,7 @@ async fn sync_tip_uses_disposable_subscription_and_strict_shape() -> Result<()>
+ async fn sync_downloads_in_bounded_steps_before_selection() -> Result<()> {
+     let mut responses=regtest_handshake();responses.push(batch(3,&[alternative()]));responses.push(batch(4,&[descendant()]));
+     let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+-    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut selected=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let mut candidate=session.begin_sync(&selected,tip(2,descendant())).await?;
+     assert_eq!(candidate.height(),0);assert_eq!(candidate.target_height(),2);assert!(!candidate.complete());
+     assert_eq!(candidate.advance(&mut session,1,1296688902).await?,1);
+@@ -43,7 +43,7 @@ async fn sync_downloads_in_bounded_steps_before_selection() -> Result<()> {
+ }
+ #[tokio::test]
+ async fn sync_discovers_fork_and_selects_only_more_work() -> Result<()> {
+-    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;selected.append(&serialize(&child()),1296688902)?;
++    let mut selected=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;selected.append(&serialize(&child()),1296688902)?;
+     let mut responses=regtest_handshake();responses.push(reply(3,json!(hex(&serialize(&alternative())))));
+     responses.push(batch(4,&[alternative(),descendant()]));let (stream,task)=server(responses);
+     let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+@@ -60,7 +60,7 @@ async fn sync_discovers_fork_and_selects_only_more_work() -> Result<()> {
+ }
+ #[tokio::test]
+ async fn sync_matching_tip_requires_no_download_and_never_claims_freshness() -> Result<()> {
+-    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;selected.append(&serialize(&child()),1296688902)?;
++    let mut selected=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;selected.append(&serialize(&child()),1296688902)?;
+     let mut responses=regtest_handshake();responses.push(reply(3,json!(hex(&serialize(&child())))));let (stream,task)=server(responses);
+     let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+     let candidate=session.begin_sync(&selected,tip(1,child())).await?;
+@@ -70,7 +70,7 @@ async fn sync_matching_tip_requires_no_download_and_never_claims_freshness() ->
+ #[tokio::test]
+ async fn sync_refuses_empty_or_changed_tip_and_keeps_selected_chain() -> Result<()> {
+     for changed in [false,true] {
+-        let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;
++        let mut selected=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+         let mut advertised=child();if changed {advertised.nonce=0;}
+         let mut responses=regtest_handshake();responses.push(if changed {batch(3,&[child()])} else {batch(3,&[])});
+         let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+@@ -85,9 +85,9 @@ async fn sync_refuses_empty_or_changed_tip_and_keeps_selected_chain() -> Result<
+ #[tokio::test]
+ async fn sync_rejects_network_budget_and_incomplete_selection_without_io() -> Result<()> {
+     let (stream,task)=server(regtest_handshake());let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+-    let other=HeaderSequence::new(LtcNetwork::Mainnet)?;
++    let other=HeaderSequence::from_genesis(LtcNetwork::Mainnet)?;
+     assert!(session.begin_sync(&other,tip(1,child())).await.is_err());
+-    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut selected=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let mut candidate=session.begin_sync(&selected,tip(1,child())).await?;
+     for count in [0,2017,u32::MAX] {assert!(candidate.advance(&mut session,count,1296688902).await.is_err());}
+     assert!(candidate.finish(&mut selected).is_err());assert_eq!(selected.height(),0);
+@@ -97,7 +97,7 @@ async fn sync_rejects_network_budget_and_incomplete_selection_without_io() -> Re
+ async fn sync_cancelled_candidate_cannot_be_finished_or_reused() -> Result<()> {
+     let (stream,_peer)=tokio::io::duplex(4096);
+     let mut session=ReadSession {stream:BufReader::new(stream),network:LtcNetwork::Regtest.into(),next_id:1,usable:true,timeout:Duration::from_secs(1)};
+-    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut selected=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let mut candidate=session.begin_sync(&selected,tip(1,child())).await?;
+     assert!(tokio::time::timeout(Duration::from_millis(20),candidate.advance(&mut session,1,1296688902)).await.is_err());
+     assert!(!candidate.complete());assert!(candidate.advance(&mut session,1,1296688902).await.is_err());
+diff --git a/swap-machine/src/litecoin_light/session/tests.rs b/swap-machine/src/litecoin_light/session/tests.rs
+index cebcb3f6c..fa047b4eb 100644
+--- a/swap-machine/src/litecoin_light/session/tests.rs
++++ b/swap-machine/src/litecoin_light/session/tests.rs
+@@ -124,7 +124,7 @@ async fn session_advances_validated_headers_and_does_not_claim_empty_reply_is_cu
+     responses.push(reply(4,json!({"count":0,"hex":"","max":2016})));
+     let (stream,task)=server(responses);
+     let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+-    let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut sequence=super::super::headers::HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     assert_eq!(session.advance(&mut sequence,2,u64::from(header.time)).await?,1);
+     assert_eq!(sequence.header(1),Some(header));let work=sequence.chain_work().clone();
+     assert_eq!(session.advance(&mut sequence,2,u64::from(header.time)).await?,0);
+@@ -140,7 +140,7 @@ async fn session_bad_header_suffix_rolls_back_and_poisoned_session_sends_no_retr
+     let mut responses=regtest_handshake();responses.push(reply(3,json!({"count":2,"hex":raw.clone()+&raw,"max":2016})));
+     let (stream,task)=server(responses);
+     let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+-    let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut sequence=super::super::headers::HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let work=sequence.chain_work().clone();
+     assert!(session.advance(&mut sequence,2,u64::from(header.time)).await.is_err());
+     assert_eq!(sequence.height(),0);assert_eq!(sequence.chain_work(),&work);
+@@ -151,9 +151,9 @@ async fn session_bad_header_suffix_rolls_back_and_poisoned_session_sends_no_retr
+ async fn session_sync_refuses_wrong_network_and_request_limits_without_io() -> Result<()> {
+     let (stream,task)=server(handshake());
+     let mut session=ReadSession::negotiate(stream,LtcNetwork::Mainnet).await?;
+-    let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut sequence=super::super::headers::HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     assert!(session.advance(&mut sequence,1,0).await.is_err());
+-    let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Mainnet)?;
++    let mut sequence=super::super::headers::HeaderSequence::from_genesis(LtcNetwork::Mainnet)?;
+     for count in [0,2017,u32::MAX] {assert!(session.advance(&mut sequence,count,0).await.is_err());}
+     drop(session);assert_eq!(task.await?.len(),2);Ok(())
+ }
+@@ -164,7 +164,7 @@ async fn session_sync_rejects_malformed_counts_and_lengths() -> Result<()> {
+         json!({"count":1.0,"hex":"","max":2016}),json!({"count":0,"hex":"","max":2016,"root":"unrequested"})] {
+         let mut responses=regtest_handshake();responses.push(reply(3,result));let (stream,task)=server(responses);
+         let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+-        let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++        let mut sequence=super::super::headers::HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+         assert!(session.advance(&mut sequence,2,2000000000).await.is_err());assert_eq!(sequence.height(),0);
+         drop(session);assert_eq!(task.await?.len(),3);
+     }
+@@ -178,7 +178,7 @@ fn anchored_fixture() -> (super::super::headers::HeaderSequence,InclusionRequest
+     header.merkle_root=original.merkle_root;
+     // Fixed header independently checked with hashlib.scrypt:
+     // 99cd547ec27bdf0f13b1b0c525008c735aa1205df1702730a9419aab4df7957e.
+-    let mut chain=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest).unwrap();
++    let mut chain=super::super::headers::HeaderSequence::from_genesis(LtcNetwork::Regtest).unwrap();
+     chain.append(&serialize(&header),u64::from(header.time)).unwrap();
+     request.height=1;request.block_hash=header.block_hash();request.id=4;
+     proof["id"]=json!(4);proof["result"]["block_height"]=json!(1);
+@@ -213,7 +213,7 @@ async fn session_selected_chain_rejects_unknown_height_and_network_without_io()
+     let (chain,request,_,_)=anchored_fixture();let (stream,task)=server(regtest_handshake());
+     let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+     for height in [2,u32::MAX] {assert!(session.inclusion_on(&chain,height,request.txid).await.is_err());}
+-    let other=super::super::headers::HeaderSequence::new(LtcNetwork::Mainnet)?;
++    let other=super::super::headers::HeaderSequence::from_genesis(LtcNetwork::Mainnet)?;
+     assert!(session.inclusion_on(&other,0,request.txid).await.is_err());
+     assert!(session.usable);drop(session);assert_eq!(task.await?.len(),2);Ok(())
+ }
+@@ -241,6 +241,6 @@ fn selected_chain_confirmation_depth_tracks_extensions() -> Result<()> {
+     assert_eq!(matched.confirmations_on(&chain),Some(2));
+     assert_eq!(matched.confirmations_on(&chain.fork(1)?),Some(1));
+     assert_eq!(matched.confirmations_on(&chain.fork(0)?),None);
+-    assert_eq!(matched.confirmations_on(&super::super::headers::HeaderSequence::new(LtcNetwork::Mainnet)?),None);
++    assert_eq!(matched.confirmations_on(&super::super::headers::HeaderSequence::from_genesis(LtcNetwork::Mainnet)?),None);
+     Ok(())
+ }
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic/tests.rs b/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic/tests.rs
+index 02cb5044e..d0e79c972 100644
+--- a/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic/tests.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic/tests.rs
+@@ -13,7 +13,7 @@ async fn scan(network:LightNetwork,account:&PublicAccount)->Result<(HeaderSequen
+         "hash_function":"sha256","server_version":"fixture","protocol_min":"1.4","protocol_max":"1.4.3","hosts":{}}))];
+     for id in 3..10 {responses.push(reply(id,json!([])));}
+     let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,network).await?;
+-    let chain=HeaderSequence::new(network)?;
++    let chain=HeaderSequence::from_genesis(network)?;
+     let observation=session.refresh_wallet(&chain,account,[2,1],
+         &RefreshLimits {gap:2,addresses_per_branch:10,history_entries_per_branch:10}).await?;
+     drop(session);task.await?;Ok((chain,observation))
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs b/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs
+index 4db9b5052..6ff3f66c4 100644
+--- a/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs
+@@ -15,7 +15,7 @@ async fn empty_scan(network:LightNetwork,minimum:[u32;2])->Result<(HeaderSequenc
+         "hash_function":"sha256","server_version":"fixture","protocol_min":"1.4","protocol_max":"1.4.3","hosts":{}}))];
+     for id in 3..3+minimum[0]+minimum[1]+4 {responses.push(reply(id as u64,json!([])));}
+     let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,network).await?;
+-    let chain=HeaderSequence::new(network)?;
++    let chain=HeaderSequence::from_genesis(network)?;
+     let observation=session.refresh_wallet(&chain,&account(network,1)?,minimum,
+         &RefreshLimits {gap:2,addresses_per_branch:10,history_entries_per_branch:10}).await?;
+     drop(session);task.await?;Ok((chain,observation))
+@@ -35,7 +35,7 @@ async fn approved_recovery_reserves_empty_scanned_ranges_and_preserves_existing_
+         let before=fs::read(directory.0.join("litecoin-address-book.json"))?;
+         assert!(review.retain_on(&chain,&mut book,sha256::Hash::hash(b"wrong approval")).is_err());
+         assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,before);
+-        let wrong_chain=HeaderSequence::new(if network==LightNetwork::Litecoin(LtcNetwork::Regtest) {
++        let wrong_chain=HeaderSequence::from_genesis(if network==LightNetwork::Litecoin(LtcNetwork::Regtest) {
+             LightNetwork::Bitcoin(BtcNetwork::Regtest)}else{LightNetwork::Litecoin(LtcNetwork::Regtest)})?;
+         assert!(review.retain_on(&wrong_chain,&mut book,review.commitment()).is_err());
+         let other=Directory::new()?;let mut other_book=AddressBook::create(&other.0,account(network,2)?)?;
+@@ -120,7 +120,7 @@ async fn journaled_recovery_resumes_exact_allocation_transition_on_four_chains()
+         assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,after);
+         let other=Directory::new()?;let mut other_book=AddressBook::create(&other.0,account(network,2)?)?;
+         assert!(resume_retention(&journal.0,&chain,&mut other_book,approved,context).is_err());
+-        let other_chain=HeaderSequence::new(if network==LightNetwork::Litecoin(LtcNetwork::Regtest) {
++        let other_chain=HeaderSequence::from_genesis(if network==LightNetwork::Litecoin(LtcNetwork::Regtest) {
+             LightNetwork::Bitcoin(BtcNetwork::Regtest)}else {LightNetwork::Litecoin(LtcNetwork::Regtest)})?;
+         assert!(resume_retention(&journal.0,&other_chain,&mut book,approved,context).is_err());
+         // Even a same-count unrelated book is not an exact completed retry.
+diff --git a/swap-machine/src/litecoin_light/transaction/tests.rs b/swap-machine/src/litecoin_light/transaction/tests.rs
+index 9d308d237..060a83c3c 100644
+--- a/swap-machine/src/litecoin_light/transaction/tests.rs
++++ b/swap-machine/src/litecoin_light/transaction/tests.rs
+@@ -11,7 +11,7 @@ fn transaction_effects_match_scripts_and_spent_outpoints()->Result<()> {
+     assert_eq!(included.outputs_to(&transaction.output[0].script_pubkey).collect::<Vec<_>>(),
+         [(OutPoint {txid:request.txid,vout:0},Amount::from_sat(100000))]);
+     assert_eq!(included.outputs_to(Script::new()).count(),0);
+-    let chain=headers::HeaderSequence::new(swap_core::litecoin_address::LtcNetwork::Regtest)?;
++    let chain=headers::HeaderSequence::from_genesis(swap_core::litecoin_address::LtcNetwork::Regtest)?;
+     assert_eq!(included.confirmations_on(&chain),None);
+     Ok(())
+ }
+@@ -28,9 +28,9 @@ async fn transaction_query_requires_local_chain_height_before_io()->Result<()> {
+     use swap_core::litecoin_address::LtcNetwork;
+     let (stream,task)=server(regtest_handshake());
+     let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+-    let chain=headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    let chain=headers::HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     assert!(session.transaction_on(&chain,1,Txid::all_zeros()).await.is_err());
+-    let chain=headers::HeaderSequence::new(LtcNetwork::Testnet)?;
++    let chain=headers::HeaderSequence::from_genesis(LtcNetwork::Testnet)?;
+     assert!(session.transaction_on(&chain,0,Txid::all_zeros()).await.is_err());
+     drop(session);assert_eq!(task.await?.len(),2);Ok(())
+ }
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+index 07a15326b..506a7cf67 100644
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+@@ -9,7 +9,7 @@ impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}
+ fn observed_claim_checks_pending_spends_before_retention_and_signing()->Result<()> {
+     // Injected policy inclusion identity, not a Merkle/consensus fixture.
+     let (seed,account,mut spend,prevout)=super::super::super::super::tests::fixture()?;
+-    let chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let chain=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let mut credit=spend.clone();credit.output=vec![prevout.clone()];
+     let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),
+         block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},&credit)?;
+@@ -35,7 +35,7 @@ fn independent_inclusion_can_be_claimed_but_changed_tip_rejects_signing()->Resul
+     let fixture:serde_json::Value=serde_json::from_str(include_str!("../../../../../session/wallet/fixture.json"))?;
+     let blocks=fixture["blocks"].as_array().unwrap();let block=&blocks[0];
+     let header=Vec::from_hex(block["header"].as_str().unwrap())?;let raw=Vec::from_hex(block["transaction"].as_str().unwrap())?;
+-    let credit:Transaction=deserialize(&raw)?;let mut chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let credit:Transaction=deserialize(&raw)?;let mut chain=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     chain.append(&header,u64::MAX-7200)?;
+     let request=InclusionRequest {id:7,txid:credit.compute_txid(),height:1,block_hash:chain.header(1).unwrap().block_hash()};
+     let proof=match_merkle_proof(&request,&header,&raw,&serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0","id":7,"result":{"block_height":1,"pos":0,"merkle":[]}}))?)?;
+@@ -47,7 +47,7 @@ fn independent_inclusion_can_be_claimed_but_changed_tip_rejects_signing()->Resul
+     let review=||ConfirmedSpendReview::new(&chain,&account,spend.clone(),&inputs,&payment,None,Amount::from_sat(40000),1);
+     let script=credit.output[0].script_pubkey.clone();
+     let observed=ObservedWallet::reconcile(&chain,&[script.clone()],std::slice::from_ref(&included))?;
+-    let stale=ObservedWallet::reconcile(&HeaderSequence::new(LtcNetwork::Regtest)?,&[script],&[])?;
++    let stale=ObservedWallet::reconcile(&HeaderSequence::from_genesis(LtcNetwork::Regtest)?,&[script],&[])?;
+     let directory=Directory::new()?;
+     assert!(review()?.retain_observed(&chain,&stale,&directory.0,Uuid::new_v4()).is_err());
+     let retained=review()?.retain_observed(&chain,&observed,&directory.0,Uuid::new_v4())?;
+@@ -61,7 +61,7 @@ fn independent_inclusion_can_be_claimed_but_changed_tip_rejects_signing()->Resul
+ fn reopened_claim_reanchors_exact_transaction_after_chain_extension()->Result<()> {
+     // Public seed and injected genesis inclusion test policy, not consensus history.
+     let (seed,account,mut spend,prevout)=super::super::super::super::tests::fixture()?;
+-    let mut chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut chain=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let mut credit=spend.clone();credit.output=vec![prevout.clone()];
+     let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),
+         block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},&credit)?;
+@@ -99,7 +99,7 @@ fn vault_approval_binds_observation_claims_password_and_account_before_intent()-
+     use bitcoin::{consensus::serialize,hashes::Hash};
+     // Public fixture seed; injected inclusion tests policy rather than consensus.
+     let (seed,account,mut spend,prevout)=super::super::super::super::tests::fixture()?;
+-    let chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let chain=HeaderSequence::from_genesis(LtcNetwork::Regtest)?;
+     let mut credit=spend.clone();credit.output=vec![prevout.clone()];
+     let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),
+         block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},&credit)?;
+@@ -155,7 +155,7 @@ fn mnemonic_approval_binds_observation_claims_password_and_account_before_intent
+     let seed=MnemonicMaterial::from_entropy(&[42;32])?;
+     let account=seed.public_account(network,2,"test passphrase")?;
+     prevout.script_pubkey=account.derive(Branch::Receive,3)?.address().script_pubkey().clone();
+-    let chain=HeaderSequence::new(network)?;
++    let chain=HeaderSequence::from_genesis(network)?;
+     let mut credit=spend.clone();credit.output=vec![prevout.clone()];
+     let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),
+         block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},&credit)?;

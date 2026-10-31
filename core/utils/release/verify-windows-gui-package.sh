@@ -28,6 +28,8 @@ grep -Fq -- '--zmq-rpc-bind-ip 127.0.0.1' "$root/start-node.bat" || {
 }
 "$script_dir/verify-release-notes.sh" "$root/GUI_BUILD_MANIFEST.txt" -windows-gui-x64 "$root/RELEASE_NOTES.md"
 (cd "$root" && sha256sum -c SHA256SUMS)
+signature_status=$("$script_dir/verify-windows-signatures.sh" "$root")
+echo "$signature_status"
 
 gui_commit=$(sed -n 's/^gui_source_commit=//p' "$root/GUI_BUILD_MANIFEST.txt")
 core_commit=$(sed -n 's/^core_source_commit=//p' "$root/GUI_BUILD_MANIFEST.txt")
@@ -38,7 +40,12 @@ expected_core_version="1.0.0-${core_commit:0:9}"
   echo "GUI manifest core version does not match its source commit" >&2; exit 1;
 }
 expected_gui_hash=$(sed -n 's/^gui_sha256=//p' "$root/GUI_BUILD_MANIFEST.txt")
-actual_gui_hash=$(sha256sum "$root/monzero-wallet-gui.exe" | awk '{print $1}')
+# The manifest describes the build; a signed package records that same unsigned hash.
+if [[ -f "$root/CODE-SIGNING.txt" ]]; then
+  actual_gui_hash=$(sed -n 's/^unsigned_sha256=\([0-9a-f]\{64\}\) monzero-wallet-gui\.exe$/\1/p' "$root/CODE-SIGNING.txt")
+else
+  actual_gui_hash=$(sha256sum "$root/monzero-wallet-gui.exe" | awk '{print $1}')
+fi
 [[ $expected_gui_hash == "$actual_gui_hash" ]] || { echo "GUI executable hash does not match manifest" >&2; exit 1; }
 
 for binary in monzero-wallet-gui.exe monzerod.exe monzero-wallet-cli.exe monzero-wallet-rpc.exe; do
@@ -66,6 +73,9 @@ if [[ ${RELEASE_STRICT:-0} == 1 ]]; then
   grep -qx 'independently_reproduced=true' "$root/GUI_BUILD_MANIFEST.txt" || { echo "Strict verification requires independent GUI reproduction" >&2; exit 1; }
   grep -qx 'security_audited=true' "$root/GUI_BUILD_MANIFEST.txt" || { echo "Strict verification requires completed GUI security review" >&2; exit 1; }
   grep -qx 'release_tests_run=true' "$root/GUI_BUILD_MANIFEST.txt" || { echo "Strict verification requires GUI release tests" >&2; exit 1; }
+  [[ $signature_status == *$'code_signed=true'* && $signature_status == *$'code_signature_timestamped=true'* ]] || {
+    echo "Strict verification requires timestamped code signatures" >&2; exit 1;
+  }
 fi
 
 echo "GUI package verification passed: $archive"

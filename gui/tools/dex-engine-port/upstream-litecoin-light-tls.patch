@@ -1,0 +1,228 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10892,6 +10892,7 @@
+  "rand_chacha 0.3.1",
+  "reqwest 0.12.28",
+  "rust_decimal",
++ "rustls-native-certs 0.8.3",
+  "serde",
+  "serde_json",
+  "sha2",
+@@ -10902,6 +10903,7 @@
+  "testcontainers",
+  "thiserror 1.0.69",
+  "tokio",
++ "tokio-rustls 0.26.4",
+  "tracing",
+  "url",
+  "uuid",
+diff --git a/swap-machine/Cargo.toml b/swap-machine/Cargo.toml
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -4,6 +4,8 @@
+ edition = "2024"
+ 
+ [dependencies]
++tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
++rustls-native-certs = "=0.8.3"
+ num-bigint = "=0.4.6"
+ ed25519-dalek = "=2.2.0"
+ zeroize = { workspace = true }
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -111,3 +111,5 @@
+ mod tests;
+ 
+ pub mod session;
++
++pub mod tls;
+diff --git a/swap-machine/src/litecoin_light/tls.rs b/swap-machine/src/litecoin_light/tls.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/tls.rs
+@@ -0,0 +1,67 @@
++//! Authenticated TLS connector for the read-only Litecoin Electrum session.
++//! Trust roots follow the platform store (including its configured certificate
++//! environment). There is no plaintext fallback or certificate-verification bypass.
++use super::session::ReadSession;
++use anyhow::{Context, Result, ensure};
++use std::{net::IpAddr, sync::Arc, time::Duration};
++use swap_core::litecoin_address::LtcNetwork;
++use tokio::net::TcpStream;
++use tokio_rustls::{TlsConnector, client::TlsStream, rustls::{ClientConfig, RootCertStore,
++    crypto::ring, pki_types::ServerName}};
++
++pub struct TlsEndpoint {
++    host: String,
++    port: u16,
++    network: LtcNetwork,
++}
++impl TlsEndpoint {
++    /// A host and explicit port, not a URL. No credentials, paths or defaults.
++    pub fn new(host: String, port: u16, network: LtcNetwork) -> Result<Self> {
++        ensure!(port != 0 && !host.is_empty() && host.len() <= 253, "invalid Electrum TLS endpoint");
++        if let Ok(ip) = host.parse::<IpAddr>() {
++            ensure!(ip.to_string() == host, "noncanonical Electrum IP address");
++        } else {
++            ensure!(host.is_ascii() && host == host.to_ascii_lowercase()
++                && host.split('.').all(|label| !label.is_empty() && label.len() <= 63
++                    && !label.starts_with('-') && !label.ends_with('-')
++                    && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')),
++                "invalid Electrum DNS name");
++        }
++        ServerName::try_from(host.clone()).context("invalid Electrum TLS server name")?;
++        Ok(Self { host, port, network })
++    }
++
++    /// The certificate authenticates this host, not the truth of its chain data.
++    /// Litecoin header validation and independent chain selection remain required.
++    pub async fn connect(&self) -> Result<ReadSession<TlsStream<TcpStream>>> {
++        let roots = tokio::task::spawn_blocking(system_roots).await.context("TLS trust-store loader failed")??;
++        self.connect_with_roots(roots, Duration::from_secs(30)).await
++    }
++
++    async fn connect_with_roots(&self, roots: RootCertStore, deadline: Duration)
++        -> Result<ReadSession<TlsStream<TcpStream>>> {
++        ensure!(!roots.is_empty(), "empty Electrum TLS trust store");
++        let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
++            .with_safe_default_protocol_versions()?
++            .with_root_certificates(roots).with_no_client_auth();
++        let connector = TlsConnector::from(Arc::new(config));
++        let name = ServerName::try_from(self.host.clone()).context("invalid Electrum TLS server name")?;
++        tokio::time::timeout(deadline, async {
++            let socket = TcpStream::connect((self.host.as_str(), self.port)).await
++                .context("Electrum TCP connection failed")?;
++            socket.set_nodelay(true)?;
++            let tls = connector.connect(name, socket).await.context("Electrum TLS authentication failed")?;
++            ReadSession::negotiate(tls, self.network).await
++        }).await.context("Electrum connection deadline exceeded")?
++    }
++}
++fn system_roots() -> Result<RootCertStore> {
++    let loaded = rustls_native_certs::load_native_certs();
++    ensure!(loaded.errors.is_empty() && !loaded.certs.is_empty(), "unable to load complete system TLS trust store");
++    let mut roots = RootCertStore::empty();
++    for cert in loaded.certs { roots.add(cert).context("invalid system TLS root certificate")?; }
++    Ok(roots)
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/tls/tests.rs b/swap-machine/src/litecoin_light/tls/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/tls/tests.rs
+@@ -0,0 +1,111 @@
++use super::*;
++use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, net::TcpListener};
++use tokio_rustls::{TlsAcceptor, rustls::{ServerConfig, pki_types::{CertificateDer, PrivatePkcs8KeyDer}}};
++use serde_json::{Value, json};
++use std::path::PathBuf;
++
++fn fixture(name: &str) -> Result<Vec<u8>> {
++    Ok(std::fs::read(PathBuf::from(std::env::var("MONZERO_LTC_TLS_FIXTURE")?).join(name))?)
++}
++fn roots(name: &str) -> Result<RootCertStore> {
++    let mut roots = RootCertStore::empty(); roots.add(CertificateDer::from(fixture(name)?))?; Ok(roots)
++}
++async fn server(cert: &str, responses: Vec<Value>) -> Result<(u16,tokio::task::JoinHandle<Result<usize>>)> {
++    let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
++        .with_safe_default_protocol_versions()?.with_no_client_auth()
++        .with_single_cert(vec![CertificateDer::from(fixture(cert)?)],
++            PrivatePkcs8KeyDer::from(fixture("server-key.der")?).into())?;
++    let listener = TcpListener::bind("127.0.0.1:0").await?;
++    let port = listener.local_addr()?.port();
++    let task = tokio::spawn(async move {
++        let (stream,_) = listener.accept().await?;
++        let tls = match TlsAcceptor::from(Arc::new(config)).accept(stream).await {
++            Ok(tls) => tls,
++            Err(_) => return Ok(0),
++        };
++        let mut stream = BufReader::new(tls); let mut count = 0;
++        for result in responses {
++            let mut line = String::new();
++            if stream.read_line(&mut line).await? == 0 { return Ok(count); }
++            let request: Value = serde_json::from_str(&line)?;
++            count += 1; assert_eq!(request["id"],json!(count));
++            let mut reply = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":count,"result":result}))?;
++            reply.push(b'\n'); stream.get_mut().write_all(&reply).await?;
++        }
++        let mut extra = String::new();
++        // The rejected-certificate client may send an alert before the server
++        // observes its failed handshake. Neither path may carry an RPC query.
++        match tokio::time::timeout(Duration::from_secs(3),stream.read_line(&mut extra)).await? {
++            Ok(0) | Err(_) => {},
++            Ok(_) => anyhow::bail!("unexpected RPC after TLS rejection or completion"),
++        }
++        Ok(count)
++    });
++    Ok((port,task))
++}
++fn handshake(network: LtcNetwork) -> Vec<Value> {
++    vec![json!(["fixture","1.4"]),json!({"genesis_hash":network.genesis(),"hash_function":"sha256"})]
++}
++fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b|format!("{b:02x}")).collect() }
++
++#[test]
++fn tls_endpoint_rejects_credentials_paths_and_noncanonical_hosts() {
++    for host in ["", "https://localhost", "user@localhost", "localhost/path", "localhost:50002",
++        "LOCALHOST", "localhost.", "a..b", "-bad.test", "bad-.test", "a_b.test", "localhost\n", "é.test"] {
++        assert!(TlsEndpoint::new(host.into(),50002,LtcNetwork::Mainnet).is_err(),"{host}");
++    }
++    assert!(TlsEndpoint::new("localhost".into(),0,LtcNetwork::Mainnet).is_err());
++    for host in ["localhost","electrum.example","127.0.0.1","::1"] {
++        assert!(TlsEndpoint::new(host.into(),50002,LtcNetwork::Mainnet).is_ok());
++    }
++}
++#[tokio::test]
++#[ignore = "requires disposable local TLS fixture certificates"]
++async fn tls_authenticated_connection_fetches_complete_inclusion() -> Result<()> {
++    let (request,header,raw,proof) = super::super::tests::fixture();
++    let mut responses = handshake(LtcNetwork::Mainnet);
++    responses.extend([json!(hex(&header)),json!(hex(&raw)),proof["result"].clone()]);
++    let (port,task) = server("server.der",responses).await?;
++    let endpoint = TlsEndpoint::new("localhost".into(),port,LtcNetwork::Mainnet)?;
++    let mut session = endpoint.connect_with_roots(roots("root.der")?,Duration::from_secs(5)).await?;
++    let matched = session.inclusion(request.height,request.block_hash,request.txid).await?;
++    assert_eq!(matched.txid(),request.txid); drop(session); assert_eq!(task.await??,5);
++    Ok(())
++}
++#[tokio::test]
++#[ignore = "requires disposable local TLS fixture certificates"]
++async fn tls_rejects_wrong_name_untrusted_root_and_expired_certificate_without_rpc() -> Result<()> {
++    for (host,root,cert) in [("127.0.0.1","root.der","server.der"),
++        ("localhost","other-root.der","server.der"),("localhost","root.der","expired.der")] {
++        let (port,task) = server(cert,vec![]).await?;
++        let endpoint = TlsEndpoint::new(host.into(),port,LtcNetwork::Mainnet)?;
++        assert!(endpoint.connect_with_roots(roots(root)?,Duration::from_secs(5)).await.is_err());
++        assert_eq!(task.await??,0);
++    }
++    Ok(())
++}
++#[tokio::test]
++#[ignore = "requires disposable local TLS fixture certificates"]
++async fn tls_authenticated_wrong_chain_stops_before_transaction_queries() -> Result<()> {
++    let (port,task) = server("server.der",handshake(LtcNetwork::Testnet)).await?;
++    let endpoint = TlsEndpoint::new("localhost".into(),port,LtcNetwork::Mainnet)?;
++    assert!(endpoint.connect_with_roots(roots("root.der")?,Duration::from_secs(5)).await.is_err());
++    assert_eq!(task.await??,2); Ok(())
++}
++#[tokio::test]
++#[ignore = "requires disposable local TLS fixture certificates"]
++async fn tls_never_falls_back_to_plaintext_and_times_out_stalled_handshake() -> Result<()> {
++    for plaintext in [true,false] {
++        let listener = TcpListener::bind("127.0.0.1:0").await?; let port = listener.local_addr()?.port();
++        let task = tokio::spawn(async move {
++            let (mut socket,_) = listener.accept().await?;
++            if plaintext { socket.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[]}\n").await?; }
++            tokio::time::sleep(Duration::from_millis(100)).await;
++            Ok::<_,anyhow::Error>(())
++        });
++        let endpoint = TlsEndpoint::new("127.0.0.1".into(),port,LtcNetwork::Mainnet)?;
++        assert!(endpoint.connect_with_roots(roots("root.der")?,Duration::from_millis(40)).await.is_err());
++        task.await??;
++    }
++    Ok(())
++}

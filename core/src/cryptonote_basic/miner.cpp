@@ -322,6 +322,10 @@ namespace cryptonote
 
     if(command_line::has_arg(vm, arg_start_mining))
     {
+#ifdef MONZERO_NO_MINING
+      LOG_ERROR("--start-mining given, but mining is disabled in this build, starting daemon canceled");
+      return false;
+#endif
       address_parse_info info;
       if(!cryptonote::get_account_address_from_str(info, nettype, command_line::get_arg(vm, arg_start_mining)) || info.is_subaddress)
       {
@@ -369,6 +373,10 @@ namespace cryptonote
   //-----------------------------------------------------------------------------------------------------
   bool miner::start(const account_public_address& adr, size_t threads_count, bool do_background, bool ignore_battery)
   {
+#ifdef MONZERO_NO_MINING
+    LOG_ERROR("Mining is disabled in this build");
+    return false;
+#endif
     m_block_reward = 0;
     m_mine_address = adr;
     m_threads_total = static_cast<uint32_t>(threads_count);

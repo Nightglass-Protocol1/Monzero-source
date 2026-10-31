@@ -1,0 +1,147 @@
+diff --git a/swap-machine/src/native_funding_rpc/spendable.rs b/swap-machine/src/native_funding_rpc/spendable.rs
+new file mode 100644
+index 0000000..9d08e08
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/spendable.rs
+@@ -0,0 +1,88 @@
++//! One orchestration entry point mirroring upstream's `Wallets::swap_wallet_spendable`:
++//! restore a wallet from a swap's recovered keys, import its lock transaction so
++//! the wallet knows about that specific output, preview the intended spend, and
++//! -- only if the preview matches exactly what will be relayed -- broadcast it.
++//! This is the shape both Alice's initial lock to the shared address and Bob's
++//! final sweep of the recovered output reduce to; nothing else protocol-specific
++//! is needed once `restore`, `import_transaction` and `relay` all exist.
++//!
++//! Unlike every other function in this module, the exact shape of this one is
++//! this codebase's own design choice, not a direct mechanical port of an
++//! existing upstream call: upstream's `Wallets` type holds a live wallet object
++//! across calls, while this module talks to wallet-rpc statelessly per call.
++//! Treat this file as the least reviewed code in the module, even relative to
++//! `relay.rs` -- it is newly designed, not just newly written.
++//!
++//! Single-shot, same as `relay` itself: calling this twice for the same swap
++//! risks a duplicate broadcast. No decode-from-untrusted-bytes entry point;
++//! every parameter must already come from the caller's own verified swap state
++//! (e.g. `bob::State5`), never from a peer or the GUI.
++use super::relay::{NativeTransferRelay, RelayRequest, RelayedTransfer};
++use super::fee_estimation::{FeeRequest, NativeFeeEstimator};
++use super::wallet_session::{NativeWalletSession, SwapWalletId};
++use super::NativeFundingRpc;
++use anyhow::{Result, ensure};
++use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
++
++pub struct SpendRequest {
++    pub id: SwapWalletId,
++    pub password: String,
++    pub spend_key: String,
++    pub view_key: String,
++    pub restore_height: u64,
++    pub lock_txid: String,
++    pub wallet: XmzAddress,
++    pub destination: XmzAddress,
++    pub amount: XmzAmount,
++    pub account: u32,
++    pub priority: u32,
++}
++
++/// Connects three independent RPC clients to the same wallet-rpc/daemon
++/// service, one per primitive, matching this module's existing convention
++/// that each primitive exclusively owns its own client rather than sharing
++/// mutable state. The caller still owns the underlying credentials and must
++/// still guarantee exclusive service ownership across all three calls this
++/// makes -- this function does not add that guarantee, only compose across it.
++///
++/// Always attempts to close the restored wallet before returning, success or
++/// failure, so one failed or completed call doesn't leave the wallet-rpc
++/// service wedged with a wallet open for every later caller (including a
++/// caller's own next attempt). A close failure is deliberately never allowed
++/// to override the real outcome: if the relay already succeeded, the funds
++/// already moved, and reporting that as an error here -- just because
++/// cleanup afterward also failed -- would be actively dangerous, since a
++/// caller who believes the operation failed may reasonably retry it, and
++/// `relay` has no protection against a resulting double spend. A close
++/// failure here is silent by design, not overlooked; there is no logging
++/// facility in this module to report it through instead.
++pub async fn swap_wallet_spendable(daemon: u16, wallet_port: u16, username: String, password: String,
++    network: XmzNetwork, expected_genesis: &str, request: SpendRequest) -> Result<RelayedTransfer> {
++    ensure!(request.wallet.network() == network && request.destination.network() == network,
++        "spendable request network mismatch");
++    let mut session = NativeWalletSession::new(
++        NativeFundingRpc::new(daemon, wallet_port, username.clone(), password.clone())?, network);
++    let result = restore_and_spend(&mut session, daemon, wallet_port, username, password,
++        expected_genesis, &request).await;
++    let _ = session.close(&request.wallet).await;
++    result
++}
++
++async fn restore_and_spend(session: &mut NativeWalletSession, daemon: u16, wallet_port: u16,
++    username: String, password: String, expected_genesis: &str,
++    request: &SpendRequest) -> Result<RelayedTransfer> {
++    session.restore(&request.id, request.spend_key.clone(), request.view_key.clone(), request.restore_height,
++        request.password.clone(), &request.wallet).await?;
++    session.import_transaction(&request.lock_txid, &request.wallet).await?;
++
++    let mut estimator = NativeFeeEstimator::new(
++        NativeFundingRpc::new(daemon, wallet_port, username.clone(), password.clone())?);
++    let preview = FeeRequest { wallet: request.wallet.clone(), destination: request.destination.clone(),
++        amount: request.amount, account: request.account, priority: request.priority };
++    estimator.estimate(preview, expected_genesis).await?;
++
++    let mut relay = NativeTransferRelay::new(NativeFundingRpc::new(daemon, wallet_port, username, password)?);
++    let spend = RelayRequest { wallet: request.wallet.clone(), destination: request.destination.clone(),
++        amount: request.amount, account: request.account, priority: request.priority };
++    relay.relay(spend, expected_genesis).await
++}
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session.rs b/swap-machine/src/native_funding_rpc/wallet_session.rs
+index d013d8b..e6add1b 100644
+--- a/swap-machine/src/native_funding_rpc/wallet_session.rs
++++ b/swap-machine/src/native_funding_rpc/wallet_session.rs
+@@ -103,6 +103,25 @@ impl NativeWalletSession {
+         Ok(())
+     }
+ 
++    /// Imports one specific transaction into the currently open wallet without
++    /// a full chain rescan, mirroring upstream's `scan_transaction` step after
++    /// restoring a swap's recovered keys. Constructs, signs and broadcasts
++    /// nothing. The caller supplies the already-known lock transaction hash
++    /// (from the swap's own transfer proof, never a peer-supplied claim taken
++    /// on trust); this call only asks the wallet to look at it.
++    pub async fn import_transaction(&mut self, txid: &str, expected: &XmzAddress) -> Result<()> {
++        ensure!(!self.uncertain, "wallet session requires reconciliation");
++        ensure!(canonical_hash(txid), "invalid import transaction hash");
++        ensure!(self.client.opened_wallet(self.network).await?.as_ref() == Some(expected),
++            "unexpected wallet before transaction import");
++        self.uncertain = true;
++        self.client.rpc(self.client.wallet, "scan_tx", json!({"txids":[txid]})).await?;
++        ensure!(self.client.opened_wallet(self.network).await?.as_ref() == Some(expected),
++            "wallet changed identity during transaction import");
++        self.uncertain = false;
++        Ok(())
++    }
++
+     pub async fn close(&mut self, expected: &XmzAddress) -> Result<()> {
+         ensure!(!self.uncertain, "wallet session requires reconciliation");
+         ensure!(self.client.opened_wallet(self.network).await?.as_ref() == Some(expected), "unexpected wallet before close");
+@@ -173,6 +192,10 @@ fn decode_control(bytes: &[u8], network: XmzNetwork) -> Result<(uuid::Uuid, Cont
+     Ok((request_id, command))
+ }
+ 
++fn canonical_hash(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
+ fn checked_password(value: String) -> Result<Zeroizing<String>> {
+     let value = Zeroizing::new(value);
+     ensure!(!value.is_empty() && value.len() <= 1024 && !value.contains('\0'), "invalid wallet password");
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index f305e9f..b8e3d6a 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -7,6 +7,7 @@
+ //! Credentials are required and intentionally have no Debug or serialization API.
+ pub mod fee_estimation;
+ pub mod relay;
++pub mod spendable;
+ pub mod wallet_session;
+ use anyhow::{Context, Result, ensure};
+ use serde_json::{Value, json};

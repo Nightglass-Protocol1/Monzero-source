@@ -1,0 +1,98 @@
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -192,3 +192,5 @@
+ pub mod scan;
+ 
+ pub mod wallet;
++
++pub mod unspent;
+diff --git a/swap-machine/src/litecoin_light/session/unspent.rs b/swap-machine/src/litecoin_light/session/unspent.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/unspent.rs
+@@ -0,0 +1,39 @@
++//! Peer-reported UTXO candidates only. A server may omit spends or fabricate
++//! outputs; this response grants no signing, balance or unspentness authority.
++use super::*;
++use bitcoin::{Amount,OutPoint};
++use std::collections::BTreeSet;
++pub struct ReportedOutput {outpoint:OutPoint,height:u32,value:Amount}
++impl ReportedOutput {
++    pub fn outpoint(&self)->OutPoint {self.outpoint}
++    /// Zero denotes a mempool report, not a confirmed genesis output.
++    pub fn height(&self)->u32 {self.height}
++    pub fn value(&self)->Amount {self.value}
++}
++impl<S:AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
++    /// Query one script under an explicit 1..=1000 entry budget. This discloses
++    /// wallet interest to the configured server. Entries remain untrusted.
++    pub async fn reported_unspent(&mut self,script:&Script,maximum:usize)->Result<Vec<ReportedOutput>> {
++        ensure!(!script.is_empty() && script.len()<=10000 && (1..=1000).contains(&maximum),
++            "invalid Litecoin unspent request");
++        let outcome=self.unspent_inner(script,maximum).await;
++        if outcome.is_err() {self.usable=false;}outcome
++    }
++    async fn unspent_inner(&mut self,script:&Script,maximum:usize)->Result<Vec<ReportedOutput>> {
++        #[derive(Deserialize)]
++        #[serde(deny_unknown_fields)]
++        struct Entry {tx_hash:String,tx_pos:u32,height:u32,value:u64}
++        let (_,bytes)=self.exchange("blockchain.scripthash.listunspent",json!([script_hash(script)]),maximum*192+1024).await?;
++        let entries:Vec<Entry>=result(&bytes)?;
++        ensure!(entries.len()<=maximum,"Litecoin unspent report exceeds entry budget");
++        let mut seen=BTreeSet::new();let mut outputs=Vec::with_capacity(entries.len());
++        for entry in entries {
++            let outpoint=OutPoint {txid:entry.tx_hash.parse().context("invalid Litecoin unspent transaction ID")?,vout:entry.tx_pos};
++            ensure!(!outpoint.is_null() && seen.insert(outpoint),"invalid or duplicate Litecoin reported output");
++            outputs.push(ReportedOutput {outpoint,height:entry.height,value:Amount::from_sat(entry.value)});
++        }
++        Ok(outputs)
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session/unspent/tests.rs b/swap-machine/src/litecoin_light/session/unspent/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/unspent/tests.rs
+@@ -0,0 +1,40 @@
++use super::*;
++use crate::litecoin_light::session::tests::{server,reply,regtest_handshake};
++fn script()->bitcoin::ScriptBuf {bitcoin::ScriptBuf::from_bytes(vec![0x51])}
++#[tokio::test]
++async fn unspent_reports_exact_outpoints_and_mempool_without_authority()->Result<()> {
++    let id="11".repeat(32);let mut responses=regtest_handshake();
++    responses.push(reply(3,json!([{"tx_hash":id,"tx_pos":0,"height":12,"value":100},
++        {"tx_hash":id,"tx_pos":1,"height":0,"value":50}])));responses.push(reply(4,json!([])));
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let outputs=session.reported_unspent(&script(),2).await?;
++    assert_eq!(outputs.len(),2);assert_eq!(outputs[0].outpoint().txid.to_string(),id);
++    assert_eq!(outputs[0].height(),12);assert_eq!(outputs[0].value().to_sat(),100);
++    assert_eq!(outputs[1].outpoint().vout,1);assert_eq!(outputs[1].height(),0);
++    assert!(session.reported_unspent(&script(),1).await?.is_empty());drop(session);
++    let requests=task.await?;assert_eq!(requests[2]["method"],"blockchain.scripthash.listunspent");
++    assert_eq!(requests[2]["params"],json!([script_hash(&script())]));Ok(())
++}
++#[tokio::test]
++async fn malformed_unspent_reports_poison_without_partial_results()->Result<()> {
++    let valid=json!({"tx_hash":"11".repeat(32),"tx_pos":0,"height":1,"value":100});
++    let mut cases=vec![json!(null),json!([valid.clone(),valid.clone()]),json!([valid.clone(),valid.clone(),valid.clone()])];
++    for (key,value) in [("height",json!(-1)),("height",json!(4294967296u64)),("tx_pos",json!(-1)),
++        ("tx_pos",json!(1.5)),("value",json!(-1)),("value",json!("100")),("extra",json!(true)),("tx_hash",json!("invalid"))] {
++        let mut bad=valid.clone();bad[key]=value;cases.push(json!([bad]));
++    }
++    for value in cases {
++        let mut responses=regtest_handshake();responses.push(reply(3,value));
++        let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++        assert!(session.reported_unspent(&script(),2).await.is_err());assert!(session.reported_unspent(&script(),2).await.is_err());
++        drop(session);assert_eq!(task.await?.len(),3);
++    }Ok(())
++}
++#[tokio::test]
++async fn unspent_local_limits_precede_network_io()->Result<()> {
++    let (stream,task)=server(regtest_handshake());let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    for maximum in [0,1001,usize::MAX] {assert!(session.reported_unspent(&script(),maximum).await.is_err());}
++    assert!(session.reported_unspent(Script::new(),1).await.is_err());
++    assert!(session.reported_unspent(&bitcoin::ScriptBuf::from_bytes(vec![0;10001]),1).await.is_err());
++    assert!(session.usable);drop(session);assert_eq!(task.await?.len(),2);Ok(())
++}

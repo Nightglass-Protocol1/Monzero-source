@@ -1,0 +1,298 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs
+@@ -51,6 +51,15 @@
+ fn slot(quote: &VerifiedBchQuote,stage: &str) -> String {record_name(quote,&format!("native-proof-{stage}"))}
+ 
+ impl AdmittedExecution<'_> {
++    pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
++    fn outgoing_native_funding_request(&self) -> Result<FundingRequest> {
++        ensure!(self.role == Role::NativeFunder,"wrong outgoing native funding observer role");
++        let (record,_) = self.retained_native_proof("outgoing")?.context("missing outgoing native proof")?;
++        let frame: Frame = serde_json::from_slice(&record.frame)?;
++        Ok(FundingRequest {address:XmzAddress::parse(self.policy.xmz_network,&frame.destination)?,
++            amount:XmzAmount::from_atoms(frame.amount),proof:frame.proof})
++    }
++
+     // Insert inside native/proof.rs's AdmittedExecution implementation.
+     // Keep this accessor private to the funding subtree.
+     pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/relay.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/relay.rs
+@@ -39,3 +39,90 @@
+         Ok(review)
+     }
+ }
++
++const ATTEMPT: &str = "monzero-bch-redemption-relay-intent-v1";
++const ACK: &str = "monzero-bch-redemption-relay-ack-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Attempt {schema: String,review: [u8;32],approved_at: u64}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Ack {schema: String,attempt: [u8;32],txid: Txid}
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub enum RedemptionRelayState {
++    /// May include interruption before dispatch. Never automatic retry authority.
++    Attempted {txid: Txid},
++    /// Exact node acknowledgement, not confirmation or settlement finality.
++    Acknowledged {txid: Txid},
++}
++fn slot(quote: &VerifiedBchQuote,suffix: &str) -> String {
++    format!("{}.bch-redemption-relay-{suffix}",quote.terms()["swapId"])
++}
++impl AdmittedExecution<'_> {
++    fn redemption_attempt(&self,review: &RedemptionRelayReview,record: &Record)
++        -> Result<Option<(Attempt,[u8;32])>> {
++        let Some(bytes) = optional(&self.metadata,&slot(self.quote,"intent"))? else {return Ok(None)};
++        ensure!(bytes.len() <= 4096,"oversized BCH redemption attempt");
++        let attempt: Attempt = serde_json::from_slice(&bytes)?;
++        ensure!(attempt.schema == ATTEMPT && attempt.review == review.commitment
++            && attempt.approved_at >= record.prepared_at && serde_json::to_vec(&attempt)? == bytes,
++            "BCH redemption attempt differs from approval");
++        Ok(Some((attempt,hash(ATTEMPT,&bytes))))
++    }
++    fn redemption_state(&self,review: &RedemptionRelayReview,record: &Record)
++        -> Result<Option<RedemptionRelayState>> {
++        let ack = optional(&self.metadata,&slot(self.quote,"ack"))?;
++        let Some((_,attempt)) = self.redemption_attempt(review,record)? else {
++            ensure!(ack.is_none(),"BCH redemption acknowledgement lacks original attempt");return Ok(None)
++        };
++        let txid = summary(record)?.txid();
++        let Some(bytes) = ack else {return Ok(Some(RedemptionRelayState::Attempted {txid}))};
++        ensure!(bytes.len() <= 4096,"oversized BCH redemption acknowledgement");
++        let ack: Ack = serde_json::from_slice(&bytes)?;
++        ensure!(ack.schema == ACK && ack.attempt == attempt && ack.txid == txid
++            && serde_json::to_vec(&ack)? == bytes,"BCH redemption acknowledgement changed");
++        Ok(Some(RedemptionRelayState::Acknowledged {txid}))
++    }
++    pub fn bch_redemption_relay_state(&self) -> Result<Option<RedemptionRelayState>> {
++        let (review,record,_,_) = self.redemption_relay_materials()?;
++        self.redemption_state(&review,&record)
++    }
++    /// Broadcast the saved redemption once. Publication reveals the native share.
++    /// Historical quote expiry does not block settlement; current chain safety does.
++    pub async fn relay_bch_redemption(&mut self,native: &impl crate::xmz_funding::FundingObserver,
++        bch: &BchRpc,approved: &[u8;32],now: u64) -> Result<Txid> {
++        let (review,record,deployment,margin) = self.redemption_relay_materials()?;
++        ensure!(review.commitment == *approved,"BCH redemption approval is stale or mismatched");
++        ensure!(now >= record.prepared_at && bch.deployment_commitment()? == deployment,
++            "BCH redemption predates preparation or changes observer");
++        if let Some((attempt,_)) = self.redemption_attempt(&review,&record)? {
++            ensure!(now >= attempt.approved_at,"BCH redemption time moved backwards");
++        }
++        match self.redemption_state(&review,&record)? {
++            Some(RedemptionRelayState::Acknowledged {txid}) => return Ok(txid),
++            Some(RedemptionRelayState::Attempted {..}) => anyhow::bail!("BCH redemption result is uncertain; reconcile without retransmitting"),
++            None => (),
++        }
++        // Finish expensive historical validation before the final live checks.
++        let request = self.outgoing_native_funding_request()?;
++        let funding = self.received_bch_funding_message()?.context("missing BCH funding receipt")?;
++        let transaction: Transaction = deserialize(&record.transaction)?;
++        ensure!(transaction.input[0].previous_output == funding.signed().lock_outpoint(),"BCH redemption funding changed");
++        // Bound observation age independently of the expired commercial quote.
++        let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_secs(30))
++            .context("BCH redemption observation deadline overflow")?;
++        let evidence = crate::xmz_funding::verify(native,request,&self.policy.xmz_genesis,
++            u64::from(self.policy.xmz_confirmations)).await?;
++        let live = bch.observe_funding(funding.signed()).await?;
++        live.require_funding_window(u64::from(self.policy.bch_confirmations),u32::from(self.policy.cancel_blocks),margin)?;
++        ensure!(native.snapshot().await? == *evidence.snapshot(),"native chain changed before BCH redemption");
++        ensure!(std::time::Instant::now() < deadline,"BCH redemption observations expired");
++        let attempt = Attempt {schema:ATTEMPT.into(),review:*approved,approved_at:now};
++        let bytes = serde_json::to_vec(&attempt)?;
++        self.metadata.retain(&slot(self.quote,"intent"),&bytes)?;
++        let txid = bch.relay_redemption(&transaction,deadline).await?;
++        let ack = Ack {schema:ACK.into(),attempt:hash(ATTEMPT,&bytes),txid};
++        self.metadata.retain(&slot(self.quote,"ack"),&serde_json::to_vec(&ack)?)?;
++        Ok(txid)
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs
+@@ -0,0 +1,61 @@
++use super::*;
++use agreement::execution::funding::success::receipt::redemption::relay::RedemptionRelayState;
++
++pub(super) async fn exercise(setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
++    fixture: &Fixture,rpc: &BchRpc,server: &Server,transaction: &Transaction) -> Result<()> {
++    let original_intent = server.state.lock().unwrap().relay_intent.clone();
++    server.state.lock().unwrap().redemption = Some(transaction.clone());
++    let txid = transaction.compute_txid();let observer = fixture.funding_client()?;
++    for mode in [0,1,2] {
++        let metadata = copy_store(metadata)?;
++        let mut execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        let intent = metadata.0.join(format!("{}.bch-redemption-relay-intent",setup.quote.terms()["swapId"]));
++        let ack = metadata.0.join(format!("{}.bch-redemption-relay-ack",setup.quote.terms()["swapId"]));
++        server.state.lock().unwrap().relay_intent = Some(intent.clone());
++        server.state.lock().unwrap().relay_mode = mode;
++        let before = server.state.lock().unwrap().redemption_relay_calls;
++        let review = execution.review_bch_redemption_relay(rpc,2038)?;
++        assert!(execution.bch_redemption_relay_state()?.is_none());
++        if mode==0 {
++            assert!(execution.relay_bch_redemption(&observer,rpc,&[0;32],2038).await.is_err());
++            assert!(execution.relay_bch_redemption(&observer,rpc,&review.commitment,2034).await.is_err());
++            fixture.confirmed.store(false,Ordering::SeqCst);
++            assert!(execution.relay_bch_redemption(&observer,rpc,&review.commitment,2038).await.is_err());
++            fixture.confirmed.store(true,Ordering::SeqCst);
++            for unsafe_mode in [1,3,21,22] {
++                server.state.lock().unwrap().observation_mode = unsafe_mode;
++                assert!(execution.relay_bch_redemption(&observer,rpc,&review.commitment,2038).await.is_err());
++                assert!(!intent.exists());
++            }
++            server.state.lock().unwrap().observation_mode = 0;
++            assert_eq!(server.state.lock().unwrap().redemption_relay_calls,before);
++        }
++        let result = execution.relay_bch_redemption(&observer,rpc,&review.commitment,2038).await;
++        assert!(intent.exists());
++        assert_eq!(server.state.lock().unwrap().redemption_relay_calls,before+1);
++        let expected = if mode==0 {
++            assert_eq!(result?,txid);assert!(ack.exists());RedemptionRelayState::Acknowledged {txid}
++        } else {assert!(result.is_err());assert!(!ack.exists());RedemptionRelayState::Attempted {txid}};
++        assert_eq!(execution.bch_redemption_relay_state()?,Some(expected));
++        drop(execution);
++        let mut restored = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        assert_eq!(restored.bch_redemption_relay_state()?,Some(expected));
++        let again = restored.relay_bch_redemption(&observer,rpc,&review.commitment,2039).await;
++        if mode==0 {assert_eq!(again?,txid);} else {assert!(again.is_err());}
++        assert_eq!(server.state.lock().unwrap().redemption_relay_calls,before+1);
++        if mode==0 {
++            let saved = std::fs::read(&ack)?;std::fs::write(&ack,b"{}")?;
++            assert!(restored.bch_redemption_relay_state().is_err());
++            assert!(restored.relay_bch_redemption(&observer,rpc,&review.commitment,2039).await.is_err());
++            std::fs::write(&ack,saved)?;
++            let saved_intent = metadata.0.join("saved-redemption-intent");std::fs::rename(&intent,&saved_intent)?;
++            assert!(restored.bch_redemption_relay_state().is_err());
++            assert!(restored.relay_bch_redemption(&observer,rpc,&review.commitment,2039).await.is_err());
++            std::fs::rename(&saved_intent,&intent)?;
++        }
++        assert_eq!(server.state.lock().unwrap().redemption_relay_calls,before+1);
++    }
++    let mut state = server.state.lock().unwrap();
++    state.redemption = None;state.relay_intent = original_intent;state.relay_mode = 0;
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
+@@ -1,8 +1,9 @@
+ use super::*;
++mod relay;
+ use bitcoin::{consensus::{deserialize,serialize},Transaction};
+ 
+-pub(super) fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
+-    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,rpc: &BchRpc,frame: &[u8]) -> Result<()> {
++pub(super) async fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
++    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,fixture: &Fixture,rpc: &BchRpc,server: &Server,frame: &[u8]) -> Result<()> {
+     assert!(bch.retain_bch_redemption(2035).is_err());
+     assert!(bch.retained_bch_redemption().is_err());
+     assert!(native.retained_bch_redemption()?.is_none());
+@@ -58,5 +59,6 @@
+     assert!(native.retain_bch_redemption(2036).is_err());
+     std::fs::rename(&saved_pin,&pin)?;
+     assert_eq!(native.retained_bch_redemption()?.unwrap().commitment(),prepared.commitment());
++    relay::exercise(setup,metadata,snapshots,fixture,rpc,server,&transaction).await?;
+     Ok(())
+ }
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
+@@ -2,8 +2,8 @@
+ use super::*;
+ mod redemption;
+ 
+-pub(super) fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
+-    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,fixture: &Fixture,rpc: &BchRpc,
++pub(super) async fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
++    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,fixture: &Fixture,rpc: &BchRpc,server: &Server,
+     frame: &[u8],signature: &[u8]) -> Result<()> {
+     let before = fixture.calls.lock().unwrap().len();
+     assert!(bch.accept_bch_success(2033,frame,signature).is_err());
+@@ -33,7 +33,6 @@
+     native.accept_bch_success(2034,frame,signature)?;
+     assert!(native.has_received_bch_success()?);
+     assert!(native.accept_bch_success(2032,frame,signature).is_err());
+-    redemption::exercise(bch,native,setup,metadata,snapshots,rpc,frame)?;
+     let restored_metadata = copy_store(metadata)?;
+     let restored = AdmittedExecution::resume(&restored_metadata.0,&snapshots.0,
+         &setup.quote,&setup.policy,Role::NativeFunder)?;
+@@ -58,5 +57,6 @@
+     std::fs::rename(&missing_pin,&pin)?;
+     assert!(native.has_received_bch_success()?);
+     assert_eq!(fixture.calls.lock().unwrap().len(),before);
++    redemption::exercise(bch,native,setup,metadata,snapshots,fixture,rpc,server,frame).await?;
+     Ok(())
+ }
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs
+@@ -52,7 +52,7 @@
+     assert!(bch.recover_bch_success_release(&observer,rpc,5,2032).await.is_err());
+     std::fs::write(&prepared,&*saved)?;
+     assert_eq!(bch.recover_bch_success_release(&observer,rpc,5,2032).await?.signature(),sig);
+-    receipt::exercise(bch,native,setup,metadata,snapshots,fixture,rpc,&frame,&sig)?;
++    receipt::exercise(bch,native,setup,metadata,snapshots,fixture,rpc,server,&frame,&sig).await?;
+     fixture.confirmed.store(false,Ordering::SeqCst);
+     Ok(())
+ }
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+@@ -7,7 +7,7 @@
+     sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
+ 
+ #[derive(Default)]
+-struct State { locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8,
++struct State { redemption: Option<Transaction>, redemption_relay_calls: usize, locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8,
+     sign_calls: usize, sign_mode: u8, signed_candidate: Vec<u8>, sign_intent: Option<std::path::PathBuf>, observed: Option<Transaction>, observed_vout: u32,
+     observation_mode: u8, observation_chain_calls: usize, relay_mode: u8, relay_calls: usize, relay_intent: Option<std::path::PathBuf> }
+ struct Server {
+@@ -103,14 +103,16 @@
+                     },
+                     "sendrawtransaction" => {
+                         use bitcoin::hex::DisplayHex;
+-                        let tx = state.observed.as_ref().context("missing relay fixture")?;
++                        let redemption = state.redemption.is_some();
++                        let tx = state.redemption.as_ref().or(state.observed.as_ref()).context("missing relay fixture")?;
+                         let txid = tx.compute_txid();
+                         ensure!(request["params"] == json!([serialize(tx).to_lower_hex_string(),false]),"wrong relay bytes or high-fee override");
+                         let intent: Value = serde_json::from_slice(&std::fs::read(
+                             state.relay_intent.as_ref().context("missing relay intent path")?)?)?;
+-                        ensure!(intent["schema"] == "monzero-bch-funding-relay-intent-v1" && state.locked,
++                        let schema = if redemption {"monzero-bch-redemption-relay-intent-v1"} else {"monzero-bch-funding-relay-intent-v1"};
++                        ensure!(intent["schema"] == schema && state.locked,
+                             "relay approval must be retained before RPC");
+-                        state.relay_calls += 1;
++                        if redemption {state.redemption_relay_calls += 1;} else {state.relay_calls += 1;}
+                         match state.relay_mode {
+                             1 => continue, // Applied, reply lost.
+                             2 => json!("00".repeat(32)),
+diff --git a/swap-machine/src/bch_rpc/relay.rs b/swap-machine/src/bch_rpc/relay.rs
+--- a/swap-machine/src/bch_rpc/relay.rs
++++ b/swap-machine/src/bch_rpc/relay.rs
+@@ -18,3 +18,20 @@
+         Ok(txid)
+     }
+ }
++
++impl BchRpc {
++    /// Executor-only: exact authenticated redemption, explicit approval, fresh
++    /// both-chain observations and durable attempt must precede this call.
++    /// A timeout or invalid reply may follow publication; never retry implicitly.
++    pub(crate) async fn relay_redemption(&self,transaction: &bitcoin::Transaction,
++        deadline: std::time::Instant) -> Result<Txid> {
++        ensure!(std::time::Instant::now() < deadline,"BCH redemption observations expired before dispatch");
++        let raw = zeroize::Zeroizing::new(serialize(transaction).to_lower_hex_string());
++        let request = json!([raw.as_str(),false]);
++        let reply = tokio::time::timeout_at(deadline.into(),self.rpc(false,"sendrawtransaction",request))
++            .await.context("BCH redemption dispatch deadline exceeded; result is uncertain")??;
++        let txid: Txid = serde_json::from_str(reply.get())?;
++        ensure!(txid == transaction.compute_txid(),"BCH redemption relay returned another transaction ID");
++        Ok(txid)
++    }
++}

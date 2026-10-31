@@ -1,0 +1,128 @@
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -1333,8 +1333,8 @@
+             "--native-proof-context-stdio-v1"=>Some("context"),
+             _=>None,
+         };
+-        let result = if matches!(action,"--punish-review-stdio-v1"|"--punish-status-stdio-v1"|"--punish-observe-stdio-v1") {
+-            let operation=if action=="--punish-review-stdio-v1" {"review"} else if action=="--punish-status-stdio-v1" {"status"} else {"observe"};
++        let result = if matches!(action,"--punish-review-stdio-v1"|"--punish-status-stdio-v1"|"--punish-observe-stdio-v1"|"--punish-submit-stdio-v1") {
++            let operation=if action=="--punish-review-stdio-v1" {"review"} else if action=="--punish-status-stdio-v1" {"status"} else if action=="--punish-submit-stdio-v1" {"submit"} else {"observe"};
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(punishment::operation(Path::new(&args[2]),&bytes,operation))?
+         } else if action=="--success-publication-repair-review-stdio-v1" {
+--- a/swap-machine/src/bin/native-bch-admission/punishment.rs
++++ b/swap-machine/src/bin/native-bch-admission/punishment.rs
+@@ -1,11 +1,13 @@
+-// Native-funder punishment review, retained history and explicit chain confirmation.
++// Native-funder punishment review, approved dispatch and explicit confirmation.
+ use super::*;
+ use swap_machine::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::recovery::punish::observation::relay::PunishRelayState;
+ fn request(bytes:&[u8],action:&str)->Result<Request> {
+-    ensure!(matches!(action,"review"|"status"|"observe") && !bytes.is_empty() && bytes.len()<=512,"invalid punishment request size or action");
++    ensure!(matches!(action,"review"|"status"|"observe"|"submit") && !bytes.is_empty() && bytes.len()<=512,"invalid punishment request size or action");
+     let request:Request=serde_json::from_slice(bytes)?;
+-    ensure!(!request.request_id.is_nil() && request.schema==format!("monzero-bch-punish-{action}-request-v1")
+-        && request.commitment.is_none(),"invalid punishment request");Ok(request)
++    ensure!(!request.request_id.is_nil() && request.schema==format!("monzero-bch-punish-{action}-request-v1"),"invalid punishment request");
++    if action=="submit" {parse_digest(request.commitment.as_deref().context("missing punishment approval")?)?;}
++    else {ensure!(request.commitment.is_none(),"unexpected punishment approval");}
++    Ok(request)
+ }
+ fn config(bytes:&[u8])->Result<FundingConfig> {
+     let config:FundingConfig=serde_json::from_slice(bytes)?;
+@@ -23,12 +25,26 @@
+         && config.punish_config_file.is_absolute() && config.rpc_file.is_absolute(),
+         "invalid punishment observation configuration");Ok(config)
+ }
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct SubmissionConfig {
++    schema:String,punish_config_file:PathBuf,rpc_file:PathBuf,native_rpc_file:PathBuf,bch_observer_kind:native_observer::Kind,
++}
++fn submission_config(bytes:&[u8])->Result<SubmissionConfig> {
++    let config:SubmissionConfig=serde_json::from_slice(bytes)?;
++    ensure!(config.schema=="monzero-private-bch-punish-submission-v1" && config.punish_config_file.is_absolute()
++        && config.rpc_file.is_absolute() && config.native_rpc_file.is_absolute(),"invalid punishment submission configuration");Ok(config)
++}
+ pub(super) async fn operation(path:&Path,bytes:&[u8],action:&str)->Result<serde_json::Value> {
+     let request=request(bytes,action)?;
+     let observation=if action=="observe" {
+         let (lease,bytes)=private_bytes(path)?;Some((lease,observation_config(&bytes)?))
+     } else {None};
++    let submission=if action=="submit" {
++        let (lease,bytes)=private_bytes(path)?;Some((lease,submission_config(&bytes)?))
++    } else {None};
+     let path=observation.as_ref().map_or(path,|(_,config)|config.punish_config_file.as_path());
++    let path=submission.as_ref().map_or(path,|(_,config)|config.punish_config_file.as_path());
+     let (_wrapper_lease,bytes)=private_bytes(path)?;let wrapper=config(&bytes)?;
+     let deployment=parse_digest(&wrapper.deployment_commitment)?;
+     let (_config_lease,config)=load(&wrapper.admission_config_file)?;
+@@ -37,15 +53,43 @@
+     let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
+         &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
+     ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"punishment trade changed");
+-    let execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,&quote,&config.policy,config.role)?;
++    let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,&quote,&config.policy,config.role)?;
+     execution.saved_admission_review(&config.negotiation_pins)?;
+     let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+     let review=execution.review_bch_punish_relay_for_deployment(&deployment,now)?;
++    if let Some((_,submit))=&submission {
++        let approved=parse_digest(request.commitment.as_deref().context("missing punishment approval")?)?;
++        ensure!(approved==review.commitment,"punishment approval changed");
++        ensure!(execution.bch_punish_relay_state()?.is_none(),"punishment already attempted; check saved status without resending");
++        // Exact approval and history are checked before either credential file.
++        let (_rpc_lease,bytes)=private_bytes(&submit.rpc_file)?;
++        let descriptor=native_observer::Descriptor::parse(Some(submit.bch_observer_kind),&bytes)?;
++        let (_cookie_lease,cookie)=private_file(descriptor.cookie_file(),true)?;
++        let backend=descriptor.backend(&cookie)?;
++        ensure!(backend.deployment_commitment()?==deployment,"punishment submission deployment changed");
++        let (_native_lease,bytes)=private_bytes(&submit.native_rpc_file)?;
++        let native:NativePreparationRpc=serde_json::from_slice(&bytes)?;
++        ensure!(native.schema=="monzero-private-bch-native-rpc-v1" && native.daemon_port>0 && native.wallet_port>0
++            && native.daemon_port!=native.wallet_port && native.login_file.is_absolute(),"invalid punishment native observer");
++        isolated_native_preparation(native.daemon_port).await?;
++        let (_login_lease,login)=private_file(&native.login_file,true)?;
++        let text=std::str::from_utf8(&login)?;let text=text.strip_suffix('\n').unwrap_or(text);
++        let (user,password)=text.split_once(':').context("invalid punishment native credentials")?;
++        ensure!(!user.is_empty() && !password.is_empty() && !text.bytes().any(|b|b.is_ascii_control()),"invalid punishment native login");
++        let observer=swap_machine::native_funding_rpc::NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?;
++        let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        match &backend {
++            native_observer::Backend::Node(bch)=>execution.relay_bch_punish(&observer,bch,None,&approved,dispatch).await?,
++            native_observer::Backend::Owned(bch)=>execution.relay_light_bch_punish(&observer,
++                &swap_machine::bch_rpc::contract_relay::OwnedBchContractRelay::new(bch),None,&approved,dispatch).await?,
++        };
++    }
+     let (state,txid)=match execution.bch_punish_relay_state()? {
+         None=>("not-attempted",review.details["txid"].as_str().context("missing punishment txid")?.to_owned()),
+         Some(PunishRelayState::Attempted {txid})=>("attempted",txid.to_string()),
+         Some(PunishRelayState::Acknowledged {txid})=>("acknowledged",txid.to_string()),
+     };
++    if action=="submit" {ensure!(state=="acknowledged","punishment submission lacks acknowledgement");}
+     let observed=if let Some((_,config))=&observation {
+         let (_rpc_lease,bytes)=private_bytes(&config.rpc_file)?;
+         let descriptor=native_observer::Descriptor::parse(Some(config.bch_observer_kind),&bytes)?;
+@@ -84,6 +128,22 @@
+         assert!(request(&serde_json::to_vec(&value)?,"review").is_err());Ok(())
+     }
+     #[test]
++    fn submission_requires_approval_and_explicit_private_paths()->Result<()> {
++        let mut request_value=serde_json::json!({"schema":"monzero-bch-punish-submit-request-v1","requestId":uuid::Uuid::new_v4()});
++        assert!(request(&serde_json::to_vec(&request_value)?,"submit").is_err());
++        request_value["commitment"]="ab".repeat(32).into();assert!(request(&serde_json::to_vec(&request_value)?,"submit").is_ok());
++        request_value["commitment"]="invalid".into();assert!(request(&serde_json::to_vec(&request_value)?,"submit").is_err());
++        let base=serde_json::json!({"schema":"monzero-private-bch-punish-submission-v1","punishConfigFile":"/private/punish",
++            "rpcFile":"/private/bch","nativeRpcFile":"/private/native","bchObserverKind":"owned-node"});
++        assert!(submission_config(&serde_json::to_vec(&base)?).is_ok());
++        for field in ["punishConfigFile","rpcFile","nativeRpcFile","bchObserverKind"] {
++            let mut value=base.clone();value.as_object_mut().unwrap().remove(field);
++            assert!(submission_config(&serde_json::to_vec(&value)?).is_err());
++            let mut value=base.clone();value[field]="relative".into();assert!(submission_config(&serde_json::to_vec(&value)?).is_err());
++        }
++        let mut value=base;value["password"]="forbidden".into();assert!(submission_config(&serde_json::to_vec(&value)?).is_err());Ok(())
++    }
++    #[test]
+     fn observation_requires_explicit_backend_and_no_approval()->Result<()> {
+         let base=serde_json::json!({"schema":"monzero-private-bch-punish-observation-v1",
+             "punishConfigFile":"/private/punish","rpcFile":"/private/rpc","bchObserverKind":"owned-node"});

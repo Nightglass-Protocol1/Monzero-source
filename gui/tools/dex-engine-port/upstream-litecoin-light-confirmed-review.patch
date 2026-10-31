@@ -1,0 +1,121 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review.rs b/swap-machine/src/litecoin_light/vault/signing/review.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review.rs
+@@ -61,3 +61,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++pub mod confirmed;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs
+@@ -0,0 +1,48 @@
++//! Review anchored to selected-chain transaction inclusions. This does not
++//! establish current unspentness, complete history, reservations or consent.
++use super::*;
++use crate::litecoin_light::{headers::HeaderSequence,transaction::IncludedTransaction};
++use bitcoin::BlockHash;
++pub struct IncludedInput<'a> {
++    pub transaction:&'a IncludedTransaction,
++    pub vout:u32,
++    pub branch:Branch,
++    pub index:u32,
++}
++pub struct ConfirmedSpendReview {
++    review:SpendReview,
++    network:LtcNetwork,
++    height:u32,
++    tip:BlockHash,
++}
++impl ConfirmedSpendReview {
++    pub fn new(chain:&HeaderSequence,account:&PublicAccount,transaction:Transaction,
++        inputs:&[IncludedInput<'_>],payment:&TxOut,change_index:Option<u32>,
++        maximum_fee:Amount,minimum_confirmations:u64)->Result<Self> {
++        ensure!(chain.network()==account.network() && minimum_confirmations>0
++            && !inputs.is_empty() && inputs.len()<=1000,"invalid Litecoin inclusion review context");
++        let mut owned=Vec::with_capacity(inputs.len());
++        for input in inputs {
++            let confirmations=input.transaction.confirmations_on(chain).context("Litecoin funding input is orphaned")?;
++            ensure!(confirmations>=minimum_confirmations
++                && (!input.transaction.is_coinbase() || confirmations>=100),"Litecoin funding input is immature");
++            let prevout=input.transaction.outputs().get(input.vout as usize).context("missing Litecoin funding output")?.clone();
++            owned.push(OwnedInput {outpoint:OutPoint {txid:input.transaction.txid(),vout:input.vout},
++                prevout,branch:input.branch,index:input.index});
++        }
++        let review=SpendReview::new(account,transaction,owned,payment,change_index,maximum_fee)?;
++        Ok(Self {review,network:chain.network(),height:chain.height(),
++            tip:chain.header(chain.height()).context("missing Litecoin selected tip")?.block_hash()})
++    }
++    pub fn transaction(&self)->&Transaction {self.review.transaction()}
++    pub fn fee(&self)->Amount {self.review.fee()}
++    /// Even a chain extension requires a fresh review. Matching this saved tip
++    /// is not evidence of wall-clock freshness or absence of later spends.
++    pub fn sign_on(&self,chain:&HeaderSequence,seed:&SecretSeed)->Result<Transaction> {
++        ensure!(chain.network()==self.network && chain.height()==self.height
++            && chain.contains(self.height,self.tip),"Litecoin chain changed; repeat spend review");
++        self.review.sign(seed)
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/tests.rs
+@@ -0,0 +1,54 @@
++use super::*;
++use crate::litecoin_light::{InclusionRequest,match_merkle_proof};
++use bitcoin::{consensus::deserialize,hex::FromHex};
++#[test]
++fn confirmed_review_uses_independent_inclusion_fixture_and_rejects_chain_change()->Result<()> {
++    // PUBLIC BIP32 seed used by the independent funded refresh fixture.
++    // Its synthetic external input is not a consensus-valid funding history.
++    let fixture:serde_json::Value=serde_json::from_str(include_str!("../../../../session/wallet/fixture.json"))?;
++    let blocks=fixture["blocks"].as_array().unwrap();let block=&blocks[0];
++    let header=Vec::from_hex(block["header"].as_str().unwrap())?;
++    let raw=Vec::from_hex(block["transaction"].as_str().unwrap())?;
++    let credit:Transaction=deserialize(&raw)?;
++    let mut chain=HeaderSequence::new(LtcNetwork::Regtest)?;chain.append(&header,u64::MAX-7200)?;
++    let request=InclusionRequest {id:7,txid:credit.compute_txid(),height:1,block_hash:chain.header(1).unwrap().block_hash()};
++    let proof=match_merkle_proof(&request,&header,&raw,&serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0","id":7,"result":{"block_height":1,"pos":0,"merkle":[]}}))?)?;
++    let included=IncludedTransaction::new(proof,&credit)?;
++    let master=Xpriv::new_master(NetworkKind::Test,&(0u8..16).collect::<Vec<_>>())?;
++    let account=PublicAccount::from_master(&master,LtcNetwork::Regtest,0)?;
++    let spend:Transaction=deserialize(&Vec::from_hex(blocks[1]["transaction"].as_str().unwrap())?)?;
++    let payment=spend.output[0].clone();
++    let inputs=[IncludedInput {transaction:&included,vout:0,branch:Branch::Receive,index:0}];
++    let review=ConfirmedSpendReview::new(&chain,&account,spend.clone(),&inputs,&payment,None,Amount::from_sat(40000),1)?;
++    assert_eq!(review.fee(),Amount::from_sat(40000));assert_eq!(review.transaction(),&spend);
++    assert!(ConfirmedSpendReview::new(&chain,&account,spend.clone(),&inputs,&payment,None,Amount::from_sat(40000),2).is_err());
++    let genesis=HeaderSequence::new(LtcNetwork::Regtest)?;
++    assert!(ConfirmedSpendReview::new(&genesis,&account,spend.clone(),&inputs,&payment,None,Amount::from_sat(40000),1).is_err());
++    let seed=SecretSeed::from_bytes(Zeroizing::new([42;32]));
++    assert!(review.sign_on(&genesis,&seed).unwrap_err().to_string().contains("chain changed"));
++    chain.append(&Vec::from_hex(blocks[1]["header"].as_str().unwrap())?,u64::MAX-7200)?;
++    assert!(review.sign_on(&chain,&seed).unwrap_err().to_string().contains("chain changed"));Ok(())
++}
++
++#[test]
++fn confirmed_review_signs_matching_seed_and_rejects_immature_coinbase()->Result<()> {
++    // Policy-only injected inclusion identity, not a Merkle/consensus fixture.
++    // The separate independent fixture above exercises actual Merkle matching.
++    use crate::litecoin_light::MerkleMatch;
++    let (seed,account,mut spend,prevout)=super::super::super::tests::fixture()?;
++    let chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut credit=spend.clone();credit.output=vec![prevout];
++    let included=|tx:&Transaction|IncludedTransaction::new(MerkleMatch {
++        txid:tx.compute_txid(),block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},tx);
++    let receipt=included(&credit)?;spend.input[0].previous_output=OutPoint {txid:receipt.txid(),vout:0};
++    let payment=spend.output[0].clone();
++    let inputs=[IncludedInput {transaction:&receipt,vout:0,branch:Branch::Receive,index:3}];
++    let review=ConfirmedSpendReview::new(&chain,&account,spend.clone(),&inputs,&payment,None,Amount::from_sat(1000),1)?;
++    let signed=review.sign_on(&chain,&seed)?;assert_eq!(signed.compute_txid(),spend.compute_txid());
++    assert_eq!(signed.input[0].witness.len(),2);
++    credit.input[0].previous_output=OutPoint::null();let coinbase=included(&credit)?;
++    spend.input[0].previous_output.txid=coinbase.txid();
++    let inputs=[IncludedInput {transaction:&coinbase,vout:0,branch:Branch::Receive,index:3}];
++    let result=ConfirmedSpendReview::new(&chain,&account,spend,&inputs,&payment,None,Amount::from_sat(1000),1);
++    assert!(result.err().unwrap().to_string().contains("immature"));Ok(())
++}

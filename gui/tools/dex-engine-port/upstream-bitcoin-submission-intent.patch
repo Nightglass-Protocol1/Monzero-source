@@ -1,0 +1,186 @@
+diff --git a/swap-machine/src/native_execution_claim/checkpoint.rs b/swap-machine/src/native_execution_claim/checkpoint.rs
+index d3a36848f..f80745645 100644
+--- a/swap-machine/src/native_execution_claim/checkpoint.rs
++++ b/swap-machine/src/native_execution_claim/checkpoint.rs
+@@ -7,6 +7,8 @@ use crate::xmz_funding::{FundingPolicy, PendingFunding};
+ use anyhow::{ensure, Context, Result};
+ use sha2::{Digest, Sha256};
+ use zeroize::Zeroizing;
++mod submission;
++pub use submission::RecordedBitcoinSubmission;
+ 
+ const DOMAIN: &[u8] = b"monzero-native-bob-pending-checkpoint-v1\0";
+ const LOCK_DOMAIN: &[u8] = b"monzero-native-bob-bitcoin-lock-v1\0";
+diff --git a/swap-machine/src/native_execution_claim/checkpoint/submission.rs b/swap-machine/src/native_execution_claim/checkpoint/submission.rs
+new file mode 100644
+index 000000000..a6362e8fe
+--- /dev/null
++++ b/swap-machine/src/native_execution_claim/checkpoint/submission.rs
+@@ -0,0 +1,116 @@
++//! Exact Bitcoin lock submission intent. No RPC, signature validation, broadcast
++//! authority or acceptance receipt. Never infer rejection from a missing receipt.
++use super::*;
++
++const SUBMISSION_DOMAIN: &[u8] = b"monzero-native-bitcoin-submission-v1\0";
++
++/// Retained transaction bytes, not proof of script validity or chain acceptance.
++pub struct RecordedBitcoinSubmission {
++    transaction: bitcoin::Transaction,
++}
++
++impl RecordedBitcoinSubmission {
++    pub fn transaction(&self) -> &bitcoin::Transaction { &self.transaction }
++}
++
++fn check_transaction(expected: &bitcoin::Transaction, transaction: &bitcoin::Transaction) -> Result<()> {
++    ensure!(!transaction.input.is_empty() && transaction.input.iter()
++        .all(|input|input.script_sig.is_empty() && !input.witness.is_empty()),
++        "Bitcoin submission requires native witness inputs");
++    let mut unsigned=transaction.clone();
++    for input in &mut unsigned.input {input.witness.clear();}
++    ensure!(&unsigned==expected,"Bitcoin submission differs from negotiated lock");
++    Ok(())
++}
++
++#[cfg(target_os = "linux")]
++fn read_record(directory: &std::fs::File, store: &CheckpointPinStore,
++    quote: &crate::native_trade_quote::RecordedQuote, suffix: &str, domain: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
++    store.separate_from(directory)?;
++    let name=format!("{}.{suffix}",filename(quote)?);
++    let pin_bytes=read_private(&store.directory,&format!("{name}.pin"))?;
++    let pin=decode_pin(&pin_bytes,quote.terms()["swapId"].parse()?,quote.commitment())?;
++    let bytes=read_pinned(directory,&name,&pin)?;
++    ensure!(bytes.len()>domain.len()+32 && bytes.starts_with(domain)
++        && &bytes[domain.len()..domain.len()+32]==quote.commitment(),
++        "Bitcoin submission checkpoint envelope mismatch");
++    Ok(bytes)
++}
++
++impl ExecutionClaim {
++    /// Require the persisted pre-lock state and preserve exact wallet-produced
++    /// bytes before the caller submits. Does not validate witness signatures.
++    #[cfg(target_os = "linux")]
++    pub fn prepare_bitcoin_submission(&self, store: &CheckpointPinStore,
++        transaction: &bitcoin::Transaction) -> Result<PreparedCheckpoint<'_>> {
++        let quote=self.checkpoint_quote.as_ref().context("missing checkpoint quote")?;
++        let bytes=read_record(&self.directory,store,quote,"bitcoin-lock",LOCK_DOMAIN)?;
++        let state:crate::bob::State3=serde_json::from_slice(&bytes[LOCK_DOMAIN.len()+32..])
++            .map_err(|_|anyhow::anyhow!("invalid pre-lock checkpoint"))?;
++        state.check_recorded_quote(quote)?;
++        ensure!(transaction.compute_txid()==state.tx_lock.txid(),"Bitcoin submission lock identity mismatch");
++        let psbt:bitcoin::psbt::Psbt=state.tx_lock.into();
++        check_transaction(&psbt.unsigned_tx,transaction)?;
++        self.prepare_record(SUBMISSION_DOMAIN,format!("{}.bitcoin-submission",filename(quote)?),
++            Zeroizing::new(bitcoin::consensus::serialize(transaction)))
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub fn prepare_bitcoin_submission(&self, _: &CheckpointPinStore,
++        _: &bitcoin::Transaction) -> Result<PreparedCheckpoint<'_>> {
++        anyhow::bail!("Bitcoin submission storage is not implemented on this platform")
++    }
++}
++
++impl RecoveryLease {
++    /// Restore intended bytes while owning recovery. Reconcile with the chain
++    /// before any decision; a stored intent does not authorize resubmission.
++    #[cfg(target_os = "linux")]
++    pub fn load_bitcoin_submission(&self, store: &CheckpointPinStore, expected_lock: bitcoin::Txid)
++        -> Result<RecordedBitcoinSubmission> {
++        let state=self.load_bitcoin_lock(store,expected_lock)?;
++        let bytes=read_record(&self.directory,store,self.record.quote(),"bitcoin-submission",SUBMISSION_DOMAIN)?;
++        let transaction:bitcoin::Transaction=bitcoin::consensus::deserialize(&bytes[SUBMISSION_DOMAIN.len()+32..])
++            .map_err(|_|anyhow::anyhow!("invalid Bitcoin submission transaction"))?;
++        ensure!(transaction.compute_txid()==expected_lock,"retained Bitcoin submission lock identity mismatch");
++        let psbt:bitcoin::psbt::Psbt=state.tx_lock.into();
++        check_transaction(&psbt.unsigned_tx,&transaction)?;
++        Ok(RecordedBitcoinSubmission {transaction})
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub fn load_bitcoin_submission(&self, _: &CheckpointPinStore, _: bitcoin::Txid)
++        -> Result<RecordedBitcoinSubmission> {
++        anyhow::bail!("Bitcoin submission recovery is not implemented on this platform")
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn submission_preserves_every_non_witness_field() -> Result<()> {
++        let unsigned=bitcoin::Transaction {
++            version:bitcoin::transaction::Version::TWO,lock_time:bitcoin::absolute::LockTime::ZERO,
++            input:vec![bitcoin::TxIn {previous_output:bitcoin::OutPoint::null(),
++                script_sig:bitcoin::ScriptBuf::new(),sequence:bitcoin::Sequence::MAX,witness:bitcoin::Witness::new()}],
++            output:vec![bitcoin::TxOut {value:bitcoin::Amount::from_sat(42),script_pubkey:bitcoin::ScriptBuf::new()}],
++        };
++        assert!(check_transaction(&unsigned,&unsigned).is_err());
++        let mut signed=unsigned.clone();signed.input[0].witness.push([1]);
++        // Synthetic witness tests structural binding only, NOT script validity.
++        check_transaction(&unsigned,&signed)?;
++        for field in 0..5 {
++            let mut changed=signed.clone();
++            match field {
++                0=>changed.output[0].value=bitcoin::Amount::from_sat(43),
++                1=>changed.input[0].previous_output.vout=1,
++                2=>changed.input[0].sequence=bitcoin::Sequence::ZERO,
++                3=>changed.lock_time=bitcoin::absolute::LockTime::from_consensus(1),
++                _=>changed.version=bitcoin::transaction::Version::ONE,
++            }
++            assert!(check_transaction(&unsigned,&changed).is_err());
++        }
++        Ok(())
++    }
++}
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 1dfbaa3f7..7540a1aae 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -466,6 +466,19 @@ async fn settlement(refund: bool) -> Result<()> {
+             "pre-lock checkpoint was overwritten");
+     }
+     let lock_tx = bob_wallet.sign_and_finalize(lock.into()).await?;
++    #[cfg(unix)]
++    if let Some(claim)=execution_claim.as_ref() {
++        let directory=std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RECOVERY_EXPORT")
++            .context("missing recovery export")?).with_extension("pins");
++        let store=swap_machine::native_execution_claim::checkpoint::CheckpointPinStore::open(&directory)?;
++        let mut changed=lock_tx.clone();changed.output[0].value=Amount::ZERO;
++        anyhow::ensure!(claim.prepare_bitcoin_submission(&store,&changed).is_err(),"changed lock submission accepted");
++        changed=lock_tx.clone();changed.input[0].witness.clear();
++        anyhow::ensure!(claim.prepare_bitcoin_submission(&store,&changed).is_err(),"missing lock witness accepted");
++        claim.prepare_bitcoin_submission(&store,&lock_tx)?.persist_with_pin_store(&store)?;
++        anyhow::ensure!(claim.prepare_bitcoin_submission(&store,&lock_tx)?.persist_with_pin_store(&store).is_err(),
++            "Bitcoin submission intent was overwritten");
++    }
+     broadcast_confirm(&env, lock_tx).await?;
+     let request = alice3.lock_xmr_transfer_request();
+     let address = swap_core::xmz_address::XmzAddress::new(
+@@ -600,7 +613,16 @@ async fn settlement(refund: bool) -> Result<()> {
+             "recovery accepted unavailable native RPC");
+         verified_state = Some(resume_in_process(&checkpoint_path, swap_id, lock_id, false, &env.bitcoind_url,alice3.association(),execution_directory).await?
+             .context("missing recovered state")?);
+-        if let Some(owner)=&quote_owner { _recovery_owner=Some(owner.acquire_recovery(swap_id)?); }
++        if let Some(owner)=&quote_owner {
++            let lease=owner.acquire_recovery(swap_id)?;
++            let store=swap_machine::native_execution_claim::checkpoint::CheckpointPinStore::open(
++                &checkpoint_path.with_extension("pins"))?;
++            let stored=lease.load_bitcoin_submission(&store,lock_id)?;
++            let observed=bob_wallet.get_raw_transaction(lock_id).await?
++                .context("confirmed lock missing from Electrum")?;
++            anyhow::ensure!(stored.transaction()==observed.as_ref(),"mined lock bytes differ from retained submission");
++            _recovery_owner=Some(lease);
++        }
+     }
+     let bob4 = match verified_state {
+         Some(state) => state,
+@@ -844,6 +866,8 @@ async fn resume_pending_in_child() -> Result<()> {
+             anyhow::ensure!(lease.load_bitcoin_lock(&store,"00".repeat(32).parse()?).is_err(),
+                 "pre-lock checkpoint accepted another lock transaction");
+             let pre_lock=lease.load_bitcoin_lock(&store,lock)?;
++            let submission=lease.load_bitcoin_submission(&store,lock)?;
++            anyhow::ensure!(submission.transaction().compute_txid()==lock,"restored submission has wrong identity");
+             pre_lock.check_recorded_quote(&association.verify_record(quote_fixture::now()?)?)?;
+             let pending=lease.load_pinned_pending(&store,lock,&policy)?;
+             anyhow::ensure!(pre_lock.cancel(swap_core::monero::BlockHeight {height:0})

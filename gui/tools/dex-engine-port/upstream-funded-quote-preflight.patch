@@ -1,0 +1,191 @@
+diff --git a/swap-machine/tests/alice_peer/mod.rs b/swap-machine/tests/alice_peer/mod.rs
+index d95644e4c..abbf537a5 100644
+--- a/swap-machine/tests/alice_peer/mod.rs
++++ b/swap-machine/tests/alice_peer/mod.rs
+@@ -54,6 +54,11 @@ impl Drop for OwnedProcess {
+     }
+ }
+ impl AlicePeer {
++    pub fn check_quote(&self, context: &Value) -> Result<()> {
++        let checked:bool=self.wire.borrow_mut().call("check-quote",context)?;
++        ensure!(checked,"Alice did not acknowledge quote preflight");
++        Ok(())
++    }
+     /// Fixture-only crash after a synced negotiated-state checkpoint.
+     /// The parent never reads the checkpoint or obtains Alice's private state.
+     pub fn restart_from_checkpoint(&mut self)->Result<()> {
+@@ -253,6 +258,11 @@ pub fn serve()->Result<()> {
+             && value["swapId"]==id.to_string() && value["sequence"]==wire.sequence,"invalid fixture command context");
+         let kind=value["kind"].as_str().context("missing command")?;
+         match kind {
++            "check-quote"=>{
++                let quote=crate::quote_fixture::read(&value["payload"],id)?;
++                state.check_native_quote(&quote,&crate::quote_fixture::policy(),crate::quote_fixture::now()?)?;
++                wire.send(kind,true)?;
++            }
+             "checkpoint"=>{
+                 use std::os::unix::fs::OpenOptionsExt;
+                 let bytes=serde_json::to_vec(&(id,wire.sequence+1,&state))?;
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index eb04625bf..b660d6562 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -4,6 +4,8 @@ mod harness;
+ mod native_rpc;
+ #[cfg(unix)]
+ mod alice_peer;
++#[cfg(unix)]
++mod quote_fixture;
+ 
+ #[cfg(unix)]
+ #[test]
+@@ -330,15 +332,24 @@ async fn settlement(refund: bool) -> Result<()> {
+         alice_wallet.new_address().await?, alice_wallet.new_address().await?,
+         fee, fee, fee, false, &mut OsRng);
+     let swap_id = Uuid::new_v4();
++    let btc_refund = bob_wallet.new_address().await?;
++    #[cfg(unix)]
++    let btc_payout = alice_wallet.new_address().await?;
++    #[cfg(unix)]
++    let quote_owner = match std::env::var_os("MONZERO_TEST_QT_QUOTE_DRIVER") {
++        Some(driver) => Some(quote_fixture::QuoteFixture::create(driver,swap_id,amount.to_sat(),
++            atoms.atoms(),&btc_payout,&btc_refund)?),
++        None => None, // Standalone legacy fixture, not quote-integration evidence.
++    };
+     let bob0 = bob::State0::new(swap_id, &mut OsRng, amount, legacy_amount,
+         CancelTimelock::new(config.bitcoin_cancel_timelock),
+         PunishTimelock::new(config.bitcoin_punish_timelock),
+         RemainingRefundTimelock::new(config.bitcoin_remaining_refund_timelock),
+-        bob_wallet.new_address().await?, config.monero_finality_confirmations,
++        btc_refund, config.monero_finality_confirmations,
+         fee, fee, fee, fee, fee, fee);
+     #[cfg(unix)]
+     let (mut alice3,bob2)=alice_peer::AlicePeer::negotiate(swap_id,bob0,&bob_wallet,
+-        alice_wallet.new_address().await?,alice_wallet.new_address().await?,amount,atoms.atoms()).await?;
++        btc_payout,alice_wallet.new_address().await?,amount,atoms.atoms()).await?;
+     #[cfg(not(unix))]
+     let (alice3,bob2)={
+     let (_, alice1) = alice0.receive(bob0.next_message()?)?;
+@@ -348,6 +359,19 @@ async fn settlement(refund: bool) -> Result<()> {
+     let alice3 = alice2.receive(bob2.next_message()?)?;
+     (alice3,bob2)
+     };
++    #[cfg(unix)]
++    if let Some(owner) = &quote_owner {
++        let quote=quote_fixture::read(owner.context(),swap_id)?;
++        bob2.check_native_quote(&quote,&quote_fixture::policy(),quote_fixture::now()?)?;
++        alice3.check_quote(owner.context())?;
++        let mut wrong=owner.context().clone(); wrong["commitment"]="0".repeat(64).into();
++        anyhow::ensure!(quote_fixture::read(&wrong,swap_id).is_err(),"accepted wrong fixture commitment");
++        let marker=serde_json::to_string(&serde_json::json!({
++            "commitment":owner.context()["commitment"],"swapId":swap_id.to_string(),
++            "xmzPayout":quote.destinations().xmz_payout.to_string(),
++            "xmzRefund":quote.destinations().xmz_refund.to_string()}))?;
++        anyhow::ensure!(export_fixture("MONZERO_TEST_QUOTE_CHECKED",&marker)?,"missing quote check marker path");
++    }
+     let (bob3, lock) = bob2.lock_btc().await?;
+     let lock_id = lock.txid();
+     let lock_tx = bob_wallet.sign_and_finalize(lock.into()).await?;
+diff --git a/swap-machine/tests/quote_fixture.rs b/swap-machine/tests/quote_fixture.rs
+new file mode 100644
+index 000000000..caa5dea59
+--- /dev/null
++++ b/swap-machine/tests/quote_fixture.rs
+@@ -0,0 +1,97 @@
++//! Disposable signed-quote/Qt bridge for funded tests, not production approval.
++#![cfg(unix)]
++use anyhow::{Context, Result, ensure};
++use ed25519_dalek::{Signer, SigningKey};
++use serde_json::{Value, json};
++use std::{io::Write, os::unix::fs::DirBuilderExt, path::PathBuf, process::{Command, Stdio}};
++use swap_machine::native_trade_quote::{DeploymentPolicy, VerifiedQuote};
++use swap_env::env::{GetConfig, Regtest};
++use uuid::Uuid;
++
++pub fn now() -> Result<u64> {
++    Ok(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())
++}
++fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b|format!("{b:02x}")).collect() }
++pub fn policy() -> DeploymentPolicy {
++    let config=Regtest::get_config();
++    DeploymentPolicy {
++        btc_genesis:bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).block_hash().to_string(),
++        xmz_genesis:"84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4".into(),
++        btc_network:"btc-regtest".into(), xmz_network:"xmz-fakechain".into(),
++        btc_confirmations:config.bitcoin_finality_confirmations, xmz_confirmations:10,
++        cancel_blocks:config.bitcoin_cancel_timelock, punish_blocks:config.bitcoin_punish_timelock,
++        maximum_btc_principal:500000, maximum_xmz_principal:200000000000,
++        maximum_btc_native_fee:10000, maximum_xmz_native_fee:1000000000,
++    }
++}
++pub struct QuoteFixture { directory: PathBuf, context: Value }
++impl Drop for QuoteFixture {
++    fn drop(&mut self) { let _=std::fs::remove_dir_all(&self.directory); }
++}
++impl QuoteFixture {
++    pub fn create(driver: std::ffi::OsString, swap_id: Uuid, btc: u64, xmz: u64,
++        payout: &bitcoin::Address, refund: &bitcoin::Address) -> Result<Self> {
++        let directory=std::env::temp_dir().canonicalize()?.join(format!("xmz-funded-quote-{}",Uuid::new_v4()));
++        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
++        let mut owner=Self {directory,context:Value::Null};
++        let policy=policy(); let accepted=now()?; let quote_id=Uuid::new_v4();
++        let b=SigningKey::from_bytes(&[1;32]); let x=SigningKey::from_bytes(&[2;32]);
++        let xmz_payout=std::env::var("MONZERO_TEST_XMZ_PAYOUT")?;
++        let xmz_refund=std::env::var("MONZERO_TEST_XMZ_REFUND")?;
++        ensure!(xmz_payout!=xmz_refund,"fixture destinations must differ");
++        let terms=json!({"schema":"monzero-native-btc-xmz-quote-v1",
++            "quoteId":quote_id.to_string(),"swapId":swap_id.to_string(),
++            "btcFunder":hex(&b.verifying_key().to_bytes()),"xmzFunder":hex(&x.verifying_key().to_bytes()),
++            "btcGenesis":policy.btc_genesis,"xmzGenesis":policy.xmz_genesis,
++            "btcNetwork":policy.btc_network,"xmzNetwork":policy.xmz_network,
++            "btcSatoshis":btc.to_string(),"xmzAtoms":xmz.to_string(),"appFeeXmzAtoms":"0",
++            "btcNativeFeeMaxSatoshis":"10000","xmzNativeFeeMaxAtoms":"1000000000",
++            "btcPayout":payout.to_string(),"btcRefund":refund.to_string(),
++            "xmzPayout":xmz_payout,"xmzRefund":xmz_refund,
++            "btcConfirmations":policy.btc_confirmations.to_string(),"xmzConfirmations":policy.xmz_confirmations.to_string(),
++            "cancelBlocks":policy.cancel_blocks.to_string(),"punishBlocks":policy.punish_blocks.to_string(),
++            "expiresAt":(accepted+3600).to_string()});
++        let payload=serde_json::to_vec(&terms)?;
++        let sign=|key: &SigningKey,role: &str| {
++            let domain=format!("monzero-native-btc-xmz-quote-v1-{role}");
++            let mut bytes=format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:",domain.len(),domain,payload.len()).into_bytes();
++            bytes.extend_from_slice(&payload); key.sign(&bytes).to_bytes()
++        };
++        let bs=sign(&b,"btc-funder"); let xs=sign(&x,"xmz-funder");
++        let quote=VerifiedQuote::verify(&payload,accepted,&b.verifying_key().to_bytes(),&x.verifying_key().to_bytes(),
++            &bs,&xs,bitcoin::Network::Regtest,swap_core::xmz_address::XmzNetwork::Mainnet)?;
++        quote.check_deployment(&policy,accepted)?;
++        let record=serde_json::to_vec(&json!({"acceptedAt":accepted.to_string(),"terms":terms,
++            "btcSignature":hex(&bs),"xmzSignature":hex(&xs)}))?;
++        let mut child=Command::new(driver).arg("--reserve-signed-fixture").arg(&owner.directory)
++            .arg(hex(&b.verifying_key().to_bytes())).arg(hex(&x.verifying_key().to_bytes()))
++            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
++        let written=child.stdin.take().context("missing Qt input")?.write_all(&record);
++        let status=child.wait()?; written?;
++        ensure!(status.success(),"Qt reservation was not acknowledged");
++        owner.context=json!({"directory":owner.directory,"quoteId":quote_id.to_string(),
++            "swapId":swap_id.to_string(),"commitment":hex(quote.commitment())});
++        let _=read(owner.context(),swap_id)?;
++        Ok(owner)
++    }
++    pub fn context(&self) -> &Value { &self.context }
++}
++
++/// Caller is the trusted test parent over its private fixture socket.
++/// Pins/policy are fixed fixture configuration, never supplied in this context.
++pub fn read(context: &Value, expected_swap: Uuid) -> Result<VerifiedQuote> {
++    ensure!(context.as_object().is_some_and(|o|o.len()==4),"invalid fixture quote context");
++    let text=|key|context[key].as_str().context("missing fixture quote context field");
++    let swap:Uuid=text("swapId")?.parse()?;
++    ensure!(swap==expected_swap,"fixture quote swap mismatch");
++    let commitment=text("commitment")?;
++    ensure!(commitment.len()==64 && commitment.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)),
++        "invalid fixture quote commitment");
++    let mut digest=[0;32];
++    for (i,b) in digest.iter_mut().enumerate() { *b=u8::from_str_radix(&commitment[i*2..i*2+2],16)?; }
++    swap_machine::native_quote_reservation::read_verified_quote(&PathBuf::from(text("directory")?),
++        text("quoteId")?.parse()?,swap,&digest,now()?,
++        &SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++        &SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes(),
++        bitcoin::Network::Regtest,swap_core::xmz_address::XmzNetwork::Mainnet,&policy())
++}

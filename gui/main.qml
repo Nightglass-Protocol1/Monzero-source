@@ -79,6 +79,7 @@ ApplicationWindow {
     property int maxWindowHeight: (isAndroid || isIOS)? screenAvailableHeight : (screenAvailableHeight < 900)? 720 : 800;
     property bool daemonRunning: !persistentSettings.useRemoteNode && !disconnected
     property int daemonStartStopInProgress: 0
+    readonly property bool localNodeCheckInProgress: localNodeStartup.pending
     property alias toolTip: toolTip
     property string walletName
     property bool viewOnly: false
@@ -87,6 +88,7 @@ ApplicationWindow {
     property int blocksToSync: 1
     property int firstBlockSeen
     property bool isMining: false
+    property double miningHashRate: 0
     property int walletMode: persistentSettings.walletMode
     property var cameraUi
     property bool androidCloseTapped: false;
@@ -317,6 +319,8 @@ ApplicationWindow {
         currentWallet.transactionCreated.disconnect(onTransactionCreated)
         currentWallet.assetIssuanceCreated.disconnect(onAssetIssuanceCreated)
         currentWallet.assetIssuanceFailed.disconnect(onAssetIssuanceFailed)
+        currentWallet.assetTransferCreated.disconnect(onAssetTransferCreated)
+        currentWallet.assetTransferFailed.disconnect(onAssetTransferFailed)
         currentWallet.connectionStatusChanged.disconnect(onWalletConnectionStatusChanged)
         currentWallet.deviceButtonRequest.disconnect(onDeviceButtonRequest);
         currentWallet.deviceButtonPressed.disconnect(onDeviceButtonPressed);
@@ -370,6 +374,8 @@ ApplicationWindow {
         currentWallet.transactionCreated.connect(onTransactionCreated)
         currentWallet.assetIssuanceCreated.connect(onAssetIssuanceCreated)
         currentWallet.assetIssuanceFailed.connect(onAssetIssuanceFailed)
+        currentWallet.assetTransferCreated.connect(onAssetTransferCreated)
+        currentWallet.assetTransferFailed.connect(onAssetTransferFailed)
         currentWallet.connectionStatusChanged.connect(onWalletConnectionStatusChanged)
         currentWallet.deviceButtonRequest.connect(onDeviceButtonRequest);
         currentWallet.deviceButtonPressed.connect(onDeviceButtonPressed);
@@ -471,6 +477,19 @@ ApplicationWindow {
         }
     }
 
+    MonzeroComponents.LocalNodeStartup {
+        id: localNodeStartup
+        wallet: currentWallet || null
+        manager: daemonManager
+        enabled: appWindow.walletMode >= 2
+        useRemoteNode: persistentSettings.useRemoteNode
+        startInProgress: appWindow.daemonStartStopInProgress !== 0
+        nettype: persistentSettings.nettype
+        dataDir: persistentSettings.blockchainDataDir
+        flags: persistentSettings.daemonFlags
+        onStartRequested: appWindow.startDaemon(flags)
+    }
+
     function onWalletConnectionStatusChanged(status){
         console.log("Wallet connection status changed " + status)
         middlePanel.updateStatus();
@@ -479,21 +498,16 @@ ApplicationWindow {
             firstBlockSeen = 0;
         }
 
-        // If wallet isnt connected, advanced wallet mode and no daemon is running - Ask
-        if (appWindow.walletMode >= 2 && !persistentSettings.useRemoteNode && !walletInitialized && disconnected) {
-            daemonManager.runningAsync(persistentSettings.nettype, persistentSettings.blockchainDataDir, function(running) {
-                if (!running) {
-                    daemonManagerDialog.open();
-                }
-            });
-        }
+        // Independent of walletInitialized: a Connecting notification can
+        // arrive before the first Disconnected notification on Windows.
+        if (status === Wallet.ConnectionStatus_Disconnected) localNodeStartup.checkDisconnected();
         // initialize transaction history once wallet is initialized first time;
         if (!walletInitialized) {
             currentWallet.history.refresh(currentWallet.currentSubaddressAccount)
             walletInitialized = true
 
             // check if daemon was already mining and add mining logo if true
-            if (!persistentSettings.useRemoteNode || persistentSettings.allowRemoteNodeMining) {
+            if (miningEnabled && (!persistentSettings.useRemoteNode || persistentSettings.allowRemoteNodeMining)) {
                 middlePanel.advancedView.miningView.update();
             }
         }
@@ -786,6 +800,7 @@ ApplicationWindow {
     }
 
     function startDaemon(flags){
+        if (!currentWallet || persistentSettings.useRemoteNode || daemonStartStopInProgress !== 0) return;
         daemonStartStopInProgress = 1;
 
         // Pause refresh while starting daemon
@@ -809,7 +824,7 @@ ApplicationWindow {
             if (splash) {
                 hideProcessingSplash();
             }
-            callback(result);
+            if (callback) callback(result);
         });
     }
 
@@ -837,12 +852,6 @@ ApplicationWindow {
         currentWallet.startRefresh();
         informationPopup.title = qsTr("Daemon failed to start") + translationManager.emptyString;
         informationPopup.text  = error + ".\n\n" + qsTr("Please check your wallet and daemon log for errors. You can also try to start %1 manually.").arg((isWindows)? "monzerod.exe" : "monzerod")
-        if (middlePanel.advancedView.miningView.stopMiningEnabled == true) {
-            walletManager.stopMining()
-            p2poolManager.exit()
-            middlePanel.advancedView.miningView.update()
-            informationPopup.text += qsTr("\n\nExiting p2pool. Please check that port 18083 is available.") + translationManager.emptyString;
-        }
         informationPopup.icon  = StandardIcon.Critical
         informationPopup.onCloseCallback = null
         informationPopup.open();
@@ -969,6 +978,57 @@ ApplicationWindow {
             request.assetType, request.atomicSupply, request.displayDecimals,
             request.metadataHash, request.metadataReference,
             request.collectionId, request.recipientAddress, 0,
+            PendingTransaction.Priority_Low);
+    }
+
+    function onAssetTransferFailed(message) {
+        txConfirmationPopup.bottomTextAnimation.running = false;
+        txConfirmationPopup.bottomText.text = "";
+        const label = txConfirmationPopup.assetBurn ? qsTr("Can't create asset burn: ") : qsTr("Can't create asset transfer: ");
+        txConfirmationPopup.errorText.text = label + message + translationManager.emptyString;
+    }
+
+    function onAssetTransferCreated(pendingTransaction) {
+        txConfirmationPopup.bottomTextAnimation.running = false;
+        txConfirmationPopup.bottomText.text = "";
+        transaction = pendingTransaction;
+        if (transaction.status !== PendingTransaction.Status_Ok) {
+            const label = txConfirmationPopup.assetBurn ? qsTr("Can't create asset burn: ") : qsTr("Can't create asset transfer: ");
+            txConfirmationPopup.errorText.text = label + transaction.errorString + translationManager.emptyString;
+            currentWallet.disposeTransaction(transaction);
+            transaction = null;
+            return;
+        }
+        txConfirmationPopup.transactionAmount = Utils.removeTrailingZeros(walletManager.displayAmount(transaction.amount));
+        txConfirmationPopup.transactionFee = Utils.removeTrailingZeros(walletManager.displayAmount(transaction.fee));
+        txConfirmationPopup.confirmButton.text = (txConfirmationPopup.assetBurn ? qsTr("Confirm burn") : qsTr("Confirm transfer")) + translationManager.emptyString;
+        txConfirmationPopup.confirmButton.rightIcon = "qrc:///images/rightArrow.png";
+    }
+
+    function handleAssetTransfer(request) {
+        txConfirmationPopup.clearFields();
+        txConfirmationPopup.assetTransfer = true;
+        txConfirmationPopup.assetId = request.assetId;
+        txConfirmationPopup.assetSummary = qsTr("Transfer %1 atomic units").arg(request.atomicAmount) + translationManager.emptyString;
+        txConfirmationPopup.recipients = [{"address": request.recipientAddress, "amount": request.atomicAmount}];
+        txConfirmationPopup.bottomText.text = qsTr("Creating asset transfer transaction...") + translationManager.emptyString;
+        txConfirmationPopup.open();
+        currentWallet.createAssetTransferAsync(
+            request.assetId, request.recipientAddress, request.atomicAmount, "", 0,
+            PendingTransaction.Priority_Low);
+    }
+
+    function handleAssetBurn(request) {
+        txConfirmationPopup.clearFields();
+        txConfirmationPopup.assetBurn = true;
+        txConfirmationPopup.assetId = request.assetId;
+        txConfirmationPopup.assetSummary = qsTr("Permanently destroy %1 atomic units").arg(request.atomicAmount) + translationManager.emptyString;
+        const selfAddress = currentWallet.address(currentWallet.currentSubaddressAccount, 0);
+        txConfirmationPopup.recipients = [{"address": selfAddress, "amount": request.atomicAmount}];
+        txConfirmationPopup.bottomText.text = qsTr("Creating asset burn transaction...") + translationManager.emptyString;
+        txConfirmationPopup.open();
+        currentWallet.createAssetTransferAsync(
+            request.assetId, selfAddress, "", request.atomicAmount, 0,
             PendingTransaction.Priority_Low);
     }
 
@@ -2087,7 +2147,7 @@ ApplicationWindow {
             property alias text: content.text
             width: content.width + 12
             height: content.height + 17
-            color: "#FF6C3C"
+            color: "#29BDB5"
             //radius: 3
             visible:false;
 

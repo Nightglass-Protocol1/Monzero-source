@@ -26,680 +26,182 @@
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import QtQml.Models 2.2
 import QtQuick 2.9
 import QtQuick.Layouts 1.1
-import QtQuick.Dialogs 1.2
 import "../components" as MonzeroComponents
-import moneroComponents.Wallet 1.0
-import moneroComponents.P2PoolManager 1.0
-import moneroComponents.DaemonManager 1.0
 
 Rectangle {
     id: root
     color: "transparent"
     property alias miningHeight: mainLayout.height
-    property double currentHashRate: 0
-    property int threads: idealThreadCount / 2
-    property alias stopMiningEnabled: stopSoloMinerButton.enabled
-    property string args: ""
+    property alias stopMiningEnabled: stopButton.enabled
+    property int threads: 1
+    property bool busy: false
+    property bool statusKnown: false
+    property bool statusPending: false
+    property int statusGeneration: 0
+    property string activeAddress: ""
+    property string errorText: ""
+    readonly property bool localConnected: currentWallet !== undefined && currentWallet !== null && !persistentSettings.useRemoteNode && !appWindow.disconnected && appWindow.daemonStartStopInProgress === 0
+    readonly property bool ready: localConnected && appWindow.daemonSynced
+
+    onLocalConnectedChanged: { statusGeneration++; statusKnown = false; appWindow.isMining = false; appWindow.miningHashRate = 0; if (localConnected) { statusText.text = qsTr("Checking mining status…"); update(); } else statusText.text = qsTr("Mining status unknown — local node disconnected. Mining may still be running."); }
+
     ColumnLayout {
         id: mainLayout
-        Layout.fillWidth: true
-        anchors.margins: 20
-        anchors.topMargin: 0
-        anchors.left: parent.left
-        anchors.top: parent.top
-        anchors.right: parent.right
-        spacing: 20
-
-        MonzeroComponents.Label {
-            id: soloTitleLabel
-            fontSize: 24
-            text: qsTr("Mining") + translationManager.emptyString
-        }
-
-        MonzeroComponents.WarningBox {
-            Layout.bottomMargin: 8
-            id: localDaemonWarning
-            text: qsTr("Mining is only available on local daemons.") + translationManager.emptyString
-            visible: false
-        }
-
-        MonzeroComponents.WarningBox {
-            Layout.bottomMargin: 8
-            text: qsTr("Your daemon must be synchronized before you can start mining") + translationManager.emptyString
-            visible: false
-        }
-
+        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 20; topMargin: 0 }
+        spacing: 18
+        MonzeroComponents.Label { text: qsTr("Mine Monzero"); fontSize: 24 }
         MonzeroComponents.TextPlain {
-            id: soloMainLabel
-            text: qsTr("Mining is managed separately from the Monzero wallet. Keeping the miner independent lets you close this GUI without interrupting mining and prevents the wallet from silently starting CPU work.\n\nStart the node with ./start-node.sh, then run ./start-mining.sh YOUR_MONZERO_ADDRESS THREADS from the Monzero command-line package. Use ./stop-mining.sh to stop mining. Coinbase rewards will appear in this wallet after refresh and unlock after 60 blocks.") + translationManager.emptyString
-            wrapMode: Text.Wrap
             Layout.fillWidth: true
-            font.family: MonzeroComponents.Style.fontRegular.name
-            font.pixelSize: 14
-            color: MonzeroComponents.Style.defaultFontColor
+            wrapMode: Text.WordWrap
+            text: qsTr("Use your computer's CPU to mine XMZ into this wallet. Choose your CPU threads, then click Start mining. Solo mining rewards depend on finding a block; payouts are not guaranteed.")
         }
-
         MonzeroComponents.WarningBox {
-            id: warningLabel
-            Layout.topMargin: 8
-            Layout.bottomMargin: 8
-            text: qsTr("This GUI does not start or stop the miner. Mining continues independently when the wallet is closed.") + translationManager.emptyString
-        }
-
-        GridLayout {
-            visible: false
-            columns: 2
             Layout.fillWidth: true
-            columnSpacing: 20
-            rowSpacing: 16
-
-            ListModel {
-                id: miningModeModel
-
-                ListElement { column1: qsTr("Solo") ; column2: ""; priority: 0}
-                ListElement { column1: "P2Pool" ; column2: ""; priority: 1}
+            visible: !root.ready
+            text: persistentSettings.useRemoteNode
+                ? qsTr("Mining needs a local node. Open Node settings, select Local node and let it synchronize first.")
+                : !root.localConnected
+                    ? qsTr("Connect to your local node before mining. You can start it from Node settings.")
+                    : qsTr("Your local node is synchronizing. Mining will be available when synchronization finishes.")
+        }
+        MonzeroComponents.StandardButton {
+            visible: !root.ready
+            text: qsTr("Open Node settings")
+            onClicked: {
+                middlePanel.settingsView.settingsStateViewState = "Node";
+                appWindow.showPageRequest("Settings");
             }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.alignment : Qt.AlignTop | Qt.AlignLeft
-
-                MonzeroComponents.Label {
-                    id: miningModeLabel
-                    color: MonzeroComponents.Style.defaultFontColor
-                    text: qsTr("Mining mode") + translationManager.emptyString
-                    fontSize: 16
-                }
+        }
+        MonzeroComponents.Label { text: qsTr("CPU threads"); fontSize: 16 }
+        RowLayout {
+            spacing: 14
+            MonzeroComponents.StandardButton {
+                objectName: "reduceMiningThreads"
+                text: "−"; small: true; primary: false
+                enabled: !root.busy && !appWindow.isMining && root.threads > 1
+                onClicked: root.threads--
             }
-
-            ColumnLayout {
-                Layout.topMargin: 5
-                spacing: 10
-
-                MonzeroComponents.StandardDropdown {
-                    Layout.maximumWidth: 200
-                    id: miningModeDropdown
-                    visible: true
-                    currentIndex: persistentSettings.miningModeSelected
-                    dataModel: miningModeModel
-                    onChanged: {
-                        persistentSettings.allow_p2pool_mining = miningModeDropdown.currentIndex === 1;
-                        persistentSettings.miningModeSelected = miningModeDropdown.currentIndex;
-                        walletManager.stopMining();
-                        p2poolManager.exit();
-                    }
-                }
+            MonzeroComponents.TextPlain { text: root.threads; Layout.minimumWidth: 35; horizontalAlignment: Text.AlignHCenter }
+            MonzeroComponents.StandardButton {
+                text: "+"; small: true; primary: false
+                enabled: !root.busy && !appWindow.isMining && root.threads < Math.max(1, idealThreadCount)
+                onClicked: root.threads++
             }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.alignment : Qt.AlignTop | Qt.AlignLeft
-
-                MonzeroComponents.Label {
-                    id: soloMinerThreadsLabel
-                    color: MonzeroComponents.Style.defaultFontColor
-                    text: qsTr("CPU threads") + translationManager.emptyString
-                    fontSize: 16
-                    wrapMode: Text.WordWrap
-                }
+            MonzeroComponents.StandardButton {
+                text: qsTr("Use half"); small: true; primary: false
+                enabled: !root.busy && !appWindow.isMining
+                onClicked: root.threads = Math.max(1, Math.floor(idealThreadCount / 2))
             }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 16
-
-                RowLayout {
-                    MonzeroComponents.StandardButton {
-                        id: removeThreadButton
-                        small: true
-                        primary: false
-                        text: "−"
-                        enabled: threads > 1
-                        onClicked: threads--
-                    }
-
-                    MonzeroComponents.TextPlain {
-                        Layout.bottomMargin: 1
-                        Layout.minimumWidth: 45
-                        color: MonzeroComponents.Style.defaultFontColor
-                        text: threads
-                        horizontalAlignment: Text.AlignHCenter
-                        font.pixelSize: 16
-
-                        MouseArea {
-                            anchors.fill: parent
-                            scrollGestureEnabled: false
-                            onWheel: {
-                                if (wheel.angleDelta.y > 0 && threads < idealThreadCount) {
-                                    return threads++
-                                } else if (wheel.angleDelta.y < 0 && threads > 1) {
-                                    return threads--
-                                }
-                            }
-                        }
-                    }
-
-                    MonzeroComponents.StandardButton {
-                        id: addThreadButton
-                        small: true
-                        primary: false
-                        text: "+"
-                        enabled: threads < idealThreadCount
-                        onClicked: threads++
-                    }
-                }
-
-                RowLayout {
-                    MonzeroComponents.StandardButton {
-                        id: autoRecommendedThreadsButton
-                        small: true
-                        primary: false
-                        text: qsTr("Use half (recommended)") +  translationManager.emptyString
-                        enabled: startSoloMinerButton.enabled
-                        onClicked: {
-                                threads = idealThreadCount / 2
-                                appWindow.showStatusMessage(qsTr("Set to use recommended # of threads"),3)
-                        }
-                    }
-
-                    MonzeroComponents.StandardButton {
-                        id: autoSetMaxThreadsButton
-                        small: true
-                        primary: false
-                        text: qsTr("Use all threads") + " (" + idealThreadCount + ")" + translationManager.emptyString
-                        enabled: startSoloMinerButton.enabled
-                        onClicked: {
-                            threads = idealThreadCount
-                            appWindow.showStatusMessage(qsTr("Set to use all threads") + translationManager.emptyString,3)
-                        }
-                    }
-                }
-
-                RowLayout {
-                    // Disable this option until stable
-                    visible: false
-                    MonzeroComponents.CheckBox {
-                        id: ignoreBattery
-                        enabled: startSoloMinerButton.enabled
-                        checked: !persistentSettings.miningIgnoreBattery
-                        onClicked: {persistentSettings.miningIgnoreBattery = !checked}
-                        text: qsTr("Enable mining when running on battery") + translationManager.emptyString
-                    }
+        }
+        MonzeroComponents.TextPlain {
+            Layout.fillWidth: true; wrapMode: Text.WordWrap
+            text: qsTr("Using fewer threads leaves more CPU capacity for other apps. Mining uses electricity and can make your computer warm. Keep laptops plugged in while mining.")
+        }
+        RowLayout {
+            spacing: 16
+            MonzeroComponents.StandardButton {
+                id: startButton
+                objectName: "startMiningButton"
+                text: root.busy ? qsTr("Please wait…") : qsTr("Start mining")
+                enabled: root.ready && root.statusKnown && !appWindow.isMining && !root.busy
+                onClicked: {
+                    if (!root.ready || !root.statusKnown || appWindow.isMining || root.busy || !currentWallet) return;
+                    root.errorText = "";
+                    root.busy = true;
+                    root.statusKnown = false;
+                    root.statusGeneration++;
+                    // No background or remote mining: an explicit local action only.
+                    var wallet = currentWallet;
+                    var endpoint = appWindow.localDaemonAddress;
+                    walletManager.localMiningCommandAsync(endpoint, wallet.address(0, 0), root.threads, true, function(ok, reason) {
+                        root.busy = false;
+                        if (currentWallet !== wallet || appWindow.localDaemonAddress !== endpoint || persistentSettings.useRemoteNode) { root.update(); return; }
+                        if (!ok) root.errorText = root.commandError(reason, true);
+                        root.update();
+                    });
                 }
             }
-
-            ColumnLayout {
-                Layout.alignment: Qt.AlignTop | Qt.AlignLeft
-                Layout.minimumWidth: 140
-
-                MonzeroComponents.Label {
-                    id: optionsLabel
-                    color: MonzeroComponents.Style.defaultFontColor
-                    visible: !persistentSettings.allow_p2pool_mining
-                    text: qsTr("Options") + translationManager.emptyString
-                    fontSize: 16
-                    wrapMode: Text.Wrap
-                    Layout.preferredWidth: manageSoloMinerLabel.textWidth
+            MonzeroComponents.StandardButton {
+                id: stopButton
+                objectName: "stopMiningButton"
+                text: qsTr("Stop mining")
+                enabled: root.localConnected && root.statusKnown && appWindow.isMining && !root.busy
+                onClicked: {
+                    if (!root.localConnected || !root.statusKnown || !appWindow.isMining || root.busy) return;
+                    root.errorText = "";
+                    root.busy = true;
+                    root.statusKnown = false;
+                    root.statusGeneration++;
+                    var wallet = currentWallet;
+                    var endpoint = appWindow.localDaemonAddress;
+                    walletManager.localMiningCommandAsync(endpoint, "", 0, false, function(ok, reason) {
+                        root.busy = false;
+                        if (currentWallet !== wallet || appWindow.localDaemonAddress !== endpoint || persistentSettings.useRemoteNode) { root.update(); return; }
+                        if (!ok) root.errorText = root.commandError(reason, false);
+                        root.update();
+                    });
                 }
             }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 16
-
-                RowLayout {
-                    MonzeroComponents.CheckBox {
-                        id: backgroundMining
-                        visible: !persistentSettings.allow_p2pool_mining
-                        enabled: startSoloMinerButton.enabled && !persistentSettings.allow_p2pool_mining
-                        checked: persistentSettings.allow_background_mining
-                        onClicked: persistentSettings.allow_background_mining = checked
-                        text: qsTr("Background mining (experimental)") + translationManager.emptyString
-                    }
-                }
-            }
-
-            ColumnLayout {
-                Layout.alignment : Qt.AlignTop | Qt.AlignLeft
-
-                MonzeroComponents.Label {
-                    id: manageSoloMinerLabel
-                    color: MonzeroComponents.Style.defaultFontColor
-                    text: qsTr("Manage miner") + translationManager.emptyString
-                    fontSize: 16
-                    wrapMode: Text.Wrap
-                    Layout.preferredWidth: manageSoloMinerLabel.textWidth
-                }
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 16
-
-                RowLayout {
-                    MonzeroComponents.StandardButton {
-                        visible: true
-                        id: startSoloMinerButton
-                        small: true
-                        primary: !stopSoloMinerButton.enabled
-                        text: qsTr("Start mining") + translationManager.emptyString
-                        onClicked: {
-                            var daemonReady = appWindow.daemonSynced && appWindow.daemonRunning && !persistentSettings.useRemoteNode
-                            if (persistentSettings.allowRemoteNodeMining) {
-                                daemonReady = persistentSettings.useRemoteNode && appWindow.daemonSynced
-                            }
-                            if (daemonReady) {
-                                var success;
-                                if (persistentSettings.allow_p2pool_mining) {
-                                    if (p2poolManager.isInstalled()) {
-                                        args = daemonManager.getArgs(persistentSettings.blockchainDataDir) //updates arguments
-                                        if (persistentSettings.allowRemoteNodeMining || (args.includes("--zmq-pub tcp://127.0.0.1:18083") || args.includes("--zmq-pub=tcp://127.0.0.1:18083")) && !args.includes("--no-zmq")) {
-                                            startP2Pool()
-                                        }
-                                        else {
-                                            daemonManager.stopAsync(persistentSettings.nettype, persistentSettings.blockchainDataDir, startP2PoolLocal)
-                                        }
-                                    }
-                                    else {
-                                        confirmationDialog.title = qsTr("P2Pool installation") + translationManager.emptyString;
-                                        confirmationDialog.text  = qsTr("P2Pool will be installed at %1. Proceed?").arg(applicationDirectory) + translationManager.emptyString;
-                                        confirmationDialog.icon = StandardIcon.Question;
-                                        confirmationDialog.cancelText = qsTr("No") + translationManager.emptyString;
-                                        confirmationDialog.okText = qsTr("Yes") + translationManager.emptyString;
-                                        confirmationDialog.onAcceptedCallback = function() {
-                                            p2poolManager.download();
-                                            statusMessageText.text = "Downloading P2Pool...";
-                                            statusMessage.visible = true
-                                            startSoloMinerButton.enabled = false;
-                                            stopSoloMinerButton.enabled = false;
-                                        }
-                                        confirmationDialog.open();
-                                    }
-                                }
-                                else 
-                                {
-                                    success = walletManager.startMining(appWindow.currentWallet.address(0, 0), threads, persistentSettings.allow_background_mining, persistentSettings.miningIgnoreBattery)
-                                    if (success) 
-                                    {
-                                        update()
-                                    } 
-                                    else 
-                                    {
-                                        miningError(qsTr("Couldn't start mining.<br>") + translationManager.emptyString)
-                                    }
-                                }
-                            }
-                            else {
-                                miningError(qsTr("Couldn't start mining.<br>") + translationManager.emptyString)
-                            }
-                        }
-                    }
-
-                    MonzeroComponents.StandardButton {
-                        visible: true
-                        id: stopSoloMinerButton
-                        small: true
-                        primary: stopSoloMinerButton.enabled
-                        text: qsTr("Stop mining") + translationManager.emptyString
-                        onClicked: {
-                            walletManager.stopMining()
-                            p2poolManager.exit()
-                            update()
-                        }
-                    }
-                }
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.alignment : Qt.AlignTop | Qt.AlignLeft
-
-                MonzeroComponents.Label {
-                    id: statusLabel
-                    color: MonzeroComponents.Style.defaultFontColor
-                    text: qsTr("Status") + translationManager.emptyString
-                    fontSize: 16
-                }
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 16
-
-                MonzeroComponents.LineEditMulti {
-                    id: statusText
-                    Layout.minimumWidth: 300
-                    text: qsTr("Not mining") + translationManager.emptyString
-                    borderDisabled: true
-                    readOnly: true
-                    wrapMode: Text.Wrap
-                    inputPaddingLeft: 0
-                }
-            }
-
-            ListModel {
-                id: chainModel
-
-                ListElement { column1: qsTr("Mini") ; column2: ""; priority: 0}
-                ListElement { column1: qsTr("Main") ; column2: ""; priority: 1}
-                ListElement { column1: qsTr("Nano") ; column2: ""; priority: 2}
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.alignment : Qt.AlignTop | Qt.AlignLeft
-
-                MonzeroComponents.Label {
-                    id: chainLabel
-                    color: MonzeroComponents.Style.defaultFontColor
-                    visible: persistentSettings.allow_p2pool_mining
-                    text: qsTr("Chain") + translationManager.emptyString
-                    fontSize: 16
-                }
-
-                MonzeroComponents.Tooltip {
-                    id: chainsHelpTooltip
-                    text: qsTr("Use the mini or nano chains if you have a low hashrate.") + translationManager.emptyString
-                }
-
-                MouseArea {
-                    id: chainsTooltipArea
-                    width: parent.width
-                    height: parent.height
-                    enabled: persistentSettings.allow_p2pool_mining
-                    hoverEnabled: true
-                    onEntered: {
-                        chainsHelpTooltip.tooltipPopup.open();
-                    }
-                    onExited: {
-                        chainsHelpTooltip.tooltipPopup.close();
-                    }
-                }
-            }
-
-            ColumnLayout {
-                Layout.topMargin: 5
-                spacing: 10
-
-                MonzeroComponents.StandardDropdown {
-                    Layout.maximumWidth: 200
-                    id: chainDropdown
-                    visible: persistentSettings.allow_p2pool_mining
-                    currentIndex: persistentSettings.chainDropdownSelected
-                    dataModel: chainModel
-                    onChanged: persistentSettings.chainDropdownSelected = chainDropdown.currentIndex;
-                }
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                Layout.alignment : Qt.AlignTop | Qt.AlignLeft
-
-                MonzeroComponents.Label {
-                    id: flagsLabel
-                    visible: persistentSettings.allow_p2pool_mining
-                    color: MonzeroComponents.Style.defaultFontColor
-                    text: qsTr("Flags") + translationManager.emptyString
-                    fontSize: 16
-                }
-
-                MonzeroComponents.Tooltip {
-                    id: flagsHelpTooltip
-                    text: "
-                    Usage:<br>
-                        --wallet              Wallet address to mine to. Subaddresses and integrated addresses are not supported!<br>
-                        --host                IP address of your Monzero node, default is 127.0.0.1<br>
-                        --rpc-port            monzerod RPC API port number, default is 6175<br>
-                        --zmq-port            monzerod ZMQ pub port number, default is 6176 (same port as in monzerod\'s \"--zmq-pub\" command line parameter)<br>
-                        --stratum             Comma-separated list of IP:port for stratum server to listen on<br>
-                        --p2p                 Comma-separated list of IP:port for p2p server to listen on<br>
-                        --addpeers            Comma-separated list of IP:port of other p2pool nodes to connect to<br>
-                        --stratum-ban-time N  Number of seconds to ban misbehaving stratum client, default is 600<br>
-                        --light-mode          Don't allocate RandomX dataset, saves 2GB of RAM<br>
-                        --loglevel            Verbosity of the log, integer number between 0 and 6<br>
-                        --data-dir            Path to store general p2pool files (log, cache, peer data, etc.), default is current directory<br>
-                        --sidechain-config    Name of the p2pool sidechain parameters file (only use it if you run your own sidechain)<br>
-                        --data-api            Path to the p2pool JSON data (use it in tandem with an external web-server)<br>
-                        --local-api           Enable /local/ path in api path for Stratum Server and built-in miner statistics<br>
-                        --stratum-api         An alias for --local-api<br>
-                        --no-cache            Disable p2pool.cache<br>
-                        --no-color            Disable colors in console output<br>
-                        --no-randomx          Disable internal RandomX hasher: p2pool will use RPC calls to monzerod to check PoW hashes<br>
-                        --out-peers N         Maximum number of outgoing connections for p2p server (any value between 10 and 1000)<br>
-                        --in-peers N          Maximum number of incoming connections for p2p server (any value between 10 and 1000)<br>
-                        --start-mining N      Start built-in miner using N threads (any value between 1 and 64)<br>
-                        --no-autodiff         Disable automatic difficulty adjustment for miners connected to stratum (WARNING: incompatible with Nicehash and MRR)<br>
-                        --rpc-login           Specify username[:password] required for Monzero RPC server<br>
-                        --socks5              Specify IP:port of a SOCKS5 proxy to use for outgoing connections<br>
-                        --no-dns              Disable DNS queries, use only IP addresses to connect to peers (seed node DNS will be unavailable too)<br>
-                        --p2p-external-port   Port number that your router uses for mapping to your local p2p port. Use it if you are behind a NAT and still want to accept incoming connections<br>
-                        --no-upnp             Disable UPnP port forwarding<br>
-                        --no-igd              An alias for --no-upnp<br>
-                        --upnp-stratum        Port forward Stratum port (it's not forwarded by default)<br>
-                        --merge-mine          IP:port and wallet address for another blockchain to merge mine with<br>
-                        --version             Print p2pool's version and build details<br>
-                        --tls-cert file       Load TLS certificate chain from \"file\" in the PEM format<br>
-                        --tls-cert-key file   Load TLS certificate private key from \"file\" in the PEM format<br>
-                        --rpc-ssl             Enable SSL on RPC connections to the Monzero node<br>
-                        --rpc-ssl-fingerprint base64-encoded fingerprint of the Monzero node's certificate (optional, use it for certificate pinning)<br>
-                        --no-stratum-http     Disable HTTP on Stratum ports<br>
-                        --help                Show this help message
-                    "
-                }
-
-                MouseArea {
-                    id: flagsTooltipArea
-                    width: parent.width
-                    height: parent.height
-                    enabled: persistentSettings.allow_p2pool_mining
-                    hoverEnabled: true
-                    onEntered: {
-                        flagsHelpTooltip.tooltipPopup.open();
-                    }
-                    onExited: {
-                        flagsHelpTooltip.tooltipPopup.close();
-                    }
-                }
-            }
-
-            ColumnLayout {
-                Layout.fillWidth: true
-                MonzeroComponents.LineEditMulti {
-                    id: p2poolFlags
-                    Layout.minimumWidth: 100
-                    Layout.bottomMargin: 20
-                    labelFontSize: 14
-                    fontSize: 15
-                    visible: persistentSettings.allow_p2pool_mining
-                    wrapMode: Text.WrapAnywhere
-                    labelText: qsTr("P2Pool startup flags") + translationManager.emptyString
-                    placeholderText: qsTr("(optional)") + translationManager.emptyString
-                    placeholderFontSize: 15
-                    text: persistentSettings.p2poolFlags
-                    addressValidation: false
-                    onEditingFinished:  {
-                        persistentSettings.allowRemoteNodeMining = p2poolFlags.text.includes("--host");
-                        persistentSettings.p2poolFlags = p2poolFlags.text;
-                    }
-                }
-            }
+        }
+        MonzeroComponents.TextPlain {
+            id: statusText
+            objectName: "miningStatusText"
+            Layout.fillWidth: true; wrapMode: Text.WordWrap
+            text: qsTr("Checking mining status…")
+        }
+        MonzeroComponents.TextPlain {
+            Layout.fillWidth: true; wrapMode: Text.WrapAnywhere
+            visible: root.statusKnown && appWindow.isMining && root.activeAddress !== ""
+            text: qsTr("Mining reward address: %1").arg(root.activeAddress)
+        }
+        MonzeroComponents.WarningBox { Layout.fillWidth: true; visible: root.errorText !== ""; text: root.errorText }
+        MonzeroComponents.TextPlain {
+            Layout.fillWidth: true; wrapMode: Text.WordWrap
+            text: qsTr("Starting mining uses this wallet's primary address. Rewards unlock after 60 blocks. The local node can keep mining when the GUI closes; use Stop mining before closing if you want it to stop.")
         }
     }
-
-    function updateStatusText(p2poolHashrate) {
-        if (appWindow.isMining) {
-            if (persistentSettings.allow_p2pool_mining) {
-                if (p2poolHashrate === 0) {
-                    statusText.text = qsTr("Starting P2Pool") + translationManager.emptyString;
-                }
-                else {
-                    statusText.text = qsTr("Mining with P2Pool, at %1 H/s").arg(p2poolHashrate) + translationManager.emptyString;
-                }
-            }
-            else {
-                var userHashRate = walletManager.miningHashRate();
-                if (userHashRate === 0) {
-                    statusText.text = qsTr("Mining temporarily suspended.") + translationManager.emptyString;
-                }
-                else {
-                    var blockTime = 120;
-                    var blocksPerDay = 86400 / blockTime;
-                    var globalHashRate = walletManager.networkDifficulty() / blockTime;
-                    var probabilityFindNextBlock = userHashRate / globalHashRate;
-                    var probabilityFindBlockDay = 1 - Math.pow(1 - probabilityFindNextBlock, blocksPerDay);
-                    var chanceFindBlockDay = Math.round(1 / probabilityFindBlockDay);
-                    statusText.text = qsTr("Mining at %1 H/s. It gives you a 1 in %2 daily chance of finding a block.").arg(userHashRate).arg(chanceFindBlockDay) + translationManager.emptyString;
-                }  
-            }
-        }
-        else {
-            statusText.text = qsTr("Not mining") + translationManager.emptyString;
-        }
+    function commandError(reason, starting) {
+        if (reason === "already-mining") return qsTr("The node reports that mining is already running. Checking its current status and reward address.");
+        if (reason === "node-busy") return qsTr("The node is busy. Let it finish synchronizing before starting mining.");
+        if (reason === "too-many-threads") return qsTr("The node rejected the thread count. Select fewer CPU threads.");
+        if (reason === "invalid-request") return qsTr("Mining requires a valid local node endpoint and wallet address. Check Node settings.");
+        if (reason === "scheduler-stopping") return qsTr("The wallet is shutting down and could not send the mining command. Check the node status when you reopen the wallet.");
+        if (reason === "start-failed") return qsTr("The node could not start its miner. Check the node console, available memory and CPU thread count.");
+        if (reason === "invalid-address") return qsTr("The node rejected the mining reward address. Check that wallet and node use the same network and a primary address.");
+        if (reason === "node-rejected") return qsTr("The local node rejected the mining command. Check its console for the reason and ensure local RPC allows mining.");
+        return starting
+            ? qsTr("The node did not confirm mining startup. It may still be initializing RandomX or mining. Wait for a status reading before retrying; check the node console, available memory and that the local RPC endpoint allows mining. Try one CPU thread when connected.")
+            : qsTr("The node did not confirm that mining stopped. Mining may still be running. Check the node console before closing the wallet.");
     }
-
-    function onMiningStatus(isMining, hashrate) {
-        var daemonReady = appWindow.daemonSynced
-        if (!persistentSettings.allowRemoteNodeMining) {
-            var daemonReady = !persistentSettings.useRemoteNode && daemonReady
-        }
-        appWindow.isMining = isMining;
-        updateStatusText(hashrate)
-        startSoloMinerButton.enabled = !appWindow.isMining && daemonReady
-        stopSoloMinerButton.enabled = !startSoloMinerButton.enabled && daemonReady
-    }
-
     function update() {
-        persistentSettings.allow_p2pool_mining = miningModeDropdown.currentIndex === 1;
-        if (persistentSettings.allow_p2pool_mining) {
-            p2poolManager.getStatus();
-        }
-        else {
-            walletManager.miningStatusAsync();
-        } 
+        if (!root.localConnected || root.busy || root.statusPending) return;
+        root.statusPending = true;
+        var generation = root.statusGeneration;
+        var endpoint = appWindow.localDaemonAddress;
+        var wallet = currentWallet;
+        walletManager.localMiningStatusAsync(endpoint, function(ok, mining, rate, address) {
+            root.statusPending = false;
+            if (generation !== root.statusGeneration || !root.localConnected || currentWallet !== wallet || appWindow.localDaemonAddress !== endpoint) { if (root.localConnected) root.update(); return; }
+            root.statusKnown = ok;
+            if (!ok) {
+                appWindow.isMining = false;
+                appWindow.miningHashRate = 0;
+                statusText.text = qsTr("Mining status unavailable. Check your local node connection.");
+                return;
+            }
+            root.activeAddress = address || "";
+            appWindow.isMining = mining;
+            appWindow.miningHashRate = rate;
+            statusText.text = mining ? (rate > 0 ? qsTr("Mining at %1 H/s").arg(rate) : qsTr("Mining enabled — waiting for a hashrate reading")) : qsTr("Not mining");
+        });
     }
-
-    function miningError(message) {
-        p2poolManager.exit()
-        errorPopup.title  = qsTr("Error starting mining") + translationManager.emptyString;
-        errorPopup.text = message
-        if (persistentSettings.useRemoteNode && !persistentSettings.allowRemoteNodeMining)
-            errorPopup.text += qsTr("Mining is only available on local daemons. Run a local daemon to be able to mine.<br>") + translationManager.emptyString
-        errorPopup.icon = StandardIcon.Critical
-        errorPopup.open()
-    }
-
-    MonzeroComponents.StandardDialog {
-        id: errorPopup
-        cancelVisible: false
-    }
-
     Timer {
-        id: timer
-        interval: 2000
-        running: middlePanel.advancedView.state === "Mining" && middlePanel.state === "Advanced" && currentWallet !== undefined && (!persistentSettings.useRemoteNode || persistentSettings.allowRemoteNodeMining)
+        interval: middlePanel.advancedView.state === "Mining" && middlePanel.state === "Advanced" ? 3000 : 15000
         repeat: true
-        onTriggered: update()
+        running: root.localConnected
+        onTriggered: root.update()
     }
-
-    function startP2PoolLocal() {
-        var noSync = false;
-        //these args will be deleted because DaemonManager::start will re-add them later.
-        //--no-zmq must be deleted. removing '--zmq-pub=tcp...' lets us blindly add '--zmq-pub tcp...' later without risking duplication.
-        var defaultArgs = ["--detach","--data-dir","--bootstrap-daemon-address","--prune-blockchain","--no-sync","--check-updates","--non-interactive","--max-concurrency","--no-zmq","--zmq-pub=tcp://127.0.0.1:18083"]
-        var customDaemonArgsArray = args.split(' ');
-        var flag = "";
-        var allArgs = [];
-        var p2poolArgs = ["--zmq-pub tcp://127.0.0.1:18083"];
-        //create an array (allArgs) of ['--arg value','--arg2','--arg3']
-        for (let i = 0; i < customDaemonArgsArray.length; i++) {
-            if(!customDaemonArgsArray[i].startsWith("--")) {
-                flag += " " + customDaemonArgsArray[i]
-            } else {
-                if(flag){
-                    allArgs.push(flag)
-                }
-                flag = customDaemonArgsArray[i]
-            }
-        }
-        allArgs.push(flag)
-        //pop from allArgs if value is inside the deleteme array (defaultArgs)
-allArgs = allArgs.filter( ( el ) => !defaultArgs.includes( el.split(" ")[0] ) )
-        //append required p2pool flags
-        for (let i = 0; i < p2poolArgs.length; i++) {
-            if(!allArgs.includes(p2poolArgs[i])) {
-                allArgs.push(p2poolArgs[i])
-                continue
-            }
-        }
-        var success = daemonManager.start(allArgs.join(" "), persistentSettings.nettype, persistentSettings.blockchainDataDir, persistentSettings.bootstrapNodeAddress, noSync, persistentSettings.pruneBlockchain)
-        if (success) {
-            startP2Pool()
-        }
-        else {
-            miningError(qsTr("Couldn't start mining.<br>") + translationManager.emptyString)
-        }
-    }
-
-    function startP2Pool() {
-        var address = currentWallet.address(0, 0);
-        var chain = "mini"
-        if (chainDropdown.currentIndex === 1) {
-            chain = "main"
-        }
-        if (chainDropdown.currentIndex === 2) {
-            chain = "nano"
-        }
-        var p2poolArgs = persistentSettings.p2poolFlags;
-        var success = p2poolManager.start(p2poolArgs, address, chain, threads);
-        if (success) 
-        {
-            update()
-        }
-        else {
-            miningError(qsTr("Couldn't start mining.<br>") + translationManager.emptyString)
-        }
-    }
-
-    function p2poolDownloadFailed(errorCode) {
-        statusMessage.visible = false
-        errorPopup.title = qsTr("P2Pool Installation Failed") + translationManager.emptyString;
-        switch (errorCode) {
-            case P2PoolManager.HashVerificationFailed:
-                errorPopup.text = qsTr("Hash verification failed.") + translationManager.emptyString;
-                break;
-            case P2PoolManager.BinaryNotAvailable:
-                errorPopup.text = qsTr("P2Pool download is not available.") + translationManager.emptyString;
-                break;
-            case P2PoolManager.ConnectionIssue:
-                errorPopup.text = qsTr("P2Pool download failed due to a connection issue.") + translationManager.emptyString;
-                break;
-            case P2PoolManager.InstallationFailed:
-                errorPopup.text = qsTr("P2Pool installation failed.") + (isWindows ? (" " + qsTr("Try starting the program with administrator privileges.")) : "")
-                break;
-            default:
-                errorPopup.text = qsTr("Unknown error.") + translationManager.emptyString;
-        }
-        errorPopup.icon = StandardIcon.Critical
-        errorPopup.open()
-        update()
-    }
-
-    function p2poolDownloadSucceeded() {
-        statusMessage.visible = false
-        informationPopup.title  = qsTr("P2Pool Installation Succeeded") + translationManager.emptyString;
-        informationPopup.text = qsTr("P2Pool has successfully installed.");
-        informationPopup.icon = StandardIcon.Critical
-        informationPopup.open()
-        update()
-    }
-
-    Component.onCompleted: {
-        walletManager.miningStatus.connect(onMiningStatus);
-        p2poolManager.p2poolStatus.connect(onMiningStatus);
-        p2poolManager.p2poolDownloadFailure.connect(p2poolDownloadFailed);
-        p2poolManager.p2poolDownloadSuccess.connect(p2poolDownloadSucceeded);
-    }
+    Component.onCompleted: update()
 }

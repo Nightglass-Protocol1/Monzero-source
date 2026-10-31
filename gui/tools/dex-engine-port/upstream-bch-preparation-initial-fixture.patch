@@ -1,0 +1,141 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -16,25 +16,31 @@
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+ async fn bch_funding_helper_reviews_retained_transaction_without_rpc_or_writes() -> Result<()> {
+-    roundtrip(None,false).await
++    roundtrip(None,false,false).await
+ }
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+-async fn bch_funding_helper_submit_acknowledged_once() -> Result<()> {roundtrip(Some(submit::Case::Acknowledged),false).await}
++async fn bch_funding_helper_submit_acknowledged_once() -> Result<()> {roundtrip(Some(submit::Case::Acknowledged),false,false).await}
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+-async fn bch_funding_helper_submit_lost_reply_is_not_retried() -> Result<()> {roundtrip(Some(submit::Case::Lost),false).await}
++async fn bch_funding_helper_submit_lost_reply_is_not_retried() -> Result<()> {roundtrip(Some(submit::Case::Lost),false,false).await}
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+-async fn bch_funding_helper_status_survives_expiry_without_relay() -> Result<()> {roundtrip(Some(submit::Case::Expired),false).await}
++async fn bch_funding_helper_status_survives_expiry_without_relay() -> Result<()> {roundtrip(Some(submit::Case::Expired),false,false).await}
+ 
+ mod preparation;
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+ async fn bch_wallet_preparation_retains_candidate_before_funding_and_resumes_without_rpc() -> Result<()> {
+-    roundtrip(None,true).await
++    roundtrip(None,true,false).await
+ }
+-async fn roundtrip(submit_case: Option<submit::Case>,wallet_preparation: bool) -> Result<()> {
++mod initial_preparation;
++#[tokio::test]
++#[ignore = "requires a separately built and digest-pinned BCH helper"]
++async fn bch_wallet_preparation_helper_selects_once_and_restores_offline_status() -> Result<()> {
++    roundtrip(None,true,true).await
++}
++async fn roundtrip(submit_case: Option<submit::Case>,wallet_preparation: bool,initial_helper: bool) -> Result<()> {
+     let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
+     let helper_digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper
+@@ -90,6 +96,11 @@
+     let rpc = backend("test","pass")?;
+     if wallet_preparation {
+         {let mut state=server.state.lock().unwrap();state.preparation=Some(funding.clone());state.preparation_parent=Some(parent.clone());}
++        if initial_helper {
++            drop(execution);
++            return initial_preparation::exercise(&setup,&metadata,&snapshots,&pins,server,&rpc,&script,
++                &helper,&helper_digest,base);
++        }
+         execution=preparation::exercise(execution,&setup,&metadata,&snapshots,&server,&rpc,&backend("other","pass")?,&script,base+6).await?;
+     } else {
+         execution.retain_bch_funding_preparation(base+6,&serialize(&funding),&[&serialize(&parent)],&script,1000,546)?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+@@ -0,0 +1,83 @@
++use super::*;
++use agreement::execution::funding::preparation::WalletPreparationPolicy;
++
++pub(super) fn exercise(setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
++    pins: &NegotiationPins,server: Server,rpc: &BchRpc,script: &bitcoin::Script,
++    helper: &std::path::Path,helper_digest: &str,base: u64) -> Result<()> {
++    let config=PrivateStore::new()?;
++    let quote=config.0.join("quote.json");save(&quote,&setup.quote.record()?)?;
++    let admission=config.0.join("admission.json");
++    save(&admission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-admission-v1",
++        "helper":helper,"helperDigest":helper_digest,"quoteFile":quote,
++        "quoteCommitment":hex(setup.quote.commitment()),"admittedAt":base,
++        "tradeId":setup.quote.terms()["swapId"],"identityPins":[
++            SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++            SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++        "policy":setup.policy,"role":"bch-funder","metadataDirectory":metadata.0,
++        "snapshotDirectory":snapshots.0,"negotiationPins":pins}))?)?;
++    let funding=config.0.join("funding.json");
++    save(&funding,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-funding-v1",
++        "admissionConfigFile":admission,"deploymentCommitment":hex(&rpc.deployment_commitment()?)}))?)?;
++    let cookie=config.0.join("cookie");save(&cookie,b"user:pass\n")?;
++    std::fs::set_permissions(&cookie,std::fs::Permissions::from_mode(0o400))?;
++    let rpc_path=config.0.join("rpc.json");
++    let descriptor=json!({"schema":"monzero-private-bch-funding-rpc-v1","port":server.port,
++        "wallet":"test","anchor":"bchreg:qanchor","anchorScript":script.to_hex_string(),
++        "cookieFile":cookie,"checkpointHeight":1,"checkpoint":"07".repeat(32),
++        "subversion":"/Bitcoin Cash Node:29.0.0/"});
++    save(&rpc_path,&serde_json::to_vec(&descriptor)?)?;
++    let policy=WalletPreparationPolicy {change_address:"bchreg:qchange".into(),change_script:script.to_owned(),
++        fee_rate_atoms_per_kb:1000,maximum_fee:1000,minimum_change:546,minimum_confirmations:3};
++    let path=config.0.join("preparation.json");
++    let wrapper=json!({"schema":"monzero-private-bch-preparation-v1","fundingConfigFile":funding,
++        "rpcFile":rpc_path,"policy":policy});
++    save(&path,&serde_json::to_vec(&wrapper)?)?;
++    let invoke=|action: &str,success: bool| -> Result<Value> {
++        let id=uuid::Uuid::new_v4();
++        let mut child=Command::new(helper).arg(format!("--funding-{action}-stdio-v1")).arg(&path)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("missing preparation stdin")?.write_all(&serde_json::to_vec(&json!({
++            "schema":format!("monzero-bch-funding-{action}-request-v1"),"requestId":id}))?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++        if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++        assert!(output.stderr.is_empty());assert!(output.stdout.len()<=65536);
++        let value: Value=serde_json::from_slice(&output.stdout)?;
++        assert_eq!(value.as_object().unwrap().len(),6);
++        assert_eq!(value["schema"],format!("monzero-bch-funding-{action}-response-v1"));
++        assert_eq!(value["requestId"],id.to_string());assert_eq!(value["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(value["executable"],false);assert_eq!(value["chainObserved"],false);
++        Ok(value)
++    };
++    let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    invoke("preparation-status",false)?;
++    let mut wrong=descriptor.clone();wrong["wallet"]=json!("other");
++    save(&rpc_path,&serde_json::to_vec(&wrong)?)?;invoke("prepare",false)?;
++    save(&rpc_path,&serde_json::to_vec(&descriptor)?)?;
++    let consent=metadata.0.join(format!("{}.bch-execution-approval-bch-funder",setup.quote.terms()["swapId"]));
++    let bytes=std::fs::read(&consent)?;std::fs::remove_file(&consent)?;invoke("prepare",false)?;save(&consent,&bytes)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    assert_eq!(server.state.lock().unwrap().preparation_calls,0);
++    let started=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    let response=invoke("prepare",true)?;
++    let ended=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    let prepared=execution.prepared_bch_funding()?.context("helper did not publish preparation")?;
++    assert!((started..=ended).contains(&prepared.prepared_at()));
++    assert_eq!(prepared.preview().fee().to_sat(),1000);
++    let expected=execution.saved_bch_wallet_preparation_review(&rpc.deployment_commitment()?,&policy)?;
++    assert_eq!(response["review"]["details"],expected.details);
++    assert_eq!(response["review"]["commitment"],hex(&expected.commitment));
++    drop(execution);
++    let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    assert_eq!(invoke("prepare",true)?["review"],response["review"]);
++    let mut wrong=wrapper.clone();wrong["policy"]["minimum_confirmations"]=json!(4);
++    save(&path,&serde_json::to_vec(&wrong)?)?;invoke("prepare",false)?;
++    save(&path,&serde_json::to_vec(&wrapper)?)?;
++    {let state=server.state.lock().unwrap();assert_eq!(state.preparation_calls,1);
++        assert_eq!(state.calls,0);assert_eq!(state.sign_calls,0);assert_eq!(state.relay_calls,0);assert!(!state.locked);}
++    drop(server);std::fs::remove_file(&rpc_path)?;std::fs::remove_file(&cookie)?;
++    assert_eq!(invoke("preparation-status",true)?["review"],response["review"]);
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    Ok(())
++}

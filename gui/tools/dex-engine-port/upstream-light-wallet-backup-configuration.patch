@@ -1,0 +1,267 @@
+diff --git a/swap-machine/src/litecoin_light/vault/backup/discovery.rs b/swap-machine/src/litecoin_light/vault/backup/discovery.rs
+--- a/swap-machine/src/litecoin_light/vault/backup/discovery.rs
++++ b/swap-machine/src/litecoin_light/vault/backup/discovery.rs
+@@ -74,3 +74,6 @@
+ 
+ #[cfg(test)]
+ mod tests;
++
++/// Approved restoration with durable configuration publication.
++pub mod configuration;
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -416,6 +416,7 @@
+             "receivingAllocated":0,"changeAllocated":0,"scope":"seed-and-address-allocations",
+             "allocationFreshness":"unassessed","activeSwapRecovery":false}))
+     }
++    mod backup_import { include!("native-ltc-light/backup_import.rs"); }
+     mod vault_format { include!("native-ltc-light/vault_format.rs"); }
+     mod recovery { include!("native-ltc-light/recovery.rs"); }
+     mod import { include!("native-ltc-light/import.rs"); }
+@@ -429,6 +430,8 @@
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
++        if args[1]=="--wallet-backup-preview-stdio-v1" {return backup_import::run(Path::new(&args[2]),false);}
++        if args[1]=="--wallet-backup-import-stdio-v1" {return backup_import::run(Path::new(&args[2]),true);}
+         if args[1]=="--wallet-import-activate-stdio-v1" {return import_activation::run(Path::new(&args[2]));}
+         if args[1]=="--wallet-import-recover-stdio-v1" {return import_recovery::run(Path::new(&args[2]));}
+         if args[1]=="--wallet-import-discover-stdio-v1" {return discovery::run(Path::new(&args[2]));}
+diff --git a/swap-machine/src/litecoin_light/vault/backup/discovery/configuration.rs b/swap-machine/src/litecoin_light/vault/backup/discovery/configuration.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/backup/discovery/configuration.rs
+@@ -0,0 +1,104 @@
++//! Reviewed, resumable publication of settings for a restored local wallet.
++//! No server contact, key generation, backup replacement or trade activation.
++use super::*;
++use crate::litecoin_light::tls::TlsEndpoint;
++use serde_json::{Value,json};
++const INTENT:&str="litecoin-backup-restore-intent.json";
++const CONFIG:&str="litecoin-wallet-restored.json";
++const COMPLETE:&str="litecoin-backup-restore-complete.json";
++
++pub struct RestoreOptions<'a> {
++    pub setup:&'a Path,
++    pub vault:&'a Path,
++    pub addresses:&'a Path,
++    pub cache:&'a Path,
++    pub spends:&'a Path,
++    pub maximum_height:u32,
++    pub endpoint:Option<&'a TlsEndpoint>,
++}
++impl RestoreOptions<'_> {
++    fn validate(&self,network:LightNetwork)->Result<()> {
++        ensure!(self.maximum_height<=10_000_000 && self.endpoint.is_none_or(|e|e.network()==network),
++            "invalid backup restoration network settings");
++        let directories=[self.setup,self.vault,self.addresses,self.cache,self.spends];
++        for (i,path) in directories.iter().enumerate() {
++            ensure!(directories[..i].iter().all(|other|!path.starts_with(other) && !other.starts_with(path)),
++                "backup restoration directories must be separate");
++            drop(Journal::open(path)?);
++        }
++        Ok(())
++    }
++}
++impl InspectedBackup {
++    /// Public review only. Directory validation takes temporary leases but does
++    /// not write records. The commitment includes the complete future config.
++    pub fn configuration_review(&self,options:&RestoreOptions<'_>)->Result<Value> {
++        options.validate(self.network)?;
++        let mut config=json!({"schema":format!("monzero-private-{}-light-v1",self.network.tag()),
++            "network":self.network.name(),"cacheDirectory":options.cache,"maximumHeight":options.maximum_height,
++            "wallet":{"account":self.account,"addressBookDirectory":options.addresses,"spendDirectory":options.spends,
++                "vault":{"directory":options.vault,"walletId":self.wallet,"seedEncoding":self.format.encoding()}}});
++        if let Some(endpoint)=options.endpoint {
++            config["endpoint"]=json!({"host":endpoint.host(),"port":endpoint.port()});
++        }
++        let review=json!({"schema":"monzero-light-backup-restore-review-v1","coin":self.network.tag(),
++            "network":self.network.name(),"walletId":self.wallet,"backupDigest":self.digest,
++            "seedEncoding":self.format.encoding(),"allocated":self.allocated,
++            "configurationFile":options.setup.join(CONFIG),"configuration":config,
++            "scope":"seed-and-address-allocations","allocationFreshness":"unassessed",
++            "historyCompleteness":"unproven","activeSwapRecovery":false,"tradingEnabled":false});
++        ensure!(serde_json::to_vec(&review)?.len()<=8192,"oversized backup restoration review");
++        Ok(review)
++    }
++    /// Fresh password and explicit review commitment are required even on retry.
++    /// Consumers must require the completion receipt before automatic reopening.
++    /// An old receipt is historical, not proof that today's allocations are backed up.
++    pub fn restore_configuration(&self,options:&RestoreOptions<'_>,password:&[u8],approved:sha256::Hash)->Result<Value> {
++        self.restore_configuration_with(options,password,approved,|_|Ok(()))
++    }
++    fn restore_configuration_with(&self,options:&RestoreOptions<'_>,password:&[u8],approved:sha256::Hash,
++        checkpoint:impl Fn(Stage)->Result<()>)->Result<Value> {
++        let review=self.configuration_review(options)?;
++        let intent=serde_json::to_vec(&review)?;
++        ensure!(sha256::Hash::hash(&intent)==approved,"backup restoration review differs from approval");
++        // Authenticate before retaining even the public intent.
++        drop(inspect(&self.encrypted,password,self.network)?);
++        let journal=Journal::open(options.setup)?;
++        let resume=match journal.read(INTENT) {
++            Ok(existing)=>{ensure!(existing==intent,"backup restoration intent differs");true},
++            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>false,
++            Err(error)=>return Err(error),
++        };
++        if !resume {
++            ensure!(std::fs::read_dir(options.setup)?.next().is_none(),"restore setup directory is occupied");
++            for path in [options.vault,options.addresses] {
++                let _lease=Journal::open(path)?;
++                ensure!(std::fs::read_dir(path)?.next().is_none(),"restore wallet directory is occupied");
++            }
++        }
++        // These backups contain neither cached observations nor spend journals.
++        let _cache=Journal::open(options.cache)?;let _spends=Journal::open(options.spends)?;
++        for path in [options.cache,options.spends] {
++            ensure!(std::fs::read_dir(path)?.next().is_none(),"restore auxiliary directory is occupied");
++        }
++        let config=serde_json::to_vec(&review["configuration"])?;
++        let completed=json!({"schema":"monzero-light-backup-restore-complete-v1","reviewDigest":approved,
++            "backupDigest":self.digest,"configurationFile":options.setup.join(CONFIG),
++            "configurationDigest":sha256::Hash::hash(&config),"walletId":self.wallet,"coin":self.network.tag(),
++            "network":self.network.name(),"allocated":self.allocated,"restored":true,
++            "allocationFreshness":"unassessed","historyCompleteness":"unproven",
++            "activeSwapRecovery":false,"tradingEnabled":false});
++        let receipt=serde_json::to_vec(&completed)?;
++        journal.compatible(CONFIG,&config)?;journal.compatible(COMPLETE,&receipt)?;
++        journal.retain(INTENT,&intent)?;checkpoint(Stage::Intent)?;
++        self.restore_into(options.vault,options.addresses,password)?;checkpoint(Stage::Records)?;
++        journal.retain(CONFIG,&config)?;checkpoint(Stage::Configuration)?;
++        journal.retain(COMPLETE,&receipt)?;checkpoint(Stage::Complete)?;
++        ensure!(journal.read(CONFIG)?==config && journal.read(COMPLETE)?==receipt,"restore configuration read-back mismatch");
++        Ok(completed)
++    }
++}
++#[derive(Clone,Copy,PartialEq,Eq)]
++enum Stage {Intent,Records,Configuration,Complete}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/backup/discovery/configuration/tests.rs b/swap-machine/src/litecoin_light/vault/backup/discovery/configuration/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/backup/discovery/configuration/tests.rs
+@@ -0,0 +1,65 @@
++use super::*;
++use crate::litecoin_light::{account::{Branch,allocation::AddressBook},network::{BtcNetwork,BchNetwork,DogeNetwork},
++    vault::mnemonic::{MnemonicMaterial,storage::MnemonicVault}};
++use std::{fs,path::PathBuf,os::unix::fs::PermissionsExt};
++const PASSWORD:&[u8]=b"disposable configured restore password";
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {
++    let p=std::env::temp_dir().join(format!("monzero-configured-restore-{}",Uuid::new_v4()));
++    fs::create_dir(&p)?;fs::set_permissions(&p,fs::Permissions::from_mode(0o700))?;Ok(Self(p.canonicalize()?))
++}}
++impl Drop for Directory {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
++#[test]
++fn restored_configuration_is_review_bound_and_resumes_each_publication_stage()->Result<()> {
++    for (index,network) in [LightNetwork::from(LtcNetwork::Regtest),BtcNetwork::Regtest.into(),BchNetwork::Regtest.into(),DogeNetwork::Regtest.into()].into_iter().enumerate() {
++        for mnemonic in [false,true] {
++            let original_vault=Directory::new()?;let original_book=Directory::new()?;
++            let wallet=Uuid::new_v4();
++            let bundle=if mnemonic {
++                let material=MnemonicMaterial::from_entropy(&[19;32])?;
++                let vault=MnemonicVault::create(&original_vault.0,network,wallet,PASSWORD,&material,"separate passphrase")?;
++                let mut book=AddressBook::create(&original_book.0,vault.unlock(PASSWORD)?.public_account(network,2)?)?;
++                book.reserve(Uuid::new_v4(),Branch::Receive)?;mnemonic_backup::export(&vault,&book,PASSWORD)?
++            } else {
++                let seed=SecretSeed::from_bytes(Zeroizing::new([20;32]));
++                let vault=SeedVault::create(&original_vault.0,network,wallet,PASSWORD,&seed)?;
++                let mut book=AddressBook::create(&original_book.0,seed.public_account(network,2)?)?;
++                book.reserve(Uuid::new_v4(),Branch::Receive)?;super::super::super::export(&vault,&book,PASSWORD)?
++            };
++            let backup=inspect(&bundle,PASSWORD,network)?;
++            let setup=Directory::new()?;let vault=Directory::new()?;let addresses=Directory::new()?;let cache=Directory::new()?;let spends=Directory::new()?;
++            let endpoint=TlsEndpoint::new("localhost".into(),50002,network)?;
++            let mut options=RestoreOptions {setup:&setup.0,vault:&vault.0,addresses:&addresses.0,cache:&cache.0,
++                spends:&spends.0,maximum_height:1000,endpoint:Some(&endpoint)};
++            let review=backup.configuration_review(&options)?;
++            let approved=sha256::Hash::hash(&serde_json::to_vec(&review)?);
++            assert!(!setup.0.join(INTENT).exists());
++            assert!(backup.restore_configuration(&options,b"wrong",approved).is_err());
++            assert!(backup.restore_configuration(&options,PASSWORD,sha256::Hash::hash(b"wrong")).is_err());
++            options.maximum_height=999;assert!(backup.restore_configuration(&options,PASSWORD,approved).is_err());options.maximum_height=1000;
++            assert!(!setup.0.join(INTENT).exists());assert!(!vault.0.join("litecoin-seed.vault").exists());
++            fs::write(spends.0.join("occupied"),b"retained trade data")?;
++            assert!(backup.restore_configuration(&options,PASSWORD,approved).is_err());fs::remove_file(spends.0.join("occupied"))?;
++            let stage=[Stage::Intent,Stage::Records,Stage::Configuration,Stage::Complete][index];
++            assert!(backup.restore_configuration_with(&options,PASSWORD,approved,|seen| {
++                ensure!(seen!=stage,"injected restore interruption");Ok(())
++            }).is_err());
++            let completed=backup.restore_configuration(&options,PASSWORD,approved)?;
++            assert_eq!(completed["allocated"],json!([1,0]));assert_eq!(completed["activeSwapRecovery"],false);
++            assert_eq!(completed["tradingEnabled"],false);
++            let encrypted=fs::read(vault.0.join("litecoin-seed.vault"))?;
++            let config=fs::read(setup.0.join(CONFIG))?;
++            assert_eq!(serde_json::from_slice::<Value>(&config)?,review["configuration"]);
++            assert_eq!(backup.restore_configuration(&options,PASSWORD,approved)?,completed);
++            assert_eq!(fs::read(vault.0.join("litecoin-seed.vault"))?,encrypted);
++            let mut book=AddressBook::open(&addresses.0,PublicAccount::from_descriptor(backup.account(),network)?)?;
++            book.reserve(Uuid::new_v4(),Branch::Change)?;drop(book);
++            let advanced=fs::read(addresses.0.join("litecoin-address-book.json"))?;
++            assert!(backup.restore_configuration(&options,PASSWORD,approved).is_err());
++            assert_eq!(fs::read(addresses.0.join("litecoin-address-book.json"))?,advanced);
++            assert_eq!(fs::read(setup.0.join(CONFIG))?,config);
++            assert_eq!(fs::read(original_vault.0.join("litecoin-seed.vault"))?,encrypted);
++        }
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/bin/native-ltc-light/backup_import.rs b/swap-machine/src/bin/native-ltc-light/backup_import.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/backup_import.rs
+@@ -0,0 +1,53 @@
++// Authenticated encrypted-backup recovery into explicitly selected local folders.
++use super::*;
++use swap_machine::litecoin_light::vault::backup::discovery::{load,configuration::RestoreOptions};
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct Settings {
++    schema:String,network:String,backup_directory:PathBuf,setup_directory:PathBuf,
++    vault_directory:PathBuf,address_book_directory:PathBuf,cache_directory:PathBuf,spend_directory:PathBuf,
++    maximum_height:u32,endpoint:Option<Endpoint>,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct Import {
++    schema:String,request_id:uuid::Uuid,approved_config_digest:String,password:Password,
++    approved_review:Option<String>,restore_approved:Option<bool>,
++}
++pub(super) fn run(path:&Path,commit:bool)->Result<()> {
++    let mode=if commit {"wallet-backup-import"} else {"wallet-backup-preview"};
++    let mut input=Zeroizing::new(Vec::with_capacity(8193));
++    std::io::stdin().take(8193).read_to_end(&mut input)?;
++    ensure!(!input.is_empty() && input.len()<=8192,"invalid backup import request size");
++    let request:Import=serde_json::from_slice(&input)?;
++    let tag=["ltc","btc","bch","doge"].into_iter()
++        .find(|tag|request.schema==format!("monzero-{tag}-light-{mode}-request-v1"))
++        .context("invalid backup import schema")?;
++    ensure!(!request.request_id.is_nil(),"invalid backup import request identity");
++    if commit {ensure!(request.restore_approved==Some(true) && request.approved_review.is_some(),"missing restore approval");}
++    else {ensure!(request.restore_approved.is_none() && request.approved_review.is_none(),"unexpected restore approval in preview");}
++    let (_lease,bytes)=private_config(path)?;
++    let approved:sha256::Hash=request.approved_config_digest.parse()?;
++    ensure!(approved.to_string()==request.approved_config_digest && sha256::Hash::hash(&bytes)==approved,
++        "backup recovery settings differ from approval");
++    let settings:Settings=serde_json::from_slice(&bytes)?;
++    ensure!(settings.schema==format!("monzero-private-{tag}-backup-setup-v1"),"invalid backup recovery settings schema");
++    let network=network_for(tag,&settings.network)?;
++    let endpoint=settings.endpoint.map(|e|TlsEndpoint::new(e.host,e.port,network)).transpose()?;
++    let options=RestoreOptions {setup:&settings.setup_directory,vault:&settings.vault_directory,
++        addresses:&settings.address_book_directory,cache:&settings.cache_directory,spends:&settings.spend_directory,
++        maximum_height:settings.maximum_height,endpoint:endpoint.as_ref()};
++    let backup=load(&settings.backup_directory,request.password.0.as_bytes(),network)?;
++    let review=backup.configuration_review(&options)?;
++    let commitment=sha256::Hash::hash(&serde_json::to_vec(&review)?);
++    if commit {
++        let expected=request.approved_review.context("missing reviewed backup")?;
++        ensure!(expected==commitment.to_string(),"backup review differs from restore approval");
++        let restored=backup.restore_configuration(&options,request.password.0.as_bytes(),commitment)?;
++        output(&json!({"schema":format!("monzero-{tag}-light-{mode}-response-v1"),"requestId":request.request_id,
++            "restoration":restored,"executable":false}))
++    } else {
++        output(&json!({"schema":format!("monzero-{tag}-light-{mode}-response-v1"),"requestId":request.request_id,
++            "configurationDigest":approved,"review":review,"reviewDigest":commitment,"executable":false}))
++    }
++}

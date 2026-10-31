@@ -1,0 +1,2341 @@
+diff --color -ruN a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs	2026-10-12 00:05:54.489059706 +0100
++++ b/swap-machine/src/bin/native-ltc-light.rs	2026-10-12 00:05:54.492160184 +0100
+@@ -1,4 +1,4 @@
+-//! App-owned Litecoin helper: observation, retained review and explicit vault-backed
++//! App-owned light-wallet helper (Litecoin, Bitcoin, Bitcoin Cash, Dogecoin; the chain is the request schema tag): observation, retained review and explicit vault-backed
+ //! signing and separately approved submission. No authoritative balance,
+ //! automatic approval or live markets.
+ #[cfg(target_os="linux")]
+@@ -12,7 +12,8 @@
+     use serde_json::{Value,json};
+     use std::{fs::{File,OpenOptions},io::{Read,Write},os::unix::fs::{MetadataExt,OpenOptionsExt},
+         path::{Path,PathBuf},time::{SystemTime,UNIX_EPOCH}};
+-    use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++    use swap_core::litecoin_address::LtcNetwork;
++    use swap_machine::litecoin_light::network::{BchNetwork,BtcNetwork,DogeNetwork,LightAddress,LightNetwork};
+     use bitcoin::{Amount,Transaction,TxOut,bip32::ChildNumber,hashes::{Hash,sha256}};
+     use swap_machine::litecoin_light::vault::signing::review::confirmed::selection::{preparation::PreparationPolicy,estimated::EstimatedPaymentPolicy};
+     use swap_machine::litecoin_light::{state::ChainState,tls::TlsEndpoint,
+@@ -97,10 +98,20 @@
+                 ==(after.mtime(),after.mtime_nsec(),after.ctime(),after.ctime_nsec()),"light-chain configuration changed");
+         Ok((file,bytes))
+     }
+-    fn config(path:&Path)->Result<(File,Config)> {
++    /// Chain tags select the chain; every file and message of one request must agree.
++    fn network_for(tag:&str,name:&str)->Result<LightNetwork> {
++        Ok(match (tag,name) {
++            ("ltc","main")=>LtcNetwork::Mainnet.into(),("ltc","test")=>LtcNetwork::Testnet.into(),("ltc","regtest")=>LtcNetwork::Regtest.into(),
++            ("btc","main")=>BtcNetwork::Mainnet.into(),("btc","test")=>BtcNetwork::Testnet.into(),("btc","regtest")=>BtcNetwork::Regtest.into(),
++            ("bch","main")=>BchNetwork::Mainnet.into(),("bch","test")=>BchNetwork::Testnet.into(),("bch","regtest")=>BchNetwork::Regtest.into(),
++            ("doge","main")=>DogeNetwork::Mainnet.into(),("doge","test")=>DogeNetwork::Testnet.into(),("doge","regtest")=>DogeNetwork::Regtest.into(),
++            _=>anyhow::bail!("unsupported light-chain network"),
++        })
++    }
++    fn config(path:&Path,tag:&str)->Result<(File,Config)> {
+         let (file,bytes)=private_config(path)?;
+         let config: Config=serde_json::from_slice(&bytes)?;
+-        ensure!(config.schema=="monzero-private-ltc-light-v1" && config.maximum_height<=10_000_000,
++        ensure!(config.schema==format!("monzero-private-{tag}-light-v1") && config.maximum_height<=10_000_000,
+             "invalid light-chain configuration");
+         Ok((file,config))
+     }
+@@ -110,7 +121,7 @@
+         Ok(json!({"network":chain.network().name(),"height":chain.height(),"tip":tip.block_hash().to_string(),
+             "chainWork":chain.chain_work().to_str_radix(10),"freshness":"unassessed"}))
+     }
+-    async fn synchronize(config: &Config,network: LtcNetwork,state: &mut ChainState,budget: u32) -> Result<Value> {
++    async fn synchronize(config: &Config,network:LightNetwork,state: &mut ChainState,budget: u32) -> Result<Value> {
+         let endpoint=config.endpoint.as_ref().context("missing explicit TLS endpoint")?;
+         let endpoint=TlsEndpoint::new(endpoint.host.clone(),endpoint.port,network)?;
+         let tip=endpoint.connect().await?.reported_tip().await?;
+@@ -132,14 +143,14 @@
+             "downloadedHeaders":downloaded,"change":changed,
+             "reportedTipOnSelectedChain":state.chain()?.contains(reported_height,reported_tip)}))
+     }
+-    fn initialize_wallet(config:&Config,network:LtcNetwork)->Result<Value> {
++    fn initialize_wallet(config:&Config,network:LightNetwork)->Result<Value> {
+         let wallet=config.wallet.as_ref().context("missing watch-only wallet configuration")?;
+         let account=PublicAccount::from_descriptor(&wallet.account,network)?;
+         let book=AddressBook::create(&wallet.address_book_directory,account)?;
+         Ok(json!({"watchOnly":true,"initialized":true,"receivingAllocated":book.allocated_count(Branch::Receive)?,
+             "changeAllocated":book.allocated_count(Branch::Change)?,"spendable":false}))
+     }
+-    fn receive_address(config:&Config,network:LtcNetwork,request_id:uuid::Uuid)->Result<Value> {
++    fn receive_address(config:&Config,network:LightNetwork,request_id:uuid::Uuid)->Result<Value> {
+         let wallet=config.wallet.as_ref().context("missing watch-only wallet configuration")?;
+         let account=PublicAccount::from_descriptor(&wallet.account,network)?;
+         let mut book=AddressBook::open(&wallet.address_book_directory,account)?;
+@@ -149,7 +160,7 @@
+             "receivingAllocated":book.allocated_count(Branch::Receive)?,
+             "changeAllocated":book.allocated_count(Branch::Change)?}))
+     }
+-    async fn refresh_wallet(config:&Config,network:LtcNetwork,state:&ChainState,scan:&WalletScan)->Result<Value> {
++    async fn refresh_wallet(config:&Config,network:LightNetwork,state:&ChainState,scan:&WalletScan)->Result<Value> {
+         let wallet=config.wallet.as_ref().context("missing watch-only wallet configuration")?;
+         let account=PublicAccount::from_descriptor(&wallet.account,network)?;
+         let book=AddressBook::open(&wallet.address_book_directory,PublicAccount::from_descriptor(&wallet.account,network)?)?;
+@@ -181,9 +192,9 @@
+         } else {None};
+         Ok((commitment,change_index))
+     }
+-    fn payment_view(network:LtcNetwork,address:&str,output:&TxOut,tx:&Transaction,fee:Amount,commitment:sha256::Hash)->Result<Value> {
++    fn payment_view(network:LightNetwork,address:&str,output:&TxOut,tx:&Transaction,fee:Amount,commitment:sha256::Hash)->Result<Value> {
+         let change=tx.output.get(1);
+-        let change_address=change.map(|out|LtcSegwitAddress::from_script(network,&out.script_pubkey).map(|a|a.to_string())).transpose()?;
++        let change_address=change.map(|out|LightAddress::from_script(network,&out.script_pubkey).map(|a|a.to_string())).transpose()?;
+         Ok(json!({"watchOnly":true,"spendable":false,"prepared":true,"signed":false,
+             "paymentAddress":address,"paymentAtomic":output.value.to_sat().to_string(),
+             "feeAtomic":fee.to_sat().to_string(),"changeAddress":change_address,
+@@ -192,11 +203,11 @@
+     }
+     // Offline signature recovery is not a fresh unspentness, broadcast or
+     // confirmation assessment. No seed is unlocked and no bytes are re-signed.
+-    fn recover_signed(config:&Config,network:LtcNetwork,payment:&Payment,operation:uuid::Uuid,retained:&RetainedReview)->Result<Value> {
++    fn recover_signed(config:&Config,network:LightNetwork,payment:&Payment,operation:uuid::Uuid,retained:&RetainedReview)->Result<Value> {
+         Ok(recovered_payment(config,network,payment,operation,retained)?.1)
+     }
+-    fn recovered_payment(config:&Config,network:LtcNetwork,payment:&Payment,operation:uuid::Uuid,retained:&RetainedReview)->Result<(ClaimedSpend,Value)> {
+-        let address=LtcSegwitAddress::parse(network,&payment.address)?;
++    fn recovered_payment(config:&Config,network:LightNetwork,payment:&Payment,operation:uuid::Uuid,retained:&RetainedReview)->Result<(ClaimedSpend,Value)> {
++        let address=LightAddress::parse(network,&payment.address)?;
+         let output=TxOut {value:atomic(&payment.amount_atomic)?,script_pubkey:address.script_pubkey().clone()};
+         let fee=atomic(&payment.fee_atomic)?;let minimum_change=atomic(&payment.minimum_change_atomic)?;
+         ensure!(output.value.to_sat()>0 && minimum_change.to_sat()>0 && payment.minimum_confirmations>0,"invalid Litecoin recovery policy");
+@@ -213,7 +224,7 @@
+         response["signed"]=json!(true);response["recovered"]=json!(true);response["broadcastStatus"]=json!("unassessed");
+         Ok((claimed,response))
+     }
+-    fn broadcast_status(config:&Config,network:LtcNetwork,payment:&Payment,operation:uuid::Uuid,retained:&RetainedReview)->Result<Value> {
++    fn broadcast_status(config:&Config,network:LightNetwork,payment:&Payment,operation:uuid::Uuid,retained:&RetainedReview)->Result<Value> {
+         let endpoint=config.endpoint.as_ref().context("missing explicit TLS endpoint")?;
+         let target=TlsEndpoint::new(endpoint.host.clone(),endpoint.port,network)?;
+         let (claimed,mut response)=recovered_payment(config,network,payment,operation,retained)?;
+@@ -230,7 +241,7 @@
+         response["confirmationStatus"]=json!("unassessed");
+         Ok(())
+     }
+-    async fn reconcile_payment(config:&Config,network:LtcNetwork,state:&ChainState,payment:&Payment,
++    async fn reconcile_payment(config:&Config,network:LightNetwork,state:&ChainState,payment:&Payment,
+         operation:uuid::Uuid,retained:&RetainedReview,maximum_history:usize)->Result<Value> {
+         let endpoint=config.endpoint.as_ref().context("missing explicit TLS endpoint")?;
+         let target=TlsEndpoint::new(endpoint.host.clone(),endpoint.port,network)?;
+@@ -248,9 +259,9 @@
+             "height":height,"blockHash":block,"confirmations":confirmations,"observedAtUnix":now()?});
+         Ok(response)
+     }
+-    async fn prepare_wallet(config:&Config,network:LtcNetwork,state:&ChainState,scan:&WalletScan,
++    async fn prepare_wallet(config:&Config,network:LightNetwork,state:&ChainState,scan:&WalletScan,
+         payment:&Payment,operation:uuid::Uuid,retained:Option<&RetainedReview>,approval:Option<&SigningApproval>,broadcast:Option<&BroadcastApproval>)->Result<Value> {
+-        let address=LtcSegwitAddress::parse(network,&payment.address)?;
++        let address=LightAddress::parse(network,&payment.address)?;
+         let output=TxOut {value:atomic(&payment.amount_atomic)?,script_pubkey:address.script_pubkey().clone()};
+         let policy=PreparationPolicy {fee:atomic(&payment.fee_atomic)?,minimum_change:atomic(&payment.minimum_change_atomic)?,
+             minimum_confirmations:payment.minimum_confirmations};
+@@ -296,13 +307,18 @@
+             let vault=SeedVault::open(&config.directory,network,config.wallet_id)?;
+             let signed=prepared.approve_with_vault_on(state.chain()?,observation.accounting(),&vault,
+                 approval.password.0.as_bytes(),approval.approved_commitment.parse()?)?;
+-            ensure!(signed.compute_txid()==tx.compute_txid(),"Litecoin signed payment identity changed");
++            // Only spending data may differ (P2PKH signatures change the txid; SegWit's do not).
++            ensure!(swap_machine::litecoin_light::script::unsigned(&signed)==*tx,"Litecoin signed payment identity changed");
++            response["txid"]=json!(signed.compute_txid().to_string());
+             response["watchOnly"]=json!(false);response["signed"]=json!(true);response["broadcast"]=json!(false);
+         }
+         if let Some(approved)=broadcast {
+-            ensure!(tx.compute_txid().to_string()==approved.approved_txid,"Litecoin broadcast transaction changed");
++            let signed=prepared.retained_signed()?;
++            ensure!(swap_machine::litecoin_light::script::unsigned(&signed)==*tx
++                && signed.compute_txid().to_string()==approved.approved_txid,"Litecoin broadcast transaction changed");
+             let txid=prepared.broadcast_on(state.chain()?,observation.accounting(),&target,approved.approved_commitment.parse()?).await?;
+-            ensure!(txid==tx.compute_txid(),"Litecoin broadcast result changed");
++            ensure!(txid==signed.compute_txid(),"Litecoin broadcast result changed");
++            response["txid"]=json!(txid.to_string());
+             response["watchOnly"]=json!(false);response["signed"]=json!(true);
+             response["broadcastStatus"]=json!("server-acknowledged");
+             response["broadcastEndpoint"]=json!({"host":endpoint.host,"port":endpoint.port});
+@@ -310,8 +326,8 @@
+         }
+         Ok(response)
+     }
+-    async fn estimate_wallet(config:&Config,network:LtcNetwork,state:&ChainState,scan:&WalletScan,quote:&FeeQuote)->Result<Value> {
+-        let address=LtcSegwitAddress::parse(network,&quote.address)?;
++    async fn estimate_wallet(config:&Config,network:LightNetwork,state:&ChainState,scan:&WalletScan,quote:&FeeQuote)->Result<Value> {
++        let address=LightAddress::parse(network,&quote.address)?;
+         let output=TxOut {value:atomic(&quote.amount_atomic)?,script_pubkey:address.script_pubkey().clone()};
+         let maximum_rate=atomic(&quote.maximum_rate_atomic_per_kvb)?.to_sat();
+         let maximum_fee=atomic(&quote.maximum_fee_atomic)?;let minimum_change=atomic(&quote.minimum_change_atomic)?;
+@@ -336,7 +352,7 @@
+             "changeAtomic":tx.output.get(1).map(|out|out.value.to_sat()).unwrap_or(0).to_string()});
+         Ok(response)
+     }
+-    fn wallet_backup(config:&Config,network:LtcNetwork,approval:&BackupApproval,save:bool)->Result<Value> {
++    fn wallet_backup(config:&Config,network:LightNetwork,approval:&BackupApproval,save:bool)->Result<Value> {
+         let wallet=config.wallet.as_ref().context("missing wallet configuration")?;
+         let account=PublicAccount::from_descriptor(&wallet.account,network)?;
+         let vault_config=wallet.vault.as_ref().context("missing vault identity")?;
+@@ -360,7 +376,7 @@
+             "scope":"seed-and-address-allocations","allocationFreshness":"unassessed",
+             "activeSwapRecovery":false}))
+     }
+-    fn restore_wallet(config:&Config,network:LtcNetwork,approval:&RestoreApproval)->Result<Value> {
++    fn restore_wallet(config:&Config,network:LightNetwork,approval:&RestoreApproval)->Result<Value> {
+         let wallet=config.wallet.as_ref().context("missing wallet configuration")?;
+         let vault_config=wallet.vault.as_ref().context("missing vault identity")?;
+         let digest:sha256::Hash=approval.approved_digest.parse()?;
+@@ -382,7 +398,7 @@
+             "walletId":info.wallet_id(),"receivingAllocated":allocated[0],"changeAllocated":allocated[1],
+             "scope":"seed-and-address-allocations","allocationFreshness":"unassessed","activeSwapRecovery":false}))
+     }
+-    fn create_wallet(path:&Path,approval:&CreateApproval)->Result<Value> {
++    fn create_wallet(path:&Path,tag:&str,approval:&CreateApproval)->Result<Value> {
+         use swap_machine::litecoin_light::vault::setup::{SetupDirectories,
+             configuration::{ConfigurationOptions,initialize_configured}};
+         let (_lease,bytes)=private_config(path)?;
+@@ -390,9 +406,8 @@
+         ensure!(approved.to_string()==approval.approved_config_digest && sha256::Hash::hash(&bytes)==approved,
+             "wallet creation settings differ from approval");
+         let config:SetupConfig=serde_json::from_slice(&bytes)?;
+-        ensure!(config.schema=="monzero-private-ltc-setup-v1","invalid Litecoin setup schema");
+-        let network=match config.network.as_str() {"main"=>LtcNetwork::Mainnet,"test"=>LtcNetwork::Testnet,
+-            "regtest"=>LtcNetwork::Regtest,_=>anyhow::bail!("unsupported creation network")};
++        ensure!(config.schema==format!("monzero-private-{tag}-setup-v1"),"invalid light-wallet setup schema");
++        let network=network_for(tag,&config.network)?;
+         let endpoint=config.endpoint.map(|e|TlsEndpoint::new(e.host,e.port,network)).transpose()?;
+         let directories=SetupDirectories {vault:config.vault_directory,addresses:config.address_book_directory,backup:config.backup_directory};
+         let options=ConfigurationOptions {cache:config.cache_directory,spends:config.spend_directory,
+@@ -421,7 +436,8 @@
+         let mut bytes=Zeroizing::new(Vec::new());std::io::stdin().take(8193).read_to_end(&mut bytes)?;
+         ensure!(!bytes.is_empty() && bytes.len()<=if mode=="wallet-sign" || backup_mode || mode=="wallet-restore" || mode=="wallet-create" {8192}else if mode=="wallet-reconcile" || mode=="wallet-broadcast" || mode=="wallet-broadcast-status" || mode=="wallet-signed" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" || mode=="wallet-estimate" {2048}else{512},"invalid light-chain request size");
+         let request: Request=serde_json::from_slice(&bytes)?;drop(bytes);
+-        let schema=format!("monzero-ltc-light-{mode}-request-v1");
++        let tag=["btc","bch","doge"].into_iter().find(|tag|request.schema.starts_with(&format!("monzero-{tag}-light-"))).unwrap_or("ltc");
++        let schema=format!("monzero-{tag}-light-{mode}-request-v1");
+         let sync=mode=="sync";
+         ensure!(request.schema==schema && !request.request_id.is_nil(),"invalid light-chain request identity");
+         ensure!(if sync || mode=="wallet-reconcile" {request.maximum_download_headers.is_some_and(|n|(1..=10_000_000).contains(&n))}
+@@ -441,21 +457,20 @@
+         ensure!((mode=="wallet-restore")==request.restore_approval.is_some(),"invalid Litecoin restore approval request");
+         ensure!((mode=="wallet-create")==request.create_approval.is_some(),"invalid Litecoin creation approval request");
+         if mode=="wallet-create" {
+-            let wallet=create_wallet(Path::new(&args[2]),request.create_approval.as_ref().context("missing creation approval")?)?;
+-            return output(&json!({"schema":format!("monzero-ltc-light-{mode}-response-v1"),
++            let wallet=create_wallet(Path::new(&args[2]),tag,request.create_approval.as_ref().context("missing creation approval")?)?;
++            return output(&json!({"schema":format!("monzero-{tag}-light-{mode}-response-v1"),
+                 "requestId":request.request_id,"executable":false,"wallet":wallet}));
+         }
+-        let (_lease,config)=config(Path::new(&args[2]))?;
+-        let network=match config.network.as_str() {"main"=>LtcNetwork::Mainnet,"test"=>LtcNetwork::Testnet,
+-            "regtest"=>LtcNetwork::Regtest,_=>anyhow::bail!("unsupported Litecoin network")};
++        let (_lease,config)=config(Path::new(&args[2]),tag)?;
++        let network=network_for(tag,&config.network)?;
+         if mode=="wallet-restore" {
+             let wallet=restore_wallet(&config,network,request.restore_approval.as_ref().context("missing restore approval")?)?;
+-            return output(&json!({"schema":format!("monzero-ltc-light-{mode}-response-v1"),
++            return output(&json!({"schema":format!("monzero-{tag}-light-{mode}-response-v1"),
+                 "requestId":request.request_id,"executable":false,"wallet":wallet}));
+         }
+         if backup_mode {
+             let wallet=wallet_backup(&config,network,request.backup_approval.as_ref().context("missing backup approval")?,mode=="wallet-backup-save")?;
+-            return output(&json!({"schema":format!("monzero-ltc-light-{mode}-response-v1"),
++            return output(&json!({"schema":format!("monzero-{tag}-light-{mode}-response-v1"),
+                 "requestId":request.request_id,"executable":false,"wallet":wallet}));
+         }
+         let mut state=ChainState::open(&config.cache_directory,network,config.maximum_height,now()?)?;
+@@ -470,7 +485,7 @@
+             }
+             Some(summary)
+         } else {None};
+-        let mut response=json!({"schema":format!("monzero-ltc-light-{mode}-response-v1"),
++        let mut response=json!({"schema":format!("monzero-{tag}-light-{mode}-response-v1"),
+             "requestId":request.request_id,"executable":false,"chain":snapshot(&state)?,"synchronization":synchronization});
+         if mode=="wallet-reconcile" || mode=="wallet-broadcast" || mode=="wallet-broadcast-status" || mode=="wallet-signed" || mode=="wallet-init" || mode=="wallet-refresh" || mode=="wallet-receive" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" || mode=="wallet-estimate" {
+             let wallet=if mode=="wallet-init" {initialize_wallet(&config,network)?}
+diff --color -ruN a/swap-machine/src/litecoin_light/account/descriptor.rs b/swap-machine/src/litecoin_light/account/descriptor.rs
+--- a/swap-machine/src/litecoin_light/account/descriptor.rs	2026-10-12 00:05:54.486307399 +0100
++++ b/swap-machine/src/litecoin_light/account/descriptor.rs	2026-10-12 00:05:54.490882462 +0100
+@@ -18,19 +18,19 @@
+     /// Export only the account-level public key and claimed origin metadata.
+     /// The xpub format is standard BIP32; Litecoin HRP is applied on derivation.
+     pub fn descriptor(&self)->PublicAccountDescriptor {
+-        PublicAccountDescriptor {schema:"monzero-ltc-public-account-v1".into(),
++        PublicAccountDescriptor {schema:format!("monzero-{}-public-account-v1",self.network.tag()),
+             network:self.network.name().into(),account:self.account,
+             master_fingerprint:self.fingerprint.to_string(),account_xpub:self.public.to_string()}
+     }
+     /// Bind import to a separately selected network. BIP32 test keys alone
+     /// cannot distinguish Litecoin testnet from regtest.
+-    pub fn from_descriptor(descriptor:&PublicAccountDescriptor,network:LtcNetwork)->Result<Self> {
+-        ensure!(descriptor.schema=="monzero-ltc-public-account-v1"
++    pub fn from_descriptor(descriptor:&PublicAccountDescriptor,network:impl Into<LightNetwork>)->Result<Self> {let network=network.into();
++        ensure!(descriptor.schema==format!("monzero-{}-public-account-v1",network.tag())
+             && descriptor.network==network.name() && descriptor.account_xpub.len()<=128
+             && descriptor.master_fingerprint.len()==8,"invalid Litecoin public account descriptor");
+         let child=ChildNumber::from_hardened_idx(descriptor.account)?;
+         let public: Xpub=descriptor.account_xpub.parse()?;
+-        let kind=if network==LtcNetwork::Mainnet {NetworkKind::Main}else{NetworkKind::Test};
++        let kind=network.network_kind();
+         ensure!(public.depth==3 && public.child_number==child && public.network==kind
+             && public.to_string()==descriptor.account_xpub,"invalid Litecoin account public key metadata");
+         let fingerprint:Fingerprint=descriptor.master_fingerprint.parse()?;
+diff --color -ruN a/swap-machine/src/litecoin_light/account.rs b/swap-machine/src/litecoin_light/account.rs
+--- a/swap-machine/src/litecoin_light/account.rs	2026-10-12 00:05:54.486221529 +0100
++++ b/swap-machine/src/litecoin_light/account.rs	2026-10-12 00:05:54.492055444 +0100
+@@ -2,8 +2,18 @@
+ //! address allocation, discovery or balance claim. Caller owns the master key.
+ use anyhow::{Result,ensure};
+ use bitcoin::{bip32::{ChildNumber,DerivationPath,Fingerprint,Xpriv,Xpub},
+-    secp256k1::Secp256k1,CompressedPublicKey,NetworkKind,Script,ScriptBuf};
+-use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++    secp256k1::Secp256k1,CompressedPublicKey,Script};
++#[cfg(test)]
++use bitcoin::ScriptBuf;
++use crate::litecoin_light::network::{LightAddress,LightNetwork};
++#[cfg(test)]
++#[allow(unused_imports)]
++use swap_core::litecoin_address::LtcNetwork;
++#[cfg(test)]
++#[allow(unused_imports)]
++use swap_core::litecoin_address::LtcSegwitAddress;
++#[cfg(test)]
++use bitcoin::NetworkKind;
+ 
+ #[derive(Clone,Copy,Debug,PartialEq,Eq)]
+ pub enum Branch {Receive,Change}
+@@ -12,23 +22,24 @@
+ /// Public derivation data only. No Debug/Serialize to avoid accidental logging
+ /// of the account's address-linking data. Not proof of present spending control.
+ pub struct PublicAccount {
+-    network:LtcNetwork,
++    network:LightNetwork,
+     account:u32,
+     fingerprint:Fingerprint,
+     public:Xpub,
+ }
+ pub struct DerivedAddress {
+-    address:LtcSegwitAddress,
++    address:LightAddress,
+     public_key:CompressedPublicKey,
+     path:DerivationPath,
+ }
+ impl PublicAccount {
+-    /// Mainnet m/84'/2'/account'; test networks m/84'/1'/account'.
++    /// m/purpose'/coin'/account': BIP84 (P2WPKH) or BIP44 (P2PKH) per chain;
++    /// Litecoin mainnet m/84'/2'/account', test networks coin type 1.
+     /// Borrowed master key must be a root of the correct network kind.
+     /// The existing BIP32 dependency can internally copy secrets; this API is
+     /// not a secure-memory or encrypted-vault implementation.
+-    pub fn from_master(master:&Xpriv,network:LtcNetwork,account:u32)->Result<Self> {
+-        let kind=if network==LtcNetwork::Mainnet {NetworkKind::Main} else {NetworkKind::Test};
++    pub fn from_master(master:&Xpriv,network:impl Into<LightNetwork>,account:u32)->Result<Self> {let network=network.into();
++        let kind=network.network_kind();
+         ensure!(master.depth==0 && master.parent_fingerprint==Fingerprint::default()
+             && master.child_number==(ChildNumber::Normal {index:0}) && master.network==kind,
+             "Litecoin account requires a matching master key");
+@@ -39,7 +50,7 @@
+         derived.private_key.non_secure_erase();
+         Ok(Self {network,account,fingerprint:master.fingerprint(&secp),public})
+     }
+-    pub fn network(&self)->LtcNetwork {self.network}
++    pub fn network(&self)->LightNetwork {self.network}
+     pub fn account_index(&self)->u32 {self.account}
+     pub fn master_fingerprint(&self)->Fingerprint {self.fingerprint}
+     /// Pure derivation, not allocation: callers must persist address indices
+@@ -48,8 +59,8 @@
+         let suffix=[ChildNumber::from_normal_idx(branch.index())?,ChildNumber::from_normal_idx(index)?];
+         let public=self.public.derive_pub(&Secp256k1::verification_only(),&suffix)?;
+         let public_key=CompressedPublicKey(public.public_key);
+-        let script=ScriptBuf::new_p2wpkh(&public_key.wpubkey_hash());
+-        let address=LtcSegwitAddress::from_script(self.network,&script)?;
++        let script=crate::litecoin_light::script::owned_script(self.network.script_kind(),&public_key);
++        let address=LightAddress::from_script(self.network,&script)?;
+         let mut path=account_path(self.network,self.account)?.as_ref().to_vec();path.extend(suffix);
+         Ok(DerivedAddress {address,public_key,path:DerivationPath::from(path)})
+     }
+@@ -59,13 +70,13 @@
+     }
+ }
+ impl DerivedAddress {
+-    pub fn address(&self)->&LtcSegwitAddress {&self.address}
++    pub fn address(&self)->&LightAddress {&self.address}
+     pub fn public_key(&self)->CompressedPublicKey {self.public_key}
+     pub fn path(&self)->&DerivationPath {&self.path}
+ }
+-fn account_path(network:LtcNetwork,account:u32)->Result<DerivationPath> {
+-    let coin=if network==LtcNetwork::Mainnet {2} else {1};
+-    Ok(DerivationPath::from(vec![ChildNumber::from_hardened_idx(84)?,
++fn account_path(network:impl Into<LightNetwork>,account:u32)->Result<DerivationPath> {let network=network.into();
++    let coin=network.coin_type();
++    Ok(DerivationPath::from(vec![ChildNumber::from_hardened_idx(network.purpose())?,
+         ChildNumber::from_hardened_idx(coin)?,ChildNumber::from_hardened_idx(account)?]))
+ }
+ #[cfg(test)]
+diff --color -ruN a/swap-machine/src/litecoin_light/headers/cache.rs b/swap-machine/src/litecoin_light/headers/cache.rs
+--- a/swap-machine/src/litecoin_light/headers/cache.rs	2026-10-12 00:05:54.486535127 +0100
++++ b/swap-machine/src/litecoin_light/headers/cache.rs	2026-10-12 00:05:54.490611993 +0100
+@@ -12,9 +12,9 @@
+ /// Exclusive cooperative-process lease, following the wallet journal pattern.
+ /// Directory must already exist, be canonical, owned and private. One network
+ /// per directory. A missing cache is explicit; corruption never becomes genesis.
+-pub struct HeaderCache { directory: File, network: LtcNetwork }
++pub struct HeaderCache { directory: File, network: LightNetwork }
+ impl HeaderCache {
+-    pub fn open(path: &Path,network: LtcNetwork) -> Result<Self> {
++    pub fn open(path: &Path,network:impl Into<LightNetwork>) -> Result<Self> {let network=network.into();
+         ensure!(path.is_absolute() && path.canonicalize()?==path, "noncanonical Litecoin header cache");
+         let directory=OpenOptions::new().read(true)
+             .custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC).open(path)?;
+diff --color -ruN a/swap-machine/src/litecoin_light/headers.rs b/swap-machine/src/litecoin_light/headers.rs
+--- a/swap-machine/src/litecoin_light/headers.rs	2026-10-12 00:05:54.486457688 +0100
++++ b/swap-machine/src/litecoin_light/headers.rs	2026-10-12 00:05:54.492160184 +0100
+@@ -1,14 +1,14 @@
+-//! Genesis-rooted Litecoin header sequence, pinned to Core v0.21.5.8 rules.
++//! Genesis-rooted header sequence for a light-wallet chain. Litecoin follows Core
++//! v0.21.5.8 rules; Bitcoin follows Bitcoin Core (see `network`).
+ //! Selects the most-work branch supplied by callers; does not establish freshness, checkpoints,
+ //! block bodies, MWEB consensus or current UTXO state. No spending authority.
+ use anyhow::{Context, Result, ensure};
+-use bitcoin::{BlockHash, TxMerkleNode, block::{Header, Version}, CompactTarget,
+-    consensus::{serialize, deserialize}, hashes::Hash};
++use bitcoin::{BlockHash, block::Header, consensus::{serialize, deserialize}, hashes::Hash};
+ use num_bigint::BigUint;
+-use swap_core::litecoin_address::LtcNetwork;
++use super::network::{LightNetwork, block_work};
+ 
+ pub struct HeaderSequence {
+-    network: LtcNetwork,
++    network: LightNetwork,
+     headers: Vec<Header>,
+     work: BigUint,
+ }
+@@ -20,25 +20,18 @@
+     pub new_tip: (u32, BlockHash),
+ }
+ impl HeaderSequence {
+-    pub fn new(network: LtcNetwork) -> Result<Self> {
+-        let (time, nonce, bits) = match network {
+-            LtcNetwork::Mainnet => (1317972665,2084524493,0x1e0ffff0),
+-            LtcNetwork::Testnet => (1486949366,293345,0x1e0ffff0),
+-            LtcNetwork::Regtest => (1296688602,0,0x207fffff),
+-        };
+-        let genesis = Header { version: Version::from_consensus(1), prev_blockhash: BlockHash::all_zeros(),
+-            merkle_root: "97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9".parse::<TxMerkleNode>()?,
+-            time, bits: CompactTarget::from_consensus(bits), nonce };
+-        ensure!(genesis.block_hash().to_string()==network.genesis(), "Litecoin genesis constants changed");
++    pub fn new(network: impl Into<LightNetwork>) -> Result<Self> {
++        let network = network.into();
++        let genesis = network.genesis_header()?;
+         // Core special-cases the independently pinned genesis identity.
+-        let work = block_work(&target(bits,network)?);
++        let work = block_work(&network.target(genesis.bits.to_consensus())?);
+         Ok(Self {network, headers:vec![genesis], work})
+     }
+     /// Atomic bounded extension. A bad suffix cannot leave a trusted prefix
+     /// installed from a rejected response. No async work occurs during mutation.
+     pub fn append_batch(&mut self,bytes: &[u8],now: u64) -> Result<u32> {
+         ensure!(!bytes.is_empty() && bytes.len()%80==0 && bytes.len()<=2016*80,
+-            "invalid Litecoin header batch size");
++            "invalid {} header batch size", self.network.coin());
+         let length = self.headers.len(); let work = self.work.clone();
+         for header in bytes.chunks_exact(80) {
+             if let Err(error) = self.append(header,now) {
+@@ -48,17 +41,17 @@
+         }
+         Ok((bytes.len()/80) as u32)
+     }
+-    pub fn network(&self) -> LtcNetwork { self.network }
++    pub fn network(&self) -> LightNetwork { self.network }
+     pub fn height(&self) -> u32 { (self.headers.len()-1) as u32 }
+     pub fn header(&self,height: u32) -> Option<Header> { self.headers.get(height as usize).copied() }
+     pub fn chain_work(&self) -> &BigUint { &self.work }
+ 
+     /// Independently extend a previously validated prefix when investigating a fork.
+     pub fn fork(&self,height: u32) -> Result<Self> {
+-        ensure!(height<=self.height(), "Litecoin fork height outside retained chain");
++        ensure!(height<=self.height(), "{} fork height outside retained chain", self.network.coin());
+         let headers = self.headers[..=height as usize].to_vec();
+         let mut work = BigUint::from(0u8);
+-        for header in &headers { work += block_work(&target(header.bits.to_consensus(),self.network)?); }
++        for header in &headers { work += block_work(&self.network.target(header.bits.to_consensus())?); }
+         Ok(Self {network:self.network,headers,work})
+     }
+ 
+@@ -66,11 +59,11 @@
+     /// their fields are private and construction starts at the pinned genesis.
+     /// This chooses among supplied branches, not necessarily the network's best tip.
+     pub fn adopt(&mut self,candidate: Self) -> Result<Option<ChainChange>> {
+-        ensure!(candidate.network==self.network, "Litecoin candidate network mismatch");
++        ensure!(candidate.network==self.network, "{} candidate network mismatch", self.network.coin());
+         if candidate.work<=self.work {return Ok(None)}
+         let common = self.headers.iter().zip(&candidate.headers)
+             .take_while(|(left,right)|left.block_hash()==right.block_hash()).count();
+-        ensure!(common>0, "Litecoin candidate genesis mismatch");
++        ensure!(common>0, "{} candidate genesis mismatch", self.network.coin());
+         let old_height = self.height(); let new_height = candidate.height();
+         let change = ChainChange {
+             common_ancestor:(common-1) as u32,
+@@ -89,21 +82,22 @@
+     /// `now` must be supplied by the caller's clock, not a server timestamp.
+     /// Validation is completed before either headers or cumulative work change.
+     pub fn append(&mut self,bytes: &[u8],now: u64) -> Result<BlockHash> {
+-        ensure!(bytes.len()==80, "invalid Litecoin header size");
++        let coin = self.network.coin();
++        ensure!(bytes.len()==80, "invalid {coin} header size");
+         let header: Header = deserialize(bytes)?;
+-        let height = u32::try_from(self.headers.len()).context("Litecoin header height exhausted")?;
+-        let previous = self.headers.last().context("missing Litecoin genesis")?;
+-        ensure!(header.prev_blockhash==previous.block_hash(), "disconnected Litecoin header");
+-        ensure!(header.bits.to_consensus()==next_bits(self.network,&self.headers,header.time)?,
+-            "incorrect Litecoin difficulty");
++        let height = u32::try_from(self.headers.len()).with_context(|| format!("{coin} header height exhausted"))?;
++        let previous = self.headers.last().with_context(|| format!("missing {coin} genesis"))?;
++        ensure!(header.prev_blockhash==previous.block_hash(), "disconnected {coin} header");
++        ensure!(header.bits.to_consensus()==self.network.next_bits(&self.headers,header.time)?,
++            "incorrect {coin} difficulty");
+         let mut times: Vec<_> = self.headers.iter().rev().take(11).map(|h|h.time).collect();
+         times.sort_unstable();
+-        ensure!(header.time>times[times.len()/2], "Litecoin timestamp does not exceed median past time");
++        ensure!(header.time>times[times.len()/2], "{coin} timestamp does not exceed median past time");
+         ensure!(u64::from(header.time)<=now.checked_add(7200).context("invalid local header clock")?,
+-            "Litecoin header timestamp too far in future");
+-        check_version(self.network,height,header.version.to_consensus())?;
+-        let target = target(header.bits.to_consensus(),self.network)?;
+-        ensure!(BigUint::from_bytes_le(&scrypt_hash(bytes)?)<=target, "insufficient Litecoin Scrypt work");
++            "{coin} header timestamp too far in future");
++        self.network.check_version(height,header.version.to_consensus())?;
++        let target = self.network.target(header.bits.to_consensus())?;
++        ensure!(self.network.pow_value(bytes)?<=target, "{}", insufficient_work(self.network));
+         let hash = header.block_hash();
+         self.work += block_work(&target);
+         self.headers.push(header);
+@@ -111,75 +105,35 @@
+     }
+ }
+ 
+-/// Fixed Litecoin N=1024, r=1, p=1, 32-byte output. Never Bitcoin SHA256d work.
+-fn scrypt_hash(header: &[u8]) -> Result<[u8;32]> {
+-    ensure!(header.len()==80, "invalid Scrypt header length");
+-    let params = scrypt::Params::new(10,1,1,32).map_err(|_|anyhow::anyhow!("invalid Litecoin Scrypt parameters"))?;
+-    let mut output = [0;32];
+-    scrypt::scrypt(header,header,&params,&mut output).map_err(|_|anyhow::anyhow!("Litecoin Scrypt failed"))?;
+-    Ok(output)
+-}
+-fn limit(network: LtcNetwork) -> BigUint {
+-    let bits = if network==LtcNetwork::Regtest {255} else {236};
+-    (BigUint::from(1u8)<<bits)-BigUint::from(1u8)
+-}
+-fn target(bits: u32,network: LtcNetwork) -> Result<BigUint> {
+-    let size = bits>>24; let word = bits&0x007fffff;
+-    ensure!(bits&0x00800000==0 && word!=0 && size<=34
+-        && !(word>0xff && size>33) && !(word>0xffff && size>32), "invalid Litecoin compact target");
+-    let value = if size<=3 {BigUint::from(word>>(8*(3-size)))}
+-        else {BigUint::from(word)<<(8*(size-3)) as usize};
+-    ensure!(value!=BigUint::from(0u8) && value<=limit(network), "Litecoin target outside network limit");
+-    Ok(value)
+-}
+-fn compact(value: &BigUint) -> u32 {
+-    let mut size = value.bits().div_ceil(8) as u32;
+-    let shifted = if size<=3 {value<<(8*(3-size)) as usize} else {value>>(8*(size-3)) as usize};
+-    let mut word = shifted.to_bytes_be().iter().fold(0u32, |word,byte| (word<<8)|u32::from(*byte));
+-    if word&0x00800000!=0 {word>>=8;size+=1;}
+-    word | (size<<24)
+-}
+-fn block_work(target: &BigUint) -> BigUint {
+-    (BigUint::from(1u8)<<256usize)/(target+BigUint::from(1u8))
+-}
++// Litecoin-signature shims so the original Litecoin consensus tests run unchanged
++// against the shared rules in `network`.
++#[cfg(test)]
++use {bitcoin::{CompactTarget, block::Version}, swap_core::litecoin_address::LtcNetwork,
++    super::network::compact};
++#[cfg(test)]
++fn scrypt_hash(header: &[u8]) -> Result<[u8;32]> { super::network::scrypt_hash(header) }
++#[cfg(test)]
++fn target(bits: u32,network: LtcNetwork) -> Result<BigUint> { LightNetwork::from(network).target(bits) }
++#[cfg(test)]
+ fn next_bits(network: LtcNetwork,headers: &[Header],time: u32) -> Result<u32> {
+-    let previous = headers.last().context("missing difficulty history")?;
+-    let height = headers.len();
+-    let easiest = compact(&limit(network));
+-    if height%2016!=0 {
+-        if network!=LtcNetwork::Mainnet {
+-            if u64::from(time)>u64::from(previous.time)+300 {return Ok(easiest)}
+-            let mut index = height-1;
+-            while index>0 && index%2016!=0 && headers[index].bits.to_consensus()==easiest {index-=1;}
+-            return Ok(headers[index].bits.to_consensus())
+-        }
+-        return Ok(previous.bits.to_consensus())
+-    }
+-    if network==LtcNetwork::Regtest {return Ok(previous.bits.to_consensus())}
+-    // Litecoin uses an extra ancestor after the first adjustment interval.
+-    let first = if height==2016 {0} else {height-2017};
+-    retarget(network,previous.bits.to_consensus(),i64::from(previous.time)-i64::from(headers[first].time))
++    LightNetwork::from(network).next_bits(headers,time)
+ }
++#[cfg(test)]
+ fn retarget(network: LtcNetwork,bits: u32,elapsed: i64) -> Result<u32> {
+-    let mut value = target(bits,network)?;
+-    let limit = limit(network);
+-    let shift = value.bits()>limit.bits()-1;
+-    if shift {value>>=1usize;}
+-    value *= elapsed.clamp(302400/4,302400*4) as u64;
+-    value /= 302400u64;
+-    if shift {value<<=1usize;}
+-    Ok(compact(&value.min(limit)))
++    LightNetwork::from(network).retarget(bits,elapsed,302400)
+ }
++#[cfg(test)]
+ fn check_version(network: LtcNetwork,height: u32,version: i32) -> Result<()> {
+-    let (bip34,bip66,bip65,segwit) = match network {
+-        LtcNetwork::Mainnet => (710000,811879,918684,1201536),
+-        LtcNetwork::Testnet => (76,76,76,6048),
+-        LtcNetwork::Regtest => (500,1251,1351,0),
+-    };
+-    ensure!(!(height>=bip34 && version<2) && !(height>=bip66 && version<3)
+-        && !(height>=bip65 && version<4) && !(height>=segwit && version<0x20000000),
+-        "outdated Litecoin header version");
+-    Ok(())
++    LightNetwork::from(network).check_version(height,version)
++}
++
++fn insufficient_work(network: LightNetwork) -> &'static str {
++    match network {
++        LightNetwork::Litecoin(_) => "insufficient Litecoin Scrypt work",
++        LightNetwork::Bitcoin(_) => "insufficient Bitcoin SHA256d work",
++        LightNetwork::BitcoinCash(_) => "insufficient Bitcoin Cash SHA256d work",
++        LightNetwork::Dogecoin(_) => "insufficient Dogecoin Scrypt work",
++    }
+ }
+ 
+ #[cfg(test)]
+diff --color -ruN a/swap-machine/src/litecoin_light/network/tests.rs b/swap-machine/src/litecoin_light/network/tests.rs
+--- a/swap-machine/src/litecoin_light/network/tests.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/swap-machine/src/litecoin_light/network/tests.rs	2026-10-12 00:05:54.492055444 +0100
+@@ -0,0 +1,279 @@
++//! Network identity and Bitcoin consensus vectors. Bitcoin headers are real
++//! mainnet headers (heights 1, 2, 30240, 32255, 32256) copied from public block
++//! data; the 32256 retarget is the first mainnet difficulty change.
++use super::*;
++use crate::litecoin_light::{account::{Branch, PublicAccount}, headers::HeaderSequence};
++use bitcoin::{bip32::Xpriv, consensus::deserialize};
++use swap_core::litecoin_address::LtcSegwitAddress;
++
++const NOW: u64 = 2_000_000_000;
++const BTC_1: &str = "010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e61bc6649ffff001d01e36299";
++const BTC_2: &str = "010000004860eb18bf1b1620e37e9490fc8a427514416fd75159ab86688e9a8300000000d5fdcc541e25de1c7a5addedf24858b8bb665c9f36ef744ee42c316022c90f9bb0bc6649ffff001d08d2bd61";
++const BTC_30240: &str = "01000000e6bf7fd7f7790a63786faa878d0dc7fd8f2ff365732e45862c66075100000000700d342f65c7b6834dffb615358a1897016f0448913372190cbe3d27a4b53355b1512b4bffff001dbfb02519";
++const BTC_32255: &str = "0100000049c1daab3b6536ff1b2633c3a316a6e06ec287676cdeec4ca7baae6b00000000ac10b36b8f354b3353207de15940a5edbc05bb8364af75b4b5409e7823f2b48923ec3a4bffff001dbd5fa412";
++const BTC_32256: &str = "010000004b0360d834a330ec7833e30e1f523ee05a0793361e29a73421964f980000000027b64a020af294e903feed93768705336a20090612a043f47af462a2f5e5b564f8ee3a4b6ad8001dd3a43707";
++
++fn bytes(hex: &str) -> Vec<u8> {
++    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
++}
++fn header(hex: &str) -> Header { deserialize(&bytes(hex)).unwrap() }
++
++const BTC_NETWORKS: [BtcNetwork; 3] = [BtcNetwork::Mainnet, BtcNetwork::Testnet, BtcNetwork::Regtest];
++const LTC_NETWORKS: [LtcNetwork; 3] = [LtcNetwork::Mainnet, LtcNetwork::Testnet, LtcNetwork::Regtest];
++
++#[test]
++fn every_network_builds_its_pinned_genesis() {
++    for network in BTC_NETWORKS.map(LightNetwork::from).into_iter().chain(LTC_NETWORKS.map(LightNetwork::from)) {
++        let chain = HeaderSequence::new(network).unwrap();
++        assert_eq!(chain.height(), 0);
++        assert_eq!(chain.header(0).unwrap().block_hash().to_string(), network.genesis());
++        assert_eq!(chain.network(), network);
++    }
++}
++
++#[test]
++fn litecoin_identity_is_unchanged() {
++    for network in LTC_NETWORKS {
++        let light = LightNetwork::from(network);
++        assert_eq!((light.name(), light.hrp(), light.genesis(), light.tag(), light.coin()),
++            (network.name(), network.hrp(), network.genesis(), "ltc", "Litecoin"));
++        assert!(light == network);
++        assert_eq!(light.coin_type(), if network == LtcNetwork::Mainnet { 2 } else { 1 });
++    }
++}
++
++#[test]
++fn bitcoin_identity() {
++    let main = LightNetwork::from(BtcNetwork::Mainnet);
++    assert_eq!((main.name(), main.hrp(), main.tag(), main.coin(), main.coin_type()), ("main", "bc", "btc", "Bitcoin", 0));
++    assert!(main.is_mainnet() && main.network_kind() == NetworkKind::Main);
++    let test = LightNetwork::from(BtcNetwork::Testnet);
++    assert_eq!((test.name(), test.hrp(), test.coin_type()), ("test", "tb", 1));
++    let regtest = LightNetwork::from(BtcNetwork::Regtest);
++    assert_eq!((regtest.name(), regtest.hrp(), regtest.coin_type()), ("regtest", "bcrt", 1));
++    assert!(!regtest.is_mainnet() && regtest.network_kind() == NetworkKind::Test);
++    // The same deployment name never makes a Bitcoin network equal to Litecoin's.
++    assert!(main != LightNetwork::from(LtcNetwork::Mainnet));
++    assert!(main != LtcNetwork::Mainnet);
++}
++
++#[test]
++fn bitcoin_mainnet_headers_extend_genesis_with_sha256d_work() {
++    let mut chain = HeaderSequence::new(BtcNetwork::Mainnet).unwrap();
++    let genesis_work = chain.chain_work().clone();
++    let first = chain.append(&bytes(BTC_1), NOW).unwrap();
++    assert_eq!(first.to_string(), "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048");
++    let second = chain.append(&bytes(BTC_2), NOW).unwrap();
++    assert_eq!(second.to_string(), "000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd");
++    assert_eq!(chain.height(), 2);
++    assert_eq!(chain.chain_work(), &(genesis_work * 3u8));
++}
++
++#[test]
++fn bitcoin_headers_are_rejected_when_work_link_or_clock_is_wrong() {
++    let mut chain = HeaderSequence::new(BtcNetwork::Mainnet).unwrap();
++    let mut tampered = bytes(BTC_1);
++    tampered[76] ^= 1;
++    assert!(chain.append(&tampered, NOW).unwrap_err().to_string().contains("insufficient Bitcoin SHA256d work"));
++    assert!(chain.append(&bytes(BTC_2), NOW).unwrap_err().to_string().contains("disconnected Bitcoin header"));
++    assert!(chain.append(&bytes(BTC_1), 1231469665 - 7201).unwrap_err().to_string().contains("too far in future"));
++    // A Litecoin chain never accepts Bitcoin work.
++    let mut litecoin = HeaderSequence::new(LtcNetwork::Mainnet).unwrap();
++    assert!(litecoin.append(&bytes(BTC_1), NOW).is_err());
++    assert_eq!((chain.height(), litecoin.height()), (0, 0));
++}
++
++#[test]
++fn bitcoin_first_mainnet_retarget_matches_block_32256() {
++    let network = LightNetwork::from(BtcNetwork::Mainnet);
++    let mut history = vec![header(BTC_32255); 32256];
++    history[30240] = header(BTC_30240);
++    let expected = header(BTC_32256);
++    assert_eq!(network.next_bits(&history, expected.time).unwrap(), expected.bits.to_consensus());
++    assert_eq!(expected.bits.to_consensus(), 0x1d00d86a);
++    // Inside an interval mainnet keeps the previous difficulty.
++    assert_eq!(network.next_bits(&history[..32255], expected.time).unwrap(), 0x1d00ffff);
++}
++
++#[test]
++fn bitcoin_difficulty_limits_and_test_network_rules() {
++    let main = LightNetwork::from(BtcNetwork::Mainnet);
++    assert_eq!(main.limit(), (BigUint::from(1u8) << 224usize) - BigUint::from(1u8));
++    assert_eq!(main.target(0x1d00ffff).unwrap(), BigUint::from(0xffffu32) << 208usize);
++    assert!(main.target(0x1e00ffff).is_err());
++    // testnet3: a block more than 20 minutes after its parent may use the minimum difficulty.
++    let test = LightNetwork::from(BtcNetwork::Testnet);
++    let mut parent = header(BTC_32255);
++    parent.bits = CompactTarget::from_consensus(0x1c0fffff);
++    let history = vec![parent; 5];
++    assert_eq!(test.next_bits(&history, parent.time + 1201).unwrap(), 0x1d00ffff);
++    assert_eq!(test.next_bits(&history, parent.time + 1200).unwrap(), 0x1c0fffff);
++    // regtest never retargets.
++    let regtest = LightNetwork::from(BtcNetwork::Regtest);
++    let mut easy = header(BTC_32255);
++    easy.bits = CompactTarget::from_consensus(0x207fffff);
++    assert_eq!(regtest.next_bits(&vec![easy; 2016], easy.time + 1).unwrap(), 0x207fffff);
++}
++
++#[test]
++fn bitcoin_header_versions_follow_activation_heights() {
++    let main = LightNetwork::from(BtcNetwork::Mainnet);
++    assert!(main.check_version(227930, 1).is_ok());
++    assert!(main.check_version(227931, 1).is_err());
++    assert!(main.check_version(388381, 3).is_err());
++    assert!(main.check_version(388381, 4).is_ok());
++    // No Litecoin-style SegWit version floor on Bitcoin.
++    assert!(main.check_version(800000, 4).is_ok());
++    assert!(LightNetwork::from(LtcNetwork::Mainnet).check_version(1201536, 4).is_err());
++}
++
++#[test]
++fn bitcoin_segwit_addresses_match_bip173() {
++    let script = ScriptBuf::from_bytes(bytes("0014751e76e8199196d454941c45d1b3a323f1433bd6"));
++    let address = SegwitAddress::from_script(BtcNetwork::Mainnet, &script).unwrap();
++    assert_eq!(address.to_string(), "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
++    assert_eq!(SegwitAddress::parse(BtcNetwork::Mainnet, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap().script_pubkey(), &script);
++    assert!(SegwitAddress::parse(BtcNetwork::Testnet, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").is_err());
++    assert!(SegwitAddress::parse(LtcNetwork::Mainnet, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").is_err());
++    assert!(SegwitAddress::parse(BtcNetwork::Mainnet, "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4").is_err(), "uppercase is noncanonical here");
++    let regtest = SegwitAddress::from_script(BtcNetwork::Regtest, &script).unwrap().to_string();
++    assert!(regtest.starts_with("bcrt1q"));
++}
++
++#[test]
++fn litecoin_addresses_are_byte_identical_to_the_original_encoder() {
++    for network in LTC_NETWORKS {
++        for program in [bytes("0014751e76e8199196d454941c45d1b3a323f1433bd6"),
++            bytes("00201863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262"),
++            bytes("5120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c")] {
++            let script = ScriptBuf::from_bytes(program);
++            let old = LtcSegwitAddress::from_script(network, &script).unwrap().to_string();
++            let new = SegwitAddress::from_script(network, &script).unwrap().to_string();
++            assert_eq!(old, new);
++            assert_eq!(SegwitAddress::parse(network, &old).unwrap().script_pubkey(), &script);
++        }
++    }
++}
++
++#[test]
++fn bitcoin_bip84_vector_derives_from_the_shared_account() {
++    // BIP84 test vector: "abandon abandon … about", no passphrase.
++    let seed = bytes("5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4");
++    let master = Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
++    let account = PublicAccount::from_master(&master, BtcNetwork::Mainnet, 0).unwrap();
++    let receive = account.derive(Branch::Receive, 0).unwrap();
++    assert_eq!(receive.address().to_string(), "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu");
++    assert_eq!(receive.path().to_string(), "84'/0'/0'/0/0");
++    assert_eq!(receive.public_key().to_string(), "0330d54fd0dd420a6e5f8d3624f5f3482cae350f79d5f0753bf5beef9c2d91af3c");
++    assert_eq!(account.derive(Branch::Change, 0).unwrap().address().to_string(), "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el");
++    // The Litecoin account from the same seed uses coin type 2 and its own HRP.
++    let litecoin = PublicAccount::from_master(&master, LtcNetwork::Mainnet, 0).unwrap().derive(Branch::Receive, 0).unwrap();
++    assert_eq!(litecoin.path().to_string(), "84'/2'/0'/0/0");
++    assert!(litecoin.address().to_string().starts_with("ltc1q"));
++    // A watch-only descriptor cannot be imported into the other chain.
++    let descriptor = account.descriptor();
++    assert!(PublicAccount::from_descriptor(&descriptor, LtcNetwork::Mainnet).is_err());
++    assert!(PublicAccount::from_descriptor(&descriptor, BtcNetwork::Mainnet).is_ok());
++}
++
++// ---- Bitcoin Cash and Dogecoin (regtest header rules; vectors from BCHN 29.0.0 and Dogecoin 1.14.9 nodes)
++
++const BCHN_ADDRESS: &str = "bchreg:qqev205kzqvvjxukn777wwg4zqmp3v7dyytrww9zgp";
++const BCHN_SCRIPT: &str = "76a91432c53e961018c91b969fbde73915103618b3cd2188ac";
++const DOGE_ADDRESS: &str = "n3Wx9JBRVoi5mKk7cjdgYyMiHmJ5zFVFBN";
++const DOGE_SCRIPT: &str = "76a914f152a426460a09138a0159450b158005d4e338be88ac";
++
++#[test]
++fn bitcoin_cash_and_dogecoin_regtest_genesis_match_the_nodes() {
++    let bch = HeaderSequence::new(BchNetwork::Regtest).unwrap();
++    assert_eq!(bch.header(0).unwrap().block_hash().to_string(), "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206");
++    let doge = HeaderSequence::new(DogeNetwork::Regtest).unwrap();
++    assert_eq!(bitcoin::consensus::serialize(&doge.header(0).unwrap()),
++        bytes("010000000000000000000000000000000000000000000000000000000000000000000000696ad20e2dd4365c7459b4a4a5af743d5e92c6da3229e6532cd605f6533f2a5bdae5494dffff7f2002000000"));
++    assert_eq!(doge.header(0).unwrap().block_hash().to_string(), "3d2160a3b5dc4a9d62e7e66a295f70313ac808440ef7400d6c0772171ce973a5");
++}
++
++#[test]
++fn unimplemented_bitcoin_cash_and_dogecoin_deployments_are_refused() {
++    for network in [LightNetwork::from(BchNetwork::Mainnet), BchNetwork::Testnet.into(), DogeNetwork::Mainnet.into(), DogeNetwork::Testnet.into()] {
++        let error = HeaderSequence::new(network).err().expect("must refuse").to_string();
++        assert!(error.contains("not implemented"), "{error}");
++    }
++}
++
++#[test]
++fn bitcoin_cash_and_dogecoin_identity_and_storage_binding() {
++    let bch = LightNetwork::from(BchNetwork::Mainnet);
++    assert_eq!((bch.coin(), bch.tag(), bch.coin_type(), bch.purpose(), bch.script_kind()), ("Bitcoin Cash", "bch", 145, 44, ScriptKind::P2pkhForkId));
++    let doge = LightNetwork::from(DogeNetwork::Mainnet);
++    assert_eq!((doge.coin(), doge.tag(), doge.coin_type(), doge.purpose(), doge.script_kind()), ("Dogecoin", "doge", 3, 44, ScriptKind::P2pkhLegacy));
++    assert_eq!(LightNetwork::from(DogeNetwork::Regtest).coin_type(), 1);
++    // Bitcoin Cash shares Bitcoin's genesis but never its persisted wallet identity.
++    for (btc, bch) in [(BtcNetwork::Mainnet, BchNetwork::Mainnet), (BtcNetwork::Testnet, BchNetwork::Testnet), (BtcNetwork::Regtest, BchNetwork::Regtest)] {
++        let (btc, bch) = (LightNetwork::from(btc), LightNetwork::from(bch));
++        assert_eq!(btc.genesis(), bch.genesis());
++        assert_ne!(btc.storage_identity(), bch.storage_identity());
++        assert_eq!(bch.storage_identity().len(), 64);
++        assert_eq!(btc.storage_identity(), btc.genesis());
++    }
++    for network in LTC_NETWORKS { assert_eq!(LightNetwork::from(network).storage_identity(), network.genesis()); }
++}
++
++#[test]
++fn cashaddr_matches_bchn_and_the_specification() {
++    let script = ScriptBuf::from_bytes(bytes(BCHN_SCRIPT));
++    assert_eq!(LegacyAddress::from_script(BchNetwork::Regtest, &script).unwrap().to_string(), BCHN_ADDRESS);
++    assert_eq!(LegacyAddress::parse(BchNetwork::Regtest, BCHN_ADDRESS).unwrap().script_pubkey(), &script);
++    // CashAddr specification vector: 1BpEi6DfDAUFd7GtittLSdBeYJvcoaVggu.
++    let spec = ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array(bytes("76a04053bda0a88bda5177b86a15c3b29f559873").try_into().unwrap()));
++    assert_eq!(LegacyAddress::from_script(BchNetwork::Mainnet, &spec).unwrap().to_string(), "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a");
++    let p2sh = ScriptBuf::new_p2sh(&bitcoin::ScriptHash::from_byte_array(bytes("76a04053bda0a88bda5177b86a15c3b29f559873").try_into().unwrap()));
++    assert_eq!(LegacyAddress::from_script(BchNetwork::Mainnet, &p2sh).unwrap().to_string(), "bitcoincash:ppm2qsznhks23z7629mms6s4cwef74vcwvn0h829pq");
++    assert!(LegacyAddress::parse(BchNetwork::Mainnet, BCHN_ADDRESS).is_err(), "regtest prefix on mainnet");
++    let mut corrupted = BCHN_ADDRESS.to_string(); corrupted.pop(); corrupted.push('q');
++    assert!(LegacyAddress::parse(BchNetwork::Regtest, &corrupted).is_err(), "checksum");
++    assert!(LegacyAddress::parse(BchNetwork::Regtest, &BCHN_ADDRESS.to_uppercase()).is_err(), "noncanonical case");
++    assert!(LegacyAddress::parse(BchNetwork::Regtest, &BCHN_ADDRESS["bchreg:".len()..]).is_err(), "prefix required");
++}
++
++#[test]
++fn dogecoin_base58_matches_the_node_and_rejects_other_networks() {
++    let script = ScriptBuf::from_bytes(bytes(DOGE_SCRIPT));
++    assert_eq!(LegacyAddress::from_script(DogeNetwork::Regtest, &script).unwrap().to_string(), DOGE_ADDRESS);
++    assert_eq!(LegacyAddress::parse(DogeNetwork::Regtest, DOGE_ADDRESS).unwrap().script_pubkey(), &script);
++    let main = LegacyAddress::from_script(DogeNetwork::Mainnet, &script).unwrap().to_string();
++    assert!(main.starts_with('D'), "{main}");
++    assert!(LegacyAddress::parse(DogeNetwork::Mainnet, DOGE_ADDRESS).is_err());
++    assert!(LegacyAddress::parse(DogeNetwork::Regtest, &main).is_err());
++    assert!(LegacyAddress::from_script(DogeNetwork::Regtest, &ScriptBuf::from_bytes(bytes("0014751e76e8199196d454941c45d1b3a323f1433bd6"))).is_err(), "no SegWit on Dogecoin");
++    assert!(SegwitAddress::from_script(DogeNetwork::Regtest, &ScriptBuf::from_bytes(bytes("0014751e76e8199196d454941c45d1b3a323f1433bd6"))).is_err());
++    assert!(LegacyAddress::from_script(BtcNetwork::Mainnet, &script).is_err(), "Bitcoin uses SegWit addresses here");
++    assert!(matches!(LightAddress::parse(DogeNetwork::Regtest, DOGE_ADDRESS).unwrap(), LightAddress::Legacy(_)));
++    assert!(matches!(LightAddress::parse(BtcNetwork::Mainnet, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap(), LightAddress::Segwit(_)));
++}
++
++#[test]
++fn bitcoin_cash_and_dogecoin_accounts_derive_bip44_p2pkh() {
++    let seed = bytes("5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4");
++    let master = Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
++    let bch = PublicAccount::from_master(&master, BchNetwork::Mainnet, 0).unwrap().derive(Branch::Receive, 0).unwrap();
++    assert_eq!(bch.path().to_string(), "44'/145'/0'/0/0");
++    assert!(bch.address().script_pubkey().is_p2pkh() && bch.address().to_string().starts_with("bitcoincash:q"));
++    let doge = PublicAccount::from_master(&master, DogeNetwork::Mainnet, 0).unwrap().derive(Branch::Change, 3).unwrap();
++    assert_eq!(doge.path().to_string(), "44'/3'/0'/1/3");
++    assert!(doge.address().script_pubkey().is_p2pkh() && doge.address().to_string().starts_with('D'));
++    // The derived key hashes to the derived P2PKH script.
++    assert_eq!(doge.address().script_pubkey(), &ScriptBuf::new_p2pkh(&doge.public_key().pubkey_hash()));
++}
++
++#[test]
++fn bitcoin_cash_and_dogecoin_regtest_header_versions() {
++    let doge = LightNetwork::from(DogeNetwork::Regtest);
++    assert!(doge.check_version(5000, 0x620004).is_ok());
++    assert!(doge.check_version(5000, 0x620104).is_err(), "AuxPoW headers refused");
++    assert!(doge.check_version(5000, 0x630004).is_err(), "foreign chain ID");
++    assert!(doge.check_version(2000, 0x620002).is_err(), "BIP65 base version");
++    let bch = LightNetwork::from(BchNetwork::Regtest);
++    assert!(bch.check_version(5000, 0x20000000).is_ok());
++    assert!(bch.check_version(1351, 3).is_err());
++}
+diff --color -ruN a/swap-machine/src/litecoin_light/network.rs b/swap-machine/src/litecoin_light/network.rs
+--- a/swap-machine/src/litecoin_light/network.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/swap-machine/src/litecoin_light/network.rs	2026-10-12 00:05:54.491933045 +0100
+@@ -0,0 +1,509 @@
++//! Chain identity and header consensus rules for the shared UTXO light wallet.
++//! Litecoin rules are pinned to Core v0.21.5.8 and unchanged from the original
++//! Litecoin-only implementation. Bitcoin rules follow Bitcoin Core's
++//! `GetNextWorkRequired`/`CalculateNextWorkRequired` and contextual header checks.
++//! A network value names both the chain and its deployment, so a Bitcoin chain,
++//! vault or session can never be mistaken for a Litecoin one at runtime.
++use anyhow::{Context, Result, ensure};
++use bitcoin::{BlockHash, CompactTarget, NetworkKind, ScriptBuf, TxMerkleNode, WitnessProgram, WitnessVersion,
++    bech32::{Hrp, segwit}, block::{Header, Version}, hashes::Hash};
++use num_bigint::BigUint;
++use std::fmt;
++use swap_core::litecoin_address::LtcNetwork;
++
++/// Bitcoin deployments. Testnet is testnet3 (testnet4 uses BIP94 rules not implemented here).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum BtcNetwork { Mainnet, Testnet, Regtest }
++/// Bitcoin Cash deployments. Only regtest header rules are implemented: mainnet
++/// and testnet need a post-fork checkpoint and ASERT, and are refused.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum BchNetwork { Mainnet, Testnet, Regtest }
++/// Dogecoin deployments. Only regtest header rules are implemented: mainnet and
++/// testnet need DigiShield, AuxPoW and checkpoints, and are refused.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum DogeNetwork { Mainnet, Testnet, Regtest }
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum LightNetwork { Litecoin(LtcNetwork), Bitcoin(BtcNetwork), BitcoinCash(BchNetwork), Dogecoin(DogeNetwork) }
++
++/// How owned outputs are locked and signed.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ScriptKind {
++    /// Native SegWit v0 P2WPKH under BIP84 (Litecoin, Bitcoin).
++    WitnessV0,
++    /// P2PKH under BIP44 with the pre-SegWit signature hash (Dogecoin).
++    P2pkhLegacy,
++    /// P2PKH under BIP44 with the BIP143-style SIGHASH_FORKID hash (Bitcoin Cash).
++    P2pkhForkId,
++}
++
++impl From<LtcNetwork> for LightNetwork { fn from(network: LtcNetwork) -> Self { Self::Litecoin(network) } }
++impl From<BtcNetwork> for LightNetwork { fn from(network: BtcNetwork) -> Self { Self::Bitcoin(network) } }
++impl From<BchNetwork> for LightNetwork { fn from(network: BchNetwork) -> Self { Self::BitcoinCash(network) } }
++impl From<DogeNetwork> for LightNetwork { fn from(network: DogeNetwork) -> Self { Self::Dogecoin(network) } }
++impl PartialEq<LtcNetwork> for LightNetwork {
++    fn eq(&self, other: &LtcNetwork) -> bool { *self == Self::Litecoin(*other) }
++}
++
++impl LightNetwork {
++    /// Human chain name, for messages only.
++    pub fn coin(self) -> &'static str {
++        match self { Self::Litecoin(_) => "Litecoin", Self::Bitcoin(_) => "Bitcoin",
++            Self::BitcoinCash(_) => "Bitcoin Cash", Self::Dogecoin(_) => "Dogecoin" }
++    }
++    /// Short tag used in persisted schema names (`monzero-ltc-…`, `monzero-btc-…`).
++    pub fn tag(self) -> &'static str {
++        match self { Self::Litecoin(_) => "ltc", Self::Bitcoin(_) => "btc", Self::BitcoinCash(_) => "bch", Self::Dogecoin(_) => "doge" }
++    }
++    /// Deployment name as reported by the chain's Core node (`getblockchaininfo.chain`).
++    pub fn name(self) -> &'static str {
++        match self {
++            Self::Litecoin(network) => network.name(),
++            Self::Bitcoin(BtcNetwork::Mainnet) | Self::BitcoinCash(BchNetwork::Mainnet) | Self::Dogecoin(DogeNetwork::Mainnet) => "main",
++            Self::Bitcoin(BtcNetwork::Testnet) | Self::BitcoinCash(BchNetwork::Testnet) | Self::Dogecoin(DogeNetwork::Testnet) => "test",
++            Self::Bitcoin(BtcNetwork::Regtest) | Self::BitcoinCash(BchNetwork::Regtest) | Self::Dogecoin(DogeNetwork::Regtest) => "regtest",
++        }
++    }
++    /// Bech32 human-readable part; empty for chains without SegWit addresses.
++    pub fn hrp(self) -> &'static str {
++        match self {
++            Self::Litecoin(network) => network.hrp(),
++            Self::Bitcoin(BtcNetwork::Mainnet) => "bc",
++            Self::Bitcoin(BtcNetwork::Testnet) => "tb",
++            Self::Bitcoin(BtcNetwork::Regtest) => "bcrt",
++            Self::BitcoinCash(_) | Self::Dogecoin(_) => "",
++        }
++    }
++    pub fn genesis(self) -> &'static str {
++        match self {
++            Self::Litecoin(network) => network.genesis(),
++            // Bitcoin Cash shares Bitcoin's genesis blocks.
++            Self::Bitcoin(BtcNetwork::Mainnet) | Self::BitcoinCash(BchNetwork::Mainnet) => "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
++            Self::Bitcoin(BtcNetwork::Testnet) | Self::BitcoinCash(BchNetwork::Testnet) => "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
++            Self::Bitcoin(BtcNetwork::Regtest) | Self::BitcoinCash(BchNetwork::Regtest) => "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
++            Self::Dogecoin(DogeNetwork::Mainnet) => "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691",
++            Self::Dogecoin(DogeNetwork::Testnet) => "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e",
++            Self::Dogecoin(DogeNetwork::Regtest) => "3d2160a3b5dc4a9d62e7e66a295f70313ac808440ef7400d6c0772171ce973a5",
++        }
++    }
++    /// 64-character identity binding persisted wallet records to one chain and
++    /// deployment. Equal to the genesis hash except for Bitcoin Cash, whose
++    /// genesis is Bitcoin's; Litecoin and Bitcoin records are unchanged.
++    pub fn storage_identity(self) -> String {
++        match self {
++            Self::BitcoinCash(_) => {
++                let tagged = format!("monzero-bch-light-identity-v1:{}", self.genesis());
++                bitcoin::hashes::sha256::Hash::hash(tagged.as_bytes()).to_string()
++            }
++            _ => self.genesis().to_string(),
++        }
++    }
++    pub fn is_mainnet(self) -> bool {
++        matches!(self, Self::Litecoin(LtcNetwork::Mainnet) | Self::Bitcoin(BtcNetwork::Mainnet)
++            | Self::BitcoinCash(BchNetwork::Mainnet) | Self::Dogecoin(DogeNetwork::Mainnet))
++    }
++    /// BIP32 key version family: test networks share testnet key prefixes.
++    pub fn network_kind(self) -> NetworkKind {
++        if self.is_mainnet() { NetworkKind::Main } else { NetworkKind::Test }
++    }
++    /// SLIP-44 coin type for account paths; every test network uses 1.
++    pub fn coin_type(self) -> u32 {
++        match self {
++            Self::Litecoin(LtcNetwork::Mainnet) => 2,
++            Self::Bitcoin(BtcNetwork::Mainnet) => 0,
++            Self::BitcoinCash(BchNetwork::Mainnet) => 145,
++            Self::Dogecoin(DogeNetwork::Mainnet) => 3,
++            _ => 1,
++        }
++    }
++    pub fn script_kind(self) -> ScriptKind {
++        match self {
++            Self::Litecoin(_) | Self::Bitcoin(_) => ScriptKind::WitnessV0,
++            Self::BitcoinCash(_) => ScriptKind::P2pkhForkId,
++            Self::Dogecoin(_) => ScriptKind::P2pkhLegacy,
++        }
++    }
++    /// BIP43 purpose: 84 for native SegWit accounts, 44 for P2PKH accounts.
++    pub fn purpose(self) -> u32 {
++        if self.script_kind() == ScriptKind::WitnessV0 { 84 } else { 44 }
++    }
++    /// Header consensus rules implemented for this deployment. Refusing is
++    /// safer than accepting headers under rules that were never checked.
++    pub(super) fn ensure_header_rules(self) -> Result<()> {
++        ensure!(!matches!(self, Self::BitcoinCash(BchNetwork::Mainnet | BchNetwork::Testnet)),
++            "Bitcoin Cash {} header validation needs a post-fork checkpoint and ASERT, which are not implemented", self.name());
++        ensure!(!matches!(self, Self::Dogecoin(DogeNetwork::Mainnet | DogeNetwork::Testnet)),
++            "Dogecoin {} header validation needs DigiShield, AuxPoW and checkpoints, which are not implemented", self.name());
++        Ok(())
++    }
++
++    pub(super) fn genesis_header(self) -> Result<Header> {
++        self.ensure_header_rules()?;
++        let (merkle, time, nonce, bits) = match self {
++            Self::Litecoin(network) => {
++                let (time, nonce, bits) = match network {
++                    LtcNetwork::Mainnet => (1317972665, 2084524493, 0x1e0ffff0),
++                    LtcNetwork::Testnet => (1486949366, 293345, 0x1e0ffff0),
++                    LtcNetwork::Regtest => (1296688602, 0, 0x207fffff),
++                };
++                ("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9", time, nonce, bits)
++            }
++            Self::Bitcoin(network) => {
++                let (time, nonce, bits) = match network {
++                    BtcNetwork::Mainnet => (1231006505, 2083236893, 0x1d00ffff),
++                    BtcNetwork::Testnet => (1296688602, 414098458, 0x1d00ffff),
++                    BtcNetwork::Regtest => (1296688602, 2, 0x207fffff),
++                };
++                ("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b", time, nonce, bits)
++            }
++            Self::BitcoinCash(network) => {
++                let (time, nonce, bits) = match network {
++                    BchNetwork::Mainnet => (1231006505, 2083236893, 0x1d00ffff),
++                    BchNetwork::Testnet => (1296688602, 414098458, 0x1d00ffff),
++                    BchNetwork::Regtest => (1296688602, 2, 0x207fffff),
++                };
++                ("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b", time, nonce, bits)
++            }
++            Self::Dogecoin(network) => {
++                let (time, nonce, bits) = match network {
++                    DogeNetwork::Mainnet => (1386325540, 99943, 0x1e0ffff0),
++                    DogeNetwork::Testnet => (1391503289, 997879, 0x1e0ffff0),
++                    DogeNetwork::Regtest => (1296688602, 2, 0x207fffff),
++                };
++                ("5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69", time, nonce, bits)
++            }
++        };
++        let genesis = Header { version: Version::from_consensus(1), prev_blockhash: BlockHash::all_zeros(),
++            merkle_root: merkle.parse::<TxMerkleNode>()?, time,
++            bits: CompactTarget::from_consensus(bits), nonce };
++        ensure!(genesis.block_hash().to_string() == self.genesis(), "{} genesis constants changed", self.coin());
++        Ok(genesis)
++    }
++
++    /// Proof-of-work value of a serialized header, little-endian as compared with targets.
++    pub(super) fn pow_value(self, header: &[u8]) -> Result<BigUint> {
++        ensure!(header.len() == 80, "invalid {} header length", self.coin());
++        Ok(match self {
++            Self::Litecoin(_) | Self::Dogecoin(_) => BigUint::from_bytes_le(&scrypt_hash(header)?),
++            Self::Bitcoin(_) | Self::BitcoinCash(_) =>
++                BigUint::from_bytes_le(&bitcoin::hashes::sha256d::Hash::hash(header).to_byte_array()),
++        })
++    }
++
++    pub(super) fn limit(self) -> BigUint {
++        let bits = match self {
++            Self::Litecoin(LtcNetwork::Regtest) | Self::Bitcoin(BtcNetwork::Regtest)
++                | Self::BitcoinCash(BchNetwork::Regtest) | Self::Dogecoin(DogeNetwork::Regtest) => 255,
++            Self::Litecoin(_) | Self::Dogecoin(_) => 236,
++            Self::Bitcoin(_) | Self::BitcoinCash(_) => 224,
++        };
++        (BigUint::from(1u8) << bits) - BigUint::from(1u8)
++    }
++
++    pub(super) fn target(self, bits: u32) -> Result<BigUint> {
++        let size = bits >> 24; let word = bits & 0x007fffff;
++        ensure!(bits & 0x00800000 == 0 && word != 0 && size <= 34
++            && !(word > 0xff && size > 33) && !(word > 0xffff && size > 32), "invalid {} compact target", self.coin());
++        let value = if size <= 3 { BigUint::from(word >> (8 * (3 - size))) }
++            else { BigUint::from(word) << (8 * (size - 3)) as usize };
++        ensure!(value != BigUint::from(0u8) && value <= self.limit(), "{} target outside network limit", self.coin());
++        Ok(value)
++    }
++
++    pub(super) fn next_bits(self, headers: &[Header], time: u32) -> Result<u32> {
++        self.ensure_header_rules()?;
++        let previous = headers.last().context("missing difficulty history")?;
++        // Implemented Bitcoin Cash and Dogecoin deployments are regtest only, where
++        // every block keeps the minimum difficulty and nodes never retarget.
++        if matches!(self, Self::BitcoinCash(_) | Self::Dogecoin(_)) { return Ok(previous.bits.to_consensus()) }
++        let height = headers.len();
++        let easiest = compact(&self.limit());
++        // Minimum-difficulty blocks on test networks: twice the target spacing.
++        let (min_difficulty_gap, timespan) = match self {
++            Self::Litecoin(_) => (300, 302400),
++            _ => (1200, 1209600),
++        };
++        if height % 2016 != 0 {
++            if !self.is_mainnet() {
++                if u64::from(time) > u64::from(previous.time) + min_difficulty_gap { return Ok(easiest) }
++                let mut index = height - 1;
++                while index > 0 && index % 2016 != 0 && headers[index].bits.to_consensus() == easiest { index -= 1; }
++                return Ok(headers[index].bits.to_consensus())
++            }
++            return Ok(previous.bits.to_consensus())
++        }
++        if matches!(self, Self::Litecoin(LtcNetwork::Regtest) | Self::Bitcoin(BtcNetwork::Regtest)) {
++            return Ok(previous.bits.to_consensus())
++        }
++        let first = match self {
++            // Litecoin uses an extra ancestor after the first adjustment interval.
++            Self::Litecoin(_) => if height == 2016 { 0 } else { height - 2017 },
++            _ => height - 2016,
++        };
++        let elapsed = i64::from(previous.time) - i64::from(headers[first].time);
++        self.retarget(previous.bits.to_consensus(), elapsed, timespan)
++    }
++
++    pub(super) fn retarget(self, bits: u32, elapsed: i64, timespan: u64) -> Result<u32> {
++        let mut value = self.target(bits)?;
++        let limit = self.limit();
++        let clamped = elapsed.clamp(timespan as i64 / 4, timespan as i64 * 4) as u64;
++        // Litecoin Core shifts once to avoid 256-bit overflow; Bitcoin Core does not.
++        let shift = matches!(self, Self::Litecoin(_)) && value.bits() > limit.bits() - 1;
++        if shift { value >>= 1usize; }
++        value *= clamped;
++        value /= timespan;
++        if shift { value <<= 1usize; }
++        Ok(compact(&value.min(limit)))
++    }
++
++    pub(super) fn check_version(self, height: u32, version: i32) -> Result<()> {
++        let (version, bip34, bip66, bip65, segwit_version) = match self {
++            // BCHN regtest: BIP34 inactive, BIP66 at 1251, BIP65 at 1351.
++            Self::BitcoinCash(_) => (version, u32::MAX, 1251, 1351, None),
++            // Dogecoin encodes its AuxPoW chain ID (0x62) above the base version.
++            Self::Dogecoin(_) => {
++                ensure!(version & 0x100 == 0, "Dogecoin AuxPoW headers are not supported");
++                ensure!(version < 0x100 || version >> 16 == 0x62, "wrong Dogecoin AuxPoW chain ID");
++                (version & 0xff, u32::MAX, 1251, 1351, None)
++            }
++            _ => { let (a, b, c, d) = self.activation_heights(); (version, a, b, c, d) }
++        };
++        ensure!(!(height >= bip34 && version < 2) && !(height >= bip66 && version < 3)
++            && !(height >= bip65 && version < 4)
++            && !segwit_version.is_some_and(|segwit| height >= segwit && version < 0x20000000),
++            "outdated {} header version", self.coin());
++        Ok(())
++    }
++
++    fn activation_heights(self) -> (u32, u32, u32, Option<u32>) {
++        match self {
++            Self::Litecoin(LtcNetwork::Mainnet) => (710000, 811879, 918684, Some(1201536)),
++            Self::Litecoin(LtcNetwork::Testnet) => (76, 76, 76, Some(6048)),
++            Self::Litecoin(LtcNetwork::Regtest) => (500, 1251, 1351, Some(0)),
++            Self::Bitcoin(BtcNetwork::Mainnet) => (227931, 363725, 388381, None),
++            Self::Bitcoin(BtcNetwork::Testnet) => (21111, 330776, 581885, None),
++            Self::Bitcoin(BtcNetwork::Regtest) => (1, 1, 1, None),
++            Self::BitcoinCash(_) | Self::Dogecoin(_) => (u32::MAX, u32::MAX, u32::MAX, None),
++        }
++    }
++}
++
++pub(super) fn compact(value: &BigUint) -> u32 {
++    let mut size = value.bits().div_ceil(8) as u32;
++    let shifted = if size <= 3 { value << (8 * (3 - size)) as usize } else { value >> (8 * (size - 3)) as usize };
++    let mut word = shifted.to_bytes_be().iter().fold(0u32, |word, byte| (word << 8) | u32::from(*byte));
++    if word & 0x00800000 != 0 { word >>= 8; size += 1; }
++    word | (size << 24)
++}
++
++pub(super) fn block_work(target: &BigUint) -> BigUint {
++    (BigUint::from(1u8) << 256usize) / (target + BigUint::from(1u8))
++}
++
++/// Fixed Litecoin N=1024, r=1, p=1, 32-byte output. Never Bitcoin SHA256d work.
++pub(super) fn scrypt_hash(header: &[u8]) -> Result<[u8; 32]> {
++    ensure!(header.len() == 80, "invalid Scrypt header length");
++    let params = scrypt::Params::new(10, 1, 1, 32).map_err(|_| anyhow::anyhow!("invalid Litecoin Scrypt parameters"))?;
++    let mut output = [0; 32];
++    scrypt::scrypt(header, header, &params, &mut output).map_err(|_| anyhow::anyhow!("Litecoin Scrypt failed"))?;
++    Ok(output)
++}
++
++/// Native-SegWit destination for any light-wallet chain: P2WPKH, P2WSH and P2TR.
++/// Encoding is identical to `LtcSegwitAddress` for Litecoin networks.
++/// Parsing does not establish wallet ownership, chain activation or fee policy.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct SegwitAddress {
++    network: LightNetwork,
++    encoded: String,
++    script: ScriptBuf,
++}
++
++impl SegwitAddress {
++    pub fn parse(network: impl Into<LightNetwork>, value: &str) -> Result<Self> {
++        let network = network.into();
++        ensure!(network.script_kind() == ScriptKind::WitnessV0, "{} has no SegWit addresses", network.coin());
++        ensure!(value.len() <= 90, "{} address too long", network.coin());
++        let (hrp, version, program) = segwit::decode(value)
++            .with_context(|| format!("invalid {} SegWit address", network.coin()))?;
++        ensure!(hrp == Hrp::parse(network.hrp())?, "wrong {} address network", network.coin());
++        let version = match version.to_u8() {
++            0 => WitnessVersion::V0,
++            1 if program.len() == 32 => WitnessVersion::V1,
++            _ => anyhow::bail!("unsupported {} witness program", network.coin()),
++        };
++        let script = ScriptBuf::new_witness_program(&WitnessProgram::new(version, &program)?);
++        let address = Self::from_script(network, &script)?;
++        ensure!(address.encoded == value, "noncanonical {} address", network.coin());
++        Ok(address)
++    }
++
++    pub fn from_script(network: impl Into<LightNetwork>, script: &ScriptBuf) -> Result<Self> {
++        let network = network.into();
++        ensure!(network.script_kind() == ScriptKind::WitnessV0, "{} has no SegWit addresses", network.coin());
++        ensure!(script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr(),
++            "unsupported {} destination script", network.coin());
++        let hrp = Hrp::parse(network.hrp())?;
++        let program = &script.as_bytes()[2..];
++        let encoded = if script.is_p2tr() { segwit::encode_v1(hrp, program)? }
++            else { segwit::encode_v0(hrp, program)? };
++        Ok(Self { network, encoded, script: script.clone() })
++    }
++
++    pub fn network(&self) -> LightNetwork { self.network }
++    pub fn script_pubkey(&self) -> &ScriptBuf { &self.script }
++}
++
++impl fmt::Display for SegwitAddress {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.encoded) }
++}
++
++/// P2PKH/P2SH destination for chains without SegWit: CashAddr for Bitcoin Cash
++/// (canonical lowercase with prefix), Base58Check for Dogecoin.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct LegacyAddress {
++    network: LightNetwork,
++    encoded: String,
++    script: ScriptBuf,
++}
++
++const CASHADDR_CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
++
++fn cashaddr_prefix(network: LightNetwork) -> Option<&'static str> {
++    match network {
++        LightNetwork::BitcoinCash(BchNetwork::Mainnet) => Some("bitcoincash"),
++        LightNetwork::BitcoinCash(BchNetwork::Testnet) => Some("bchtest"),
++        LightNetwork::BitcoinCash(BchNetwork::Regtest) => Some("bchreg"),
++        _ => None,
++    }
++}
++/// Base58Check version bytes (P2PKH, P2SH).
++fn base58_versions(network: LightNetwork) -> Option<(u8, u8)> {
++    match network {
++        LightNetwork::Dogecoin(DogeNetwork::Mainnet) => Some((30, 22)),
++        LightNetwork::Dogecoin(DogeNetwork::Testnet) => Some((113, 196)),
++        LightNetwork::Dogecoin(DogeNetwork::Regtest) => Some((111, 196)),
++        _ => None,
++    }
++}
++fn cashaddr_polymod(values: &[u8]) -> u64 {
++    let mut c: u64 = 1;
++    for value in values {
++        let c0 = (c >> 35) as u8;
++        c = ((c & 0x07_ffff_ffff) << 5) ^ u64::from(*value);
++        for (bit, generator) in [0x98f2bc8e61u64, 0x79b76d99e2, 0xf33e5fb3c4, 0xae2eabe2a8, 0x1e4f43e470].iter().enumerate() {
++            if c0 & (1 << bit) != 0 { c ^= generator; }
++        }
++    }
++    c ^ 1
++}
++fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Result<Vec<u8>> {
++    let (mut acc, mut bits, mut out) = (0u32, 0u32, Vec::new());
++    let maximum = (1u32 << to) - 1;
++    for value in data {
++        ensure!(u32::from(*value) >> from == 0, "invalid CashAddr data");
++        acc = (acc << from) | u32::from(*value); bits += from;
++        while bits >= to { bits -= to; out.push(((acc >> bits) & maximum) as u8); }
++    }
++    if pad { if bits > 0 { out.push(((acc << (to - bits)) & maximum) as u8); } }
++    else { ensure!(bits < from && (acc << (to - bits)) & maximum == 0, "invalid CashAddr padding"); }
++    Ok(out)
++}
++fn cashaddr_encode(prefix: &str, version: u8, hash: &[u8; 20]) -> Result<String> {
++    let mut payload = vec![version]; payload.extend_from_slice(hash);
++    let data = convert_bits(&payload, 8, 5, true)?;
++    let mut checked: Vec<u8> = prefix.bytes().map(|b| b & 0x1f).collect();
++    checked.push(0); checked.extend_from_slice(&data); checked.extend_from_slice(&[0; 8]);
++    let checksum = cashaddr_polymod(&checked);
++    let mut encoded = format!("{prefix}:");
++    for value in data.iter().copied().chain((0..8).map(|i| ((checksum >> (5 * (7 - i))) & 0x1f) as u8)) {
++        encoded.push(CASHADDR_CHARSET[value as usize] as char);
++    }
++    Ok(encoded)
++}
++fn cashaddr_decode(prefix: &str, value: &str) -> Result<(u8, [u8; 20])> {
++    let body = value.strip_prefix(prefix).and_then(|rest| rest.strip_prefix(':')).context("wrong CashAddr prefix")?;
++    let data: Vec<u8> = body.bytes().map(|b| CASHADDR_CHARSET.iter().position(|c| *c == b).map(|i| i as u8))
++        .collect::<Option<_>>().context("invalid CashAddr character")?;
++    ensure!(data.len() == 42, "unsupported CashAddr length");
++    let mut checked: Vec<u8> = prefix.bytes().map(|b| b & 0x1f).collect();
++    checked.push(0); checked.extend_from_slice(&data);
++    ensure!(cashaddr_polymod(&checked) == 0, "invalid CashAddr checksum");
++    let payload = convert_bits(&data[..34], 5, 8, false)?;
++    ensure!(payload.len() == 21, "invalid CashAddr payload");
++    Ok((payload[0], payload[1..].try_into()?))
++}
++
++impl LegacyAddress {
++    pub fn from_script(network: impl Into<LightNetwork>, script: &ScriptBuf) -> Result<Self> {
++        let network = network.into();
++        ensure!(network.script_kind() != ScriptKind::WitnessV0, "{} uses SegWit addresses", network.coin());
++        let bytes = script.as_bytes();
++        let (p2sh, hash): (bool, [u8; 20]) = if script.is_p2pkh() { (false, bytes[3..23].try_into()?) }
++            else if script.is_p2sh() { (true, bytes[2..22].try_into()?) }
++            else { anyhow::bail!("unsupported {} destination script", network.coin()) };
++        let encoded = if let Some(prefix) = cashaddr_prefix(network) {
++            cashaddr_encode(prefix, if p2sh { 8 } else { 0 }, &hash)?
++        } else {
++            let (pubkey, scripthash) = base58_versions(network).context("missing address versions")?;
++            let mut data = vec![if p2sh { scripthash } else { pubkey }]; data.extend_from_slice(&hash);
++            bitcoin::base58::encode_check(&data)
++        };
++        Ok(Self { network, encoded, script: script.clone() })
++    }
++    pub fn parse(network: impl Into<LightNetwork>, value: &str) -> Result<Self> {
++        let network = network.into();
++        ensure!(value.len() <= 120, "{} address too long", network.coin());
++        let (p2sh, hash) = if let Some(prefix) = cashaddr_prefix(network) {
++            let (version, hash) = cashaddr_decode(prefix, value)?;
++            ensure!(version == 0 || version == 8, "unsupported Bitcoin Cash address type");
++            (version == 8, hash)
++        } else {
++            let (pubkey, scripthash) = base58_versions(network).with_context(|| format!("{} uses SegWit addresses", network.coin()))?;
++            let data = bitcoin::base58::decode_check(value).with_context(|| format!("invalid {} address", network.coin()))?;
++            ensure!(data.len() == 21 && (data[0] == pubkey || data[0] == scripthash), "wrong {} address network", network.coin());
++            (data[0] == scripthash, data[1..].try_into()?)
++        };
++        let script = if p2sh { ScriptBuf::new_p2sh(&bitcoin::ScriptHash::from_byte_array(hash)) }
++            else { ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array(hash)) };
++        let address = Self::from_script(network, &script)?;
++        ensure!(address.encoded == value, "noncanonical {} address", network.coin());
++        Ok(address)
++    }
++    pub fn network(&self) -> LightNetwork { self.network }
++    pub fn script_pubkey(&self) -> &ScriptBuf { &self.script }
++}
++impl fmt::Display for LegacyAddress {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.encoded) }
++}
++
++/// The destination format a light-wallet chain uses.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum LightAddress { Segwit(SegwitAddress), Legacy(LegacyAddress) }
++impl LightAddress {
++    pub fn parse(network: impl Into<LightNetwork>, value: &str) -> Result<Self> {
++        let network = network.into();
++        Ok(if network.script_kind() == ScriptKind::WitnessV0 { Self::Segwit(SegwitAddress::parse(network, value)?) }
++            else { Self::Legacy(LegacyAddress::parse(network, value)?) })
++    }
++    pub fn from_script(network: impl Into<LightNetwork>, script: &ScriptBuf) -> Result<Self> {
++        let network = network.into();
++        Ok(if network.script_kind() == ScriptKind::WitnessV0 { Self::Segwit(SegwitAddress::from_script(network, script)?) }
++            else { Self::Legacy(LegacyAddress::from_script(network, script)?) })
++    }
++    pub fn network(&self) -> LightNetwork {
++        match self { Self::Segwit(address) => address.network(), Self::Legacy(address) => address.network() }
++    }
++    pub fn script_pubkey(&self) -> &ScriptBuf {
++        match self { Self::Segwit(address) => address.script_pubkey(), Self::Legacy(address) => address.script_pubkey() }
++    }
++}
++impl fmt::Display for LightAddress {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self { Self::Segwit(address) => address.fmt(f), Self::Legacy(address) => address.fmt(f) }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --color -ruN a/swap-machine/src/litecoin_light/script/tests.rs b/swap-machine/src/litecoin_light/script/tests.rs
+--- a/swap-machine/src/litecoin_light/script/tests.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/swap-machine/src/litecoin_light/script/tests.rs	2026-10-12 00:05:54.492160184 +0100
+@@ -0,0 +1,103 @@
++//! Script-kind signing checks. The BIP143 implementation used for Bitcoin Cash
++//! is cross-checked against rust-bitcoin's independent P2WPKH digest, which is
++//! the same preimage with hash type 1. Real-node acceptance is covered by the
++//! Bitcoin Cash and Dogecoin end-to-end fixtures.
++use super::*;
++use bitcoin::{Amount, OutPoint, Sequence, Txid, absolute, secp256k1::{Message, Secp256k1, SecretKey}, transaction};
++
++fn key(byte: u8) -> (SecretKey, CompressedPublicKey) {
++    let secret = SecretKey::from_slice(&[byte; 32]).unwrap();
++    let public = CompressedPublicKey(secret.public_key(&Secp256k1::new()));
++    (secret, public)
++}
++fn spend(prevouts: usize) -> Transaction {
++    Transaction { version: transaction::Version::TWO, lock_time: absolute::LockTime::from_consensus(17),
++        input: (0..prevouts).map(|i| TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([i as u8 + 1; 32]), vout: i as u32 },
++            script_sig: ScriptBuf::new(), sequence: Sequence(0xffff_fffe - i as u32), witness: Witness::new() }).collect(),
++        output: vec![TxOut { value: Amount::from_sat(70_000), script_pubkey: ScriptBuf::new_op_return([1, 2, 3]) },
++                     TxOut { value: Amount::from_sat(29_000), script_pubkey: owned_script(ScriptKind::P2pkhForkId, &key(9).1) }] }
++}
++
++#[test]
++fn bip143_matches_rust_bitcoin_p2wpkh_digest_for_hash_type_one() {
++    let (_, public) = key(3);
++    let transaction = spend(3);
++    let witness_prevout = TxOut { value: Amount::from_sat(123_456), script_pubkey: owned_script(ScriptKind::WitnessV0, &public) };
++    let expected = SighashCache::new(&transaction)
++        .p2wpkh_signature_hash(1, &witness_prevout.script_pubkey, witness_prevout.value, EcdsaSighashType::All).unwrap();
++    // BIP143's P2WPKH scriptCode is the P2PKH script of the same key.
++    let script_code = owned_script(ScriptKind::P2pkhLegacy, &public);
++    assert_eq!(bip143_hash(&transaction, 1, &script_code, 123_456, 1).unwrap(), expected.to_byte_array());
++}
++
++#[test]
++fn forkid_digest_differs_only_by_hash_type_and_requires_p2pkh() {
++    let (_, public) = key(4);
++    let transaction = spend(2);
++    let prevout = TxOut { value: Amount::from_sat(99_000), script_pubkey: owned_script(ScriptKind::P2pkhForkId, &public) };
++    let forkid = signature_hash(ScriptKind::P2pkhForkId, &transaction, 0, &prevout).unwrap();
++    assert_eq!(forkid, bip143_hash(&transaction, 0, &prevout.script_pubkey, 99_000, 0x41).unwrap());
++    assert_ne!(forkid, bip143_hash(&transaction, 0, &prevout.script_pubkey, 99_000, 1).unwrap());
++    assert_ne!(forkid, signature_hash(ScriptKind::P2pkhLegacy, &transaction, 0, &prevout).unwrap(), "legacy and FORKID digests must differ");
++    let witness = TxOut { value: prevout.value, script_pubkey: owned_script(ScriptKind::WitnessV0, &public) };
++    assert!(signature_hash(ScriptKind::P2pkhForkId, &transaction, 0, &witness).is_err());
++    assert!(signature_hash(ScriptKind::P2pkhForkId, &transaction, 5, &prevout).is_err());
++}
++
++#[test]
++fn every_kind_round_trips_its_spending_format_and_verifies() {
++    let secp = Secp256k1::new();
++    for kind in [ScriptKind::WitnessV0, ScriptKind::P2pkhLegacy, ScriptKind::P2pkhForkId] {
++        let (secret, public) = key(5);
++        let prevout = TxOut { value: Amount::from_sat(50_000), script_pubkey: owned_script(kind, &public) };
++        let mut transaction = spend(1);
++        let digest = signature_hash(kind, &transaction, 0, &prevout).unwrap();
++        let signature = secp.sign_ecdsa(&Message::from_digest(digest), &secret);
++        finalize_input(kind, &mut transaction.input[0], &signature, &public).unwrap();
++        assert!(finalize_input(kind, &mut transaction.input[0], &signature, &public).is_err(), "double signing");
++        let (read, key_bytes) = signed_parts(kind, &transaction.input[0]).unwrap();
++        assert_eq!((read, key_bytes.as_slice()), (signature, public.to_bytes().as_slice()));
++        // The digest commits to no spending data: signing does not change it.
++        assert_eq!(signature_hash(kind, &transaction, 0, &prevout).unwrap(), digest);
++        secp.verify_ecdsa(&Message::from_digest(digest), &read, &public.0).unwrap();
++        assert_eq!(unsigned(&transaction), spend(1));
++        match kind {
++            ScriptKind::WitnessV0 => assert!(transaction.input[0].script_sig.is_empty() && transaction.input[0].witness.len() == 2),
++            _ => {
++                assert!(transaction.input[0].witness.is_empty());
++                let flag = *transaction.input[0].script_sig.as_bytes()[1..].iter().nth(signature.serialize_der().len()).unwrap();
++                assert_eq!(flag, if kind == ScriptKind::P2pkhForkId { 0x41 } else { 0x01 });
++            }
++        }
++    }
++}
++
++#[test]
++fn signed_parts_rejects_wrong_formats_and_hash_types() {
++    let secp = Secp256k1::new();
++    let (secret, public) = key(6);
++    let mut legacy = spend(1);
++    let prevout = TxOut { value: Amount::from_sat(1), script_pubkey: owned_script(ScriptKind::P2pkhLegacy, &public) };
++    let signature = secp.sign_ecdsa(&Message::from_digest(signature_hash(ScriptKind::P2pkhLegacy, &legacy, 0, &prevout).unwrap()), &secret);
++    finalize_input(ScriptKind::P2pkhLegacy, &mut legacy.input[0], &signature, &public).unwrap();
++    assert!(signed_parts(ScriptKind::P2pkhForkId, &legacy.input[0]).is_err(), "a legacy signature is not a FORKID signature");
++    assert!(signed_parts(ScriptKind::WitnessV0, &legacy.input[0]).is_err());
++    let mut extra = legacy.input[0].clone();
++    extra.script_sig = Builder::from(extra.script_sig.to_bytes()).push_slice([1u8]).into_script();
++    assert!(signed_parts(ScriptKind::P2pkhLegacy, &extra).is_err());
++    let mut opcode = legacy.input[0].clone();
++    opcode.script_sig = Builder::from(opcode.script_sig.to_bytes()).push_opcode(bitcoin::opcodes::all::OP_DROP).into_script();
++    assert!(signed_parts(ScriptKind::P2pkhLegacy, &opcode).is_err());
++}
++
++#[test]
++fn size_templates_cover_maximum_signatures() {
++    let mut witness = spend(2);
++    size_template(ScriptKind::WitnessV0, &mut witness).unwrap();
++    assert!(witness.input.iter().all(|i| i.witness.len() == 2 && i.script_sig.is_empty()));
++    let mut legacy = spend(2);
++    size_template(ScriptKind::P2pkhForkId, &mut legacy).unwrap();
++    // 1-byte push + 73-byte signature + 1-byte push + 33-byte key.
++    assert!(legacy.input.iter().all(|i| i.script_sig.len() == 108 && i.witness.is_empty()));
++    assert!(legacy.vsize() > witness.vsize(), "P2PKH inputs get no witness discount");
++}
+diff --color -ruN a/swap-machine/src/litecoin_light/script.rs b/swap-machine/src/litecoin_light/script.rs
+--- a/swap-machine/src/litecoin_light/script.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/swap-machine/src/litecoin_light/script.rs	2026-10-12 00:05:54.492059699 +0100
+@@ -0,0 +1,132 @@
++//! Owned-output locking and signing for each chain's script kind.
++//! SegWit v0 P2WPKH (Litecoin, Bitcoin), P2PKH with the legacy signature hash
++//! (Dogecoin) and P2PKH with the BIP143-style SIGHASH_FORKID hash (Bitcoin Cash).
++//! Every signature commits to all inputs and outputs (SIGHASH_ALL).
++use super::network::ScriptKind;
++use anyhow::{Context, Result, ensure};
++use bitcoin::{CompressedPublicKey, EcdsaSighashType, ScriptBuf, Transaction, TxIn, TxOut, Witness,
++    consensus::Encodable, ecdsa, hashes::{Hash, sha256d}, script::{Builder, Instruction, PushBytesBuf},
++    secp256k1, sighash::SighashCache};
++
++/// Bitcoin Cash replay-protected SIGHASH_ALL | SIGHASH_FORKID with fork id 0.
++const SIGHASH_ALL_FORKID: u8 = 0x41;
++/// Conservative DER signature plus hash-type byte.
++const MAX_SIGNATURE: usize = 73;
++
++/// Locking script controlled by `key`.
++pub fn owned_script(kind: ScriptKind, key: &CompressedPublicKey) -> ScriptBuf {
++    match kind {
++        ScriptKind::WitnessV0 => ScriptBuf::new_p2wpkh(&key.wpubkey_hash()),
++        ScriptKind::P2pkhLegacy | ScriptKind::P2pkhForkId => ScriptBuf::new_p2pkh(&key.pubkey_hash()),
++    }
++}
++
++fn hash_type(kind: ScriptKind) -> u8 {
++    match kind {
++        ScriptKind::WitnessV0 | ScriptKind::P2pkhLegacy => EcdsaSighashType::All as u8,
++        ScriptKind::P2pkhForkId => SIGHASH_ALL_FORKID,
++    }
++}
++
++/// The digest an owned input signs.
++pub fn signature_hash(kind: ScriptKind, transaction: &Transaction, input: usize, prevout: &TxOut) -> Result<[u8; 32]> {
++    ensure!(input < transaction.input.len(), "signature input outside transaction");
++    Ok(match kind {
++        ScriptKind::WitnessV0 => SighashCache::new(transaction)
++            .p2wpkh_signature_hash(input, &prevout.script_pubkey, prevout.value, EcdsaSighashType::All)?.to_byte_array(),
++        ScriptKind::P2pkhLegacy => SighashCache::new(transaction)
++            .legacy_signature_hash(input, &prevout.script_pubkey, EcdsaSighashType::All.to_u32())?.to_byte_array(),
++        ScriptKind::P2pkhForkId => {
++            ensure!(prevout.script_pubkey.is_p2pkh(), "Bitcoin Cash signing requires a P2PKH prevout");
++            bip143_hash(transaction, input, &prevout.script_pubkey, prevout.value.to_sat(), u32::from(SIGHASH_ALL_FORKID))?
++        }
++    })
++}
++
++/// BIP143 signature hash (adopted by Bitcoin Cash with SIGHASH_FORKID). For
++/// P2PKH the scriptCode is the prevout script itself.
++fn bip143_hash(transaction: &Transaction, input: usize, script_code: &bitcoin::Script, value: u64, hash_type: u32)
++    -> Result<[u8; 32]> {
++    let digest = |data: &[u8]| sha256d::Hash::hash(data).to_byte_array();
++    let (mut prevouts, mut sequences, mut outputs) = (Vec::new(), Vec::new(), Vec::new());
++    for txin in &transaction.input {
++        txin.previous_output.consensus_encode(&mut prevouts)?;
++        txin.sequence.consensus_encode(&mut sequences)?;
++    }
++    for txout in &transaction.output { txout.consensus_encode(&mut outputs)?; }
++    let target = &transaction.input[input];
++    let mut preimage = Vec::new();
++    transaction.version.consensus_encode(&mut preimage)?;
++    preimage.extend_from_slice(&digest(&prevouts));
++    preimage.extend_from_slice(&digest(&sequences));
++    target.previous_output.consensus_encode(&mut preimage)?;
++    script_code.to_owned().consensus_encode(&mut preimage)?;
++    value.consensus_encode(&mut preimage)?;
++    target.sequence.consensus_encode(&mut preimage)?;
++    preimage.extend_from_slice(&digest(&outputs));
++    transaction.lock_time.consensus_encode(&mut preimage)?;
++    hash_type.consensus_encode(&mut preimage)?;
++    Ok(digest(&preimage))
++}
++
++/// Attach a signature to an unsigned input in the chain's spending format.
++pub fn finalize_input(kind: ScriptKind, input: &mut TxIn, signature: &secp256k1::ecdsa::Signature,
++    key: &CompressedPublicKey) -> Result<()> {
++    ensure!(input.script_sig.is_empty() && input.witness.is_empty(), "input is already signed");
++    match kind {
++        ScriptKind::WitnessV0 => input.witness = Witness::p2wpkh(
++            &ecdsa::Signature { signature: *signature, sighash_type: EcdsaSighashType::All }, &key.0),
++        ScriptKind::P2pkhLegacy | ScriptKind::P2pkhForkId => {
++            let mut encoded = signature.serialize_der().to_vec();
++            encoded.push(hash_type(kind));
++            input.script_sig = Builder::new().push_slice(PushBytesBuf::try_from(encoded)?)
++                .push_slice(key.to_bytes()).into_script();
++        }
++    }
++    Ok(())
++}
++
++/// Read back (signature, public key) from a signed input, requiring the exact
++/// two-element spending format and SIGHASH_ALL (with FORKID on Bitcoin Cash).
++pub fn signed_parts(kind: ScriptKind, input: &TxIn) -> Result<(secp256k1::ecdsa::Signature, Vec<u8>)> {
++    let items: Vec<Vec<u8>> = match kind {
++        ScriptKind::WitnessV0 => {
++            ensure!(input.script_sig.is_empty(), "unexpected scriptSig on a witness input");
++            input.witness.iter().map(<[u8]>::to_vec).collect()
++        }
++        ScriptKind::P2pkhLegacy | ScriptKind::P2pkhForkId => {
++            ensure!(input.witness.is_empty(), "unexpected witness on a P2PKH input");
++            input.script_sig.instructions().map(|instruction| match instruction? {
++                Instruction::PushBytes(bytes) => Ok(bytes.as_bytes().to_vec()),
++                Instruction::Op(_) => anyhow::bail!("non-push scriptSig"),
++            }).collect::<Result<_>>()?
++        }
++    };
++    ensure!(items.len() == 2, "invalid signed input format");
++    let (flag, signature) = items[0].split_last().context("missing signature")?;
++    ensure!(*flag == hash_type(kind), "unexpected signature hash type");
++    Ok((secp256k1::ecdsa::Signature::from_der(signature)?, items[1].clone()))
++}
++
++/// Replace every input with a maximum-size spend of `kind` for size estimation.
++pub fn size_template(kind: ScriptKind, transaction: &mut Transaction) -> Result<()> {
++    for input in &mut transaction.input {
++        match kind {
++            ScriptKind::WitnessV0 => input.witness = Witness::from_slice(&[vec![0u8; MAX_SIGNATURE], vec![0u8; 33]]),
++            ScriptKind::P2pkhLegacy | ScriptKind::P2pkhForkId => input.script_sig = Builder::new()
++                .push_slice(PushBytesBuf::try_from(vec![0u8; MAX_SIGNATURE])?)
++                .push_slice(PushBytesBuf::try_from(vec![0u8; 33])?).into_script(),
++        }
++    }
++    Ok(())
++}
++
++/// The transaction with all spending data removed.
++pub fn unsigned(transaction: &Transaction) -> Transaction {
++    let mut stripped = transaction.clone();
++    for input in &mut stripped.input { input.witness = Witness::new(); input.script_sig = ScriptBuf::new(); }
++    stripped
++}
++
++#[cfg(test)]
++mod tests;
+diff --color -ruN a/swap-machine/src/litecoin_light/session/fees.rs b/swap-machine/src/litecoin_light/session/fees.rs
+--- a/swap-machine/src/litecoin_light/session/fees.rs	2026-10-12 00:05:54.486675836 +0100
++++ b/swap-machine/src/litecoin_light/session/fees.rs	2026-10-12 00:05:54.490445504 +0100
+@@ -1,7 +1,9 @@
+ //! Untrusted server fee estimates, never approval or a confirmation guarantee.
+ //! Electrum reports coin units per kilobyte; retain a rounded-up atomic rate.
+ use super::*;
+-use bitcoin::{Amount,Transaction,Witness};
++use bitcoin::{Amount,Transaction};
++#[cfg(test)]
++use bitcoin::Witness;
+ 
+ pub struct ReportedFeeRate {target:u16,atomic_per_kvb:u64}
+ impl ReportedFeeRate {
+@@ -12,13 +14,18 @@
+     /// The caller must verify input types and review the resulting absolute fee.
+     /// No MWEB, legacy or arbitrary-script input estimate is supported here.
+     pub fn p2wpkh_fee(&self,unsigned:&Transaction,maximum_fee:Amount)->Result<(u64,Amount)> {
++        self.fee_for(crate::litecoin_light::network::ScriptKind::WitnessV0,unsigned,maximum_fee)
++    }
++    /// The same conservative estimate for every input of `kind`: P2WPKH
++    /// witnesses or P2PKH scriptSigs (73-byte signature, 33-byte key).
++    pub fn fee_for(&self,kind:crate::litecoin_light::network::ScriptKind,unsigned:&Transaction,maximum_fee:Amount)->Result<(u64,Amount)> {
+         ensure!(!unsigned.input.is_empty() && unsigned.input.len()<=1000
+             && !unsigned.output.is_empty() && unsigned.output.len()<=1000
+             && unsigned.output.iter().all(|out|out.script_pubkey.len()<=10000)
+             && unsigned.input.iter().all(|input|!input.previous_output.is_null()
+                 && input.script_sig.is_empty() && input.witness.is_empty()),"invalid Litecoin fee template");
+         let mut template=unsigned.clone();
+-        for input in &mut template.input {input.witness=Witness::from_slice(&[vec![0u8;73],vec![0u8;33]]);}
++        crate::litecoin_light::script::size_template(kind,&mut template)?;
+         let virtual_bytes=template.vsize() as u64;
+         let fee=(u128::from(self.atomic_per_kvb)*u128::from(virtual_bytes)).div_ceil(1000);
+         ensure!(fee<=u128::from(maximum_fee.to_sat()),"Litecoin estimated fee exceeds maximum");
+diff --color -ruN a/swap-machine/src/litecoin_light/session/reconciliation.rs b/swap-machine/src/litecoin_light/session/reconciliation.rs
+--- a/swap-machine/src/litecoin_light/session/reconciliation.rs	2026-10-12 00:05:54.486805346 +0100
++++ b/swap-machine/src/litecoin_light/session/reconciliation.rs	2026-10-12 00:05:54.490366625 +0100
+@@ -11,7 +11,7 @@
+     Included {height:u32,block_hash:BlockHash,confirmations:u64},
+ }
+ pub struct PaymentObservation {
+-    txid:Txid,network:LtcNetwork,height:u32,tip:BlockHash,position:PaymentPosition,
++    txid:Txid,network:LightNetwork,height:u32,tip:BlockHash,position:PaymentPosition,
+ }
+ impl PaymentObservation {
+     pub fn txid(&self)->Txid {self.txid}
+diff --color -ruN a/swap-machine/src/litecoin_light/session/sync/tests.rs b/swap-machine/src/litecoin_light/session/sync/tests.rs
+--- a/swap-machine/src/litecoin_light/session/sync/tests.rs	2026-10-12 00:05:54.486974465 +0100
++++ b/swap-machine/src/litecoin_light/session/sync/tests.rs	2026-10-12 00:05:54.489863898 +0100
+@@ -5,7 +5,7 @@
+     deserialize(&decode_hex("000000209d08f789f2afaf053878d9b21add2f847fff4a9c32fb58b8c5c79ca166f94a9d111111111111111111111111111111111111111111111111111111111111111106e7494dffff7f2000000000",80).unwrap()).unwrap()
+ }
+ fn tip(height: u32,header: Header) -> ReportedTip {
+-    ReportedTip {network:LtcNetwork::Regtest,height,hash:header.block_hash()}
++    ReportedTip {network:LtcNetwork::Regtest.into(),height,hash:header.block_hash()}
+ }
+ fn batch(id: u64,headers: &[Header]) -> Vec<u8> {
+     reply(id,json!({"count":headers.len(),"hex":hex(&headers.iter().flat_map(serialize).collect::<Vec<_>>()),"max":2016}))
+@@ -96,7 +96,7 @@
+ #[tokio::test]
+ async fn sync_cancelled_candidate_cannot_be_finished_or_reused() -> Result<()> {
+     let (stream,_peer)=tokio::io::duplex(4096);
+-    let mut session=ReadSession {stream:BufReader::new(stream),network:LtcNetwork::Regtest,next_id:1,usable:true,timeout:Duration::from_secs(1)};
++    let mut session=ReadSession {stream:BufReader::new(stream),network:LtcNetwork::Regtest.into(),next_id:1,usable:true,timeout:Duration::from_secs(1)};
+     let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;
+     let mut candidate=session.begin_sync(&selected,tip(1,child())).await?;
+     assert!(tokio::time::timeout(Duration::from_millis(20),candidate.advance(&mut session,1,1296688902)).await.is_err());
+diff --color -ruN a/swap-machine/src/litecoin_light/session/sync.rs b/swap-machine/src/litecoin_light/session/sync.rs
+--- a/swap-machine/src/litecoin_light/session/sync.rs	2026-10-12 00:05:54.486917575 +0100
++++ b/swap-machine/src/litecoin_light/session/sync.rs	2026-10-12 00:05:54.489863898 +0100
+@@ -5,7 +5,7 @@
+ use crate::litecoin_light::headers::{HeaderSequence, ChainChange};
+ 
+ /// A peer claim, never a validated chain tip or a spendability capability.
+-pub struct ReportedTip { network: LtcNetwork, height: u32, hash: BlockHash }
++pub struct ReportedTip { network: LightNetwork, height: u32, hash: BlockHash }
+ impl ReportedTip {
+     pub fn height(&self) -> u32 {self.height}
+     pub fn hash(&self) -> BlockHash {self.hash}
+diff --color -ruN a/swap-machine/src/litecoin_light/session/tests.rs b/swap-machine/src/litecoin_light/session/tests.rs
+--- a/swap-machine/src/litecoin_light/session/tests.rs	2026-10-12 00:05:54.486974465 +0100
++++ b/swap-machine/src/litecoin_light/session/tests.rs	2026-10-12 00:05:54.490445504 +0100
+@@ -104,7 +104,7 @@
+     let (stream,_peer) = tokio::io::duplex(4096);
+     assert!(ReadSession::negotiate_with_timeout(stream,LtcNetwork::Mainnet,Duration::from_millis(20)).await.is_err());
+     let (stream,_peer) = tokio::io::duplex(4096);
+-    let mut session = ReadSession {stream:BufReader::new(stream),network:LtcNetwork::Mainnet,next_id:1,usable:true,timeout:Duration::from_secs(1)};
++    let mut session = ReadSession {stream:BufReader::new(stream),network:LtcNetwork::Mainnet.into(),next_id:1,usable:true,timeout:Duration::from_secs(1)};
+     let timed = tokio::time::timeout(Duration::from_millis(20),session.exchange("server.features",json!([]),MAX_RESPONSE)).await;
+     assert!(timed.is_err()); assert!(!session.usable);
+     assert!(session.exchange("server.features",json!([]),MAX_RESPONSE).await.is_err());
+diff --color -ruN a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs	2026-10-12 00:05:54.486572647 +0100
++++ b/swap-machine/src/litecoin_light/session.rs	2026-10-12 00:05:54.489794188 +0100
+@@ -7,12 +7,15 @@
+ use serde::de::DeserializeOwned;
+ use serde_json::{Value, json, value::RawValue};
+ use std::time::Duration;
++use crate::litecoin_light::network::LightNetwork;
++#[cfg(test)]
++#[allow(unused_imports)]
+ use swap_core::litecoin_address::LtcNetwork;
+ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+ 
+ pub struct ReadSession<S> {
+     stream: BufReader<S>,
+-    network: LtcNetwork,
++    network: LightNetwork,
+     next_id: u64,
+     usable: bool,
+     timeout: Duration,
+@@ -31,10 +34,10 @@
+ impl<S: AsyncRead + AsyncWrite + Unpin> ReadSession<S> {
+     /// Negotiates only protocol 1.4. No addresses or wallet data are queried
+     /// before the server's claimed genesis and script-hash function match.
+-    pub async fn negotiate(stream: S, network: LtcNetwork) -> Result<Self> {
++    pub async fn negotiate(stream: S, network:impl Into<LightNetwork>) -> Result<Self> {let network=network.into();
+         Self::negotiate_with_timeout(stream, network, Duration::from_secs(15)).await
+     }
+-    async fn negotiate_with_timeout(stream: S, network: LtcNetwork, timeout: Duration) -> Result<Self> {
++    async fn negotiate_with_timeout(stream: S, network:impl Into<LightNetwork>, timeout: Duration) -> Result<Self> {let network=network.into();
+         let mut session = Self { stream: BufReader::new(stream), network, next_id: 1, usable: true, timeout };
+         let (_, bytes) = session.exchange("server.version", json!(["Monzero", "1.4"]), MAX_RESPONSE).await?;
+         let version: [String; 2] = result(&bytes)?;
+diff --color -ruN a/swap-machine/src/litecoin_light/state.rs b/swap-machine/src/litecoin_light/state.rs
+--- a/swap-machine/src/litecoin_light/state.rs	2026-10-12 00:05:54.487267703 +0100
++++ b/swap-machine/src/litecoin_light/state.rs	2026-10-12 00:05:54.490709823 +0100
+@@ -4,6 +4,9 @@
+ use super::{headers::{HeaderSequence,ChainChange,cache::HeaderCache},session::sync::SyncCandidate};
+ use anyhow::{Result,ensure};
+ use std::path::Path;
++use crate::litecoin_light::network::LightNetwork;
++#[cfg(test)]
++#[allow(unused_imports)]
+ use swap_core::litecoin_address::LtcNetwork;
+ 
+ /// Owns the cache lease throughout synchronization. No mutable chain reference
+@@ -17,7 +20,7 @@
+ impl ChainState {
+     /// Only an absent cache starts at genesis; a damaged cache is an error.
+     /// A restored chain still requires current network/freshness assessment.
+-    pub fn open(directory: &Path,network: LtcNetwork,maximum_height: u32,now: u64) -> Result<Self> {
++    pub fn open(directory: &Path,network:impl Into<LightNetwork>,maximum_height: u32,now: u64) -> Result<Self> {let network=network.into();
+         let cache=HeaderCache::open(directory,network)?;
+         let selected=match cache.load(maximum_height,now)? {
+             Some(chain)=>chain,
+diff --color -ruN a/swap-machine/src/litecoin_light/tls.rs b/swap-machine/src/litecoin_light/tls.rs
+--- a/swap-machine/src/litecoin_light/tls.rs	2026-10-12 00:05:54.487324103 +0100
++++ b/swap-machine/src/litecoin_light/tls.rs	2026-10-12 00:05:54.490445504 +0100
+@@ -4,6 +4,9 @@
+ use super::session::ReadSession;
+ use anyhow::{Context, Result, ensure};
+ use std::{net::IpAddr, sync::Arc, time::Duration};
++use crate::litecoin_light::network::LightNetwork;
++#[cfg(test)]
++#[allow(unused_imports)]
+ use swap_core::litecoin_address::LtcNetwork;
+ use tokio::net::TcpStream;
+ use tokio_rustls::{TlsConnector, client::TlsStream, rustls::{ClientConfig, RootCertStore,
+@@ -12,12 +15,12 @@
+ pub struct TlsEndpoint {
+     host: String,
+     port: u16,
+-    network: LtcNetwork,
++    network: LightNetwork,
+ }
+ impl TlsEndpoint {
+     pub(in crate::litecoin_light) fn host(&self)->&str {&self.host}
+     pub(in crate::litecoin_light) fn port(&self)->u16 {self.port}
+-    pub(in crate::litecoin_light) fn network(&self)->LtcNetwork {self.network}
++    pub(in crate::litecoin_light) fn network(&self)->LightNetwork {self.network}
+ 
+     /// Explicitly submit the exact retained signed transaction. The caller must
+     /// obtain separate send consent and assess chain/fee policy beforehand.
+@@ -33,7 +36,7 @@
+     }
+ 
+     /// A host and explicit port, not a URL. No credentials, paths or defaults.
+-    pub fn new(host: String, port: u16, network: LtcNetwork) -> Result<Self> {
++    pub fn new(host: String, port: u16, network:impl Into<LightNetwork>) -> Result<Self> {let network=network.into();
+         ensure!(port != 0 && !host.is_empty() && host.len() <= 253, "invalid Electrum TLS endpoint");
+         if let Ok(ip) = host.parse::<IpAddr>() {
+             ensure!(ip.to_string() == host, "noncanonical Electrum IP address");
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/backup/storage.rs b/swap-machine/src/litecoin_light/vault/backup/storage.rs
+--- a/swap-machine/src/litecoin_light/vault/backup/storage.rs	2026-10-12 00:05:54.487575871 +0100
++++ b/swap-machine/src/litecoin_light/vault/backup/storage.rs	2026-10-12 00:05:54.491195700 +0100
+@@ -19,25 +19,25 @@
+     pub fn allocated(&self)->[u32;2] {self.allocated}
+ }
+ /// Authenticate encrypted data without restoring or writing wallet files.
+-pub fn inspect(bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<BackupInfo> {
++pub fn inspect(bundle:&[u8],password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<BackupInfo> {let network=network.into();
+     let (_payload,account,allocated)=decode_checked(bundle,password,network,wallet)?;
+     Ok(BackupInfo {digest:sha256::Hash::hash(bundle),account,wallet,allocated})
+ }
+ /// The destination is an existing canonical private directory. The fixed file
+ /// name prevents path traversal. Different backup contents are never replaced;
+ /// use a new destination directory for a newer backup generation.
+-pub fn save_verified(directory:&Path,bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<BackupInfo> {
++pub fn save_verified(directory:&Path,bundle:&[u8],password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<BackupInfo> {let network=network.into();
+     save_with(directory,bundle,password,network,wallet,|journal,bytes|journal.retain(FILE,bytes))
+ }
+-fn save_with(directory:&Path,bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid,
+-    publish:impl FnOnce(&Journal,&[u8])->Result<()>)->Result<BackupInfo> {
++fn save_with(directory:&Path,bundle:&[u8],password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid,
++    publish:impl FnOnce(&Journal,&[u8])->Result<()>)->Result<BackupInfo> {let network=network.into();
+     let info=inspect(bundle,password,network,wallet)?;
+     let journal=Journal::open(directory)?;publish(&journal,bundle)?;
+     ensure!(journal.read(FILE)?==bundle,"Litecoin backup read-back mismatch");Ok(info)
+ }
+ /// Read and authenticate an existing backup. No implicit creation or mutation.
+ /// Returns encrypted bytes for the separately explicit restore operation.
+-pub fn load_verified(directory:&Path,password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<(Vec<u8>,BackupInfo)> {
++pub fn load_verified(directory:&Path,password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<(Vec<u8>,BackupInfo)> {let network=network.into();
+     let journal=Journal::open(directory)?;let bundle=journal.read(FILE)?;
+     let info=inspect(&bundle,password,network,wallet)?;Ok((bundle,info))
+ }
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/backup.rs b/swap-machine/src/litecoin_light/vault/backup.rs
+--- a/swap-machine/src/litecoin_light/vault/backup.rs	2026-10-12 00:05:54.487540731 +0100
++++ b/swap-machine/src/litecoin_light/vault/backup.rs	2026-10-12 00:05:54.491933045 +0100
+@@ -25,8 +25,8 @@
+ /// private directories, so errors can leave the vault alone published. Retrying
+ /// the identical bundle completes it without overwriting different records.
+ /// Callers must not activate the wallet unless this whole operation succeeds.
+-pub fn restore(vault_directory:&Path,book_directory:&Path,network:LtcNetwork,wallet:Uuid,
+-    password:&[u8],bundle:&[u8])->Result<(SeedVault,AddressBook)> {
++pub fn restore(vault_directory:&Path,book_directory:&Path,network:impl Into<LightNetwork>,wallet:Uuid,
++    password:&[u8],bundle:&[u8])->Result<(SeedVault,AddressBook)> {let network=network.into();
+     let (payload,account,_)=decode_checked(bundle,password,network,wallet)?;
+     let vault_journal=Journal::open(vault_directory)?;
+     let book_journal=Journal::open(book_directory)?;
+@@ -37,8 +37,8 @@
+     let vault=SeedVault {journal:vault_journal,network,wallet,bytes:payload[..LENGTH].to_vec(),usable:true};
+     Ok((vault,book))
+ }
+-fn decode_checked(bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)
+-    ->Result<(Zeroizing<Vec<u8>>,PublicAccount,[u32;2])> {
++fn decode_checked(bundle:&[u8],password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)
++    ->Result<(Zeroizing<Vec<u8>>,PublicAccount,[u32;2])> {let network=network.into();
+     let payload=decrypt(bundle,password,network,wallet)?;
+     ensure!(payload.len()>PREFIX,"truncated Litecoin wallet backup");
+     let account_index=u32::from_be_bytes(payload[LENGTH..LENGTH+4].try_into()?);
+@@ -49,22 +49,22 @@
+     let allocated=AddressBook::backup_counts(&account,&payload[PREFIX..])?;
+     Ok((payload,account,allocated))
+ }
+-fn encrypt(payload:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<Vec<u8>> {
++fn encrypt(payload:&[u8],password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<Vec<u8>> {let network=network.into();
+     ensure!(!wallet.is_nil() && payload.len()>PREFIX && payload.len()<=PREFIX+MAX_RECORD,"invalid wallet backup payload");
+     let mut salt=[0u8;16];let mut nonce=[0u8;24];
+     OsRng.try_fill_bytes(&mut salt).context("backup entropy unavailable")?;
+     OsRng.try_fill_bytes(&mut nonce).context("backup entropy unavailable")?;
+     let mut header=Vec::with_capacity(HEADER+payload.len()+16);
+-    header.extend_from_slice(BUNDLE_MAGIC);header.extend_from_slice(network.genesis().as_bytes());header.extend_from_slice(wallet.as_bytes());
++    header.extend_from_slice(BUNDLE_MAGIC);header.extend_from_slice(network.storage_identity().as_bytes());header.extend_from_slice(wallet.as_bytes());
+     header.extend_from_slice(&salt);header.extend_from_slice(&nonce);
+     let key=key(password,&salt)?;let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid backup key"))?;
+     let mut encrypted=Zeroizing::new(Vec::with_capacity(payload.len()+16));encrypted.extend_from_slice(payload);
+     cipher.encrypt_in_place(XNonce::from_slice(&nonce),&header,&mut *encrypted).map_err(|_|anyhow::anyhow!("backup encryption failed"))?;
+     header.extend_from_slice(&encrypted);Ok(header)
+ }
+-fn decrypt(bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<Zeroizing<Vec<u8>>> {
++fn decrypt(bundle:&[u8],password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<Zeroizing<Vec<u8>>> {let network=network.into();
+     ensure!(!wallet.is_nil() && bundle.len()>HEADER+PREFIX+16 && bundle.len()<=MAX_BUNDLE
+-        && &bundle[..8]==BUNDLE_MAGIC && &bundle[8..72]==network.genesis().as_bytes()
++        && &bundle[..8]==BUNDLE_MAGIC && &bundle[8..72]==network.storage_identity().as_bytes()
+         && &bundle[72..88]==wallet.as_bytes(),"invalid wallet backup context or length");
+     let key=key(password,&bundle[88..104])?;
+     let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid backup key"))?;
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/setup/configuration.rs b/swap-machine/src/litecoin_light/vault/setup/configuration.rs
+--- a/swap-machine/src/litecoin_light/vault/setup/configuration.rs	2026-10-12 00:05:54.487705070 +0100
++++ b/swap-machine/src/litecoin_light/vault/setup/configuration.rs	2026-10-12 00:05:54.491933045 +0100
+@@ -26,7 +26,7 @@
+     fn endpoint_value(&self)->Value {
+         self.endpoint.as_ref().map(|e|json!({"host":e.host(),"port":e.port()})).unwrap_or(Value::Null)
+     }
+-    fn validate(&self,setup:&Path,paths:&SetupDirectories,network:LtcNetwork)->Result<()> {
++    fn validate(&self,setup:&Path,paths:&SetupDirectories,network:impl Into<LightNetwork>)->Result<()> {let network=network.into();
+         ensure!(self.maximum_height<=10_000_000 && self.endpoint.as_ref().is_none_or(|e|e.network()==network),
+             "invalid Litecoin creation chain settings");
+         let directories=[setup,paths.vault.as_path(),paths.addresses.as_path(),paths.backup.as_path(),
+@@ -41,12 +41,12 @@
+ /// The caller explicitly approves these settings before passing a password.
+ /// Identical retries reuse both keys and configuration; changed settings fail.
+ /// Configuration contains only public account data and local storage paths.
+-pub fn initialize_configured(setup:&Path,paths:&SetupDirectories,network:LtcNetwork,wallet:Uuid,
+-    index:u32,password:&[u8],options:&ConfigurationOptions)->Result<ConfiguredWallet> {
++pub fn initialize_configured(setup:&Path,paths:&SetupDirectories,network:impl Into<LightNetwork>,wallet:Uuid,
++    index:u32,password:&[u8],options:&ConfigurationOptions)->Result<ConfiguredWallet> {let network=network.into();
+     ensure!(!wallet.is_nil() && !password.is_empty() && password.len()<=1024,"invalid wallet creation identity or password");
+     bitcoin::bip32::ChildNumber::from_hardened_idx(index)?;
+     options.validate(setup,paths,network)?;
+-    let settings=serde_json::to_vec(&json!({"schema":"monzero-ltc-wallet-settings-v1","network":network.name(),
++    let settings=serde_json::to_vec(&json!({"schema":format!("monzero-{}-wallet-settings-v1",network.tag()),"network":network.name(),
+         "wallet":wallet,"account":index,"directories":paths,"cache":options.cache,"spends":options.spends,
+         "maximumHeight":options.maximum_height,"endpoint":options.endpoint_value()}))?;
+     {
+@@ -62,7 +62,7 @@
+         journal.retain(SETTINGS,&settings)?;
+     }
+     let created=initialize(setup,paths,network,wallet,index,password)?;
+-    let mut configuration=json!({"schema":"monzero-private-ltc-light-v1","network":network.name(),
++    let mut configuration=json!({"schema":format!("monzero-private-{}-light-v1",network.tag()),"network":network.name(),
+         "cacheDirectory":options.cache,"maximumHeight":options.maximum_height,
+         "wallet":{"account":created.account().descriptor(),"addressBookDirectory":paths.addresses,
+             "spendDirectory":options.spends,"vault":{"directory":paths.vault,"walletId":wallet}}});
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/setup.rs b/swap-machine/src/litecoin_light/vault/setup.rs
+--- a/swap-machine/src/litecoin_light/vault/setup.rs	2026-10-12 00:05:54.487611761 +0100
++++ b/swap-machine/src/litecoin_light/vault/setup.rs	2026-10-12 00:05:54.491790186 +0100
+@@ -40,8 +40,8 @@
+ /// Setup retains an extra encrypted seed copy in its intent, never plaintext.
+ /// Exact retries are allowed only while the allocation record remains empty.
+ /// Password changes cannot revoke the setup intent or older encrypted backups.
+-pub fn initialize(setup:&Path,directories:&SetupDirectories,network:LtcNetwork,wallet:Uuid,
+-    account_index:u32,password:&[u8])->Result<CreatedWallet> {
++pub fn initialize(setup:&Path,directories:&SetupDirectories,network:impl Into<LightNetwork>,wallet:Uuid,
++    account_index:u32,password:&[u8])->Result<CreatedWallet> {let network=network.into();
+     initialize_with(setup,directories,network,wallet,account_index,password,|_|Ok(()))
+ }
+ fn missing(error:&anyhow::Error)->bool {
+@@ -51,8 +51,8 @@
+     match journal.read(name) {Err(error) if missing(&error)=>Ok(()),Err(error)=>Err(error),
+         Ok(_)=>anyhow::bail!("existing records cannot be adopted by new Litecoin setup")}
+ }
+-fn initialize_with(setup:&Path,directories:&SetupDirectories,network:LtcNetwork,wallet:Uuid,
+-    account_index:u32,password:&[u8],mut published:impl FnMut(Publication)->Result<()>)->Result<CreatedWallet> {
++fn initialize_with(setup:&Path,directories:&SetupDirectories,network:impl Into<LightNetwork>,wallet:Uuid,
++    account_index:u32,password:&[u8],mut published:impl FnMut(Publication)->Result<()>)->Result<CreatedWallet> {let network=network.into();
+     ensure!(!wallet.is_nil() && !password.is_empty() && password.len()<=1024,"invalid Litecoin setup identity or password");
+     bitcoin::bip32::ChildNumber::from_hardened_idx(account_index)?;
+     let paths=[setup,directories.vault.as_path(),directories.addresses.as_path(),directories.backup.as_path()];
+@@ -61,7 +61,7 @@
+         drop(Journal::open(path)?);
+     }
+     let journal=Journal::open(setup)?;
+-    let context=ContextRecord {schema:"monzero-ltc-wallet-setup-v1".into(),network:network.name().into(),
++    let context=ContextRecord {schema:format!("monzero-{}-wallet-setup-v1",network.tag()),network:network.name().into(),
+         wallet,account:account_index,directories:directories.clone()};
+     let (intent,bytes)=match journal.read(INTENT) {
+         Ok(bytes)=>{
+@@ -104,7 +104,7 @@
+         && backup.allocated()==[0,0] && book.allocated_count(Branch::Receive)?==0 && book.allocated_count(Branch::Change)?==0,
+         "initial Litecoin backup does not match setup");
+     published(Publication::Backup)?;
+-    let complete=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-wallet-ready-v1",
++    let complete=serde_json::to_vec(&serde_json::json!({"schema":format!("monzero-{}-wallet-ready-v1",network.tag()),
+         "wallet":wallet,"account":account.descriptor(),"backupDigest":backup.digest().to_string()}))?;
+     journal.retain(COMPLETE,&complete)?;
+     Ok(CreatedWallet {account,backup})
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/signing/review/claims/broadcast.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims/broadcast.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims/broadcast.rs	2026-10-12 00:05:54.487849589 +0100
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/broadcast.rs	2026-10-12 00:05:54.491790186 +0100
+@@ -46,7 +46,7 @@
+         let raw=serialize(&signed);
+         ensure!(raw.len()<=crate::litecoin_light::MAX_TRANSACTION,"oversized Litecoin broadcast transaction");
+         let scope=serde_json::to_vec(&serde_json::json!({"commitment":expected.to_string(),
+-            "network":endpoint.network().genesis(),"host":endpoint.host(),"port":endpoint.port()}))?;
++            "network":endpoint.network().storage_identity(),"host":endpoint.host(),"port":endpoint.port()}))?;
+         let name=format!("ltc-broadcast-{}",sha256::Hash::hash(&scope));
+         let intent=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-broadcast-intent-v1",
+             "scope":serde_json::from_slice::<serde_json::Value>(&scope)?,
+@@ -85,7 +85,7 @@
+         self.claim.journal.retain(&format!("{}-intent.json",self.name),&self.intent)
+     }
+     pub(in crate::litecoin_light) fn transaction(&self)->&Transaction {&self.signed}
+-    pub(in crate::litecoin_light) fn network(&self)->LtcNetwork {self.claim.review.account.network()}
++    pub(in crate::litecoin_light) fn network(&self)->LightNetwork {self.claim.review.account.network()}
+     pub(in crate::litecoin_light) fn check_intent(&self)->Result<()> {
+         ensure!(self.claim.load_signed()?==self.signed,"Litecoin signed broadcast bytes changed");
+         ensure!(self.matching_record("intent",&self.intent)?,"missing Litecoin broadcast intent");
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs	2026-10-12 00:05:54.487887299 +0100
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs	2026-10-12 00:05:54.491790186 +0100
+@@ -23,7 +23,7 @@
+         ensure!(sha256::Hash::hash(&bytes)==expected,"Litecoin signing review commitment mismatch");
+         let manifest:Manifest=serde_json::from_slice(&bytes)?;
+         ensure!(manifest.schema=="monzero-ltc-spend-claim-v1" && manifest.operation==operation
+-            && manifest.network==account.network().genesis(),"Litecoin recovered spend context mismatch");
++            && manifest.network==account.network().storage_identity(),"Litecoin recovered spend context mismatch");
+         let imported=PublicAccount::from_descriptor(&manifest.account,account.network())?;
+         ensure!(serde_json::to_vec(&imported.descriptor())?==serde_json::to_vec(&account.descriptor())?,
+             "Litecoin recovered spend account mismatch");
+@@ -80,21 +80,17 @@
+         let bytes=self.journal.read(&format!("ltc-signed-{commitment}.tx"))?;
+         let signed:Transaction=deserialize(&bytes)?;
+         ensure!(serialize(&signed)==bytes,"noncanonical Litecoin signed transaction");
+-        let mut unsigned=signed.clone();
+-        for input in &mut unsigned.input {input.witness=Witness::new();}
+-        ensure!(unsigned==self.review.transaction,"Litecoin signed transaction content mismatch");
++        ensure!(crate::litecoin_light::script::unsigned(&signed)==self.review.transaction,"Litecoin signed transaction content mismatch");
+         let secp=Secp256k1::verification_only();
++        let kind=self.review.account.network().script_kind();
+         for (index,owned) in self.review.inputs.iter().enumerate() {
+-            let witness=&signed.input[index].witness;
+-            ensure!(witness.len()==2,"invalid Litecoin signed witness");
+-            let mut items=witness.iter();
+-            let signature=ecdsa::Signature::from_slice(items.next().context("missing Litecoin signature")?)?;
++            let (signature,key_bytes)=crate::litecoin_light::script::signed_parts(kind,&signed.input[index])
++                .context("invalid Litecoin signed witness")?;
+             let key=self.review.account.derive(owned.branch,owned.index)?.public_key();
+-            ensure!(signature.sighash_type==EcdsaSighashType::All
+-                && items.next()==Some(key.0.serialize().as_slice()),"Litecoin signed witness ownership mismatch");
+-            let hash=SighashCache::new(&signed).p2wpkh_signature_hash(index,&owned.prevout.script_pubkey,
+-                owned.prevout.value,EcdsaSighashType::All)?;
+-            secp.verify_ecdsa(&Message::from(hash),&signature.signature,&key.0)?;
++            ensure!(key_bytes==key.0.serialize().as_slice(),"Litecoin signed witness ownership mismatch");
++            // The digest covers no spending data, so the signed transaction can be used directly.
++            let hash=crate::litecoin_light::script::signature_hash(kind,&signed,index,&owned.prevout)?;
++            secp.verify_ecdsa(&Message::from_digest(hash),&signature,&key.0)?;
+         }
+         Ok(signed)
+     }
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs	2026-10-12 00:05:54.487813530 +0100
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs	2026-10-12 00:05:54.491790186 +0100
+@@ -8,13 +8,13 @@
+     let inputs=review.inputs.iter().map(|input|serde_json::json!({"outpoint":input.outpoint.to_string(),
+         "prevout":serialize(&input.prevout),"branch":match input.branch {Branch::Receive=>0,Branch::Change=>1},"index":input.index})).collect::<Vec<_>>();
+     let manifest=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-spend-claim-v1","operation":operation,
+-        "network":review.account.network().genesis(),"account":review.account.descriptor(),
++        "network":review.account.network().storage_identity(),"account":review.account.descriptor(),
+         "transaction":serialize(&review.transaction),"inputs":inputs}))?;
+     ensure!(manifest.len()<=2_000_000,"Litecoin spend claim exceeds record limit");
+     let commitment=sha256::Hash::hash(&manifest).to_string();
+     let mut records=vec![(format!("ltc-spend-{operation}.json"),manifest)];
+     for input in &review.inputs {
+-        let scope=serde_json::to_vec(&serde_json::json!({"network":review.account.network().genesis(),"outpoint":input.outpoint.to_string()}))?;
++        let scope=serde_json::to_vec(&serde_json::json!({"network":review.account.network().storage_identity(),"outpoint":input.outpoint.to_string()}))?;
+         let name=format!("ltc-input-{}.claim",sha256::Hash::hash(&scope));
+         let bytes=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-input-claim-v1","operation":operation,"commitment":commitment}))?;
+         records.push((name,bytes));
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs	2026-10-12 00:05:54.488044958 +0100
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs	2026-10-12 00:05:54.491380298 +0100
+@@ -9,11 +9,11 @@
+ 
+ pub struct ObservedClaimedSpend {
+     claimed:ClaimedSpend,
+-    network:LtcNetwork,height:u32,tip:BlockHash,
++    network:LightNetwork,height:u32,tip:BlockHash,
+     inputs:Vec<(OutPoint,Amount)>,
+ }
+-fn require_observed(chain:&HeaderSequence,observed:&ObservedWallet,network:LtcNetwork,
+-    height:u32,tip:BlockHash,inputs:&[(OutPoint,Amount)])->Result<()> {
++fn require_observed(chain:&HeaderSequence,observed:&ObservedWallet,network:impl Into<LightNetwork>,
++    height:u32,tip:BlockHash,inputs:&[(OutPoint,Amount)])->Result<()> {let network=network.into();
+     ensure!(chain.network()==network && chain.height()==height && chain.contains(height,tip),
+         "Litecoin chain changed; repeat spend review");
+     ensure!(observed.height()==height && observed.tip()==tip,"Litecoin observation tip differs from spend review");
+@@ -52,6 +52,10 @@
+     pub fn transaction(&self)->&Transaction {self.claimed.transaction()}
+     pub fn fee(&self)->Amount {self.claimed.fee()}
+     pub fn signing_commitment(&self)->sha256::Hash {self.claimed.signing_commitment()}
++    /// The retained signed transaction, revalidated against the review from local
++    /// records only. P2PKH signatures are part of the txid, so callers must take the
++    /// final identity from here rather than from the unsigned review.
++    pub fn retained_signed(&self)->Result<Transaction> {self.claimed.load_signed()}
+     /// Submit the retained signed bytes only after the same-tip input policy
+     /// still holds. Separate send consent is the caller's responsibility.
+     /// Ambiguous outcomes retain claims and require recovery, never re-signing.
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/estimated.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/estimated.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/estimated.rs	2026-10-12 00:05:54.488157068 +0100
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/estimated.rs	2026-10-12 00:05:54.491597797 +0100
+@@ -29,13 +29,13 @@
+             }).collect();
+             let mut transaction=Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
+                 input,output:vec![payment.clone()]};
+-            let (size,fee)=rate.p2wpkh_fee(&transaction,policy.maximum_fee)?;
++            let (size,fee)=rate.fee_for(account.network().script_kind(),&transaction,policy.maximum_fee)?;
+             let required=payment.value.to_sat().checked_add(fee.to_sat()).context("Litecoin estimated payment overflow")?;
+             if total==required {
+                 return Ok((Self::new(chain,account,transaction,&selected,payment,None,fee,policy.minimum_confirmations)?,size));
+             }
+             transaction.output.push(TxOut {value:Amount::from_sat(1),script_pubkey:change_script.clone()});
+-            let (size,fee)=rate.p2wpkh_fee(&transaction,policy.maximum_fee)?;
++            let (size,fee)=rate.fee_for(account.network().script_kind(),&transaction,policy.maximum_fee)?;
+             let required=payment.value.to_sat().checked_add(fee.to_sat()).context("Litecoin estimated payment overflow")?;
+             if let Some(change)=total.checked_sub(required) {
+                 if change>=policy.minimum_change.to_sat() {
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs	2026-10-12 00:05:54.487970479 +0100
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs	2026-10-12 00:05:54.491313669 +0100
+@@ -11,7 +11,7 @@
+ }
+ pub struct ConfirmedSpendReview {
+     review:SpendReview,
+-    network:LtcNetwork,
++    network:LightNetwork,
+     height:u32,
+     tip:BlockHash,
+ }
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/signing/review.rs b/swap-machine/src/litecoin_light/vault/signing/review.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review.rs	2026-10-12 00:05:54.487778280 +0100
++++ b/swap-machine/src/litecoin_light/vault/signing/review.rs	2026-10-12 00:05:54.491255629 +0100
+@@ -51,11 +51,20 @@
+     /// freshness, unspentness, relay policy or user approval.
+     pub fn sign(&self,seed:&SecretSeed)->Result<Transaction> {
+         let mut signed=self.transaction.clone();
++        let kind=self.account.network().script_kind();
+         for (index,input) in self.inputs.iter().enumerate() {
+-            signed.input[index].witness=seed.sign_p2wpkh_input(&self.account,input.branch,input.index,
++            let (signature,key)=seed.sign_owned_input(&self.account,input.branch,input.index,
+                 &self.transaction,index,&input.prevout)?;
++            crate::litecoin_light::script::finalize_input(kind,&mut signed.input[index],&signature,&key)?;
++        }
++        // SegWit signatures never change the txid; P2PKH signatures are part of it,
++        // so there only the spending data may differ from the reviewed transaction.
++        if kind==crate::litecoin_light::network::ScriptKind::WitnessV0 {
++            ensure!(signed.compute_txid()==self.transaction.compute_txid(),"Litecoin signing changed transaction identity");
++        } else {
++            ensure!(crate::litecoin_light::script::unsigned(&signed)==self.transaction,
++                "{} signing changed reviewed transaction content",self.account.network().coin());
+         }
+-        ensure!(signed.compute_txid()==self.transaction.compute_txid(),"Litecoin signing changed transaction identity");
+         Ok(signed)
+     }
+ }
+diff --color -ruN a/swap-machine/src/litecoin_light/vault/signing.rs b/swap-machine/src/litecoin_light/vault/signing.rs
+--- a/swap-machine/src/litecoin_light/vault/signing.rs	2026-10-12 00:05:54.487705070 +0100
++++ b/swap-machine/src/litecoin_light/vault/signing.rs	2026-10-12 00:05:54.491933045 +0100
+@@ -2,8 +2,10 @@
+ //! unspentness proof, transaction publication or live-trading authority.
+ use super::*;
+ use crate::litecoin_light::account::Branch;
+-use bitcoin::{Transaction,TxOut,Witness,EcdsaSighashType,sighash::SighashCache,
+-    secp256k1::{Secp256k1,Message},ecdsa};
++use bitcoin::{Transaction,TxOut,Witness,secp256k1::{Secp256k1,Message}};
++#[cfg(test)]
++#[allow(unused_imports)]
++use bitcoin::{EcdsaSighashType,sighash::SighashCache,ecdsa};
+ 
+ impl SecretSeed {
+     /// Sign exactly one native P2WPKH input, committing to all outputs. The
+@@ -11,6 +13,18 @@
+     /// and enforce reservation/fee/recovery policy before using the witness.
+     pub fn sign_p2wpkh_input(&self,account:&PublicAccount,branch:Branch,index:u32,
+         transaction:&Transaction,input:usize,prevout:&TxOut)->Result<Witness> {
++        ensure!(account.network().script_kind()==crate::litecoin_light::network::ScriptKind::WitnessV0,
++            "{} inputs are not P2WPKH",account.network().coin());
++        let (signature,key)=self.sign_owned_input(account,branch,index,transaction,input,prevout)?;
++        let mut signed=transaction.input[input].clone();
++        crate::litecoin_light::script::finalize_input(account.network().script_kind(),&mut signed,&signature,&key)?;
++        Ok(signed.witness)
++    }
++    /// Sign exactly one owned input in the account chain's script format
++    /// (P2WPKH, legacy P2PKH or FORKID P2PKH), committing to all outputs.
++    /// The same caller obligations as `sign_p2wpkh_input` apply.
++    pub fn sign_owned_input(&self,account:&PublicAccount,branch:Branch,index:u32,
++        transaction:&Transaction,input:usize,prevout:&TxOut)->Result<(bitcoin::secp256k1::ecdsa::Signature,bitcoin::CompressedPublicKey)> {
+         ensure!(!transaction.input.is_empty() && transaction.input.len()<=1000
+             && !transaction.output.is_empty() && transaction.output.len()<=1000,
+             "invalid Litecoin signing transaction size");
+@@ -26,17 +40,16 @@
+         let address=account.derive(branch,index)?;
+         ensure!(prevout.value.to_sat()>0 && &prevout.script_pubkey==address.address().script_pubkey(),
+             "Litecoin signing prevout does not match derived address");
+-        let sighash=SighashCache::new(transaction).p2wpkh_signature_hash(input,&prevout.script_pubkey,
+-            prevout.value,EcdsaSighashType::All)?;
++        let sighash=crate::litecoin_light::script::signature_hash(account.network().script_kind(),transaction,input,prevout)?;
+         let secp=Secp256k1::new();
+-        let mut root=Xpriv::new_master(if account.network()==LtcNetwork::Mainnet {NetworkKind::Main}else{NetworkKind::Test},&*self.0)?;
++        let mut root=Xpriv::new_master(account.network().network_kind(),&*self.0)?;
+         let child=root.derive_priv(&secp,address.path());
+         root.private_key.non_secure_erase();root.chain_code=[0u8;32].into();
+         let mut child=child?;
+-        let signature=secp.sign_ecdsa(&Message::from(sighash),&child.private_key);
++        let signature=secp.sign_ecdsa(&Message::from_digest(sighash),&child.private_key);
+         child.private_key.non_secure_erase();child.chain_code=[0u8;32].into();
+-        secp.verify_ecdsa(&Message::from(sighash),&signature,&address.public_key().0)?;
+-        Ok(Witness::p2wpkh(&ecdsa::Signature {signature,sighash_type:EcdsaSighashType::All},&address.public_key().0))
++        secp.verify_ecdsa(&Message::from_digest(sighash),&signature,&address.public_key().0)?;
++        Ok((signature,address.public_key()))
+     }
+ }
+ #[cfg(test)]
+diff --color -ruN a/swap-machine/src/litecoin_light/vault.rs b/swap-machine/src/litecoin_light/vault.rs
+--- a/swap-machine/src/litecoin_light/vault.rs	2026-10-12 00:05:54.487479722 +0100
++++ b/swap-machine/src/litecoin_light/vault.rs	2026-10-12 00:05:54.492059699 +0100
+@@ -2,10 +2,15 @@
+ //! password recovery, signing, or secure-memory guarantee. Dependency internals
+ //! may copy secrets; owned seed, derived key and plaintext buffers are erased.
+ use anyhow::{Context,Result,ensure};
+-use bitcoin::{bip32::Xpriv,NetworkKind};
++use bitcoin::bip32::Xpriv;
++#[cfg(test)]
++use bitcoin::NetworkKind;
+ use chacha20poly1305::{XChaCha20Poly1305,XNonce,aead::{AeadInPlace,KeyInit}};
+ use rand::{RngCore,rngs::OsRng};
+ use std::path::Path;
++use crate::litecoin_light::network::LightNetwork;
++#[cfg(test)]
++#[allow(unused_imports)]
+ use swap_core::litecoin_address::LtcNetwork;
+ use uuid::Uuid;
+ use zeroize::Zeroizing;
+@@ -18,7 +23,7 @@
+ 
+ /// Deliberately neither Clone, Debug nor serializable.
+ pub struct SecretSeed(Zeroizing<[u8;32]>);
+-pub struct SeedVault {journal:Journal,network:LtcNetwork,wallet:Uuid,bytes:Vec<u8>,usable:bool}
++pub struct SeedVault {journal:Journal,network:LightNetwork,wallet:Uuid,bytes:Vec<u8>,usable:bool}
+ impl SecretSeed {
+     pub fn generate()->Result<Self> {
+         let mut bytes=Zeroizing::new([0u8;32]);OsRng.try_fill_bytes(&mut *bytes).context("seed entropy unavailable")?;
+@@ -27,8 +32,8 @@
+     /// Restore caller-owned entropy. The caller is responsible for its source
+     /// and for erasing any other copies; never use public fixture seeds.
+     pub fn from_bytes(bytes:Zeroizing<[u8;32]>)->Self {Self(bytes)}
+-    pub fn public_account(&self,network:LtcNetwork,index:u32)->Result<PublicAccount> {
+-        let mut root=Xpriv::new_master(if network==LtcNetwork::Mainnet {NetworkKind::Main}else{NetworkKind::Test},&*self.0)?;
++    pub fn public_account(&self,network:impl Into<LightNetwork>,index:u32)->Result<PublicAccount> {let network=network.into();
++        let mut root=Xpriv::new_master(network.network_kind(),&*self.0)?;
+         let account=PublicAccount::from_master(&root,network,index);
+         root.private_key.non_secure_erase();root.chain_code=[0u8;32].into();account
+     }
+@@ -36,7 +41,7 @@
+ impl SeedVault {
+     /// Explicit creation; never replaces another vault. Retain caller seed for
+     /// the required backup ceremony, which is not implemented by this API.
+-    pub fn create(directory:&Path,network:LtcNetwork,wallet:Uuid,password:&[u8],seed:&SecretSeed)->Result<Self> {
++    pub fn create(directory:&Path,network:impl Into<LightNetwork>,wallet:Uuid,password:&[u8],seed:&SecretSeed)->Result<Self> {let network=network.into();
+         let journal=Journal::open(directory)?;
+         let bytes=seal_random(seed,password,network,wallet)?;
+         journal.retain(NAME,&bytes)?;
+@@ -44,14 +49,14 @@
+     }
+     /// Missing/invalid state is an error. Recover a potentially uncertain
+     /// publication by syncing the existing record before it can be unlocked.
+-    pub fn open(directory:&Path,network:LtcNetwork,wallet:Uuid)->Result<Self> {
++    pub fn open(directory:&Path,network:impl Into<LightNetwork>,wallet:Uuid)->Result<Self> {let network=network.into();
+         let journal=Journal::open(directory)?;let bytes=journal.read(NAME)?;
+         check(&bytes,network,wallet)?;journal.retain(NAME,&bytes)?;
+         Ok(Self {journal,network,wallet,bytes,usable:true})
+     }
+     /// Authenticate before publishing; restoration never replaces different
+     /// retained ciphertext. Network and wallet identity remain those of backup.
+-    pub fn restore_encrypted(directory:&Path,network:LtcNetwork,wallet:Uuid,password:&[u8],backup:&[u8])->Result<Self> {
++    pub fn restore_encrypted(directory:&Path,network:impl Into<LightNetwork>,wallet:Uuid,password:&[u8],backup:&[u8])->Result<Self> {let network=network.into();
+         drop(unlock(backup,password,network,wallet)?);
+         let journal=Journal::open(directory)?;journal.retain(NAME,backup)?;
+         Ok(Self {journal,network,wallet,bytes:backup.to_vec(),usable:true})
+@@ -86,7 +91,7 @@
+         unlock(&self.bytes,password,self.network,self.wallet)
+     }
+ }
+-fn seal_random(seed:&SecretSeed,password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<Vec<u8>> {
++fn seal_random(seed:&SecretSeed,password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<Vec<u8>> {let network=network.into();
+     let mut salt=[0u8;16];let mut nonce=[0u8;24];
+     OsRng.try_fill_bytes(&mut salt).context("vault entropy unavailable")?;
+     OsRng.try_fill_bytes(&mut nonce).context("vault entropy unavailable")?;
+@@ -100,22 +105,22 @@
+     let mut result=Zeroizing::new([0u8;32]);
+     scrypt::scrypt(password,salt,&params,&mut *result).map_err(|_|anyhow::anyhow!("vault KDF failed"))?;Ok(result)
+ }
+-fn check(bytes:&[u8],network:LtcNetwork,wallet:Uuid)->Result<()> {
++fn check(bytes:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<()> {let network=network.into();
+     ensure!(!wallet.is_nil() && bytes.len()==LENGTH && &bytes[..8]==MAGIC
+-        && &bytes[8..72]==network.genesis().as_bytes() && &bytes[72..88]==wallet.as_bytes(),
++        && &bytes[8..72]==network.storage_identity().as_bytes() && &bytes[72..88]==wallet.as_bytes(),
+         "invalid Litecoin seed vault context");Ok(())
+ }
+-fn seal(seed:&SecretSeed,password:&[u8],network:LtcNetwork,wallet:Uuid,salt:[u8;16],nonce:[u8;24])->Result<Vec<u8>> {
++fn seal(seed:&SecretSeed,password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid,salt:[u8;16],nonce:[u8;24])->Result<Vec<u8>> {let network=network.into();
+     ensure!(!wallet.is_nil(),"missing Litecoin wallet identity");
+     let mut header=Vec::with_capacity(LENGTH);header.extend_from_slice(MAGIC);
+-    header.extend_from_slice(network.genesis().as_bytes());header.extend_from_slice(wallet.as_bytes());
++    header.extend_from_slice(network.storage_identity().as_bytes());header.extend_from_slice(wallet.as_bytes());
+     header.extend_from_slice(&salt);header.extend_from_slice(&nonce);ensure!(header.len()==HEADER,"invalid vault header");
+     let key=key(password,&salt)?;let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid vault key"))?;
+     let mut payload=Zeroizing::new(Vec::with_capacity(48));payload.extend_from_slice(&*seed.0);
+     cipher.encrypt_in_place(XNonce::from_slice(&nonce),&header,&mut *payload).map_err(|_|anyhow::anyhow!("vault encryption failed"))?;
+     header.extend_from_slice(&payload);Ok(header)
+ }
+-fn unlock(bytes:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<SecretSeed> {
++fn unlock(bytes:&[u8],password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<SecretSeed> {let network=network.into();
+     check(bytes,network,wallet)?;let key=key(password,&bytes[88..104])?;
+     let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid vault key"))?;
+     let mut payload=Zeroizing::new(bytes[HEADER..].to_vec());
+diff --color -ruN a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs	2026-10-12 00:05:54.488250507 +0100
++++ b/swap-machine/src/litecoin_light.rs	2026-10-12 00:05:54.492160184 +0100
+@@ -123,6 +123,10 @@
+ 
+ pub mod tls;
+ 
++pub mod network;
++
++pub mod script;
++
+ pub mod headers;
+ 
+ pub mod state;

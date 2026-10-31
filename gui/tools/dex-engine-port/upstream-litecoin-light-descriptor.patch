@@ -1,0 +1,123 @@
+diff --git a/swap-machine/src/litecoin_light/account.rs b/swap-machine/src/litecoin_light/account.rs
+--- a/swap-machine/src/litecoin_light/account.rs
++++ b/swap-machine/src/litecoin_light/account.rs
+@@ -73,3 +73,5 @@
+ 
+ #[cfg(target_os="linux")]
+ pub mod allocation;
++
++pub mod descriptor;
+diff --git a/swap-machine/src/litecoin_light/account/descriptor.rs b/swap-machine/src/litecoin_light/account/descriptor.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/account/descriptor.rs
+@@ -0,0 +1,42 @@
++//! Watch-only account interchange. This format contains address-linking public
++//! data and belongs in private configuration, never public logs or URLs.
++//! Imported origin metadata is asserted by its provider, not cryptographically
++//! authenticated; import proves neither ownership nor present signing control.
++use super::*;
++use serde::{Deserialize,Serialize};
++
++#[derive(Deserialize,Serialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++pub struct PublicAccountDescriptor {
++    schema:String,
++    network:String,
++    account:u32,
++    master_fingerprint:String,
++    account_xpub:String,
++}
++impl PublicAccount {
++    /// Export only the account-level public key and claimed origin metadata.
++    /// The xpub format is standard BIP32; Litecoin HRP is applied on derivation.
++    pub fn descriptor(&self)->PublicAccountDescriptor {
++        PublicAccountDescriptor {schema:"monzero-ltc-public-account-v1".into(),
++            network:self.network.name().into(),account:self.account,
++            master_fingerprint:self.fingerprint.to_string(),account_xpub:self.public.to_string()}
++    }
++    /// Bind import to a separately selected network. BIP32 test keys alone
++    /// cannot distinguish Litecoin testnet from regtest.
++    pub fn from_descriptor(descriptor:&PublicAccountDescriptor,network:LtcNetwork)->Result<Self> {
++        ensure!(descriptor.schema=="monzero-ltc-public-account-v1"
++            && descriptor.network==network.name() && descriptor.account_xpub.len()<=128
++            && descriptor.master_fingerprint.len()==8,"invalid Litecoin public account descriptor");
++        let child=ChildNumber::from_hardened_idx(descriptor.account)?;
++        let public: Xpub=descriptor.account_xpub.parse()?;
++        let kind=if network==LtcNetwork::Mainnet {NetworkKind::Main}else{NetworkKind::Test};
++        ensure!(public.depth==3 && public.child_number==child && public.network==kind
++            && public.to_string()==descriptor.account_xpub,"invalid Litecoin account public key metadata");
++        let fingerprint:Fingerprint=descriptor.master_fingerprint.parse()?;
++        ensure!(fingerprint.to_string()==descriptor.master_fingerprint,"noncanonical Litecoin origin fingerprint");
++        Ok(Self {network,account:descriptor.account,fingerprint,public})
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/account/descriptor/tests.rs b/swap-machine/src/litecoin_light/account/descriptor/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/account/descriptor/tests.rs
+@@ -0,0 +1,62 @@
++use super::*;
++use serde_json::{Value,json};
++fn root(network:LtcNetwork)->Xpriv {
++    Xpriv::new_master(if network==LtcNetwork::Mainnet {NetworkKind::Main}else{NetworkKind::Test},&(0u8..16).collect::<Vec<_>>()).unwrap()
++}
++#[test]
++fn descriptor_roundtrip_preserves_public_account_derivation()->Result<()> {
++    for network in [LtcNetwork::Mainnet,LtcNetwork::Testnet,LtcNetwork::Regtest] {
++        for index in [0,1,(1<<31)-1] {
++            let original=PublicAccount::from_master(&root(network),network,index)?;
++            let bytes=serde_json::to_vec(&original.descriptor())?;
++            let descriptor:PublicAccountDescriptor=serde_json::from_slice(&bytes)?;
++            let restored=PublicAccount::from_descriptor(&descriptor,network)?;
++            assert_eq!(restored.master_fingerprint(),original.master_fingerprint());
++            assert_eq!(restored.account_index(),index);assert_eq!(restored.network(),network);
++            assert_eq!(serde_json::to_vec(&restored.descriptor())?,bytes);
++            for branch in [Branch::Receive,Branch::Change] {
++                for address_index in [0,7] {
++                    assert_eq!(restored.derive(branch,address_index)?.address().to_string(),original.derive(branch,address_index)?.address().to_string());
++                }
++            }
++            let value:Value=serde_json::from_slice(&bytes)?;
++            assert_eq!(value.as_object().unwrap().len(),5);
++            assert!(value.get("seed").is_none());assert!(value.get("privateKey").is_none());
++        }
++    }
++    Ok(())
++}
++#[test]
++fn descriptor_rejects_private_keys_wrong_network_and_invalid_origins()->Result<()> {
++    let network=LtcNetwork::Regtest;let root=root(network);
++    let account=PublicAccount::from_master(&root,network,0)?;
++    let original=serde_json::to_value(account.descriptor())?;
++    for (field,value) in [("schema",json!("other")),("network",json!("test")),("account",json!(1)),
++        ("account",json!(1u32<<31)),("masterFingerprint",json!("bad")),
++        ("masterFingerprint",json!("3442193E")),("accountXpub",json!(root.to_string())),
++        ("accountXpub",json!("xpub-invalid")),("accountXpub",json!("a".repeat(129)))] {
++        let mut changed=original.clone();changed[field]=value;
++        let descriptor:PublicAccountDescriptor=serde_json::from_value(changed)?;
++        assert!(PublicAccount::from_descriptor(&descriptor,network).is_err());
++    }
++    for other in [LtcNetwork::Mainnet,LtcNetwork::Testnet] {
++        assert!(PublicAccount::from_descriptor(&account.descriptor(),other).is_err());
++    }
++    let mut changed=original.clone();changed["seed"]=json!("forbidden");
++    assert!(serde_json::from_value::<PublicAccountDescriptor>(changed).is_err());
++    let raw=serde_json::to_string(&original)?;
++    let duplicate=raw.replacen('{',"{\"account\":0,",1);
++    assert!(serde_json::from_str::<PublicAccountDescriptor>(&duplicate).is_err());Ok(())
++}
++#[test]
++fn descriptor_requires_account_depth_hardened_child_and_key_network()->Result<()> {
++    let network=LtcNetwork::Regtest;let account=PublicAccount::from_master(&root(network),network,0)?;
++    for case in 0..4 {
++        let mut public=account.public;
++        match case {0=>public.depth=0,1=>public.depth=2,2=>public.child_number=ChildNumber::from_normal_idx(0)?,
++            3=>public.network=NetworkKind::Main,_=>unreachable!()}
++        let mut descriptor=account.descriptor();descriptor.account_xpub=public.to_string();
++        assert!(PublicAccount::from_descriptor(&descriptor,network).is_err());
++    }
++    Ok(())
++}

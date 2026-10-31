@@ -1,0 +1,125 @@
+diff --git a/swap-machine/src/native_funding_rpc/full_proceeds.rs b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+index 6620f9a76..3b5a65849 100644
+--- a/swap-machine/src/native_funding_rpc/full_proceeds.rs
++++ b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+@@ -44,6 +44,70 @@ pub struct ExactNetPreview {
+     pub network_fee: XmzAmount,
+ }
+ 
++/// Engine-owned prepared transaction, not serializable and not relay authority.
++/// There is deliberately no metadata accessor or broadcast method until a
++/// durable two-source intent can bind this exact transaction before dispatch.
++pub struct PreparedExactNet {
++    preview: ExactNetPreview,
++    terms: Value,
++    _metadata: zeroize::Zeroizing<String>,
++}
++
++impl PreparedExactNet {
++    pub fn preview(&self) -> &ExactNetPreview { &self.preview }
++    /// Public accounting and transaction identity only; contains no signing data.
++    pub fn terms(&self) -> &Value { &self.terms }
++}
++
++/// Prepare once with relay disabled. Caller owns the dedicated wallet service
++/// and independently establishes the approved sources and swap outcome.
++pub async fn prepare_exact_net_with_top_up(client: &NativeFundingRpc, request: &ExactNetRequest,
++    genesis: &str, top_up_txid: &str) -> Result<PreparedExactNet> {
++    let source = &request.source;
++    let mut params = exact_net_params(request)?;
++    ensure!(hash(genesis) && hash(&source.lock_txid) && hash(top_up_txid)
++        && top_up_txid != "0".repeat(64) && top_up_txid != source.lock_txid,
++        "invalid exact-net preparation context");
++    let before = client.snapshot().await?;
++    ensure!(before.genesis == genesis && hash(&before.tip_hash), "unexpected exact-net chain");
++    ensure!(client.opened_wallet(source.wallet.network()).await?.as_ref() == Some(&source.wallet),
++        "unexpected exact-net wallet");
++    let incoming = client.rpc(client.wallet, "incoming_transfers",
++        json!({"transfer_type":"available", "account_index":source.account})).await?;
++    let inputs = top_up_inputs(&incoming, request, top_up_txid)?;
++    params["get_tx_metadata"] = json!(true);
++    let response = client.rpc(client.wallet, "transfer", params).await?;
++    let prepared = check_prepared_exact_net(response, request, genesis, top_up_txid, &inputs)?;
++    ensure!(client.opened_wallet(source.wallet.network()).await?.as_ref() == Some(&source.wallet),
++        "exact-net wallet changed");
++    ensure!(client.snapshot().await? == before, "exact-net chain changed");
++    Ok(prepared)
++}
++
++fn check_prepared_exact_net(mut response: Value, request: &ExactNetRequest,
++    genesis: &str, top_up_txid: &str, inputs: &BTreeSet<String>) -> Result<PreparedExactNet> {
++    let metadata = match response.get_mut("tx_metadata").map(Value::take) {
++        Some(Value::String(value)) => zeroize::Zeroizing::new(value),
++        _ => anyhow::bail!("missing private exact-net metadata"),
++    };
++    ensure!(!metadata.is_empty() && metadata.len() <= 524288 && metadata.len() % 2 == 0
++        && metadata.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
++        "invalid private exact-net metadata");
++    response["tx_metadata"] = json!("");
++    let preview = check_exact_net(&response, request, inputs)?;
++    let source = &request.source;
++    let terms = json!({"schema":"monzero-exact-net-prepared-accounting-v1",
++        "genesis":genesis,"wallet":source.wallet.to_string(),"lockTxid":source.lock_txid,
++        "topUpTxid":top_up_txid,"totalAtoms":source.locked.atom_string(),
++        "principalAtoms":request.principal.atom_string(),"destination":source.destination.to_string(),
++        "reserveReturnDestination":request.reserve_return.to_string(),
++        "reserveReturnAtoms":preview.reserve_return.atom_string(),
++        "feeAtoms":preview.network_fee.atom_string(),"maximumFeeAtoms":source.maximum_fee.atom_string(),
++        "account":source.account,"priority":source.priority,"txid":response["tx_hash"],
++        "weight":number(&response,"weight")?});
++    Ok(PreparedExactNet { preview, terms, _metadata: metadata })
++}
++
+ /// Constructs but never exports or broadcasts a transaction. Fees are deducted
+ /// exclusively from the reserve-return output, never the exact-net payout.
+ pub async fn preview_exact_net(client: &NativeFundingRpc, request: &ExactNetRequest,
+@@ -301,6 +365,29 @@ mod tests {
+         Ok(())
+     }
+     #[test]
++    fn prepared_exact_net_keeps_metadata_out_of_public_accounting() -> Result<()> {
++        let request = ExactNetRequest { source: request(), principal: XmzAmount::from_atoms(90),
++            reserve_return: request().wallet };
++        let inputs = BTreeSet::from(["b".repeat(64)]);
++        let mut valid = response();
++        valid["amounts_by_dest"]["amounts"]=json!([90,10]);
++        valid["tx_metadata"]=json!("abcdef12");
++        let prepared = check_prepared_exact_net(valid.clone(),&request,&"f".repeat(64),
++            &"d".repeat(64),&inputs)?;
++        assert_eq!(prepared.preview().recipient.atoms(),90);
++        assert_eq!(prepared.terms()["txid"],"c".repeat(64));
++        assert_eq!(prepared.terms()["reserveReturnAtoms"],"10");
++        assert!(!prepared.terms().to_string().contains("abcdef12"));
++        assert!(prepared.terms().get("tx_metadata").is_none());
++        for metadata in [json!(""),json!("abc"),json!("ABCD"),json!(null),json!("a".repeat(524290))] {
++            let mut invalid=valid.clone();invalid["tx_metadata"]=metadata;
++            assert!(check_prepared_exact_net(invalid,&request,&"f".repeat(64),&"d".repeat(64),&inputs).is_err());
++        }
++        valid["amounts_by_dest"]["amounts"]=json!([89,11]);
++        assert!(check_prepared_exact_net(valid,&request,&"f".repeat(64),&"d".repeat(64),&inputs).is_err());
++        Ok(())
++    }
++    #[test]
+     fn full_proceeds_requests_never_relay_or_export_metadata() {
+         let value = params(&request());
+         assert_eq!(value["do_not_relay"], true);
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index ac97e9217..bf8b3ed0e 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -285,6 +285,15 @@ async fn native_exact_net_top_up_preview() -> Result<()> {
+     anyhow::ensure!(checked.recipient == request.principal
+         && checked.reserve_return.checked_add(checked.network_fee)
+             == Some(XmzAmount::from_atoms(10_000_000_000)), "incorrect two-source accounting");
++    let prepared = swap_machine::native_funding_rpc::full_proceeds::prepare_exact_net_with_top_up(
++        &client,&request,genesis,&top_up).await?;
++    anyhow::ensure!(prepared.preview().recipient == request.principal
++        && prepared.preview().reserve_return.checked_add(prepared.preview().network_fee)
++            == Some(XmzAmount::from_atoms(10_000_000_000))
++        && prepared.terms()["lockTxid"] == request.source.lock_txid
++        && prepared.terms()["topUpTxid"] == top_up
++        && prepared.terms().get("tx_metadata").is_none(), "incorrect prepared two-source accounting");
++    drop(prepared); // No relay API or metadata export is available.
+     for invalid in [&request.source.lock_txid, &"0".repeat(64)] {
+         anyhow::ensure!(preview_exact_net_with_top_up(&client,&request,genesis,invalid).await.is_err(),
+             "invalid top-up identity accepted");

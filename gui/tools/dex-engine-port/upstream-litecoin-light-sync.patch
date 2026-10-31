@@ -1,0 +1,186 @@
+diff --git a/swap-machine/src/litecoin_light/headers.rs b/swap-machine/src/litecoin_light/headers.rs
+--- a/swap-machine/src/litecoin_light/headers.rs
++++ b/swap-machine/src/litecoin_light/headers.rs
+@@ -26,6 +26,20 @@
+         // Core special-cases the independently pinned genesis identity.
+         let work = block_work(&target(bits,network)?);
+         Ok(Self {network, headers:vec![genesis], work})
++    }
++    /// Atomic bounded extension. A bad suffix cannot leave a trusted prefix
++    /// installed from a rejected response. No async work occurs during mutation.
++    pub fn append_batch(&mut self,bytes: &[u8],now: u64) -> Result<u32> {
++        ensure!(!bytes.is_empty() && bytes.len()%80==0 && bytes.len()<=2016*80,
++            "invalid Litecoin header batch size");
++        let length = self.headers.len(); let work = self.work.clone();
++        for header in bytes.chunks_exact(80) {
++            if let Err(error) = self.append(header,now) {
++                self.headers.truncate(length); self.work=work;
++                return Err(error);
++            }
++        }
++        Ok((bytes.len()/80) as u32)
+     }
+     pub fn network(&self) -> LtcNetwork { self.network }
+     pub fn height(&self) -> u32 { (self.headers.len()-1) as u32 }
+@@ -129,4 +143,4 @@
+ }
+ 
+ #[cfg(test)]
+-mod tests;
++pub(super) mod tests;
+diff --git a/swap-machine/src/litecoin_light/headers/tests.rs b/swap-machine/src/litecoin_light/headers/tests.rs
+--- a/swap-machine/src/litecoin_light/headers/tests.rs
++++ b/swap-machine/src/litecoin_light/headers/tests.rs
+@@ -2,7 +2,7 @@
+ fn bytes(hex: &str) -> Vec<u8> {
+     (0..hex.len()).step_by(2).map(|i|u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect()
+ }
+-fn child() -> Header {
++pub(in crate::litecoin_light) fn child() -> Header {
+     deserialize(&bytes("00000020f916c456fc51df627885d7d674ed02dc88a225adb3f02ad13eb4938ff3270853111111111111111111111111111111111111111111111111111111111111111170e6494dffff7f202a000000")).unwrap()
+ }
+ #[test]
+@@ -155,3 +155,19 @@
+     assert_eq!(sequence.height(),1);
+     Ok(())
+ }
++
++#[test]
++fn headers_batch_rejection_restores_prefix_and_work() -> Result<()> {
++    let mut sequence=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let original=sequence.header(0); let work=sequence.chain_work().clone();
++    let header=child(); let raw=serialize(&header); let mut invalid=raw.clone();invalid.extend(&raw);
++    assert!(sequence.append_batch(&invalid,u64::from(header.time)).is_err());
++    assert_eq!(sequence.height(),0);assert_eq!(sequence.header(0),original);assert_eq!(sequence.chain_work(),&work);
++    for bytes in [vec![],vec![0;81],vec![0;2017*80]] {
++        assert!(sequence.append_batch(&bytes,u64::from(header.time)).is_err());
++        assert_eq!(sequence.height(),0);assert_eq!(sequence.chain_work(),&work);
++    }
++    assert_eq!(sequence.append_batch(&raw,u64::from(header.time))?,1);
++    assert_eq!(sequence.chain_work(),&BigUint::from(4u8));
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -11,6 +11,7 @@
+ 
+ pub struct ReadSession<S> {
+     stream: BufReader<S>,
++    network: LtcNetwork,
+     next_id: u64,
+     usable: bool,
+     timeout: Duration,
+@@ -33,7 +34,7 @@
+         Self::negotiate_with_timeout(stream, network, Duration::from_secs(15)).await
+     }
+     async fn negotiate_with_timeout(stream: S, network: LtcNetwork, timeout: Duration) -> Result<Self> {
+-        let mut session = Self { stream: BufReader::new(stream), next_id: 1, usable: true, timeout };
++        let mut session = Self { stream: BufReader::new(stream), network, next_id: 1, usable: true, timeout };
+         let (_, bytes) = session.exchange("server.version", json!(["Monzero", "1.4"]), MAX_RESPONSE).await?;
+         let version: [String; 2] = result(&bytes)?;
+         ensure!(!version[0].is_empty() && version[0].len() <= 256 && version[1] == "1.4",
+@@ -43,6 +44,29 @@
+         ensure!(features.genesis_hash == network.genesis() && features.hash_function == "sha256",
+             "wrong Electrum network or script hashing");
+         Ok(session)
++    }
++
++    /// Extend this branch from its next height. A short/empty response is only
++    /// a server report, never a declaration of current-chain synchronization.
++    pub async fn advance(&mut self,sequence: &mut super::headers::HeaderSequence,count: u32,now: u64) -> Result<u32> {
++        ensure!(sequence.network()==self.network && (1..=2016).contains(&count),
++            "invalid Litecoin header synchronization request");
++        let outcome=self.advance_inner(sequence,count,now).await;
++        if outcome.is_err() {self.usable=false;}
++        outcome
++    }
++    async fn advance_inner(&mut self,sequence: &mut super::headers::HeaderSequence,count: u32,now: u64) -> Result<u32> {
++        #[derive(Deserialize)]
++        #[serde(deny_unknown_fields)]
++        struct Batch {count:u32,hex:String,max:u32}
++        let start=sequence.height().checked_add(1).context("Litecoin height exhausted")?;
++        let (_,bytes)=self.exchange("blockchain.block.headers",json!([start,count]),count as usize*160+1024).await?;
++        let batch: Batch=result(&bytes)?;
++        ensure!(batch.count<=count && batch.max>0 && batch.count<=batch.max
++            && batch.hex.len()==batch.count as usize*160,"invalid Electrum header batch");
++        if batch.count==0 {return Ok(0)}
++        let raw=decode_hex(&batch.hex,count as usize*80)?;
++        sequence.append_batch(&raw,now)
+     }
+ 
+     /// Fetch a header, raw transparent transaction and inclusion branch.
+diff --git a/swap-machine/src/litecoin_light/session/tests.rs b/swap-machine/src/litecoin_light/session/tests.rs
+--- a/swap-machine/src/litecoin_light/session/tests.rs
++++ b/swap-machine/src/litecoin_light/session/tests.rs
+@@ -104,9 +104,69 @@
+     let (stream,_peer) = tokio::io::duplex(4096);
+     assert!(ReadSession::negotiate_with_timeout(stream,LtcNetwork::Mainnet,Duration::from_millis(20)).await.is_err());
+     let (stream,_peer) = tokio::io::duplex(4096);
+-    let mut session = ReadSession {stream:BufReader::new(stream),next_id:1,usable:true,timeout:Duration::from_secs(1)};
++    let mut session = ReadSession {stream:BufReader::new(stream),network:LtcNetwork::Mainnet,next_id:1,usable:true,timeout:Duration::from_secs(1)};
+     let timed = tokio::time::timeout(Duration::from_millis(20),session.exchange("server.features",json!([]),MAX_RESPONSE)).await;
+     assert!(timed.is_err()); assert!(!session.usable);
+     assert!(session.exchange("server.features",json!([]),MAX_RESPONSE).await.is_err());
+     Ok(())
+ }
++
++fn regtest_handshake() -> Vec<Vec<u8>> {
++    let mut responses=handshake();
++    responses[1]=reply(2,json!({"genesis_hash":LtcNetwork::Regtest.genesis(),"hash_function":"sha256"}));
++    responses
++}
++#[tokio::test]
++async fn session_advances_validated_headers_and_does_not_claim_empty_reply_is_current() -> Result<()> {
++    let header=super::super::headers::tests::child();
++    let mut responses=regtest_handshake();
++    responses.push(reply(3,json!({"count":1,"hex":hex(&serialize(&header)),"max":2016})));
++    responses.push(reply(4,json!({"count":0,"hex":"","max":2016})));
++    let (stream,task)=server(responses);
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    assert_eq!(session.advance(&mut sequence,2,u64::from(header.time)).await?,1);
++    assert_eq!(sequence.header(1),Some(header));let work=sequence.chain_work().clone();
++    assert_eq!(session.advance(&mut sequence,2,u64::from(header.time)).await?,0);
++    assert_eq!(sequence.height(),1);assert_eq!(sequence.chain_work(),&work);
++    drop(session);let requests=task.await?;
++    assert_eq!(requests[2]["method"],"blockchain.block.headers");
++    assert_eq!(requests[2]["params"],json!([1,2]));assert_eq!(requests[3]["params"],json!([2,2]));
++    Ok(())
++}
++#[tokio::test]
++async fn session_bad_header_suffix_rolls_back_and_poisoned_session_sends_no_retry() -> Result<()> {
++    let header=super::super::headers::tests::child();let raw=hex(&serialize(&header));
++    let mut responses=regtest_handshake();responses.push(reply(3,json!({"count":2,"hex":raw.clone()+&raw,"max":2016})));
++    let (stream,task)=server(responses);
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    let work=sequence.chain_work().clone();
++    assert!(session.advance(&mut sequence,2,u64::from(header.time)).await.is_err());
++    assert_eq!(sequence.height(),0);assert_eq!(sequence.chain_work(),&work);
++    assert!(session.advance(&mut sequence,2,u64::from(header.time)).await.is_err());
++    drop(session);assert_eq!(task.await?.len(),3);Ok(())
++}
++#[tokio::test]
++async fn session_sync_refuses_wrong_network_and_request_limits_without_io() -> Result<()> {
++    let (stream,task)=server(handshake());
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Mainnet).await?;
++    let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    assert!(session.advance(&mut sequence,1,0).await.is_err());
++    let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Mainnet)?;
++    for count in [0,2017,u32::MAX] {assert!(session.advance(&mut sequence,count,0).await.is_err());}
++    drop(session);assert_eq!(task.await?.len(),2);Ok(())
++}
++#[tokio::test]
++async fn session_sync_rejects_malformed_counts_and_lengths() -> Result<()> {
++    for result in [json!({"count":3,"hex":"","max":2016}),json!({"count":0,"hex":"00","max":2016}),
++        json!({"count":1,"hex":"00","max":2016}),json!({"count":0,"hex":"","max":0}),
++        json!({"count":1.0,"hex":"","max":2016}),json!({"count":0,"hex":"","max":2016,"root":"unrequested"})] {
++        let mut responses=regtest_handshake();responses.push(reply(3,result));let (stream,task)=server(responses);
++        let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++        let mut sequence=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++        assert!(session.advance(&mut sequence,2,2000000000).await.is_err());assert_eq!(sequence.height(),0);
++        drop(session);assert_eq!(task.await?.len(),3);
++    }
++    Ok(())
++}

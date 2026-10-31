@@ -1,0 +1,206 @@
+--- a/swap-machine/src/litecoin_light/vault.rs
++++ b/swap-machine/src/litecoin_light/vault.rs
+@@ -130,3 +130,5 @@
+ pub mod backup;
+ 
+ pub mod signing;
++
++pub mod setup;
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/setup.rs
+@@ -0,0 +1,113 @@
++//! Explicit new-wallet setup with an encrypted intent retained before publication.
++//! No automatic activation or replacement of an existing wallet. Preserve all
++//! directories after errors; an identical retry reuses the retained seed.
++//! The initial backup covers only the seed and empty address allocation record.
++use super::*;
++use super::backup::storage::BackupInfo;
++use crate::litecoin_light::account::{Branch,allocation::AddressBook};
++use serde::{Deserialize,Serialize};
++use std::path::PathBuf;
++const INTENT:&str="litecoin-wallet-setup.json";
++const COMPLETE:&str="litecoin-wallet-ready.json";
++const ADDRESSES:&str="litecoin-address-book.json";
++const BACKUP:&str="litecoin-wallet.backup";
++
++#[derive(Clone,Deserialize,Serialize,PartialEq,Eq)]
++#[serde(deny_unknown_fields)]
++pub struct SetupDirectories {
++    pub vault:PathBuf,
++    pub addresses:PathBuf,
++    pub backup:PathBuf,
++}
++#[derive(Deserialize,Serialize,PartialEq,Eq)]
++#[serde(deny_unknown_fields)]
++struct ContextRecord {schema:String,network:String,wallet:Uuid,account:u32,directories:SetupDirectories}
++#[derive(Deserialize,Serialize)]
++#[serde(deny_unknown_fields)]
++struct Intent {context:ContextRecord,encrypted_seed:Vec<u8>}
++
++/// Public account and authenticated initial-backup information. This does not
++/// authorize signing, networking or trading, or prove a separate/offline copy.
++pub struct CreatedWallet {account:PublicAccount,backup:BackupInfo}
++impl CreatedWallet {
++    pub fn account(&self)->&PublicAccount {&self.account}
++    pub fn backup(&self)->&BackupInfo {&self.backup}
++}
++#[derive(Clone,Copy,PartialEq,Eq)]
++enum Publication {Intent,Vault,Addresses,Backup}
++
++/// All four directories must already exist, be canonical, private and distinct.
++/// Setup retains an extra encrypted seed copy in its intent, never plaintext.
++/// Exact retries are allowed only while the allocation record remains empty.
++/// Password changes cannot revoke the setup intent or older encrypted backups.
++pub fn initialize(setup:&Path,directories:&SetupDirectories,network:LtcNetwork,wallet:Uuid,
++    account_index:u32,password:&[u8])->Result<CreatedWallet> {
++    initialize_with(setup,directories,network,wallet,account_index,password,|_|Ok(()))
++}
++fn missing(error:&anyhow::Error)->bool {
++    error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)
++}
++fn require_absent(journal:&Journal,name:&str)->Result<()> {
++    match journal.read(name) {Err(error) if missing(&error)=>Ok(()),Err(error)=>Err(error),
++        Ok(_)=>anyhow::bail!("existing records cannot be adopted by new Litecoin setup")}
++}
++fn initialize_with(setup:&Path,directories:&SetupDirectories,network:LtcNetwork,wallet:Uuid,
++    account_index:u32,password:&[u8],mut published:impl FnMut(Publication)->Result<()>)->Result<CreatedWallet> {
++    ensure!(!wallet.is_nil() && !password.is_empty() && password.len()<=1024,"invalid Litecoin setup identity or password");
++    bitcoin::bip32::ChildNumber::from_hardened_idx(account_index)?;
++    let paths=[setup,directories.vault.as_path(),directories.addresses.as_path(),directories.backup.as_path()];
++    for (i,path) in paths.iter().enumerate() {
++        ensure!(paths[..i].iter().all(|other|other!=path),"Litecoin setup directories must be distinct");
++        drop(Journal::open(path)?);
++    }
++    let journal=Journal::open(setup)?;
++    let context=ContextRecord {schema:"monzero-ltc-wallet-setup-v1".into(),network:network.name().into(),
++        wallet,account:account_index,directories:directories.clone()};
++    let (intent,bytes)=match journal.read(INTENT) {
++        Ok(bytes)=>{
++            let intent:Intent=serde_json::from_slice(&bytes)?;
++            ensure!(serde_json::to_vec(&intent)?==bytes && intent.context==context,"Litecoin setup context changed");
++            (intent,bytes)
++        },
++        Err(error) if missing(&error)=>{
++            require_absent(&journal,COMPLETE)?;
++            for (path,name) in [(directories.vault.as_path(),NAME),(directories.addresses.as_path(),ADDRESSES),
++                (directories.backup.as_path(),BACKUP)] {
++                require_absent(&Journal::open(path)?,name)?;
++            }
++            let seed=SecretSeed::generate()?;
++            let encrypted_seed=seal_random(&seed,password,network,wallet)?;drop(seed);
++            let intent=Intent {context,encrypted_seed};let bytes=serde_json::to_vec(&intent)?;
++            (intent,bytes)
++        },
++        Err(error)=>return Err(error),
++    };
++    let seed=unlock(&intent.encrypted_seed,password,network,wallet)?;
++    let account=seed.public_account(network,account_index)?;drop(seed);
++    journal.retain(INTENT,&bytes)?;published(Publication::Intent)?;
++    let vault=SeedVault::restore_encrypted(&directories.vault,network,wallet,password,&intent.encrypted_seed)?;
++    published(Publication::Vault)?;
++    // create() accepts an identical empty record but refuses later allocations.
++    let book=AddressBook::create(&directories.addresses,PublicAccount::from_descriptor(&account.descriptor(),network)?)?;
++    published(Publication::Addresses)?;
++    let existing={
++        let destination=Journal::open(&directories.backup)?;
++        match destination.read(BACKUP) {Ok(_)=>true,Err(error) if missing(&error)=>false,Err(error)=>return Err(error)}
++    };
++    let backup=if existing {
++        backup::storage::load_verified(&directories.backup,password,network,wallet)?.1
++    } else {
++        let encrypted=backup::export(&vault,&book,password)?;
++        backup::storage::save_verified(&directories.backup,&encrypted,password,network,wallet)?
++    };
++    ensure!(serde_json::to_vec(&backup.account().descriptor())?==serde_json::to_vec(&account.descriptor())?
++        && backup.allocated()==[0,0] && book.allocated_count(Branch::Receive)?==0 && book.allocated_count(Branch::Change)?==0,
++        "initial Litecoin backup does not match setup");
++    published(Publication::Backup)?;
++    let complete=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-wallet-ready-v1",
++        "wallet":wallet,"account":account.descriptor(),"backupDigest":backup.digest().to_string()}))?;
++    journal.retain(COMPLETE,&complete)?;
++    Ok(CreatedWallet {account,backup})
++}
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/setup/tests.rs
+@@ -0,0 +1,79 @@
++use super::*;
++use std::{fs,os::unix::fs::PermissionsExt};
++const PASSWORD:&[u8]=b"PUBLIC SETUP TEST PASSWORD";
++struct Fixture {root:PathBuf,setup:PathBuf,paths:SetupDirectories,wallet:Uuid}
++impl Fixture {
++    fn new()->Result<Self> {
++        let root=std::env::temp_dir().join(format!("monzero-ltc-setup-{}",Uuid::new_v4()));
++        fs::create_dir(&root)?;fs::set_permissions(&root,fs::Permissions::from_mode(0o700))?;
++        for name in ["setup","vault","addresses","backup"] {
++            let path=root.join(name);fs::create_dir(&path)?;fs::set_permissions(path,fs::Permissions::from_mode(0o700))?;
++        }
++        Ok(Self {setup:root.join("setup"),paths:SetupDirectories {vault:root.join("vault"),
++            addresses:root.join("addresses"),backup:root.join("backup")},root,wallet:Uuid::new_v4()})
++    }
++    fn initialize(&self)->Result<CreatedWallet> {initialize(&self.setup,&self.paths,LtcNetwork::Regtest,self.wallet,0,PASSWORD)}
++}
++impl Drop for Fixture {fn drop(&mut self) {let _=fs::remove_dir_all(&self.root);}}
++#[test]
++fn setup_reuses_seed_after_every_partial_publication_and_keeps_backup()->Result<()> {
++    for stage in [Publication::Intent,Publication::Vault,Publication::Addresses,Publication::Backup] {
++        let f=Fixture::new()?;
++        assert!(initialize_with(&f.setup,&f.paths,LtcNetwork::Regtest,f.wallet,0,PASSWORD,|at| {
++            if at==stage {anyhow::bail!("injected publication interruption")}Ok(())
++        }).is_err());
++        let original=fs::read(f.setup.join(INTENT))?;
++        assert!(!f.setup.join(COMPLETE).exists());
++        let ready=f.initialize()?;let digest=ready.backup().digest();
++        assert_eq!(fs::read(f.setup.join(INTENT))?,original);
++        let intent:Intent=serde_json::from_slice(&original)?;
++        assert_eq!(fs::read(f.paths.vault.join(NAME))?,intent.encrypted_seed);
++        assert_eq!(ready.backup().allocated(),[0,0]);
++        let completion=fs::read(f.setup.join(COMPLETE))?;
++        assert_eq!(f.initialize()?.backup().digest(),digest);
++        assert_eq!(fs::read(f.setup.join(COMPLETE))?,completion);
++        let destination=Fixture::new()?;
++        let (encrypted,_)=backup::storage::load_verified(&f.paths.backup,PASSWORD,LtcNetwork::Regtest,f.wallet)?;
++        let (vault,mut book)=backup::restore(&destination.paths.vault,&destination.paths.addresses,LtcNetwork::Regtest,f.wallet,PASSWORD,&encrypted)?;
++        let seed=vault.unlock_for_account(PASSWORD,&ready.account().descriptor())?;
++        assert_eq!(serde_json::to_vec(&seed.public_account(LtcNetwork::Regtest,0)?.descriptor())?,
++            serde_json::to_vec(&ready.account().descriptor())?);
++        assert_eq!(book.reserve(Uuid::new_v4(),Branch::Receive)?.path().to_string(),"84'/1'/0'/0/0");
++    }
++    Ok(())
++}
++#[test]
++fn setup_rejects_changed_context_credentials_corruption_and_existing_wallets()->Result<()> {
++    let f=Fixture::new()?;
++    assert!(initialize_with(&f.setup,&f.paths,LtcNetwork::Regtest,f.wallet,0,PASSWORD,|_|anyhow::bail!("stop after intent")).is_err());
++    let original=fs::read(f.setup.join(INTENT))?;
++    assert!(initialize(&f.setup,&f.paths,LtcNetwork::Regtest,f.wallet,0,b"wrong").is_err());
++    assert!(initialize(&f.setup,&f.paths,LtcNetwork::Regtest,Uuid::new_v4(),0,PASSWORD).is_err());
++    assert!(initialize(&f.setup,&f.paths,LtcNetwork::Testnet,f.wallet,0,PASSWORD).is_err());
++    assert!(initialize(&f.setup,&f.paths,LtcNetwork::Regtest,f.wallet,1,PASSWORD).is_err());
++    let other=Fixture::new()?;
++    assert!(initialize(&f.setup,&other.paths,LtcNetwork::Regtest,f.wallet,0,PASSWORD).is_err());
++    assert_eq!(fs::read(f.setup.join(INTENT))?,original);assert!(!f.paths.vault.join(NAME).exists());
++    fs::write(f.setup.join(INTENT),b"corrupt")?;assert!(f.initialize().is_err());
++    assert_eq!(fs::read(f.setup.join(INTENT))?,b"corrupt");
++    fs::write(other.paths.vault.join(NAME),b"existing")?;
++    fs::set_permissions(other.paths.vault.join(NAME),fs::Permissions::from_mode(0o600))?;
++    assert!(other.initialize().is_err());assert!(!other.setup.join(INTENT).exists());
++    assert_eq!(fs::read(other.paths.vault.join(NAME))?,b"existing");
++    Ok(())
++}
++#[test]
++fn setup_requires_distinct_private_directories_and_does_not_reset_allocations()->Result<()> {
++    let f=Fixture::new()?;let mut paths=f.paths.clone();paths.backup=paths.vault.clone();
++    assert!(initialize(&f.setup,&paths,LtcNetwork::Regtest,f.wallet,0,PASSWORD).is_err());
++    fs::set_permissions(&f.paths.backup,fs::Permissions::from_mode(0o755))?;
++    assert!(f.initialize().is_err());assert!(!f.setup.join(INTENT).exists());
++    fs::set_permissions(&f.paths.backup,fs::Permissions::from_mode(0o700))?;
++    let ready=f.initialize()?;let original=fs::read(f.setup.join(INTENT))?;
++    let mut book=AddressBook::open(&f.paths.addresses,PublicAccount::from_descriptor(&ready.account().descriptor(),LtcNetwork::Regtest)?)?;
++    book.reserve(Uuid::new_v4(),Branch::Receive)?;drop(book);
++    let allocated=fs::read(f.paths.addresses.join(ADDRESSES))?;
++    assert!(f.initialize().is_err());assert_eq!(fs::read(f.paths.addresses.join(ADDRESSES))?,allocated);
++    assert_eq!(fs::read(f.setup.join(INTENT))?,original);
++    Ok(())
++}

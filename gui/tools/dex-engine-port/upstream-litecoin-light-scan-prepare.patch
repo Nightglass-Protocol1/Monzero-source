@@ -1,0 +1,122 @@
+diff --git a/swap-machine/src/litecoin_light/session/wallet/payment.rs b/swap-machine/src/litecoin_light/session/wallet/payment.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet/payment.rs
+@@ -0,0 +1,29 @@
++//! Payment preparation from the exact retained scan evidence. The server can
++//! still omit spends/history; observations do not prove complete unspentness.
++use super::*;
++use crate::litecoin_light::{headers::HeaderSequence,account::allocation::AddressBook,
++    vault::signing::review::confirmed::{IncludedInput,claimed::ObservedClaimedSpend,
++        selection::preparation::{PreparationPolicy,prepare_payment}}};
++use bitcoin::TxOut;
++use std::path::Path;
++use uuid::Uuid;
++impl WalletObservation {
++    /// No caller-created prevouts or derivation metadata enter this path.
++    /// Reuses inclusion evidence and ownership paths from this account's scan;
++    /// pending receipts and observed spent outputs cannot enter selection.
++    /// Requires a separately reviewed fee policy and an initialized address book.
++    pub fn prepare_payment(&self,chain:&HeaderSequence,payment:&TxOut,policy:&PreparationPolicy,
++        book:&mut AddressBook,directory:&Path,operation:Uuid)->Result<ObservedClaimedSpend> {
++        ensure!(self.accounting.coins().len()<=1000,"Litecoin payment candidate limit exceeded");
++        let transactions=self.transactions.iter().map(|tx|(tx.txid(),tx)).collect::<BTreeMap<_,_>>();
++        let mut inputs=Vec::new();
++        for coin in self.accounting.coins() {
++            let outpoint=coin.outpoint();
++            let transaction=*transactions.get(&outpoint.txid).context("missing Litecoin scanned input transaction")?;
++            let output=transaction.outputs().get(outpoint.vout as usize).context("missing Litecoin scanned output")?;
++            let (branch,index)=*self.origins.get(&output.script_pubkey).context("missing Litecoin scanned derivation")?;
++            inputs.push(IncludedInput {transaction,vout:outpoint.vout,branch,index});
++        }
++        prepare_payment(chain,&self.accounting,&self.account,&inputs,payment,policy,book,directory,operation)
++    }
++}
+diff --git a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+@@ -45,6 +45,8 @@
+         assert_eq!(accounting.coins().len(),1);
+         assert_eq!(accounting.coins()[0].outpoint().txid,if short {credit.txid}else{spend.txid});
+         assert_eq!(accounting.coins()[0].confirmations(),1);
++        #[cfg(target_os="linux")]
++        verify_scan_preparation(&result,&account,&chain)?;
+     }
+     drop(session);let requests=task.await?;assert_eq!(requests.len(),expected);
+     for (offset,block) in selected.values().enumerate() {
+@@ -99,3 +101,31 @@
+     assert!(session.refresh_wallet(&chain,&account,[0,0],&limits()).await.is_err());
+     assert!(!session.usable);drop(session);assert_eq!(task.await?.len(),6);Ok(())
+ }
++
++#[cfg(target_os="linux")]
++fn verify_scan_preparation(observation:&WalletObservation,account:&PublicAccount,chain:&HeaderSequence)->Result<()> {
++    use crate::litecoin_light::{account::allocation::AddressBook,
++        vault::signing::review::confirmed::selection::preparation::PreparationPolicy};
++    use bitcoin::{Amount,TxOut};
++    use std::{fs,path::PathBuf,os::unix::fs::DirBuilderExt};
++    struct Directory(PathBuf);
++    impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("ltc-scan-prepare-{}",uuid::Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
++    impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++    let addresses=Directory::new()?;let claims=Directory::new()?;
++    let mut book=AddressBook::create(&addresses.0,PublicAccount::from_descriptor(&account.descriptor(),account.network())?)?;
++    let payment=TxOut {value:Amount::from_sat(40000),script_pubkey:account.derive(Branch::Receive,5)?.address().script_pubkey().clone()};
++    let policy=PreparationPolicy {fee:Amount::from_sat(1000),minimum_change:Amount::from_sat(1000),minimum_confirmations:1};
++    let genesis=HeaderSequence::new(LtcNetwork::Regtest)?;
++    assert!(observation.prepare_payment(&genesis,&payment,&policy,&mut book,&claims.0,uuid::Uuid::new_v4()).is_err());
++    assert_eq!(book.allocated_count(Branch::Change)?,0);
++    let operation=uuid::Uuid::new_v4();
++    let prepared=observation.prepare_payment(chain,&payment,&policy,&mut book,&claims.0,operation)?;
++    assert_eq!(prepared.transaction().input.len(),1);
++    assert_eq!(prepared.transaction().input[0].previous_output,observation.accounting().coins()[0].outpoint());
++    assert_eq!(prepared.transaction().output[0],payment);assert_eq!(prepared.fee().to_sat(),1000);
++    assert_eq!(prepared.transaction().output[1].value.to_sat(),observation.accounting().observed_mature().to_sat()-41000);
++    let commitment=prepared.signing_commitment();drop(prepared);drop(book);
++    let mut book=AddressBook::open(&addresses.0,PublicAccount::from_descriptor(&account.descriptor(),account.network())?)?;
++    let resumed=observation.prepare_payment(chain,&payment,&policy,&mut book,&claims.0,operation)?;
++    assert_eq!(resumed.signing_commitment(),commitment);assert_eq!(book.allocated_count(Branch::Change)?,1);Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/session/wallet.rs b/swap-machine/src/litecoin_light/session/wallet.rs
+--- a/swap-machine/src/litecoin_light/session/wallet.rs
++++ b/swap-machine/src/litecoin_light/session/wallet.rs
+@@ -17,6 +17,9 @@
+     change:BranchScan,
+     accounting:ObservedWallet,
+     pending_reports:usize,
++    account:PublicAccount,
++    origins:BTreeMap<ScriptBuf,(Branch,u32)>,
++    transactions:Vec<crate::litecoin_light::transaction::IncludedTransaction>,
+ }
+ impl WalletObservation {
+     pub fn receive(&self)->&BranchScan {&self.receive}
+@@ -48,10 +51,14 @@
+         let change=self.scan_branch(account,Branch::Change,allocated[1],limits.gap,
+             limits.addresses_per_branch,limits.history_entries_per_branch).await?;
+         ensure!(change.stop()==ScanStop::ReportedGap,"incomplete Litecoin change scan");
+-        let mut scripts=Vec::new();
++        let mut scripts=Vec::new();let mut origins=BTreeMap::new();
+         let mut reports:BTreeMap<Txid,(ReportedPosition,BTreeSet<ScriptBuf>)>=BTreeMap::new();
+         for (branch,scan) in [(Branch::Receive,&receive),(Branch::Change,&change)] {
+-            for index in 0..scan.scanned() {scripts.push(account.derive(branch,index)?.address().script_pubkey().clone());}
++            for index in 0..scan.scanned() {
++                let script=account.derive(branch,index)?.address().script_pubkey().clone();
++                ensure!(origins.insert(script.clone(),(branch,index)).is_none(),"duplicate Litecoin scanned script");
++                scripts.push(script);
++            }
+             for address in scan.reported() {
+                 let script=account.derive(branch,address.index())?.address().script_pubkey().clone();
+                 for report in address.history() {
+@@ -104,8 +111,12 @@
+         }
+         let pending_reports=pending.len();
+         let accounting=ObservedWallet::reconcile_with_pending(chain,&scripts,&transactions,&pending)?;
+-        Ok(WalletObservation {receive,change,accounting,pending_reports})
++        Ok(WalletObservation {receive,change,accounting,pending_reports,origins,transactions,
++            account:PublicAccount::from_descriptor(&account.descriptor(),account.network())?})
+     }
+ }
+ #[cfg(test)]
+ mod tests;
++
++#[cfg(target_os="linux")]
++mod payment;

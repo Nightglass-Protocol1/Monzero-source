@@ -1,0 +1,223 @@
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -43,7 +43,7 @@
+     struct RetainedReview {signing_commitment:String,change_address:Option<String>}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+-    struct VaultConfig {directory:PathBuf,wallet_id:uuid::Uuid}
++    struct VaultConfig {directory:PathBuf,wallet_id:uuid::Uuid,#[serde(default)] seed_encoding:vault_format::VaultFormat}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct SigningApproval {approved_commitment:String,password:Password}
+@@ -304,9 +304,8 @@
+         let mut response=payment_view(network,&address.to_string(),&output,tx,prepared.fee(),prepared.signing_commitment())?;
+         if let Some(approval)=approval {
+             let config=wallet.vault.as_ref().context("missing Litecoin vault configuration")?;
+-            let vault=SeedVault::open(&config.directory,network,config.wallet_id)?;
+-            let signed=prepared.approve_with_vault_on(state.chain()?,observation.accounting(),&vault,
+-                approval.password.0.as_bytes(),approval.approved_commitment.parse()?)?;
++            let signed=vault_format::sign(config,network,approval.password.0.as_bytes(),
++                approval.approved_commitment.parse()?,&prepared,state.chain()?,observation.accounting())?;
+             // Only spending data may differ (P2PKH signatures change the txid; SegWit's do not).
+             ensure!(swap_machine::litecoin_light::script::unsigned(&signed)==*tx,"Litecoin signed payment identity changed");
+             response["txid"]=json!(signed.compute_txid().to_string());
+@@ -361,17 +360,15 @@
+         let password=approval.password.0.as_bytes();
+         let info=if save {
+             let book=AddressBook::open(&wallet.address_book_directory,account)?;
+-            let vault=SeedVault::open(&vault_config.directory,network,vault_config.wallet_id)?;
+-            let encrypted=backup::export(&vault,&book,password)?;
+-            backup::storage::save_verified(&approval.directory,&encrypted,password,network,vault_config.wallet_id)?
++            vault_format::save(vault_config,network,&book,password,&approval.directory)?
+         } else {
+-            backup::storage::load_verified(&approval.directory,password,network,vault_config.wallet_id)?.1
++            vault_format::load(vault_config,network,password,&approval.directory)?.1
+         };
+-        ensure!(serde_json::to_vec(&info.account().descriptor())?==serde_json::to_vec(&wallet.account)?,
++        ensure!(serde_json::to_vec(&info.account)?==serde_json::to_vec(&wallet.account)?,
+             "backup does not match configured account");
+-        let allocated=info.allocated();
++        let allocated=info.allocated;
+         Ok(json!({"watchOnly":true,"spendable":false,"backupVerified":true,"backupSaved":save,
+-            "backupDigest":info.digest().to_string(),"walletId":info.wallet_id(),
++            "backupDigest":info.digest.to_string(),"walletId":info.wallet,
+             "receivingAllocated":allocated[0],"changeAllocated":allocated[1],
+             "scope":"seed-and-address-allocations","allocationFreshness":"unassessed",
+             "activeSwapRecovery":false}))
+@@ -384,18 +381,15 @@
+         ensure!(approval.directory.is_absolute() && approval.directory.canonicalize()?==approval.directory,
+             "invalid backup source");
+         let password=approval.password.0.as_bytes();
+-        let (encrypted,info)=backup::storage::load_verified(&approval.directory,password,network,vault_config.wallet_id)?;
++        let (encrypted,info)=vault_format::load(vault_config,network,password,&approval.directory)?;
+         // Bind approval and configured account before either destination is opened for publication.
+-        ensure!(info.digest()==digest && serde_json::to_vec(&info.account().descriptor())?==serde_json::to_vec(&wallet.account)?,
++        ensure!(info.digest==digest && serde_json::to_vec(&info.account)?==serde_json::to_vec(&wallet.account)?,
+             "backup differs from approved wallet context");
+-        let (vault,book)=backup::restore(&vault_config.directory,&wallet.address_book_directory,network,
+-            vault_config.wallet_id,password,&encrypted)?;
+-        drop(vault.unlock_for_account(password,&wallet.account)?);
+-        let allocated=info.allocated();
+-        ensure!(book.allocated_count(Branch::Receive)?==allocated[0]
+-            && book.allocated_count(Branch::Change)?==allocated[1],"restored allocation counts differ");
+-        Ok(json!({"watchOnly":true,"spendable":false,"restored":true,"backupDigest":info.digest().to_string(),
+-            "walletId":info.wallet_id(),"receivingAllocated":allocated[0],"changeAllocated":allocated[1],
++        let restored=vault_format::restore(vault_config,network,password,&encrypted,wallet)?;
++        let allocated=info.allocated;
++        ensure!(restored==allocated,"restored allocation counts differ");
++        Ok(json!({"watchOnly":true,"spendable":false,"restored":true,"backupDigest":info.digest.to_string(),
++            "walletId":info.wallet,"receivingAllocated":allocated[0],"changeAllocated":allocated[1],
+             "scope":"seed-and-address-allocations","allocationFreshness":"unassessed","activeSwapRecovery":false}))
+     }
+     fn create_wallet(path:&Path,tag:&str,approval:&CreateApproval)->Result<Value> {
+@@ -420,6 +414,7 @@
+             "receivingAllocated":0,"changeAllocated":0,"scope":"seed-and-address-allocations",
+             "allocationFreshness":"unassessed","activeSwapRecovery":false}))
+     }
++    mod vault_format { include!("native-ltc-light/vault_format.rs"); }
+     mod recovery { include!("native-ltc-light/recovery.rs"); }
+     fn output(response:&Value)->Result<()> {
+         let bytes=serde_json::to_vec(response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
+diff --git a/swap-machine/src/bin/native-ltc-light/vault_format.rs b/swap-machine/src/bin/native-ltc-light/vault_format.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/vault_format.rs
+@@ -0,0 +1,78 @@
++// Explicit format dispatch. Missing format preserves existing raw-seed configs;
++// unknown encodings fail deserialization, never fall back to another vault.
++use super::*;
++use swap_machine::litecoin_light::vault::mnemonic::storage::{MnemonicVault,backup as mnemonic_backup};
++#[derive(Clone,Copy,Default,Deserialize)]
++pub(super) enum VaultFormat {
++    #[default]
++    #[serde(rename="raw-bip32-seed-hex-v1")]
++    Raw,
++    #[serde(rename="bip39-english-v1")]
++    Mnemonic,
++}
++pub(super) struct BackupDetails {
++    pub digest:sha256::Hash,
++    pub account:PublicAccountDescriptor,
++    pub wallet:uuid::Uuid,
++    pub allocated:[u32;2],
++}
++impl From<backup::storage::BackupInfo> for BackupDetails {
++    fn from(info:backup::storage::BackupInfo)->Self {
++        Self {digest:info.digest(),account:info.account().descriptor(),wallet:info.wallet_id(),allocated:info.allocated()}
++    }
++}
++impl From<mnemonic_backup::BackupInfo> for BackupDetails {
++    fn from(info:mnemonic_backup::BackupInfo)->Self {
++        Self {digest:info.digest(),account:info.account().descriptor(),wallet:info.wallet_id(),allocated:info.allocated()}
++    }
++}
++pub(super) fn save(config:&VaultConfig,network:LightNetwork,book:&AddressBook,password:&[u8],destination:&Path)->Result<BackupDetails> {
++    match config.seed_encoding {
++        VaultFormat::Raw=>{
++            let vault=SeedVault::open(&config.directory,network,config.wallet_id)?;
++            let bundle=backup::export(&vault,book,password)?;
++            Ok(backup::storage::save_verified(destination,&bundle,password,network,config.wallet_id)?.into())
++        },
++        VaultFormat::Mnemonic=>{
++            let vault=MnemonicVault::open(&config.directory,network,config.wallet_id)?;
++            let bundle=mnemonic_backup::export(&vault,book,password)?;
++            Ok(mnemonic_backup::save_verified(destination,&bundle,password,network,config.wallet_id)?.into())
++        },
++    }
++}
++pub(super) fn load(config:&VaultConfig,network:LightNetwork,password:&[u8],source:&Path)->Result<(Vec<u8>,BackupDetails)> {
++    match config.seed_encoding {
++        VaultFormat::Raw=>{let (bytes,info)=backup::storage::load_verified(source,password,network,config.wallet_id)?;Ok((bytes,info.into()))},
++        VaultFormat::Mnemonic=>{let (bytes,info)=mnemonic_backup::load_verified(source,password,network,config.wallet_id)?;Ok((bytes,info.into()))},
++    }
++}
++pub(super) fn restore(config:&VaultConfig,network:LightNetwork,password:&[u8],encrypted:&[u8],wallet:&WalletConfig)->Result<[u32;2]> {
++    let book=match config.seed_encoding {
++        VaultFormat::Raw=>{
++            let (vault,book)=backup::restore(&config.directory,&wallet.address_book_directory,network,config.wallet_id,password,encrypted)?;
++            drop(vault.unlock_for_account(password,&wallet.account)?);book
++        },
++        VaultFormat::Mnemonic=>{
++            let (vault,book)=mnemonic_backup::restore(&config.directory,&wallet.address_book_directory,network,config.wallet_id,password,encrypted)?;
++            drop(vault.unlock_for_account(password,&wallet.account)?);book
++        },
++    };
++    Ok([book.allocated_count(Branch::Receive)?,book.allocated_count(Branch::Change)?])
++}
++pub(super) fn sign(config:&VaultConfig,network:LightNetwork,password:&[u8],expected:sha256::Hash,
++    prepared:&swap_machine::litecoin_light::vault::signing::review::confirmed::claimed::ObservedClaimedSpend,
++    chain:&swap_machine::litecoin_light::headers::HeaderSequence,observed:&swap_machine::litecoin_light::accounting::ObservedWallet)->Result<Transaction> {
++    match config.seed_encoding {
++        VaultFormat::Raw=>{
++            let vault=SeedVault::open(&config.directory,network,config.wallet_id)?;
++            prepared.approve_with_vault_on(chain,observed,&vault,password,expected)
++        },
++        VaultFormat::Mnemonic=>{
++            let vault=MnemonicVault::open(&config.directory,network,config.wallet_id)?;
++            prepared.approve_with_mnemonic_on(chain,observed,&vault,password,expected)
++        },
++    }
++}
++#[cfg(test)]
++#[path="vault_format/tests.rs"]
++mod tests;
+diff --git a/swap-machine/src/bin/native-ltc-light/vault_format/tests.rs b/swap-machine/src/bin/native-ltc-light/vault_format/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/vault_format/tests.rs
+@@ -0,0 +1,54 @@
++use super::*;
++use swap_machine::litecoin_light::vault::mnemonic::MnemonicMaterial;
++use std::{fs,os::unix::fs::DirBuilderExt};
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("mnemonic-helper-{}",uuid::Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++
++#[test]
++fn helper_backup_restore_dispatches_both_formats_for_each_coin()->Result<()> {
++    for network in [LightNetwork::Litecoin(LtcNetwork::Regtest),LightNetwork::Bitcoin(BtcNetwork::Regtest),
++        LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
++        for mnemonic in [false,true] {
++            let source=Directory::new()?;let addresses=Directory::new()?;let destination=Directory::new()?;
++            let restore_vault=Directory::new()?;let restore_book=Directory::new()?;
++            let wallet=uuid::Uuid::new_v4();let password="disposable helper password";
++            let account=if mnemonic {
++                let material=MnemonicMaterial::from_entropy(&[7;32])?;
++                drop(MnemonicVault::create(&source.0,network,wallet,password.as_bytes(),&material,"fixture passphrase")?);
++                material.public_account(network,3,"fixture passphrase")?
++            } else {
++                let seed=swap_machine::litecoin_light::vault::SecretSeed::from_bytes(Zeroizing::new([7;32]));
++                drop(SeedVault::create(&source.0,network,wallet,password.as_bytes(),&seed)?);
++                seed.public_account(network,3)?
++            };
++            let mut book=AddressBook::create(&addresses.0,PublicAccount::from_descriptor(&account.descriptor(),network)?)?;
++            book.reserve(uuid::Uuid::new_v4(),Branch::Receive)?;drop(book);
++            let encoding=if mnemonic {"bip39-english-v1"} else {"raw-bip32-seed-hex-v1"};
++            let mut value=json!({"schema":format!("monzero-private-{}-light-v1",network.tag()),"network":"regtest",
++                "cacheDirectory":source.0,"maximumHeight":1000,"wallet":{"account":account.descriptor(),
++                    "addressBookDirectory":addresses.0,"vault":{"directory":source.0,"walletId":wallet,"seedEncoding":encoding}}});
++            if !mnemonic {value["wallet"]["vault"].as_object_mut().unwrap().remove("seedEncoding");}
++            let config:Config=serde_json::from_value(value.clone())?;
++            let approval=BackupApproval {directory:destination.0.clone(),password:Password(Zeroizing::new(password.to_owned()))};
++            let saved=wallet_backup(&config,network,&approval,true)?;
++            assert_eq!(saved["receivingAllocated"],1);assert_eq!(saved["backupVerified"],true);
++            assert_eq!(wallet_backup(&config,network,&approval,false)?["backupDigest"],saved["backupDigest"]);
++            value["wallet"]["vault"]["directory"]=json!(restore_vault.0);
++            value["wallet"]["addressBookDirectory"]=json!(restore_book.0);
++            let restore_config:Config=serde_json::from_value(value.clone())?;
++            let mut restore=RestoreApproval {directory:destination.0.clone(),password:Password(Zeroizing::new(password.to_owned())),approved_digest:"00".repeat(32)};
++            assert!(restore_wallet(&restore_config,network,&restore).is_err());
++            assert_eq!(fs::read_dir(&restore_vault.0)?.count(),0);
++            restore.approved_digest=saved["backupDigest"].as_str().unwrap().to_owned();
++            assert_eq!(restore_wallet(&restore_config,network,&restore)?["restored"],true);
++            assert_eq!(restore_wallet(&restore_config,network,&restore)?["receivingAllocated"],1);
++            value["wallet"]["vault"]["seedEncoding"]=json!(if mnemonic {"raw-bip32-seed-hex-v1"} else {"bip39-english-v1"});
++            let wrong:Config=serde_json::from_value(value.clone())?;
++            assert!(wallet_backup(&wrong,network,&approval,false).is_err());
++            value["wallet"]["vault"]["seedEncoding"]=json!("unknown");
++            assert!(serde_json::from_value::<Config>(value).is_err());
++        }
++    }
++    Ok(())
++}

@@ -1,0 +1,152 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement.rs
+@@ -4,6 +4,8 @@
+ pub mod checkpoint;
+ #[cfg(target_os="linux")]
+ pub mod storage;
++#[cfg(target_os="linux")]
++pub mod execution;
+ 
+ const DOMAIN: &str = "monzero-bch-xmz-key-agreement-v1";
+ const MAX_ACK: usize = 4096;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -697,3 +697,45 @@
+     assert!(accept(1003,nv.frame(),nv.signature()).is_err());
+     Ok(())
+ }
++
++#[cfg(target_os="linux")]
++#[test]
++fn execution_admission_owns_and_revalidates_both_negotiations() -> Result<()> {
++    use agreement::execution::{AdmittedExecution,NegotiationPins};
++    let setup = Setup::new()?; let snapshots = PrivateStore::new()?;
++    let (b,bv,bpin) = selected_with_outgoing(&setup,&snapshots.0,0)?;
++    let (n,nv,npin) = selected_with_outgoing(&setup,&snapshots.0,1)?;
++    for (role,selected,own,peer,initial) in [
++        (Role::BchFunder,&b,&bv,&nv,bpin),(Role::NativeFunder,&n,&nv,&bv,npin)] {
++        let metadata = PrivateStore::new()?;
++        let (wallet,received) = selected.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++            1003,own.commitment(),peer.frame(),peer.signature())?;
++        let ack = wallet.acknowledgement(&setup.quote)?;
++        let agreed = wallet.accept_agreement(&setup.quote,&setup.policy,1004,&ack,
++            &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++        let agreement = agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,role,&agreed)?;
++        let pins = NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
++        let admit = |metadata: &std::path::Path,review: &[u8;32],pins,now| AdmittedExecution::admit(metadata,
++            &snapshots.0,&setup.quote,&setup.policy,role,review,pins,now);
++        assert!(admit(&metadata.0,&[0;32],pins.clone(),1005).is_err());
++        assert!(admit(&metadata.0,setup.quote.commitment(),pins.clone(),1003).is_err());
++        assert!(admit(&metadata.0,setup.quote.commitment(),pins.clone(),2000).is_err());
++        let mut wrong = pins.clone(); wrong.received[0] ^= 1;
++        assert!(admit(&metadata.0,setup.quote.commitment(),wrong,1005).is_err());
++        assert!(admit(&snapshots.0,setup.quote.commitment(),pins.clone(),1005).is_err());
++        assert_eq!(std::fs::read_dir(&metadata.0)?.count(),0);
++        let execution = admit(&metadata.0,setup.quote.commitment(),pins.clone(),1005)?;
++        assert!(AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role).is_err());
++        assert_eq!(*execution.restore_agreement()?.secret_checkpoint(&setup.quote)?,*agreed.secret_checkpoint(&setup.quote)?);
++        drop(execution);
++        let execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role)?;
++        assert_eq!(execution.restore_agreement()?.commitment(),agreed.commitment());
++        drop(execution);
++        // An identical admission is an idempotent retry, not a replacement.
++        drop(admit(&metadata.0,setup.quote.commitment(),pins,1005)?);
++        let record = std::fs::read_dir(&metadata.0)?.next().unwrap()?.path();
++        std::fs::write(&record,b"{")?;
++        assert!(AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role).is_err());
++    }
++    Ok(())
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
+@@ -0,0 +1,90 @@
++//! Exclusive ownership of a completed negotiation's independently retained pins.
++//! This immutable admission record is the starting point for future funding
++//! state, not a mutable funding head, user approval or transaction relay right.
++use super::*;
++use crate::bch_key_recovery::authenticated::local_keys::{RetainedLocalKeys,peer::RetainedPeer};
++use crate::litecoin_rpc::reservation::Journal;
++use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt};
++
++const SCHEMA: &str = "monzero-bch-execution-admission-v1";
++
++#[derive(Clone,Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct NegotiationPins {
++    pub initial: [u8;32], pub selection: [u8;32], pub outgoing: [u8;32],
++    pub received: [u8;32], pub agreement: [u8;32],
++}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Admission { schema: String, trade: String, quote: [u8;32], role: Role, pins: NegotiationPins }
++
++/// One live controller holds the metadata directory's nonblocking process lease.
++/// The caller must trust that directory independently of its secret snapshots.
++/// Neither directory is protected against an attacker controlling both stores.
++pub struct AdmittedExecution<'a> {
++    metadata: Journal, snapshots: PathBuf, quote: &'a VerifiedBchQuote,
++    policy: &'a Policy, role: Role,
++}
++fn name(quote: &VerifiedBchQuote, role: Role) -> String {
++    format!("{}.bch-execution-admission-{}",quote.terms()["swapId"],role.domain())
++}
++fn open(metadata: &Path, snapshots: &Path) -> Result<Journal> {
++    let journal = Journal::open(metadata)?;
++    let a = std::fs::metadata(metadata)?; let b = std::fs::metadata(snapshots)?;
++    ensure!((a.dev(),a.ino()) != (b.dev(),b.ino()),"BCH execution metadata and secret snapshots must be separate");
++    drop(Journal::open(snapshots)?);
++    Ok(journal)
++}
++fn validate(snapshots: &Path, quote: &VerifiedBchQuote, policy: &Policy, role: Role,
++    pins: &NegotiationPins) -> Result<AgreedNativeWallet> {
++    let local = RetainedLocalKeys::restore(snapshots,quote,policy,role,&pins.initial)?;
++    let selected = RetainedPeer::restore(snapshots,quote,policy,local,&pins.selection)?;
++    selected.restore_signed_view(snapshots,quote,policy,&pins.outgoing)?;
++    let wallet = selected.restore_received_view(snapshots,quote,policy,&pins.received)?;
++    let agreed = storage::restore(snapshots,quote,policy,role,&pins.agreement)?;
++    let reconstructed = wallet.accept_agreement(quote,policy,agreed.agreed_at,&agreed.acknowledgement,
++        &agreed.signatures[0],&agreed.signatures[1])?;
++    ensure!(*reconstructed.secret_checkpoint(quote)? == *agreed.secret_checkpoint(quote)?,
++        "BCH agreement differs from retained negotiation history");
++    Ok(agreed)
++}
++
++impl<'a> AdmittedExecution<'a> {
++    /// Admit only a currently valid reviewed quote and an entirely revalidated
++    /// negotiation. The reviewed digest is an input from the separate review UI,
++    /// not evidence that the user approved funding or any particular transaction.
++    pub fn admit(metadata: &Path, snapshots: &Path, quote: &'a VerifiedBchQuote,
++        policy: &'a Policy, role: Role, reviewed_quote: &[u8;32], pins: NegotiationPins,
++        now: u64) -> Result<Self> {
++        quote.check_policy(policy,now)?;
++        ensure!(quote.commitment() == reviewed_quote,"BCH execution review differs from quote");
++        let metadata = open(metadata,snapshots)?;
++        let agreed = validate(snapshots,quote,policy,role,&pins)?;
++        ensure!(now >= agreed.agreed_at,"BCH execution admission predates agreement");
++        let admission = Admission {schema:SCHEMA.into(),trade:quote.terms()["swapId"].clone(),
++            quote:*reviewed_quote,role,pins};
++        metadata.retain(&name(quote,role),&serde_json::to_vec(&admission)?)?;
++        Ok(Self {metadata,snapshots:snapshots.into(),quote,policy,role})
++    }
++
++    /// Cold recovery uses the original externally verified quote/policy/role.
++    /// No directory scan, replacement, expiry extension or automatic relay.
++    pub fn resume(metadata: &Path, snapshots: &Path, quote: &'a VerifiedBchQuote,
++        policy: &'a Policy, role: Role) -> Result<Self> {
++        let execution = Self {metadata:open(metadata,snapshots)?,snapshots:snapshots.into(),quote,policy,role};
++        execution.restore_agreement()?;
++        Ok(execution)
++    }
++
++    /// Revalidate every predecessor under the metadata lease before exposing
++    /// recovery material. Funding still requires its separate policy/state flow.
++    pub fn restore_agreement(&self) -> Result<AgreedNativeWallet> {
++        let bytes = self.metadata.read(&name(self.quote,self.role))?;
++        ensure!(bytes.len() <= 4096,"oversized BCH execution admission");
++        let admission: Admission = serde_json::from_slice(&bytes)?;
++        ensure!(admission.schema == SCHEMA && admission.trade == self.quote.terms()["swapId"]
++            && admission.quote == *self.quote.commitment() && admission.role == self.role
++            && serde_json::to_vec(&admission)? == bytes,"BCH execution admission context mismatch");
++        validate(&self.snapshots,self.quote,self.policy,self.role,&admission.pins)
++    }
++}

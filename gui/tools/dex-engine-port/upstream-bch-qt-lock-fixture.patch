@@ -1,0 +1,17 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+@@ -89,11 +89,11 @@
+     {let state=server.state.lock().unwrap();assert_eq!(state.preparation_calls,1);
+         assert_eq!(state.calls,0);assert_eq!(state.sign_calls,0);assert_eq!(state.relay_calls,0);assert!(!state.locked);}
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+-    let locked=locking::exercise(helper,&path,&server,metadata,snapshots,&response["review"],
++    let locked=locking::exercise(&program,&path,&server,metadata,snapshots,&response["review"],
+         &rpc_path,&descriptor)?;
+     let before=contents(&metadata.0)?;
+     drop(server);std::fs::remove_file(&rpc_path)?;std::fs::remove_file(&cookie)?;
+-    assert_eq!(locking::invoke(helper,&path,"lock-status",None,true)?["lockIntent"],locked);
++    assert_eq!(locking::invoke(&program,&path,"lock-status",None,true)?["lockIntent"],locked);
+ 
+     assert_eq!(invoke("preparation-status",true)?["review"],response["review"]);
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);

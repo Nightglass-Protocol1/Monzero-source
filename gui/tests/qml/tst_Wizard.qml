@@ -166,7 +166,7 @@ Item {
     WizardController {
         id: wizardController
         anchors.fill: parent
-        onUseMoneroClicked: {
+        onUseMonzeroClicked: {
             appWindow.walletCreated = true
             appWindow.openWallet()
         }

@@ -1,0 +1,455 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 1a8ce34c5..935b75170 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -25,6 +25,7 @@ mod linux {
+     enum Action {Send,Retransmit}
+     fn valid_request(request:&Request,mode:&str)->bool {
+         let (schema,action,approval,funding)=match mode {
++            "--redeem-review-stdio-v1"=>("monzero-ltc-redeem-review-request-v1",false,false,false),
+             "--negotiation-status-stdio-v1"=>("monzero-ltc-negotiation-status-request-v1",false,false,false),
+             "--outgoing-review-stdio-v1"=>("monzero-ltc-outgoing-review-request-v1",false,false,false),
+             "--snapshot-stdio-v1"=>("monzero-ltc-journal-request-v1",false,false,false),
+@@ -183,6 +184,16 @@ mod linux {
+         if ["--recovery-review-stdio-v1","--recovery-submit-stdio-v1","--recovery-accept-stdio-v1"].contains(&mode) {
+             return recovery_message(&mut execution,input,now,mode);
+         }
++        if mode=="--redeem-accept-stdio-v1" {
++            let request:PeerRequest=serde_json::from_slice(input)?;
++            ensure!(request.schema=="monzero-ltc-redeem-accept-request-v1" && !request.request_id.is_nil(),"invalid redeem admission request");
++            let frame=zeroize::Zeroizing::new(decode_peer_hex(&request.frame_hex,16_384)?);
++            let signature=decode_peer_hex(&request.signature_hex,64)?;
++            ensure!(signature.len()==64,"invalid redeem signature size");
++            let completed=execution.complete_redeem(&frame,&signature)?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-redeem-accept-response-v1","requestId":request.request_id,
++                "txid":completed.compute_txid(),"snapshot":execution.saved_status()?}));
++        }
+         if mode=="--negotiation-status-stdio-v1" {
+             let request:Request=serde_json::from_slice(input)?;
+             ensure!(valid_request(&request,mode),"invalid negotiation status request");
+@@ -310,6 +321,58 @@ mod linux {
+                 "wallet":rpc.ltc_wallet,"anchor":rpc.ltc_anchor,"reserved":true,"signed":false,"broadcast":false}}))
+     }
+ 
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct RedeemRpc {
++        schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
++        native_daemon_port:u16,observer_wallet_port:u16,observer_login_file:PathBuf,safety_blocks:u32,
++    }
++    async fn release_litecoin(path:&Path,input:&[u8],mode:&str)->Result<serde_json::Value> {
++        use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::NativeFundingRpc};
++        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        let reviewing=mode=="--redeem-review-stdio-v1";
++        let (request_id,incoming)=if reviewing {
++            let request:Request=serde_json::from_slice(input)?;
++            ensure!(valid_request(&request,mode),"invalid redeem review request");
++            (request.request_id,None)
++        } else {
++            ensure!(mode=="--redeem-submit-stdio-v1","invalid redeem release mode");
++            let request:PeerRequest=serde_json::from_slice(input)?;
++            ensure!(request.schema=="monzero-ltc-redeem-submit-request-v1" && !request.request_id.is_nil(),"invalid redeem signature request");
++            let frame=zeroize::Zeroizing::new(decode_peer_hex(&request.frame_hex,16_384)?);
++            let signature=decode_peer_hex(&request.signature_hex,64)?;
++            ensure!(signature.len()==64,"invalid redeem signature size");
++            (request.request_id,Some((frame,signature)))
++        };
++        let (_wrapper,bytes)=private_bytes(path,false)?;
++        let wrapper:ReservationConfig=serde_json::from_slice(&bytes)?;
++        ensure!(wrapper.schema=="monzero-private-ltc-redeem-v1","invalid redeem configuration");
++        let (_journal,config)=load(&wrapper.journal_config_file)?;
++        ensure!(config.schema=="monzero-private-ltc-journal-v5" && config.role=="litecoin-funder"
++            && config.policy.ltc_network==LtcNetwork::Regtest,"redeem release requires isolated Litecoin funder startup configuration");
++        let (_rpc,bytes)=private_bytes(&wrapper.rpc_file,false)?;
++        let rpc:RedeemRpc=serde_json::from_slice(&bytes)?;
++        ensure!(rpc.schema=="monzero-private-ltc-redeem-rpc-v1" && rpc.ltc_port>0 && rpc.native_daemon_port>0
++            && rpc.observer_wallet_port>0 && rpc.safety_blocks>0 && rpc.ltc_port!=rpc.native_daemon_port
++            && rpc.observer_wallet_port!=rpc.native_daemon_port && rpc.observer_wallet_port!=rpc.ltc_port,"invalid redeem RPC configuration");
++        let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
++            config.trade_id,&config.policy,LocalRole::LitecoinFunder,config.pins)?;
++        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
++            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let (_login,user,password)=credentials(&rpc.observer_login_file)?;
++        let native=NativeFundingRpc::new(rpc.native_daemon_port,rpc.observer_wallet_port,user,password)?;
++        if let Some((frame,signature))=incoming {
++            let retained=execution.submit_redeem_signature(&native,&ltc,rpc.safety_blocks,&frame,&signature).await?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-redeem-submit-response-v1","requestId":request_id,
++                "frameHex":retained.bytes().iter().map(|b|format!("{b:02x}")).collect::<String>(),
++                "signatureHex":retained.signature().iter().map(|b|format!("{b:02x}")).collect::<String>(),"snapshot":execution.saved_status()?}));
++        }
++        let frame=zeroize::Zeroizing::new(execution.redeem_signing_frame(&native,&ltc,rpc.safety_blocks).await?);
++        Ok(serde_json::json!({"schema":"monzero-ltc-redeem-review-response-v1","requestId":request_id,
++            "frameHex":frame.iter().map(|b|format!("{b:02x}")).collect::<String>(),"snapshot":execution.saved_status()?}))
++    }
++
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct PreparationObserver {wallet_port:u16,login_file:PathBuf}
+@@ -780,6 +843,18 @@ mod linux {
+             }
+         }
+         #[test]
++        fn redeem_review_cannot_supply_keys_or_send_authority()->Result<()> {
++            let base=serde_json::json!({"schema":"monzero-ltc-redeem-review-request-v1","requestId":uuid::Uuid::new_v4()});
++            assert!(valid_request(&serde_json::from_value(base.clone())?,"--redeem-review-stdio-v1"));
++            for (key,value) in [("commitment",serde_json::json!("00".repeat(32))),
++                ("action",serde_json::json!("send")),("safetyBlocks",serde_json::json!(2)),("priority",serde_json::json!(1))] {
++                let mut request=base.clone();request[key]=value;
++                assert!(!valid_request(&serde_json::from_value(request)?,"--redeem-review-stdio-v1"));
++            }
++            let mut request=base;request["privateKey"]=serde_json::json!("00".repeat(32));
++            assert!(serde_json::from_value::<Request>(request).is_err());Ok(())
++        }
++        #[test]
+         fn funding_configuration_cannot_grant_refund_or_payout_authority() {
+             for version in 0..=6 {
+                 for role in ["native-funder","litecoin-funder","unknown"] {
+@@ -823,6 +898,14 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
++        if args.len()==4 && ["--redeem-review-stdio-v1","--redeem-submit-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
++            let mut input=zeroize::Zeroizing::new(Vec::new());std::io::stdin().take(34001).read_to_end(&mut input)?;
++            ensure!(input.len()<=34000,"oversized redeem release request");
++            let response=tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(release_litecoin(Path::new(&args[3]),&input,args[1].to_str().context("invalid redeem mode")?))?;
++            let output=zeroize::Zeroizing::new(serde_json::to_vec(&response)?);
++            ensure!(output.len()<=40000,"oversized redeem release response");std::io::stdout().write_all(&output)?;return Ok(());
++        }
+         if args.len()==4 && ["--reservation-prepare-stdio-v1","--lock-funding-review-stdio-v1","--lock-funding-submit-stdio-v1","--recovery-cancel-review-stdio-v1","--recovery-cancel-submit-stdio-v1","--recovery-refund-review-stdio-v1","--recovery-refund-submit-stdio-v1","--recovery-cancel-check-stdio-v1","--recovery-refund-check-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
+             let mut input=Vec::new();std::io::stdin().take(513).read_to_end(&mut input)?;
+             ensure!(input.len()<=512,"oversized reservation request");
+@@ -834,7 +917,7 @@ mod linux {
+         let wallet_mode=args.get(1).and_then(|a|a.to_str()).and_then(|mode|
+             ["payout","refund"].into_iter().flat_map(|p|["restore","open","check"].into_iter().map(move |o|(p,o)))
+                 .find(|(p,o)|mode==format!("--{p}-wallet-{o}-stdio-v1")));
+-        ensure!(args.len()==4 && (wallet_mode.is_some() || args[1]=="--snapshot-stdio-v1" || args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-prepare-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-prepare-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
++        ensure!(args.len()==4 && (wallet_mode.is_some() || args[1]=="--snapshot-stdio-v1" || args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--redeem-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-prepare-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-prepare-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
+             && args[2]=="--config-file","invalid journal helper arguments");
+         let refund_prepare_mode=args[1]=="--refund-prepare-stdio-v1";
+         let payout_prepare_mode=args[1]=="--payout-prepare-stdio-v1";
+@@ -849,7 +932,7 @@ mod linux {
+         let payout_submit_mode=args[1]=="--payout-submit-stdio-v1";
+         let payout_check_mode=args[1]=="--payout-check-stdio-v1";
+         let (_lease,config)=load(Path::new(&args[3]))?;
+-        if args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" {
++        if args[1]=="--recovery-review-stdio-v1" || args[1]=="--recovery-submit-stdio-v1" || args[1]=="--recovery-accept-stdio-v1" || args[1]=="--redeem-accept-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" {
+             let mut input=zeroize::Zeroizing::new(Vec::new());
+             std::io::stdin().take(401025).read_to_end(&mut input)?;
+             ensure!(input.len()<=401024,"oversized peer admission request");
+diff --git a/swap-machine/src/litecoin_negotiation/execution.rs b/swap-machine/src/litecoin_negotiation/execution.rs
+index 9a76047cc..cbfbc6d3c 100644
+--- a/swap-machine/src/litecoin_negotiation/execution.rs
++++ b/swap-machine/src/litecoin_negotiation/execution.rs
+@@ -20,6 +20,8 @@ struct Head { schema:String,trade:uuid::Uuid,quote:[u8;32],checkpoint:[u8;32],st
+     #[serde(default,skip_serializing_if="Option::is_none")]
+     redeem_outgoing:Option<[u8;32]>,
+     #[serde(default,skip_serializing_if="Option::is_none")]
++    redeem_pending:Option<[u8;32]>,
++    #[serde(default,skip_serializing_if="Option::is_none")]
+     native_lock_intent:Option<[u8;32]>,
+     #[serde(default,skip_serializing_if="Option::is_none")]
+     native_lock:Option<[u8;32]>,
+@@ -100,7 +102,7 @@ impl Execution {
+         let exchange=KeyExchange::new(quote,policy,now,role,&keys)?;
+         let checkpoint=storage::persist(snapshots,quote,policy,role,&keys,&exchange)?;
+         let head=Head { schema:"monzero-ltc-execution-head-v1".into(),trade,quote:*reviewed_commitment,
+-            checkpoint,step:0,outgoing_source:None,recovery_intent:None,native_proof:None,redeem_outgoing:None,native_lock_intent:None,native_lock:None,native_dispatch:None,native_receipt:None,redeem_completed:None,native_claim:None,native_payout_intent:None,native_payout:None,native_payout_dispatch:None,native_payout_receipt:None,redeem_dispatch:None,redeem_receipt:None,native_refund:None,native_refund_payout_intent:None,native_refund_payout:None,native_refund_payout_dispatch:None,native_refund_payout_receipt:None,recovery_dispatch:Default::default(),recovery_receipts:Default::default() };
++            checkpoint,step:0,outgoing_source:None,recovery_intent:None,native_proof:None,redeem_outgoing:None,redeem_pending:None,native_lock_intent:None,native_lock:None,native_dispatch:None,native_receipt:None,redeem_completed:None,native_claim:None,native_payout_intent:None,native_payout:None,native_payout_dispatch:None,native_payout_receipt:None,redeem_dispatch:None,redeem_receipt:None,native_refund:None,native_refund_payout_intent:None,native_refund_payout:None,native_refund_payout_dispatch:None,native_refund_payout_receipt:None,recovery_dispatch:Default::default(),recovery_receipts:Default::default() };
+         journal.retain(&head_name(trade),&serde_json::to_vec(&head)?)?;
+         Ok(Self { metadata:journal,snapshots:snapshots.into(),claim,policy:policy.clone(),role })
+     }
+@@ -162,6 +164,11 @@ impl Execution {
+             let retained=self.metadata.read(&native_relay::receipt_name(self.claim.trade))?;
+             ensure!(<[u8;32]>::from(Sha256::digest(&retained))==expected,"missing or altered native relay receipt");
+         }
++        if let Some(expected)=head.redeem_pending {
++            ensure!(self.claim.role==0 && head.native_proof.is_some(),"pending redeem release lacks native proof");
++            let retained=self.metadata.read(&redeem::pending_name(self.claim.trade))?;
++            ensure!(<[u8;32]>::from(Sha256::digest(&retained))==expected,"missing or altered pending redeem release");
++        }
+         if let Some(expected)=head.redeem_outgoing {
+             ensure!(self.claim.role==0 && head.native_proof.is_some(),"redeem release lacks native proof");
+             let retained=self.metadata.read(&redeem::release_name(self.claim.trade))?;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/redeem.rs b/swap-machine/src/litecoin_negotiation/execution/redeem.rs
+index 769df3ddd..953c19885 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/redeem.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/redeem.rs
+@@ -6,36 +6,57 @@ use crate::litecoin_negotiation::recovery::redeem::SignedRedeem;
+ #[derive(Serialize,Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct Release { schema:String,checkpoint:[u8;32],quote:[u8;32],native_proof:[u8;32],bytes:Vec<u8>,signature:Vec<u8> }
++#[derive(Clone,Copy)]
++enum ReleaseAction<'a> {Review,Sign(&'a ed25519_dalek::SigningKey),Submit(&'a [u8],&'a [u8]),Recover}
++impl Release {
++    fn signed(self)->Result<SignedRedeem> {
++        let signature=self.signature.try_into().map_err(|_|anyhow::anyhow!("invalid redeem identity signature length"))?;
++        Ok(SignedRedeem::from_verified(self.bytes,signature))
++    }
++}
++pub(super) fn pending_name(trade:uuid::Uuid)->String {format!("{trade}.ltc-redeem-unsigned")}
+ pub(super) fn release_name(trade:uuid::Uuid)->String { format!("{trade}.ltc-redeem-outgoing") }
+ impl Execution {
+     pub async fn release_redeem(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
+         safety_blocks:u32,identity:&ed25519_dalek::SigningKey)->Result<SignedRedeem> {
+         ensure!(identity.verifying_key().to_bytes()==self.claim.pins[0],"wrong redeem identity");
+-        self.checked_release(native,ltc,safety_blocks,Some(identity)).await
++        self.checked_release(native,ltc,safety_blocks,ReleaseAction::Sign(identity)).await?.signed()
+     }
+ 
+     /// An identity-free retry still checks current funding, the live lock and
+     /// cancellation margin. A saved frame never bypasses either chain check.
+     pub async fn recover_redeem_release(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
+         safety_blocks:u32)->Result<SignedRedeem> {
+-        self.checked_release(native,ltc,safety_blocks,None).await
++        self.checked_release(native,ltc,safety_blocks,ReleaseAction::Recover).await?.signed()
++    }
++
++    /// Retain one exact adaptor frame for the external identity signer. The
++    /// frame itself is sensitive release material: both chains are checked even
++    /// on review and retry, before any frame is returned.
++    pub async fn redeem_signing_frame(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++        safety_blocks:u32)->Result<Vec<u8>> {
++        Ok(self.checked_release(native,ltc,safety_blocks,ReleaseAction::Review).await?.bytes)
++    }
++    pub async fn submit_redeem_signature(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++        safety_blocks:u32,bytes:&[u8],signature:&[u8])->Result<SignedRedeem> {
++        self.checked_release(native,ltc,safety_blocks,ReleaseAction::Submit(bytes,signature)).await?.signed()
+     }
+ 
+     async fn checked_release(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
+-        safety_blocks:u32,identity:Option<&ed25519_dalek::SigningKey>)->Result<SignedRedeem> {
++        safety_blocks:u32,action:ReleaseAction<'_>)->Result<Release> {
+         ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong redeem release role");
+         let filename=release_name(self.claim.trade);
+         let retained=match self.metadata.read(&filename) {
+             Ok(bytes)=>Some(bytes),
+             Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
+-                ensure!(identity.is_some(),"no retained redeem release");None
++                ensure!(!matches!(action,ReleaseAction::Recover),"no retained redeem release");None
+             },
+             Err(e)=>return Err(e),
+         };
+         // Load/revalidate slow proof state before the final chain observations.
+         let (plan,local)=self.recovery_plan()?;
+         let evidence=self.recover_native_funding(native).await?;
+-        let (mut head,previous,quote,_,exchange)=self.load()?;
++        let (mut head,mut previous,quote,_,exchange)=self.load()?;
+         let keys=exchange.finish()?;
+         evidence.check_trade(&keys,&quote)?;
+         let snapshot=evidence.funding().snapshot();
+@@ -58,16 +79,53 @@ impl Execution {
+             (record,bytes)
+         } else {
+             ensure!(head.redeem_outgoing.is_none(),"committed redeem release is missing");
+-            let signed=plan.prepare_redeem(&local,identity.context("missing redeem identity")?,native_txid)?;
+-            let record=Release { schema:"monzero-ltc-redeem-release-v1".into(),checkpoint:head.checkpoint,
+-                quote:self.claim.quote,native_proof,bytes:signed.bytes().to_vec(),signature:signed.signature().to_vec() };
++            let pending=pending_name(self.claim.trade);
++            let pending_bytes=match self.metadata.read(&pending) {
++                Ok(bytes)=>bytes,
++                Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
++                    ensure!(!matches!(action,ReleaseAction::Submit(..)),"no retained redeem signing frame");
++                    let record=Release {schema:"monzero-ltc-redeem-unsigned-v1".into(),checkpoint:head.checkpoint,
++                        quote:self.claim.quote,native_proof,bytes:plan.redeem_signing_frame(&local,native_txid)?,signature:Vec::new()};
++                    serde_json::to_vec(&record)?
++                },
++                Err(e)=>return Err(e),
++            };
++            let mut record:Release=serde_json::from_slice(&pending_bytes)?;
++            ensure!(serde_json::to_vec(&record)?==pending_bytes && record.schema=="monzero-ltc-redeem-unsigned-v1"
++                && record.checkpoint==head.checkpoint && record.quote==self.claim.quote && record.native_proof==native_proof
++                && record.signature.is_empty(),"retained redeem signing context mismatch");
++            plan.checked_redeem_frame(native_txid,&record.bytes)?;
++            self.metadata.retain(&pending,&pending_bytes)?;
++            let digest:[u8;32]=Sha256::digest(&pending_bytes).into();
++            if let Some(expected)=head.redeem_pending {ensure!(expected==digest,"pending redeem frame differs from head");}
++            else {
++                head.redeem_pending=Some(digest);
++                let published=serde_json::to_vec(&head)?;
++                self.metadata.replace_execution_head(self.claim.trade,&previous,&published)?;
++                previous=published;
++            }
++            match action {
++                ReleaseAction::Review=>return Ok(record),
++                ReleaseAction::Sign(identity)=>{
++                    use ed25519_dalek::Signer;
++                    record.signature=identity.sign(&crate::litecoin_negotiation::recovery::redeem::signing_bytes(&record.bytes)?).to_bytes().to_vec();
++                },
++                ReleaseAction::Submit(bytes,signature)=>{
++                    ensure!(record.bytes==bytes,"redeem signature differs from reviewed frame");
++                    record.signature=signature.to_vec();
++                },
++                ReleaseAction::Recover=>anyhow::bail!("missing retained redeem release"),
++            }
++            record.schema="monzero-ltc-redeem-release-v1".into();
+             let bytes=serde_json::to_vec(&record)?;(record,bytes)
+         };
+         ensure!(record.schema=="monzero-ltc-redeem-release-v1" && record.checkpoint==head.checkpoint
+             && record.quote==self.claim.quote && record.native_proof==native_proof,
+             "retained redeem release context mismatch");
+         plan.checked_redeem(native_txid,&record.bytes,&record.signature)?;
+-        let signature:[u8;64]=record.signature.try_into().map_err(|_|anyhow::anyhow!("invalid redeem identity signature length"))?;
++        if let ReleaseAction::Submit(bytes,signature)=action {
++            ensure!(record.bytes==bytes && record.signature==signature,"conflicting retained redeem release");
++        }
+         let digest=Sha256::digest(&bytes).into();
+         if let Some(expected)=head.redeem_outgoing { ensure!(expected==digest,"redeem release differs from head"); }
+         self.metadata.retain(&filename,&bytes)?;
+@@ -75,7 +133,7 @@ impl Execution {
+             head.redeem_outgoing=Some(digest);
+             self.metadata.replace_execution_head(self.claim.trade,&previous,&serde_json::to_vec(&head)?)?;
+         }
+-        Ok(SignedRedeem::from_verified(record.bytes,signature))
++        Ok(record)
+     }
+ }
+ 
+diff --git a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+index c02da6d86..f4a6ccb48 100644
+--- a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
++++ b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+@@ -180,6 +180,20 @@ async fn actual_paired_chain_execution()->Result<()> {
+             result["nativeDepth"]=serde_json::json!(alice.reconcile_native_refund_payout(&relay,&rpc,request.block.context("missing refund block")?).await?);
+             result["payout"]=alice.recover_prepared_native_refund_payout()?;
+         },
++        "admit_native"=>{
++            let observer=native(&root,&request,request.observer_wallet_port)?;
++            let relay=NativeTransferRelay::new(native(&root,&request,request.wallet_port)?);
++            let proof=alice.reconcile_native_lock(&relay).await?;
++            bob.admit_native_funding(&observer,proof,now).await?;
++        },
++        "redeem_retained"=>{
++            let rpc=litecoin(&root,&request)?;
++            let relay=NativeTransferRelay::new(native(&root,&request,request.wallet_port)?);
++            let completed=alice.recover_completed_redeem()?;
++            let outcome=alice.relay_completed_redeem(&relay,&rpc).await?;
++            ensure!(matches!(outcome,execution::redeem_relay::RedeemRelayOutcome::Acknowledged {..}),"fixture redemption acknowledgement missing");
++            result["txid"]=serde_json::json!(completed.compute_txid());
++        },
+         "redeem"=>{
+             let rpc=litecoin(&root,&request)?;
+             let observer=native(&root,&request,request.observer_wallet_port)?;
+diff --git a/swap-machine/src/litecoin_negotiation/recovery/redeem.rs b/swap-machine/src/litecoin_negotiation/recovery/redeem.rs
+index 0f8557589..eb4ae58d4 100644
+--- a/swap-machine/src/litecoin_negotiation/recovery/redeem.rs
++++ b/swap-machine/src/litecoin_negotiation/recovery/redeem.rs
+@@ -22,7 +22,7 @@ fn check_txid(txid:&str)->Result<()> {
+         "invalid native funding transaction identity");
+     Ok(())
+ }
+-fn signing_bytes(bytes:&[u8])->Result<Vec<u8>> {
++pub(crate) fn signing_bytes(bytes:&[u8])->Result<Vec<u8>> {
+     ensure!(!bytes.is_empty() && bytes.len()<=MAX_FRAME,"invalid redeem frame size");
+     let mut result=DOMAIN.as_bytes().to_vec();result.push(0);
+     result.extend_from_slice(&(bytes.len() as u64).to_be_bytes());result.extend_from_slice(bytes);
+@@ -31,18 +31,19 @@ fn signing_bytes(bytes:&[u8])->Result<Vec<u8>> {
+ impl RecoveryPlan {
+     pub(crate) fn redeem_txid(&self)->bitcoin::Txid { self.redeem.txid() }
+     pub(crate) fn prepare_redeem(&self,local:&LocalKeys,identity:&SigningKey,native_txid:&str)->Result<SignedRedeem> {
+-        self.check_local(local,0)?;
+         ensure!(identity.verifying_key()==self.pins[0],"wrong redeem signing identity");
+-        check_txid(native_txid)?;
+-        let frame=Frame { schema:DOMAIN.into(),binding:self.binding.clone(),redeem:self.redeem.txid(),
+-            native_txid:native_txid.into(),encrypted:local.contract_secret().encsign(self.adaptors[1],self.redeem.digest()) };
+-        let bytes=canonical(&frame)?;let signature=identity.sign(&signing_bytes(&bytes)?).to_bytes();
+-        Ok(SignedRedeem { bytes,signature })
++        let bytes=self.redeem_signing_frame(local,native_txid)?;
++        let signature=identity.sign(&signing_bytes(&bytes)?).to_bytes();
++        Ok(SignedRedeem {bytes,signature})
+     }
+-
+-    pub(crate) fn checked_redeem(&self,native_txid:&str,bytes:&[u8],signature:&[u8])->Result<contract::EncryptedSignature> {
++    pub(crate) fn redeem_signing_frame(&self,local:&LocalKeys,native_txid:&str)->Result<Vec<u8>> {
++        self.check_local(local,0)?;check_txid(native_txid)?;
++        canonical(&Frame {schema:DOMAIN.into(),binding:self.binding.clone(),redeem:self.redeem.txid(),
++            native_txid:native_txid.into(),encrypted:local.contract_secret().encsign(self.adaptors[1],self.redeem.digest())})
++    }
++    pub(crate) fn checked_redeem_frame(&self,native_txid:&str,bytes:&[u8])->Result<contract::EncryptedSignature> {
+         check_txid(native_txid)?;
+-        self.pins[0].verify_strict(&signing_bytes(bytes)?,&ed25519_dalek::Signature::from_slice(signature)?)?;
++        ensure!(!bytes.is_empty() && bytes.len()<=MAX_FRAME,"invalid redeem frame size");
+         let frame:Frame=serde_json::from_slice(bytes)?;
+         ensure!(canonical(&frame)?==bytes && frame.schema==DOMAIN && frame.binding==self.binding
+             && frame.redeem==self.redeem.txid() && frame.native_txid==native_txid,
+@@ -50,6 +51,10 @@ impl RecoveryPlan {
+         contract::verify_encsig(self.keys[0],self.adaptors[1],&self.redeem.digest(),&frame.encrypted)?;
+         Ok(frame.encrypted)
+     }
++    pub(crate) fn checked_redeem(&self,native_txid:&str,bytes:&[u8],signature:&[u8])->Result<contract::EncryptedSignature> {
++        self.pins[0].verify_strict(&signing_bytes(bytes)?,&ed25519_dalek::Signature::from_slice(signature)?)?;
++        self.checked_redeem_frame(native_txid,bytes)
++    }
+ 
+     /// The caller must derive native_txid from its own retained funding operation,
+     /// not from the received message. Completion is not relay authorization.
+diff --git a/swap-machine/src/litecoin_negotiation/tests.rs b/swap-machine/src/litecoin_negotiation/tests.rs
+index 5d3100f55..dd4d1983c 100644
+--- a/swap-machine/src/litecoin_negotiation/tests.rs
++++ b/swap-machine/src/litecoin_negotiation/tests.rs
+@@ -549,10 +549,40 @@ fn owned_execution_lifecycle(payout_v2:bool,payout_relay:bool) -> Result<()> {
+     let head_path=bm.join(format!("{trade}.ltc-execution-head"));
+     let before_release=std::fs::read(&head_path)?;
+     let outpoint=bob_recovery.cancel.input[0].previous_output;
+-    let (rpc,stop,server)=live_release_node(outpoint,keys.contract_address().script_pubkey().clone())?;
+-    let result=runtime.block_on(bob.release_redeem(&observer,&rpc,2,&ltc));
+-    stop.store(true,Ordering::SeqCst);let served=server.join().unwrap();
+-    let released=result?;served?;
++    let (rpc,stop,server)=live_release_node_repeated(outpoint,keys.contract_address().script_pubkey().clone(),7)?;
++    let frame=runtime.block_on(bob.redeem_signing_frame(&observer,&rpc,2))?;
++    let pending=bm.join(format!("{trade}.ltc-redeem-unsigned"));
++    let saved_pending=std::fs::read(&pending)?;
++    assert!(!bm.join(format!("{trade}.ltc-redeem-outgoing")).exists());
++    assert_ne!(std::fs::read(&head_path)?,before_release);
++    let before_release=std::fs::read(&head_path)?;
++    drop(bob);
++    let hidden_pending=root.join("hidden-redeem-unsigned");
++    std::fs::rename(&pending,&hidden_pending)?;
++    assert!(Execution::resume(&bm,&bs,trade,&policy,LocalRole::LitecoinFunder,pins).is_err());
++    assert!(!pending.exists());
++    std::fs::rename(&hidden_pending,&pending)?;
++    let mut bob=Execution::resume(&bm,&bs,trade,&policy,LocalRole::LitecoinFunder,pins)?;
++    assert_eq!(runtime.block_on(bob.redeem_signing_frame(&observer,&rpc,2))?,frame);
++    use ed25519_dalek::Signer;
++    let signature=ltc.sign(&recovery::redeem::signing_bytes(&frame)?).to_bytes();
++    observer.confirmed.store(false,Ordering::SeqCst);
++    assert!(runtime.block_on(bob.redeem_signing_frame(&observer,&rpc,2)).is_err());
++    assert!(runtime.block_on(bob.submit_redeem_signature(&observer,&rpc,2,&frame,&signature)).is_err());
++    observer.confirmed.store(true,Ordering::SeqCst);
++    assert!(runtime.block_on(bob.submit_redeem_signature(&observer,&rpc,2,&frame,&[0;64])).is_err());
++    let wrong_domain=ltc.sign(&recovery::signing_bytes(&frame)?).to_bytes();
++    assert!(runtime.block_on(bob.submit_redeem_signature(&observer,&rpc,2,&frame,&wrong_domain)).is_err());
++    std::fs::write(&pending,b"corrupt")?;
++    assert!(runtime.block_on(bob.redeem_signing_frame(&observer,&rpc,2)).is_err());
++    assert_eq!(std::fs::read(&pending)?,b"corrupt");
++    std::fs::write(&pending,&saved_pending)?;
++    assert_eq!(std::fs::read(&head_path)?,before_release);
++    let result=runtime.block_on(bob.submit_redeem_signature(&observer,&rpc,2,&frame,&signature));
++    let released=result?;
++    assert_eq!(runtime.block_on(bob.release_redeem(&observer,&rpc,2,&ltc))?.bytes(),frame);
++    assert!(runtime.block_on(bob.submit_redeem_signature(&observer,&rpc,2,&frame,&[0;64])).is_err());
++    stop.store(true,Ordering::SeqCst);server.join().unwrap()?;
+     let release_path=bm.join(format!("{trade}.ltc-redeem-outgoing"));
+     assert!(release_path.exists());
+     // Simulate crash after frame retention but before publishing its head digest.
+@@ -997,13 +1027,18 @@ fn owned_execution_lifecycle(payout_v2:bool,payout_relay:bool) -> Result<()> {
+ 
+ #[cfg(target_os="linux")]
+ fn live_release_node(outpoint:bitcoin::OutPoint,script:bitcoin::ScriptBuf)
++    ->Result<(crate::litecoin_rpc::LitecoinRpc,std::sync::Arc<std::sync::atomic::AtomicBool>,std::thread::JoinHandle<Result<()>>)> {
++    live_release_node_repeated(outpoint,script,1)
++}
++fn live_release_node_repeated(outpoint:bitcoin::OutPoint,script:bitcoin::ScriptBuf,rounds:u32)
+     ->Result<(crate::litecoin_rpc::LitecoinRpc,std::sync::Arc<std::sync::atomic::AtomicBool>,std::thread::JoinHandle<Result<()>>)> {
+     use std::{net::TcpListener,io::{BufRead,BufReader,Read,Write},sync::{Arc,atomic::{AtomicBool,Ordering}},time::Duration};
+     let listener=TcpListener::bind("127.0.0.1:0")?;
+     let port=listener.local_addr()?.port();listener.set_nonblocking(true)?;
+     let stop=Arc::new(AtomicBool::new(false));let stopped=stop.clone();
+     let server=std::thread::spawn(move || ->Result<()> {
+-        for id in 0..5 {
++        for request_index in 0..5*rounds {
++            let id=request_index%5;
+             let (mut socket,_)=loop {
+                 ensure!(!stopped.load(Ordering::SeqCst),"live-release test node stopped early");
+                 match listener.accept() {

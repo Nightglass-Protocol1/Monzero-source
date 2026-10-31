@@ -1,0 +1,265 @@
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 4c8d3294c..7c29f64d9 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -2,6 +2,13 @@
+ #[path = "../../bitcoin-wallet/tests/harness/mod.rs"]
+ mod harness;
+ mod native_rpc;
++#[cfg(unix)]
++mod alice_peer;
++
++#[cfg(unix)]
++#[test]
++#[ignore = "private child process of the isolated settlement fixture"]
++fn alice_peer_process() -> Result<()> { alice_peer::serve() }
+ 
+ use anyhow::{Context, Result};
+ use bitcoin::{Amount, Network, Transaction};
+@@ -13,7 +20,9 @@ use std::time::Duration;
+ use swap_core::bitcoin::{CancelTimelock, PunishTimelock, RemainingRefundTimelock};
+ use swap_core::monero::{Scalar, TransferProof};
+ use swap_env::env::{GetConfig, Regtest};
+-use swap_machine::{alice, bob};
++use swap_machine::bob;
++#[cfg(not(unix))]
++use swap_machine::alice;
+ use testcontainers::clients::Cli;
+ use uuid::Uuid;
+ 
+@@ -314,6 +323,7 @@ async fn settlement(refund: bool) -> Result<()> {
+     // This does not validate native XMZ funding, network identity, or transfer proof.
+     let atoms: swap_core::xmz::XmzAmount = "2".parse().expect("constant fixture amount");
+     let legacy_amount = swap_core::monero::primitives::Amount::from_pico(atoms.atoms());
++    #[cfg(not(unix))]
+     let alice0 = alice::State0::new(amount, legacy_amount, Amount::ZERO, config,
+         alice_wallet.new_address().await?, alice_wallet.new_address().await?,
+         fee, fee, fee, false, &mut OsRng);
+@@ -324,11 +334,18 @@ async fn settlement(refund: bool) -> Result<()> {
+         RemainingRefundTimelock::new(config.bitcoin_remaining_refund_timelock),
+         bob_wallet.new_address().await?, config.monero_finality_confirmations,
+         fee, fee, fee, fee, fee, fee);
++    #[cfg(unix)]
++    let (mut alice3,bob2)=alice_peer::AlicePeer::negotiate(swap_id,bob0,&bob_wallet,
++        alice_wallet.new_address().await?,alice_wallet.new_address().await?).await?;
++    #[cfg(not(unix))]
++    let (alice3,bob2)={
+     let (_, alice1) = alice0.receive(bob0.next_message()?)?;
+     let bob1 = bob0.receive(&bob_wallet, alice1.next_message()?).await?;
+     let alice2 = alice1.receive(bob1.next_message())?;
+     let bob2 = bob1.receive(alice2.next_message()?)?;
+     let alice3 = alice2.receive(bob2.next_message()?)?;
++    (alice3,bob2)
++    };
+     let (bob3, lock) = bob2.lock_btc().await?;
+     let lock_id = lock.txid();
+     let lock_tx = bob_wallet.sign_and_finalize(lock.into()).await?;
+@@ -479,6 +496,8 @@ async fn settlement(refund: bool) -> Result<()> {
+     if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
+         assert_pending_rejected(&env, swap_id, lock_id, "Bitcoin lock absent or spent").await?;
+     }
++    #[cfg(unix)]
++    alice3.finish()?;
+     Ok(())
+ }
+ 
+diff --git a/swap-machine/tests/alice_peer/mod.rs b/swap-machine/tests/alice_peer/mod.rs
+new file mode 100644
+index 000000000..2077de9cf
+--- /dev/null
++++ b/swap-machine/tests/alice_peer/mod.rs
+@@ -0,0 +1,194 @@
++//! Test-only separate Alice process. Private local socket, not a public peer API.
++//! No Alice state is serialized to Bob. Refund recovery keys are exported only
++//! for the existing disposable native-wallet fixture, never production wiring.
++use anyhow::{Context, Result, ensure};
++use serde::{Serialize, de::DeserializeOwned};
++use serde_json::{Value, json};
++use std::{cell::RefCell, io::{Read, Write}, os::unix::{fs::DirBuilderExt, net::{UnixListener, UnixStream}},
++    path::PathBuf, process::{Child, Command, Stdio}, time::{Duration, Instant}};
++use swap_machine::{alice, bob};
++use swap_env::env::{GetConfig, Regtest};
++use uuid::Uuid;
++
++struct Wire { socket: UnixStream, id: Uuid, sequence: u64 }
++impl Wire {
++    fn send<T: Serialize>(&mut self, kind: &str, payload: T) -> Result<()> {
++        let bytes=serde_json::to_vec(&json!({"schema":"isolated-alice-fixture-v1",
++            "swapId":self.id.to_string(),"sequence":self.sequence,"kind":kind,"payload":payload}))?;
++        ensure!(bytes.len()<=1_048_576,"oversized fixture frame");
++        self.socket.write_all(&(bytes.len() as u32).to_be_bytes())?;
++        self.socket.write_all(&bytes)?;
++        Ok(())
++    }
++    fn receive<T: DeserializeOwned>(&mut self, kind: &str) -> Result<T> {
++        let mut size=[0;4]; self.socket.read_exact(&mut size)?;
++        let size=u32::from_be_bytes(size) as usize;
++        ensure!(size>0 && size<=1_048_576,"invalid fixture frame length");
++        let mut bytes=vec![0;size]; self.socket.read_exact(&mut bytes)?;
++        let value: Value=serde_json::from_slice(&bytes)?;
++        ensure!(serde_json::to_vec(&value)?==bytes,"ambiguous fixture JSON");
++        ensure!(value.as_object().is_some_and(|v|v.len()==5)
++            && value["schema"]=="isolated-alice-fixture-v1" && value["swapId"]==self.id.to_string()
++            && value["sequence"]==self.sequence && value["kind"]==kind,
++            "fixture message context mismatch");
++        serde_json::from_value(value["payload"].clone()).context("invalid fixture payload")
++    }
++    fn call<T: Serialize, R: DeserializeOwned>(&mut self, kind: &str, payload: T) -> Result<R> {
++        self.send(kind,payload)?;
++        let result=self.receive(kind)?;
++        self.sequence+=1;
++        Ok(result)
++    }
++}
++
++pub struct AlicePeer {
++    wire: RefCell<Wire>, owner: OwnedProcess,
++    funding: (monero_oxide_ext::PublicKey, monero_oxide_ext::PublicKey),
++}
++struct OwnedProcess { child: Child, directory: PathBuf }
++impl Drop for OwnedProcess {
++    fn drop(&mut self) {
++        if self.child.try_wait().ok().flatten().is_none() { let _=self.child.kill(); }
++        let _=self.child.wait();
++        let _=std::fs::remove_dir_all(&self.directory); // Only our UUID fixture directory.
++    }
++}
++impl AlicePeer {
++    pub async fn negotiate(id: Uuid, bob0: bob::State0, wallet: &bitcoin_wallet::Wallet,
++        redeem: bitcoin::Address, punish: bitcoin::Address) -> Result<(Self,bob::State2)> {
++        let directory=std::env::temp_dir().join(format!("xmz-alice-{}",Uuid::new_v4()));
++        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
++        let path=directory.join("peer");
++        let listener=UnixListener::bind(&path)?;
++        listener.set_nonblocking(true)?;
++        let child=Command::new(std::env::current_exe()?)
++            .args(["--exact","alice_peer_process","--ignored"])
++            .env("MONZERO_TEST_ALICE_SOCKET",&path).env("MONZERO_TEST_ALICE_ID",id.to_string())
++            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
++        let mut owner=OwnedProcess {child,directory};
++        let deadline=Instant::now()+Duration::from_secs(15);
++        let socket=loop {
++            match listener.accept() {
++                Ok((socket,_))=>break socket,
++                Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{
++                    if Instant::now()>=deadline || owner.child.try_wait()?.is_some() {
++                        anyhow::bail!("Alice fixture did not connect");
++                    }
++                    std::thread::sleep(Duration::from_millis(10));
++                }
++                Err(error)=>return Err(error.into()),
++            }
++        };
++        socket.set_read_timeout(Some(Duration::from_secs(30)))?;
++        socket.set_write_timeout(Some(Duration::from_secs(30)))?;
++        let mut wire=Wire {socket,id,sequence:0};
++        let _: bool=wire.call("init",json!({"redeem":redeem.to_string(),"punish":punish.to_string()}))?;
++        let message=wire.call("message0",bob0.next_message()?)?;
++        let bob1=bob0.receive(wallet,message).await?;
++        let message=wire.call("message2",bob1.next_message())?;
++        let bob2=bob1.receive(message)?;
++        let funding=wire.call("message4",bob2.next_message()?)?;
++        Ok((Self {wire:RefCell::new(wire),owner,funding},bob2))
++    }
++    pub fn lock_xmr_transfer_request(&self)->swap_core::monero::TransferRequest {
++        swap_core::monero::TransferRequest {public_spend_key:self.funding.0,
++            public_view_key:swap_core::monero::PublicViewKey(self.funding.1),
++            amount:swap_core::monero::primitives::Amount::from_pico(200_000_000_000).into()}
++    }
++    pub fn signed_cancel_transaction(&self)->Result<bitcoin::Transaction> { self.wire.borrow_mut().call("cancel",()) }
++    pub fn signed_redeem_transaction(&self, signature: swap_core::bitcoin::EncryptedSignature)->Result<bitcoin::Transaction> {
++        self.wire.borrow_mut().call("redeem",signature)
++    }
++    pub fn extract_monero_private_key_from_refund(&self, transaction: std::sync::Arc<bitcoin::Transaction>)->Result<monero_oxide_ext::PrivateKey> {
++        let key: String=self.wire.borrow_mut().call("refund-key",transaction.as_ref())?;
++        Ok(monero_oxide_ext::PrivateKey::from_str(&key)?)
++    }
++    pub fn finish(&mut self)->Result<()> {
++        let _: bool=self.wire.borrow_mut().call("finish",())?;
++        let deadline=Instant::now()+Duration::from_secs(5);
++        loop {
++            if let Some(status)=self.owner.child.try_wait()? { ensure!(status.success(),"Alice peer failed"); return Ok(()); }
++            ensure!(Instant::now()<deadline,"Alice peer failed to exit");
++            std::thread::sleep(Duration::from_millis(10));
++        }
++    }
++}
++use std::str::FromStr;
++
++#[test]
++fn fixture_frame_context_boundaries()->Result<()> {
++    let id=Uuid::new_v4();
++    let good=json!({"schema":"isolated-alice-fixture-v1","swapId":id.to_string(),
++        "sequence":7,"kind":"message0","payload":true});
++    for mode in 0..7 {
++        let (socket,mut sender)=UnixStream::pair()?;
++        socket.set_read_timeout(Some(Duration::from_secs(1)))?;
++        let mut wire=Wire {socket,id,sequence:7};
++        let mut value=good.clone();
++        match mode {
++            1=>value["swapId"]=json!(Uuid::new_v4().to_string()),
++            2=>value["sequence"]=json!(6),
++            3=>value["kind"]=json!("message2"),
++            4=>value["extra"]=json!(true),
++            _=>{},
++        }
++        let mut bytes=serde_json::to_vec(&value)?;
++        if mode==5 { bytes.splice(1..1,b"\"sequence\":7,".iter().copied()); }
++        let size=if mode==6 {1_048_577} else {bytes.len() as u32};
++        sender.write_all(&size.to_be_bytes())?;
++        sender.write_all(&bytes)?;
++        drop(sender);
++        let result=wire.receive::<bool>("message0");
++        if mode==0 { ensure!(result?,"valid payload lost"); }
++        else { ensure!(result.is_err(),"invalid fixture frame accepted"); }
++    }
++    Ok(())
++}
++
++pub fn serve()->Result<()> {
++    let socket=UnixStream::connect(std::env::var_os("MONZERO_TEST_ALICE_SOCKET").context("missing socket")?)?;
++    socket.set_read_timeout(Some(Duration::from_secs(600)))?;
++    socket.set_write_timeout(Some(Duration::from_secs(30)))?;
++    let id=std::env::var("MONZERO_TEST_ALICE_ID")?.parse()?;
++    let mut wire=Wire {socket,id,sequence:0};
++    let init: Value=wire.receive("init")?;
++    let redeem=init["redeem"].as_str().context("missing redeem")?.parse::<bitcoin::Address<_>>()?.require_network(bitcoin::Network::Regtest)?;
++    let punish=init["punish"].as_str().context("missing punish")?.parse::<bitcoin::Address<_>>()?.require_network(bitcoin::Network::Regtest)?;
++    let fee=bitcoin::Amount::from_sat(1000);
++    let state=alice::State0::new(bitcoin::Amount::from_sat(500000),
++        swap_core::monero::primitives::Amount::from_pico(200_000_000_000),bitcoin::Amount::ZERO,
++        Regtest::get_config(),redeem,punish,fee,fee,fee,false,&mut rand::rngs::OsRng);
++    wire.send("init",true)?; wire.sequence+=1;
++    let (received,state)=state.receive(wire.receive("message0")?)?;
++    ensure!(received==id,"wrong negotiated swap id");
++    wire.send("message0",state.next_message()?)?; wire.sequence+=1;
++    let state=state.receive(wire.receive("message2")?)?;
++    wire.send("message2",state.next_message()?)?; wire.sequence+=1;
++    let state=state.receive(wire.receive("message4")?)?;
++    let funding=state.lock_xmr_transfer_request();
++    wire.send("message4",(funding.public_spend_key,funding.public_view_key.0))?; wire.sequence+=1;
++    // Post-negotiation operations remain fixture-only and retain Alice's keys here.
++    loop {
++        // Peek the framed command once, then dispatch through the same bound decoder.
++        let mut size=[0;4]; wire.socket.read_exact(&mut size)?;
++        let size=u32::from_be_bytes(size) as usize;
++        ensure!(size>0 && size<=1_048_576,"invalid fixture command size");
++        let mut bytes=vec![0;size]; wire.socket.read_exact(&mut bytes)?;
++        let value: Value=serde_json::from_slice(&bytes)?;
++        ensure!(serde_json::to_vec(&value)?==bytes,"ambiguous fixture JSON");
++        ensure!(value.as_object().is_some_and(|v|v.len()==5) && value["schema"]=="isolated-alice-fixture-v1"
++            && value["swapId"]==id.to_string() && value["sequence"]==wire.sequence,"invalid fixture command context");
++        let kind=value["kind"].as_str().context("missing command")?;
++        match kind {
++            "cancel"=>wire.send(kind,state.signed_cancel_transaction()?)?,
++            "redeem"=>wire.send(kind,state.signed_redeem_transaction(serde_json::from_value(value["payload"].clone())?)?)?,
++            "refund-key"=>{
++                let tx:bitcoin::Transaction=serde_json::from_value(value["payload"].clone())?;
++                wire.send(kind,state.extract_monero_private_key_from_refund(std::sync::Arc::new(tx))?.to_string())?;
++            }
++            "finish"=>{ wire.send(kind,true)?; return Ok(()); }
++            _=>anyhow::bail!("unexpected Alice fixture command"),
++        }
++        wire.sequence+=1;
++    }
++}

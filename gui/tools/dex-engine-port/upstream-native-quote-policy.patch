@@ -1,0 +1,115 @@
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index 3b1f05cbd..0de6555e2 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -5,6 +5,24 @@ use std::collections::BTreeMap;
+ use swap_core::xmz_address::XmzNetwork;
+ use crate::{native_quote_destinations::QuoteDestinations, native_quote_signatures};
+ 
++/// Trusted operator policy, never inferred from the peer's proposed terms.
++/// Exact matching does not prove that a timeout policy is safe across chains.
++#[derive(Clone)]
++pub struct DeploymentPolicy {
++    pub btc_genesis: String,
++    pub xmz_genesis: String,
++    pub btc_network: String,
++    pub xmz_network: String,
++    pub btc_confirmations: u32,
++    pub xmz_confirmations: u32,
++    pub cancel_blocks: u32,
++    pub punish_blocks: u32,
++    pub maximum_btc_principal: u64,
++    pub maximum_xmz_principal: u64,
++    pub maximum_btc_native_fee: u64,
++    pub maximum_xmz_native_fee: u64,
++}
++
+ /// Immutable validated terms. Callers must additionally enforce deployment policy,
+ /// durable approval/replay protection and binding to the negotiated protocol state.
+ pub struct VerifiedQuote {
+@@ -82,6 +100,36 @@ impl VerifiedQuote {
+     pub fn terms(&self) -> &BTreeMap<String, String> { &self.terms }
+     pub fn commitment(&self) -> &[u8; 32] { &self.commitment }
+     pub fn destinations(&self) -> &QuoteDestinations { &self.destinations }
++
++    /// Recheck at the point of use. Does not attest the connected daemons' chains,
++    /// reserve funds, persist approval, or authorize any transaction.
++    pub fn check_deployment(&self, policy: &DeploymentPolicy, now: u64) -> Result<()> {
++        let number = |key: &str| -> Result<u64> { Ok(self.terms[key].parse()?) };
++        let expiry = number("expiresAt")?;
++        ensure!(expiry > now && expiry - now <= 3600, "quote outside validity window");
++        for (field, expected) in [
++            ("btcGenesis", &policy.btc_genesis), ("xmzGenesis", &policy.xmz_genesis),
++            ("btcNetwork", &policy.btc_network), ("xmzNetwork", &policy.xmz_network),
++        ] {
++            ensure!(&self.terms[field] == expected, "quote deployment identity mismatch");
++        }
++        for (field, expected) in [
++            ("btcConfirmations", policy.btc_confirmations),
++            ("xmzConfirmations", policy.xmz_confirmations),
++            ("cancelBlocks", policy.cancel_blocks), ("punishBlocks", policy.punish_blocks),
++        ] {
++            ensure!(number(field)? == u64::from(expected), "quote deployment timing mismatch");
++        }
++        for (field, maximum) in [
++            ("btcSatoshis", policy.maximum_btc_principal),
++            ("xmzAtoms", policy.maximum_xmz_principal),
++            ("btcNativeFeeMaxSatoshis", policy.maximum_btc_native_fee),
++            ("xmzNativeFeeMaxAtoms", policy.maximum_xmz_native_fee),
++        ] {
++            ensure!(maximum > 0 && number(field)? <= maximum, "quote exceeds deployment limits");
++        }
++        Ok(())
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -161,4 +209,48 @@ mod tests {
+         let mut extra = original; extra["unexpected"] = "value".into();
+         assert!(verify(&extra, 1000).is_err());
+     }
++
++    #[test]
++    fn deployment_policy_is_exact_and_rechecked_at_use() {
++        let quote = verify(&fixture(), 1000).unwrap();
++        let policy = DeploymentPolicy {
++            btc_genesis: "a".repeat(64), xmz_genesis: "b".repeat(64),
++            btc_network: "btc-regtest".into(), xmz_network: "xmz-fakechain".into(),
++            btc_confirmations: 1, xmz_confirmations: 1, cancel_blocks: 10, punish_blocks: 20,
++            maximum_btc_principal: 500000, maximum_xmz_principal: 200000000000,
++            maximum_btc_native_fee: 10000, maximum_xmz_native_fee: 1000000000,
++        };
++        quote.check_deployment(&policy, 1000).unwrap();
++        assert!(quote.check_deployment(&policy, 1100).is_err());
++        assert!(quote.check_deployment(&policy, u64::MAX).is_err());
++        for field in 0..12 {
++            let mut changed = policy.clone();
++            match field {
++                0 => changed.btc_genesis = "c".repeat(64),
++                1 => changed.xmz_genesis = "c".repeat(64),
++                2 => changed.btc_network = "btc-mainnet".into(),
++                // Same address encoding, different deployment: must still fail.
++                3 => changed.xmz_network = "xmz-mainnet".into(),
++                4 => changed.btc_confirmations += 1,
++                5 => changed.xmz_confirmations += 1,
++                6 => changed.cancel_blocks += 1,
++                7 => changed.punish_blocks += 1,
++                8 => changed.maximum_btc_principal -= 1,
++                9 => changed.maximum_xmz_principal -= 1,
++                10 => changed.maximum_btc_native_fee -= 1,
++                11 => changed.maximum_xmz_native_fee -= 1,
++                _ => unreachable!(),
++            }
++            assert!(quote.check_deployment(&changed, 1000).is_err(), "policy field {field}");
++        }
++        let mut disabled = policy.clone();
++        disabled.maximum_btc_principal = 0;
++        assert!(quote.check_deployment(&disabled, 1000).is_err());
++        let mut larger = policy;
++        larger.maximum_btc_principal += 1;
++        larger.maximum_xmz_principal += 1;
++        larger.maximum_btc_native_fee += 1;
++        larger.maximum_xmz_native_fee += 1;
++        quote.check_deployment(&larger, 1000).unwrap();
++    }
+ }

@@ -1,0 +1,201 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/light.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/light.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/light.rs
+@@ -0,0 +1,23 @@
++//! Owned native wallet lifecycle for a freshly verified local-funded BCH claim.
++//! Restore/open/check do not construct or authorize any native payout.
++use super::*;
++use crate::bch_rpc::observer::OwnedBchObserver;
++impl AdmittedExecution<'_> {
++    pub async fn restore_light_bch_claim_wallet(&mut self,native:&impl FundingObserver,bch:&OwnedBchObserver,
++        redemption:Txid,block:Option<BlockHash>,now:u64,session:&mut NativeWalletSession,password:String)->Result<()> {
++        let password=Zeroizing::new(password);
++        let claim=self.recover_light_bch_native_claim(native,bch,redemption,block,now).await?;
++        self.restore_claim_wallet(&claim,now,session,password).await
++    }
++    pub async fn open_light_bch_claim_wallet(&mut self,native:&impl FundingObserver,bch:&OwnedBchObserver,
++        redemption:Txid,block:Option<BlockHash>,now:u64,session:&mut NativeWalletSession,password:String)->Result<()> {
++        let password=Zeroizing::new(password);
++        let claim=self.recover_light_bch_native_claim(native,bch,redemption,block,now).await?;
++        self.open_claim_wallet(&claim,now,session,password).await
++    }
++    pub async fn check_light_bch_claim_wallet(&mut self,native:&impl FundingObserver,bch:&OwnedBchObserver,
++        redemption:Txid,block:Option<BlockHash>,now:u64,session:&mut NativeWalletSession)->Result<()> {
++        let claim=self.recover_light_bch_native_claim(native,bch,redemption,block,now).await?;
++        self.check_claim_wallet(&claim,now,session).await
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
+@@ -14,7 +14,14 @@
+ fn name(quote: &VerifiedBchQuote,suffix: &str) -> String {
+     format!("{}.bch-native-claim-wallet-{suffix}",quote.terms()["swapId"])
+ }
+-fn key_hex(bytes: &[u8;32]) -> String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
++fn key_hex(bytes:&[u8;32])->String {
++    // One allocation, immediately transferred to the session's zeroizing input.
++    let mut encoded=String::with_capacity(64);const HEX:&[u8;16]=b"0123456789abcdef";
++    for &byte in bytes {
++        encoded.push(HEX[usize::from(byte>>4)] as char);encoded.push(HEX[usize::from(byte&15)] as char);
++    }
++    encoded
++}
+ impl NativeClaim {
+     async fn check_wallet(&self,session: &mut NativeWalletSession) -> Result<()> {
+         session.verify_spend_key(&self.spend,&self.address).await?;
+@@ -66,8 +73,12 @@
+         redemption: Txid,block: Option<BlockHash>,now: u64,session: &mut NativeWalletSession,password: String) -> Result<()> {
+         let password=Zeroizing::new(password);
+         let claim=self.recover_bch_native_claim(native,bch,redemption,block,now).await?;
++        self.restore_claim_wallet(&claim,now,session,password).await
++    }
++    async fn restore_claim_wallet(&mut self,claim:&NativeClaim,now:u64,session:&mut NativeWalletSession,
++        password:Zeroizing<String>)->Result<()> {
+         let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
+-        let binding=self.claim_wallet_binding(&claim,&id)?;
++        let binding=self.claim_wallet_binding(claim,&id)?;
+         ensure!(self.claim_wallet_intent(&binding,now)?.is_none(),"BCH claim wallet restore was already attempted; open/check explicitly");
+         session.preflight_restore(&password,&claim.address).await?;
+         let bytes=serde_json::to_vec(&Intent {schema:INTENT.into(),binding,at:now})?;
+@@ -82,8 +93,12 @@
+         redemption: Txid,block: Option<BlockHash>,now: u64,session: &mut NativeWalletSession,password: String) -> Result<()> {
+         let password=Zeroizing::new(password);
+         let claim=self.recover_bch_native_claim(native,bch,redemption,block,now).await?;
++        self.open_claim_wallet(&claim,now,session,password).await
++    }
++    async fn open_claim_wallet(&mut self,claim:&NativeClaim,now:u64,session:&mut NativeWalletSession,
++        password:Zeroizing<String>)->Result<()> {
+         let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
+-        let binding=self.claim_wallet_binding(&claim,&id)?;
++        let binding=self.claim_wallet_binding(claim,&id)?;
+         let intent=self.claim_wallet_intent(&binding,now)?.context("missing original BCH claim wallet intent")?;
+         session.open(&id,password.to_string(),&claim.address).await?;
+         claim.check_wallet(session).await?;self.retain_claim_wallet_ready(intent)
+@@ -93,11 +108,16 @@
+     pub async fn check_bch_claim_wallet(&mut self,native: &impl FundingObserver,bch: &BchRpc,
+         redemption: Txid,block: Option<BlockHash>,now: u64,session: &mut NativeWalletSession) -> Result<()> {
+         let claim=self.recover_bch_native_claim(native,bch,redemption,block,now).await?;
++        self.check_claim_wallet(&claim,now,session).await
++    }
++    async fn check_claim_wallet(&mut self,claim:&NativeClaim,now:u64,session:&mut NativeWalletSession)->Result<()> {
+         let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
+-        let binding=self.claim_wallet_binding(&claim,&id)?;
++        let binding=self.claim_wallet_binding(claim,&id)?;
+         let intent=self.claim_wallet_intent(&binding,now)?.context("missing original BCH claim wallet intent")?;
+         claim.check_wallet(session).await?;self.retain_claim_wallet_ready(intent)
+     }
+ }
+ 
+ pub mod payout;
++
++pub mod light;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim/wallet.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim/wallet.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim/wallet.rs
+@@ -0,0 +1,53 @@
++use super::*;
++use crate::native_funding_rpc::wallet_session::{SwapWalletId,fixture::Fixture as WalletFixture};
++use agreement::execution::funding::success::native_claim::NativeClaim;
++
++pub(super) async fn exercise(metadata:&std::path::Path,snapshots:&std::path::Path,setup:&Setup,
++    bch:&super::super::super::light_observer::Fixture,txid:bitcoin::Txid,claim:&NativeClaim)->Result<()> {
++    let id=SwapWalletId::new(setup.quote.terms()["swapId"].parse()?)?;
++    let block=Some(BlockHash::from_byte_array([6;32]));
++    for lost in [false,true] {
++        let copied=PrivateStore::new()?;
++        for entry in std::fs::read_dir(metadata)? {
++            let entry=entry?;if entry.file_type()?.is_file() {std::fs::copy(entry.path(),copied.0.join(entry.file_name()))?;}
++        }
++        let mut execution=AdmittedExecution::resume(&copied.0,snapshots,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let native=Native::new(&execution,setup)?;
++        let intent=copied.0.join(format!("{}.bch-native-claim-wallet-intent",setup.quote.terms()["swapId"]));
++        let ready=copied.0.join(format!("{}.bch-native-claim-wallet-ready",setup.quote.terms()["swapId"]));
++        let wallet=WalletFixture::new(&id,claim.address(),claim.spend_key(),claim.view_key(),claim.native_txid()).await?;
++        {let mut state=wallet.state.lock().unwrap();state.intent=Some(intent.clone());state.lose_restore=lost;}
++        let mut session=wallet.session()?;
++        native.mode(1);
++        assert!(execution.restore_light_bch_claim_wallet(&native,&bch.observer,txid,block,2030,&mut session,"fixture".into()).await.err()
++            .context("unconfirmed native payment must block restoration")?.to_string().contains("native funding is not mined"));
++        assert!(!intent.exists());assert!(!ready.exists());assert!(wallet.state.lock().unwrap().calls.is_empty());
++        native.mode(0);
++        let result=execution.restore_light_bch_claim_wallet(&native,&bch.observer,txid,block,2030,&mut session,"fixture".into()).await;
++        assert!(intent.exists());
++        if lost {assert!(result.is_err());assert!(!ready.exists());}else{result?;assert!(ready.exists());}
++        let before=wallet.state.lock().unwrap().calls.len();let observations=native.snapshots.load(Ordering::SeqCst);
++        assert!(execution.restore_light_bch_claim_wallet(&native,&bch.observer,txid,block,2031,&mut wallet.session()?,"fixture".into()).await.err()
++            .context("duplicate wallet restoration must fail")?.to_string().contains("already attempted"));
++        assert_eq!(wallet.state.lock().unwrap().calls.len(),before);
++        assert!(native.snapshots.load(Ordering::SeqCst)>observations);
++        drop(execution);
++        let mut execution=AdmittedExecution::resume(&copied.0,snapshots,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let mut recovered=wallet.session()?;
++        execution.check_light_bch_claim_wallet(&native,&bch.observer,txid,block,2032,&mut recovered).await?;
++        assert!(ready.exists());
++        recovered.close(claim.address()).await?;
++        execution.open_light_bch_claim_wallet(&native,&bch.observer,txid,block,2033,&mut recovered,"fixture".into()).await?;
++        if !lost {
++            let saved=std::fs::read(&ready)?;std::fs::write(&ready,b"{}")?;
++            let before=wallet.state.lock().unwrap().calls.len();
++            let result=execution.check_light_bch_claim_wallet(&native,&bch.observer,txid,block,2034,&mut recovered).await;
++            std::fs::write(&ready,saved)?;
++            assert!(result.is_err());assert_eq!(wallet.state.lock().unwrap().calls.len(),before);
++        }
++        let state=wallet.state.lock().unwrap();
++        assert_eq!(state.calls.iter().filter(|method|method.as_str()=="generate_from_keys").count(),1);
++        assert!(state.calls.iter().all(|method|matches!(method.as_str(),"get_address"|"generate_from_keys"|"query_key"|"scan_tx"|"open_wallet"|"close_wallet")));
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim.rs
+@@ -3,7 +3,7 @@
+ 
+ pub(in crate::bch_key_recovery::authenticated::native_wallet::tests)
+ async fn exercise(execution:&AdmittedExecution<'_>,setup:&Setup,fixture:&super::super::light_observer::Fixture,
+-    release:&SignedSuccess,funding:&Transaction,metadata:&std::path::Path)->Result<()> {
++    release:&SignedSuccess,funding:&Transaction,metadata:&std::path::Path,snapshots:&std::path::Path)->Result<()> {
+     // Use the native funder's actual fixture share to decrypt the released
+     // adaptor and construct the covenant redemption, not an invented spend.
+     let frame:serde_json::Value=serde_json::from_slice(release.frame())?;
+@@ -65,5 +65,8 @@
+     let indexed=execution.recover_light_bch_native_claim(&native,observer,id,None,2022).await?;
+     ensure!(indexed.spend_key()==claim.spend_key() && indexed.view_key()==claim.view_key(),"indexed native claim differs");
+     assert_eq!(indexed.commitment(),claim.commitment());
++    wallet::exercise(metadata,snapshots,setup,fixture,id,&claim).await?;
+     Ok(())
+ }
++
++mod wallet;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -1034,7 +1034,7 @@
+         cold.bind_reviewed_light_bch_observer(&observer,2003,&review.commitment)?;
+         assert_eq!(std::fs::read(bound_path)?,bound);
+         light_success::reopen(&mut cold,&setup,&fixture,&release).await?;
+-        light_success::claim::exercise(&cold,&setup,&fixture,&release,&signed,&metadata.0).await?;
++        light_success::claim::exercise(&cold,&setup,&fixture,&release,&signed,&metadata.0,&snapshots.0).await?;
+         fixture.finish()?;
+     }
+     }
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session.rs b/swap-machine/src/native_funding_rpc/wallet_session.rs
+--- a/swap-machine/src/native_funding_rpc/wallet_session.rs
++++ b/swap-machine/src/native_funding_rpc/wallet_session.rs
+@@ -167,7 +167,12 @@
+             Some(serde_json::Value::String(key))=>checked_private_key_hex(key)?,
+             _=>anyhow::bail!("missing recovered wallet spend key"),
+         };
+-        let expected_hex=zeroize::Zeroizing::new(expected_key.iter().map(|b|format!("{b:02x}")).collect::<String>());
++        let mut expected_hex=zeroize::Zeroizing::new(String::with_capacity(64));
++        const HEX:&[u8;16]=b"0123456789abcdef";
++        for &byte in expected_key {
++            expected_hex.push(HEX[usize::from(byte>>4)] as char);
++            expected_hex.push(HEX[usize::from(byte&15)] as char);
++        }
+         ensure!(*key==*expected_hex,"opened wallet lacks expected recovered spend key");
+         ensure!(self.client.opened_wallet(self.network).await?.as_ref()==Some(expected),"spend wallet changed during verification");
+         Ok(())

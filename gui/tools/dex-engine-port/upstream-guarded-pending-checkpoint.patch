@@ -1,0 +1,486 @@
+diff --git a/swap-machine/src/native_execution_claim.rs b/swap-machine/src/native_execution_claim.rs
+index 13ba26656..1651f4448 100644
+--- a/swap-machine/src/native_execution_claim.rs
++++ b/swap-machine/src/native_execution_claim.rs
+@@ -4,6 +4,7 @@
+ use anyhow::{Result, ensure};
+ use std::path::Path;
+ use crate::native_trade_quote::{DeploymentPolicy, VerifiedQuote};
++pub mod checkpoint;
+ 
+ /// Only a successful durable create yields this handle. It cannot be reopened
+ /// from a file or cloned. Keeping it does not bypass fresh chain/quote checks.
+@@ -11,6 +12,8 @@ pub struct ExecutionClaim {
+     quote: VerifiedQuote,
+     // Process ownership only; dropping this never removes the durable attempt.
+     _owner: std::fs::File,
++    directory: std::fs::File,
++    checkpoint_quote: Option<crate::native_trade_quote::RecordedQuote>,
+ }
+ 
+ impl ExecutionClaim {
+@@ -31,7 +34,7 @@ impl ExecutionClaim {
+             "requestedAt": now.to_string(),
+             "terms": quote.terms(),
+         });
+-        Self::reserve_record(directory, quote, policy, reviewed_commitment, now, value)
++        Self::reserve_record(directory, quote, policy, reviewed_commitment, now, value, None)
+     }
+ 
+     /// Retain signed reservation and policy before returning a new execution
+@@ -50,7 +53,7 @@ impl ExecutionClaim {
+         let value = serde_json::json!({"schema":"monzero-native-execution-attempt-v3",
+             "quoteCommitment":context.commitment,"requestedAt":now.to_string(),
+             "policy":context.policy,"reservation":serde_json::from_slice::<serde_json::Value>(reservation)?});
+-        Self::reserve_record(directory, quote, context.policy, context.commitment, now, value)
++        Self::reserve_record(directory, quote, context.policy, context.commitment, now, value, Some(verified.into_recorded()))
+     }
+ 
+     #[cfg(not(target_os = "linux"))]
+@@ -60,7 +63,8 @@ impl ExecutionClaim {
+ 
+     #[cfg(target_os = "linux")]
+     fn reserve_record(directory: &Path, quote: VerifiedQuote, policy: &DeploymentPolicy,
+-        reviewed_commitment: &[u8;32], now: u64, value: serde_json::Value) -> Result<Self> {
++        reviewed_commitment: &[u8;32], now: u64, value: serde_json::Value,
++        checkpoint_quote: Option<crate::native_trade_quote::RecordedQuote>) -> Result<Self> {
+         use std::{fs::{File, OpenOptions}, io::Write,
+             os::{fd::{AsRawFd, FromRawFd}, unix::fs::{MetadataExt, OpenOptionsExt}}};
+         quote.check_deployment(policy, now)?;
+@@ -87,7 +91,7 @@ impl ExecutionClaim {
+         file.write_all(&bytes)?;
+         file.sync_all()?;
+         root.sync_all()?;
+-        Ok(Self { quote, _owner:file })
++        Ok(Self { quote, _owner:file, directory:root, checkpoint_quote })
+     }
+ 
+     #[cfg(not(target_os = "linux"))]
+@@ -125,7 +129,7 @@ impl RecordedExecution {
+ 
+     #[cfg(target_os = "linux")]
+     pub fn load(directory: &Path, context: &RecoveryContext<'_>, now: u64) -> Result<Self> {
+-        let (_,bytes) = read_execution(directory, context.swap_id, false)?;
++        let (_,_,bytes) = read_execution(directory, context.swap_id, false)?;
+         Self::decode(&bytes, context, now)
+     }
+ 
+@@ -173,6 +177,7 @@ impl RecordedExecution {
+ pub struct RecoveryLease {
+     record: RecordedExecution,
+     _owner: std::fs::File,
++    directory: std::fs::File,
+ }
+ 
+ impl RecoveryLease {
+@@ -191,10 +196,10 @@ impl RecoveryLease {
+ 
+     #[cfg(target_os = "linux")]
+     pub fn acquire(directory: &Path, context: &RecoveryContext<'_>, now: u64) -> Result<Self> {
+-        let (owner,bytes)=read_execution(directory,context.swap_id,true)?;
++        let (root,owner,bytes)=read_execution(directory,context.swap_id,true)?;
+         let record=RecordedExecution::decode(&bytes,context,now)?;
+         ensure!(record.ownership_aware,"legacy execution record has no recovery ownership protocol");
+-        Ok(Self {record,_owner:owner})
++        Ok(Self {record,_owner:owner,directory:root})
+     }
+ 
+     #[cfg(not(target_os = "linux"))]
+@@ -213,7 +218,7 @@ fn lock_owner(file: &std::fs::File) -> Result<()> {
+ }
+ 
+ #[cfg(target_os = "linux")]
+-fn read_execution(directory: &Path, swap: uuid::Uuid, exclusive: bool) -> Result<(std::fs::File,Vec<u8>)> {
++fn read_execution(directory: &Path, swap: uuid::Uuid, exclusive: bool) -> Result<(std::fs::File,std::fs::File,Vec<u8>)> {
+     use std::{fs::{File, OpenOptions}, io::Read,
+         os::{fd::{AsRawFd, FromRawFd}, unix::fs::{MetadataExt, OpenOptionsExt}}};
+     ensure!(!swap.is_nil() && directory.is_absolute() && directory.canonicalize()? == directory,
+@@ -241,5 +246,5 @@ fn read_execution(directory: &Path, swap: uuid::Uuid, exclusive: bool) -> Result
+         && (after.mtime(),after.mtime_nsec(),after.ctime(),after.ctime_nsec())
+             ==(before.mtime(),before.mtime_nsec(),before.ctime(),before.ctime_nsec())
+         && (named.dev(),named.ino())==(before.dev(),before.ino()),"execution record changed while reading");
+-    Ok((file,bytes))
++    Ok((root,file,bytes))
+ }
+diff --git a/swap-machine/src/native_execution_claim/checkpoint.rs b/swap-machine/src/native_execution_claim/checkpoint.rs
+new file mode 100644
+index 000000000..23cba210b
+--- /dev/null
++++ b/swap-machine/src/native_execution_claim/checkpoint.rs
+@@ -0,0 +1,172 @@
++//! Write-once Bob pending-funding checkpoint, held under attempt ownership.
++//! Contains plaintext secrets: private local storage is REQUIRED. This is not
++//! encryption or a key-management system. Expected digests must be retained in
++//! trusted context separately, never adopted from the file being loaded.
++use super::{ExecutionClaim, RecoveryLease};
++use crate::xmz_funding::{FundingPolicy, PendingFunding};
++use anyhow::{ensure, Context, Result};
++use sha2::{Digest, Sha256};
++use zeroize::Zeroizing;
++
++const DOMAIN: &[u8] = b"monzero-native-bob-pending-checkpoint-v1\0";
++const MAX_BYTES: usize = 1_048_576 + DOMAIN.len() + 32;
++
++impl ExecutionClaim {
++    /// Return a digest only after file AND directory fsync. Any error may leave
++    /// a complete or torn record; never remove it or overwrite it to retry.
++    /// No signing, broadcast, checkpoint replacement or final-state assertion.
++    #[cfg(target_os = "linux")]
++    pub fn save_pending(&self, pending: &PendingFunding) -> Result<[u8;32]> {
++        let quote=self.checkpoint_quote.as_ref().context("legacy claim cannot store a guarded checkpoint")?;
++        pending.check_recorded_quote(quote)?;
++        let encoded=Zeroizing::new(pending.encode()?);
++        let mut bytes=Zeroizing::new(Vec::with_capacity(DOMAIN.len()+32+encoded.len()));
++        bytes.extend_from_slice(DOMAIN);
++        bytes.extend_from_slice(quote.commitment());
++        bytes.extend_from_slice(&encoded);
++        write_once(&self.directory,&filename(quote)?,&bytes)
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub fn save_pending(&self, _: &PendingFunding) -> Result<[u8;32]> {
++        anyhow::bail!("pending checkpoint storage is not implemented on this platform")
++    }
++}
++
++impl RecoveryLease {
++    /// Verifies all bytes against an independently retained digest before
++    /// decoding secret protocol state. Does not prove latest state or authorize
++    /// resending anything; use fresh chain reconciliation under this lease.
++    #[cfg(target_os = "linux")]
++    pub fn load_pending(&self, expected_digest: &[u8;32], lock: bitcoin::Txid,
++        policy: &FundingPolicy) -> Result<PendingFunding> {
++        let quote=self.record.quote();
++        let bytes=read_pinned(&self.directory,&filename(quote)?,expected_digest)?;
++        ensure!(bytes.len()>DOMAIN.len()+32 && bytes.starts_with(DOMAIN)
++            && &bytes[DOMAIN.len()..DOMAIN.len()+32]==quote.commitment(),
++            "checkpoint envelope differs from retained execution");
++        let pending=PendingFunding::decode(&bytes[DOMAIN.len()+32..],
++            quote.terms()["swapId"].parse()?,lock,policy)
++            .map_err(|_|anyhow::anyhow!("invalid stored pending checkpoint"))?;
++        pending.check_recorded_quote(quote)?;
++        Ok(pending)
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub fn load_pending(&self, _: &[u8;32], _: bitcoin::Txid, _: &FundingPolicy) -> Result<PendingFunding> {
++        anyhow::bail!("pending checkpoint storage is not implemented on this platform")
++    }
++}
++
++fn filename(quote:&crate::native_trade_quote::RecordedQuote) -> Result<String> {
++    let id:uuid::Uuid=quote.terms()["swapId"].parse()?;
++    ensure!(!id.is_nil(),"missing checkpoint swap identity");
++    Ok(format!("swap-{id}.pending"))
++}
++
++#[cfg(target_os = "linux")]
++fn directory_is_private(directory:&std::fs::File) -> Result<()> {
++    use std::os::unix::fs::MetadataExt;
++    let metadata=directory.metadata()?;
++    ensure!(metadata.is_dir() && metadata.uid()==unsafe{libc::geteuid()}
++        && metadata.mode()&0o077==0,"checkpoint directory is not private and owned");
++    Ok(())
++}
++
++#[cfg(target_os = "linux")]
++fn open(directory:&std::fs::File,name:&str,flags:i32) -> Result<std::fs::File> {
++    use std::os::fd::{AsRawFd,FromRawFd};
++    let name=std::ffi::CString::new(name)?;
++    let fd=unsafe{libc::openat(directory.as_raw_fd(),name.as_ptr(),flags|libc::O_NOFOLLOW|libc::O_CLOEXEC,0o600)};
++    if fd<0 {return Err(std::io::Error::last_os_error().into());}
++    Ok(unsafe{std::fs::File::from_raw_fd(fd)})
++}
++
++#[cfg(target_os = "linux")]
++fn write_once(directory:&std::fs::File,name:&str,bytes:&[u8]) -> Result<[u8;32]> {
++    use std::io::Write;
++    ensure!(!bytes.is_empty() && bytes.len()<=MAX_BYTES,"invalid checkpoint size");
++    directory_is_private(directory)?;
++    let mut file=open(directory,name,libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL)?;
++    file.write_all(bytes)?;
++    file.sync_all()?;
++    directory.sync_all()?;
++    Ok(Sha256::digest(bytes).into())
++}
++
++#[cfg(target_os = "linux")]
++fn read_pinned(directory:&std::fs::File,name:&str,expected:&[u8;32]) -> Result<Zeroizing<Vec<u8>>> {
++    use std::{io::Read,os::unix::fs::MetadataExt};
++    directory_is_private(directory)?;
++    let mut file=open(directory,name,libc::O_RDONLY|libc::O_NONBLOCK)?;
++    let before=file.metadata()?;
++    ensure!(before.is_file() && before.uid()==unsafe{libc::geteuid()} && before.mode()&0o077==0
++        && before.nlink()==1 && before.len()>0 && before.len()<=MAX_BYTES as u64,"unsafe checkpoint record");
++    let mut bytes=Zeroizing::new(Vec::new());
++    (&mut file).take(MAX_BYTES as u64+1).read_to_end(&mut bytes)?;
++    let after=file.metadata()?;
++    let named=open(directory,name,libc::O_RDONLY|libc::O_NONBLOCK)?.metadata()?;
++    ensure!(bytes.len() as u64==before.len() && after.len()==before.len()
++        && after.uid()==before.uid() && after.mode()==before.mode() && after.nlink()==1
++        && (after.mtime(),after.mtime_nsec(),after.ctime(),after.ctime_nsec())
++            ==(before.mtime(),before.mtime_nsec(),before.ctime(),before.ctime_nsec())
++        && (named.dev(),named.ino())==(before.dev(),before.ino()),"checkpoint changed while reading");
++    ensure!(<[u8;32]>::from(Sha256::digest(bytes.as_slice()))==*expected,"checkpoint digest mismatch");
++    Ok(bytes)
++}
++
++#[cfg(all(test,target_os="linux"))]
++mod tests {
++    use super::*;
++    use std::{fs,os::unix::fs::{DirBuilderExt,PermissionsExt,symlink}};
++    struct Directory(std::path::PathBuf);
++    impl Drop for Directory {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
++    fn root() -> Result<(Directory,fs::File)> {
++        let path=std::env::temp_dir().canonicalize()?.join(format!("xmz-pending-store-{}",uuid::Uuid::new_v4()));
++        fs::DirBuilder::new().mode(0o700).create(&path)?;
++        let fd=fs::File::open(&path)?;
++        Ok((Directory(path),fd))
++    }
++    #[test]
++    fn checkpoint_is_write_once_pinned_and_directory_anchored() -> Result<()> {
++        let (root,fd)=root()?;let name="swap-fixture.pending";
++        let pin=write_once(&fd,name,b"synthetic-private-fixture")?;
++        assert_eq!(read_pinned(&fd,name,&pin)?.as_slice(),b"synthetic-private-fixture");
++        assert!(write_once(&fd,name,b"replacement").is_err());
++        assert!(read_pinned(&fd,name,&[0;32]).is_err());
++        let selected=root.0.join("selected");fs::DirBuilder::new().mode(0o700).create(&selected)?;
++        let selected_fd=fs::File::open(&selected)?;
++        let selected_pin=write_once(&selected_fd,name,b"original-directory")?;
++        fs::rename(&selected,root.0.join("moved"))?;
++        fs::DirBuilder::new().mode(0o700).create(&selected)?;
++        write_once(&fs::File::open(&selected)?,name,b"replacement-directory")?;
++        assert_eq!(read_pinned(&selected_fd,name,&selected_pin)?.as_slice(),b"original-directory");
++        assert_eq!(fs::metadata(root.0.join(name))?.permissions().mode()&0o777,0o600);
++        fs::write(root.0.join(name),b"altered")?;
++        assert!(read_pinned(&fd,name,&pin).is_err());
++        fs::write(root.0.join(name),b"")?;
++        assert!(read_pinned(&fd,name,&pin).is_err());
++        assert!(write_once(&fd,name,b"retry").is_err());
++        Ok(())
++    }
++    #[test]
++    fn checkpoint_rejects_aliases_permissions_and_oversize() -> Result<()> {
++        let (root,fd)=root()?;let name="swap-fixture.pending";let path=root.0.join(name);
++        let pin=write_once(&fd,name,b"synthetic-private-fixture")?;
++        symlink(&path,root.0.join("symlink"))?;
++        assert!(read_pinned(&fd,"symlink",&pin).is_err());
++        fs::hard_link(&path,root.0.join("hardlink"))?;
++        assert!(read_pinned(&fd,name,&pin).is_err());fs::remove_file(root.0.join("hardlink"))?;
++        fs::set_permissions(&path,fs::Permissions::from_mode(0o644))?;
++        assert!(read_pinned(&fd,name,&pin).is_err());
++        fs::set_permissions(&path,fs::Permissions::from_mode(0o600))?;
++        fs::OpenOptions::new().write(true).open(&path)?.set_len(MAX_BYTES as u64+1)?;
++        assert!(read_pinned(&fd,name,&pin).is_err());
++        assert!(write_once(&fd,"oversize",&vec![0;MAX_BYTES+1]).is_err());
++        assert!(!root.0.join("oversize").exists());
++        fs::set_permissions(&root.0,fs::Permissions::from_mode(0o755))?;
++        assert!(write_once(&fd,"public-directory",b"data").is_err());
++        assert!(read_pinned(&fd,name,&pin).is_err());
++        Ok(())
++    }
++}
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index 96cd04d8e..bd7a2ac3a 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -64,6 +64,7 @@ impl RecordedQuote {
+ }
+ 
+ impl VerifiedQuote {
++    pub(crate) fn into_recorded(self) -> RecordedQuote { RecordedQuote {quote:self} }
+     /// Decode the GUI reservation schema. Bytes alone do not prove a durable
+     /// reservation or user approval: the driver must validate trusted storage,
+     /// expected quote/swap identity and its single-use ownership separately.
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index dbe0bad76..beb446c31 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -441,6 +441,8 @@ async fn settlement(refund: bool) -> Result<()> {
+     } else { None };
+     #[cfg(unix)]
+     let mut _recovery_owner = None;
++    #[cfg(unix)]
++    let mut checkpoint_pin = None;
+     let (bob3, lock) = bob2.lock_btc().await?;
+     let lock_id = lock.txid();
+     let lock_tx = bob_wallet.sign_and_finalize(lock.into()).await?;
+@@ -518,7 +520,6 @@ async fn settlement(refund: bool) -> Result<()> {
+             let changed=PendingFunding::decode(&serde_json::to_vec(&changed)?,swap_id,bob3.tx_lock.txid(),&policy)?;
+             anyhow::ensure!(changed.check_recorded_quote(&quote).is_err(),"accepted changed restored XMZ principal");
+         }
+-        drop(pending);
+         let lock_id = bob3.tx_lock.txid();
+         anyhow::ensure!(PendingFunding::decode(&encoded, Uuid::new_v4(), lock_id, &policy).is_err(),
+             "accepted another swap's recovery record");
+@@ -537,11 +538,17 @@ async fn settlement(refund: bool) -> Result<()> {
+         use std::os::unix::fs::OpenOptionsExt;
+         let checkpoint_path = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RECOVERY_EXPORT")
+             .context("missing fixture recovery export")?).with_extension("pending-state");
+-        let mut checkpoint = std::fs::OpenOptions::new().write(true).create_new(true)
+-            .mode(0o600).open(&checkpoint_path)?;
+-        checkpoint.write_all(&encoded)?;
+-        checkpoint.sync_all()?;
+-        drop(checkpoint);
++        if let Some(claim)=execution_claim.as_ref() {
++            checkpoint_pin=Some(claim.save_pending(&pending)?);
++            anyhow::ensure!(claim.save_pending(&pending).is_err(),"checkpoint was overwritten");
++        } else {
++            // Explicit legacy unsigned fixture; signed mode uses guarded storage.
++            let mut checkpoint = std::fs::OpenOptions::new().write(true).create_new(true)
++                .mode(0o600).open(&checkpoint_path)?;
++            checkpoint.write_all(&encoded)?;
++            checkpoint.sync_all()?;
++        }
++        drop(pending);
+         if let Some(association)=alice3.association() {
+             let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                 .open(checkpoint_path.with_extension("quote-context"))?;
+@@ -556,9 +563,9 @@ async fn settlement(refund: bool) -> Result<()> {
+             anyhow::ensure!(owner.acquire_recovery(swap_id).is_err(),"recovery overlapped the live execution owner");
+         }
+         drop(execution_claim.take());
+-        anyhow::ensure!(resume_in_process(&checkpoint_path, swap_id, lock_id, true, &env.bitcoind_url,alice3.association(),execution_directory).await?.is_none(),
++        anyhow::ensure!(resume_in_process(&checkpoint_path, swap_id, lock_id, true, &env.bitcoind_url,alice3.association(),execution_directory,checkpoint_pin.as_ref()).await?.is_none(),
+             "recovery accepted unavailable native RPC");
+-        verified_state = Some(resume_in_process(&checkpoint_path, swap_id, lock_id, false, &env.bitcoind_url,alice3.association(),execution_directory).await?
++        verified_state = Some(resume_in_process(&checkpoint_path, swap_id, lock_id, false, &env.bitcoind_url,alice3.association(),execution_directory,checkpoint_pin.as_ref()).await?
+             .context("missing recovered state")?);
+         if let Some(owner)=&quote_owner { _recovery_owner=Some(owner.acquire_recovery(swap_id)?); }
+     }
+@@ -590,13 +597,13 @@ async fn settlement(refund: bool) -> Result<()> {
+         #[cfg(unix)]
+         if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
+             assert_pending_rejected(&env, swap_id, lock_id,
+-                "Bitcoin cancellation window reached; recovery required").await?;
++                "Bitcoin cancellation window reached; recovery required",_recovery_owner.as_ref(),checkpoint_pin.as_ref()).await?;
+         }
+         broadcast_confirm(&env, cancel).await?;
+         let mut cancellation = bob4.cancel();
+         #[cfg(unix)]
+         if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
+-            cancellation = load_pending_fixture(swap_id, lock_id)?.prepare_cancellation();
++            cancellation = load_pending_fixture(swap_id, lock_id,_recovery_owner.as_ref(),checkpoint_pin.as_ref())?.prepare_cancellation();
+         }
+         let refund_tx = cancellation.signed_full_refund_transaction()?;
+         let refund_id = refund_tx.compute_txid();
+@@ -616,7 +623,7 @@ async fn settlement(refund: bool) -> Result<()> {
+     } else {
+         #[cfg(unix)]
+         let signature = if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
+-            let pending = load_pending_fixture(swap_id, lock_id)?;
++            let pending = load_pending_fixture(swap_id, lock_id,_recovery_owner.as_ref(),checkpoint_pin.as_ref())?;
+             let native = native_rpc::authenticated_fixture()?;
+             let bitcoin = native_rpc::BitcoinRpc::new(env.bitcoind_url.clone())?;
+             pending.redeem_signature(&native, &bitcoin).await?
+@@ -644,7 +651,7 @@ async fn settlement(refund: bool) -> Result<()> {
+     }
+     #[cfg(unix)]
+     if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
+-        assert_pending_rejected(&env, swap_id, lock_id, "Bitcoin lock absent or spent").await?;
++        assert_pending_rejected(&env, swap_id, lock_id, "Bitcoin lock absent or spent",_recovery_owner.as_ref(),checkpoint_pin.as_ref()).await?;
+     }
+     #[cfg(unix)]
+     alice3.finish()?;
+@@ -653,8 +660,8 @@ async fn settlement(refund: bool) -> Result<()> {
+ 
+ #[cfg(unix)]
+ async fn assert_pending_rejected(env: &harness::TestEnv<'_>, swap_id: Uuid, lock_id: bitcoin::Txid,
+-    reason: &str) -> Result<()> {
+-        let pending = load_pending_fixture(swap_id, lock_id)?;
++    reason: &str,owner:Option<&swap_machine::native_execution_claim::RecoveryLease>,pin:Option<&[u8;32]>) -> Result<()> {
++        let pending = load_pending_fixture(swap_id, lock_id,owner,pin)?;
+         let native = native_rpc::authenticated_fixture()?;
+         let bitcoin = native_rpc::BitcoinRpc::new(env.bitcoind_url.clone())?;
+         let error = pending.resume(&native, &bitcoin).await.err().context("resumed an unavailable Bitcoin lock")?;
+@@ -666,19 +673,22 @@ async fn assert_pending_rejected(env: &harness::TestEnv<'_>, swap_id: Uuid, lock
+ }
+ 
+ #[cfg(unix)]
+-fn load_pending_fixture(swap_id: Uuid, lock_id: bitcoin::Txid) -> Result<swap_machine::xmz_funding::PendingFunding> {
++fn load_pending_fixture(swap_id: Uuid, lock_id: bitcoin::Txid,
++    owner:Option<&swap_machine::native_execution_claim::RecoveryLease>,pin:Option<&[u8;32]>) -> Result<swap_machine::xmz_funding::PendingFunding> {
+         use swap_machine::xmz_funding::{FundingPolicy, PendingFunding};
+         let path = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RECOVERY_EXPORT").unwrap())
+             .with_extension("pending-state");
+         let policy = FundingPolicy::new(swap_core::xmz_address::XmzNetwork::Mainnet,
+             "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4".into(), 10, Network::Regtest, 1)?;
++        if let (Some(owner),Some(pin))=(owner,pin) {return owner.load_pending(pin,lock_id,&policy);}
++        anyhow::ensure!(owner.is_none() && pin.is_none(),"incomplete guarded checkpoint context");
+         PendingFunding::decode(&std::fs::read(path)?, swap_id, lock_id, &policy)
+ }
+ 
+ #[cfg(unix)]
+ async fn resume_in_process(checkpoint: &std::path::Path, swap_id: Uuid, lock_id: bitcoin::Txid,
+     unavailable: bool, bitcoin_url: &url::Url, association: Option<&quote_fixture::Association>,
+-    execution_directory:Option<&std::path::Path>) -> Result<Option<bob::State4>> {
++    execution_directory:Option<&std::path::Path>,checkpoint_pin:Option<&[u8;32]>) -> Result<Option<bob::State4>> {
+     use std::io::{Read, Write};
+     let output = checkpoint.with_extension(if unavailable { "refused-state" } else { "resumed-state" });
+     let rejection = checkpoint.with_extension("rpc-rejection");
+@@ -701,9 +711,11 @@ async fn resume_in_process(checkpoint: &std::path::Path, swap_id: Uuid, lock_id:
+         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+     command.env("MONZERO_TEST_CHILD_REQUIRE_QUOTE",if association.is_some() {"1"} else {"0"})
+         .env_remove("MONZERO_TEST_CHILD_QUOTE_FINGERPRINT")
++        .env_remove("MONZERO_TEST_CHILD_CHECKPOINT_PIN")
+         .env_remove("MONZERO_TEST_CHILD_EXECUTION_DIRECTORY");
+     if let Some(association)=association {
+         command.env("MONZERO_TEST_CHILD_EXECUTION_DIRECTORY",execution_directory.context("missing execution owner directory")?);
++        command.env("MONZERO_TEST_CHILD_CHECKPOINT_PIN",serde_json::to_string(checkpoint_pin.context("missing trusted checkpoint pin")?)?);
+         command.env("MONZERO_TEST_CHILD_QUOTE_FINGERPRINT",serde_json::to_string(&association.fingerprint()?)?);
+     }
+     if let Some(server) = &server {
+@@ -773,35 +785,40 @@ async fn resume_pending_in_child() -> Result<()> {
+     use swap_machine::xmz_funding::{FundingPolicy, PendingFunding};
+     let input = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_CHILD_CHECKPOINT")
+         .context("missing private checkpoint")?);
+-    let metadata = std::fs::symlink_metadata(&input)?;
+-    anyhow::ensure!(metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
+-        "checkpoint must be a private regular file");
+-    let mut bytes = Vec::new();
+-    std::fs::File::open(&input)?.take(1_048_577).read_to_end(&mut bytes)?;
+     let policy = FundingPolicy::new(swap_core::xmz_address::XmzNetwork::Mainnet,
+         "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4".into(), 10, Network::Regtest, 1)?;
+-    let pending = PendingFunding::decode(&bytes, std::env::var("MONZERO_TEST_CHILD_SWAP")?.parse()?,
+-        std::env::var("MONZERO_TEST_CHILD_LOCK")?.parse()?, &policy)?;
+-    let _recovery_owner=match std::env::var("MONZERO_TEST_CHILD_REQUIRE_QUOTE")?.as_str() {
++    let (pending,_recovery_owner)=match std::env::var("MONZERO_TEST_CHILD_REQUIRE_QUOTE")?.as_str() {
+         "1"=>{
+             let expected:[u8;32]=serde_json::from_str(&std::env::var("MONZERO_TEST_CHILD_QUOTE_FINGERPRINT")?)?;
+             let association=quote_fixture::load_association(&input.with_extension("quote-context"),expected)?;
+-            pending.check_recorded_quote(&association.verify_record(quote_fixture::now()?)?)?;
+             let directory=std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_CHILD_EXECUTION_DIRECTORY")
+                 .context("missing retained execution directory")?);
+             let lease=quote_fixture::acquire_execution_recovery(&directory,
+                 std::env::var("MONZERO_TEST_CHILD_SWAP")?.parse()?,&association.quote)?;
+-            pending.check_recorded_quote(lease.record().quote())?;
+-            Some(lease)
++            let pin:[u8;32]=serde_json::from_str(&std::env::var("MONZERO_TEST_CHILD_CHECKPOINT_PIN")?)?;
++            let lock=std::env::var("MONZERO_TEST_CHILD_LOCK")?.parse()?;
++            let mut wrong=pin;wrong[0]^=1;
++            let rejected=lease.load_pending(&wrong,lock,&policy).err().context("incorrect checkpoint pin accepted")?;
++            anyhow::ensure!(rejected.to_string()=="checkpoint digest mismatch","wrong checkpoint rejection boundary");
++            let pending=lease.load_pending(&pin,lock,&policy)?;
++            pending.check_recorded_quote(&association.verify_record(quote_fixture::now()?)?)?;
++            (pending,Some(lease))
++        }
++        "0"=>{
++            let metadata=std::fs::symlink_metadata(&input)?;
++            anyhow::ensure!(metadata.is_file() && metadata.permissions().mode()&0o077==0,"checkpoint must be private");
++            let mut bytes=Vec::new();std::fs::File::open(&input)?.take(1_048_577).read_to_end(&mut bytes)?;
++            (PendingFunding::decode(&bytes,std::env::var("MONZERO_TEST_CHILD_SWAP")?.parse()?,
++                std::env::var("MONZERO_TEST_CHILD_LOCK")?.parse()?,&policy)?,None)
+         }
+-        "0"=>None,
+         _=>anyhow::bail!("invalid fixture quote recovery mode"),
+     };
+     let observer = native_rpc::authenticated_fixture()?;
+     let bitcoin = native_rpc::BitcoinRpc::new(std::env::var("MONZERO_TEST_CHILD_BITCOIN_RPC")?.parse()?)?;
+     let checked=match &_recovery_owner {
+         Some(owner)=>{
+-            let mut altered:serde_json::Value=serde_json::from_slice(&bytes)?;
++            let encoded=zeroize::Zeroizing::new(pending.encode()?);
++            let mut altered:serde_json::Value=serde_json::from_slice(&encoded)?;
+             let atoms:u64=owner.record().quote().terms()["xmzAtoms"].parse()?;
+             altered["state"]["xmr"]=serde_json::to_value(swap_core::monero::primitives::Amount::from_pico(
+                 atoms.checked_add(1).context("fixture amount overflow")?))?;

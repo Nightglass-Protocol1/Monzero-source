@@ -29,6 +29,8 @@ grep -Fq -- '--zmq-rpc-bind-ip 127.0.0.1' "$root/start-node.bat" || {
 "$script_dir/verify-release-notes.sh" "$root/BUILD-MANIFEST.txt" -windows-x64 "$root/RELEASE_NOTES.md"
 if find "$root" -type l -print -quit | grep -q .; then echo "Package contains symbolic links" >&2; exit 1; fi
 (cd "$root" && sha256sum -c SHA256SUMS)
+signature_status=$("$script_dir/verify-windows-signatures.sh" "$root")
+echo "$signature_status"
 
 if [[ -f "$root/monzero-miner-reporter.ps1" ]]; then
   grep -Fq 'mining_status' "$root/monzero-miner-reporter.ps1" || {
@@ -75,6 +77,9 @@ if [[ ${RELEASE_STRICT:-0} == 1 ]]; then
   grep -qx 'binaries_stripped=true' "$root/BUILD-MANIFEST.txt" || { echo "Strict verification requires stripped binaries" >&2; exit 1; }
   grep -qx 'binary_build_reproducibility=verified' "$root/BUILD-MANIFEST.txt" || {
     echo "Strict verification requires independently verified binary reproducibility" >&2; exit 1;
+  }
+  [[ $signature_status == *$'code_signed=true'* && $signature_status == *$'code_signature_timestamped=true'* ]] || {
+    echo "Strict verification requires timestamped code signatures" >&2; exit 1;
   }
 fi
 echo "Package verification passed: $archive"

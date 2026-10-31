@@ -1,0 +1,238 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 4ebaea908..2284e327f 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -36,6 +36,7 @@ mod linux {
+             "--payout-review-stdio-v1"=>("monzero-ltc-payout-review-request-v1",true,false,false),
+             "--payout-submit-stdio-v1"=>("monzero-ltc-payout-submit-request-v1",true,true,false),
+             "--payout-check-stdio-v1"=>("monzero-ltc-payout-check-request-v1",false,false,false),
++            "--funding-prepare-stdio-v1"=>("monzero-ltc-funding-prepare-request-v1",false,false,true),
+             "--funding-review-stdio-v1"=>("monzero-ltc-funding-review-request-v1",true,false,true),
+             "--funding-check-stdio-v1"=>("monzero-ltc-funding-check-request-v1",false,false,true),
+             "--funding-submit-stdio-v1"=>("monzero-ltc-funding-submit-request-v1",true,true,true),
+@@ -187,7 +188,31 @@ mod linux {
+     struct FundingRpc {
+         schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
+         native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,
++        #[serde(default)] source:Option<FundingSource>,
+     }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields)]
++    struct FundingSource {wallet:String,account:u32,priority:u32}
++    impl FundingRpc {
++        fn valid(&self)->bool {
++            let source=match self.schema.as_str() {
++                "monzero-private-ltc-funding-rpc-v1"=>self.source.is_none(),
++                "monzero-private-ltc-funding-rpc-v2"=>self.source.as_ref().is_some_and(|s|
++                    !s.wallet.is_empty() && (1..=4).contains(&s.priority)),
++                _=>false,
++            };
++            source && self.ltc_port!=0 && self.native_daemon_port!=0 && self.native_wallet_port!=0
++                && self.ltc_port!=self.native_daemon_port && self.ltc_port!=self.native_wallet_port
++                && self.native_daemon_port!=self.native_wallet_port
++        }
++        fn matches_source(&self,review:&serde_json::Value)->bool {
++            self.source.as_ref().is_none_or(|s|review["wallet"]==s.wallet
++                && review["account"].as_u64()==Some(u64::from(s.account))
++                && review["priority"].as_u64()==Some(u64::from(s.priority)))
++        }
++    }
++    enum FundingOperation {Prepare,Submit,Check}
++
+     fn credentials(path:&Path)->Result<(File,String,String)> {
+         let (lease,bytes)=private_bytes(path,true)?;
+         ensure!(bytes.len()<=1024,"oversized RPC credentials");
+@@ -301,14 +326,21 @@ mod linux {
+             "snapshot":execution.saved_status()?,"outcome":{"state":"acknowledged","txid":payment.txid,
+                 "feeAtoms":payment.fee.atom_string(),"chainObserved":false,"executable":false}}))
+     }
+-    async fn funding_rpc(config:&Config,execution:&mut Execution,request:&Request,checking:bool)->Result<serde_json::Value> {
++    async fn funding_rpc(config:&Config,execution:&mut Execution,request:&Request,operation:FundingOperation)->Result<serde_json::Value> {
++        let checking=matches!(operation,FundingOperation::Check);
++        let preparing=matches!(operation,FundingOperation::Prepare);
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+-            litecoin_negotiation::execution::funding_approval::FundingAction};
++            litecoin_negotiation::execution::{funding_approval::FundingAction,lock_funding::NativeFundingSource}};
+         use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
+         ensure!(config.role=="native-funder" && config.policy.ltc_network==LtcNetwork::Regtest,
+             "funding GUI submission is limited to isolated-chain development");
+         let safety=request.safety_blocks.context("missing funding safety blocks")?;
+-        let approval=if checking {
++        let approval=if preparing {
++            let snapshot=execution.saved_status()?;
++            ensure!(snapshot["keysReady"]==true && snapshot["recoveryIntentRetained"]==true
++                && snapshot["nativeFunding"]["attempted"]==false,"funding preparation prerequisites missing");
++            None
++        } else if checking {
+             // Validate the retained attempted payment without granting a send.
+             execution.review_native_lock_payment(FundingAction::Retransmit,safety)?;
+             None
+@@ -322,10 +354,16 @@ mod linux {
+         };
+         let (_rpc_lease,bytes)=private_bytes(config.funding_rpc_file.as_deref().context("funding execution not configured")?,false)?;
+         let rpc:FundingRpc=serde_json::from_slice(&bytes)?;
+-        ensure!(rpc.schema=="monzero-private-ltc-funding-rpc-v1" && rpc.ltc_port!=0
+-            && rpc.native_daemon_port!=0 && rpc.native_wallet_port!=0
+-            && rpc.ltc_port!=rpc.native_daemon_port && rpc.ltc_port!=rpc.native_wallet_port
+-            && rpc.native_daemon_port!=rpc.native_wallet_port,"invalid funding RPC configuration");
++        ensure!(rpc.valid(),"invalid funding RPC configuration");
++        let source=if preparing {
++            let source=rpc.source.as_ref().context("funding source is not configured for preparation")?;
++            Some(NativeFundingSource {wallet:swap_core::xmz_address::XmzAddress::parse(config.policy.xmz_network,&source.wallet)?,
++                account:source.account,priority:source.priority})
++        } else {
++            let action=if checking {FundingAction::Retransmit} else {approval.context("missing funding approval")?.0};
++            ensure!(rpc.matches_source(&execution.review_native_lock_payment(action,safety)?.details),"funding source differs from configured source");
++            None
++        };
+         isolated_native(rpc.native_daemon_port).await?;
+         let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
+         let mut native=NativeTransferRelay::new(NativeFundingRpc::new(rpc.native_daemon_port,rpc.native_wallet_port,user,password)?);
+@@ -340,10 +378,19 @@ mod linux {
+                     "confirmations":depth.to_string(),"chainObserved":true,"executable":false},
+                 "review":{"details":review.details,"commitment":commitment}}));
+         }
+-        let (action,approved)=approval.context("missing submission approval")?;
+         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
+             LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        if preparing {
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            let payment=execution.prepare_native_lock(&mut native,&ltc,source.context("missing preparation source")?,safety,now).await?;
++            let review=execution.review_native_lock_payment(FundingAction::Send,safety)?;
++            ensure!(review.details["txid"]==payment.txid && rpc.matches_source(&review.details),"prepared funding differs from configured source");
++            let commitment=review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>();
++            return Ok(serde_json::json!({"schema":"monzero-ltc-funding-prepare-response-v1","requestId":request.request_id,
++                "snapshot":execution.saved_status()?,"review":{"details":review.details,"commitment":commitment}}));
++        }
++        let (action,approved)=approval.context("missing submission approval")?;
+         let payment=execution.relay_reviewed_native_lock(action,approved,&mut native,&ltc,safety).await?;
+         Ok(serde_json::json!({"schema":"monzero-ltc-funding-submit-response-v1","requestId":request.request_id,
+             "snapshot":execution.saved_status()?,"outcome":{"state":"acknowledged","txid":payment.txid,
+@@ -356,6 +403,28 @@ mod linux {
+         struct OwnedDirectory(PathBuf);
+         impl Drop for OwnedDirectory {fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);}}
+         #[test]
++        fn funding_preparation_source_is_explicit_and_bound()->Result<()> {
++            let base=serde_json::json!({"schema":"monzero-private-ltc-funding-rpc-v1",
++                "ltcPort":1,"ltcWallet":"fixture","ltcAnchor":"fixture","ltcCookieFile":"/cookie",
++                "nativeDaemonPort":2,"nativeWalletPort":3,"nativeLoginFile":"/login"});
++            assert!(serde_json::from_value::<FundingRpc>(base.clone())?.valid());
++            for version in [1,2,3] {for priority in [0,1,4,5] {
++                let mut value=base.clone();value["schema"]=serde_json::json!(format!("monzero-private-ltc-funding-rpc-v{version}"));
++                value["source"]=serde_json::json!({"wallet":"source-wallet","account":0,"priority":priority});
++                let rpc:FundingRpc=serde_json::from_value(value)?;
++                assert_eq!(rpc.valid(),version==2 && (1..=4).contains(&priority));
++                assert!(rpc.matches_source(&serde_json::json!({"wallet":"source-wallet","account":0,"priority":priority})));
++                for changed in [serde_json::json!({"wallet":"other","account":0,"priority":priority}),
++                    serde_json::json!({"wallet":"source-wallet","account":1,"priority":priority}),
++                    serde_json::json!({"wallet":"source-wallet","account":0,"priority":priority+1})] {
++                    assert!(!rpc.matches_source(&changed));
++                }
++            }}
++            let mut missing=base;missing["schema"]=serde_json::json!("monzero-private-ltc-funding-rpc-v2");
++            assert!(!serde_json::from_value::<FundingRpc>(missing)?.valid());
++            Ok(())
++        }
++        #[test]
+         fn peer_encoding_and_request_reject_ambiguous_or_excess_authority()->Result<()> {
+             assert_eq!(decode_peer_hex("00ff",2)?,vec![0,255]);
+             for value in ["","0","AA","gg","é","000000"] {
+@@ -384,6 +453,7 @@ mod linux {
+                 ("--payout-review-stdio-v1","monzero-ltc-payout-review-request-v1",true,false,false),
+                 ("--payout-submit-stdio-v1","monzero-ltc-payout-submit-request-v1",true,true,false),
+                 ("--payout-check-stdio-v1","monzero-ltc-payout-check-request-v1",false,false,false),
++                ("--funding-prepare-stdio-v1","monzero-ltc-funding-prepare-request-v1",false,false,true),
+                 ("--funding-review-stdio-v1","monzero-ltc-funding-review-request-v1",true,false,true),
+                 ("--funding-submit-stdio-v1","monzero-ltc-funding-submit-request-v1",true,true,true),
+                 ("--funding-check-stdio-v1","monzero-ltc-funding-check-request-v1",false,false,true)];
+@@ -450,10 +520,11 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
+-        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
++        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--negotiation-status-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-prepare-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
+             && args[2]=="--config-file","invalid journal helper arguments");
+         let review_mode=args[1]=="--refund-review-stdio-v1";
+         let payout_review_mode=args[1]=="--payout-review-stdio-v1";
++        let funding_prepare_mode=args[1]=="--funding-prepare-stdio-v1";
+         let funding_review_mode=args[1]=="--funding-review-stdio-v1";
+         let funding_check_mode=args[1]=="--funding-check-stdio-v1";
+         let funding_submit_mode=args[1]=="--funding-submit-stdio-v1";
+@@ -497,8 +568,8 @@ mod linux {
+             let commitment=review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>();
+             serde_json::json!({"schema":"monzero-ltc-funding-review-response-v1","requestId":request.request_id,
+                 "snapshot":execution.saved_status()?,"review":{"details":review.details,"commitment":commitment}})
+-        } else if funding_submit_mode || funding_check_mode {
+-            tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(funding_rpc(&config,&mut execution,&request,funding_check_mode))?
++        } else if funding_prepare_mode || funding_submit_mode || funding_check_mode {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(funding_rpc(&config,&mut execution,&request,if funding_prepare_mode {FundingOperation::Prepare} else if funding_check_mode {FundingOperation::Check} else {FundingOperation::Submit}))?
+         } else if payout_submit_mode || payout_check_mode {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(payout_rpc(&config,&mut execution,&request,payout_check_mode))?
+         } else if submit_mode || check_mode {
+diff --git a/swap-machine/src/litecoin_negotiation/execution/lock_funding.rs b/swap-machine/src/litecoin_negotiation/execution/lock_funding.rs
+index 8b2239c9f..ab443a6cf 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/lock_funding.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/lock_funding.rs
+@@ -63,15 +63,19 @@ impl Execution {
+             priority:source.priority,admitted_at:retained.as_ref().map(|(_,at)|*at).unwrap_or(now)};
+         let bytes=serde_json::to_vec(&intent)?;
+         ensure!(intent.admitted_at>=agreement_at && intent.admitted_at<=now,"invalid native preparation admission time");
++        let new_intent=retained.is_none();
+         if let Some((saved,_))=retained { ensure!(saved==bytes,"retained native funding intent differs from trade"); }
+         let digest=Sha256::digest(&bytes).into();
+         if let Some(expected)=head.native_lock_intent { ensure!(expected==digest,"native funding intent differs from head"); }
+         self.observe_live_lock(ltc,safety_blocks).await?;
++        let request=RelayRequest { wallet:source.wallet,destination:keys.native_address().clone(),
++            amount:XmzAmount::from_atoms(amount),account:source.account,priority:source.priority };
++        // A wrong wallet/account must not pin an unusable source to this trade.
++        // Construction performs its own fresh preflight again before signing.
++        if new_intent {relay.preflight(&request,&intent.genesis).await?;}
+         self.metadata.retain(&filename,&bytes)?;
+         head.native_lock_intent=Some(digest);
+         self.metadata.replace_execution_head(self.claim.trade,&previous,&serde_json::to_vec(&head)?)?;
+-        let request=RelayRequest { wallet:source.wallet,destination:keys.native_address().clone(),
+-            amount:XmzAmount::from_atoms(amount),account:source.account,priority:source.priority };
+         let prepared=relay.prepare_native_lock(request,&intent.genesis,XmzAmount::from_atoms(maximum_fee)).await?;
+         // No relay has occurred. Retain exact private bytes even if the quote or
+         // chain window expires during construction; future relay must check anew.
+diff --git a/swap-machine/src/litecoin_negotiation/tests.rs b/swap-machine/src/litecoin_negotiation/tests.rs
+index 44c4b954d..931b99f37 100644
+--- a/swap-machine/src/litecoin_negotiation/tests.rs
++++ b/swap-machine/src/litecoin_negotiation/tests.rs
+@@ -387,8 +387,8 @@ fn owned_execution_lifecycle(payout_v2:bool,payout_relay:bool) -> Result<()> {
+     let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+     let wallet=quote.destinations().xmz_refund.clone();
+     let source=||NativeFundingSource {wallet:wallet.clone(),account:0,priority:1};
+-    // A failed native preflight leaves fixed terms, but no payment or prepared
+-    // bytes. Fresh retry may construct under those same terms only.
++    // A failed read-only preflight retains no source intent or payment bytes.
++    // A corrected source may be retried while the quote is fresh.
+     let mut wrong_chain=runtime.block_on(Fixture::new(wallet.clone(),keys.native_address().clone(),
+         "b".repeat(64),500_000_000,1))?;
+     let (rpc,stop,server)=live_release_node(bob_recovery.cancel.input[0].previous_output,keys.contract_address().script_pubkey().clone())?;
+@@ -396,7 +396,7 @@ fn owned_execution_lifecycle(payout_v2:bool,payout_relay:bool) -> Result<()> {
+     stop.store(true,std::sync::atomic::Ordering::SeqCst);server.join().unwrap()?;
+     assert!(result.is_err());
+     assert!(!wrong_chain.calls.lock().unwrap().iter().any(|s|s=="transfer" || s=="relay_tx"));
+-    assert!(am.join(format!("{trade}.ltc-native-lock-intent")).exists());
++    assert!(!am.join(format!("{trade}.ltc-native-lock-intent")).exists());
+     assert!(!als.join(format!("{trade}.ltc-native-lock-prepared")).exists());
+     assert!(runtime.block_on(alice.prepare_native_lock(&mut wrong_chain.relay,&rpc,source(),2,base+3501)).is_err());
+     drop(wrong_chain);
+diff --git a/swap-machine/src/native_funding_rpc/relay.rs b/swap-machine/src/native_funding_rpc/relay.rs
+index 7098fcd26..a12b693c7 100644
+--- a/swap-machine/src/native_funding_rpc/relay.rs
++++ b/swap-machine/src/native_funding_rpc/relay.rs
+@@ -85,7 +85,9 @@ impl NativeTransferRelay {
+         self.broadcast(request).await
+     }
+ 
+-    async fn preflight(&self, request: &RelayRequest, expected_genesis: &str) -> Result<()> {
++    // Read-only chain, source identity and account/principal check. Also used
++    // before a controller retains a new preparation intent.
++    pub(crate) async fn preflight(&self, request: &RelayRequest, expected_genesis: &str) -> Result<()> {
+         ensure!(!self.dispatched, "relay instance already dispatched; reconcile before retrying");
+         ensure!(canonical_hash(expected_genesis), "invalid relay chain policy");
+         ensure!(request.amount.atoms() > 0 && (1..=4).contains(&request.priority),

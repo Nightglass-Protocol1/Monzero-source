@@ -1,0 +1,8 @@
+#ifndef MONZERO_BUNDLED_LIGHT_WALLET_HELPER_H
+#define MONZERO_BUNDLED_LIGHT_WALLET_HELPER_H
+// Digest is fixed by the reviewed build configuration, never an adjacent manifest.
+namespace BundledLightWalletHelper {
+constexpr const char *sha256 = "@MONZERO_BUNDLED_LIGHT_HELPER_SHA256@";
+constexpr const char *relativePath = "/monzero-light/native-ltc-light";
+}
+#endif

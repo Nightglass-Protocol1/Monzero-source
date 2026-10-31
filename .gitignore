@@ -1,2 +1,12 @@
 build/
 *.log
+# Rust, Node and Hardhat outputs (DEX components)
+target/
+node_modules/
+gui/dex-contracts/artifacts/
+gui/dex-contracts/cache/
+# Never commit wallets, keys or local secrets
+*.keys
+.env
+.env.*
+!core/tests/data/*.keys

@@ -1,0 +1,194 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index f703bf1d5..41fc1f888 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -216,12 +216,15 @@ mod linux {
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct ReservationRpc {schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,
+         ltc_cookie_file:PathBuf,reservation_directory:PathBuf,fee_rate_atoms_per_kb:u64}
+-    async fn reserve_litecoin(path:&Path,input:&[u8])->Result<serde_json::Value> {
++    async fn reserve_litecoin(path:&Path,input:&[u8],mode:&str)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_quote::VerifiedLtcQuote,litecoin_rpc::LitecoinRpc};
+         use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
+         let request:Request=serde_json::from_slice(input)?;
+-        ensure!(request.schema=="monzero-ltc-reservation-prepare-request-v1" && !request.request_id.is_nil()
+-            && request.action.is_none() && request.commitment.is_none() && request.safety_blocks.is_none(),"invalid reservation request");
++        let review=mode=="--lock-funding-review-stdio-v1";let submit=mode=="--lock-funding-submit-stdio-v1";
++        ensure!(request.schema==if review {"monzero-ltc-lock-funding-review-request-v1"}
++            else if submit {"monzero-ltc-lock-funding-submit-request-v1"} else {"monzero-ltc-reservation-prepare-request-v1"}
++            && !request.request_id.is_nil() && request.action.is_none() && request.safety_blocks.is_none()
++            && request.commitment.is_some()==submit,"invalid reservation/funding request");
+         let (_wrapper,bytes)=private_bytes(path,false)?;
+         let wrapper:ReservationConfig=serde_json::from_slice(&bytes)?;
+         ensure!(wrapper.schema=="monzero-private-ltc-reservation-v1","invalid reservation configuration");
+@@ -232,18 +235,30 @@ mod linux {
+         let rpc:ReservationRpc=serde_json::from_slice(&bytes)?;
+         ensure!(rpc.schema=="monzero-private-ltc-reservation-rpc-v1" && rpc.ltc_port>0
+             && rpc.fee_rate_atoms_per_kb>0,"invalid reservation RPC configuration");
+-        let (_quote,bytes)=private_bytes(config.start_quote_file.as_deref().context("missing reservation quote")?,false)?;
+         let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+-        let quote=VerifiedLtcQuote::from_envelope(&bytes,now,&config.policy,config.pins)?;
+-        let execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
++        let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
+             config.trade_id,&config.policy,LocalRole::LitecoinFunder,config.pins)?;
++        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
++        let adapter=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
++            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        if review {
++            let review=execution.review_litecoin_funding(&adapter,&rpc.reservation_directory)?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-lock-funding-review-response-v1","requestId":request.request_id,
++                "snapshot":execution.saved_status()?,"review":{"details":review.details,
++                    "commitment":review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()}}));
++        }
++        if submit {
++            let approved=parse_commitment(request.commitment.as_deref().context("missing funding approval")?)?;
++            let outcome=execution.submit_litecoin_funding(&adapter,&rpc.reservation_directory,&approved,now).await?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-lock-funding-submit-response-v1","requestId":request.request_id,
++                "snapshot":execution.saved_status()?,"outcome":outcome}));
++        }
++        let (_quote,bytes)=private_bytes(config.start_quote_file.as_deref().context("missing reservation quote")?,false)?;
++        let quote=VerifiedLtcQuote::from_envelope(&bytes,now,&config.policy,config.pins)?;
+         let snapshot=execution.saved_status()?;
+         let commitment=quote.commitment().iter().map(|b|format!("{b:02x}")).collect::<String>();
+         ensure!(snapshot["quoteCommitment"]==commitment,"reservation quote differs from saved trade");
+         let keys=execution.completed_keys()?;
+-        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let adapter=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
+-            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
+         let amount=bitcoin::Amount::from_sat(quote.terms()["ltcAtoms"].parse()?);
+         let maximum_fee=bitcoin::Amount::from_sat(quote.terms()["ltcFundingFeeMaxAtoms"].parse()?);
+         let saved=adapter.prepare_or_resume_lock(&rpc.reservation_directory,config.trade_id,
+@@ -605,11 +620,11 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
+-        if args.len()==4 && args[1]=="--reservation-prepare-stdio-v1" && args[2]=="--config-file" {
++        if args.len()==4 && ["--reservation-prepare-stdio-v1","--lock-funding-review-stdio-v1","--lock-funding-submit-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
+             let mut input=Vec::new();std::io::stdin().take(513).read_to_end(&mut input)?;
+             ensure!(input.len()<=512,"oversized reservation request");
+             let response=tokio::runtime::Builder::new_current_thread().enable_all().build()?
+-                .block_on(reserve_litecoin(Path::new(&args[3]),&input))?;
++                .block_on(reserve_litecoin(Path::new(&args[3]),&input,args[1].to_str().context("invalid reservation mode")?))?;
+             let output=serde_json::to_vec(&response)?;ensure!(output.len()<=110000,"oversized reservation response");
+             std::io::stdout().write_all(&output)?;return Ok(());
+         }
+diff --git a/swap-machine/src/litecoin_negotiation/execution.rs b/swap-machine/src/litecoin_negotiation/execution.rs
+index 62c32a871..9a76047cc 100644
+--- a/swap-machine/src/litecoin_negotiation/execution.rs
++++ b/swap-machine/src/litecoin_negotiation/execution.rs
+@@ -403,3 +403,5 @@ pub mod payout_approval;
+ pub mod funding_approval;
+ 
+ pub mod start_approval;
++
++pub mod lock_approval;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/lock_approval.rs b/swap-machine/src/litecoin_negotiation/execution/lock_approval.rs
+new file mode 100644
+index 000000000..3b6a7d837
+--- /dev/null
++++ b/swap-machine/src/litecoin_negotiation/execution/lock_approval.rs
+@@ -0,0 +1,36 @@
++//! Explicit approval of one retained Litecoin funding transaction/action.
++use super::*;
++use crate::litecoin_rpc::{LitecoinRpc,reservation::RelayOutcome};
++
++pub struct LockFundingReview {pub details:serde_json::Value,pub commitment:[u8;32]}
++impl Execution {
++    pub fn review_litecoin_funding(&mut self,rpc:&LitecoinRpc,directory:&Path)->Result<LockFundingReview> {
++        ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong Litecoin funding role");
++        let (head,_,quote,_,exchange)=self.load()?;
++        let (_,admitted)=self.recovery_admission(&head)?;
++        let keys=exchange.finish()?;
++        let recovery=self.recover_recovery()?;
++        let refund=recovery.refund.context("missing retained Litecoin refund")?;
++        let details=rpc.review_reserved_funding(directory,self.claim.trade,&quote,&self.policy,admitted,
++            &keys,&recovery.cancel,&refund)?;
++        let mut hash=Sha256::new();hash.update(b"MONZERO-LTC-LOCK-FUNDING-APPROVAL-V1\0");
++        hash.update(serde_json::to_vec(&details)?);
++        Ok(LockFundingReview {details,commitment:hash.finalize().into()})
++    }
++
++    /// Verify approval before signing or relay. A prior attempt uses only exact
++    /// persisted bytes through chain reconciliation; it cannot sign a new lock.
++    pub async fn submit_litecoin_funding(&mut self,rpc:&LitecoinRpc,directory:&Path,
++        approved:&[u8;32],now:u64)->Result<RelayOutcome> {
++        let review=self.review_litecoin_funding(rpc,directory)?;
++        ensure!(review.commitment==*approved,"Litecoin funding approval is stale or differs from retained action");
++        let txid=review.details["txid"].as_str().context("missing reviewed lock")?.parse()?;
++        if review.details["action"]=="retransmit" {
++            return rpc.resume_reserved_relay(directory,self.claim.trade,txid).await;
++        }
++        ensure!(review.details["action"]=="send","invalid funding action");
++        let signed=self.sign_recovered_lock(rpc,directory,now).await?;
++        ensure!(signed.transaction().compute_txid()==txid,"signing changed approved funding transaction");
++        rpc.relay_reserved_lock(directory,self.claim.trade,txid).await
++    }
++}
+diff --git a/swap-machine/src/litecoin_rpc/reservation_signing.rs b/swap-machine/src/litecoin_rpc/reservation_signing.rs
+index 14b8c7948..a1bfaa1f9 100644
+--- a/swap-machine/src/litecoin_rpc/reservation_signing.rs
++++ b/swap-machine/src/litecoin_rpc/reservation_signing.rs
+@@ -47,6 +47,63 @@ struct SigningRecord {
+ struct SignedRecord { schema: String, txid: bitcoin::Txid, hex: String }
+ 
+ impl LitecoinRpc {
++    /// Offline funding review. Validate the exact owned reservation, negotiated
++    /// recovery and any prior dispatch without signing or changing wallet locks.
++    pub(crate) fn review_reserved_funding(&self,directory:&Path,trade:uuid::Uuid,
++        quote:&crate::litecoin_quote::VerifiedLtcQuote,policy:&crate::litecoin_quote::Policy,
++        admitted:u64,keys:&crate::litecoin_negotiation::VerifiedKeys,
++        cancel:&Transaction,refund:&Transaction)->Result<Value> {
++        keys.require_ltc_funder()?;
++        let recovery=keys.recovery_policy(quote,policy,admitted)?;
++        let journal=Journal::open(directory)?;
++        let bytes=journal.read(&format!("{trade}.intent"))?;
++        let intent:Intent=serde_json::from_slice(&bytes)?;
++        ensure!(intent.trade==trade && intent.contract==keys.contract_address().to_string()
++            && self.network==policy.ltc_network,"funding review differs from negotiated deployment");
++        let preview=self.validate_intent(&intent)?;
++        quote.check_funding(policy,admitted,trade,intent.amount,intent.maximum_fee)?;
++        verify_recovery(&intent,&preview.psbt,self.network,&recovery,cancel,refund)?;
++        let txid=preview.psbt.unsigned_tx.compute_txid();
++        let owner=format!("{trade}:{txid}");
++        for input in &preview.psbt.unsigned_tx.input {
++            let key=format!("{}:{}",intent.genesis,input.previous_output);
++            ensure!(journal.read(&format!("{:x}.input",Sha256::digest(key)))?==owner.as_bytes(),"funding review input claim mismatch");
++        }
++        let quote_hash=Some(format!("{:x}",Sha256::digest(quote.record()?)));
++        let exchange_hash=Some(format!("{:x}",Sha256::digest(keys.public_record(quote)?)));
++        check_signing_context(&journal,trade,&recovery,cancel,refund,txid,quote_hash.clone(),exchange_hash.clone())?;
++        let signed_hash=retained_record_hash(&journal,trade,"signed")?;
++        let transaction=if signed_hash.is_some() {
++            journal.read(&format!("{trade}.signing"))?;
++            ensure!(retained_quote_hash(&journal,trade)?==quote_hash
++                && retained_record_hash(&journal,trade,"exchange")?==exchange_hash,"signed funding lost quote/exchange binding");
++            let signed:SignedRecord=serde_json::from_slice(&journal.read(&format!("{trade}.signed"))?)?;
++            ensure!(signed.schema=="monzero-ltc-signed-v1" && signed.txid==txid,"invalid signed funding review");
++            Some(checked_signed(&signed.hex,&preview.psbt)?)
++        } else {None};
++        let dispatch_hash=retained_record_hash(&journal,trade,"relay")?;
++        if dispatch_hash.is_some() {
++            let transaction=transaction.context("funding dispatch lacks signed bytes")?;
++            let expected=serde_json::to_vec(&json!({"schema":"monzero-ltc-relay-intent-v1","trade":trade,
++                "genesis":intent.genesis,"wallet":intent.wallet,"txid":txid,"wtxid":transaction.compute_wtxid()}))?;
++            ensure!(journal.read(&format!("{trade}.relay"))?==expected,"funding dispatch differs from signed transaction");
++        }
++        let change=LtcSegwitAddress::parse(self.network,&intent.change)?;
++        let change_atoms=preview.psbt.unsigned_tx.output.iter().filter(|o|o.script_pubkey==*change.script_pubkey())
++            .try_fold(0u64,|sum,o|sum.checked_add(o.value.to_sat())).context("funding change overflow")?;
++        let debit=intent.amount.checked_add(intent.fee).context("funding debit overflow")?;
++        let recovery_hash=Sha256::digest([bitcoin::consensus::serialize(cancel),bitcoin::consensus::serialize(refund)].concat());
++        Ok(json!({"schema":"monzero-ltc-lock-funding-review-v1","tradeId":trade,
++            "quoteCommitment":quote.commitment().iter().map(|b|format!("{b:02x}")).collect::<String>(),
++            "reservationCommitment":format!("{:x}",Sha256::digest(&bytes)),"recoveryCommitment":format!("{recovery_hash:x}"),
++            "signedCommitment":signed_hash,"dispatchCommitment":dispatch_hash,
++            "action":if dispatch_hash.is_some(){"retransmit"}else{"send"},"txid":txid,"wallet":intent.wallet,
++            "anchor":intent.anchor,"contract":intent.contract,"change":intent.change,"changeAtoms":change_atoms.to_string(),
++            "amountAtoms":intent.amount.to_string(),"feeAtoms":intent.fee.to_string(),"maximumFeeAtoms":intent.maximum_fee.to_string(),
++            "totalDebitAtoms":debit.to_string(),"inputCount":preview.psbt.inputs.len().to_string(),
++            "refundAddress":recovery.refund_address,"expiresAt":quote.terms()["expiresAt"],"chainObserved":false}))
++    }
++
+     /// Trusted caller must already have authenticated/approved the negotiated
+     /// trade and persisted peer recovery state. This API does not grant approval.
+     /// At most one automatic send attempt per trade, with intent synced first.

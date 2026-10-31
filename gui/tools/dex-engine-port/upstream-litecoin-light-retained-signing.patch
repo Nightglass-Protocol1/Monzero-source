@@ -1,0 +1,101 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
+@@ -15,7 +15,7 @@
+ fn claims_survive_restart_and_reject_conflicts_before_partial_publication()->Result<()> {
+     let directory=Directory::new()?;let operation=Uuid::new_v4();let (seed,first)=review(&[0])?;
+     let claim=ClaimedSpend::retain(&directory.0,operation,first)?;
+-    assert_eq!(claim.sign(&seed)?.input[0].witness.len(),2);assert_eq!(claim.fee().to_sat(),1000);
++    assert_eq!(claim.approve_and_sign(&seed,claim.signing_commitment())?.input[0].witness.len(),2);assert_eq!(claim.fee().to_sat(),1000);
+     assert!(ClaimedSpend::retain(&directory.0,operation,review(&[0])?.1).is_err());drop(claim);
+     drop(ClaimedSpend::retain(&directory.0,operation,review(&[0])?.1)?);
+     let count=fs::read_dir(&directory.0)?.count();
+@@ -30,7 +30,47 @@
+     let entries=records(operation,&review)?;let journal=Journal::open(&directory.0)?;
+     journal.retain(&entries[1].0,&entries[1].1)?;drop(journal);
+     let claim=ClaimedSpend::retain(&directory.0,operation,review)?;
+-    assert_eq!(claim.sign(&seed)?.input.len(),2);
++    assert_eq!(claim.approve_and_sign(&seed,claim.signing_commitment())?.input.len(),2);
+     fs::write(directory.0.join(&entries[0].0),b"changed")?;
+-    assert!(claim.sign(&seed).is_err());Ok(())
++    assert!(claim.approve_and_sign(&seed,claim.signing_commitment()).is_err());Ok(())
+ }
++
++#[test]
++fn signing_requires_exact_commitment_and_retains_bytes_across_restart()->Result<()> {
++    let directory=Directory::new()?;let operation=Uuid::new_v4();
++    let (seed,prepared)=review(&[0])?;
++    let claim=ClaimedSpend::retain(&directory.0,operation,prepared)?;
++    let commitment=claim.signing_commitment();let count=fs::read_dir(&directory.0)?.count();
++    let error=claim.approve_and_sign(&seed,sha256::Hash::hash(b"different review")).unwrap_err();
++    assert!(error.to_string().contains("commitment mismatch"));
++    assert_eq!(fs::read_dir(&directory.0)?.count(),count);
++    let signed=claim.approve_and_sign(&seed,commitment)?;
++    let path=directory.0.join(format!("ltc-signed-{commitment}.tx"));
++    assert_eq!(fs::read(&path)?,serialize(&signed));
++    assert_eq!(signed.compute_txid(),claim.transaction().compute_txid());
++    assert_eq!(claim.approve_and_sign(&seed,commitment)?,signed);drop(claim);
++    let reopened=ClaimedSpend::retain(&directory.0,operation,review(&[0])?.1)?;
++    assert_eq!(reopened.signing_commitment(),commitment);
++    assert_eq!(reopened.approve_and_sign(&seed,commitment)?,signed);
++    fs::write(&path,b"conflicting signed bytes")?;
++    assert!(reopened.approve_and_sign(&seed,commitment).is_err());
++    assert_eq!(fs::read(&path)?,b"conflicting signed bytes");Ok(())
++}
++#[test]
++fn signing_resumes_retained_intent_and_rejects_conflicting_intent()->Result<()> {
++    let directory=Directory::new()?;let operation=Uuid::new_v4();
++    let (seed,prepared)=review(&[0])?;
++    let claim=ClaimedSpend::retain(&directory.0,operation,prepared)?;
++    let commitment=claim.signing_commitment();
++    let approval=directory.0.join(format!("ltc-signing-{commitment}.json"));
++    let signed=directory.0.join(format!("ltc-signed-{commitment}.tx"));
++    // A failed unlock/signing attempt retains intent but cannot publish a tx.
++    let wrong=SecretSeed::from_bytes(Zeroizing::new([43;32]));
++    assert!(claim.approve_and_sign(&wrong,commitment).is_err());
++    assert!(approval.exists());assert!(!signed.exists());drop(claim);
++    let reopened=ClaimedSpend::retain(&directory.0,operation,review(&[0])?.1)?;
++    assert_eq!(reopened.approve_and_sign(&seed,commitment)?.input[0].witness.len(),2);
++    fs::write(&approval,b"conflicting intent")?;
++    assert!(reopened.approve_and_sign(&seed,commitment).is_err());
++    assert_eq!(fs::read(&approval)?,b"conflicting intent");Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -34,11 +34,33 @@
+     }
+     pub fn transaction(&self)->&Transaction {self.review.transaction()}
+     pub fn fee(&self)->Amount {self.review.fee()}
+-    pub fn sign(&self,seed:&SecretSeed)->Result<Transaction> {
++    /// Identifies the exact retained transaction, prevouts, account and operation.
++    /// The caller must display the review and obtain consent separately.
++    pub fn signing_commitment(&self)->sha256::Hash {
++        sha256::Hash::hash(&self.records[0].1)
++    }
++    /// Retains signing intent before signing, then durably retains the signed
++    /// bytes before returning them. Exact retries (including after reopening
++    /// with the same operation/review) retain the same deterministic signature.
++    /// This does not establish human consent, unspentness or broadcast approval.
++    pub fn approve_and_sign(&self,seed:&SecretSeed,expected:sha256::Hash)->Result<Transaction> {
++        let commitment=self.signing_commitment();
++        ensure!(expected==commitment,"Litecoin signing review commitment mismatch");
+         for (name,bytes) in &self.records {
+             ensure!(self.journal.read(name)?==*bytes,"Litecoin spend claim changed; reopen required");
+         }
+-        self.review.sign(seed)
++        let approval_name=format!("ltc-signing-{commitment}.json");
++        let approval=serde_json::to_vec(&serde_json::json!({
++            "schema":"monzero-ltc-signing-intent-v1","commitment":commitment.to_string()
++        }))?;
++        self.journal.retain(&approval_name,&approval)?;
++        let signed=self.review.sign(seed)?;
++        let bytes=serialize(&signed);
++        let signed_name=format!("ltc-signed-{commitment}.tx");
++        self.journal.retain(&signed_name,&bytes)?;
++        ensure!(self.journal.read(&approval_name)?==approval
++            && self.journal.read(&signed_name)?==bytes,"Litecoin retained signing record changed");
++        Ok(signed)
+     }
+ }
+ #[cfg(test)]

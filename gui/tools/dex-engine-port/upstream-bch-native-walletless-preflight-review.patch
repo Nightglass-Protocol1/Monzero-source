@@ -1,0 +1,26 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message/walletless.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message/walletless.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message/walletless.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message/walletless.rs
+@@ -3,6 +3,8 @@
+ use super::*;
+ use crate::bch_rpc::{observer::OwnedBchObserver,observation::BoundFundingObservation};
+ 
++/// A point-in-time read result, never authorization for preparation or relay.
++/// Consumers must obtain a new chain check within each payment operation.
+ pub struct LightNativeFundingLockCheck {
+     observation:BoundFundingObservation,destination:XmzAddress,amount:u64,maximum_fee:u64,
+ }
+@@ -16,8 +18,11 @@
+     /// Historical authenticated funding observation. No quote renewal and no
+     /// inference that an unobserved transaction was never sent.
+     pub async fn observe_received_light_bch_funding(&self,observer:&OwnedBchObserver)->Result<BoundFundingObservation> {
+-        ensure!(observer.network().quote_name()==self.quote.terms()["bchNetwork"]
+-            && observer.network().genesis()==self.quote.terms()["bchGenesis"],"BCH peer funding observer has another network");
++        let terms=self.quote.terms();
++        let network=terms.get("bchNetwork").context("BCH quote missing network")?;
++        let genesis=terms.get("bchGenesis").context("BCH quote missing genesis")?;
++        ensure!(observer.network().quote_name()==network
++            && observer.network().genesis()==genesis,"BCH peer funding observer has another network");
+         let message=self.received_bch_funding_message()?.context("missing authenticated BCH funding receipt")?;
+         observer.observe_funding(message.signed()).await
+     }

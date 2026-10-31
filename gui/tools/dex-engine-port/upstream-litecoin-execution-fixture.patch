@@ -1,0 +1,42 @@
+--- a/swap-core/tests/litecoin_settlement.rs
++++ b/swap-core/tests/litecoin_settlement.rs
+@@ -235,24 +235,21 @@
+ 
+ impl FixtureKeys {
+     fn new() -> Self {
+-        Self {
+-            a: fixture_key("alice-redeem-key"),
+-            b: fixture_key("bob-refund-key"),
+-            s_a: fixture_adaptor_key("alice-adaptor-secret"),
+-            s_b: fixture_adaptor_key("bob-adaptor-secret"),
+-        }
+-    }
+-}
+-
+-fn fixture_key(label: &str) -> SecretKey {
+-    let seed: [u8; 32] = Sha256::digest(format!("{SCHEMA}/{label}")).into();
+-    SecretKey::new_random(&mut ChaCha20Rng::from_seed(seed))
+-}
+-
+-fn fixture_adaptor_key(label: &str) -> SecretKey {
+-    let seed: [u8; 32] = Sha256::digest(format!("{SCHEMA}/{label}")).into();
+-    let scalar = swap_core::monero::Scalar::random(&mut ChaCha20Rng::from_seed(seed));
+-    SecretKey::from(scalar.to_secpfun_scalar())
++        let (a,s_a)=execution_fixture_keys("alice");
++        let (b,s_b)=execution_fixture_keys("bob");
++        Self { a,b,s_a,s_b }
++    }
++}
++
++// Public test seeds shared with the independent machine execution fixture.
++// LocalKeys::generate draws its contract and native spend secrets first; view
++// generation and proof randomness occur afterward and do not change these keys.
++fn execution_fixture_keys(role: &str) -> (SecretKey,SecretKey) {
++    let seed: [u8;32]=Sha256::digest(format!("monzero-ltc-execution-fixture-v1/{role}")).into();
++    let mut rng=ChaCha20Rng::from_seed(seed);
++    let contract=SecretKey::new_random(&mut rng);
++    let native=swap_core::monero::Scalar::random(&mut rng);
++    (contract,SecretKey::from(native.to_secpfun_scalar()))
+ }
+ 
+ /// Public contract parameters shared by both modes.

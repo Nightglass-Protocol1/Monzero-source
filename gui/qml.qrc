@@ -5,6 +5,18 @@
         <file>MiddlePanel.qml</file>
         <file>components/Dialog.qml</file>
         <file>components/Label.qml</file>
+        <file>components/LightWalletPanel.qml</file>
+        <file>components/LightDexFundingPanel.qml</file>
+        <file>components/BchLightDexFundingPanel.qml</file>
+        <file>components/LightWalletBackupRestorePanel.qml</file>
+        <file>components/LightWalletSetupPanel.qml</file>
+        <file>components/LitecoinTradeSetupPanel.qml</file>
+        <file>components/LightWalletImportPanel.qml</file>
+        <file>components/LightWalletDiscoveryPanel.qml</file>
+        <file>components/LightWalletImportRecoveryPanel.qml</file>
+        <file>components/LightWalletImportActivationPanel.qml</file>
+        <file>components/LightWalletRecoveryPanel.qml</file>
+        <file>components/LightWalletPaymentPanel.qml</file>
         <file>components/LanguageButton.qml</file>
         <file>components/Navbar.qml</file>
         <file>components/NavbarItem.qml</file>
@@ -23,6 +35,7 @@
         <file>pages/Account.qml</file>
         <file>pages/Assets.qml</file>
         <file>pages/Dex.qml</file>
+        <file>js/DexDemo.js</file>
         <file>pages/Advanced.qml</file>
         <file>pages/Transfer.qml</file>
         <file>pages/History.qml</file>
@@ -31,6 +44,7 @@
         <file>components/ContextMenu.qml</file>
         <file>components/ContextMenuItem.qml</file>
         <file>components/NetworkStatusItem.qml</file>
+        <file>components/LocalNodeStartup.qml</file>
         <file>components/Input.qml</file>
         <file>components/StandardButton.qml</file>
         <file>components/LineEdit.qml</file>
@@ -151,6 +165,7 @@
         <file>fonts/RobotoMono-Light.ttf</file>
         <file>fonts/RobotoMono-Bold.ttf</file>
         <file>components/Style.qml</file>
+        <file>components/PublicWalletProfile.qml</file>
         <file>components/qmldir</file>
         <file>components/InlineButton.qml</file>
         <file>images/lightning.png</file>
@@ -159,6 +174,7 @@
         <file>images/logout@2x.png</file>
         <file>images/monzeroIcon-28x28.png</file>
         <file>images/monzero-xmz-coin.png</file>
+        <file>images/branding/monzero-banner.jpg</file>
         <file>images/monzeroIcon-28x28@2x.png</file>
         <file>images/lightning-white.png</file>
         <file>images/lightning-white@2x.png</file>

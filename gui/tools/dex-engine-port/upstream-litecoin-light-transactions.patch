@@ -1,0 +1,133 @@
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -127,3 +127,5 @@
+ pub mod state;
+ 
+ pub mod account;
++
++pub mod transaction;
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -82,6 +82,17 @@
+         matched
+     }
+ 
++    /// Retrieve transaction effects bound to a locally validated header.
++    /// Returned outputs are receipts, not evidence of current unspentness.
++    pub async fn transaction_on(&mut self,chain: &super::headers::HeaderSequence,
++        height:u32,txid:Txid)->Result<super::transaction::IncludedTransaction> {
++        ensure!(chain.network()==self.network,"Litecoin transaction network mismatch");
++        let header=chain.header(height).context("Litecoin transaction height outside selected chain")?;
++        let outcome=self.transaction_effects(height,&serialize(&header),txid).await;
++        if outcome.is_err() {self.usable=false;}
++        outcome
++    }
++
+     /// Fetch a header, raw transparent transaction and inclusion branch.
+     /// The expected block hash and height must come from independent chain
+     /// validation, not from this server. Returns no confirmation/unspent claim.
+@@ -99,6 +110,10 @@
+         self.transaction_inclusion(height,&header,txid).await
+     }
+     async fn transaction_inclusion(&mut self,height: u32,header: &[u8],txid: Txid) -> Result<MerkleMatch> {
++        Ok(self.transaction_effects(height,header,txid).await?.into_proof())
++    }
++    async fn transaction_effects(&mut self,height:u32,header:&[u8],txid:Txid)
++        ->Result<super::transaction::IncludedTransaction> {
+         let parsed: Header = deserialize(header)?;
+         let block_hash = parsed.block_hash();
+         let (_, bytes) = self.exchange("blockchain.transaction.get", json!([txid.to_string(), false]),
+@@ -108,7 +123,8 @@
+         ensure!(transaction.compute_txid() == txid, "Electrum returned another transaction");
+         let (id, proof) = self.exchange("blockchain.transaction.get_merkle", json!([txid.to_string(), height]),
+             MAX_RESPONSE).await?;
+-        match_merkle_proof(&InclusionRequest { id, height, block_hash, txid }, header, &raw, &proof)
++        let matched=match_merkle_proof(&InclusionRequest { id, height, block_hash, txid }, header, &raw, &proof)?;
++        super::transaction::IncludedTransaction::new(matched,&transaction)
+     }
+ 
+     async fn exchange(&mut self, method: &str, params: Value, limit: usize) -> Result<(u64, Vec<u8>)> {
+diff --git a/swap-machine/src/litecoin_light/transaction.rs b/swap-machine/src/litecoin_light/transaction.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/transaction.rs
+@@ -0,0 +1,36 @@
++//! Transaction effects committed by an inclusion proof. No witness or signing
++//! authority is exposed. Inclusion alone does not establish an unspent balance.
++use super::*;
++use bitcoin::{Amount, OutPoint, TxOut};
++
++pub struct IncludedTransaction {
++    proof: MerkleMatch,
++    inputs: Vec<OutPoint>,
++    outputs: Vec<TxOut>,
++    coinbase: bool,
++}
++impl IncludedTransaction {
++    pub(super) fn new(proof:MerkleMatch,transaction:&Transaction)->Result<Self> {
++        ensure!(transaction.compute_txid()==proof.txid(),"Litecoin included transaction identity changed");
++        Ok(Self {proof,inputs:transaction.input.iter().map(|input|input.previous_output).collect(),
++            outputs:transaction.output.clone(),coinbase:transaction.is_coinbase()})
++    }
++    pub(super) fn into_proof(self)->MerkleMatch {self.proof}
++    pub fn txid(&self)->Txid {self.proof.txid()}
++    pub fn block_hash(&self)->BlockHash {self.proof.block_hash()}
++    pub fn height(&self)->u32 {self.proof.claimed_height()}
++    pub fn confirmations_on(&self,chain:&headers::HeaderSequence)->Option<u64> {
++        self.proof.confirmations_on(chain)
++    }
++    /// Coinbase receipts additionally require maturity handling before spending.
++    pub fn is_coinbase(&self)->bool {self.coinbase}
++    pub fn inputs(&self)->&[OutPoint] {&self.inputs}
++    /// Exact script equality; callers derive their own wallet scripts.
++    /// Values are committed output amounts, never a spendable-balance assertion.
++    pub fn outputs_to<'a>(&'a self,script:&'a Script)->impl Iterator<Item=(OutPoint,Amount)>+'a {
++        self.outputs.iter().enumerate().filter(move |(_,output)|output.script_pubkey.as_script()==script)
++            .map(move |(index,output)|(OutPoint {txid:self.txid(),vout:index as u32},output.value))
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/transaction/tests.rs b/swap-machine/src/litecoin_light/transaction/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/transaction/tests.rs
+@@ -0,0 +1,36 @@
++use super::*;
++#[test]
++fn transaction_effects_match_scripts_and_spent_outpoints()->Result<()> {
++    let (request,header,raw,response)=crate::litecoin_light::tests::fixture();
++    let proof=match_merkle_proof(&request,&header,&raw,&serde_json::to_vec(&response)?)?;
++    let transaction:Transaction=deserialize(&raw)?;
++    let included=IncludedTransaction::new(proof,&transaction)?;
++    assert_eq!(included.txid(),request.txid);assert_eq!(included.block_hash(),request.block_hash);
++    assert_eq!(included.height(),request.height);assert!(!included.is_coinbase());
++    assert_eq!(included.inputs(),&[transaction.input[0].previous_output]);
++    assert_eq!(included.outputs_to(&transaction.output[0].script_pubkey).collect::<Vec<_>>(),
++        [(OutPoint {txid:request.txid,vout:0},Amount::from_sat(100000))]);
++    assert_eq!(included.outputs_to(Script::new()).count(),0);
++    let chain=headers::HeaderSequence::new(swap_core::litecoin_address::LtcNetwork::Regtest)?;
++    assert_eq!(included.confirmations_on(&chain),None);
++    Ok(())
++}
++#[test]
++fn transaction_effects_reject_replaced_outputs()->Result<()> {
++    let (request,header,raw,response)=crate::litecoin_light::tests::fixture();
++    let proof=match_merkle_proof(&request,&header,&raw,&serde_json::to_vec(&response)?)?;
++    let mut transaction:Transaction=deserialize(&raw)?;transaction.output[0].value=Amount::from_sat(100001);
++    assert!(IncludedTransaction::new(proof,&transaction).is_err());Ok(())
++}
++#[tokio::test]
++async fn transaction_query_requires_local_chain_height_before_io()->Result<()> {
++    use crate::litecoin_light::session::{ReadSession,tests::{server,regtest_handshake}};
++    use swap_core::litecoin_address::LtcNetwork;
++    let (stream,task)=server(regtest_handshake());
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let chain=headers::HeaderSequence::new(LtcNetwork::Regtest)?;
++    assert!(session.transaction_on(&chain,1,Txid::all_zeros()).await.is_err());
++    let chain=headers::HeaderSequence::new(LtcNetwork::Testnet)?;
++    assert!(session.transaction_on(&chain,0,Txid::all_zeros()).await.is_err());
++    drop(session);assert_eq!(task.await?.len(),2);Ok(())
++}

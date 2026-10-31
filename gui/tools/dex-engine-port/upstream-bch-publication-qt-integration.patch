@@ -1,0 +1,33 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/publication_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/publication_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/publication_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/publication_helper.rs
+@@ -22,13 +22,27 @@
+     let action=if approval.is_some() {"submit"}else{"review"};let id=uuid::Uuid::new_v4();
+     let mut request=serde_json::json!({"schema":format!("monzero-bch-success-publication-repair-{action}-request-v1"),"requestId":id,"stage":stage});
+     if let Some(approved)=approval {request["commitment"]=approved.into();}
+-    let mut child=Command::new(helper).arg(format!("--success-publication-repair-{action}-stdio-v1")).arg(config)
++    let (program,qt)=match (std::env::var_os("MONZERO_BCH_QT_PUBLICATION_REPAIR_PROBE"),
++        std::env::var_os("MONZERO_BCH_QT_PUBLICATION_REPAIR_PROBE_SHA256")) {
++        (None,None)=>(helper.to_path_buf(),false),
++        (Some(path),Some(expected))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path,"noncanonical Qt publication repair probe");
++            ensure!(expected.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),
++                "Qt publication repair probe digest mismatch");
++            (path,true)
++        },
++        _=>anyhow::bail!("incomplete Qt publication repair probe configuration"),
++    };
++    let mut child=Command::new(program).arg(format!("--success-publication-repair-{action}-stdio-v1")).arg(config)
+         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+     child.stdin.take().context("missing repair helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
+     let output=child.wait_with_output()?;
+     ensure!(output.status.success()==success,"unexpected repair helper result for {stage} {action}");
+     if !success {
+-        ensure!(output.stdout.is_empty() && output.stderr==b"BCH admission request failed; inspect retained state before retrying\n",
++        let expected:&[u8]=if qt {b"BCH publication repair Qt fixture failed\n"}
++            else {b"BCH admission request failed; inspect retained state before retrying\n"};
++        ensure!(output.stdout.is_empty() && output.stderr==expected,
+             "failed repair helper disclosed unexpected output");return Ok(serde_json::Value::Null)
+     }
+     ensure!(output.stderr.is_empty() && output.stdout.len()<=16384,"unexpected repair helper output");

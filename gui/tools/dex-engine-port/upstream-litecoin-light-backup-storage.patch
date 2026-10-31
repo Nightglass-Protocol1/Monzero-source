@@ -1,0 +1,181 @@
+diff --git a/swap-machine/src/litecoin_light/vault/backup.rs b/swap-machine/src/litecoin_light/vault/backup.rs
+--- a/swap-machine/src/litecoin_light/vault/backup.rs
++++ b/swap-machine/src/litecoin_light/vault/backup.rs
+@@ -4,7 +4,7 @@
+ use super::*;
+ use crate::litecoin_light::account::allocation::AddressBook;
+ const BUNDLE_MAGIC:&[u8;8]=b"MZLTCB01";
+-const MAX_RECORD:usize=2_000_000;
++const MAX_RECORD:usize=2_000_000-HEADER-PREFIX-16;
+ const PREFIX:usize=LENGTH+8;
+ const MAX_BUNDLE:usize=HEADER+PREFIX+MAX_RECORD+16;
+ 
+@@ -27,13 +27,7 @@
+ /// Callers must not activate the wallet unless this whole operation succeeds.
+ pub fn restore(vault_directory:&Path,book_directory:&Path,network:LtcNetwork,wallet:Uuid,
+     password:&[u8],bundle:&[u8])->Result<(SeedVault,AddressBook)> {
+-    let payload=decrypt(bundle,password,network,wallet)?;
+-    ensure!(payload.len()>PREFIX,"truncated Litecoin wallet backup");
+-    let account_index=u32::from_be_bytes(payload[LENGTH..LENGTH+4].try_into()?);
+-    let length=u32::from_be_bytes(payload[LENGTH+4..PREFIX].try_into()?) as usize;
+-    ensure!(length<=MAX_RECORD && payload.len()==PREFIX+length,"invalid address backup length");
+-    let seed=unlock(&payload[..LENGTH],password,network,wallet)?;
+-    let account=seed.public_account(network,account_index)?;drop(seed);
++    let (payload,account,_)=decode_checked(bundle,password,network,wallet)?;
+     let vault_journal=Journal::open(vault_directory)?;
+     let book_journal=Journal::open(book_directory)?;
+     vault_journal.compatible(NAME,&payload[..LENGTH])?;
+@@ -42,6 +36,18 @@
+     let book=AddressBook::restore_record(book_journal,account,payload[PREFIX..].to_vec())?;
+     let vault=SeedVault {journal:vault_journal,network,wallet,bytes:payload[..LENGTH].to_vec(),usable:true};
+     Ok((vault,book))
++}
++fn decode_checked(bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)
++    ->Result<(Zeroizing<Vec<u8>>,PublicAccount,[u32;2])> {
++    let payload=decrypt(bundle,password,network,wallet)?;
++    ensure!(payload.len()>PREFIX,"truncated Litecoin wallet backup");
++    let account_index=u32::from_be_bytes(payload[LENGTH..LENGTH+4].try_into()?);
++    let length=u32::from_be_bytes(payload[LENGTH+4..PREFIX].try_into()?) as usize;
++    ensure!(length<=MAX_RECORD && payload.len()==PREFIX+length,"invalid address backup length");
++    let seed=unlock(&payload[..LENGTH],password,network,wallet)?;
++    let account=seed.public_account(network,account_index)?;drop(seed);
++    let allocated=AddressBook::backup_counts(&account,&payload[PREFIX..])?;
++    Ok((payload,account,allocated))
+ }
+ fn encrypt(payload:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<Vec<u8>> {
+     ensure!(!wallet.is_nil() && payload.len()>PREFIX && payload.len()<=PREFIX+MAX_RECORD,"invalid wallet backup payload");
+@@ -68,3 +74,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++pub mod storage;
+diff --git a/swap-machine/src/litecoin_light/account/allocation.rs b/swap-machine/src/litecoin_light/account/allocation.rs
+--- a/swap-machine/src/litecoin_light/account/allocation.rs
++++ b/swap-machine/src/litecoin_light/account/allocation.rs
+@@ -43,6 +43,10 @@
+     pub(in crate::litecoin_light) fn backup_parts(&self)->Result<(super::descriptor::PublicAccountDescriptor,Vec<u8>)> {
+         ensure!(self.usable && self.journal.read(NAME)?==self.bytes,"address book changed before backup");
+         Ok((self.account.descriptor(),self.bytes.clone()))
++    }
++    pub(in crate::litecoin_light) fn backup_counts(account:&PublicAccount,bytes:&[u8])->Result<[u32;2]> {
++        let record=validate_record(account,bytes)?;let mut counts=[0u32;2];
++        for entry in record.entries {counts[entry.branch as usize]+=1;}Ok(counts)
+     }
+     pub(in crate::litecoin_light) fn restore_preflight(journal:&Journal,account:&PublicAccount,bytes:&[u8])->Result<()> {
+         validate_record(account,bytes)?;journal.compatible(NAME,bytes)
+diff --git a/swap-machine/src/litecoin_light/vault/backup/storage.rs b/swap-machine/src/litecoin_light/vault/backup/storage.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/backup/storage.rs
+@@ -0,0 +1,45 @@
++//! Private backup destination publication and authenticated read-back.
++//! A successful read does not prove a separate/offline copy or backup freshness.
++use super::*;
++use bitcoin::hashes::{Hash,sha256};
++const FILE:&str="litecoin-wallet.backup";
++
++/// Public recovery metadata only; no seed or password serialization.
++pub struct BackupInfo {
++    digest:sha256::Hash,
++    account:PublicAccount,
++    wallet:Uuid,
++    allocated:[u32;2],
++}
++impl BackupInfo {
++    pub fn digest(&self)->sha256::Hash {self.digest}
++    pub fn account(&self)->&PublicAccount {&self.account}
++    pub fn wallet_id(&self)->Uuid {self.wallet}
++    /// Receiving then change counts, authenticated against the recovered seed.
++    pub fn allocated(&self)->[u32;2] {self.allocated}
++}
++/// Authenticate encrypted data without restoring or writing wallet files.
++pub fn inspect(bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<BackupInfo> {
++    let (_payload,account,allocated)=decode_checked(bundle,password,network,wallet)?;
++    Ok(BackupInfo {digest:sha256::Hash::hash(bundle),account,wallet,allocated})
++}
++/// The destination is an existing canonical private directory. The fixed file
++/// name prevents path traversal. Different backup contents are never replaced;
++/// use a new destination directory for a newer backup generation.
++pub fn save_verified(directory:&Path,bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<BackupInfo> {
++    save_with(directory,bundle,password,network,wallet,|journal,bytes|journal.retain(FILE,bytes))
++}
++fn save_with(directory:&Path,bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid,
++    publish:impl FnOnce(&Journal,&[u8])->Result<()>)->Result<BackupInfo> {
++    let info=inspect(bundle,password,network,wallet)?;
++    let journal=Journal::open(directory)?;publish(&journal,bundle)?;
++    ensure!(journal.read(FILE)?==bundle,"Litecoin backup read-back mismatch");Ok(info)
++}
++/// Read and authenticate an existing backup. No implicit creation or mutation.
++/// Returns encrypted bytes for the separately explicit restore operation.
++pub fn load_verified(directory:&Path,password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<(Vec<u8>,BackupInfo)> {
++    let journal=Journal::open(directory)?;let bundle=journal.read(FILE)?;
++    let info=inspect(&bundle,password,network,wallet)?;Ok((bundle,info))
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/backup/storage/tests.rs b/swap-machine/src/litecoin_light/vault/backup/storage/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/backup/storage/tests.rs
+@@ -0,0 +1,60 @@
++use super::*;
++use crate::litecoin_light::account::Branch;
++use std::{fs,os::unix::fs::{PermissionsExt,symlink},path::PathBuf};
++const PASSWORD:&[u8]=b"PUBLIC TEST PASSWORD";
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {
++    let path=std::env::temp_dir().join(format!("monzero-backup-storage-{}",Uuid::new_v4()));fs::create_dir(&path)?;
++    fs::set_permissions(&path,fs::Permissions::from_mode(0o700))?;Ok(Self(path.canonicalize()?))
++}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++fn fixture()->Result<(Vec<u8>,Uuid)> {
++    let vault_dir=Directory::new()?;let book_dir=Directory::new()?;let wallet=Uuid::new_v4();
++    let seed=SecretSeed::from_bytes(Zeroizing::new([42;32]));
++    let vault=SeedVault::create(&vault_dir.0,LtcNetwork::Regtest,wallet,PASSWORD,&seed)?;
++    let mut book=AddressBook::create(&book_dir.0,seed.public_account(LtcNetwork::Regtest,3)?)?;
++    book.reserve(Uuid::new_v4(),Branch::Receive)?;book.reserve(Uuid::new_v4(),Branch::Change)?;
++    Ok((export(&vault,&book,PASSWORD)?,wallet))
++}
++#[test]
++fn saved_backup_authenticates_readback_and_restores_allocation_metadata()->Result<()> {
++    let (bundle,wallet)=fixture()?;let destination=Directory::new()?;
++    let receipt=save_verified(&destination.0,&bundle,PASSWORD,LtcNetwork::Regtest,wallet)?;
++    assert_eq!(receipt.digest(),sha256::Hash::hash(&bundle));assert_eq!(receipt.allocated(),[1,1]);
++    assert_eq!(receipt.wallet_id(),wallet);assert_eq!(receipt.account().account_index(),3);
++    assert_eq!(fs::metadata(destination.0.join(FILE))?.permissions().mode()&0o777,0o600);
++    assert_eq!(save_verified(&destination.0,&bundle,PASSWORD,LtcNetwork::Regtest,wallet)?.digest(),receipt.digest());
++    let (loaded,info)=load_verified(&destination.0,PASSWORD,LtcNetwork::Regtest,wallet)?;
++    assert_eq!(loaded,bundle);assert_eq!(info.digest(),receipt.digest());
++    let restored_vault=Directory::new()?;let restored_book=Directory::new()?;
++    let (_,book)=restore(&restored_vault.0,&restored_book.0,LtcNetwork::Regtest,wallet,PASSWORD,&loaded)?;
++    assert_eq!(book.allocated_count(Branch::Receive)?,1);assert_eq!(book.allocated_count(Branch::Change)?,1);Ok(())
++}
++#[test]
++fn backup_storage_refuses_bad_auth_conflicts_and_unsafe_files()->Result<()> {
++    let (bundle,wallet)=fixture()?;let destination=Directory::new()?;
++    assert!(save_verified(&destination.0,&bundle,b"wrong",LtcNetwork::Regtest,wallet).is_err());assert!(!destination.0.join(FILE).exists());
++    save_verified(&destination.0,&bundle,PASSWORD,LtcNetwork::Regtest,wallet)?;
++    let path=destination.0.join(FILE);let before=fs::read(&path)?;
++    let payload=decrypt(&bundle,PASSWORD,LtcNetwork::Regtest,wallet)?;
++    let different=encrypt(&payload,PASSWORD,LtcNetwork::Regtest,wallet)?;
++    assert!(save_verified(&destination.0,&different,PASSWORD,LtcNetwork::Regtest,wallet).is_err());assert_eq!(fs::read(&path)?,before);
++    fs::set_permissions(&path,fs::Permissions::from_mode(0o644))?;
++    assert!(load_verified(&destination.0,PASSWORD,LtcNetwork::Regtest,wallet).is_err());
++    fs::set_permissions(&path,fs::Permissions::from_mode(0o600))?;
++    let mut tampered=before.clone();*tampered.last_mut().unwrap()^=1;fs::write(&path,tampered)?;
++    assert!(load_verified(&destination.0,PASSWORD,LtcNetwork::Regtest,wallet).is_err());
++    fs::remove_file(&path)?;let other=destination.0.join("target");fs::write(&other,&before)?;symlink(&other,&path)?;
++    assert!(save_verified(&destination.0,&bundle,PASSWORD,LtcNetwork::Regtest,wallet).is_err());assert_eq!(fs::read(other)?,before);Ok(())
++}
++#[test]
++fn backup_storage_retries_uncertain_publication_and_checks_readback()->Result<()> {
++    let (bundle,wallet)=fixture()?;let destination=Directory::new()?;
++    assert!(save_with(&destination.0,&bundle,PASSWORD,LtcNetwork::Regtest,wallet,|journal,bytes| {
++        journal.retain(FILE,bytes)?;anyhow::bail!("injected lost publication result")
++    }).is_err());
++    assert_eq!(save_verified(&destination.0,&bundle,PASSWORD,LtcNetwork::Regtest,wallet)?.digest(),sha256::Hash::hash(&bundle));
++    let absent=Directory::new()?;
++    assert!(save_with(&absent.0,&bundle,PASSWORD,LtcNetwork::Regtest,wallet,|_,_|Ok(())).is_err());
++    assert!(load_verified(&absent.0,PASSWORD,LtcNetwork::Regtest,wallet).is_err());Ok(())
++}

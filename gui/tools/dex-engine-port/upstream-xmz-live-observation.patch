@@ -1,0 +1,274 @@
+diff --git a/swap-machine/src/litecoin_negotiation/execution/redeem.rs b/swap-machine/src/litecoin_negotiation/execution/redeem.rs
+index 953c19885..9f1f2c050 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/redeem.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/redeem.rs
+@@ -16,6 +16,9 @@ impl Release {
+ }
+ pub(super) fn pending_name(trade:uuid::Uuid)->String {format!("{trade}.ltc-redeem-unsigned")}
+ pub(super) fn release_name(trade:uuid::Uuid)->String { format!("{trade}.ltc-redeem-outgoing") }
++const RELEASE_OBSERVATION_ATTEMPTS:usize=4;
++const RELEASE_RETRY_DELAY:std::time::Duration=std::time::Duration::from_millis(if cfg!(test) {1} else {2000});
++
+ impl Execution {
+     pub async fn release_redeem(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
+         safety_blocks:u32,identity:&ed25519_dalek::SigningKey)->Result<SignedRedeem> {
+@@ -55,16 +58,24 @@ impl Execution {
+         };
+         // Load/revalidate slow proof state before the final chain observations.
+         let (plan,local)=self.recovery_plan()?;
+-        let evidence=self.recover_native_funding(native).await?;
+-        let (mut head,mut previous,quote,_,exchange)=self.load()?;
+-        let keys=exchange.finish()?;
+-        evidence.check_trade(&keys,&quote)?;
+-        let snapshot=evidence.funding().snapshot();
+-        let depth=snapshot.tip_height.checked_sub(evidence.funding().height())
+-            .and_then(|v|v.checked_add(1)).context("invalid native funding depth")?;
+-        ensure!(depth>=u64::from(self.policy.xmz_confirmations),"native evidence below current confirmation policy");
+-        let live=self.observe_live_lock(ltc,safety_blocks).await?;
+-        ensure!(native.snapshot().await?==*snapshot,"native chain changed before redeem release");
++        // Both chains must be seen at one native tip. A native block landing
++        // between the two observations makes them incomparable: observe again.
++        let mut attempt=0;
++        let (evidence,live,mut head,mut previous,quote,keys)=loop {
++            attempt+=1;
++            let evidence=self.recover_native_funding(native).await?;
++            let (head,previous,quote,_,exchange)=self.load()?;
++            let keys=exchange.finish()?;
++            evidence.check_trade(&keys,&quote)?;
++            let snapshot=evidence.funding().snapshot();
++            let depth=snapshot.tip_height.checked_sub(evidence.funding().height())
++                .and_then(|v|v.checked_add(1)).context("invalid native funding depth")?;
++            ensure!(depth>=u64::from(self.policy.xmz_confirmations),"native evidence below current confirmation policy");
++            let live=self.observe_live_lock(ltc,safety_blocks).await?;
++            if native.snapshot().await?==*snapshot {break (evidence,live,head,previous,quote,keys);}
++            ensure!(attempt<RELEASE_OBSERVATION_ATTEMPTS,"native chain changed before redeem release");
++            tokio::time::sleep(RELEASE_RETRY_DELAY).await;
++        };
+         ensure!(live.observation().script==*keys.contract_address().script_pubkey()
+             && live.observation().amount.to_sat()==quote.terms()["ltcAtoms"].parse::<u64>()?,
+             "redeem release live lock differs from quote");
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index 4f77850a2..e6c034990 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -226,21 +226,28 @@ impl FundingObserver for NativeFundingRpc {
+     }
+ 
+     async fn observe(&self, request: &FundingRequest) -> Result<FundingObservation> {
+-        let address = self.rpc(self.wallet, "get_address", json!({})).await?;
+-        let checked = self.rpc(self.wallet, "check_tx_key", json!({
+-            "txid": request.proof.tx_hash.0, "tx_key": request.proof.tx_key.to_string(),
+-            "address": request.address.to_string(),
+-        })).await?;
+-        let result = self.rpc(self.wallet, "get_transfer_by_txid", json!({"txid":request.proof.tx_hash.0})).await?;
+-        let transfer = &result["transfer"];
+-        ensure!(transfer["type"] == "in", "native transfer is not incoming");
+-        ensure!(number(transfer, "unlock_time")? == 0, "native funding has an explicit unlock delay");
+-        let received = number(&checked, "received")?;
+-        let confirmations = number(&checked, "confirmations")?;
+-        ensure!(number(transfer, "amount")? == received && number(transfer, "confirmations")? == confirmations,
+-            "native wallet observations disagree");
+-        Ok(FundingObservation { txid: string(transfer, "txid")?, address: string(&address, "address")?,
+-            received_atoms: received, in_pool: checked["in_pool"].as_bool().context("missing native pool status")?,
+-            height: number(transfer, "height")?, confirmations })
++        // The wallet scans new blocks on its own timer while check_tx_key reads the
++        // daemon tip, so catch the wallet up first and re-read if a block lands
++        // between the two calls. The amounts must always agree.
++        for _ in 0..3 {
++            self.rpc(self.wallet, "refresh", json!({})).await?;
++            let address = self.rpc(self.wallet, "get_address", json!({})).await?;
++            let checked = self.rpc(self.wallet, "check_tx_key", json!({
++                "txid": request.proof.tx_hash.0, "tx_key": request.proof.tx_key.to_string(),
++                "address": request.address.to_string(),
++            })).await?;
++            let result = self.rpc(self.wallet, "get_transfer_by_txid", json!({"txid":request.proof.tx_hash.0})).await?;
++            let transfer = &result["transfer"];
++            ensure!(transfer["type"] == "in", "native transfer is not incoming");
++            ensure!(number(transfer, "unlock_time")? == 0, "native funding has an explicit unlock delay");
++            let received = number(&checked, "received")?;
++            let confirmations = number(&checked, "confirmations")?;
++            ensure!(number(transfer, "amount")? == received, "native wallet observations disagree");
++            if number(transfer, "confirmations")? != confirmations { continue; }
++            return Ok(FundingObservation { txid: string(transfer, "txid")?, address: string(&address, "address")?,
++                received_atoms: received, in_pool: checked["in_pool"].as_bool().context("missing native pool status")?,
++                height: number(transfer, "height")?, confirmations });
++        }
++        anyhow::bail!("native wallet observations disagree")
+     }
+ }
+diff --git a/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs b/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs
+index f288e3ba6..9e14c57af 100644
+--- a/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs
++++ b/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs
+@@ -12,6 +12,10 @@ struct Record {
+     schema:String,binding:[u8;32],genesis:String,wallet:String,destination:String,
+     amount:u64,account:u32,priority:u32,fee:u64,weight:u64,metadata:String,proof:TransferProof,
+ }
++
++const CONFIRMATION_ATTEMPTS:usize=4;
++const CONFIRMATION_RETRY_DELAY:std::time::Duration=std::time::Duration::from_millis(if cfg!(test) {1} else {2000});
++
+ impl Drop for Record { fn drop(&mut self) { self.metadata.zeroize(); } }
+ fn encode_record(record:&Record)->Result<Zeroizing<Vec<u8>>> {
+     // Bound the checkpoint and avoid reallocating secret-bearing serialization
+@@ -123,6 +127,16 @@ impl NativeTransferRelay {
+     /// relay acknowledgement never substitutes for confirmation at a stable tip.
+     pub(crate) async fn confirm_native_lock(&self,prepared:&PreparedNativeLock,minimum:u64)->Result<u64> {
+         ensure!(minimum>0,"zero native funding confirmation requirement");
++        // The source wallet scans blocks on its own timer and a block can land
++        // mid-read; such a disagreement is re-read, never relaxed.
++        for attempt in 1..=CONFIRMATION_ATTEMPTS {
++            self.client.rpc(self.client.wallet,"refresh",json!({})).await?;
++            if let Some(confirmations)=self.confirm_native_lock_once(prepared,minimum).await? {return Ok(confirmations);}
++            if attempt<CONFIRMATION_ATTEMPTS {tokio::time::sleep(CONFIRMATION_RETRY_DELAY).await;}
++        }
++        anyhow::bail!("native chain changed during funding reconciliation")
++    }
++    async fn confirm_native_lock_once(&self,prepared:&PreparedNativeLock,minimum:u64)->Result<Option<u64>> {
+         let transfer=&prepared.transfer;
+         let before=self.client.snapshot().await?;
+         ensure!(before.genesis==transfer.genesis && canonical_hash(&before.tip_hash),"unexpected native funding chain");
+@@ -139,17 +153,18 @@ impl NativeTransferRelay {
+         ensure!(destinations.len()==1 && destinations[0]["address"]==transfer.request.destination.to_string()
+             && number(&destinations[0],"amount")?==transfer.request.amount.atoms(),"native funding destination mismatch");
+         let height=number(observed,"height")?;let confirmations=number(observed,"confirmations")?;
+-        ensure!(height>0 && confirmations>=minimum
+-            && before.tip_height.checked_sub(height).and_then(|v|v.checked_add(1))==Some(confirmations),
+-            "native funding is not sufficiently confirmed");
++        ensure!(height>0,"native funding is not sufficiently confirmed");
++        if before.tip_height.checked_sub(height).and_then(|v|v.checked_add(1))!=Some(confirmations) {return Ok(None);}
++        ensure!(confirmations>=minimum,"native funding is not sufficiently confirmed");
+         let key=Zeroizing::new(prepared.proof.tx_key.to_string());
+         let checked=self.client.rpc(self.client.wallet,"check_tx_key",json!({"txid":transfer.summary.txid,
+             "tx_key":key.as_str(),"address":transfer.request.destination.to_string()})).await?;
+-        ensure!(checked["in_pool"]==false && number(&checked,"received")?==transfer.request.amount.atoms()
+-            && number(&checked,"confirmations")?==confirmations,"native funding proof disagrees with wallet history");
++        ensure!(checked["in_pool"]==false && number(&checked,"received")?==transfer.request.amount.atoms(),
++            "native funding proof disagrees with wallet history");
++        if number(&checked,"confirmations")?!=confirmations {return Ok(None);}
+         self.check_wallet(&transfer.request).await?;
+-        ensure!(self.client.snapshot().await?==before,"native chain changed during funding reconciliation");
+-        Ok(confirmations)
++        if self.client.snapshot().await?!=before {return Ok(None);}
++        Ok(Some(confirmations))
+     }
+     /// No broadcast. Caller must reserve its immutable funding intent first.
+     pub(crate) async fn prepare_native_lock(&mut self,request:RelayRequest,genesis:&str,
+@@ -256,6 +271,7 @@ pub(crate) mod tests {
+                             },
+                             "get_block_header_by_height"=>json!({"block_header":{"hash":genesis}}),
+                             "get_version"=>json!({"version":(3u64<<16)|7}),
++                            "refresh"=>json!({"blocks_fetched":0,"received_money":false}),
+                             "get_last_block_header"=>json!({"block_header":{"hash":"ef".repeat(32),"height":109}}),
+                             "get_address"=>json!({"address":if incoming.load(Ordering::SeqCst) {destination.to_string()} else {wallet.to_string()}}),
+                             "get_balance"=>{
+diff --git a/swap-machine/src/xmz_funding.rs b/swap-machine/src/xmz_funding.rs
+index 736a30710..fce981fa7 100644
+--- a/swap-machine/src/xmz_funding.rs
++++ b/swap-machine/src/xmz_funding.rs
+@@ -56,20 +56,41 @@ pub async fn verify(
+ ) -> Result<VerifiedFunding> {
+     ensure!(hash(expected_genesis) && hash(&request.proof.tx_hash.0), "invalid funding identity");
+     ensure!(required_confirmations > 0 && request.amount.atoms() > 0, "invalid funding policy");
++    // A live chain can gain a block between the reads of one observation. Such a
++    // race is retried with a fresh observation; every identity, amount and depth
++    // rule still applies to the observation that is finally accepted.
++    for attempt in 1..=OBSERVATION_ATTEMPTS {
++        if let Some((snapshot, height)) = observe_stable(observer, &request, expected_genesis, required_confirmations).await? {
++            return Ok(VerifiedFunding { request, snapshot, height });
++        }
++        if attempt < OBSERVATION_ATTEMPTS { tokio::time::sleep(OBSERVATION_RETRY_DELAY).await; }
++    }
++    anyhow::bail!("native chain changed during funding verification")
++}
++
++const OBSERVATION_ATTEMPTS: usize = 4;
++const OBSERVATION_RETRY_DELAY: std::time::Duration =
++    std::time::Duration::from_millis(if cfg!(test) { 1 } else { 2000 });
++
++/// One consistent read, or None when the chain moved while it was taken.
++async fn observe_stable(observer: &impl FundingObserver, request: &FundingRequest, expected_genesis: &str,
++    required_confirmations: u64) -> Result<Option<(ChainSnapshot, u64)>> {
+     let before = observer.snapshot().await?;
+     ensure!(before.genesis == expected_genesis && hash(&before.tip_hash), "unexpected native chain");
+-    let observed = observer.observe(&request).await?;
++    let observed = observer.observe(request).await?;
+     ensure!(observed.txid == request.proof.tx_hash.0 && observed.address == request.address.to_string(),
+         "native funding identity mismatch");
+     ensure!(observed.received_atoms == request.amount.atoms(), "native funding amount mismatch");
++    let after = observer.snapshot().await?;
++    if before != after {
++        return Ok(None); // A block arrived during the read; its depths are not comparable.
++    }
+     ensure!(!observed.in_pool && observed.height > 0 && observed.height <= before.tip_height,
+         "native funding is not mined");
+     let depth = before.tip_height - observed.height + 1;
+     ensure!(observed.confirmations == depth && depth >= required_confirmations,
+         "native funding confirmation mismatch");
+-    let after = observer.snapshot().await?;
+-    ensure!(before == after, "native chain changed during funding verification");
+-    Ok(VerifiedFunding { request, snapshot: after, height: observed.height })
++    Ok(Some((after, observed.height)))
+ }
+ 
+ fn hash(value: &str) -> bool {
+@@ -307,13 +328,16 @@ mod tests {
+         observation: FundingObservation,
+         calls: AtomicUsize,
+         fail: bool,
++        unstable: bool,
+     }
+ 
+     #[async_trait::async_trait]
+     impl FundingObserver for Observer {
+         async fn snapshot(&self) -> Result<ChainSnapshot> {
+-            Ok(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+-                self.before.clone()
++            let call = self.calls.fetch_add(1, Ordering::SeqCst);
++            // An unstable chain gains a different tip on every read.
++            Ok(if call == 0 { self.before.clone() } else if self.unstable {
++                ChainSnapshot { tip_hash: format!("{:064x}", call), ..self.after.clone() }
+             } else { self.after.clone() })
+         }
+         async fn observe(&self, _: &FundingRequest) -> Result<FundingObservation> {
+@@ -332,7 +356,7 @@ mod tests {
+             address: request.address.to_string(), received_atoms: request.amount.atoms(),
+             in_pool: false, height: 132, confirmations: 10 };
+         (Observer { before: chain.clone(), after: chain, observation,
+-            calls: AtomicUsize::new(0), fail: false }, request)
++            calls: AtomicUsize::new(0), fail: false, unstable: false }, request)
+     }
+ 
+     #[tokio::test]
+@@ -361,8 +385,8 @@ mod tests {
+                 "future" => observer.observation.height = 142,
+                 "depth" => observer.observation.confirmations = 9,
+                 "shallow" => required = 11,
+-                "reorg" => observer.after.tip_hash = "00".repeat(32),
+-                "growth" => observer.after.tip_height += 1,
++                "reorg" => observer.unstable = true,
++                "growth" => { observer.unstable = true; observer.after.tip_height += 1 },
+                 "backend" => observer.fail = true,
+                 _ => unreachable!(),
+             }
+@@ -371,4 +395,20 @@ mod tests {
+         let (observer, request) = fixture();
+         assert!(verify(&observer, request, &"cd".repeat(32), 0).await.is_err());
+     }
++
++    #[tokio::test]
++    async fn retries_a_block_arriving_between_reads() {
++        // One new tip during the first read; the next consistent read is accepted.
++        let (mut observer, request) = fixture();
++        observer.after.tip_hash = "01".repeat(32);
++        let verified = verify(&observer, request, &"cd".repeat(32), 10).await.unwrap();
++        assert_eq!(verified.snapshot().tip_hash, "01".repeat(32));
++        assert_eq!(observer.calls.load(Ordering::SeqCst), 4);
++        // A transaction still in the pool on a stable chain is not mined.
++        let (mut observer, request) = fixture();
++        observer.after = observer.before.clone();
++        observer.observation.in_pool = true;
++        assert!(verify(&observer, request, &"cd".repeat(32), 10).await.is_err());
++        assert_eq!(observer.calls.load(Ordering::SeqCst), 2);
++    }
+ }

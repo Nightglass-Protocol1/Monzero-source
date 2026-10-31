@@ -1,0 +1,42 @@
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index d4e673061..8ea43f57b 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -225,6 +225,37 @@ mod tests {
+         assert!(verify(&later, 1000).is_ok());
+     }
+ 
++    #[test]
++    #[ignore = "requires explicitly selected Qt disposable reservation fixture executable"]
++    fn qt_written_reservation_interoperates() -> Result<()> {
++        let driver = std::env::var_os("MONZERO_TEST_QT_QUOTE_DRIVER")
++            .ok_or_else(|| anyhow::anyhow!("missing Qt fixture executable"))?;
++        let output = std::process::Command::new(driver).arg("--export-reservation-fixture").output()?;
++        ensure!(output.status.success() && output.stdout.len() <= 32768, "Qt reservation fixture failed");
++        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)?;
++        let key = |field: &str| -> Result<[u8; 32]> {
++            let text = envelope[field].as_str().ok_or_else(|| anyhow::anyhow!("missing fixture pin"))?;
++            ensure!(text.len() == 64 && text.is_ascii(), "invalid fixture pin");
++            let mut bytes = [0; 32];
++            for (i, byte) in bytes.iter_mut().enumerate() {
++                *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)?;
++            }
++            Ok(bytes)
++        };
++        // Pins come from the explicitly trusted test driver, not a production peer.
++        let b = key("btcPeer")?; let x = key("xmzPeer")?;
++        let bytes = envelope["record"].as_str().ok_or_else(|| anyhow::anyhow!("missing Qt record"))?.as_bytes();
++        let quote = VerifiedQuote::from_gui_reservation(bytes, 100, &b, &x, Network::Bitcoin, XmzNetwork::Mainnet)?;
++        let commitment = quote.commitment().iter().map(|b| format!("{b:02x}")).collect::<String>();
++        assert_eq!(envelope["commitment"], commitment);
++        assert_eq!(quote.terms()["btcSatoshis"], "500000");
++        assert_eq!(quote.terms()["xmzAtoms"], "200000000000");
++        assert!(VerifiedQuote::from_gui_reservation(bytes, 200, &b, &x, Network::Bitcoin, XmzNetwork::Mainnet).is_err());
++        assert!(VerifiedQuote::from_gui_reservation(bytes, 100, &x, &b, Network::Bitcoin, XmzNetwork::Mainnet).is_err());
++        assert!(VerifiedQuote::from_gui_reservation(bytes, 100, &b, &x, Network::Regtest, XmzNetwork::Mainnet).is_err());
++        Ok(())
++    }
++
+     #[test]
+     fn gui_reservation_decoder_rechecks_signed_terms_and_freshness() -> Result<()> {
+         let terms = fixture();

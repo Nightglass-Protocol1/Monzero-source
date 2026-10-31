@@ -193,7 +193,7 @@ ColumnLayout {
                             font.family: MonzeroComponents.Style.fontRegular.name
                             font.bold: false
                             font.pixelSize: fontItemSize
-                            color: itemArea.containsMouse || index === columnid.currentIndex || itemArea.containsMouse ? "#FA6800" : "#FFFFFF"
+                            color: itemArea.containsMouse || index === columnid.currentIndex || itemArea.containsMouse ? MonzeroComponents.Style.accent : "#FFFFFF"
                             text: qsTr(column1) + translationManager.emptyString
                         }
 

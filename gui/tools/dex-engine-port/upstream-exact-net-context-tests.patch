@@ -1,0 +1,128 @@
+diff --git a/swap-machine/src/native_funding_rpc/full_proceeds.rs b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+index 3b5a65849..e1dbd813c 100644
+--- a/swap-machine/src/native_funding_rpc/full_proceeds.rs
++++ b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+@@ -4,7 +4,7 @@
+ //! trusted caller must exclusively own the restored wallet service. Native RPC
+ //! constructs/signs internally; this is not a read-only wallet operation.
+ use super::{number, NativeFundingRpc};
+-use crate::xmz_funding::FundingObserver;
++use crate::xmz_funding::{ChainSnapshot, FundingObserver};
+ use anyhow::{ensure, Context, Result};
+ use serde_json::{json, Value};
+ use std::collections::BTreeSet;
+@@ -78,12 +78,33 @@ pub async fn prepare_exact_net_with_top_up(client: &NativeFundingRpc, request: &
+     params["get_tx_metadata"] = json!(true);
+     let response = client.rpc(client.wallet, "transfer", params).await?;
+     let prepared = check_prepared_exact_net(response, request, genesis, top_up_txid, &inputs)?;
+-    ensure!(client.opened_wallet(source.wallet.network()).await?.as_ref() == Some(&source.wallet),
+-        "exact-net wallet changed");
+-    ensure!(client.snapshot().await? == before, "exact-net chain changed");
++    revalidate_exact_net(client, &source.wallet, &before).await?;
+     Ok(prepared)
+ }
+ 
++// Private seam: public callers cannot substitute peer-provided observations.
++#[async_trait::async_trait]
++trait ConstructionContext: Sync {
++    async fn current_wallet(&self, expected: &XmzAddress) -> Result<Option<XmzAddress>>;
++    async fn current_snapshot(&self) -> Result<ChainSnapshot>;
++}
++
++#[async_trait::async_trait]
++impl ConstructionContext for NativeFundingRpc {
++    async fn current_wallet(&self, expected: &XmzAddress) -> Result<Option<XmzAddress>> {
++        self.opened_wallet(expected.network()).await
++    }
++    async fn current_snapshot(&self) -> Result<ChainSnapshot> { self.snapshot().await }
++}
++
++async fn revalidate_exact_net(context: &impl ConstructionContext, wallet: &XmzAddress,
++    before: &ChainSnapshot) -> Result<()> {
++    ensure!(context.current_wallet(wallet).await?.as_ref() == Some(wallet),
++        "exact-net wallet changed");
++    ensure!(context.current_snapshot().await? == *before, "exact-net chain changed");
++    Ok(())
++}
++
+ fn check_prepared_exact_net(mut response: Value, request: &ExactNetRequest,
+     genesis: &str, top_up_txid: &str, inputs: &BTreeSet<String>) -> Result<PreparedExactNet> {
+     let metadata = match response.get_mut("tx_metadata").map(Value::take) {
+@@ -143,9 +164,7 @@ async fn preview_exact_net_inner(client: &NativeFundingRpc, request: &ExactNetRe
+     };
+     let response = client.rpc(client.wallet, "transfer", params).await?;
+     let preview = check_exact_net(&response, request, &inputs)?;
+-    ensure!(client.opened_wallet(source.wallet.network()).await?.as_ref() == Some(&source.wallet),
+-        "exact-net wallet changed");
+-    ensure!(client.snapshot().await? == before, "exact-net chain changed");
++    revalidate_exact_net(client, &source.wallet, &before).await?;
+     Ok(preview)
+ }
+ 
+@@ -296,6 +315,66 @@ fn hash(value: &str) -> bool {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    struct ConstructionFixture {
++        wallet: Option<XmzAddress>,
++        snapshot: ChainSnapshot,
++        failure: Option<&'static str>,
++        calls: std::sync::Mutex<Vec<&'static str>>,
++    }
++    #[async_trait::async_trait]
++    impl ConstructionContext for ConstructionFixture {
++        async fn current_wallet(&self, _: &XmzAddress) -> Result<Option<XmzAddress>> {
++            self.calls.lock().unwrap().push("wallet");
++            ensure!(self.failure != Some("wallet"), "fixture wallet RPC failed");
++            Ok(self.wallet.clone())
++        }
++        async fn current_snapshot(&self) -> Result<ChainSnapshot> {
++            self.calls.lock().unwrap().push("snapshot");
++            ensure!(self.failure != Some("snapshot"), "fixture snapshot RPC failed");
++            Ok(self.snapshot.clone())
++        }
++    }
++    #[tokio::test]
++    async fn exact_net_postchecks_reject_changed_wallet_and_chain() -> Result<()> {
++        let wallet=request().wallet;
++        let before=ChainSnapshot { genesis:"a".repeat(64),tip_hash:"b".repeat(64),tip_height:100 };
++        let mut fixture=ConstructionFixture { wallet:Some(wallet.clone()),snapshot:before.clone(),
++            failure:None,calls:std::sync::Mutex::new(Vec::new()) };
++        revalidate_exact_net(&fixture,&wallet,&before).await?;
++        assert_eq!(*fixture.calls.lock().unwrap(),vec!["wallet","snapshot"]);
++        for field in ["genesis","tip","height"] {
++            fixture.snapshot=before.clone();
++            match field {
++                "genesis" => fixture.snapshot.genesis="c".repeat(64),
++                "tip" => fixture.snapshot.tip_hash="c".repeat(64),
++                _ => fixture.snapshot.tip_height+=1,
++            }
++            assert_eq!(revalidate_exact_net(&fixture,&wallet,&before).await.unwrap_err().to_string(),
++                "exact-net chain changed");
++        }
++        fixture.snapshot=before.clone();fixture.wallet=None;
++        fixture.calls.lock().unwrap().clear();
++        assert_eq!(revalidate_exact_net(&fixture,&wallet,&before).await.unwrap_err().to_string(),
++            "exact-net wallet changed");
++        assert_eq!(*fixture.calls.lock().unwrap(),vec!["wallet"]);
++        let other=XmzAddress::parse(wallet.network(),
++            include_str!("../../../swap-core/src/xmz_address_vectors.txt").lines().nth(2).unwrap())?;
++        fixture.wallet=Some(other);
++        assert!(revalidate_exact_net(&fixture,&wallet,&before).await.is_err());
++        Ok(())
++    }
++    #[tokio::test]
++    async fn exact_net_postchecks_propagate_rpc_failure_without_fallback() {
++        let wallet=request().wallet;
++        let before=ChainSnapshot { genesis:"a".repeat(64),tip_hash:"b".repeat(64),tip_height:100 };
++        for (failure,expected_calls) in [("wallet",vec!["wallet"]),("snapshot",vec!["wallet","snapshot"])] {
++            let fixture=ConstructionFixture { wallet:Some(wallet.clone()),snapshot:before.clone(),
++                failure:Some(failure),calls:std::sync::Mutex::new(Vec::new()) };
++            assert_eq!(revalidate_exact_net(&fixture,&wallet,&before).await.unwrap_err().to_string(),
++                format!("fixture {failure} RPC failed"));
++            assert_eq!(*fixture.calls.lock().unwrap(),expected_calls);
++        }
++    }
+     fn request() -> FullProceedsRequest {
+         let wallet = XmzAddress::parse(swap_core::xmz_address::XmzNetwork::Mainnet,
+             "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H").unwrap();

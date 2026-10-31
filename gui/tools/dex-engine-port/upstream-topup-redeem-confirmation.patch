@@ -1,0 +1,99 @@
+diff --git a/swap-machine/src/bob/mod.rs b/swap-machine/src/bob/mod.rs
+index 8eebfcf36..c6acef7ea 100644
+--- a/swap-machine/src/bob/mod.rs
++++ b/swap-machine/src/bob/mod.rs
+@@ -1251,6 +1251,33 @@ impl State4 {
+         })
+     }
+ 
++    /// Like `watch_for_redeem_btc`, but only recovers the key once the redeem
++    /// transaction has reached `required_confirmations`, not merely been seen.
++    /// A caller about to authorize a new payment against the recovered key
++    /// (rather than just reacting to it) needs this stronger depth guarantee;
++    /// `required_confirmations` is local policy, never a peer-supplied value.
++    pub async fn watch_for_redeem_btc_confirmed(
++        &self,
++        bitcoin_wallet: &dyn bitcoin_wallet::BitcoinWallet,
++        required_confirmations: u32,
++    ) -> Result<State5> {
++        anyhow::ensure!(required_confirmations > 0, "invalid required confirmation depth");
++        let tx_redeem =
++            bitcoin::TxRedeem::new(&self.tx_lock, &self.redeem_address, self.tx_redeem_fee);
++
++        bitcoin_wallet
++            .subscribe_to(Box::new(tx_redeem))
++            .await
++            .wait_until_confirmed_with(required_confirmations)
++            .await?;
++
++        let state5 = self.check_for_tx_redeem(bitcoin_wallet).await?;
++
++        state5.ok_or_else(|| {
++            anyhow!("Bitcoin redeem transaction was not found in the chain even though we previously saw it confirmed. Our Electrum server might have reorged?")
++        })
++    }
++
+     pub async fn expired_timelock(
+         &self,
+         bitcoin_wallet: &dyn bitcoin_wallet::BitcoinWallet,
+diff --git a/swap-machine/src/native_funding_rpc/topup_journal.rs b/swap-machine/src/native_funding_rpc/topup_journal.rs
+index eb9d15c48..90d2eb250 100644
+--- a/swap-machine/src/native_funding_rpc/topup_journal.rs
++++ b/swap-machine/src/native_funding_rpc/topup_journal.rs
+@@ -11,7 +11,7 @@ use serde_json::{json, Value};
+ use std::{fs::File, path::Path};
+ #[cfg(unix)]
+ use std::io::Write;
+-use swap_core::{xmz::XmzAmount, xmz_address::XmzAddress};
++use swap_core::{monero, xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
+ 
+ /// Buyer-approved top-up budget and destination, bound to one trade lock.
+ /// `destination` is the recovered swap address, never the buyer's own change.
+@@ -118,6 +118,22 @@ fn hash(value: &str) -> bool {
+     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+ }
+ 
++/// The address a `TopUpRequest` targets must be exactly the one this trade's
++/// protocol actually derives, never a value trusted from elsewhere. Callers
++/// obtain `spend`/`view` from `bob::State5::xmr_keys()` after
++/// `bob::State4::watch_for_redeem_btc_confirmed` -- which enforces the
++/// required Bitcoin confirmation depth -- and must call this immediately
++/// before reserving, not rely on an earlier binding.
++pub fn authorize_recovered_destination(request: &TopUpRequest, network: XmzNetwork,
++    spend: monero_oxide_ext::PrivateKey, view: monero::PrivateViewKey) -> Result<()> {
++    let address = XmzAddress::new(network, monero_address::AddressType::Legacy,
++        monero_oxide_ext::PublicKey::from_private_key(&spend).decompress(),
++        view.public().0.decompress())?;
++    ensure!(address == request.destination,
++        "recovered swap address does not match the approved top-up destination");
++    Ok(())
++}
++
+ #[cfg(all(test, unix))]
+ mod tests {
+     use super::*;
+@@ -208,4 +224,24 @@ mod tests {
+         assert_eq!(std::fs::read_dir(&directory.0)?.count(), 2);
+         Ok(())
+     }
++
++    #[test]
++    fn authorization_binds_the_exact_recovered_address_and_rejects_any_other() {
++        use swap_core::monero::{PrivateKey as XmrPrivateKey, PrivateViewKey, Scalar};
++        let network = XmzNetwork::Mainnet;
++        let spend = XmrPrivateKey::from_scalar(Scalar::ONE);
++        let view = PrivateViewKey(XmrPrivateKey::from_scalar(Scalar::ONE) + XmrPrivateKey::from_scalar(Scalar::ONE));
++        let destination = XmzAddress::new(network, monero_address::AddressType::Legacy,
++            monero_oxide_ext::PublicKey::from_private_key(&spend).decompress(),
++            view.public().0.decompress()).unwrap();
++        let mut request = request();
++        request.destination = destination;
++        assert!(authorize_recovered_destination(&request, network, spend, view).is_ok());
++
++        let wrong_spend = XmrPrivateKey::from_scalar(Scalar::ONE) + XmrPrivateKey::from_scalar(Scalar::ONE) + XmrPrivateKey::from_scalar(Scalar::ONE);
++        assert!(authorize_recovered_destination(&request, network, wrong_spend, view).is_err());
++        let wrong_view = PrivateViewKey(XmrPrivateKey::from_scalar(Scalar::ONE));
++        assert!(authorize_recovered_destination(&request, network, spend, wrong_view).is_err());
++        assert!(authorize_recovered_destination(&request, XmzNetwork::Testnet, spend, view).is_err());
++    }
+ }

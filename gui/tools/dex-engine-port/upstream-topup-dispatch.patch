@@ -1,0 +1,170 @@
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index 69109d730..81d0366e6 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -13,6 +13,7 @@ pub mod relay;
+ pub mod spendable;
+ pub mod spend_journal;
+ pub mod spend_recovery;
++pub mod topup_dispatch;
+ pub mod topup_journal;
+ pub mod wallet_session;
+ use anyhow::{Context, Result, ensure};
+diff --git a/swap-machine/src/native_funding_rpc/topup_dispatch.rs b/swap-machine/src/native_funding_rpc/topup_dispatch.rs
+new file mode 100644
+index 000000000..d0ab329b9
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/topup_dispatch.rs
+@@ -0,0 +1,41 @@
++//! Orchestrates the buyer's top-up dispatch leg of the delayed-top-up
++//! candidate (see `DEX_BUYER_RESERVE_CANDIDATE.md`): given a confirmed,
++//! address-bound Bitcoin redemption outcome (`topup_journal::authorize_
++//! recovered_destination`, itself fed by `bob::State4::watch_for_redeem_
++//! btc_confirmed`), durably reserve then relay the buyer's own payment to
++//! the recovered swap destination. Mirrors `spendable.rs`'s
++//! journal -> prepare -> record_prepared -> relay_prepared -> record_relay
++//! sequence, but the buyer's wallet is the caller's own already-open
++//! wallet: no restore or lock-transaction import happens here, unlike the
++//! seller-side recovery spend.
++use super::relay::{NativeTransferRelay, RelayRequest, RelayedTransfer};
++use super::topup_journal::{TopUpJournal, TopUpRequest};
++use super::NativeFundingRpc;
++use anyhow::Result;
++use std::path::Path;
++
++pub struct TopUpOutcome {
++    pub transfer: RelayedTransfer,
++    pub receipt_persisted: bool,
++}
++
++/// Caller must have already called `topup_journal::authorize_recovered_
++/// destination` against this exact `request` -- this function does not
++/// re-derive or check the recovered swap key itself, only dispatches the
++/// already-approved payment. Caller also exclusively owns the wallet-rpc
++/// service across this call and that `request.buyer_wallet` is presently
++/// open there; neither is verified beyond `NativeTransferRelay`'s own
++/// preflight wallet-identity check.
++pub async fn dispatch_topup(client: NativeFundingRpc, journal_directory: &Path,
++    expected_genesis: &str, request: TopUpRequest) -> Result<TopUpOutcome> {
++    let journal = TopUpJournal::reserve(journal_directory, expected_genesis, &request)?;
++    let mut relay = NativeTransferRelay::new(client);
++    let transfer_request = RelayRequest { wallet: request.buyer_wallet.clone(),
++        destination: request.destination.clone(), amount: request.reserve,
++        account: request.account, priority: request.priority };
++    let prepared = relay.prepare(transfer_request, expected_genesis, request.maximum_fee).await?;
++    journal.record_prepared(&prepared)?;
++    let transfer = relay.relay_prepared(prepared).await?;
++    let receipt_persisted = journal.record_relay(&transfer).is_ok();
++    Ok(TopUpOutcome { transfer, receipt_persisted })
++}
+diff --git a/swap-machine/src/native_funding_rpc/topup_journal.rs b/swap-machine/src/native_funding_rpc/topup_journal.rs
+index 90d2eb250..18c17f08f 100644
+--- a/swap-machine/src/native_funding_rpc/topup_journal.rs
++++ b/swap-machine/src/native_funding_rpc/topup_journal.rs
+@@ -26,18 +26,6 @@ pub struct TopUpRequest {
+     pub priority: u32,
+ }
+ 
+-pub struct PreparedTopUp {
+-    pub txid: String,
+-    pub fee: XmzAmount,
+-    pub weight: u64,
+-}
+-
+-pub struct RelayedTopUp {
+-    pub txid: String,
+-    pub fee: XmzAmount,
+-    pub weight: u64,
+-}
+-
+ pub struct TopUpJournal {
+     directory: File,
+     receipt: String,
+@@ -72,15 +60,26 @@ impl TopUpJournal {
+ 
+     /// Persist the exact prepared transaction identity before relay. No private
+     /// metadata is stored. If a crash loses that metadata, absence on-chain is
+-    /// not permission to construct a replacement top-up.
++    /// not permission to construct a replacement top-up. Rejects a prepared
++    /// transfer that does not exactly match this journal's approved wallet,
++    /// destination, chain and reserve amount -- a caller cannot journal one
++    /// intent and relay a different transaction under its receipt slot.
+     #[cfg(unix)]
+-    pub fn record_prepared(&self, prepared: &PreparedTopUp) -> Result<()> {
+-        ensure!(hash(&prepared.txid), "invalid prepared top-up hash");
++    pub fn record_prepared(&self, prepared: &super::relay::PreparedTransfer) -> Result<()> {
++        let transfer = prepared.summary();
++        let terms = prepared.journal_terms();
++        ensure!(terms.get("genesis") == self.intent.get("genesis")
++            && terms.get("wallet") == self.intent.get("buyerWallet")
++            && terms.get("destination") == self.intent.get("destination")
++            && terms.get("amountAtoms") == self.intent.get("reserveAtoms")
++            && terms.get("account") == self.intent.get("account")
++            && terms.get("priority") == self.intent.get("priority"),
++            "prepared top-up differs from durable intent");
+         let maximum_fee: u64 = self.intent["maximumFeeAtoms"].as_str()
+             .ok_or_else(|| anyhow::anyhow!("invalid journal fee limit"))?.parse()?;
+-        ensure!(prepared.fee.atoms() <= maximum_fee, "prepared top-up fee exceeds journal approval");
+-        let value = json!({"schema":"monzero-topup-dispatch-prepared-v1", "txid":prepared.txid,
+-            "feeAtoms":prepared.fee.atom_string(), "weight":prepared.weight});
++        ensure!(transfer.fee.atoms() <= maximum_fee, "prepared top-up fee exceeds journal approval");
++        let value = json!({"schema":"monzero-topup-dispatch-prepared-v1", "txid":transfer.txid,
++            "feeAtoms":transfer.fee.atom_string(), "weight":transfer.weight});
+         let name = self.receipt.strip_suffix(".receipt").expect("internal receipt suffix");
+         let mut file = super::spend_journal::create_record(&self.directory, &format!("{name}.prepared"))?;
+         file.write_all(&serde_json::to_vec(&value)?)?;
+@@ -90,14 +89,14 @@ impl TopUpJournal {
+     }
+ 
+     #[cfg(not(unix))]
+-    pub fn record_prepared(&self, _: &PreparedTopUp) -> Result<()> {
++    pub fn record_prepared(&self, _: &super::relay::PreparedTransfer) -> Result<()> {
+         anyhow::bail!("top-up dispatch journal not implemented on this platform")
+     }
+ 
+     /// Receipt failure must never erase a successful broadcast result. Caller
+     /// reports persistence health separately and reconciles the retained intent.
+     #[cfg(unix)]
+-    pub fn record_relay(&self, transfer: &RelayedTopUp) -> Result<()> {
++    pub fn record_relay(&self, transfer: &super::relay::RelayedTransfer) -> Result<()> {
+         ensure!(hash(&transfer.txid), "invalid journal relay hash");
+         let value = json!({"schema":"monzero-topup-dispatch-receipt-v1", "txid":transfer.txid,
+             "feeAtoms":transfer.fee.atom_string(), "weight":transfer.weight});
+@@ -109,7 +108,7 @@ impl TopUpJournal {
+     }
+ 
+     #[cfg(not(unix))]
+-    pub fn record_relay(&self, _: &RelayedTopUp) -> Result<()> {
++    pub fn record_relay(&self, _: &super::relay::RelayedTransfer) -> Result<()> {
+         anyhow::bail!("top-up dispatch journal not implemented on this platform")
+     }
+ }
+@@ -183,7 +182,7 @@ mod tests {
+         assert!(TopUpJournal::reserve(&directory.0, &"a".repeat(64), &request()).is_err());
+         std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))?;
+         let journal = TopUpJournal::reserve(&directory.0, &"a".repeat(64), &request())?;
+-        let transfer = RelayedTopUp { txid: "c".repeat(64), fee: XmzAmount::from_atoms(1), weight: 1 };
++        let transfer = super::super::relay::RelayedTransfer { txid: "c".repeat(64), fee: XmzAmount::from_atoms(1), weight: 1 };
+         journal.record_relay(&transfer)?;
+         assert!(journal.record_relay(&transfer).is_err());
+         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.0.join(&journal.receipt))?)?;
+@@ -191,19 +190,6 @@ mod tests {
+         Ok(())
+     }
+ 
+-    #[test]
+-    fn prepared_fee_must_not_exceed_journal_approval() -> Result<()> {
+-        let directory = PrivateDirectory::new();
+-        let journal = TopUpJournal::reserve(&directory.0, &"a".repeat(64), &request())?;
+-        let over_budget = PreparedTopUp { txid: "c".repeat(64), fee: XmzAmount::from_atoms(3), weight: 1 };
+-        assert!(journal.record_prepared(&over_budget).is_err());
+-        let invalid_hash = PreparedTopUp { txid: "not-a-hash".into(), fee: XmzAmount::from_atoms(1), weight: 1 };
+-        assert!(journal.record_prepared(&invalid_hash).is_err());
+-        let within_budget = PreparedTopUp { txid: "c".repeat(64), fee: XmzAmount::from_atoms(2), weight: 1 };
+-        journal.record_prepared(&within_budget)?;
+-        Ok(())
+-    }
+-
+     #[test]
+     fn buyer_and_seller_journals_for_the_same_lock_do_not_collide() -> Result<()> {
+         // The buyer's top-up dispatch is keyed by the buyer's own wallet, so it

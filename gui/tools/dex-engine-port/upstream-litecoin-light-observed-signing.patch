@@ -1,0 +1,129 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+@@ -0,0 +1,58 @@
++use super::*;
++use crate::litecoin_light::MerkleMatch;
++use bitcoin::{consensus::deserialize,hex::FromHex};
++use std::{fs,path::PathBuf,os::unix::fs::DirBuilderExt};
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("ltc-observed-{}",Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++#[test]
++fn observed_claim_checks_pending_spends_before_retention_and_signing()->Result<()> {
++    // Injected policy inclusion identity, not a Merkle/consensus fixture.
++    let (seed,account,mut spend,prevout)=super::super::super::super::tests::fixture()?;
++    let chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut credit=spend.clone();credit.output=vec![prevout.clone()];
++    let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),
++        block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},&credit)?;
++    spend.input[0].previous_output=OutPoint {txid:included.txid(),vout:0};
++    let payment=spend.output[0].clone();
++    let inputs=[IncludedInput {transaction:&included,vout:0,branch:Branch::Receive,index:3}];
++    let review=||ConfirmedSpendReview::new(&chain,&account,spend.clone(),&inputs,&payment,None,Amount::from_sat(1000),1);
++    let observed=ObservedWallet::reconcile(&chain,&[prevout.script_pubkey.clone()],std::slice::from_ref(&included))?;
++    let spent=ObservedWallet::reconcile_with_pending(&chain,&[prevout.script_pubkey],std::slice::from_ref(&included),&[spend.clone()])?;
++    let directory=Directory::new()?;let operation=Uuid::new_v4();
++    assert!(review()?.retain_observed(&chain,&spent,&directory.0,operation).is_err());
++    assert_eq!(fs::read_dir(&directory.0)?.count(),0);
++    let retained=review()?.retain_observed(&chain,&observed,&directory.0,operation)?;
++    let count=fs::read_dir(&directory.0)?.count();let commitment=retained.signing_commitment();
++    assert!(retained.approve_and_sign_on(&chain,&spent,&seed,commitment).unwrap_err().to_string().contains("observed spent"));
++    assert_eq!(fs::read_dir(&directory.0)?.count(),count);
++    assert_eq!(retained.approve_and_sign_on(&chain,&observed,&seed,commitment)?.input[0].witness.len(),2);
++    assert!(retained.approve_and_sign_on(&chain,&spent,&seed,commitment).is_err());Ok(())
++}
++#[test]
++fn independent_inclusion_can_be_claimed_but_changed_tip_rejects_signing()->Result<()> {
++    use crate::litecoin_light::{InclusionRequest,match_merkle_proof};
++    let fixture:serde_json::Value=serde_json::from_str(include_str!("../../../../../session/wallet/fixture.json"))?;
++    let blocks=fixture["blocks"].as_array().unwrap();let block=&blocks[0];
++    let header=Vec::from_hex(block["header"].as_str().unwrap())?;let raw=Vec::from_hex(block["transaction"].as_str().unwrap())?;
++    let credit:Transaction=deserialize(&raw)?;let mut chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    chain.append(&header,u64::MAX-7200)?;
++    let request=InclusionRequest {id:7,txid:credit.compute_txid(),height:1,block_hash:chain.header(1).unwrap().block_hash()};
++    let proof=match_merkle_proof(&request,&header,&raw,&serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0","id":7,"result":{"block_height":1,"pos":0,"merkle":[]}}))?)?;
++    let included=IncludedTransaction::new(proof,&credit)?;
++    let master=Xpriv::new_master(NetworkKind::Test,&(0u8..16).collect::<Vec<_>>())?;
++    let account=PublicAccount::from_master(&master,LtcNetwork::Regtest,0)?;
++    let spend:Transaction=deserialize(&Vec::from_hex(blocks[1]["transaction"].as_str().unwrap())?)?;
++    let payment=spend.output[0].clone();let inputs=[IncludedInput {transaction:&included,vout:0,branch:Branch::Receive,index:0}];
++    let review=||ConfirmedSpendReview::new(&chain,&account,spend.clone(),&inputs,&payment,None,Amount::from_sat(40000),1);
++    let script=credit.output[0].script_pubkey.clone();
++    let observed=ObservedWallet::reconcile(&chain,&[script.clone()],std::slice::from_ref(&included))?;
++    let stale=ObservedWallet::reconcile(&HeaderSequence::new(LtcNetwork::Regtest)?,&[script],&[])?;
++    let directory=Directory::new()?;
++    assert!(review()?.retain_observed(&chain,&stale,&directory.0,Uuid::new_v4()).is_err());
++    let retained=review()?.retain_observed(&chain,&observed,&directory.0,Uuid::new_v4())?;
++    chain.append(&Vec::from_hex(blocks[1]["header"].as_str().unwrap())?,u64::MAX-7200)?;
++    let wrong_seed=SecretSeed::from_bytes(Zeroizing::new([42;32]));
++    let error=retained.approve_and_sign_on(&chain,&observed,&wrong_seed,retained.signing_commitment()).unwrap_err();
++    assert!(error.to_string().contains("chain changed"));Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+@@ -0,0 +1,52 @@
++//! Same-tip observed-input policy combined with durable claims and signing.
++//! An incomplete or stale server view can omit spends; no freshness or complete
++//! unspentness guarantee, broadcast permission or automatic release is implied.
++use super::*;
++use crate::litecoin_light::accounting::ObservedWallet;
++use super::super::claims::ClaimedSpend;
++use bitcoin::hashes::sha256;
++use std::collections::BTreeMap;
++
++pub struct ObservedClaimedSpend {
++    claimed:ClaimedSpend,
++    network:LtcNetwork,height:u32,tip:BlockHash,
++    inputs:Vec<(OutPoint,Amount)>,
++}
++fn require_observed(chain:&HeaderSequence,observed:&ObservedWallet,network:LtcNetwork,
++    height:u32,tip:BlockHash,inputs:&[(OutPoint,Amount)])->Result<()> {
++    ensure!(chain.network()==network && chain.height()==height && chain.contains(height,tip),
++        "Litecoin chain changed; repeat spend review");
++    ensure!(observed.height()==height && observed.tip()==tip,"Litecoin observation tip differs from spend review");
++    let coins=observed.coins().iter().map(|coin|(coin.outpoint(),coin)).collect::<BTreeMap<_,_>>();
++    for (outpoint,amount) in inputs {
++        let coin=coins.get(outpoint).context("Litecoin reviewed input is absent or observed spent")?;
++        ensure!(coin.amount()==*amount && coin.maturity_satisfied(),"Litecoin reviewed input observation mismatch");
++    }
++    Ok(())
++}
++impl ConfirmedSpendReview {
++    /// Consume the inclusion review and claim its exact inputs only if they
++    /// remain present in the supplied same-tip confirmed/pending observation.
++    pub fn retain_observed(self,chain:&HeaderSequence,observed:&ObservedWallet,
++        directory:&Path,operation:Uuid)->Result<ObservedClaimedSpend> {
++        let inputs=self.review.inputs.iter().map(|input|(input.outpoint,input.prevout.value)).collect::<Vec<_>>();
++        require_observed(chain,observed,self.network,self.height,self.tip,&inputs)?;
++        let claimed=ClaimedSpend::retain(directory,operation,self.review)?;
++        Ok(ObservedClaimedSpend {claimed,network:self.network,height:self.height,tip:self.tip,inputs})
++    }
++}
++impl ObservedClaimedSpend {
++    pub fn transaction(&self)->&Transaction {self.claimed.transaction()}
++    pub fn fee(&self)->Amount {self.claimed.fee()}
++    pub fn signing_commitment(&self)->sha256::Hash {self.claimed.signing_commitment()}
++    /// Require a current caller-supplied observation even on retry. A caller
++    /// must refresh it; equality of tips alone cannot prove wall-clock freshness.
++    /// The lower-level recovery API can inspect previously retained bytes.
++    pub fn approve_and_sign_on(&self,chain:&HeaderSequence,observed:&ObservedWallet,
++        seed:&SecretSeed,expected:sha256::Hash)->Result<Transaction> {
++        require_observed(chain,observed,self.network,self.height,self.tip,&self.inputs)?;
++        self.claimed.approve_and_sign(seed,expected)
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs
+@@ -46,3 +46,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++pub mod claimed;

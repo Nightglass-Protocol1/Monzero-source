@@ -1,0 +1,103 @@
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index 38ad504d0..d4e673061 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -32,6 +32,46 @@ pub struct VerifiedQuote {
+ }
+ 
+ impl VerifiedQuote {
++    /// Decode the GUI reservation schema. Bytes alone do not prove a durable
++    /// reservation or user approval: the driver must validate trusted storage,
++    /// expected quote/swap identity and its single-use ownership separately.
++    /// This fresh-quote entry point must not be used to gate historical recovery.
++    pub fn from_gui_reservation(
++        bytes: &[u8], now: u64, btc_key: &[u8; 32], xmz_key: &[u8; 32],
++        btc_network: Network, xmz_network: XmzNetwork,
++    ) -> Result<Self> {
++        #[derive(serde::Deserialize)]
++        #[serde(deny_unknown_fields, rename_all = "camelCase")]
++        struct Record {
++            schema: String, accepted_at: String, terms: serde_json::Value,
++            btc_signature: String, xmz_signature: String,
++        }
++        ensure!(!bytes.is_empty() && bytes.len() <= 16384, "invalid reservation record size");
++        let value: serde_json::Value = serde_json::from_slice(bytes)?;
++        ensure!(serde_json::to_vec(&value)? == bytes, "noncanonical reservation record");
++        let record: Record = serde_json::from_value(value)?;
++        ensure!(record.schema == "monzero-native-quote-reservation-v1", "wrong reservation schema");
++        let accepted_at: u64 = record.accepted_at.parse()?;
++        ensure!(accepted_at <= i64::MAX as u64 && accepted_at <= now
++            && accepted_at.to_string() == record.accepted_at, "invalid reservation timestamp");
++        let signature = |text: &str| -> Result<[u8; 64]> {
++            ensure!(text.len() == 128 && text.bytes().all(|b| b.is_ascii_digit()
++                || (b'a'..=b'f').contains(&b)), "invalid reservation signature encoding");
++            let mut result = [0; 64];
++            for (i, byte) in result.iter_mut().enumerate() {
++                *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)?;
++            }
++            Ok(result)
++        };
++        let payload = serde_json::to_vec(&record.terms)?;
++        let quote = Self::verify(&payload, accepted_at, btc_key, xmz_key,
++            &signature(&record.btc_signature)?, &signature(&record.xmz_signature)?,
++            btc_network, xmz_network)?;
++        let expiry: u64 = quote.terms["expiresAt"].parse()?;
++        ensure!(expiry > now && expiry - now <= 3600, "reservation quote is no longer fresh");
++        Ok(quote)
++    }
++
+     /// Keys and address networks must be supplied by trusted local configuration.
+     pub fn verify(
+         payload: &[u8], now: u64, btc_key: &[u8; 32], xmz_key: &[u8; 32],
+@@ -184,6 +224,51 @@ mod tests {
+         later["expiresAt"] = "4600".into();
+         assert!(verify(&later, 1000).is_ok());
+     }
++
++    #[test]
++    fn gui_reservation_decoder_rechecks_signed_terms_and_freshness() -> Result<()> {
++        let terms = fixture();
++        let payload = serde_json::to_vec(&terms)?;
++        let btc = SigningKey::from_bytes(&[1; 32]);
++        let xmz = SigningKey::from_bytes(&[2; 32]);
++        let sign = |key: &SigningKey, role: &str| {
++            let domain = format!("monzero-native-btc-xmz-quote-v1-{role}");
++            let mut message = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:", domain.len(), domain, payload.len()).into_bytes();
++            message.extend_from_slice(&payload);
++            key.sign(&message).to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>()
++        };
++        let record = serde_json::json!({"schema":"monzero-native-quote-reservation-v1",
++            "acceptedAt":"1000", "terms":terms,
++            "btcSignature":sign(&btc,"btc-funder"), "xmzSignature":sign(&xmz,"xmz-funder")});
++        let b = btc.verifying_key().to_bytes();
++        let x = xmz.verifying_key().to_bytes();
++        let decode = |value: &serde_json::Value, now| VerifiedQuote::from_gui_reservation(
++            &serde_json::to_vec(value).unwrap(), now, &b, &x, Network::Regtest, XmzNetwork::Mainnet);
++        let decoded = decode(&record, 1001)?;
++        assert_eq!(decoded.commitment(), verify(&fixture(), 1000)?.commitment());
++        assert!(decode(&record, 999).is_err());
++        assert!(decode(&record, 1100).is_err());
++        for timestamp in ["01000", "-1", "1002", "9223372036854775808"] {
++            let mut changed = record.clone(); changed["acceptedAt"] = timestamp.into();
++            assert!(decode(&changed, 1001).is_err());
++        }
++        let mut altered = record.clone(); altered["terms"]["xmzAtoms"] = "1".into();
++        assert!(decode(&altered, 1001).is_err());
++        altered = record.clone(); altered["btcSignature"] = record["xmzSignature"].clone();
++        assert!(decode(&altered, 1001).is_err());
++        altered = record.clone(); altered["extra"] = true.into();
++        assert!(decode(&altered, 1001).is_err());
++        let bytes = serde_json::to_vec(&record)?;
++        assert!(VerifiedQuote::from_gui_reservation(&bytes, 1001, &x, &b,
++            Network::Regtest, XmzNetwork::Mainnet).is_err());
++        let mut duplicate = bytes;
++        duplicate.splice(1..1, b"\"acceptedAt\":\"1000\",".iter().copied());
++        assert!(VerifiedQuote::from_gui_reservation(&duplicate, 1001, &b, &x,
++            Network::Regtest, XmzNetwork::Mainnet).is_err());
++        assert!(VerifiedQuote::from_gui_reservation(&vec![b' ';16385], 1001, &b, &x,
++            Network::Regtest, XmzNetwork::Mainnet).is_err());
++        Ok(())
++    }
+     #[test]
+     fn valid_signatures_do_not_authorize_invalid_terms() {
+         let original = fixture();

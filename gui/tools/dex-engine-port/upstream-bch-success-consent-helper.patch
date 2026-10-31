@@ -1,0 +1,154 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -199,3 +199,5 @@
+ mod observation_helper;
+ 
+ mod success_release_helper;
++
++mod success_identity_fixture;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+@@ -83,10 +83,36 @@
+     let before=contents(&sender_metadata.0)?;let secrets=contents(&snapshots.0)?;
+     assert!(sender.prepare_reviewed_bch_success_release(&observer,bch,5,release_time,&[0;32]).await.is_err());
+     assert_eq!(contents(&sender_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+-    success_release_helper::exercise(setup,sender_metadata,snapshots,pins,base,&deployment,&release.details,&release.commitment,
+-        &json!({"details":saved.review.details,"commitment":hex(&saved.review.commitment)}),&context)?;
++    success_release_helper::exercise(setup,sender_metadata,snapshots,pins,base,&deployment,&release.details,&release.commitment)?;
+     let adaptor=sender.prepare_reviewed_bch_success_release(&observer,bch,5,release_time,&release.commitment).await?;
+-    assert!(!adaptor.is_empty());drop(adaptor);
++    assert!(!adaptor.is_empty());
++    let signature=success_identity_fixture::sign(&adaptor)?;
++    let before=contents(&sender_metadata.0)?;let secrets=contents(&snapshots.0)?;
++    let signing_time=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().max(release_time);
++    let signing=sender.review_bch_success_signature_retention(&deployment,5,signing_time)?;
++    assert_eq!(signing.details["action"],"retain-bch-success-signature");
++    assert_ne!(signing.commitment,release.commitment);
++    assert!(sender.review_signed_bch_success_release(&deployment,5,signing_time).is_err());
++    // Preparation approval cannot authorize identity retention, even with a valid signature.
++    for wrong in [[0;32],release.commitment] {
++        assert!(sender.retain_reviewed_bch_success_signature(&observer,bch,5,signing_time,&adaptor,&signature,&wrong).await.is_err());
++        assert_eq!(contents(&sender_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    }
++    assert!(sender.retain_reviewed_bch_success_signature(&observer,bch,5,signing_time,&adaptor,&[0;64],&signing.commitment).await.is_err());
++    assert_eq!(contents(&sender_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    let signed=sender.retain_reviewed_bch_success_signature(&observer,bch,5,signing_time,&adaptor,&signature,&signing.commitment).await?;
++    assert_eq!(signed.frame(),adaptor.as_slice());assert_eq!(signed.signature(),signature.as_slice());
++    let outgoing=sender.review_signed_bch_success_release(&deployment,5,signing_time)?;
++    assert_eq!(outgoing.details["action"],"release-signed-bch-success");
++    assert_ne!(outgoing.commitment,release.commitment);assert_ne!(outgoing.commitment,signing.commitment);
++    let before=contents(&sender_metadata.0)?;let secrets=contents(&snapshots.0)?;
++    for wrong in [[0;32],release.commitment,signing.commitment] {
++        assert!(sender.recover_reviewed_bch_success_release(&observer,bch,5,signing_time,&wrong).await.is_err());
++        assert_eq!(contents(&sender_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    }
++    let recovered=sender.recover_reviewed_bch_success_release(&observer,bch,5,signing_time,&outgoing.commitment).await?;
++    assert_eq!(recovered.frame(),signed.frame());assert_eq!(recovered.signature(),signed.signature());
++    drop(recovered);drop(signed);drop(adaptor);
+     // Keep the private snapshot directory live through the final observation.
+     assert!(!contents(&snapshots.0)?.is_empty());
+     Ok(())
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs
+@@ -1,7 +1,7 @@
+ //! Public release review via the real helper; neither journal may change.
+ use super::*;
+ pub(super) fn exercise(setup: &Setup,original: &PrivateStore,snapshots: &PrivateStore,
+-    pins: &NegotiationPins,base: u64,deployment: &[u8;32],details: &Value,commitment: &[u8;32],proof_review: &Value,context: &Value) -> Result<()> {
++    pins: &NegotiationPins,base: u64,deployment: &[u8;32],details: &Value,commitment: &[u8;32]) -> Result<()> {
+     let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
+     let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper
+@@ -72,16 +72,10 @@
+     save(&preparation,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-success-preparation-v1",
+         "admissionConfigFile":admission,"deploymentCommitment":hex(deployment),"safetyBlocks":5,
+         "bchRpcFile":bch,"nativeRpcFile":native}))?)?;
+-    let status_program=PathBuf::from(std::env::var("MONZERO_BCH_QT_SUCCESS_STATUS_PROBE")?);
+-    let expected=std::env::var("MONZERO_BCH_QT_SUCCESS_STATUS_PROBE_SHA256")?;
+-    ensure!(status_program.is_absolute() && status_program.canonicalize()?==status_program
+-        && hex(&Sha256::digest(std::fs::read(&status_program)?))==expected,"Qt saved preparation probe changed");
+-    save(&PathBuf::from(format!("{}.public-context.json",preparation.display())),&serde_json::to_vec(context)?)?;
+-    save(&PathBuf::from(format!("{}.public-proof.json",preparation.display())),&serde_json::to_vec(proof_review)?)?;
+     let status=|prepared: bool,success: bool| -> Result<()> {
+         let id=uuid::Uuid::new_v4();
+         let request=json!({"schema":"monzero-bch-success-preparation-status-request-v1","requestId":id});
+-        let mut child=Command::new(&status_program).arg("--success-preparation-status-stdio-v1").arg(&preparation)
++        let mut child=Command::new(&helper).arg("--success-preparation-status-stdio-v1").arg(&preparation)
+             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+         child.stdin.take().context("preparation status stdin")?.write_all(&serde_json::to_vec(&request)?)?;
+         let output=child.wait_with_output()?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs
+@@ -0,0 +1,24 @@
++//! Actual Qt identity-store signer for a disposable controller-produced frame.
++use super::*;
++pub(super) fn sign(frame: &[u8]) -> Result<Vec<u8>> {
++    let program=PathBuf::from(std::env::var("MONZERO_BCH_QT_SUCCESS_IDENTITY_PROBE")?);
++    let expected=std::env::var("MONZERO_BCH_QT_SUCCESS_IDENTITY_PROBE_SHA256")?;
++    ensure!(program.is_absolute() && program.canonicalize()?==program
++        && hex(&Sha256::digest(std::fs::read(&program)?))==expected,"Qt identity probe changed");
++    let config=PathBuf::from(std::env::var("MONZERO_BCH_QT_SUCCESS_IDENTITY_CONFIG")?);
++    ensure!(config.is_absolute() && config.canonicalize()?==config
++        && hex(&Sha256::digest(std::fs::read(&config)?))==std::env::var("MONZERO_BCH_QT_SUCCESS_IDENTITY_CONFIG_SHA256")?,"Qt identity fixture changed");
++    let id=uuid::Uuid::new_v4();
++    let request=json!({"schema":"monzero-bch-success-sign-fixture-request-v1","requestId":id,"frameHex":hex(frame)});
++    let mut child=Command::new(&program).arg("--success-sign-fixture-v1").arg(&config)
++        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++    child.stdin.take().context("identity fixture stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++    let output=child.wait_with_output()?;
++    ensure!(output.status.success() && output.stderr.is_empty() && output.stdout.len()<=512,"Qt identity fixture failed");
++    let response: Value=serde_json::from_slice(&output.stdout)?;
++    ensure!(response.as_object().is_some_and(|v|v.len()==3)
++        && response["schema"]=="monzero-bch-success-sign-fixture-response-v1" && response["requestId"]==id.to_string(),"Qt identity response changed");
++    let signature=response["signatureHex"].as_str().context("identity signature")?;
++    ensure!(signature.len()==128 && signature.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid identity signature");
++    Ok((0..64).map(|i|u8::from_str_radix(&signature[i*2..i*2+2],16)).collect::<std::result::Result<Vec<_>,_>>()?)
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs
+@@ -55,4 +55,39 @@
+         ensure!(review.commitment==*approved,"BCH success release consent changed");
+         self.bch_success_signing_frame(native,bch,safety_blocks,now).await
+     }
++    /// Preparation approval is not approval to retain a signature or send a
++    /// signed release. Each operation has its own public review commitment.
++    pub fn review_bch_success_signature_retention(&self,deployment: &[u8;32],safety_blocks: u32,now: u64)
++        -> Result<SuccessReleaseReview> {
++        let saved=self.saved_bch_success_preparation(deployment,safety_blocks,now)?;
++        ensure!(saved.prepared_at.is_some(),"missing BCH success signing preparation");
++        success_action_review(saved.review,"retain-bch-success-signature")
++    }
++    pub fn review_signed_bch_success_release(&self,deployment: &[u8;32],safety_blocks: u32,now: u64)
++        -> Result<SuccessReleaseReview> {
++        let saved=self.saved_bch_success_preparation(deployment,safety_blocks,now)?;
++        ensure!(saved.signature_retained,"missing signed BCH success release");
++        success_action_review(saved.review,"release-signed-bch-success")
++    }
++    pub async fn retain_reviewed_bch_success_signature(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++        safety_blocks: u32,now: u64,frame: &[u8],signature: &[u8],approved: &[u8;32]) -> Result<SignedSuccess> {
++        let review=self.review_bch_success_signature_retention(&bch.deployment_commitment()?,safety_blocks,now)?;
++        ensure!(review.commitment==*approved,"BCH success signature consent changed");
++        self.retain_bch_success_signature(native,bch,safety_blocks,now,frame,signature).await
++    }
++    /// Every retry still observes both chains; retained state is not permission
++    /// to expose a previously signed adaptor to the peer.
++    pub async fn recover_reviewed_bch_success_release(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++        safety_blocks: u32,now: u64,approved: &[u8;32]) -> Result<SignedSuccess> {
++        let review=self.review_signed_bch_success_release(&bch.deployment_commitment()?,safety_blocks,now)?;
++        ensure!(review.commitment==*approved,"signed BCH success release consent changed");
++        self.recover_bch_success_release(native,bch,safety_blocks,now).await
++    }
++
+ }
++
++fn success_action_review(mut review: SuccessReleaseReview,action: &str) -> Result<SuccessReleaseReview> {
++    review.details["action"]=json!(action);
++    review.commitment=hash(REVIEW,&serde_json::to_vec(&review.details)?);
++    Ok(review)
++}

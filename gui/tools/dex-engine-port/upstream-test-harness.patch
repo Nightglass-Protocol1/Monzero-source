@@ -1,0 +1,54 @@
+diff --git a/bitcoin-wallet/src/wallet.rs b/bitcoin-wallet/src/wallet.rs
+index 910e5f0..4949ef7 100644
+--- a/bitcoin-wallet/src/wallet.rs
++++ b/bitcoin-wallet/src/wallet.rs
+@@ -3019,7 +3019,7 @@ impl BitcoinWallet for Wallet<Connection, StaticFeeRate> {
+     }
+ 
+     async fn new_address(&self) -> Result<Address> {
+-        unimplemented!("stub method called erroneously")
++        Wallet::new_address(self).await
+     }
+ 
+     async fn send_to_address(
+@@ -3029,7 +3029,7 @@ impl BitcoinWallet for Wallet<Connection, StaticFeeRate> {
+         spending_fee: Amount,
+         change_override: Option<Address>,
+     ) -> Result<Psbt> {
+-        unimplemented!("stub method called erroneously")
++        Wallet::send_to_address(self, address, amount, spending_fee, change_override).await
+     }
+ 
+     async fn send_to_address_dynamic_fee(
+@@ -3046,7 +3046,7 @@ impl BitcoinWallet for Wallet<Connection, StaticFeeRate> {
+     }
+ 
+     async fn sign_and_finalize(&self, psbt: Psbt) -> Result<bitcoin::Transaction> {
+-        unimplemented!("stub method called erroneously")
++        Wallet::sign_and_finalize(self, psbt).await
+     }
+ 
+     async fn sync(&self) -> Result<()> {
+@@ -3085,7 +3085,7 @@ impl BitcoinWallet for Wallet<Connection, StaticFeeRate> {
+     }
+ 
+     fn network(&self) -> Network {
+-        unimplemented!("stub method called erroneously")
++        Wallet::network(self)
+     }
+ 
+     fn finality_confirmations(&self) -> u32 {
+diff --git a/swap-core/src/monero/primitives.rs b/swap-core/src/monero/primitives.rs
+index 90d97c1..478872c 100644
+--- a/swap-core/src/monero/primitives.rs
++++ b/swap-core/src/monero/primitives.rs
+@@ -507,7 +507,7 @@ mod tests {
+         let overflow_pics = "18446744.073709551616";
+         let error = Amount::parse_monero(overflow_pics).unwrap_err();
+         assert_eq!(
+-            error.downcast_ref::<OverflowError>().unwrap(),
+-            &OverflowError(overflow_pics.to_owned())
++            error.to_string(),
++            format!("{} too big", overflow_pics)
+         );
+     }

@@ -1,0 +1,33 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -20,6 +20,20 @@
+     let helper_digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper
+         && hex(&Sha256::digest(std::fs::read(&helper)?))==helper_digest,"invalid helper pin");
++    // The app adapter and real helper are independently pinned. The private
++    // configuration still names the Rust helper that the Qt job must validate.
++    let program=match (std::env::var_os("MONZERO_BCH_QT_FUNDING_PROBE"),
++        std::env::var_os("MONZERO_BCH_QT_FUNDING_PROBE_SHA256")) {
++        (None,None)=>helper.clone(),
++        (Some(path),Some(expected))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && expected.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),
++                "invalid Qt funding probe pin");
++            path
++        }
++        _=>anyhow::bail!("incomplete Qt funding probe configuration"),
++    };
+     let clock=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+     let base=clock.checked_sub(60).context("invalid fixture clock")?;
+     let network = BchNetwork::Regtest {checkpoint_height:1,checkpoint:BlockHash::from_byte_array([7;32])};
+@@ -103,7 +117,7 @@
+     let invoke=|success: bool| -> Result<Value> {
+         let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
+         let id=uuid::Uuid::new_v4();
+-        let mut child=Command::new(&helper).arg("--funding-review-stdio-v1").arg(&funding_path)
++        let mut child=Command::new(&program).arg("--funding-review-stdio-v1").arg(&funding_path)
+             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+         child.stdin.take().context("missing stdin")?.write_all(&serde_json::to_vec(&json!({
+             "schema":"monzero-bch-funding-review-request-v1","requestId":id}))?)?;

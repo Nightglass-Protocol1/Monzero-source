@@ -10,7 +10,7 @@ class PrivateQuoteServer final : public QTcpServer
     Q_OBJECT
 public:
     PrivateQuoteServer(QSslConfiguration configuration, QByteArray peerPin,
-                       QObject *parent = nullptr);
+                       QObject *parent = nullptr, PrivateQuoteChannel::Profile profile = PrivateQuoteChannel::Profile::Quotes);
     ~PrivateQuoteServer() override;
     bool start(const QHostAddress &address, quint16 port);
     void stop();
@@ -19,6 +19,7 @@ signals:
     void authenticated(PrivateQuoteChannel *channel);
 private:
     void incomingConnection(qintptr descriptor) override;
+    PrivateQuoteChannel::Profile m_profile;
     QSslConfiguration m_configuration;
     QByteArray m_pin;
     QSet<PrivateQuoteChannel *> m_peers;

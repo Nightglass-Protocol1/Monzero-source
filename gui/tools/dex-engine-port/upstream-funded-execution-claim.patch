@@ -1,0 +1,48 @@
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 7a59f53be..cd3eef05e 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -399,19 +399,23 @@ async fn settlement(refund: bool) -> Result<()> {
+     (alice3,bob2)
+     };
+     #[cfg(unix)]
+-    if let Some(owner) = &quote_owner {
++    let _execution_claim = if let Some(owner) = &quote_owner {
+         let quote=quote_fixture::read(owner.context(),swap_id)?;
+         bob2.check_native_quote(&quote,&quote_fixture::policy(),quote_fixture::now()?)?;
+         alice3.check_quote(owner.context())?;
+         let mut wrong=owner.context().clone(); wrong["commitment"]="0".repeat(64).into();
+         anyhow::ensure!(quote_fixture::read(&wrong,swap_id).is_err(),"accepted wrong fixture commitment");
++        let claim=owner.claim_execution(swap_id)?;
++        anyhow::ensure!(claim.quote().commitment()==quote.commitment(),"execution claim quote changed");
++        anyhow::ensure!(owner.claim_execution(swap_id).is_err(),"duplicate execution attempt accepted before funding");
+         let marker=serde_json::to_string(&serde_json::json!({
+             "commitment":owner.context()["commitment"],"swapId":swap_id.to_string(),
+             "associationFingerprint":alice3.association().context("missing negotiated quote association")?.fingerprint()?,
+             "xmzPayout":quote.destinations().xmz_payout.to_string(),
+             "xmzRefund":quote.destinations().xmz_refund.to_string()}))?;
+         anyhow::ensure!(export_fixture("MONZERO_TEST_QUOTE_CHECKED",&marker)?,"missing quote check marker path");
+-    }
++        Some(claim)
++    } else { None };
+     let (bob3, lock) = bob2.lock_btc().await?;
+     let lock_id = lock.txid();
+     let lock_tx = bob_wallet.sign_and_finalize(lock.into()).await?;
+diff --git a/swap-machine/tests/quote_fixture.rs b/swap-machine/tests/quote_fixture.rs
+index f72017b34..16125f1a4 100644
+--- a/swap-machine/tests/quote_fixture.rs
++++ b/swap-machine/tests/quote_fixture.rs
+@@ -143,6 +143,13 @@ impl Drop for QuoteFixture {
+     fn drop(&mut self) { let _=std::fs::remove_dir_all(&self.directory); }
+ }
+ impl QuoteFixture {
++    /// Fixture-only explicit start consent. Not inferred production GUI approval.
++    pub fn claim_execution(&self, swap: Uuid) -> Result<swap_machine::native_execution_claim::ExecutionClaim> {
++        let quote=read(&self.context,swap)?;
++        let commitment=*quote.commitment();
++        swap_machine::native_execution_claim::ExecutionClaim::reserve(
++            &self.directory,quote,&policy(),&commitment,now()?)
++    }
+     pub fn create(driver: std::ffi::OsString, swap_id: Uuid, btc: u64, xmz: u64,
+         payout: &bitcoin::Address, refund: &bitcoin::Address) -> Result<Self> {
+         let directory=std::env::temp_dir().canonicalize()?.join(format!("xmz-funded-quote-{}",Uuid::new_v4()));

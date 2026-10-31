@@ -1,0 +1,95 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing.rs b/swap-machine/src/litecoin_light/vault/signing.rs
+--- a/swap-machine/src/litecoin_light/vault/signing.rs
++++ b/swap-machine/src/litecoin_light/vault/signing.rs
+@@ -25,6 +25,15 @@
+     /// The same caller obligations as `sign_p2wpkh_input` apply.
+     pub fn sign_owned_input(&self,account:&PublicAccount,branch:Branch,index:u32,
+         transaction:&Transaction,input:usize,prevout:&TxOut)->Result<(bitcoin::secp256k1::ecdsa::Signature,bitcoin::CompressedPublicKey)> {
++        sign_seed(&*self.0,account,branch,index,transaction,input,prevout)
++    }
++}
++
++/// Shared by legacy 32-byte raw seeds and full 64-byte BIP39-derived seeds.
++/// This is private to the vault implementation, not a caller-supplied seed API.
++pub(super) fn sign_seed(seed:&[u8],account:&PublicAccount,branch:Branch,index:u32,
++    transaction:&Transaction,input:usize,prevout:&TxOut)->Result<(bitcoin::secp256k1::ecdsa::Signature,bitcoin::CompressedPublicKey)> {
++        ensure!(seed.len()==32 || seed.len()==64,"unsupported signing seed length");
+         ensure!(!transaction.input.is_empty() && transaction.input.len()<=1000
+             && !transaction.output.is_empty() && transaction.output.len()<=1000,
+             "invalid Litecoin signing transaction size");
+@@ -34,7 +43,10 @@
+         ensure!(target.witness.is_empty(),"Litecoin input already has a witness");
+         let mut seen=std::collections::HashSet::new();
+         ensure!(transaction.input.iter().all(|i|seen.insert(i.previous_output)),"duplicate Litecoin signing input");
+-        let actual=self.public_account(account.network(),account.account_index())?;
++        let mut master=Xpriv::new_master(account.network().network_kind(),seed)?;
++        let actual=PublicAccount::from_master(&master,account.network(),account.account_index());
++        master.private_key.non_secure_erase();master.chain_code=[0u8;32].into();
++        let actual=actual?;
+         ensure!(serde_json::to_vec(&actual.descriptor())?==serde_json::to_vec(&account.descriptor())?,
+             "Litecoin signing seed does not match account");
+         let address=account.derive(branch,index)?;
+@@ -42,7 +54,7 @@
+             "Litecoin signing prevout does not match derived address");
+         let sighash=crate::litecoin_light::script::signature_hash(account.network().script_kind(),transaction,input,prevout)?;
+         let secp=Secp256k1::new();
+-        let mut root=Xpriv::new_master(account.network().network_kind(),&*self.0)?;
++        let mut root=Xpriv::new_master(account.network().network_kind(),seed)?;
+         let child=root.derive_priv(&secp,address.path());
+         root.private_key.non_secure_erase();root.chain_code=[0u8;32].into();
+         let mut child=child?;
+@@ -50,7 +62,6 @@
+         child.private_key.non_secure_erase();child.chain_code=[0u8;32].into();
+         secp.verify_ecdsa(&Message::from_digest(sighash),&signature,&address.public_key().0)?;
+         Ok((signature,address.public_key()))
+-    }
+ }
+ #[cfg(test)]
+ mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+--- a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+@@ -21,6 +21,15 @@
+     passphrase: Zeroizing<String>,
+ }
+ impl UnlockedMnemonic {
++    /// Sign using the same ownership and transaction checks as legacy wallets.
++    /// Unlocking alone does not approve spending; callers must still enforce
++    /// reviewed payment, fee, reservation and broadcast policy.
++    pub fn sign_owned_input(&self,account:&PublicAccount,branch:crate::litecoin_light::account::Branch,index:u32,
++        transaction:&bitcoin::Transaction,input:usize,prevout:&bitcoin::TxOut)
++        ->Result<(bitcoin::secp256k1::ecdsa::Signature,bitcoin::CompressedPublicKey)> {
++        let seed=self.material.derive_seed(&self.passphrase)?;
++        super::super::signing::sign_seed(&*seed,account,branch,index,transaction,input,prevout)
++    }
+     pub fn material(&self) -> &MnemonicMaterial { &self.material }
+     pub fn passphrase(&self) -> &str { &self.passphrase }
+     pub fn public_account(&self, network: impl Into<LightNetwork>, index: u32) -> Result<PublicAccount> {
+@@ -113,6 +122,27 @@
+         let expected=material.public_account(network,0,"test passphrase")?;
+         let unlocked=vault.unlock(password)?;
+         assert_eq!(serde_json::to_vec(&expected.descriptor())?,serde_json::to_vec(&unlocked.public_account(network,0)?.descriptor())?);
++        // Exercise the unlocked mnemonic through the shared signer on each chain.
++        use crate::litecoin_light::account::Branch;
++        use bitcoin::{absolute,transaction,Amount,TxOut,TxIn,OutPoint,Txid,ScriptBuf,Sequence,Witness,hashes::Hash};
++        let owned=expected.derive(Branch::Receive,3)?;
++        let prevout=TxOut {value:Amount::from_sat(100000),script_pubkey:owned.address().script_pubkey().clone()};
++        let tx=bitcoin::Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
++            input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([1;32]),vout:0},
++                script_sig:ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++            output:vec![TxOut {value:Amount::from_sat(99000),script_pubkey:expected.derive(Branch::Change,0)?.address().script_pubkey().clone()}]};
++        let (signature,key)=unlocked.sign_owned_input(&expected,Branch::Receive,3,&tx,0,&prevout)?;
++        let verify=|candidate:&bitcoin::Transaction|->Result<bool> {
++            let digest=crate::litecoin_light::script::signature_hash(network.script_kind(),candidate,0,&prevout)?;
++            Ok(bitcoin::secp256k1::Secp256k1::verification_only().verify_ecdsa(
++                &bitcoin::secp256k1::Message::from_digest(digest),&signature,&key.0).is_ok())
++        };
++        assert!(verify(&tx)?);
++        let mut changed=tx.clone();changed.output[0].value=Amount::from_sat(98000);assert!(!verify(&changed)?);
++        let wrong=material.public_account(network,0,"wrong passphrase")?;
++        assert!(unlocked.sign_owned_input(&wrong,Branch::Receive,3,&tx,0,&prevout).is_err());
++        assert!(unlocked.sign_owned_input(&expected,Branch::Change,3,&tx,0,&prevout).is_err());
++        assert!(unlocked.sign_owned_input(&expected,Branch::Receive,3,&tx,1,&prevout).is_err());
+         assert_eq!(&*unlocked.material().reveal(),&*material.reveal());assert_eq!(unlocked.passphrase(),"test passphrase");
+         assert!(vault.unlock(b"wrong").is_err());
+         let ciphertext=std::fs::read(temp.0.join(RECORD))?;

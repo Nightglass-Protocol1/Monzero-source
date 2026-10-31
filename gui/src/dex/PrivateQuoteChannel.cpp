@@ -3,16 +3,19 @@
 #include <QPointer>
 #include <QSslKey>
 
-namespace { constexpr int maximumMessage = 98304; }
+namespace { int limit(PrivateQuoteChannel::Profile profile) {
+    return profile==PrivateQuoteChannel::Profile::Quotes?98304:
+        profile==PrivateQuoteChannel::Profile::LitecoinNegotiation?410000:0;
+} }
 
 PrivateQuoteChannel::PrivateQuoteChannel(QSslConfiguration configuration,
-    QByteArray peerPin, QObject *parent)
-    : QObject(parent), m_pin(std::move(peerPin))
+    QByteArray peerPin, QObject *parent, Profile profile)
+    : QObject(parent), m_profile(profile), m_maximumMessage(limit(profile)), m_pin(std::move(peerPin))
 {
     configuration.setProtocol(QSsl::TlsV1_2OrLater);
     configuration.setPeerVerifyMode(QSslSocket::VerifyPeer);
     m_socket.setSslConfiguration(configuration);
-    m_socket.setReadBufferSize(maximumMessage + 4);
+    m_socket.setReadBufferSize(m_maximumMessage + 4);
     m_deadline.setSingleShot(true);
     m_deadline.setInterval(10000);
     connect(&m_deadline, &QTimer::timeout, this, &PrivateQuoteChannel::reject);
@@ -41,7 +44,7 @@ PrivateQuoteChannel::PrivateQuoteChannel(QSslConfiguration configuration,
 
 bool PrivateQuoteChannel::connectToPeer(const QString &host, quint16 port, const QString &peerName)
 {
-    if (m_failed || m_ready || m_socket.state() != QAbstractSocket::UnconnectedState
+    if (!m_maximumMessage || m_failed || m_ready || m_socket.state() != QAbstractSocket::UnconnectedState
         || host.isEmpty() || !port || peerName.isEmpty() || m_pin.size() != 32
         || m_pin == QByteArray(32, '\0') || !QSslSocket::supportsSsl()) return false;
     m_deadline.start();
@@ -49,8 +52,9 @@ bool PrivateQuoteChannel::connectToPeer(const QString &host, quint16 port, const
     return true;
 }
 
-bool PrivateQuoteChannel::hasWriteCapacity(qint64 plaintextBytes, qint64 encryptedBytes, int messageBytes)
+bool PrivateQuoteChannel::hasWriteCapacity(qint64 plaintextBytes, qint64 encryptedBytes, int messageBytes, Profile profile)
 {
+    const int maximumMessage=limit(profile);
     if (plaintextBytes < 0 || encryptedBytes < 0 || messageBytes < 1
         || messageBytes > maximumMessage) return false;
     const qint64 available = 2 * maximumMessage - messageBytes - 4;
@@ -61,7 +65,7 @@ bool PrivateQuoteChannel::hasWriteCapacity(qint64 plaintextBytes, qint64 encrypt
 bool PrivateQuoteChannel::send(const QByteArray &message)
 {
     if (!ready() || !m_socket.isEncrypted()
-        || !hasWriteCapacity(m_socket.bytesToWrite(), m_socket.encryptedBytesToWrite(), message.size())) return false;
+        || !hasWriteCapacity(m_socket.bytesToWrite(), m_socket.encryptedBytesToWrite(), message.size(), m_profile)) return false;
     QByteArray frame;
     for (int shift = 24; shift >= 0; shift -= 8) frame.append(char((quint32(message.size()) >> shift) & 255));
     frame += message;
@@ -71,7 +75,7 @@ bool PrivateQuoteChannel::send(const QByteArray &message)
 
 bool PrivateQuoteChannel::acceptPeer(qintptr socketDescriptor)
 {
-    if (m_failed || m_ready || m_socket.state() != QAbstractSocket::UnconnectedState
+    if (!m_maximumMessage || m_failed || m_ready || m_socket.state() != QAbstractSocket::UnconnectedState
         || m_pin.size() != 32 || m_pin == QByteArray(32, '\0') || !QSslSocket::supportsSsl()
         || m_socket.localCertificate().isNull() || m_socket.privateKey().isNull()) return false;
     if (!m_socket.setSocketDescriptor(socketDescriptor)) return false;
@@ -107,7 +111,7 @@ void PrivateQuoteChannel::read()
         if (m_pending.size() >= 4) {
             quint32 length = 0;
             for (int i = 0; i < 4; ++i) length = (length << 8) | static_cast<unsigned char>(m_pending.at(i));
-            if (!length || length > maximumMessage) { reject(); return; }
+            if (!length || length > quint32(m_maximumMessage)) { reject(); return; }
             target += int(length);
         }
         m_pending += m_socket.read(target - m_pending.size());
@@ -115,7 +119,7 @@ void PrivateQuoteChannel::read()
         if (target == 4) {
             quint32 length = 0;
             for (char byte : m_pending) length = (length << 8) | static_cast<unsigned char>(byte);
-            if (!length || length > maximumMessage) { reject(); return; }
+            if (!length || length > quint32(m_maximumMessage)) { reject(); return; }
             continue;
         }
         const auto message = m_pending.mid(4);

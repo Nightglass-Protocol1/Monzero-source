@@ -1,0 +1,73 @@
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index 0de6555e2..c7e9da045 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -253,4 +253,68 @@ mod tests {
+         larger.maximum_xmz_native_fee += 1;
+         quote.check_deployment(&larger, 1000).unwrap();
+     }
++
++    /// Real cryptographic negotiation using in-memory Bitcoin wallets only.
++    /// No transaction broadcast, native funding proof, or public peer transport.
++    #[tokio::test]
++    async fn signed_quote_drives_engine_negotiation() -> Result<()> {
++        use bitcoin_wallet::TestWalletBuilder;
++        use rand::rngs::OsRng;
++        use swap_core::bitcoin::{CancelTimelock, PunishTimelock, RemainingRefundTimelock};
++        use swap_env::env::{GetConfig, Regtest};
++        let bob_wallet = TestWalletBuilder::new(1_000_000).build().await;
++        let alice_wallet = TestWalletBuilder::new(1_000_000).build().await;
++        let mut proposed = fixture();
++        proposed["btcPayout"] = alice_wallet.new_address().await?.to_string().into();
++        proposed["btcRefund"] = bob_wallet.new_address().await?.to_string().into();
++        // Deliberately differ from the existing settlement fixture's constants.
++        proposed["btcSatoshis"] = "450000".into();
++        proposed["xmzAtoms"] = "150000000000".into();
++        let alice_quote = verify(&proposed, 1000)?;
++        let bob_quote = verify(&proposed, 1000)?;
++        let policy = DeploymentPolicy {
++            btc_genesis: "a".repeat(64), xmz_genesis: "b".repeat(64),
++            btc_network: "btc-regtest".into(), xmz_network: "xmz-fakechain".into(),
++            btc_confirmations: 1, xmz_confirmations: 1, cancel_blocks: 10, punish_blocks: 20,
++            maximum_btc_principal: 500000, maximum_xmz_principal: 200000000000,
++            maximum_btc_native_fee: 10000, maximum_xmz_native_fee: 1000000000,
++        };
++        alice_quote.check_deployment(&policy, 1000)?;
++        bob_quote.check_deployment(&policy, 1000)?;
++        assert_eq!(alice_quote.commitment(), bob_quote.commitment());
++        let mut config = Regtest::get_config();
++        config.bitcoin_cancel_timelock = policy.cancel_blocks;
++        config.bitcoin_punish_timelock = policy.punish_blocks;
++        config.bitcoin_finality_confirmations = policy.btc_confirmations;
++        config.monero_finality_confirmations = u64::from(policy.xmz_confirmations);
++        let fee = bitcoin::Amount::from_sat(1000);
++        // Explicit fixture-only choices for engine options not covered by v1.
++        // Production must bind these before treating a quote as funding authority.
++        let punish_address = alice_wallet.new_address().await?;
++        let alice0 = crate::alice::State0::new(
++            bitcoin::Amount::from_sat(alice_quote.terms()["btcSatoshis"].parse()?),
++            swap_core::monero::primitives::Amount::from_pico(alice_quote.terms()["xmzAtoms"].parse()?),
++            bitcoin::Amount::ZERO, config, alice_quote.destinations().btc_payout.clone(),
++            punish_address, fee, fee, fee, false, &mut OsRng,
++        );
++        let id: uuid::Uuid = bob_quote.terms()["swapId"].parse()?;
++        let bob0 = crate::bob::State0::new(id, &mut OsRng,
++            bitcoin::Amount::from_sat(bob_quote.terms()["btcSatoshis"].parse()?),
++            swap_core::monero::primitives::Amount::from_pico(bob_quote.terms()["xmzAtoms"].parse()?),
++            CancelTimelock::new(policy.cancel_blocks), PunishTimelock::new(policy.punish_blocks),
++            RemainingRefundTimelock::new(config.bitcoin_remaining_refund_timelock),
++            bob_quote.destinations().btc_refund.clone(), u64::from(policy.xmz_confirmations),
++            fee, fee, fee, fee, fee, fee);
++        let (received_id, alice1) = alice0.receive(bob0.next_message()?)?;
++        assert_eq!(received_id, id);
++        let bob1 = bob0.receive(&bob_wallet, alice1.next_message()?).await?;
++        let alice2 = alice1.receive(bob1.next_message())?;
++        let bob2 = bob1.receive(alice2.next_message()?)?;
++        let alice3 = alice2.receive(bob2.next_message()?)?;
++        let (bob3, lock) = bob2.lock_btc().await?;
++        assert_eq!(alice3.lock_xmr_transfer_request().amount.as_pico(), 150000000000);
++        assert_eq!(bob3.xmr_amount().as_pico(), 150000000000);
++        assert_eq!(lock.lock_amount().to_sat(), 450000);
++        Ok(())
++    }
+ }

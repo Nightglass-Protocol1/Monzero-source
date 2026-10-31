@@ -1,0 +1,159 @@
+diff --git a/swap-machine/src/native_execution_claim/checkpoint.rs b/swap-machine/src/native_execution_claim/checkpoint.rs
+index 0962f4718..b7b37493c 100644
+--- a/swap-machine/src/native_execution_claim/checkpoint.rs
++++ b/swap-machine/src/native_execution_claim/checkpoint.rs
+@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
+ use zeroize::Zeroizing;
+ 
+ const DOMAIN: &[u8] = b"monzero-native-bob-pending-checkpoint-v1\0";
++const LOCK_DOMAIN: &[u8] = b"monzero-native-bob-bitcoin-lock-v1\0";
+ const MAX_BYTES: usize = 1_048_576 + DOMAIN.len() + 32;
+ const PIN_DOMAIN: &[u8] = b"monzero-pending-pin-v1\0";
+ 
+@@ -116,6 +117,21 @@ impl PreparedCheckpoint<'_> {
+ }
+ 
+ impl ExecutionClaim {
++    /// Preserve negotiated Bob recovery state BEFORE signing/broadcasting the
++    /// Bitcoin lock. Does not save a signed transaction or authorize broadcast.
++    #[cfg(target_os = "linux")]
++    pub fn prepare_bitcoin_lock(&self, state: &crate::bob::State3) -> Result<PreparedCheckpoint<'_>> {
++        let quote=self.checkpoint_quote.as_ref().context("legacy claim cannot store a guarded checkpoint")?;
++        state.check_recorded_quote(quote)?;
++        let encoded=Zeroizing::new(serde_json::to_vec(state)?);
++        self.prepare_record(LOCK_DOMAIN,format!("{}.bitcoin-lock",filename(quote)?),encoded)
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub fn prepare_bitcoin_lock(&self, _: &crate::bob::State3) -> Result<PreparedCheckpoint<'_>> {
++        anyhow::bail!("Bitcoin lock checkpoint storage is not implemented on this platform")
++    }
++
+     /// Validate and encode without filesystem writes, exposing the digest
+     /// before persistence so a coordinator can retain trusted metadata first.
+     /// Dropping this value does not save any recovery state.
+@@ -124,13 +140,19 @@ impl ExecutionClaim {
+         let quote=self.checkpoint_quote.as_ref().context("legacy claim cannot store a guarded checkpoint")?;
+         pending.check_recorded_quote(quote)?;
+         let encoded=Zeroizing::new(pending.encode()?);
+-        let mut bytes=Zeroizing::new(Vec::with_capacity(DOMAIN.len()+32+encoded.len()));
+-        bytes.extend_from_slice(DOMAIN);
++        self.prepare_record(DOMAIN,filename(quote)?,encoded)
++    }
++
++    #[cfg(target_os = "linux")]
++    fn prepare_record(&self, domain: &[u8], name: String, encoded: Zeroizing<Vec<u8>>) -> Result<PreparedCheckpoint<'_>> {
++        let quote=self.checkpoint_quote.as_ref().context("missing checkpoint quote")?;
++        let mut bytes=Zeroizing::new(Vec::with_capacity(domain.len()+32+encoded.len()));
++        bytes.extend_from_slice(domain);
+         bytes.extend_from_slice(quote.commitment());
+         bytes.extend_from_slice(&encoded);
+         ensure!(bytes.len()<=MAX_BYTES,"invalid checkpoint size");
+         let digest=Sha256::digest(bytes.as_slice()).into();
+-        Ok(PreparedCheckpoint {claim:self,name:filename(quote)?,bytes,digest})
++        Ok(PreparedCheckpoint {claim:self,name,bytes,digest})
+     }
+ 
+     #[cfg(not(target_os = "linux"))]
+@@ -156,6 +178,33 @@ impl ExecutionClaim {
+ }
+ 
+ impl RecoveryLease {
++    /// Historical pre-lock recovery data only. This does NOT prove whether the
++    /// lock was signed, broadcast, mined or spent, and permits no funding retry.
++    /// Caller must reconcile the exact transaction with the expected chain.
++    #[cfg(target_os = "linux")]
++    pub fn load_bitcoin_lock(&self, store: &CheckpointPinStore, expected_lock: bitcoin::Txid)
++        -> Result<crate::bob::State3> {
++        store.separate_from(&self.directory)?;
++        let quote=self.record.quote();
++        let name=format!("{}.bitcoin-lock",filename(quote)?);
++        let pin_bytes=read_private(&store.directory,&format!("{name}.pin"))?;
++        let pin=decode_pin(&pin_bytes,quote.terms()["swapId"].parse()?,quote.commitment())?;
++        let bytes=read_pinned(&self.directory,&name,&pin)?;
++        ensure!(bytes.len()>LOCK_DOMAIN.len()+32 && bytes.starts_with(LOCK_DOMAIN)
++            && &bytes[LOCK_DOMAIN.len()..LOCK_DOMAIN.len()+32]==quote.commitment(),
++            "Bitcoin lock checkpoint envelope mismatch");
++        let state:crate::bob::State3=serde_json::from_slice(&bytes[LOCK_DOMAIN.len()+32..])
++            .map_err(|_|anyhow::anyhow!("invalid Bitcoin lock checkpoint"))?;
++        ensure!(state.tx_lock.txid()==expected_lock,"Bitcoin lock checkpoint transaction mismatch");
++        state.check_recorded_quote(quote)?;
++        Ok(state)
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub fn load_bitcoin_lock(&self, _: &CheckpointPinStore, _: bitcoin::Txid) -> Result<crate::bob::State3> {
++        anyhow::bail!("Bitcoin lock checkpoint recovery is not implemented on this platform")
++    }
++
+     /// Load from an explicitly trusted pin store, then verify the entire secret
+     /// checkpoint. Missing/torn records are errors, never permission to retry.
+     /// Historical quote context and fresh chain reconciliation remain required.
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 838d0ed95..877eba048 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -445,6 +445,19 @@ async fn settlement(refund: bool) -> Result<()> {
+     let mut checkpoint_pin = None;
+     let (bob3, lock) = bob2.lock_btc().await?;
+     let lock_id = lock.txid();
++    #[cfg(unix)]
++    if let Some(claim)=execution_claim.as_ref() {
++        use std::os::unix::fs::DirBuilderExt;
++        use swap_machine::native_execution_claim::checkpoint::CheckpointPinStore;
++        let pin_directory=std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RECOVERY_EXPORT")
++            .context("missing fixture recovery export")?).with_extension("pins");
++        std::fs::DirBuilder::new().mode(0o700).create(&pin_directory)?;
++        std::fs::File::open(pin_directory.parent().context("missing pin parent")?)?.sync_all()?;
++        let store=CheckpointPinStore::open(&pin_directory)?;
++        claim.prepare_bitcoin_lock(&bob3)?.persist_with_pin_store(&store)?;
++        anyhow::ensure!(claim.prepare_bitcoin_lock(&bob3)?.persist_with_pin_store(&store).is_err(),
++            "pre-lock checkpoint was overwritten");
++    }
+     let lock_tx = bob_wallet.sign_and_finalize(lock.into()).await?;
+     broadcast_confirm(&env, lock_tx).await?;
+     let request = alice3.lock_xmr_transfer_request();
+@@ -548,12 +561,8 @@ async fn settlement(refund: bool) -> Result<()> {
+             anyhow::ensure!(!stored.exists(),"dropping preparation wrote a checkpoint");
+             let prepared=claim.prepare_pending(&pending)?;
+             anyhow::ensure!(*prepared.digest()==pin,"checkpoint preparation changed content");
+-            use std::os::unix::fs::DirBuilderExt;
+             use swap_machine::native_execution_claim::checkpoint::CheckpointPinStore;
+             let pin_directory=checkpoint_path.with_extension("pins");
+-            std::fs::DirBuilder::new().mode(0o700).create(&pin_directory)?;
+-            // Persist the new directory entry before relying on this root.
+-            std::fs::File::open(pin_directory.parent().context("missing pin parent")?)?.sync_all()?;
+             let store=CheckpointPinStore::open(&pin_directory)?;
+             checkpoint_pin=Some(pin);
+             anyhow::ensure!(prepared.persist_with_pin_store(&store)?==pin,"persisted checkpoint digest changed");
+@@ -620,7 +629,14 @@ async fn settlement(refund: bool) -> Result<()> {
+         let mut cancellation = bob4.cancel();
+         #[cfg(unix)]
+         if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
+-            cancellation = load_pending_fixture(swap_id, lock_id,_recovery_owner.as_ref(),checkpoint_pin.as_ref())?.prepare_cancellation();
++            cancellation = if let Some(owner)=_recovery_owner.as_ref() {
++                let directory=std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RECOVERY_EXPORT")
++                    .context("missing recovery export")?).with_extension("pins");
++                let store=swap_machine::native_execution_claim::checkpoint::CheckpointPinStore::open(&directory)?;
++                owner.load_bitcoin_lock(&store,lock_id)?.cancel(swap_core::monero::BlockHeight {height:0})
++            } else {
++                load_pending_fixture(swap_id, lock_id,None,None)?.prepare_cancellation()
++            };
+         }
+         let refund_tx = cancellation.signed_full_refund_transaction()?;
+         let refund_id = refund_tx.compute_txid();
+@@ -818,7 +834,14 @@ async fn resume_pending_in_child() -> Result<()> {
+             anyhow::ensure!(rejected.to_string()=="checkpoint digest mismatch","wrong checkpoint rejection boundary");
+             let store=swap_machine::native_execution_claim::checkpoint::CheckpointPinStore::open(
+                 &input.with_extension("pins"))?;
++            anyhow::ensure!(lease.load_bitcoin_lock(&store,"00".repeat(32).parse()?).is_err(),
++                "pre-lock checkpoint accepted another lock transaction");
++            let pre_lock=lease.load_bitcoin_lock(&store,lock)?;
++            pre_lock.check_recorded_quote(&association.verify_record(quote_fixture::now()?)?)?;
+             let pending=lease.load_pinned_pending(&store,lock,&policy)?;
++            anyhow::ensure!(pre_lock.cancel(swap_core::monero::BlockHeight {height:0})
++                .signed_full_refund_transaction()?==pending.prepare_cancellation().signed_full_refund_transaction()?,
++                "pre-lock and pending checkpoints disagree on signed refund");
+             pending.check_recorded_quote(&association.verify_record(quote_fixture::now()?)?)?;
+             (pending,Some(lease))
+         }

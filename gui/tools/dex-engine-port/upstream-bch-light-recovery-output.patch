@@ -1,0 +1,94 @@
+diff --git a/swap-machine/src/bch_rpc/unspent/tests.rs b/swap-machine/src/bch_rpc/unspent/tests.rs
+--- a/swap-machine/src/bch_rpc/unspent/tests.rs
++++ b/swap-machine/src/bch_rpc/unspent/tests.rs
+@@ -19,6 +19,7 @@
+ 
+ #[tokio::test]
+ async fn bch_confirmed_output_rpc_rejects_spends_mismatches_and_tip_changes() -> Result<()> {
++    for local in [false,true] {
+     for mode in 0..=9 {
+         let tx=Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
+             input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([1;32]),vout:0},script_sig:ScriptBuf::new(),
+@@ -45,12 +46,15 @@
+                     }
+                 };
+                 socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+-                let mut reader=BufReader::new(socket.try_clone()?);let mut line=String::new();let mut length=None;
++                let mut reader=BufReader::new(socket.try_clone()?);let mut line=String::new();let mut length=None;let mut root=false;let mut authenticated=false;
+                 loop {
+                     line.clear();ensure!(reader.read_line(&mut line)?>0,"missing BCH output fixture headers");
+                     if line=="\r\n" {break;}
++                    if line.starts_with("POST ") {root=line.starts_with("POST / HTTP/");}
++                    if line.to_ascii_lowercase().starts_with("authorization: basic ") {authenticated=true;}
+                     if let Some(value)=line.to_ascii_lowercase().strip_prefix("content-length:") {length=Some(value.trim().parse::<usize>()?);}
+                 }
++                ensure!(root && authenticated,"BCH output fixture requires authenticated root RPC");
+                 let length=length.context("missing BCH output request length")?;ensure!(length<4096,"oversized BCH output test request");
+                 let mut bytes=vec![0;length];reader.read_exact(&mut bytes)?;let request:Value=serde_json::from_slice(&bytes)?;
+                 ensure!(request["method"]==*method,"unexpected BCH output observation RPC order");
+@@ -86,9 +90,19 @@
+         });
+         let rpc=BchRpc::new(port,"fixture".into(),"fixture".into(),network,"fixture".into(),"bchreg:qanchor".into(),
+             ScriptBuf::from_bytes(vec![0x51]),"/Bitcoin Cash Node:29.0.0/".into())?;
+-        let parent=rpc.confirmed_transaction(txid,block,3).await?;
+-        assert!(rpc.confirmed_unspent_output(&parent,1).await.is_err());
+-        let result=rpc.confirmed_unspent_output(&parent,0).await;
++        let observer=observer::OwnedBchObserver::new(port,"fixture".into(),"fixture".into(),network,"/Bitcoin Cash Node:29.0.0/".into())?;
++        assert_ne!(rpc.deployment_commitment()?,observer.deployment_commitment()?);
++        let parent=if local {observer.confirmed_transaction(txid,block,3).await?}else{rpc.confirmed_transaction(txid,block,3).await?};
++        // Cross-source evidence and absent outputs must fail before network I/O.
++        let result=if local {
++            assert!(rpc.confirmed_unspent_output(&parent,0).await.is_err());
++            assert!(observer.confirmed_unspent_output(&parent,1).await.is_err());
++            observer.confirmed_unspent_output(&parent,0).await
++        } else {
++            assert!(observer.confirmed_unspent_output(&parent,0).await.is_err());
++            assert!(rpc.confirmed_unspent_output(&parent,1).await.is_err());
++            rpc.confirmed_unspent_output(&parent,0).await
++        };
+         server.join().unwrap()?;
+         if mode==0 {
+             let output=result?;assert_eq!(output.outpoint(),OutPoint {txid,vout:0});assert_eq!(output.confirmations(),3);
+@@ -96,5 +110,6 @@
+             assert_eq!(output.deployment(),parent.deployment());output.require_refund_window(2,30,5)?;
+         } else {assert!(result.is_err(),"accepted invalid recovery output mode {mode}");}
+     }
++    }
+     Ok(())
+ }
+diff --git a/swap-machine/src/bch_rpc/unspent.rs b/swap-machine/src/bch_rpc/unspent.rs
+--- a/swap-machine/src/bch_rpc/unspent.rs
++++ b/swap-machine/src/bch_rpc/unspent.rs
+@@ -25,16 +25,29 @@
+     }
+ }
+ impl BchRpc {
++    /// Keep the original node-wallet deployment pin while sharing root chain
++    /// validation. This read does not attest live wallet ownership.
++    pub async fn confirmed_unspent_output(&self,parent:&ConfirmedTransaction,vout:u32)->Result<ConfirmedUnspentOutput> {
++        self.observer.confirmed_unspent_output_for_deployment(parent,vout,&self.deployment_commitment()?).await
++    }
++}
++impl observer::OwnedBchObserver {
+     /// Reobserve after every tip change. Null includes both chain and mempool
+     /// spends; it never establishes who spent the output or a safe retry.
+-    pub async fn confirmed_unspent_output(&self,parent: &ConfirmedTransaction,vout: u32) -> Result<ConfirmedUnspentOutput> {
+-        ensure!(parent.deployment()==&self.deployment_commitment()?,"BCH output observer deployment changed");
++    pub async fn confirmed_unspent_output(&self,parent:&ConfirmedTransaction,vout:u32)->Result<ConfirmedUnspentOutput> {
++        self.confirmed_unspent_output_for_deployment(parent,vout,&self.deployment_commitment()?).await
++    }
++    // Private bridge permits the existing node wrapper to preserve its original
++    // deployment identity. Callers cannot choose or relabel a parent deployment.
++    async fn confirmed_unspent_output_for_deployment(&self,parent:&ConfirmedTransaction,vout:u32,deployment:&[u8;32])
++        ->Result<ConfirmedUnspentOutput> {
++        ensure!(parent.deployment()==deployment,"BCH output observer deployment changed");
+         let expected=parent.transaction().output.get(vout as usize).context("missing BCH parent output")?;
+         let chain=self.chain_state().await?;
+         ensure!(chain.bestblockhash==parent.tip() && chain.blocks.checked_sub(parent.height()).and_then(|v|v.checked_add(1))
+             ==Some(parent.confirmations()),"BCH parent confirmation is stale");
+         let outpoint=OutPoint {txid:parent.transaction().compute_txid(),vout};
+-        let raw=self.rpc(false,"gettxout",json!([outpoint.txid,outpoint.vout,true])).await?;
++        let raw=self.rpc(None,"gettxout",json!([outpoint.txid,outpoint.vout,true])).await?;
+         let output: Option<Output>=serde_json::from_str(raw.get())?;
+         let output=output.context("BCH confirmed output is spent or unavailable")?;
+         ensure!(output.bestblock==chain.bestblockhash && output.confirmations==parent.confirmations()

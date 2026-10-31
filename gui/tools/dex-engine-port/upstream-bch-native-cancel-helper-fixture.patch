@@ -1,0 +1,187 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/cancel.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/cancel.rs
+@@ -1,6 +1,7 @@
+ use super::*;
+ use crate::bch_rpc::contract_relay::OwnedBchContractRelay;
+ use agreement::execution::funding::recovery::cancel::CancelRelayState;
++mod helper;
+ 
+ pub(super) async fn exercise(metadata: &PrivateStore,snapshots: &PrivateStore,setup: &Setup,
+     rpc: &OwnedBchObserver,server: &Server,cancel: &Transaction) -> Result<()> {
+@@ -8,13 +9,16 @@
+     let original_intent=server.state.lock().unwrap().relay_intent.clone();
+     let block=Some(BlockHash::from_byte_array([6;32]));let txid=cancel.compute_txid();
+     let private=PrivateStore::new()?;
++    let mut excluded=0;
+     for entry in std::fs::read_dir(&snapshots.0)? {
+         let entry=entry?;
+         ensure!(entry.file_type()?.is_file(),"unexpected fixture directory entry");
+         if !entry.file_name().to_string_lossy().ends_with(".bch-funding-private-recovery") {
+             std::fs::copy(entry.path(),private.0.join(entry.file_name()))?;
+-        }
++        } else {excluded+=1;}
+     }
++    assert!(excluded>0,"fixture did not exclude a BCH private recovery bundle");
++    helper::exercise(setup,metadata,&private,server,rpc,cancel)?;
+     for mode in [0,1,2] {
+         let copied=PrivateStore::new()?;
+         for entry in std::fs::read_dir(&metadata.0)? {let entry=entry?;ensure!(entry.file_type()?.is_file(),"unexpected fixture directory entry");std::fs::copy(entry.path(),copied.0.join(entry.file_name()))?;}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/cancel/helper.rs
+@@ -0,0 +1,141 @@
++//! Real helper cancellation relay against the owned loopback RPC fixture.
++use super::*;
++use std::{path::PathBuf,process::{Command,Stdio},os::unix::fs::PermissionsExt};
++use sha2::{Digest,Sha256};
++fn hex(bytes:&[u8])->String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
++fn save(path:&std::path::Path,bytes:&[u8])->Result<()> {
++    std::fs::write(path,bytes)?;std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;Ok(())
++}
++fn contents(path:&std::path::Path)->Result<std::collections::BTreeMap<std::ffi::OsString,Vec<u8>>> {
++    std::fs::read_dir(path)?.map(|entry| {let entry=entry?;
++        Ok((entry.file_name(),std::fs::read(entry.path())?))}).collect()
++}
++struct RestoreServer<'a> {server:&'a Server,cancel:Option<Transaction>,observed:Option<Transaction>,observed_vout:u32,observation_mode:u8,observation_chain_calls:usize,relay_mode:u8,relay_intent:Option<std::path::PathBuf>,locked:bool,redemption_confirmation_mode:u8}
++impl<'a> RestoreServer<'a> {
++    fn new(server:&'a Server)->Self {let state=server.state.lock().unwrap();Self {server,cancel:state.cancel.clone(),observed:state.observed.clone(),observed_vout:state.observed_vout.clone(),observation_mode:state.observation_mode.clone(),observation_chain_calls:state.observation_chain_calls.clone(),relay_mode:state.relay_mode.clone(),relay_intent:state.relay_intent.clone(),locked:state.locked.clone(),redemption_confirmation_mode:state.redemption_confirmation_mode.clone()}}
++}
++impl Drop for RestoreServer<'_> {
++    fn drop(&mut self) {let mut state=self.server.state.lock().unwrap();state.cancel=self.cancel.clone();state.observed=self.observed.clone();state.observed_vout=self.observed_vout.clone();state.observation_mode=self.observation_mode.clone();state.observation_chain_calls=self.observation_chain_calls.clone();state.relay_mode=self.relay_mode.clone();state.relay_intent=self.relay_intent.clone();state.locked=self.locked.clone();state.redemption_confirmation_mode=self.redemption_confirmation_mode.clone();}
++}
++fn invoke(helper: &std::path::Path,path: &std::path::Path,action: &str,
++    commitment: Option<&str>,success: bool) -> Result<Value> {
++    let id=uuid::Uuid::new_v4();
++    let mut request=json!({"schema":format!("monzero-bch-cancel-{action}-request-v1"),"requestId":id});
++    if let Some(commitment)=commitment {request["commitment"]=json!(commitment);}
++    let mut child=Command::new(helper).env_clear()
++        .envs(std::env::vars_os().filter(|(key,_)|matches!(key.to_str(),Some("PATH"|"LD_LIBRARY_PATH"))))
++        .arg(format!("--cancel-{action}-stdio-v1")).arg(path)
++        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++    let written=child.stdin.take().context("missing helper stdin")?.write_all(&serde_json::to_vec(&request)?);
++    if let Err(error)=written {
++        if success || error.kind()!=std::io::ErrorKind::BrokenPipe {
++            let _=child.kill();let _=child.wait();return Err(error.into())
++        }
++    }
++    let output=child.wait_with_output()?;
++    assert_eq!(output.status.success(),success,"unexpected cancellation {action}: {}",String::from_utf8_lossy(&output.stderr));
++    if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++    assert!(output.stderr.is_empty());assert!(output.stdout.len()<=16384);
++    let response:Value=serde_json::from_slice(&output.stdout)?;
++    assert_eq!(response.as_object().unwrap().len(),8);
++    assert_eq!(response["schema"],format!("monzero-bch-cancel-{action}-response-v1"));
++    assert_eq!(response["requestId"],id.to_string());assert_eq!(response["executable"],false);
++    assert_eq!(response["chainObserved"],action=="observe");
++    Ok(response)
++}
++pub(super) fn exercise(setup:&Setup,metadata:&PrivateStore,snapshots:&PrivateStore,
++    server:&Server,rpc:&OwnedBchObserver,cancel:&Transaction)->Result<()> {
++    let Some(helper)=std::env::var_os("MONZERO_BCH_NATIVE_CANCEL_HELPER") else {return Ok(())};
++    let helper=PathBuf::from(helper);
++    let expected=std::env::var("MONZERO_BCH_NATIVE_CANCEL_HELPER_SHA256")?;
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper
++        && hex(&Sha256::digest(std::fs::read(&helper)?))==expected,"native cancellation helper pin changed");
++    let admission_name=format!("{}.bch-execution-admission-{}",setup.quote.terms()["swapId"],Role::NativeFunder.domain());
++    let retained:Value=serde_json::from_slice(&std::fs::read(metadata.0.join(admission_name))?)?;
++    let quote=PrivateStore::new()?;let quote_path=quote.0.join("quote.json");save(&quote_path,&setup.quote.record()?)?;
++    let quote_record:Value=serde_json::from_slice(&setup.quote.record()?)?;
++    let quote_admitted=quote_record["admittedAt"].as_u64().context("missing quote admission time")?;
++    ensure!(quote_admitted<=retained["admitted_at"].as_u64().context("missing execution admission time")?,
++        "fixture execution predates quote admission");
++    let original=json!({"schema":"monzero-private-bch-admission-v1","helper":helper,"helperDigest":expected,
++        "quoteFile":quote_path,"quoteCommitment":hex(setup.quote.commitment()),"admittedAt":quote_admitted,
++        "tradeId":setup.quote.terms()["swapId"],"identityPins":[SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++            SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],"policy":setup.policy,"role":"native-funder",
++        "metadataDirectory":metadata.0,"snapshotDirectory":snapshots.0,"negotiationPins":retained["pins"]});
++    let program=match (std::env::var_os("MONZERO_BCH_QT_CANCEL_PROBE"),std::env::var_os("MONZERO_BCH_QT_CANCEL_PROBE_SHA256")) {
++        (None,None)=>helper.clone(),
++        (Some(path),Some(expected))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && expected.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),"invalid Qt cancellation probe pin");
++            path
++        }
++        _=>anyhow::bail!("incomplete Qt cancellation probe configuration"),
++    };
++    let via_qt=program!=helper;
++    let _restore=RestoreServer::new(server);
++    let original_metadata=contents(&metadata.0)?;
++    let secrets=contents(&snapshots.0)?;
++
++    for mode in [0,1,2] {
++        let copied=PrivateStore::new()?;let config=PrivateStore::new()?;
++        for entry in std::fs::read_dir(&metadata.0)? {
++            let entry=entry?;std::fs::copy(entry.path(),copied.0.join(entry.file_name()))?;
++        }
++        let mut value=original.clone();value["metadataDirectory"]=json!(copied.0);
++        let admission=config.0.join("admission.json");save(&admission,&serde_json::to_vec(&value)?)?;
++        let wrapper=config.0.join("cancel.json");
++        save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-cancel-v2","bchObserverKind":"owned-node",
++            "admissionConfigFile":admission,"deploymentCommitment":hex(&rpc.deployment_commitment()?)}))?)?;
++        let cookie=config.0.join("cookie");save(&cookie,b"user:pass\n")?;
++        let rpc_path=config.0.join("rpc.json");
++        save(&rpc_path,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-observer-rpc-v1",
++            "port":server.port,
++            "cookieFile":cookie,"checkpointHeight":1,"checkpoint":"07".repeat(32),"subversion":"/Bitcoin Cash Node:29.0.0/"}))?)?;
++        let submission=config.0.join("submission.json");
++        save(&submission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-cancel-submission-v1",
++            "cancelConfigFile":wrapper,"rpcFile":rpc_path}))?)?;
++        let execution=AdmittedExecution::resume(&copied.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        let funding=execution.received_bch_funding_message()?.context("missing native funding receipt")?;
++        let signed=funding.signed();drop(execution);
++        let txid=cancel.compute_txid().to_string();let trade=&setup.quote.terms()["swapId"];
++        let intent=copied.0.join(format!("{trade}.bch-cancel-relay-intent"));
++        {
++            let mut state=server.state.lock().unwrap();state.cancel=Some(cancel.clone());state.relay_mode=mode;
++            state.observed=Some(signed.transaction().clone());state.observed_vout=signed.lock_outpoint().vout;
++            state.observation_mode=23;state.observation_chain_calls=0;state.relay_intent=Some(intent.clone());state.locked=true;
++        }
++        let calls=server.state.lock().unwrap().cancel_relay_calls;
++        let before=contents(&copied.0)?;
++        let reviewed=invoke(&program,&wrapper,"review",None,true)?;
++        let approval=reviewed["review"]["commitment"].as_str().context("missing commitment")?;
++        assert_eq!(reviewed["review"]["details"]["txid"],txid);
++        assert_eq!(invoke(&program,&wrapper,"status",None,true)?["relay"]["state"],"not-attempted");
++        assert_eq!(server.state.lock().unwrap().observation_chain_calls,0);
++        invoke(&program,&submission,"submit",Some(&"00".repeat(32)),false)?;
++        assert_eq!(contents(&copied.0)?,before);
++        server.state.lock().unwrap().observation_mode=0;
++        invoke(&program,&submission,"submit",Some(approval),false)?;
++        assert!(!intent.exists());assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls);
++        assert_eq!(contents(&copied.0)?,before);
++        server.state.lock().unwrap().observation_mode=23;
++        invoke(&program,&submission,"submit",Some(approval),mode==0)?;
++        assert!(intent.exists());assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls+1);
++        let state=if mode==0 {"acknowledged"} else {"attempted"};
++        assert_eq!(invoke(&program,&wrapper,"status",None,true)?["relay"],json!({"state":state,"txid":txid,"confirmed":false}));
++        // Qt deliberately disables a second submission even after acknowledgement.
++        invoke(&program,&submission,"submit",Some(approval),mode==0 && !via_qt)?;
++        assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls+1);
++        let observed=invoke(&program,&submission,"observe",None,true)?;
++        assert_eq!(observed["observation"]["txid"],txid);assert_eq!(observed["observation"]["confirmations"],"3");
++        assert_eq!(observed["relay"]["state"],state);assert_eq!(observed["relay"]["confirmed"],false);
++        server.state.lock().unwrap().redemption_confirmation_mode=1;
++        invoke(&program,&submission,"observe",None,false)?;
++        server.state.lock().unwrap().redemption_confirmation_mode=0;
++        assert_eq!(invoke(&program,&wrapper,"status",None,true)?["relay"]["state"],state);
++        assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls+1);
++        assert_eq!(contents(&snapshots.0)?,secrets);
++        assert_eq!(contents(&metadata.0)?,original_metadata);
++    }
++    Ok(())
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message.rs
+@@ -15,8 +15,10 @@
+     let agreement = agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder,&agreed)?;
+     let pins = NegotiationPins {initial,selection:*n.commitment(),outgoing:*nv.commitment(),received,agreement};
+     let metadata = PrivateStore::new()?;
+-    let mut native = AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
+-        Role::NativeFunder,setup.quote.commitment(),pins,1005)?;
++    let review=agreement::execution::approval::review_admission(&setup.quote,&setup.policy,Role::NativeFunder,&pins,1005)?;
++    let mut native = AdmittedExecution::admit_reviewed(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++        Role::NativeFunder,&review.commitment,pins.clone(),1005)?;
++    assert_eq!(native.saved_admission_review(&pins)?.review.commitment,review.commitment);
+     let key = SigningKey::from_bytes(&[1;32]); let wrong = SigningKey::from_bytes(&[2;32]);
+     assert!(sender.prepare_bch_funding_message(1017).is_err());
+     let frame = sender.prepare_bch_funding_message(1020)?;

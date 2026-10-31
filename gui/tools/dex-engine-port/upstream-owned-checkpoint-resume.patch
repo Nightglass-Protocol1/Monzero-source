@@ -1,0 +1,53 @@
+diff --git a/swap-machine/src/native_execution_claim.rs b/swap-machine/src/native_execution_claim.rs
+index aab5c074a..13ba26656 100644
+--- a/swap-machine/src/native_execution_claim.rs
++++ b/swap-machine/src/native_execution_claim.rs
+@@ -178,6 +178,17 @@ pub struct RecoveryLease {
+ impl RecoveryLease {
+     pub fn record(&self) -> &RecordedExecution { &self.record }
+ 
++    /// Bind checkpoint economics to the retained signed terms while ownership
++    /// is held, then revalidate both chains and the cancellation window. The
++    /// caller must still authenticate checkpoint storage and keep this lease
++    /// alive for subsequent protocol operations. No broadcast or fresh claim.
++    pub async fn resume_pending(&self, pending: &crate::xmz_funding::PendingFunding,
++        observer: &impl crate::xmz_funding::FundingObserver,
++        bitcoin: &impl crate::xmz_funding::BitcoinLockObserver) -> Result<crate::bob::State4> {
++        pending.check_recorded_quote(self.record.quote())?;
++        pending.resume(observer, bitcoin).await
++    }
++
+     #[cfg(target_os = "linux")]
+     pub fn acquire(directory: &Path, context: &RecoveryContext<'_>, now: u64) -> Result<Self> {
+         let (owner,bytes)=read_execution(directory,context.swap_id,true)?;
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index e0ac0747d..dbe0bad76 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -799,7 +799,25 @@ async fn resume_pending_in_child() -> Result<()> {
+     };
+     let observer = native_rpc::authenticated_fixture()?;
+     let bitcoin = native_rpc::BitcoinRpc::new(std::env::var("MONZERO_TEST_CHILD_BITCOIN_RPC")?.parse()?)?;
+-    let resumed = match pending.resume(&observer, &bitcoin).await {
++    let checked=match &_recovery_owner {
++        Some(owner)=>{
++            let mut altered:serde_json::Value=serde_json::from_slice(&bytes)?;
++            let atoms:u64=owner.record().quote().terms()["xmzAtoms"].parse()?;
++            altered["state"]["xmr"]=serde_json::to_value(swap_core::monero::primitives::Amount::from_pico(
++                atoms.checked_add(1).context("fixture amount overflow")?))?;
++            let changed=PendingFunding::decode(&serde_json::to_vec(&altered)?,
++                std::env::var("MONZERO_TEST_CHILD_SWAP")?.parse()?,
++                std::env::var("MONZERO_TEST_CHILD_LOCK")?.parse()?,&policy)?;
++            let expected=changed.check_recorded_quote(owner.record().quote()).err()
++                .context("changed checkpoint unexpectedly matches signed terms")?;
++            let rejected=owner.resume_pending(&changed,&observer,&bitcoin).await.err()
++                .context("owned recovery accepted a changed checkpoint principal")?;
++            anyhow::ensure!(rejected.to_string()==expected.to_string(),"owned recovery did not enforce quote binding first");
++            owner.resume_pending(&pending,&observer,&bitcoin).await
++        }
++        None=>pending.resume(&observer,&bitcoin).await, // Explicit unsigned-fixture mode only.
++    };
++    let resumed = match checked {
+         Ok(state) => state,
+         Err(error) => {
+             if std::env::var_os("MONZERO_TEST_CHILD_REJECTION").is_some() {

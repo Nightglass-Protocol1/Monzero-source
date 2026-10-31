@@ -110,8 +110,12 @@
     <string name="status_wallet_unloaded">Wallet saved</string>
     <string name="status_wallet_unload_failed">Wallet save failed!</string>
     <string name="status_wallet_connecting">Connecting &#8230;</string>
-    <string name="status_wallet_connect_failed">Node connection failed!\nCheck username/password</string>
+    <string name="status_wallet_connect_failed">Node connection failed!\nCheck the node address, and its username/password if it has one</string>
     <string name="status_wallet_connect_wrongversion">Node version incompatible - please upgrade!</string>
+    <string name="status_wallet_not_connected_title">Could not connect to the node</string>
+    <string name="status_wallet_node_unreachable">The node %1$s did not answer.</string>
+    <string name="status_wallet_open_failed">The wallet could not be started.</string>
+    <string name="status_wallet_not_connected_help">Your wallet and funds are safe. Check your internet connection and try again. If it keeps happening, tap the node name on the start screen and pick another node, or try Wi-Fi instead of mobile data: some networks block port 6175.</string>
     <string name="status_wallet_node_invalid">Node invalid!\nTry another.</string>
     <string name="status_wallet_connect_ioex">Cannot reach node!\nTry again or another.</string>
 
@@ -134,7 +138,8 @@
     <string name="bad_password">Incorrect password!</string>
     <string name="bad_saved_password">Saved password is incorrect.\nPlease enter password manually.</string>
     <string name="bad_wallet">Wallet does not exist!</string>
-    <string name="prompt_daemon_missing">Node must be set!</string>
+    <string name="prompt_daemon_missing">No node selected. Tap the node name at the top and pick one (node.monzero.org is the default).</string>
+    <string name="prompt_no_network">No internet connection, so no node could be selected. Connect and try again.</string>
     <string name="prompt_wrong_net">Wallet does not match selected net</string><!--TODO deleteme-->
 
     <string name="label_watchonly">(Watch Only)</string>

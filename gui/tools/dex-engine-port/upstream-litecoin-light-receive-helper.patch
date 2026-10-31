@@ -1,0 +1,40 @@
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -80,6 +80,16 @@
+         Ok(json!({"watchOnly":true,"initialized":true,"receivingAllocated":book.allocated_count(Branch::Receive)?,
+             "changeAllocated":book.allocated_count(Branch::Change)?,"spendable":false}))
+     }
++    fn receive_address(config:&Config,network:LtcNetwork,request_id:uuid::Uuid)->Result<Value> {
++        let wallet=config.wallet.as_ref().context("missing watch-only wallet configuration")?;
++        let account=PublicAccount::from_descriptor(&wallet.account,network)?;
++        let mut book=AddressBook::open(&wallet.address_book_directory,account)?;
++        let address=book.reserve(request_id,Branch::Receive)?;
++        Ok(json!({"watchOnly":true,"spendable":false,"address":address.address().to_string(),
++            "derivationPath":address.path().to_string(),
++            "receivingAllocated":book.allocated_count(Branch::Receive)?,
++            "changeAllocated":book.allocated_count(Branch::Change)?}))
++    }
+     async fn refresh_wallet(config:&Config,network:LtcNetwork,state:&ChainState,scan:&WalletScan)->Result<Value> {
+         let wallet=config.wallet.as_ref().context("missing watch-only wallet configuration")?;
+         let account=PublicAccount::from_descriptor(&wallet.account,network)?;
+@@ -103,6 +113,7 @@
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
+         let mode=match args[1].to_str() {Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
++            Some("--wallet-receive-stdio-v1")=>"wallet-receive",
+             Some("--wallet-init-stdio-v1")=>"wallet-init",Some("--wallet-refresh-stdio-v1")=>"wallet-refresh",
+             _=>anyhow::bail!("unsupported light-chain operation")};
+         let mut bytes=Vec::new();std::io::stdin().take(513).read_to_end(&mut bytes)?;
+@@ -128,8 +139,9 @@
+         } else {None};
+         let mut response=json!({"schema":format!("monzero-ltc-light-{mode}-response-v1"),
+             "requestId":request.request_id,"executable":false,"chain":snapshot(&state)?,"synchronization":synchronization});
+-        if mode=="wallet-init" || mode=="wallet-refresh" {
+-            let wallet=if mode=="wallet-init" {initialize_wallet(&config,network)?} else {
++        if mode=="wallet-init" || mode=="wallet-refresh" || mode=="wallet-receive" {
++            let wallet=if mode=="wallet-init" {initialize_wallet(&config,network)?}
++            else if mode=="wallet-receive" {receive_address(&config,network,request.request_id)?} else {
+                 let scan=request.wallet_scan.as_ref().context("missing wallet scan budget")?;
+                 tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+                     tokio::time::timeout(std::time::Duration::from_secs(3600),refresh_wallet(&config,network,&state,scan)).await

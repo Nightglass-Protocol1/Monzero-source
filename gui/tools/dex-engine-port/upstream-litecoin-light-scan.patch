@@ -1,0 +1,145 @@
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -160,3 +160,5 @@
+ pub mod sync;
+ 
+ pub mod history;
++
++pub mod scan;
+diff --git a/swap-machine/src/litecoin_light/account/allocation.rs b/swap-machine/src/litecoin_light/account/allocation.rs
+--- a/swap-machine/src/litecoin_light/account/allocation.rs
++++ b/swap-machine/src/litecoin_light/account/allocation.rs
+@@ -48,6 +48,12 @@
+         journal.retain(NAME,&bytes)?;
+         Ok(Self {journal,account,record,bytes,usable:true})
+     }
++    /// Number of allocated indices that discovery must cover on this branch.
++    pub fn allocated_count(&self,branch:Branch)->Result<u32> {
++        ensure!(self.usable && self.journal.read(NAME)?==self.bytes,
++            "Litecoin address book requires validated reopen");
++        Ok(self.record.entries.iter().filter(|entry|entry.branch==branch.index() as u8).count() as u32)
++    }
+     /// Request IDs are retry identities and must be retained by the caller.
+     /// Same ID/branch returns the original address without allocating another.
+     pub fn reserve(&mut self,request:Uuid,branch:Branch)->Result<DerivedAddress> {
+diff --git a/swap-machine/src/litecoin_light/session/scan.rs b/swap-machine/src/litecoin_light/session/scan.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/scan.rs
+@@ -0,0 +1,59 @@
++//! Bounded public-account discovery from untrusted history reports.
++//! A reported gap is only a stopping policy, not proof of wallet completeness.
++use super::*;
++use super::history::ReportedTransaction;
++use crate::litecoin_light::account::{Branch, PublicAccount};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ScanStop { ReportedGap, AddressBudget }
++pub struct ReportedAddressHistory {
++    index: u32,
++    history: Vec<ReportedTransaction>,
++}
++impl ReportedAddressHistory {
++    pub fn index(&self) -> u32 { self.index }
++    pub fn history(&self) -> &[ReportedTransaction] { &self.history }
++}
++pub struct BranchScan {
++    scanned: u32,
++    stop: ScanStop,
++    reported: Vec<ReportedAddressHistory>,
++}
++impl BranchScan {
++    pub fn scanned(&self) -> u32 { self.scanned }
++    pub fn stop(&self) -> ScanStop { self.stop }
++    pub fn reported(&self) -> &[ReportedAddressHistory] { &self.reported }
++}
++
++impl<S: AsyncRead + AsyncWrite + Unpin> ReadSession<S> {
++    /// Scan from index zero, covering allocated_count before counting a gap.
++    /// All limits are explicit. No index is allocated or persisted by scanning.
++    /// The peer learns related script hashes; results remain unverified hints.
++    /// Errors return no partial scan; budget exhaustion is explicitly marked.
++    pub async fn scan_branch(&mut self, account: &PublicAccount, branch: Branch,
++        allocated_count: u32, gap: u32, maximum_addresses: u32,
++        maximum_entries: usize) -> Result<BranchScan> {
++        ensure!(account.network()==self.network && allocated_count<=10_000
++            && (1..=1000).contains(&gap) && (1..=10_000).contains(&maximum_addresses)
++            && (1..=10_000).contains(&maximum_entries), "invalid Litecoin discovery request");
++        let mut reported = Vec::new();
++        let mut empty = 0;
++        let mut entries = 0;
++        for index in 0..maximum_addresses {
++            let address = account.derive(branch,index)?;
++            // Conservative total-memory bound. Exhaustion never becomes a gap.
++            let remaining = maximum_entries-entries;
++            ensure!(remaining>0, "Litecoin discovery history budget exhausted");
++            let history = self.reported_history(address.address().script_pubkey(), remaining.min(1000)).await?;
++            if history.is_empty() && index>=allocated_count { empty+=1; } else { empty=0; }
++            entries+=history.len();
++            if !history.is_empty() { reported.push(ReportedAddressHistory {index,history}); }
++            if empty==gap {
++                return Ok(BranchScan {scanned:index+1,stop:ScanStop::ReportedGap,reported});
++            }
++        }
++        Ok(BranchScan {scanned:maximum_addresses,stop:ScanStop::AddressBudget,reported})
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session/scan/tests.rs b/swap-machine/src/litecoin_light/session/scan/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/scan/tests.rs
+@@ -0,0 +1,51 @@
++use super::*;
++use crate::litecoin_light::session::tests::{server,reply,regtest_handshake};
++use bitcoin::{bip32::Xpriv,NetworkKind};
++fn account(network:LtcNetwork)->PublicAccount {
++    PublicAccount::from_master(&Xpriv::new_master(NetworkKind::Test,&[1;32]).unwrap(),network,0).unwrap()
++}
++fn used()->Value {json!([{"tx_hash":"11".repeat(32),"height":1}])}
++#[tokio::test]
++async fn scan_covers_allocations_and_resets_gap_after_reported_use()->Result<()> {
++    let account=account(LtcNetwork::Regtest);
++    let mut responses=regtest_handshake();
++    // Existing allocations 0..3 must not be skipped despite leading empties.
++    for (i,value) in [json!([]),json!([]),json!([]),used(),json!([]),used(),json!([]),json!([])].into_iter().enumerate() {
++        responses.push(reply(i as u64+3,value));
++    }
++    let (stream,task)=server(responses);
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let scan=session.scan_branch(&account,Branch::Receive,4,2,10,10).await?;
++    assert_eq!(scan.stop(),ScanStop::ReportedGap);assert_eq!(scan.scanned(),8);
++    assert_eq!(scan.reported().iter().map(|entry|entry.index()).collect::<Vec<_>>(),[3,5]);
++    assert_eq!(scan.reported()[0].history().len(),1);
++    drop(session);let requests=task.await?;
++    for index in 0..8 {
++        assert_eq!(requests[index+2]["params"],json!([script_hash(account.derive(Branch::Receive,index as u32)?.address().script_pubkey())]));
++    }
++    Ok(())
++}
++#[tokio::test]
++async fn scan_address_budget_is_not_reported_as_gap()->Result<()> {
++    let mut responses=regtest_handshake();responses.push(reply(3,json!([])));responses.push(reply(4,json!([])));
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let scan=session.scan_branch(&account(LtcNetwork::Regtest),Branch::Change,4,2,2,10).await?;
++    assert_eq!(scan.stop(),ScanStop::AddressBudget);assert_eq!(scan.scanned(),2);assert!(scan.reported().is_empty());
++    drop(session);assert_eq!(task.await?.len(),4);Ok(())
++}
++#[tokio::test]
++async fn scan_total_history_budget_does_not_silently_truncate()->Result<()> {
++    let mut responses=regtest_handshake();responses.push(reply(3,used()));
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    assert!(session.scan_branch(&account(LtcNetwork::Regtest),Branch::Receive,0,2,10,1).await.is_err());
++    drop(session);assert_eq!(task.await?.len(),3);Ok(())
++}
++#[tokio::test]
++async fn scan_wrong_network_and_invalid_limits_send_no_queries()->Result<()> {
++    let (stream,task)=server(regtest_handshake());let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    assert!(session.scan_branch(&account(LtcNetwork::Testnet),Branch::Receive,0,2,10,10).await.is_err());
++    for (allocated,gap,addresses,entries) in [(10001,2,10,10),(0,0,10,10),(0,1001,10,10),(0,2,0,10),(0,2,10001,10),(0,2,10,0),(0,2,10,10001)] {
++        assert!(session.scan_branch(&account(LtcNetwork::Regtest),Branch::Receive,allocated,gap,addresses,entries).await.is_err());
++    }
++    drop(session);assert_eq!(task.await?.len(),2);Ok(())
++}

@@ -1,0 +1,305 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+@@ -29,7 +29,18 @@
+     /// Recovered keys stay private; later wallet/payout actions need fresh checks.
+     pub async fn recover_bch_native_claim(&self,native: &impl FundingObserver,bch: &BchRpc,
+         redemption: Txid,block: Option<BlockHash>,now: u64) -> Result<NativeClaim> {
+-        let context=self.success_context(bch,now)?;
++        self.recover_bch_native_claim_with_observer(native,SuccessObserver::Node(bch),redemption,block,now).await
++    }
++    /// The exact local-wallet source and observer binding are required before
++    /// any live evidence. Recovered keys stay inside the existing private claim.
++    pub async fn recover_light_bch_native_claim(&self,native:&impl FundingObserver,bch:&crate::bch_rpc::observer::OwnedBchObserver,
++        redemption:Txid,block:Option<BlockHash>,now:u64)->Result<NativeClaim> {
++        self.recover_bch_native_claim_with_observer(native,SuccessObserver::Local(bch),redemption,block,now).await
++    }
++    async fn recover_bch_native_claim_with_observer(&self,native:&impl FundingObserver,bch:SuccessObserver<'_>,
++        redemption:Txid,block:Option<BlockHash>,now:u64)->Result<NativeClaim> {
++        let context=self.success_context_for_observer(&bch,now)?;
++        let deployment=bch.deployment()?;
+         let prepared=self.load_success("prepared",&context)?.context("missing original BCH success preparation")?;
+         ensure!(now>=prepared.at,"native claim predates success preparation");
+         if let Some(signed)=self.load_success("signed",&context)? {
+@@ -44,11 +55,17 @@
+         let native_evidence=xmz_funding::verify(native,context.request,&self.policy.xmz_genesis,
+             u64::from(self.policy.xmz_confirmations)).await?;
+         let minimum=u64::from(self.policy.bch_confirmations);
+-        let confirmed=match block {
+-            Some(block)=>bch.confirmed_transaction(redemption,block,minimum).await?,
+-            None=>bch.indexed_confirmed_transaction(redemption,minimum).await?,
++        let confirmed=match bch {
++            SuccessObserver::Node(rpc)=>match block {
++                Some(block)=>rpc.confirmed_transaction(redemption,block,minimum).await?,
++                None=>rpc.indexed_confirmed_transaction(redemption,minimum).await?,
++            },
++            SuccessObserver::Local(observer)=>match block {
++                Some(block)=>observer.confirmed_transaction(redemption,block,minimum).await?,
++                None=>observer.indexed_confirmed_transaction(redemption,minimum).await?,
++            },
+         };
+-        ensure!(confirmed.deployment()==&bch.deployment_commitment()?,"BCH native recovery deployment changed");
++        ensure!(confirmed.deployment()==&deployment,"BCH native recovery deployment changed");
+         ensure!(native.snapshot().await?==*native_evidence.snapshot(),"native chain changed during BCH claim recovery");
+         let observed_at=std::time::Instant::now();
+         let raw=Zeroizing::new(serialize(confirmed.transaction()));
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+@@ -55,9 +55,6 @@
+     ensure!(bytes.len() <= 65536,"oversized BCH success release");Ok(bytes)
+ }
+ impl AdmittedExecution<'_> {
+-    fn success_context(&self,bch:&BchRpc,now:u64)->Result<ReleaseContext> {
+-        self.success_context_for_deployment(&bch.deployment_commitment()?,now)
+-    }
+     fn success_context_for_observer(&self,bch:&SuccessObserver<'_>,now:u64)->Result<ReleaseContext> {
+         match bch {
+             SuccessObserver::Node(rpc)=>self.success_context_for_deployment(&rpc.deployment_commitment()?,now),
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_observer.rs
+@@ -7,6 +7,7 @@
+ 
+ pub(super) struct Fixture {
+     pub observer:OwnedBchObserver,pub depth:Arc<AtomicUsize>,stop:Arc<AtomicBool>,
++    pub redemption:Arc<std::sync::Mutex<Option<Transaction>>>,pub redemption_mode:Arc<AtomicUsize>,
+     server:Option<std::thread::JoinHandle<Result<()>>>,
+ }
+ impl Fixture {
+@@ -109,6 +110,8 @@
+     for path in [&source,&local,&slot] {std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;}
+     let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();let calls=Arc::new(AtomicUsize::new(0));let counted=calls.clone();
+     let depth=Arc::new(AtomicUsize::new(3));let observed_depth=depth.clone();
++    let redemption=Arc::new(std::sync::Mutex::new(None::<Transaction>));let observed_redemption=redemption.clone();
++    let redemption_mode=Arc::new(AtomicUsize::new(0));let observed_redemption_mode=redemption_mode.clone();
+     let txid=signed.compute_txid();let script=signed.output[0].script_pubkey.to_hex_string();
+     let server=std::thread::spawn(move ||->Result<()> {
+         while !signal.load(Ordering::Relaxed) {
+@@ -127,6 +130,22 @@
+                 "getblockhash"=>json!(if request["params"][0]==0 {network.genesis().to_owned()}else{"07".repeat(32)}),
+                 "gettxout"=>{ensure!(request["params"]==json!([txid,0,true]),"wrong exact funding output");json!({"bestblock":"08".repeat(32),"confirmations":observed_depth.load(Ordering::Relaxed),
+                     "value":0.001,"coinbase":false,"scriptPubKey":{"hex":script,"addresses":[]}})},
++                "getrawtransaction"=>{
++                    let transaction=observed_redemption.lock().unwrap().clone().context("missing fixture redemption")?;
++                    let id=transaction.compute_txid();let block="06".repeat(32);
++                    if request["params"]==json!([id,true]) {json!({"txid":id,"blockhash":block})} else {
++                        ensure!(request["params"]==json!([id,true,block]),"wrong redemption query");
++                        let mode=observed_redemption_mode.load(Ordering::SeqCst);let mut raw=transaction;
++                        if mode==2 {raw.output[0].value+=Amount::from_sat(1);}
++                        json!({"in_active_chain":mode!=1,"hex":bitcoin::consensus::encode::serialize_hex(&raw),"txid":id,"blockhash":block,
++                            "confirmations":if mode==3 {1}else{3}})
++                    }
++                },
++                "getblockheader"=>{
++                    ensure!(request["params"]==json!(["06".repeat(32),true]),"wrong redemption block");
++                    let shallow=observed_redemption_mode.load(Ordering::SeqCst)==3;
++                    json!({"hash":"06".repeat(32),"height":if shallow {200}else{198},"confirmations":if shallow {1}else{3}})
++                },
+                 _=>anyhow::bail!("wallet or mutating RPC forbidden"),
+             };
+             counted.fetch_add(1,Ordering::Relaxed);let bytes=serde_json::to_vec(&json!({"id":request["id"],"error":null,"result":result}))?;
+@@ -134,7 +153,7 @@
+         }
+         Ok(())
+     });
+-    let fixture=Fixture {observer,depth,stop,server:Some(server)};
++    let fixture=Fixture {observer,depth,stop,server:Some(server),redemption,redemption_mode};
+     let observed=execution.observe_light_bch_funding(&fixture.observer,2002).await?;
+     let exact=observed.for_deployment(&fixture.observer.deployment_commitment()?)?;
+     assert_eq!(exact.txid(),signed.compute_txid());assert_eq!(exact.status(),FundingStatus::ConfirmedUnspent {confirmations:3});
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/claim.rs
+@@ -0,0 +1,69 @@
++use super::*;
++use bitcoin::{OutPoint,BlockHash};
++
++pub(in crate::bch_key_recovery::authenticated::native_wallet::tests)
++async fn exercise(execution:&AdmittedExecution<'_>,setup:&Setup,fixture:&super::super::light_observer::Fixture,
++    release:&SignedSuccess,funding:&Transaction,metadata:&std::path::Path)->Result<()> {
++    // Use the native funder's actual fixture share to decrypt the released
++    // adaptor and construct the covenant redemption, not an invented spend.
++    let frame:serde_json::Value=serde_json::from_slice(release.frame())?;
++    let encrypted=serde_json::from_value(frame["encrypted"].clone())?;
++    let mut bytes=Zeroizing::new(setup.spend[1].as_bytes());bytes.reverse();
++    let decrypt=ecdsa_fun::fun::Scalar::from_bytes(*bytes).context("invalid native fixture share")?
++        .non_zero().context("zero fixture share")?;
++    let plan=setup.quote.recovery_plan();
++    let signer=ecdsa_fun::fun::Point::from_bytes(plan.lock().terms().signing_key.serialize()).context("invalid fixture signer")?;
++    let signature=Zeroizing::new(plan.lock().data_message().decrypt(&signer,&decrypt,encrypted)?);
++    let outpoint=OutPoint {txid:funding.compute_txid(),vout:0};
++    let transaction=plan.lock().prepare_redemption(&serialize(funding),&plan.lock_spend_terms(outpoint),&signature)?;
++    let id=transaction.compute_txid();let block=Some(BlockHash::from_byte_array([6;32]));
++    *fixture.redemption.lock().unwrap()=Some(transaction.clone());
++    let native=Native::new(execution,setup)?;let observer=&fixture.observer;
++    assert!(execution.recover_light_bch_native_claim(&native,observer,id,block,2009).await.err()
++        .context("early claim must fail")?.to_string().contains("predates success preparation"));
++    let port=u16::try_from(observer.deployment_context()?["port"].as_u64().context("missing fixture port")?)?;
++    let changed=crate::bch_rpc::observer::OwnedBchObserver::new(if port==65535 {port-1}else{port+1},
++        "user".into(),"pass".into(),observer.network(),"/Bitcoin Cash Node:29.0.0/".into())?;
++    assert!(execution.recover_light_bch_native_claim(&native,&changed,id,block,2021).await.err()
++        .context("changed observer must fail")?.to_string().contains("binding changed"));
++    let node=crate::bch_rpc::BchRpc::new(port,"user".into(),"pass".into(),observer.network(),"test".into(),
++        "bchreg:qanchor".into(),bitcoin::ScriptBuf::from_bytes(vec![0x51]),"/Bitcoin Cash Node:29.0.0/".into())?;
++    assert!(execution.recover_bch_native_claim(&native,&node,id,block,2021).await.err()
++        .context("node claim must reject local source")?.to_string().contains("local funding observer"));
++    let trade=&setup.quote.terms()["swapId"];
++    for (name,error) in [
++        (format!("{trade}.bch-funding-local-observer"),"approve and retain"),
++        (format!("{trade}.bch-success-prepared-pin"),"lacks trusted pin"),
++    ] {
++        let path=metadata.join(name);let held=metadata.join("held-claim-test-record");
++        std::fs::rename(&path,&held)?;
++        let result=execution.recover_light_bch_native_claim(&native,observer,id,block,2021).await;
++        std::fs::rename(&held,&path)?;
++        assert!(result.err().context("missing claim record must fail")?.to_string().contains(error));
++    }
++    assert_eq!(native.snapshots.load(Ordering::SeqCst),0);
++    let claim=execution.recover_light_bch_native_claim(&native,observer,id,block,2021).await?;
++    ensure!(claim.spend_key()==&(setup.spend[0]+setup.spend[1]).as_bytes(),"recovered native spend key differs");
++    ensure!(claim.view_key()==&(setup.view[0].0+setup.view[1].0).as_bytes(),"recovered native view key differs");
++    assert_eq!(claim.native_txid(),"ab".repeat(32));assert_eq!(claim.redemption_txid(),id);
++    assert_eq!(claim.address(),execution.restore_agreement()?.owned().wallet().address());
++    for mode in [1,2,3] {
++        native.mode(mode);
++        assert!(execution.recover_light_bch_native_claim(&native,observer,id,block,2021).await.is_err(),"unsafe native mode {mode}");
++    }
++    native.mode(0);
++    for mode in [1,2,3] {
++        fixture.redemption_mode.store(mode,Ordering::SeqCst);
++        assert!(execution.recover_light_bch_native_claim(&native,observer,id,block,2021).await.is_err(),"unsafe redemption mode {mode}");
++    }
++    fixture.redemption_mode.store(0,Ordering::SeqCst);
++    // A confirmed transaction must still redeem this exact covenant/outpoint.
++    let mut wrong=transaction.clone();wrong.input[0].previous_output.vout=1;
++    let wrong_id=wrong.compute_txid();*fixture.redemption.lock().unwrap()=Some(wrong);
++    assert!(execution.recover_light_bch_native_claim(&native,observer,wrong_id,block,2021).await.is_err());
++    *fixture.redemption.lock().unwrap()=Some(transaction);
++    let indexed=execution.recover_light_bch_native_claim(&native,observer,id,None,2022).await?;
++    ensure!(indexed.spend_key()==claim.spend_key() && indexed.view_key()==claim.view_key(),"indexed native claim differs");
++    assert_eq!(indexed.commitment(),claim.commitment());
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
+@@ -112,3 +112,5 @@
+     assert_eq!(recovered.frame(),original.frame());assert_eq!(recovered.signature(),original.signature());
+     Ok(())
+ }
++
++pub(super) mod claim;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -1034,6 +1034,7 @@
+         cold.bind_reviewed_light_bch_observer(&observer,2003,&review.commitment)?;
+         assert_eq!(std::fs::read(bound_path)?,bound);
+         light_success::reopen(&mut cold,&setup,&fixture,&release).await?;
++        light_success::claim::exercise(&cold,&setup,&fixture,&release,&signed,&metadata.0).await?;
+         fixture.finish()?;
+     }
+     }
+diff --git a/swap-machine/src/bch_rpc/confirmed/rpc_tests.rs b/swap-machine/src/bch_rpc/confirmed/rpc_tests.rs
+--- a/swap-machine/src/bch_rpc/confirmed/rpc_tests.rs
++++ b/swap-machine/src/bch_rpc/confirmed/rpc_tests.rs
+@@ -3,6 +3,7 @@
+ 
+ #[tokio::test]
+ async fn bch_confirmation_rpc_checks_exact_lookup_and_stable_deployment_tip() -> Result<()> {
++    for chain_only in [false,true] {
+     for (indexed,mode) in [(false,0),(false,1),(true,0),(true,1),(true,2)] {
+         let tx=tests::transaction();let txid=tx.compute_txid();let block=BlockHash::from_byte_array([7;32]);
+         let tip=BlockHash::from_byte_array([8;32]);let checkpoint=BlockHash::from_byte_array([4;32]);
+@@ -27,12 +28,15 @@
+                     }
+                 };
+                 socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+-                let mut reader=BufReader::new(socket.try_clone()?);let mut line=String::new();let mut length=None;
++                let mut reader=BufReader::new(socket.try_clone()?);let mut line=String::new();let mut length=None;let mut authenticated=false;
++                reader.read_line(&mut line)?;ensure!(line.split_whitespace().nth(1)==Some("/"),"wallet route forbidden");
+                 loop {
+                     line.clear();ensure!(reader.read_line(&mut line)?>0,"missing BCH request headers");
+                     if line=="\r\n" {break;}
++                    if line.to_ascii_lowercase().starts_with("authorization:") {authenticated=line.trim().ends_with("Basic Zml4dHVyZTpmaXh0dXJl");}
+                     if let Some(value)=line.to_ascii_lowercase().strip_prefix("content-length:") {length=Some(value.trim().parse::<usize>()?);}
+                 }
++                ensure!(authenticated,"missing observer authentication");
+                 let length=length.context("missing BCH request length")?;ensure!(length<4096,"oversized BCH test request");
+                 let mut bytes=vec![0;length];reader.read_exact(&mut bytes)?;let request:Value=serde_json::from_slice(&bytes)?;
+                 ensure!(request["method"]==*method,"unexpected BCH confirmation RPC order");
+@@ -61,14 +65,19 @@
+         });
+         let rpc=BchRpc::new(port,"fixture".into(),"fixture".into(),network,"fixture".into(),
+             "bchreg:qanchor".into(),ScriptBuf::from_bytes(vec![0x51]),"/Bitcoin Cash Node:29.0.0/".into())?;
+-        let result=if indexed {rpc.indexed_confirmed_transaction(txid,3).await} else {rpc.confirmed_transaction(txid,block,3).await};
++        let observer=observer::OwnedBchObserver::new(port,"fixture".into(),"fixture".into(),network,"/Bitcoin Cash Node:29.0.0/".into())?;
++        assert_ne!(rpc.deployment_commitment()?,observer.deployment_commitment()?);
++        let result=if chain_only {
++            if indexed {observer.indexed_confirmed_transaction(txid,3).await} else {observer.confirmed_transaction(txid,block,3).await}
++        } else if indexed {rpc.indexed_confirmed_transaction(txid,3).await} else {rpc.confirmed_transaction(txid,block,3).await};
+         server.join().unwrap()?;
+         if mode!=0 {assert!(result.is_err());} else {
+             let observed=result?;
+             assert_eq!(observed.transaction().compute_txid(),txid);assert_eq!(observed.confirmations(),3);
+             assert_eq!(observed.height(),100);assert_eq!(observed.block(),block);assert_eq!(observed.tip(),tip);
+-            assert_eq!(observed.deployment(),&rpc.deployment_commitment()?);
++            assert_eq!(observed.deployment(),&if chain_only {observer.deployment_commitment()?}else{rpc.deployment_commitment()?});
+         }
++    }
+     }
+     Ok(())
+ }
+diff --git a/swap-machine/src/bch_rpc/confirmed.rs b/swap-machine/src/bch_rpc/confirmed.rs
+--- a/swap-machine/src/bch_rpc/confirmed.rs
++++ b/swap-machine/src/bch_rpc/confirmed.rs
+@@ -37,13 +37,13 @@
+         "unsupported BCH transaction observation shape or token prefix");
+     Ok(transaction)
+ }
+-impl BchRpc {
++impl observer::OwnedBchObserver {
+     /// Index lookup supplies a location hint only; block lookup below performs
+     /// all active-chain and byte checks. Missing index/confirmation is an error.
+     pub async fn indexed_confirmed_transaction(&self,txid: Txid,minimum: u64) -> Result<ConfirmedTransaction> {
+         ensure!(minimum > 0,"zero BCH confirmation requirement");
+         #[derive(Deserialize)] struct Location {txid: Txid,blockhash: BlockHash}
+-        let location: Location = serde_json::from_str(self.rpc(false,"getrawtransaction",json!([txid,true])).await?.get())?;
++        let location: Location = serde_json::from_str(self.rpc(None,"getrawtransaction",json!([txid,true])).await?.get())?;
+         ensure!(location.txid == txid,"indexed BCH transaction identity mismatch");
+         self.confirmed_transaction(txid,location.blockhash,minimum).await
+     }
+@@ -52,8 +52,8 @@
+     pub async fn confirmed_transaction(&self,txid: Txid,block: BlockHash,minimum: u64) -> Result<ConfirmedTransaction> {
+         ensure!(minimum > 0 && block != BlockHash::all_zeros(),"invalid BCH confirmation requirement or block hint");
+         let chain = self.chain_state().await?;
+-        let raw: RawTransaction = serde_json::from_str(self.rpc(false,"getrawtransaction",json!([txid,true,block])).await?.get())?;
+-        let header: Header = serde_json::from_str(self.rpc(false,"getblockheader",json!([block,true])).await?.get())?;
++        let raw: RawTransaction = serde_json::from_str(self.rpc(None,"getrawtransaction",json!([txid,true,block])).await?.get())?;
++        let header: Header = serde_json::from_str(self.rpc(None,"getblockheader",json!([block,true])).await?.get())?;
+         let confirmations = raw.confirmations;
+         let transaction = validate(raw,&header,txid,block,chain.blocks,minimum)?;
+         let after = self.chain_state().await?;
+@@ -61,6 +61,20 @@
+             "BCH tip changed during transaction observation");
+         Ok(ConfirmedTransaction {deployment:self.deployment_commitment()?,tip:chain.bestblockhash,
+             block,height:header.height,confirmations,transaction})
++    }
++}
++
++impl BchRpc {
++    /// Preserve the historical configured node-wallet deployment identity for
++    /// existing claims. Root chain RPC proves no live wallet ownership; these
++    /// reads share the exact chain-only validation implementation.
++    pub async fn indexed_confirmed_transaction(&self,txid:Txid,minimum:u64)->Result<ConfirmedTransaction> {
++        let mut confirmed=self.observer.indexed_confirmed_transaction(txid,minimum).await?;
++        confirmed.deployment=self.deployment_commitment()?;Ok(confirmed)
++    }
++    pub async fn confirmed_transaction(&self,txid:Txid,block:BlockHash,minimum:u64)->Result<ConfirmedTransaction> {
++        let mut confirmed=self.observer.confirmed_transaction(txid,block,minimum).await?;
++        confirmed.deployment=self.deployment_commitment()?;Ok(confirmed)
+     }
+ }
+ 

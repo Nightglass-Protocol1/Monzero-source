@@ -1,0 +1,182 @@
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+index a64e22f09..881dda78e 100644
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -5,6 +5,7 @@ pub mod xmz_funding;
+ pub mod native_funding_rpc;
+ pub mod native_quote_destinations;
+ pub mod native_quote_signatures;
++pub mod native_trade_quote;
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+new file mode 100644
+index 000000000..3b1f05cbd
+--- /dev/null
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -0,0 +1,164 @@
++//! Signed commercial terms, not funding authority or a negotiated swap transcript.
++use anyhow::{Result, ensure};
++use bitcoin::Network;
++use std::collections::BTreeMap;
++use swap_core::xmz_address::XmzNetwork;
++use crate::{native_quote_destinations::QuoteDestinations, native_quote_signatures};
++
++/// Immutable validated terms. Callers must additionally enforce deployment policy,
++/// durable approval/replay protection and binding to the negotiated protocol state.
++pub struct VerifiedQuote {
++    terms: BTreeMap<String, String>,
++    commitment: [u8; 32],
++    destinations: QuoteDestinations,
++}
++
++impl VerifiedQuote {
++    /// Keys and address networks must be supplied by trusted local configuration.
++    pub fn verify(
++        payload: &[u8], now: u64, btc_key: &[u8; 32], xmz_key: &[u8; 32],
++        btc_signature: &[u8], xmz_signature: &[u8],
++        btc_network: Network, xmz_network: XmzNetwork,
++    ) -> Result<Self> {
++        let commitment = native_quote_signatures::verify(payload, btc_key, xmz_key,
++            btc_signature, xmz_signature)?;
++        let terms: BTreeMap<String, String> = serde_json::from_slice(payload)?;
++        const FIELDS: &[&str] = &[
++            "schema", "quoteId", "swapId", "btcFunder", "xmzFunder",
++            "btcGenesis", "xmzGenesis", "btcNetwork", "xmzNetwork",
++            "btcSatoshis", "xmzAtoms", "appFeeXmzAtoms", "btcNativeFeeMaxSatoshis",
++            "xmzNativeFeeMaxAtoms", "btcPayout", "btcRefund", "xmzPayout", "xmzRefund",
++            "btcConfirmations", "xmzConfirmations", "cancelBlocks", "punishBlocks", "expiresAt",
++        ];
++        ensure!(terms.len() == FIELDS.len() && FIELDS.iter().all(|k| terms.contains_key(*k)),
++            "unexpected commercial quote fields");
++        ensure!(terms["appFeeXmzAtoms"] == "0", "unsupported application fee");
++        for key in ["quoteId", "swapId"] {
++            let id: uuid::Uuid = terms[key].parse()?;
++            ensure!(!id.is_nil() && id.to_string() == terms[key], "invalid quote identifier");
++        }
++        for key in ["btcGenesis", "xmzGenesis", "btcFunder", "xmzFunder"] {
++            let value = &terms[key];
++            ensure!(value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit()
++                || (b'a'..=b'f').contains(&b)) && value != &"0".repeat(64),
++                "invalid quote identity");
++        }
++        ensure!(terms["btcGenesis"] != terms["xmzGenesis"], "identical chain identities");
++        let expected_btc = match btc_network {
++            Network::Bitcoin => "btc-mainnet", Network::Testnet => "btc-testnet",
++            Network::Regtest => "btc-regtest", _ => anyhow::bail!("unsupported Bitcoin deployment"),
++        };
++        ensure!(terms["btcNetwork"] == expected_btc, "wrong Bitcoin deployment");
++        let xmz_matches = match xmz_network {
++            XmzNetwork::Mainnet => matches!(terms["xmzNetwork"].as_str(), "xmz-mainnet" | "xmz-fakechain"),
++            XmzNetwork::Testnet => terms["xmzNetwork"] == "xmz-testnet",
++            XmzNetwork::Stagenet => terms["xmzNetwork"] == "xmz-stagenet",
++        };
++        ensure!(xmz_matches, "wrong XMZ address network");
++        let number = |key: &str| -> Result<u64> {
++            let value: u64 = terms[key].parse()?;
++            ensure!(value > 0 && value.to_string() == terms[key], "invalid quote integer");
++            Ok(value)
++        };
++        for key in ["btcSatoshis", "btcNativeFeeMaxSatoshis"] {
++            ensure!(number(key)? <= 2_100_000_000_000_000, "Bitcoin amount out of range");
++        }
++        number("xmzAtoms")?;
++        number("xmzNativeFeeMaxAtoms")?;
++        let btc_confirmations = number("btcConfirmations")?;
++        ensure!(btc_confirmations <= 1000 && number("xmzConfirmations")? <= 1000,
++            "confirmation count out of range");
++        for key in ["cancelBlocks", "punishBlocks"] {
++            let blocks = number(key)?;
++            ensure!(blocks > btc_confirmations && blocks <= 65535, "invalid relative timelock");
++        }
++        let expiry = number("expiresAt")?;
++        ensure!(expiry > now && expiry - now <= 3600, "quote outside validity window");
++        let destinations = QuoteDestinations::parse(btc_network, xmz_network,
++            &terms["btcPayout"], &terms["btcRefund"], &terms["xmzPayout"], &terms["xmzRefund"])?;
++        Ok(Self { terms, commitment, destinations })
++    }
++
++    pub fn terms(&self) -> &BTreeMap<String, String> { &self.terms }
++    pub fn commitment(&self) -> &[u8; 32] { &self.commitment }
++    pub fn destinations(&self) -> &QuoteDestinations { &self.destinations }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use ed25519_dalek::{Signer, SigningKey};
++    fn fixture() -> serde_json::Value {
++        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
++        let btc = SigningKey::from_bytes(&[1; 32]);
++        let xmz = SigningKey::from_bytes(&[2; 32]);
++        let address = bitcoin::Address::p2wsh(&bitcoin::ScriptBuf::new(), Network::Regtest).to_string();
++        let xmz_address = include_str!("../../swap-core/src/xmz_address_vectors.txt").lines().next().unwrap();
++        serde_json::json!({
++            "schema":"monzero-native-btc-xmz-quote-v1",
++            "quoteId":"10000000-0000-4000-8000-000000000001",
++            "swapId":"10000000-0000-4000-8000-000000000002",
++            "btcFunder":hex(&btc.verifying_key().to_bytes()),
++            "xmzFunder":hex(&xmz.verifying_key().to_bytes()),
++            "btcGenesis":"a".repeat(64), "xmzGenesis":"b".repeat(64),
++            "btcNetwork":"btc-regtest", "xmzNetwork":"xmz-fakechain",
++            "btcSatoshis":"500000", "xmzAtoms":"200000000000", "appFeeXmzAtoms":"0",
++            "btcNativeFeeMaxSatoshis":"10000", "xmzNativeFeeMaxAtoms":"1000000000",
++            "btcPayout":address, "btcRefund":address, "xmzPayout":xmz_address, "xmzRefund":xmz_address,
++            "btcConfirmations":"1", "xmzConfirmations":"1", "cancelBlocks":"10",
++            "punishBlocks":"20", "expiresAt":"1100"
++        })
++    }
++    fn verify(value: &serde_json::Value, now: u64) -> Result<VerifiedQuote> {
++        let btc = SigningKey::from_bytes(&[1; 32]);
++        let xmz = SigningKey::from_bytes(&[2; 32]);
++        let payload = serde_json::to_vec(value)?;
++        let sign = |key: &SigningKey, role: &str| {
++            let domain = format!("monzero-native-btc-xmz-quote-v1-{role}");
++            let mut framed = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:", domain.len(), domain, payload.len()).into_bytes();
++            framed.extend_from_slice(&payload);
++            key.sign(&framed).to_bytes()
++        };
++        VerifiedQuote::verify(&payload, now, &btc.verifying_key().to_bytes(),
++            &xmz.verifying_key().to_bytes(), &sign(&btc, "btc-funder"),
++            &sign(&xmz, "xmz-funder"), Network::Regtest, XmzNetwork::Mainnet)
++    }
++    #[test]
++    fn verifies_complete_signed_commercial_terms() {
++        let value = fixture();
++        let quote = verify(&value, 1000).unwrap();
++        assert_eq!(quote.terms()["xmzAtoms"], "200000000000");
++        assert_eq!(quote.destinations().btc_payout.to_string(), value["btcPayout"]);
++        assert_ne!(quote.commitment(), &[0; 32]);
++        assert!(verify(&value, 1100).is_err());
++        let mut later = value.clone(); later["expiresAt"] = "4601".into();
++        assert!(verify(&later, 1000).is_err());
++        later["expiresAt"] = "4600".into();
++        assert!(verify(&later, 1000).is_ok());
++    }
++    #[test]
++    fn valid_signatures_do_not_authorize_invalid_terms() {
++        let original = fixture();
++        for key in original.as_object().unwrap().keys() {
++            let mut missing = original.clone(); missing.as_object_mut().unwrap().remove(key);
++            assert!(verify(&missing, 1000).is_err(), "missing {key}");
++            let mut wrong_type = original.clone(); wrong_type[key] = 1.into();
++            assert!(verify(&wrong_type, 1000).is_err(), "type {key}");
++        }
++        for (key, value) in [
++            ("appFeeXmzAtoms", "1"), ("btcSatoshis", "0500000"), ("xmzAtoms", "0"),
++            ("xmzAtoms", "18446744073709551616"), ("btcNativeFeeMaxSatoshis", "2100000000000001"),
++            ("xmzNativeFeeMaxAtoms", "+1"), ("btcConfirmations", "1001"),
++            ("xmzConfirmations", "1001"), ("cancelBlocks", "1"), ("punishBlocks", "65536"),
++            ("btcNetwork", "btc-mainnet"), ("xmzNetwork", "xmz-testnet"),
++            ("btcGenesis", "bad"), ("xmzGenesis", "bad"),
++            ("quoteId", "00000000-0000-0000-0000-000000000000"), ("swapId", "bad"),
++            ("btcPayout", "bad"), ("btcRefund", "bad"), ("xmzPayout", "bad"), ("xmzRefund", "bad"),
++        ] {
++            let mut changed = original.clone(); changed[key] = value.into();
++            assert!(verify(&changed, 1000).is_err(), "accepted invalid {key}");
++        }
++        let mut extra = original; extra["unexpected"] = "value".into();
++        assert!(verify(&extra, 1000).is_err());
++    }
++}

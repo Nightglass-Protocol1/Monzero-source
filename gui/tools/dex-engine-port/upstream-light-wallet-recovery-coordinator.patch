@@ -1,0 +1,241 @@
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery/retention.rs b/swap-machine/src/litecoin_light/session/wallet/recovery/retention.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/recovery/retention.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery/retention.rs
+@@ -18,6 +18,11 @@
+         approved:sha256::Hash,context:sha256::Hash)->Result<Value> {
+         ensure!(approved==self.commitment,"recovery coverage differs from approval");
+         let journal=Journal::open(directory)?;
++        self.retain_with_journal(&journal,chain,book,approved,context)
++    }
++    fn retain_with_journal(&self,journal:&Journal,chain:&HeaderSequence,book:&mut AddressBook,
++        approved:sha256::Hash,context:sha256::Hash)->Result<Value> {
++        ensure!(approved==self.commitment,"recovery coverage differs from approval");
+         match journal.read(INTENT) {
+             Ok(_)=>{},
+             Err(error) if error.downcast_ref::<std::io::Error>()
+@@ -37,7 +42,7 @@
+             },
+             Err(error)=>return Err(error),
+         }
+-        resume(&journal,chain,book,approved,context)
++        resume(journal,chain,book,approved,context)
+     }
+ }
+ 
+@@ -91,3 +96,6 @@
+     ensure!(journal.read(COMPLETE)?==completed,"recovery completion read-back mismatch");
+     Ok(serde_json::from_slice(&completed)?)
+ }
++
++/// Authenticated allocation retention and verified backup coordination.
++pub mod mnemonic;
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic.rs b/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic.rs
+@@ -0,0 +1,93 @@
++//! Password-authenticated recovery coordination; activation remains separate.
++use super::*;
++use crate::litecoin_light::vault::mnemonic::storage::{MnemonicVault,backup};
++const CONTEXT:&str="light-recovery-backup-context.json";
++const COMPLETE:&str="light-recovery-backup-complete.json";
++/// Existing, canonical, private directories. The backup destination must be
++/// separate from the initial wallet backup and is fixed for this operation.
++pub struct Destinations<'a> {pub journal:&'a Path,pub backup:&'a Path}
++/// Both hashes come from the caller's separately approved review, not journal
++/// contents. Configuration must include the selected account and local paths.
++pub struct Approval {pub coverage:sha256::Hash,pub configuration:sha256::Hash}
++
++impl RecoveryCoverage {
++    /// Authenticate before publishing recovery state or changing allocations;
++    /// then retain allocations, verify an exact encrypted backup and receipt.
++    pub fn retain_mnemonic_recovery(&self,destinations:&Destinations<'_>,chain:&HeaderSequence,
++        book:&mut AddressBook,vault:&MnemonicVault,password:&[u8],approval:&Approval)->Result<Value> {
++        coordinate(Some(self),destinations,chain,book,vault,password,approval,|_|Ok(()))
++    }
++}
++/// Reverify password, exact vault, address records and backup on every retry.
++/// A saved completion file alone is never fresh backup verification.
++pub fn resume_mnemonic_recovery(destinations:&Destinations<'_>,chain:&HeaderSequence,
++    book:&mut AddressBook,vault:&MnemonicVault,password:&[u8],approval:&Approval)->Result<Value> {
++    coordinate(None,destinations,chain,book,vault,password,approval,|_|Ok(()))
++}
++#[derive(Clone,Copy,PartialEq)]
++enum Stage {Context,Allocations,Backup,Complete}
++fn coordinate(coverage:Option<&RecoveryCoverage>,destinations:&Destinations<'_>,chain:&HeaderSequence,
++    book:&mut AddressBook,vault:&MnemonicVault,password:&[u8],approval:&Approval,
++    checkpoint:impl Fn(Stage)->Result<()>)->Result<Value> {
++    if let Some(coverage)=coverage {
++        ensure!(coverage.commitment()==approval.coverage,"recovery coverage differs from approval");
++    }
++    let (descriptor,_)=book.backup_parts()?;
++    drop(vault.unlock_for_account(password,&descriptor)?);
++    let vault_digest=vault.record_commitment()?;
++    ensure!(destinations.journal!=destinations.backup,"recovery directories must differ");
++    let journal=Journal::open(destinations.journal)?;
++    // Opening validates canonical ownership, privacy and exclusive access before
++    // publishing any context. Do not keep this lease across the backup writer.
++    let backup_journal=Journal::open(destinations.backup)?;
++    let context=serde_json::to_vec(&json!({"schema":"monzero-light-recovery-backup-context-v1",
++        "coverageCommitment":approval.coverage,"configurationDigest":approval.configuration,
++        "vaultDigest":vault_digest,"account":descriptor,"backupDirectory":destinations.backup}))?;
++    match journal.read(CONTEXT) {
++        Ok(existing)=>ensure!(existing==context,"recovery backup context changed"),
++        Err(error) if error.downcast_ref::<std::io::Error>()
++            .is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
++            ensure!(coverage.is_some(),"missing recovery backup context; begin recovery first");
++            // A fresh operation cannot adopt an old or unrelated backup. This
++            // rejects the initial backup directory before addresses are changed.
++            match backup_journal.read("litecoin-wallet.backup") {
++                Err(error) if error.downcast_ref::<std::io::Error>()
++                    .is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{},
++                Err(error)=>return Err(error),
++                Ok(_)=>anyhow::bail!("recovery backup destination already contains a backup"),
++            }
++            match journal.read(COMPLETE) {
++                Err(error) if error.downcast_ref::<std::io::Error>()
++                    .is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{},
++                Err(error)=>return Err(error),
++                Ok(_)=>anyhow::bail!("recovery completion has no matching context"),
++            }
++        },
++        Err(error)=>return Err(error),
++    }
++    drop(backup_journal);
++    journal.retain(CONTEXT,&context)?;checkpoint(Stage::Context)?;
++    let allocation=if let Some(coverage)=coverage {
++        coverage.retain_with_journal(&journal,chain,book,approval.coverage,approval.configuration)?
++    } else {super::resume(&journal,chain,book,approval.coverage,approval.configuration)?};
++    checkpoint(Stage::Allocations)?;
++    let backup=backup::retain_current(destinations.backup,vault,book,password)?;
++    checkpoint(Stage::Backup)?;
++    let (_,record)=book.backup_parts()?;
++    let allocation_digest=sha256::Hash::hash(&record);
++    ensure!(allocation["allocationDigest"]==serde_json::to_value(allocation_digest)?
++        && vault.record_commitment()?==vault_digest,"recovered wallet changed before completion");
++    let receipt=serde_json::to_vec(&json!({"schema":"monzero-light-recovery-backup-complete-v1",
++        "configurationDigest":approval.configuration,"coverageCommitment":approval.coverage,
++        "contextDigest":sha256::Hash::hash(&context),"vaultDigest":vault_digest,
++        "allocationDigest":allocation_digest,"backupDigest":backup.digest(),
++        "backupDirectory":destinations.backup,"walletId":backup.wallet_id(),
++        "allocated":backup.allocated(),"allocationsRetained":true,"backupVerified":true,
++        "activated":false,"historyCompleteness":"unproven","activeSwapRecovery":false}))?;
++    journal.retain(COMPLETE,&receipt)?;
++    ensure!(journal.read(COMPLETE)?==receipt,"recovery backup completion read-back mismatch");
++    checkpoint(Stage::Complete)?;
++    Ok(serde_json::from_slice(&receipt)?)
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic/tests.rs b/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery/retention/mnemonic/tests.rs
+@@ -0,0 +1,89 @@
++use super::*;
++use crate::litecoin_light::{vault::mnemonic::MnemonicMaterial,network::{BtcNetwork,BchNetwork,DogeNetwork},
++    session::tests::{reply,server}};
++use std::{fs,path::PathBuf,os::unix::fs::PermissionsExt};
++use uuid::Uuid;
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().join(format!("recovery-backup-{}",Uuid::new_v4()));
++    fs::create_dir(&path)?;fs::set_permissions(&path,fs::Permissions::from_mode(0o700))?;Ok(Self(path.canonicalize()?))}}
++impl Drop for Directory {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
++const PASSWORD:&[u8]=b"disposable recovery coordination password";
++async fn scan(network:LightNetwork,account:&PublicAccount)->Result<(HeaderSequence,WalletObservation)> {
++    let mut responses=vec![reply(1,json!(["fixture","1.4"])),reply(2,json!({"genesis_hash":network.genesis(),
++        "hash_function":"sha256","server_version":"fixture","protocol_min":"1.4","protocol_max":"1.4.3","hosts":{}}))];
++    for id in 3..10 {responses.push(reply(id,json!([])));}
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,network).await?;
++    let chain=HeaderSequence::new(network)?;
++    let observation=session.refresh_wallet(&chain,account,[2,1],
++        &RefreshLimits {gap:2,addresses_per_branch:10,history_entries_per_branch:10}).await?;
++    drop(session);task.await?;Ok((chain,observation))
++}
++#[tokio::test]
++async fn authenticated_recovery_coordinates_interrupted_allocations_and_backup_on_four_chains()->Result<()> {
++    let cases=[(LightNetwork::Litecoin(LtcNetwork::Regtest),Stage::Context),
++        (LightNetwork::Bitcoin(BtcNetwork::Regtest),Stage::Allocations),
++        (LightNetwork::BitcoinCash(BchNetwork::Regtest),Stage::Backup),
++        (LightNetwork::Dogecoin(DogeNetwork::Regtest),Stage::Complete)];
++    for (network,stop) in cases {
++        let source=Directory::new()?;let addresses=Directory::new()?;let journal=Directory::new()?;
++        let destination=Directory::new()?;let initial=Directory::new()?;
++        let material=MnemonicMaterial::from_entropy(&[42;32])?;let wallet=Uuid::new_v4();
++        let account=||material.public_account(network,1,"optional recovery passphrase");
++        let vault=MnemonicVault::create(&source.0,network,wallet,PASSWORD,&material,"optional recovery passphrase")?;
++        let mut book=AddressBook::create(&addresses.0,account()?)?;
++        let request=Uuid::new_v4();let first=book.reserve(request,Branch::Receive)?.address().to_string();
++        let original=backup::export(&vault,&book,PASSWORD)?;
++        backup::save_verified(&initial.0,&original,PASSWORD,network,wallet)?;
++        let (chain,observation)=scan(network,&account()?).await?;
++        let coverage=observation.review_recovery_coverage(&chain,&book,[2,1])?;
++        let approval=Approval {coverage:coverage.commitment(),configuration:sha256::Hash::hash(b"reviewed pending config")};
++        let destinations=Destinations {journal:&journal.0,backup:&destination.0};
++        let before=fs::read(addresses.0.join("litecoin-address-book.json"))?;
++        assert!(coverage.retain_mnemonic_recovery(&destinations,&chain,&mut book,&vault,b"wrong",&approval).is_err());
++        assert_eq!(fs::read_dir(&journal.0)?.count(),0);assert_eq!(fs::read_dir(&destination.0)?.count(),0);
++        assert_eq!(fs::read(addresses.0.join("litecoin-address-book.json"))?,before);
++        assert!(coverage.retain_mnemonic_recovery(&Destinations {journal:&journal.0,backup:&initial.0},
++            &chain,&mut book,&vault,PASSWORD,&approval).is_err());
++        assert_eq!(fs::read_dir(&journal.0)?.count(),0);
++        let result=coordinate(Some(&coverage),&destinations,&chain,&mut book,&vault,PASSWORD,&approval,
++            |stage|{ensure!(stage!=stop,"injected recovery interruption");Ok(())});
++        assert!(result.is_err());
++        if stop==Stage::Context {assert_eq!(fs::read(addresses.0.join("litecoin-address-book.json"))?,before);}
++        let saved_backup=fs::read(destination.0.join("litecoin-wallet.backup")).ok();
++        drop(book);drop(vault);drop(coverage);drop(observation);
++        let vault=MnemonicVault::open(&source.0,network,wallet)?;
++        let mut book=AddressBook::open(&addresses.0,account()?)?;
++        let other=Directory::new()?;
++        assert!(resume_mnemonic_recovery(&Destinations {journal:&journal.0,backup:&other.0},
++            &chain,&mut book,&vault,PASSWORD,&approval).is_err());
++        let receipt=if stop==Stage::Context {
++            // No allocation intent was published yet; a new observation must
++            // reproduce the separately approved coverage before continuation.
++            assert!(resume_mnemonic_recovery(&destinations,&chain,&mut book,&vault,PASSWORD,&approval).is_err());
++            let (chain,observed)=scan(network,&account()?).await?;
++            let coverage=observed.review_recovery_coverage(&chain,&book,[2,1])?;
++            coverage.retain_mnemonic_recovery(&destinations,&chain,&mut book,&vault,PASSWORD,&approval)?
++        } else {resume_mnemonic_recovery(&destinations,&chain,&mut book,&vault,PASSWORD,&approval)?};
++        assert_eq!(receipt["backupVerified"],true);assert_eq!(receipt["activated"],false);
++        assert_eq!(receipt["allocated"],json!([4,3]));
++        assert_eq!(book.reserved(request,Branch::Receive)?.unwrap().address().to_string(),first);
++        let recovered=fs::read(destination.0.join("litecoin-wallet.backup"))?;
++        if let Some(saved)=saved_backup {assert_eq!(recovered,saved);}
++        assert_eq!(fs::read(initial.0.join("litecoin-wallet.backup"))?,original);
++        assert_eq!(backup::verify_current(&recovered,&vault,&book,PASSWORD)?.digest().to_string(),receipt["backupDigest"]);
++        assert_eq!(resume_mnemonic_recovery(&destinations,&chain,&mut book,&vault,PASSWORD,&approval)?,receipt);
++        // Historical completion cannot bypass authentication or backup integrity.
++        assert!(resume_mnemonic_recovery(&destinations,&chain,&mut book,&vault,b"wrong",&approval).is_err());
++        let mut damaged=recovered.clone();let end=damaged.len()-1;damaged[end]^=1;
++        fs::write(destination.0.join("litecoin-wallet.backup"),&damaged)?;
++        assert!(resume_mnemonic_recovery(&destinations,&chain,&mut book,&vault,PASSWORD,&approval).is_err());
++        assert_eq!(fs::read(destination.0.join("litecoin-wallet.backup"))?,damaged);
++        // Completion records and local context never contain recovery material.
++        for entry in fs::read_dir(&journal.0)? {
++            let bytes=fs::read(entry?.path())?;let public=String::from_utf8(bytes)?;
++            assert!(!public.contains(&*material.reveal()));assert!(!public.contains("optional recovery passphrase"));
++            assert!(!public.contains(std::str::from_utf8(PASSWORD)?));
++        }
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+--- a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+@@ -101,6 +101,14 @@
+         ensure!(serde_json::to_vec(&actual.descriptor())?==serde_json::to_vec(expected)?,
+             "mnemonic vault does not match public account");
+         Ok(unlocked)
++    }
++
++    /// Bind a recovery intent to the exact retained encrypted vault record.
++    /// This is a public ciphertext digest, never key material or authentication.
++    pub fn record_commitment(&self)->Result<bitcoin::hashes::sha256::Hash> {
++        use bitcoin::hashes::Hash;
++        ensure!(self.journal.read(RECORD)?==self.bytes,"mnemonic vault changed; reopen required");
++        Ok(bitcoin::hashes::sha256::Hash::hash(&self.bytes))
+     }
+ 
+     pub fn unlock(&self,password:&[u8])->Result<UnlockedMnemonic> {

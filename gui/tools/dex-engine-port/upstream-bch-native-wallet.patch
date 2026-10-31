@@ -1,0 +1,279 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated.rs
+@@ -10,6 +10,8 @@
+ use swap_core::{bitcoin::PublicKey, monero};
+ use crate::bch_quote::{Policy, VerifiedBchQuote};
+ use super::ProvenNativeAdaptor;
++
++pub mod native_wallet;
+ 
+ const DOMAIN: &str = "monzero-bch-xmz-native-proof-v1";
+ const MAX_FRAME: usize = 200_000;
+@@ -38,6 +40,7 @@
+ /// and signed proof against the independently retained admission context.
+ pub struct AuthenticatedNativeAdaptor {
+     quote_commitment: [u8;32], role: Role, binding: ProvenNativeAdaptor,
++    proof_commitment: [u8;32],
+ }
+ 
+ fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+@@ -82,7 +85,10 @@
+             && adaptor.to_bytes() != plan.terms().native_funder_signing_key.serialize(),
+             "BCH contract signing key reused as a native adaptor");
+         let binding = ProvenNativeAdaptor::verify(adaptor,frame.native_spend_key,&frame.proof)?;
+-        Ok(Self { quote_commitment:*quote.commitment(),role,binding })
++        use sha2::{Digest,Sha256};
++        let mut hash = Sha256::new(); hash.update(DOMAIN); hash.update([0]);
++        hash.update(bytes); hash.update(signature);
++        Ok(Self { quote_commitment:*quote.commitment(),role,binding,proof_commitment:hash.finalize().into() })
+     }
+ 
+     /// Inspect the exact signed spend using the quoted contract and derive the
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet.rs
+@@ -0,0 +1,125 @@
++//! Shared native wallet key material, not funding or relay authority.
++//! View frames contain private view-key shares: use private authenticated
++//! transport/storage, never public order-book messages or diagnostic logs.
++use super::*;
++use curve25519_dalek_ng::{edwards::{CompressedEdwardsY,EdwardsPoint},traits::Identity};
++use sha2::{Digest,Sha256};
++use swap_core::xmz_address::XmzAddress;
++
++const VIEW_DOMAIN: &str = "monzero-bch-xmz-private-view-v1";
++const MAX_VIEW_FRAME: usize = 2048;
++
++pub struct NativePair {
++    bch: AuthenticatedNativeAdaptor, native: AuthenticatedNativeAdaptor,
++    pair_commitment: [u8;32], spend_public: [u8;32],
++}
++
++/// No Debug or implicit serialization: this includes a private view key.
++/// Local secret ownership, transcript acknowledgement, durable state and both
++/// chain observations must still be checked before funding the derived address.
++pub struct NativeWalletKeys {
++    pair: NativePair, address: XmzAddress, view: monero::PrivateViewKey,
++    transcript: [u8;32],
++}
++
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct ViewFrame { schema: String, pair_commitment: String, role: Role, view_share: [u8;32] }
++fn encode(frame: &ViewFrame) -> Result<Vec<u8>> {
++    Ok(serde_json::to_vec(&serde_json::to_value(frame)?)?)
++}
++fn view_key(bytes: &[u8;32]) -> Result<monero::PrivateKey> {
++    let key = monero::PrivateKey::from_slice(bytes).map_err(|_|anyhow::anyhow!("invalid BCH native view share"))?;
++    ensure!(key.as_bytes() == *bytes && *bytes != [0;32], "noncanonical or zero BCH native view share");
++    Ok(key)
++}
++
++pub fn view_signing_bytes(frame: &[u8], role: Role) -> Result<Vec<u8>> {
++    ensure!(!frame.is_empty() && frame.len() <= MAX_VIEW_FRAME,"invalid BCH private view frame size");
++    let domain = format!("{VIEW_DOMAIN}-{}",role.domain());
++    let mut bytes = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:",domain.len(),domain,frame.len()).into_bytes();
++    bytes.extend_from_slice(frame); Ok(bytes)
++}
++
++impl NativePair {
++    pub fn new(quote: &VerifiedBchQuote, bch: AuthenticatedNativeAdaptor,
++        native: AuthenticatedNativeAdaptor) -> Result<Self> {
++        ensure!(bch.role == Role::BchFunder && native.role == Role::NativeFunder
++            && bch.quote_commitment == *quote.commitment() && native.quote_commitment == *quote.commitment(),
++            "BCH native pair quote or role mismatch");
++        ensure!(bch.binding.adaptor != native.binding.adaptor && bch.binding.native != native.binding.native,
++            "BCH participants reused native adaptor keys");
++        let left = CompressedEdwardsY(bch.binding.native).decompress().context("invalid BCH native pair key")?;
++        let right = CompressedEdwardsY(native.binding.native).decompress().context("invalid BCH native pair key")?;
++        let spend = left + right;
++        ensure!(spend != EdwardsPoint::identity(), "BCH native spend shares cancel");
++        let mut hash = Sha256::new(); hash.update(b"monzero-bch-xmz-native-pair-v1\0");
++        hash.update(quote.commitment()); hash.update(bch.proof_commitment); hash.update(native.proof_commitment);
++        Ok(Self { bch,native,pair_commitment:hash.finalize().into(),spend_public:spend.compress().to_bytes() })
++    }
++
++    /// This output contains a private scalar and must never be logged.
++    pub fn view_frame(&self, role: Role, share: &monero::PrivateViewKey) -> Result<Vec<u8>> {
++        view_key(&share.0.as_bytes())?;
++        encode(&ViewFrame { schema:VIEW_DOMAIN.into(),pair_commitment:hex(&self.pair_commitment),
++            role,view_share:share.0.as_bytes() })
++    }
++
++    fn verify_view(&self, quote: &VerifiedBchQuote, bytes: &[u8], signature: &[u8], role: Role)
++        -> Result<monero::PrivateKey> {
++        let message = view_signing_bytes(bytes,role)?;
++        // Suppress decoder diagnostics that could contain private material.
++        let frame: ViewFrame = serde_json::from_slice(bytes).map_err(|_|anyhow::anyhow!("invalid BCH private view frame"))?;
++        ensure!(frame.schema == VIEW_DOMAIN && frame.role == role
++            && frame.pair_commitment == hex(&self.pair_commitment), "BCH private view frame context mismatch");
++        ensure!(encode(&frame)? == bytes, "noncanonical BCH private view frame");
++        let identity = &quote.terms()[role.identity()]; let mut pin = [0;32];
++        for (i,byte) in pin.iter_mut().enumerate() { *byte = u8::from_str_radix(&identity[i*2..i*2+2],16)?; }
++        VerifyingKey::from_bytes(&pin)?.verify_strict(&message,&Signature::from_slice(signature)?)?;
++        view_key(&frame.view_share)
++    }
++
++    /// Frames are ordered BCH funder, native funder. Both must be signed for this
++    /// exact proof pair; possession of a single participant's frame is insufficient.
++    pub fn finish(self, quote: &VerifiedBchQuote, policy: &Policy, now: u64,
++        frames: [(&[u8],&[u8]);2]) -> Result<NativeWalletKeys> {
++        quote.check_policy(policy,now)?;
++        ensure!(self.bch.quote_commitment == *quote.commitment(), "BCH native wallet quote mismatch");
++        let bch = self.verify_view(quote,frames[0].0,frames[0].1,Role::BchFunder)?;
++        let native = self.verify_view(quote,frames[1].0,frames[1].1,Role::NativeFunder)?;
++        let view = bch + native;
++        ensure!(view.as_bytes() != [0;32], "BCH native view shares cancel");
++        let spend = monero::PublicKey::from_slice(&self.spend_public)?;
++        let public_view = monero::PublicKey::from_private_key(&view);
++        let address = XmzAddress::new(policy.xmz_network,monero_address::AddressType::Legacy,
++            spend.decompress(),public_view.decompress())?;
++        let mut hash = Sha256::new(); hash.update(b"monzero-bch-xmz-native-wallet-v1\0"); hash.update(self.pair_commitment);
++        for (frame,signature) in frames { hash.update((frame.len() as u64).to_be_bytes()); hash.update(frame); hash.update(signature); }
++        Ok(NativeWalletKeys { pair:self,address,view:monero::PrivateViewKey(view),transcript:hash.finalize().into() })
++    }
++}
++
++impl NativeWalletKeys {
++    pub fn address(&self) -> &XmzAddress { &self.address }
++    pub fn private_view_key(&self) -> &monero::PrivateViewKey { &self.view }
++    pub fn transcript_commitment(&self) -> &[u8;32] { &self.transcript }
++
++    /// Reconstruct the native spend key only when the local secret matches its
++    /// authenticated share and the exact peer-revealing BCH spend verifies.
++    /// Caller must independently establish confirmation/reorg and release policy.
++    pub fn recover_spend_key(&self, quote: &VerifiedBchQuote, local_role: Role, local: &monero::PrivateKey,
++        funding: &[u8], outpoint: OutPoint, spend: &[u8], encrypted: &EncryptedSignature) -> Result<monero::PrivateKey> {
++        let (own,peer) = match local_role { Role::BchFunder => (&self.pair.bch,&self.pair.native),
++            Role::NativeFunder => (&self.pair.native,&self.pair.bch) };
++        ensure!(monero::PublicKey::from_private_key(local).decompress().compress().to_bytes() == own.binding.native,
++            "BCH native local secret differs from authenticated share");
++        let recovered = peer.recover_from_spend(quote,funding,outpoint,spend,encrypted)?;
++        let combined = *local + recovered;
++        ensure!(monero::PublicKey::from_private_key(&combined).decompress().compress().to_bytes() == self.pair.spend_public,
++            "recovered BCH native wallet key differs from shared address");
++        Ok(combined)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -0,0 +1,117 @@
++use super::*;
++use crate::{bch_quote::tests::{fixture,signed},common::CROSS_CURVE_PROOF_SYSTEM};
++use swap_core::compat::IntoDalekNg;
++use ed25519_dalek::{Signer,SigningKey};
++use ecdsa_fun::fun::Scalar;
++use bitcoin::{absolute,consensus::serialize,hashes::Hash,transaction::Version,
++    Amount,Sequence,Transaction,TxIn,TxOut,Txid,Witness};
++fn sign(bytes: &[u8], role: Role, view: bool) -> Vec<u8> {
++    let key = SigningKey::from_bytes(&[if role == Role::BchFunder {1} else {2};32]);
++    let message = if view { view_signing_bytes(bytes,role) } else { super::super::signing_bytes(bytes,role) }.unwrap();
++    key.sign(&message).to_bytes().to_vec()
++}
++struct Setup {
++    policy: Policy, quote: VerifiedBchQuote, spend: Vec<monero::PrivateKey>, view: Vec<monero::PrivateViewKey>,
++    frames: Vec<Vec<u8>>, signatures: Vec<Vec<u8>>,
++}
++impl Setup {
++    fn new() -> Result<Self> {
++        let (policy,terms) = fixture(); let quote = signed(&terms,&policy,1000)?;
++        let mut setup = Self {policy,quote,spend:vec![],view:vec![],frames:vec![],signatures:vec![]};
++        for role in [Role::BchFunder,Role::NativeFunder] {
++            let scalar = monero::Scalar::random(&mut rand::thread_rng());
++            let (proof,(secp,edwards)) = CROSS_CURVE_PROOF_SYSTEM.prove(&scalar.into_dalek_ng(),&mut rand::thread_rng());
++            let frame = super::super::frame(&setup.quote,role,secp.into(),edwards.compress().to_bytes(),proof)?;
++            setup.signatures.push(sign(&frame,role,false)); setup.frames.push(frame);
++            setup.spend.push(monero::PrivateKey::from_scalar(scalar));
++            setup.view.push(monero::PrivateViewKey::new_random(&mut rand::thread_rng()));
++        }
++        Ok(setup)
++    }
++    fn pair(&self) -> Result<NativePair> {
++        NativePair::new(&self.quote,
++            AuthenticatedNativeAdaptor::verify(&self.frames[0],&self.signatures[0],&self.quote,&self.policy,1000,Role::BchFunder)?,
++            AuthenticatedNativeAdaptor::verify(&self.frames[1],&self.signatures[1],&self.quote,&self.policy,1000,Role::NativeFunder)?)
++    }
++}
++
++#[test]
++fn shared_wallet_matches_recovered_success_and_refund_spend_keys() -> Result<()> {
++    let setup = Setup::new()?; let pair = setup.pair()?;
++    let b = pair.view_frame(Role::BchFunder,&setup.view[0])?;
++    let n = pair.view_frame(Role::NativeFunder,&setup.view[1])?;
++    let bs = sign(&b,Role::BchFunder,true); let ns = sign(&n,Role::NativeFunder,true);
++    let wallet = pair.finish(&setup.quote,&setup.policy,1000,[(&b,&bs),(&n,&ns)])?;
++    let spend = setup.spend[0]+setup.spend[1]; let view = setup.view[0].0+setup.view[1].0;
++    let expected = XmzAddress::new(setup.policy.xmz_network,monero_address::AddressType::Legacy,
++        monero::PublicKey::from_private_key(&spend).decompress(),monero::PublicKey::from_private_key(&view).decompress())?;
++    assert_eq!(wallet.address(),&expected);
++    assert_eq!(wallet.private_view_key().0.as_bytes(),view.as_bytes());
++    assert_eq!(wallet.transcript_commitment(),setup.pair()?.finish(&setup.quote,&setup.policy,1000,[(&b,&bs),(&n,&ns)])?.transcript_commitment());
++    let plan = setup.quote.recovery_plan();
++    let funding = Transaction { version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([7;32]),vout:0},
++            script_sig:bitcoin::ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++        output:vec![TxOut {value:Amount::from_sat(plan.terms().locked_atoms),script_pubkey:plan.lock().script_pubkey()}] };
++    let first = OutPoint {txid:funding.compute_txid(),vout:0};
++    let cancel = plan.lock().prepare_timeout(&serialize(&funding),&plan.lock_spend_terms(first))?;
++    for (local_index,role) in [(0,Role::BchFunder),(1,Role::NativeFunder)] {
++        let peer_index = 1-local_index;
++        let peer: super::super::Frame = serde_json::from_slice(&setup.frames[peer_index])?;
++        let (covenant,raw,outpoint,tag) = if local_index == 0 {
++            (plan.lock(),serialize(&funding),first,3)
++        } else { (plan.recovery(),serialize(&cancel),OutPoint {txid:cancel.compute_txid(),vout:0},4) };
++        let secret = Scalar::from_bytes([tag;32]).unwrap().non_zero().unwrap();
++        let encrypted = covenant.data_message().encrypted_sign(&secret,&peer.adaptor_key.into());
++        let mut decrypt = setup.spend[peer_index].as_bytes(); decrypt.reverse();
++        let decrypt = Scalar::from_bytes(decrypt).unwrap().non_zero().unwrap();
++        let signer = Point::from_bytes(covenant.terms().signing_key.serialize()).unwrap();
++        let der = covenant.data_message().decrypt(&signer,&decrypt,encrypted.clone())?;
++        let terms = if local_index == 0 {plan.lock_spend_terms(outpoint)} else {plan.recovery_spend_terms(outpoint)};
++        let tx = covenant.prepare_redemption(&raw,&terms,&der)?;
++        assert_eq!(wallet.recover_spend_key(&setup.quote,role,&setup.spend[local_index],&raw,outpoint,&serialize(&tx),&encrypted)?.as_bytes(),spend.as_bytes());
++        assert!(wallet.recover_spend_key(&setup.quote,role,&setup.spend[peer_index],&raw,outpoint,&serialize(&tx),&encrypted).is_err());
++    }
++    Ok(())
++}
++
++#[test]
++fn private_view_frames_require_exact_pair_role_signatures_and_canonical_scalars() -> Result<()> {
++    let setup = Setup::new()?; let pair = setup.pair()?;
++    let b = pair.view_frame(Role::BchFunder,&setup.view[0])?;
++    let n = pair.view_frame(Role::NativeFunder,&setup.view[1])?;
++    let bs = sign(&b,Role::BchFunder,true); let ns = sign(&n,Role::NativeFunder,true);
++    assert!(setup.pair()?.finish(&setup.quote,&setup.policy,2000,[(&b,&bs),(&n,&ns)]).is_err());
++    assert!(setup.pair()?.finish(&setup.quote,&setup.policy,1000,[(&n,&ns),(&b,&bs)]).is_err());
++    assert!(setup.pair()?.finish(&setup.quote,&setup.policy,1000,[(&b,&ns),(&n,&bs)]).is_err());
++    let mut variants = vec![];
++    for scalar in [[0;32],[255;32]] {
++        let mut frame: ViewFrame = serde_json::from_slice(&b)?; frame.view_share = scalar;
++        variants.push(encode(&frame)?);
++    }
++    let mut wrong_pair: ViewFrame = serde_json::from_slice(&b)?;
++    wrong_pair.pair_commitment = "00".repeat(32); variants.push(encode(&wrong_pair)?);
++    let mut duplicate = b.clone(); duplicate.splice(1..1,b"\"schema\":\"ignored\",".iter().copied()); variants.push(duplicate);
++    for invalid in variants {
++        let signature = sign(&invalid,Role::BchFunder,true);
++        assert!(setup.pair()?.finish(&setup.quote,&setup.policy,1000,[(&invalid,&signature),(&n,&ns)]).is_err());
++    }
++    let mut cancelling: ViewFrame = serde_json::from_slice(&n)?;
++    let first = curve25519_dalek_ng::scalar::Scalar::from_canonical_bytes(setup.view[0].0.as_bytes()).unwrap();
++    cancelling.view_share = (-first).to_bytes();
++    let bytes = encode(&cancelling)?; let signature = sign(&bytes,Role::NativeFunder,true);
++    assert!(setup.pair()?.finish(&setup.quote,&setup.policy,1000,[(&b,&bs),(&bytes,&signature)]).is_err());
++    Ok(())
++}
++
++#[test]
++fn different_roles_cannot_reuse_the_same_native_share() -> Result<()> {
++    let setup = Setup::new()?;
++    let mut reused: super::super::Frame = serde_json::from_slice(&setup.frames[0])?;
++    reused.role = Role::NativeFunder;
++    let bytes = super::super::canonical(&reused)?; let signature = sign(&bytes,Role::NativeFunder,false);
++    let bch = AuthenticatedNativeAdaptor::verify(&setup.frames[0],&setup.signatures[0],&setup.quote,&setup.policy,1000,Role::BchFunder)?;
++    let native = AuthenticatedNativeAdaptor::verify(&bytes,&signature,&setup.quote,&setup.policy,1000,Role::NativeFunder)?;
++    assert!(NativePair::new(&setup.quote,bch,native).is_err());
++    Ok(())
++}

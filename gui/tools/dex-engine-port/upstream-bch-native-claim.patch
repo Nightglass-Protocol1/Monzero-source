@@ -1,0 +1,165 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+@@ -0,0 +1,66 @@
++//! Private native-key recovery from an exact confirmed BCH covenant spend.
++//! This capability is not approval to import a wallet or prepare/relay a payout.
++use super::*;
++use bitcoin::{BlockHash,Txid,consensus::serialize};
++use serde_json::json;
++
++/// No Debug, Clone, Serialize or key getters. Future wallet operations must use
++/// an exclusively owned local session and separate durable execution intent.
++pub struct NativeClaim {
++    spend: Zeroizing<[u8;32]>,view: Zeroizing<[u8;32]>,address: XmzAddress,
++    native_txid: String,redemption: Txid,block: BlockHash,commitment: [u8;32],
++}
++impl NativeClaim {
++    #[cfg(test)]
++    pub(crate) fn spend_key(&self) -> &[u8;32] {&self.spend}
++    #[cfg(test)]
++    pub(crate) fn view_key(&self) -> &[u8;32] {&self.view}
++
++    pub fn address(&self) -> &XmzAddress {&self.address}
++    pub fn native_txid(&self) -> &str {&self.native_txid}
++    pub fn redemption_txid(&self) -> Txid {self.redemption}
++    pub fn block(&self) -> BlockHash {self.block}
++    pub fn commitment(&self) -> &[u8;32] {&self.commitment}
++}
++impl AdmittedExecution<'_> {
++    /// The peer-supplied txid/block are search hints only. The complete confirmed
++    /// transaction must satisfy this quote's exact funding and success covenant.
++    /// Recovered keys stay private; later wallet/payout actions need fresh checks.
++    pub async fn recover_bch_native_claim(&self,native: &impl FundingObserver,bch: &BchRpc,
++        redemption: Txid,block: Option<BlockHash>,now: u64) -> Result<NativeClaim> {
++        let context=self.success_context(bch,now)?;
++        let prepared=self.load_success("prepared",&context)?.context("missing original BCH success preparation")?;
++        ensure!(now>=prepared.at,"native claim predates success preparation");
++        if let Some(signed)=self.load_success("signed",&context)? {
++            ensure!(signed.frame==prepared.frame && signed.at>=prepared.at && now>=signed.at,
++                "native claim success signature differs from original preparation or time");
++        }
++        let native_txid=context.request.proof.tx_hash.0.clone();
++        let encrypted=context.agreement.check_success_frame(self.quote,context.funding.lock_outpoint(),
++            &native_txid,&prepared.frame)?;
++        let release=hash(RECORD,&encode(&prepared)?);
++        // All historical restoration precedes the final live observations.
++        let native_evidence=xmz_funding::verify(native,context.request,&self.policy.xmz_genesis,
++            u64::from(self.policy.xmz_confirmations)).await?;
++        let minimum=u64::from(self.policy.bch_confirmations);
++        let confirmed=match block {
++            Some(block)=>bch.confirmed_transaction(redemption,block,minimum).await?,
++            None=>bch.indexed_confirmed_transaction(redemption,minimum).await?,
++        };
++        ensure!(confirmed.deployment()==&bch.deployment_commitment()?,"BCH native recovery deployment changed");
++        ensure!(native.snapshot().await?==*native_evidence.snapshot(),"native chain changed during BCH claim recovery");
++        let raw=Zeroizing::new(serialize(confirmed.transaction()));
++        let spend=context.agreement.owned().recover_spend_key(self.quote,
++            &serialize(context.funding.transaction()),context.funding.lock_outpoint(),&raw,&encrypted)?;
++        let wallet=context.agreement.owned().wallet();
++        let address=wallet.address().clone();
++        let commitment=hash("monzero-bch-native-claim-v1",&serde_json::to_vec(&json!({
++            "quote":self.quote.commitment(),"admission":context.admission,"successPreparation":release,
++            "nativePayment":native_txid,"nativeProof":context.receipt,"address":address.to_string(),
++            "redemption":redemption,"redemptionBlock":confirmed.block(),
++            "bchDeployment":confirmed.deployment()}))?);
++        Ok(NativeClaim {spend:Zeroizing::new(spend.as_bytes()),
++            view:Zeroizing::new(wallet.private_view_key().0.as_bytes()),address,native_txid,
++            redemption,block:confirmed.block(),commitment})
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+@@ -150,3 +150,5 @@
+ }
+ 
+ pub mod receipt;
++
++pub mod native_claim;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs
+@@ -0,0 +1,45 @@
++use super::*;
++
++pub(super) async fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
++    bch_metadata: &std::path::Path,setup: &Setup,snapshots: &PrivateStore,fixture: &Fixture,
++    rpc: &BchRpc,server: &Server,txid: Txid) -> Result<()> {
++    let observer=fixture.funding_client()?;
++    let block=Some(BlockHash::from_byte_array([6;32]));
++    assert!(native.recover_bch_native_claim(&observer,rpc,txid,block,2040).await.is_err());
++    assert!(bch.recover_bch_native_claim(&observer,rpc,txid,block,2029).await.is_err());
++    let expected_spend=setup.spend[0]+setup.spend[1];
++    let expected_view=setup.view[0].0+setup.view[1].0;
++    let claim=bch.recover_bch_native_claim(&observer,rpc,txid,block,2040).await?;
++    assert_eq!(claim.spend_key(),&expected_spend.as_bytes());
++    assert_eq!(claim.view_key(),&expected_view.as_bytes());
++    assert_eq!(claim.native_txid(),"ab".repeat(32));assert_eq!(claim.redemption_txid(),txid);
++    assert_eq!(claim.address(),bch.restore_agreement()?.owned().wallet().address());
++    fixture.confirmed.store(false,Ordering::SeqCst);
++    assert!(bch.recover_bch_native_claim(&observer,rpc,txid,block,2040).await.is_err());
++    fixture.confirmed.store(true,Ordering::SeqCst);
++    fixture.incoming_unlock.store(500,Ordering::SeqCst);
++    assert!(bch.recover_bch_native_claim(&observer,rpc,txid,block,2040).await.is_err());
++    fixture.incoming_unlock.store(0,Ordering::SeqCst);
++    for mode in [1,2,3] {
++        server.state.lock().unwrap().redemption_confirmation_mode=mode;
++        assert!(bch.recover_bch_native_claim(&observer,rpc,txid,block,2040).await.is_err());
++    }
++    server.state.lock().unwrap().redemption_confirmation_mode=0;
++    // A prepared adaptor was already exposed before external identity signing.
++    // Restore a separate metadata history where the signed envelope was never saved.
++    let copied=PrivateStore::new()?;
++    for entry in std::fs::read_dir(bch_metadata)? {
++        let entry=entry?;if entry.file_type()?.is_file() {std::fs::copy(entry.path(),copied.0.join(entry.file_name()))?;}
++    }
++    let signed=format!("{}.bch-success-signed",setup.quote.terms()["swapId"]);
++    std::fs::remove_file(copied.0.join(format!("{signed}-pin")))?;
++    let private=snapshots.0.join(&signed);let held=snapshots.0.join("held-signed-success-for-claim-test");
++    std::fs::rename(&private,&held)?;
++    let restored=AdmittedExecution::resume(&copied.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    let recovered=restored.recover_bch_native_claim(&observer,rpc,txid,None,2041).await;
++    std::fs::rename(&held,&private)?;
++    let recovered=recovered?;
++    assert_eq!(recovered.spend_key(),claim.spend_key());assert_eq!(recovered.view_key(),claim.view_key());
++    assert_eq!(recovered.commitment(),claim.commitment());
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs
+@@ -1,7 +1,8 @@
+ use super::*;
++mod native_claim;
+ use agreement::execution::funding::success::receipt::redemption::relay::RedemptionRelayState;
+ 
+-pub(super) async fn exercise(setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
++pub(super) async fn exercise(bch: &mut AdmittedExecution<'_>,setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
+     fixture: &Fixture,rpc: &BchRpc,server: &Server,transaction: &Transaction) -> Result<()> {
+     let original_intent = server.state.lock().unwrap().relay_intent.clone();
+     server.state.lock().unwrap().redemption = Some(transaction.clone());
+@@ -54,6 +55,10 @@
+                 assert!(restored.observe_bch_redemption(rpc,None).await.is_err());
+             }
+             server.state.lock().unwrap().redemption_confirmation_mode=0;
++            let bch_metadata=original_intent.as_ref().context("missing original BCH relay intent")?
++                .parent().context("missing BCH metadata directory")?;
++            native_claim::exercise(bch,&mut restored,bch_metadata,setup,snapshots,fixture,rpc,server,txid).await?;
++
+         }
+ 
+         let again = restored.relay_bch_redemption(&observer,rpc,&review.commitment,2039).await;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
+@@ -59,6 +59,6 @@
+     assert!(native.retain_bch_redemption(2036).is_err());
+     std::fs::rename(&saved_pin,&pin)?;
+     assert_eq!(native.retained_bch_redemption()?.unwrap().commitment(),prepared.commitment());
+-    relay::exercise(setup,metadata,snapshots,fixture,rpc,server,&transaction).await?;
++    relay::exercise(bch,setup,metadata,snapshots,fixture,rpc,server,&transaction).await?;
+     Ok(())
+ }

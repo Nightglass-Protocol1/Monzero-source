@@ -1,0 +1,231 @@
+--- a/swap-core/src/lib.rs
++++ b/swap-core/src/lib.rs
+@@ -4,3 +4,4 @@
+ pub mod xmz;
+ pub mod xmz_address;
+ pub mod litecoin_address;
++pub mod dogecoin;
+--- /dev/null
++++ b/swap-core/src/dogecoin.rs
+@@ -0,0 +1,221 @@
++//! Dogecoin legacy address and timelocked-refund primitives.
++//! Parameters: dogecoin/dogecoin v1.14.9, src/chainparams.cpp and script/interpreter.cpp.
++//! This is not a cross-chain swap protocol or permission to broadcast. In particular,
++//! legacy transaction malleability must be addressed before adopting dependent spends.
++use anyhow::{ensure,Context,Result};
++use bitcoin::{absolute,base58,hashes::Hash,opcodes::all::{OP_CLTV,OP_DROP,OP_CHECKSIG},
++    script::{Builder,PushBytesBuf},secp256k1::{Message,PublicKey,Secp256k1,SecretKey},
++    sighash::{EcdsaSighashType,SighashCache},transaction::Version,
++    Amount,OutPoint,PubkeyHash,ScriptBuf,ScriptHash,Sequence,Transaction,TxIn,TxOut,Witness};
++use std::fmt;
++
++// Dogecoin v1.14.9 amount.h transaction value bound, not a supply limit.
++const MAX_MONEY_ATOMS:u64=1_000_000_000_000_000_000;
++
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub enum DogeNetwork {Mainnet,Testnet,Regtest}
++impl DogeNetwork {
++    pub fn name(self)->&'static str {match self {Self::Mainnet=>"main",Self::Testnet=>"test",Self::Regtest=>"regtest"}}
++    pub fn genesis(self)->&'static str {match self {
++        Self::Mainnet=>"1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691",
++        Self::Testnet=>"bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e",
++        Self::Regtest=>"3d2160a3b5dc4a9d62e7e66a295f70313ac808440ef7400d6c0772171ce973a5"}}
++    fn prefixes(self)->(u8,u8) {match self {Self::Mainnet=>(30,22),Self::Testnet=>(113,196),Self::Regtest=>(111,196)}}
++    /// Address prefixes overlap other deployments. Independently obtained chain
++    /// identity must also match; this alone does not authenticate a remote node.
++    pub fn verify_chain(self,chain:&str,genesis:&str)->Result<()> {
++        ensure!(chain==self.name() && genesis==self.genesis(),"wrong Dogecoin chain identity");Ok(())
++    }
++}
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++enum Kind {P2pkh,P2sh}
++#[derive(Clone,Debug,PartialEq,Eq)]
++pub struct DogeAddress {network:DogeNetwork,kind:Kind,payload:[u8;20]}
++impl DogeAddress {
++    pub fn parse(network:DogeNetwork,text:&str)->Result<Self> {
++        ensure!((26..=35).contains(&text.len()),"invalid Dogecoin address length");
++        let bytes=base58::decode_check(text)?;
++        ensure!(bytes.len()==21,"invalid Dogecoin address payload");
++        let prefixes=network.prefixes();
++        let kind=if bytes[0]==prefixes.0 {Kind::P2pkh} else if bytes[0]==prefixes.1 {Kind::P2sh}
++            else {anyhow::bail!("wrong Dogecoin address network or kind")};
++        let address=Self {network,kind,payload:bytes[1..].try_into()?};
++        ensure!(address.to_string()==text,"noncanonical Dogecoin address");Ok(address)
++    }
++    pub fn network(&self)->DogeNetwork {self.network}
++    pub fn script_pubkey(&self)->ScriptBuf {match self.kind {
++        Kind::P2pkh=>ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array(self.payload)),
++        Kind::P2sh=>ScriptBuf::new_p2sh(&ScriptHash::from_byte_array(self.payload)),
++    }}
++}
++impl fmt::Display for DogeAddress {
++    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {
++        let mut bytes=[0u8;21];let prefixes=self.network.prefixes();
++        bytes[0]=match self.kind {Kind::P2pkh=>prefixes.0,Kind::P2sh=>prefixes.1};
++        bytes[1..].copy_from_slice(&self.payload);f.write_str(&base58::encode_check(&bytes))
++    }
++}
++
++/// One-key, absolute-height refund lock. It has no counterparty redemption path;
++/// it must not be advertised as DOGE/XMZ atomic settlement.
++pub struct TimelockedRefund {network:DogeNetwork,key:PublicKey,height:u32,script:ScriptBuf}
++pub struct RefundTerms {
++    pub outpoint:OutPoint,pub locked_atoms:u64,pub recipient:DogeAddress,
++    pub fee_atoms:u64,pub maximum_fee_atoms:u64,pub minimum_output_atoms:u64,
++}
++pub struct PreparedRefund {transaction:Transaction,fee_atoms:u64}
++impl PreparedRefund {
++    pub fn transaction(&self)->&Transaction {&self.transaction}
++    pub fn fee_atoms(&self)->u64 {self.fee_atoms}
++}
++impl TimelockedRefund {
++    pub fn new(network:DogeNetwork,key:PublicKey,height:u32)->Result<Self> {
++        ensure!(height>0 && height<500_000_000,"Dogecoin refund requires an absolute block height");
++        let script=Builder::new().push_int(i64::from(height)).push_opcode(OP_CLTV).push_opcode(OP_DROP)
++            .push_slice(key.serialize()).push_opcode(OP_CHECKSIG).into_script();
++        Ok(Self {network,key,height,script})
++    }
++    pub fn redeem_script(&self)->&ScriptBuf {&self.script}
++    pub fn address(&self)->DogeAddress {DogeAddress {network:self.network,kind:Kind::P2sh,
++        payload:self.script.script_hash().to_byte_array()}}
++    /// Sign one exact legacy input and one exact output. This does not establish
++    /// confirmation, CLTV activation, maturity, unspentness or current fee policy.
++    /// Caller-owned quote/chain validation is still required before any relay.
++    pub fn prepare_refund(&self,funding:&Transaction,terms:&RefundTerms,key:&SecretKey)->Result<PreparedRefund> {
++        ensure!(terms.recipient.network==self.network,"wrong Dogecoin refund recipient network");
++        ensure!(PublicKey::from_secret_key(&Secp256k1::new(),key)==self.key,"wrong Dogecoin refund key");
++        ensure!(funding.input.iter().all(|input|input.witness.is_empty()),"Dogecoin funding cannot contain witness data");
++        ensure!(funding.compute_txid()==terms.outpoint.txid,"Dogecoin funding transaction mismatch");
++        let output=funding.output.get(terms.outpoint.vout as usize).context("missing Dogecoin funding output")?;
++        ensure!(output.script_pubkey==self.address().script_pubkey() && output.value.to_sat()==terms.locked_atoms
++            && terms.locked_atoms<=MAX_MONEY_ATOMS,"Dogecoin funding output differs from refund terms");
++        let total=funding.output.iter().try_fold(0u64,|sum,output|sum.checked_add(output.value.to_sat()))
++            .context("Dogecoin funding output total overflow")?;
++        ensure!(total<=MAX_MONEY_ATOMS,"Dogecoin funding exceeds consensus value range");
++        ensure!(terms.fee_atoms>0 && terms.fee_atoms<=terms.maximum_fee_atoms && terms.minimum_output_atoms>0,
++            "invalid Dogecoin refund fee or output policy");
++        let amount=terms.locked_atoms.checked_sub(terms.fee_atoms).context("Dogecoin fee exceeds lock")?;
++        ensure!(amount>=terms.minimum_output_atoms,"Dogecoin refund below minimum output");
++        let mut transaction=Transaction {version:Version::ONE,lock_time:absolute::LockTime::from_height(self.height)?,
++            input:vec![TxIn {previous_output:terms.outpoint,script_sig:ScriptBuf::new(),
++                sequence:Sequence::ENABLE_LOCKTIME_NO_RBF,witness:Witness::new()}],
++            output:vec![TxOut {value:Amount::from_sat(amount),script_pubkey:terms.recipient.script_pubkey()}]};
++        sign_input(&mut transaction,&self.script,key)?;
++        Ok(PreparedRefund {transaction,fee_atoms:terms.fee_atoms})
++    }
++}
++fn sign_input(transaction:&mut Transaction,script:&ScriptBuf,key:&SecretKey)->Result<()> {
++    let digest=SighashCache::new(&*transaction).legacy_signature_hash(0,script,EcdsaSighashType::All.to_u32())?;
++    let signature=Secp256k1::new().sign_ecdsa(&Message::from_digest(digest.to_byte_array()),key);
++    let mut bytes=signature.serialize_der().to_vec();bytes.push(EcdsaSighashType::All.to_u32() as u8);
++    transaction.input[0].script_sig=Builder::new().push_slice(PushBytesBuf::try_from(bytes)?)
++        .push_slice(PushBytesBuf::try_from(script.as_bytes().to_vec())?).into_script();
++    Ok(())
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn key(byte:u8)->SecretKey {SecretKey::from_slice(&[byte;32]).unwrap()}
++    #[test]
++    fn address_networks_require_independent_chain_identity()->Result<()> {
++        for network in [DogeNetwork::Mainnet,DogeNetwork::Testnet,DogeNetwork::Regtest] {
++            for kind in [Kind::P2pkh,Kind::P2sh] {
++                let address=DogeAddress {network,kind,payload:[1;20]};
++                assert_eq!(DogeAddress::parse(network,&address.to_string())?,address);
++                assert!(DogeAddress::parse(network,&format!(" {}",address)).is_err());
++                let mut damaged=address.to_string();damaged.pop();damaged.push('0');
++                assert!(DogeAddress::parse(network,&damaged).is_err());
++            }
++            network.verify_chain(network.name(),network.genesis())?;
++            assert!(network.verify_chain(network.name(),"00").is_err());
++        }
++        assert!(DogeAddress::parse(DogeNetwork::Mainnet,"1BoatSLRHtKNngkdXEeobR76b53LETtpyT").is_err());
++        let test=DogeAddress {network:DogeNetwork::Testnet,kind:Kind::P2pkh,payload:[1;20]};
++        assert!(DogeAddress::parse(DogeNetwork::Regtest,&test.to_string()).is_err());
++        // Test and regtest P2SH prefixes overlap: parsing cannot prove deployment.
++        let test=DogeAddress {network:DogeNetwork::Testnet,kind:Kind::P2sh,payload:[1;20]};
++        assert!(DogeAddress::parse(DogeNetwork::Regtest,&test.to_string()).is_ok());
++        assert!(DogeNetwork::Regtest.verify_chain("test",DogeNetwork::Testnet.genesis()).is_err());
++        Ok(())
++    }
++    #[test]
++    fn refund_signer_binds_parent_key_recipient_amount_and_fee()->Result<()> {
++        let network=DogeNetwork::Regtest;let key=key(1);
++        let public=PublicKey::from_secret_key(&Secp256k1::new(),&key);
++        assert!(TimelockedRefund::new(network,public,0).is_err());
++        assert!(TimelockedRefund::new(network,public,500_000_000).is_err());
++        let lock=TimelockedRefund::new(network,public,1410)?;
++        let funding=Transaction {version:Version::ONE,lock_time:absolute::LockTime::ZERO,
++            input:vec![TxIn::default()],output:vec![TxOut {value:Amount::from_sat(1_000_000_000),script_pubkey:lock.address().script_pubkey()}]};
++        let mut terms=RefundTerms {outpoint:OutPoint {txid:funding.compute_txid(),vout:0},locked_atoms:1_000_000_000,
++            recipient:DogeAddress {network,kind:Kind::P2pkh,payload:[2;20]},fee_atoms:1_000_000,
++            maximum_fee_atoms:1_000_000,minimum_output_atoms:100_000_000};
++        let prepared=lock.prepare_refund(&funding,&terms,&key)?;
++        let tx=prepared.transaction();
++        assert_eq!(tx.lock_time.to_consensus_u32(),1410);
++        assert_eq!(tx.output[0].value.to_sat(),999_000_000);
++        assert_eq!(tx.output[0].script_pubkey,terms.recipient.script_pubkey());
++        assert_eq!(prepared.fee_atoms(),1_000_000);
++        assert_eq!(lock.prepare_refund(&funding,&terms,&key)?.transaction(),tx);
++        assert!(lock.prepare_refund(&funding,&terms,&super::tests::key(2)).is_err());
++        terms.maximum_fee_atoms=999_999;assert!(lock.prepare_refund(&funding,&terms,&key).is_err());terms.maximum_fee_atoms=1_000_000;
++        terms.minimum_output_atoms=1_000_000_000;assert!(lock.prepare_refund(&funding,&terms,&key).is_err());terms.minimum_output_atoms=100_000_000;
++        terms.locked_atoms-=1;assert!(lock.prepare_refund(&funding,&terms,&key).is_err());terms.locked_atoms+=1;
++        terms.outpoint.vout=1;assert!(lock.prepare_refund(&funding,&terms,&key).is_err());terms.outpoint.vout=0;
++        let mut changed=funding.clone();changed.output[0].script_pubkey=ScriptBuf::new();
++        assert!(lock.prepare_refund(&changed,&terms,&key).is_err());
++        terms.outpoint.txid=changed.compute_txid();
++        assert!(lock.prepare_refund(&changed,&terms,&key).is_err()); // Matching parent identity, wrong lock script.
++        terms.outpoint.txid=funding.compute_txid();
++        let mut witnessed=funding.clone();witnessed.input[0].witness.push([1]);
++        assert!(lock.prepare_refund(&witnessed,&terms,&key).is_err());
++        let mut excessive=funding.clone();excessive.output.push(TxOut {value:Amount::from_sat(MAX_MONEY_ATOMS-terms.locked_atoms+1),script_pubkey:ScriptBuf::new()});
++        terms.outpoint.txid=excessive.compute_txid();
++        assert!(lock.prepare_refund(&excessive,&terms,&key).is_err()); // Individually valid values, invalid total.
++        terms.outpoint.txid=funding.compute_txid();
++        terms.fee_atoms=0;assert!(lock.prepare_refund(&funding,&terms,&key).is_err());terms.fee_atoms=1_000_000;
++        terms.recipient.network=DogeNetwork::Mainnet;assert!(lock.prepare_refund(&funding,&terms,&key).is_err());
++        Ok(())
++    }
++    #[test]
++    #[ignore = "requires owned Dogecoin regtest request/response files"]
++    #[cfg(unix)]
++    fn actual_dogecoin_refund_fixture()->Result<()> {
++        use serde::Deserialize;
++        use std::{io::{Read,Write},os::unix::fs::OpenOptionsExt};
++        #[derive(Deserialize)]
++        #[serde(deny_unknown_fields,rename_all="camelCase")]
++        struct Request {schema:String,request_id:String,height:u32,funding:Option<String>,vout:Option<u32>,recipient:Option<String>}
++        let input=std::env::var_os("MONZERO_DOGE_PRIMITIVE_REQUEST").context("missing Dogecoin fixture request")?;
++        let output=std::env::var_os("MONZERO_DOGE_PRIMITIVE_RESPONSE").context("missing Dogecoin fixture response")?;
++        let mut bytes=Vec::new();std::fs::File::open(input)?.take(16385).read_to_end(&mut bytes)?;
++        ensure!(bytes.len()<=16384,"oversized Dogecoin fixture request");
++        let request:Request=serde_json::from_slice(&bytes)?;
++        ensure!(request.schema=="monzero-doge-primitive-request-v1" && request.request_id.len()==32
++            && request.request_id.bytes().all(|b|b.is_ascii_hexdigit()),"invalid Dogecoin fixture context");
++        // Public, deterministic test key, never included in production builds.
++        let key=key(7);let network=DogeNetwork::Regtest;
++        let lock=TimelockedRefund::new(network,PublicKey::from_secret_key(&Secp256k1::new(),&key),request.height)?;
++        let mut response=serde_json::json!({"schema":"monzero-doge-primitive-response-v1","requestId":request.request_id,
++            "address":lock.address().to_string(),"redeemScript":hex::encode(lock.redeem_script().as_bytes()),
++            "fullCrossChainSettlement":false,"executable":false});
++        if let Some(raw)=request.funding {
++            let funding:Transaction=bitcoin::consensus::deserialize(&hex::decode(raw)?)?;
++            let terms=RefundTerms {outpoint:OutPoint {txid:funding.compute_txid(),vout:request.vout.context("missing output")?},
++                locked_atoms:1_000_000_000,recipient:DogeAddress::parse(network,&request.recipient.context("missing recipient")?)?,
++                fee_atoms:1_000_000,maximum_fee_atoms:1_000_000,minimum_output_atoms:100_000_000};
++            let prepared=lock.prepare_refund(&funding,&terms,&key)?;
++            response["raw"]=serde_json::json!(hex::encode(bitcoin::consensus::serialize(prepared.transaction())));
++            response["txid"]=serde_json::json!(prepared.transaction().compute_txid().to_string());
++            response["feeAtoms"]=serde_json::json!(prepared.fee_atoms().to_string());
++            // Independently signed invalid locktime isolates CLTV enforcement
++            // from ordinary signature failure in the actual node test.
++            let mut invalid=prepared.transaction().clone();invalid.lock_time=absolute::LockTime::ZERO;
++            invalid.input[0].script_sig=ScriptBuf::new();sign_input(&mut invalid,lock.redeem_script(),&key)?;
++            response["invalidLocktimeRaw"]=serde_json::json!(hex::encode(bitcoin::consensus::serialize(&invalid)));
++        } else {ensure!(request.vout.is_none() && request.recipient.is_none(),"incomplete Dogecoin signing request");}
++        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(output)?;
++        file.write_all(&serde_json::to_vec(&response)?)?;file.sync_all()?;Ok(())
++    }
++
++}

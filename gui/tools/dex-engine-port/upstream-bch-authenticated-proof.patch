@@ -1,0 +1,246 @@
+--- a/swap-machine/src/bch_key_recovery.rs
++++ b/swap-machine/src/bch_key_recovery.rs
+@@ -8,6 +8,8 @@
+ use swap_core::{bch::DataMessage, monero};
+ use zeroize::Zeroizing;
+ use crate::common::CROSS_CURVE_PROOF_SYSTEM;
++
++pub mod authenticated;
+ 
+ /// Non-deserializable proof-checked public binding. This does not establish
+ /// participant identity, quote ownership or uniqueness across trades.
+--- a/swap-machine/src/bch_quote.rs
++++ b/swap-machine/src/bch_quote.rs
+@@ -176,4 +176,4 @@
+ }
+ 
+ #[cfg(test)]
+-mod tests;
++pub(crate) mod tests;
+--- a/swap-machine/src/bch_quote/tests.rs
++++ b/swap-machine/src/bch_quote/tests.rs
+@@ -2,7 +2,7 @@
+ use ed25519_dalek::{Signer, SigningKey};
+ use bitcoin::secp256k1::{Secp256k1, SecretKey};
+ fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+-fn fixture() -> (Policy, BTreeMap<String,String>) {
++pub(crate) fn fixture() -> (Policy, BTreeMap<String,String>) {
+     let policy = Policy { bch_network:"bch-regtest".into(), bch_genesis:"b".repeat(64),
+         xmz_network:XmzNetwork::Mainnet, xmz_genesis:"a".repeat(64),
+         bch_confirmations:2, xmz_confirmations:10, cancel_blocks:20, punish_blocks:30,
+@@ -26,7 +26,7 @@
+         "bchMinimumOutputAtoms":"546", "expiresAt":"2000", "appFeeXmzAtoms":"0"});
+     (policy, serde_json::from_value(t).unwrap())
+ }
+-fn signed(t: &BTreeMap<String,String>, p: &Policy, now: u64) -> Result<VerifiedBchQuote> {
++pub(crate) fn signed(t: &BTreeMap<String,String>, p: &Policy, now: u64) -> Result<VerifiedBchQuote> {
+     let payload = serde_json::to_vec(t)?;
+     let b = SigningKey::from_bytes(&[1;32]); let x = SigningKey::from_bytes(&[2;32]);
+     let message = |role| {
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated.rs
+@@ -0,0 +1,109 @@
++//! Public adaptor proof frames bound to a jointly signed quote and role.
++//! This is not a complete key exchange: local secret ownership, combined native
++//! wallet/view keys, durable transcript state and release policy remain separate.
++use anyhow::{Context, Result, ensure};
++use bitcoin::OutPoint;
++use ed25519_dalek::{Signature, VerifyingKey};
++use serde::{Deserialize, Serialize};
++use ecdsa_fun::{adaptor::EncryptedSignature, fun::Point};
++use sigma_fun::ext::dl_secp256k1_ed25519_eq::CrossCurveDLEQProof;
++use swap_core::{bitcoin::PublicKey, monero};
++use crate::bch_quote::{Policy, VerifiedBchQuote};
++use super::ProvenNativeAdaptor;
++
++const DOMAIN: &str = "monzero-bch-xmz-native-proof-v1";
++const MAX_FRAME: usize = 200_000;
++
++#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all="kebab-case")]
++pub enum Role { BchFunder, NativeFunder }
++impl Role {
++    fn identity(self) -> &'static str {
++        match self { Self::BchFunder => "bchFunder", Self::NativeFunder => "xmzFunder" }
++    }
++    fn domain(self) -> &'static str {
++        match self { Self::BchFunder => "bch-funder", Self::NativeFunder => "xmz-funder" }
++    }
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields, rename_all="camelCase")]
++struct Frame {
++    schema: String, quote_commitment: String, swap_id: String, role: Role,
++    adaptor_key: PublicKey, native_spend_key: [u8;32], proof: CrossCurveDLEQProof,
++}
++
++/// A checked public proof and role association, not a chain observation.
++/// Do not construct this from serialized state without revalidating the quote
++/// and signed proof against the independently retained admission context.
++pub struct AuthenticatedNativeAdaptor {
++    quote_commitment: [u8;32], role: Role, binding: ProvenNativeAdaptor,
++}
++
++fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
++fn canonical(frame: &Frame) -> Result<Vec<u8>> {
++    Ok(serde_json::to_vec(&serde_json::to_value(frame)?)?)
++}
++
++/// Prepare a public frame for the participant to sign with its pinned identity.
++/// Proof validity is enforced on acceptance, not inferred from this encoding.
++pub fn frame(quote: &VerifiedBchQuote, role: Role, adaptor: PublicKey,
++    native: [u8;32], proof: CrossCurveDLEQProof) -> Result<Vec<u8>> {
++    let bytes = canonical(&Frame { schema: DOMAIN.into(), quote_commitment:hex(quote.commitment()),
++        swap_id:quote.terms()["swapId"].clone(), role, adaptor_key:adaptor, native_spend_key:native, proof })?;
++    ensure!(bytes.len() <= MAX_FRAME, "oversized BCH native proof frame");
++    Ok(bytes)
++}
++
++pub fn signing_bytes(bytes: &[u8], role: Role) -> Result<Vec<u8>> {
++    ensure!(!bytes.is_empty() && bytes.len() <= MAX_FRAME, "invalid BCH native proof frame size");
++    let domain = format!("{DOMAIN}-{}",role.domain());
++    let mut message = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:",domain.len(),domain,bytes.len()).into_bytes();
++    message.extend_from_slice(bytes); Ok(message)
++}
++
++impl AuthenticatedNativeAdaptor {
++    pub fn verify(bytes: &[u8], signature: &[u8], quote: &VerifiedBchQuote,
++        policy: &Policy, now: u64, role: Role) -> Result<Self> {
++        quote.check_policy(policy,now)?;
++        let message = signing_bytes(bytes,role)?;
++        let frame: Frame = serde_json::from_slice(bytes)?;
++        ensure!(frame.schema == DOMAIN && frame.role == role
++            && frame.quote_commitment == hex(quote.commitment()) && frame.swap_id == quote.terms()["swapId"],
++            "BCH native proof belongs to another role or quote");
++        ensure!(canonical(&frame)? == bytes, "noncanonical BCH native proof frame");
++        let identity = &quote.terms()[role.identity()];
++        let mut pin = [0;32];
++        for (i,byte) in pin.iter_mut().enumerate() { *byte = u8::from_str_radix(&identity[i*2..i*2+2],16)?; }
++        VerifyingKey::from_bytes(&pin)?.verify_strict(&message,&Signature::from_slice(signature)?)?;
++        let adaptor: Point = frame.adaptor_key.into();
++        let plan = quote.recovery_plan();
++        ensure!(adaptor.to_bytes() != plan.terms().bch_funder_signing_key.serialize()
++            && adaptor.to_bytes() != plan.terms().native_funder_signing_key.serialize(),
++            "BCH contract signing key reused as a native adaptor");
++        let binding = ProvenNativeAdaptor::verify(adaptor,frame.native_spend_key,&frame.proof)?;
++        Ok(Self { quote_commitment:*quote.commitment(),role,binding })
++    }
++
++    /// Inspect the exact signed spend using the quoted contract and derive the
++    /// appropriate native share. No confirmation, canonical-chain membership or
++    /// permission to import/spend the recovered share is implied by this result.
++    /// The native funder's share is revealed by success; the BCH funder's share
++    /// is revealed by the signed refund from the second covenant stage.
++    pub fn recover_from_spend(&self, quote: &VerifiedBchQuote, funding: &[u8], outpoint: OutPoint,
++        spend: &[u8], encrypted: &EncryptedSignature) -> Result<monero::PrivateKey> {
++        ensure!(self.quote_commitment == *quote.commitment(), "BCH proof recovery quote mismatch");
++        let plan = quote.recovery_plan();
++        let (covenant, terms) = match self.role {
++            Role::NativeFunder => (plan.lock(),plan.lock_spend_terms(outpoint)),
++            Role::BchFunder => (plan.recovery(),plan.recovery_spend_terms(outpoint)),
++        };
++        let signature = covenant.redemption_signature(funding,&terms,spend)?;
++        let signer = Point::from_bytes(covenant.terms().signing_key.serialize())
++            .context("invalid quoted BCH contract public key")?;
++        self.binding.recover_share(&covenant.data_message(),&signer,encrypted,&signature)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/tests.rs
+@@ -0,0 +1,92 @@
++use super::*;
++use crate::{bch_quote::tests::{fixture,signed},common::CROSS_CURVE_PROOF_SYSTEM};
++use swap_core::compat::IntoDalekNg;
++use ed25519_dalek::{Signer,SigningKey};
++use ecdsa_fun::fun::Scalar;
++use bitcoin::{absolute,consensus::serialize,hashes::Hash,transaction::Version,
++    Amount,Sequence,Transaction,TxIn,TxOut,Txid,Witness};
++fn sign(bytes: &[u8], role: Role) -> Vec<u8> {
++    let key = SigningKey::from_bytes(&[match role { Role::BchFunder=>1,Role::NativeFunder=>2 };32]);
++    key.sign(&signing_bytes(bytes,role).unwrap()).to_bytes().to_vec()
++}
++fn parent(script: bitcoin::ScriptBuf, atoms: u64) -> Transaction {
++    Transaction { version:Version::TWO, lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn { previous_output:OutPoint { txid:Txid::from_byte_array([7;32]),vout:0 },
++            script_sig:bitcoin::ScriptBuf::new(), sequence:Sequence::MAX,witness:Witness::new() }],
++        output:vec![TxOut { value:Amount::from_sat(atoms),script_pubkey:script }] }
++}
++
++#[test]
++fn authenticated_proofs_recover_native_shares_from_quoted_success_and_refund() -> Result<()> {
++    let (policy,terms) = fixture(); let quote = signed(&terms,&policy,1000)?;
++    let plan = quote.recovery_plan();
++    let funding = parent(plan.lock().script_pubkey(),plan.terms().locked_atoms);
++    let funding_raw = serialize(&funding);
++    let funding_outpoint = OutPoint { txid:funding.compute_txid(),vout:0 };
++    let cancel = plan.lock().prepare_timeout(&funding_raw,&plan.lock_spend_terms(funding_outpoint))?;
++    let cancel_raw = serialize(&cancel);
++    for role in [Role::NativeFunder,Role::BchFunder] {
++        let native = monero::Scalar::random(&mut rand::thread_rng());
++        let original = monero::PrivateKey::from_scalar(native);
++        let (proof,(adaptor,edwards)) = CROSS_CURVE_PROOF_SYSTEM.prove(&native.into_dalek_ng(),&mut rand::thread_rng());
++        let bytes = frame(&quote,role,adaptor.into(),edwards.compress().to_bytes(),proof)?;
++        let accepted = AuthenticatedNativeAdaptor::verify(&bytes,&sign(&bytes,role),&quote,&policy,1000,role)?;
++        let (covenant,raw,outpoint,secret_tag) = match role {
++            Role::NativeFunder => (plan.lock(),&funding_raw,funding_outpoint,3),
++            Role::BchFunder => (plan.recovery(),&cancel_raw,OutPoint { txid:cancel.compute_txid(),vout:0 },4),
++        };
++        let secret = Scalar::from_bytes([secret_tag;32]).unwrap().non_zero().unwrap();
++        let mut scalar = original.as_bytes(); scalar.reverse();
++        let decrypt = Scalar::from_bytes(scalar).unwrap().non_zero().unwrap();
++        let signer = Point::from_bytes(covenant.terms().signing_key.serialize()).unwrap();
++        let encrypted = covenant.data_message().encrypted_sign(&secret,&adaptor);
++        let der = covenant.data_message().decrypt(&signer,&decrypt,encrypted.clone())?;
++        let spend_terms = match role { Role::NativeFunder=>plan.lock_spend_terms(outpoint),
++            Role::BchFunder=>plan.recovery_spend_terms(outpoint) };
++        let spend = covenant.prepare_redemption(raw,&spend_terms,&der)?;
++        assert_eq!(accepted.recover_from_spend(&quote,raw,outpoint,&serialize(&spend),&encrypted)?.as_bytes(),original.as_bytes());
++        let mut changed = spend.clone(); changed.output[0].value = Amount::from_sat(spend.output[0].value.to_sat()-1);
++        assert!(accepted.recover_from_spend(&quote,raw,outpoint,&serialize(&changed),&encrypted).is_err());
++        let wrong = OutPoint { txid:outpoint.txid,vout:1 };
++        assert!(accepted.recover_from_spend(&quote,raw,wrong,&serialize(&spend),&encrypted).is_err());
++        let timeout = covenant.prepare_timeout(raw,&spend_terms)?;
++        assert!(accepted.recover_from_spend(&quote,raw,outpoint,&serialize(&timeout),&encrypted).is_err());
++        let mut changed_terms = terms.clone(); changed_terms.insert("bchLockFeeAtoms".into(),"1001".into());
++        let other_quote = signed(&changed_terms,&policy,1000)?;
++        assert!(accepted.recover_from_spend(&other_quote,raw,outpoint,&serialize(&spend),&encrypted).is_err());
++    }
++    Ok(())
++}
++
++#[test]
++fn role_quote_identity_expiry_and_proof_are_all_required() -> Result<()> {
++    let (policy,terms) = fixture(); let quote = signed(&terms,&policy,1000)?;
++    let role = Role::NativeFunder;
++    let native = monero::Scalar::random(&mut rand::thread_rng());
++    let (proof,(adaptor,edwards)) = CROSS_CURVE_PROOF_SYSTEM.prove(&native.into_dalek_ng(),&mut rand::thread_rng());
++    let bytes = frame(&quote,role,adaptor.into(),edwards.compress().to_bytes(),proof)?;
++    let signature = sign(&bytes,role);
++    assert!(AuthenticatedNativeAdaptor::verify(&bytes,&signature,&quote,&policy,1000,role).is_ok());
++    assert!(AuthenticatedNativeAdaptor::verify(&bytes,&signature,&quote,&policy,1000,Role::BchFunder).is_err());
++    assert!(AuthenticatedNativeAdaptor::verify(&bytes,&signature,&quote,&policy,2000,role).is_err());
++    assert!(AuthenticatedNativeAdaptor::verify(&bytes,&sign(&bytes,Role::BchFunder),&quote,&policy,1000,role).is_err());
++    let mut other_terms = terms.clone(); other_terms.insert("bchLockFeeAtoms".into(),"1001".into());
++    let other = signed(&other_terms,&policy,1000)?;
++    assert!(AuthenticatedNativeAdaptor::verify(&bytes,&signature,&other,&policy,1000,role).is_err());
++    let mut invalid: Frame = serde_json::from_slice(&bytes)?;
++    invalid.native_spend_key = [0;32];
++    let invalid_bytes = canonical(&invalid)?;
++    assert!(AuthenticatedNativeAdaptor::verify(&invalid_bytes,&sign(&invalid_bytes,role),&quote,&policy,1000,role).is_err());
++    invalid = serde_json::from_slice(&bytes)?;
++    invalid.native_spend_key = monero::PublicKey::from_private_key(&monero::PrivateKey::from_scalar(
++        monero::Scalar::random(&mut rand::thread_rng()))).decompress().compress().to_bytes();
++    let invalid_bytes = canonical(&invalid)?;
++    assert!(AuthenticatedNativeAdaptor::verify(&invalid_bytes,&sign(&invalid_bytes,role),&quote,&policy,1000,role).is_err());
++    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
++    let mut duplicate = bytes.clone(); duplicate.splice(1..1,b"\"schema\":\"ignored\",".iter().copied());
++    for invalid_bytes in [Vec::new(),vec![b' ';MAX_FRAME+1],duplicate,serde_json::to_vec_pretty(&value)?] {
++        let sig = if invalid_bytes.is_empty() || invalid_bytes.len()>MAX_FRAME { vec![0;64] } else { sign(&invalid_bytes,role) };
++        assert!(AuthenticatedNativeAdaptor::verify(&invalid_bytes,&sig,&quote,&policy,1000,role).is_err());
++    }
++    Ok(())
++}

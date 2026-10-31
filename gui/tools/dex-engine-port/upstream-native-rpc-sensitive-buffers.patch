@@ -1,0 +1,264 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10926,6 +10926,7 @@
+  "bitcoin 0.32.8",
+  "bitcoin-harness",
+  "bitcoin-wallet",
++ "bytes",
+  "chacha20poly1305",
+  "curve25519-dalek-ng",
+  "digest_auth",
+diff --git a/swap-machine/Cargo.toml b/swap-machine/Cargo.toml
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -4,6 +4,7 @@
+ edition = "2024"
+ 
+ [dependencies]
++bytes = "=1.11.1"
+ bip39 = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+ chacha20poly1305 = "=0.10.1"
+ scrypt = { version = "=0.11.0", default-features = false }
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -18,6 +18,10 @@
+ pub mod topup_journal;
+ pub mod topup_recovery;
+ pub mod wallet_session;
++mod sensitive;
++#[cfg(test)]
++mod transport_tests;
++use sensitive::{SecretJson,request_body};
+ use anyhow::{Context, Result, ensure};
+ use serde_json::{Value, json};
+ use zeroize::Zeroizing;
+@@ -55,7 +59,8 @@
+     /// Only the native NOT_OPEN error means empty; other failures propagate.
+     pub async fn opened_wallet(&self, network: swap_core::xmz_address::XmzNetwork)
+         -> Result<Option<swap_core::xmz_address::XmzAddress>> {
+-        opened_wallet_response(&self.rpc_response(self.wallet, "get_address", json!({"account_index":0})).await?, network)
++        let response=SecretJson(self.rpc_response(self.wallet, "get_address", json!({"account_index":0})).await?);
++        opened_wallet_response(&response.0, network)
+     }
+ 
+     /// Replace caller-owned credentials and discard the old connection pool.
+@@ -67,17 +72,27 @@
+         Ok(())
+     }
+ 
+-    async fn rpc(&self, port: u16, method: &str, params: Value) -> Result<Value> {
+-        let response = self.rpc_response(port, method, params).await?;
+-        ensure!(response.get("error").is_none(), "native RPC rejected request");
+-        response.get("result").cloned().context("missing native RPC result")
+-    }
+-
+-    async fn rpc_response(&self, port: u16, method: &str, params: Value) -> Result<Value> {
++    fn rpc<'a>(&'a self, port: u16, method: &'a str, params: Value)
++        ->impl std::future::Future<Output=Result<Value>>+Send+'a {
++        let mut params=SecretJson(params);
++        async move {
++        let mut response = SecretJson(self.rpc_response(port, method, std::mem::take(&mut params.0)).await?);
++        ensure!(response.0.get("error").is_none(), "native RPC rejected request");
++        response.0.as_object_mut().context("native RPC response is not an object")?
++            .remove("result").context("missing native RPC result")
++        }
++    }
++
++    fn rpc_response<'a>(&'a self, port: u16, method: &'a str, params: Value)
++        ->impl std::future::Future<Output=Result<Value>>+Send+'a {
++        // Guard synchronously, including futures dropped without ever being polled.
++        let params=SecretJson(params);
++        async move {
++        let body=request_body(method,&params.0)?;
++        drop(params);
+         // Keep challenge and response on an uncontended pooled connection.
+         let _guard = self.auth_lock.lock().await;
+         let url = format!("http://127.0.0.1:{port}/json_rpc");
+-        let body = serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":"native-funding", "method":method, "params":params}))?;
+         let send = || self.client.post(&url).header("Content-Type", "application/json").body(body.clone());
+         let mut response = send().send().await.context("native local RPC transport")?;
+         ensure!(port != self.wallet || response.status() == reqwest::StatusCode::UNAUTHORIZED,
+@@ -95,21 +110,23 @@
+                     ensure!(drained <= 65536, "oversized Digest challenge body");
+                 }
+                 let context = digest_auth::AuthContext::new_post(username.as_str(), password.as_str(),
+-                    "/json_rpc", Some(body.as_slice()));
++                    "/json_rpc", Some(body.as_ref()));
+                 let authorization = sensitive_authorization(
+                     prompt.respond(&context).context("Digest response construction")?.to_string())?;
+                 response = send().header(reqwest::header::AUTHORIZATION, authorization).send().await?;
+             }
+         }
+         response = response.error_for_status()?;
+-        let mut bytes = Vec::new();
++        // Reserve the bounded maximum so growth cannot free uncleared earlier buffers.
++        let mut bytes = Zeroizing::new(Vec::with_capacity(1_048_576));
+         while let Some(chunk) = response.chunk().await? {
+             ensure!(bytes.len() + chunk.len() <= 1_048_576, "oversized native RPC response");
+             bytes.extend_from_slice(&chunk);
+         }
+-        let result: Value = serde_json::from_slice(&bytes).context("native RPC JSON")?;
+-        ensure!(result["id"] == "native-funding", "native RPC response identity mismatch");
+-        Ok(result)
++        let mut result = SecretJson(serde_json::from_slice(&bytes).context("native RPC JSON")?);
++        ensure!(result.0["id"] == "native-funding", "native RPC response identity mismatch");
++        Ok(std::mem::take(&mut result.0))
++        }
+     }
+ }
+ 
+diff --git a/swap-machine/src/native_funding_rpc/sensitive.rs b/swap-machine/src/native_funding_rpc/sensitive.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/sensitive.rs
+@@ -0,0 +1,83 @@
++//! Owned RPC buffers only. Socket/library buffers and returned result values
++//! have separate lifetimes; this module does not promise complete memory erasure.
++use super::*;
++use std::io::{self,Write};
++use zeroize::Zeroize;
++
++pub(super) struct SecretJson(pub(super) Value);
++impl Drop for SecretJson {fn drop(&mut self){clear(&mut self.0);}}
++fn clear(value:&mut Value) {
++    match value {
++        Value::String(text)=>wipe_string(text),
++        Value::Array(values)=>{for value in values {clear(value);}},
++        Value::Object(values)=>{
++            for (mut key,mut value) in std::mem::take(values) {wipe_string(&mut key);clear(&mut value);}
++        },
++        _=>(),
++    }
++    *value=Value::Null;
++}
++fn wipe_string(text:&mut String) {
++    text.zeroize();
++    #[cfg(test)]
++    WIPES.with(|count|{assert!(text.is_empty());count.set(count.get()+1);});
++}
++#[cfg(test)]
++std::thread_local! {static WIPES:std::cell::Cell<usize>=const {std::cell::Cell::new(0)};}
++struct SensitiveBytes(Zeroizing<Vec<u8>>);
++impl AsRef<[u8]> for SensitiveBytes {fn as_ref(&self)->&[u8]{self.0.as_slice()}}
++struct Size(usize);
++impl Write for Size {
++    fn write(&mut self,bytes:&[u8])->io::Result<usize> {
++        self.0=self.0.checked_add(bytes.len()).ok_or_else(||io::Error::other("native RPC request size overflow"))?;
++        Ok(bytes.len())
++    }
++    fn flush(&mut self)->io::Result<()> {Ok(())}
++}
++pub(super) fn request_body(method:&str,params:&Value)->Result<bytes::Bytes> {
++    #[derive(serde::Serialize)]
++    struct Request<'a> {jsonrpc:&'static str,id:&'static str,method:&'a str,params:&'a Value}
++    let request=Request {jsonrpc:"2.0",id:"native-funding",method,params};
++    // Count without storing secrets, then serialize without reallocating.
++    let mut size=Size(0);serde_json::to_writer(&mut size,&request)?;
++    let mut body=Zeroizing::new(Vec::with_capacity(size.0));
++    serde_json::to_writer(&mut *body,&request)?;
++    ensure!(body.len()==size.0,"native RPC request size changed during serialization");
++    // Clones for Digest retry share this owner; the last drop wipes its buffer.
++    Ok(bytes::Bytes::from_owner(SensitiveBytes(body)))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn request_preserves_escaped_secrets_and_shares_retry_storage()->Result<()> {
++        let params=SecretJson(json!({"password":"fixture\"\n秘密","nested":[{"spendkey":"0123"},null,42]}));
++        let body=request_body("generate_from_keys",&params.0)?;
++        let retry=body.clone();assert_eq!(body.as_ptr(),retry.as_ptr());
++        let parsed:Value=serde_json::from_slice(&body)?;
++        assert_eq!(parsed,json!({"jsonrpc":"2.0","id":"native-funding","method":"generate_from_keys","params":params.0}));
++        drop(params);drop(body);
++        assert_eq!(serde_json::from_slice::<Value>(&retry)?,parsed);
++        Ok(())
++    }
++    #[test]
++    fn clear_visits_nested_strings_and_object_keys() {
++        let mut value=json!({"fixture-secret-key":["secret",{"password":"value"},false,123,null]});
++        let before=WIPES.with(|count|count.get());
++        clear(&mut value);assert!(value.is_null());
++        assert_eq!(WIPES.with(|count|count.get())-before,4);
++    }
++    #[test]
++    fn unpolled_rpc_futures_drop_their_parameter_guards()->Result<()> {
++        let client=NativeFundingRpc::new(1,2,"fixture".into(),"fixture".into())?;
++        let before=WIPES.with(|count|count.get());
++        drop(client.rpc(2,"open_wallet",json!({"password":"fixture-secret"})));
++        assert_eq!(WIPES.with(|count|count.get())-before,2);
++        let before=WIPES.with(|count|count.get());
++        drop(client.rpc_response(2,"open_wallet",json!({"password":"fixture-secret"})));
++        assert_eq!(WIPES.with(|count|count.get())-before,2);
++        Ok(())
++    }
++
++}
+diff --git a/swap-machine/src/native_funding_rpc/transport_tests.rs b/swap-machine/src/native_funding_rpc/transport_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/transport_tests.rs
+@@ -0,0 +1,60 @@
++use super::*;
++use std::{io::{BufRead,BufReader,Read,Write},net::{TcpListener,TcpStream}};
++fn request(reader:&mut BufReader<TcpStream>)->Result<(Vec<u8>,bool)> {
++    let mut line=String::new();reader.read_line(&mut line)?;
++    ensure!(line.starts_with("POST /json_rpc HTTP/1.1"),"unexpected request");
++    let mut length=None;let mut authenticated=false;
++    loop {
++        line.clear();ensure!(reader.read_line(&mut line)?>0,"missing headers");
++        if line=="\r\n" {break}
++        let lower=line.to_ascii_lowercase();
++        if let Some(value)=lower.strip_prefix("content-length:"){length=Some(value.trim().parse::<usize>()?);}
++        if lower.starts_with("authorization:") {ensure!(lower.contains("digest ") && lower.contains("auth-int"),"missing auth-int");authenticated=true;}
++    }
++    let length=length.context("missing length")?;ensure!(length<4096,"unexpected request size");
++    let mut bytes=vec![0;length];reader.read_exact(&mut bytes)?;Ok((bytes,authenticated))
++}
++#[tokio::test]
++async fn digest_retry_preserves_body_and_drains_challenge()->Result<()> {
++    for reject in [false,true] {
++        let server=TcpListener::bind(("127.0.0.1",0))?;let port=server.local_addr()?.port();
++        let thread=std::thread::spawn(move ||->Result<()> {
++            let (mut socket,_)=server.accept()?;socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
++            let mut reader=BufReader::new(socket.try_clone()?);
++            let (first,auth)=request(&mut reader)?;ensure!(!auth,"unexpected initial credentials");
++            socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"fixture\", nonce=\"fixed-nonce\", algorithm=MD5, qop=\"auth-int\"\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nchallenge")?;
++            let (second,auth)=request(&mut reader)?;ensure!(auth && first==second,"retry body or authorization changed");
++            let parsed:Value=serde_json::from_slice(&second)?;ensure!(parsed["params"]["password"]=="fixture-secret","wrong parameters");
++            if reject {socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;}
++            else {
++                let body=br#"{"id":"native-funding","result":{"accepted":true}}"#;
++                write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;socket.write_all(body)?;
++            }
++            Ok(())
++        });
++        let client=NativeFundingRpc::new(if port==1 {2}else{1},port,"fixture".into(),"fixture".into())?;
++        let result=client.rpc(port,"open_wallet",json!({"password":"fixture-secret"})).await;
++        thread.join().map_err(|_|anyhow::anyhow!("server thread failed"))??;
++        if reject {assert!(result.is_err());}else{assert_eq!(result?,json!({"accepted":true}));}
++    }
++    Ok(())
++}
++#[tokio::test]
++async fn rejects_malformed_wrong_id_and_oversized_responses()->Result<()> {
++    for body in [b"not-json".to_vec(),br#"{"id":"wrong","result":{"secret":"fixture"}}"#.to_vec(),vec![b' ';1_048_577]] {
++        let server=TcpListener::bind(("127.0.0.1",0))?;let port=server.local_addr()?.port();
++        let thread=std::thread::spawn(move ||->Result<()> {
++            let (mut socket,_)=server.accept()?;socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
++            let mut reader=BufReader::new(socket.try_clone()?);request(&mut reader)?;
++            write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;
++            // The client may close immediately on exceeding its response bound.
++            let _=socket.write_all(&body);Ok(())
++        });
++        let client=NativeFundingRpc::new(port,if port==1 {2}else{1},"fixture".into(),"fixture".into())?;
++        let result=client.rpc(port,"get_version",json!({})).await;
++        thread.join().map_err(|_|anyhow::anyhow!("server thread failed"))??;
++        let error=result.err().context("invalid response accepted")?.to_string();
++        assert!(error.contains("native RPC JSON") || error.contains("response identity mismatch") || error.contains("oversized native RPC response"));
++    }
++    Ok(())
++}

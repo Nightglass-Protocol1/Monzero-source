@@ -1,0 +1,91 @@
+--- a/swap-core/src/bch/spend.rs
++++ b/swap-core/src/bch/spend.rs
+@@ -18,6 +18,34 @@
+ }
+ 
+ impl Covenant {
++    /// Validate exact timeout bytes, including the agreed funding identity,
++    /// sequence, destination and absolute fee. This is not chain observation.
++    pub fn verify_timeout(&self, funding_raw: &[u8], terms: &SpendTerms,
++        proposed: &[u8]) -> Result<()> {
++        let expected = self.prepare_timeout(funding_raw, terms)?;
++        ensure!(serialize(&expected) == proposed, "BCH timeout differs from agreed spend");
++        Ok(())
++    }
++
++    /// Extract a data signature only after validating the complete redemption.
++    /// An untrusted peer can supply these bytes before broadcast: callers must
++    /// separately establish chain confirmation before treating this as payment.
++    pub fn redemption_signature(&self, funding_raw: &[u8], terms: &SpendTerms,
++        proposed: &[u8]) -> Result<Vec<u8>> {
++        ensure!(proposed.len() <= 10_000, "oversized BCH covenant redemption");
++        let transaction: Transaction = deserialize(proposed).context("invalid BCH redemption bytes")?;
++        ensure!(transaction.input.len() == 1, "BCH redemption requires exactly one input");
++        let first = transaction.input[0].script_sig.instructions_minimal().next()
++            .context("missing BCH redemption data signature")??;
++        let signature = match first {
++            bitcoin::script::Instruction::PushBytes(bytes) => bytes.as_bytes(),
++            _ => anyhow::bail!("BCH redemption signature is not a data push"),
++        };
++        let expected = self.prepare_redemption(funding_raw, terms, signature)?;
++        ensure!(serialize(&expected) == proposed, "BCH redemption differs from agreed spend");
++        Ok(signature.to_vec())
++    }
++
+     /// Forward to the agreed timeout destination with this stage's CSV delay.
+     /// This checks neither the chain's activation state nor actual maturity.
+     pub fn prepare_timeout(&self, funding_raw: &[u8], terms: &SpendTerms) -> Result<Transaction> {
+--- a/swap-core/src/bch/spend/tests.rs
++++ b/swap-core/src/bch/spend/tests.rs
+@@ -98,3 +98,51 @@
+     rejected(&raw, &spend); rejected(&[], &spend);
+     Ok(())
+ }
++
++
++#[test]
++fn received_spends_bind_every_transaction_field_before_signature_extraction() -> Result<()> {
++    let (terms, signature, _) = fixture()?; let contract = Covenant::new(terms)?;
++    let (parent, spend) = funding(&contract, 100_000); let funding_raw = serialize(&parent);
++    let redeem = contract.prepare_redemption(&funding_raw, &spend, &signature)?;
++    let timeout = contract.prepare_timeout(&funding_raw, &spend)?;
++    assert_eq!(contract.redemption_signature(&funding_raw, &spend, &serialize(&redeem))?, signature);
++    contract.verify_timeout(&funding_raw, &spend, &serialize(&timeout))?;
++    assert!(contract.redemption_signature(&funding_raw, &spend, &serialize(&timeout)).is_err());
++    assert!(contract.verify_timeout(&funding_raw, &spend, &serialize(&redeem)).is_err());
++    for tx in [redeem, timeout] {
++        let mut mutations = Vec::new();
++        let mut changed = tx.clone(); changed.version = Version::ONE; mutations.push(changed);
++        let mut changed = tx.clone(); changed.lock_time = absolute::LockTime::from_height(1)?; mutations.push(changed);
++        let mut changed = tx.clone(); changed.input[0].previous_output.vout += 1; mutations.push(changed);
++        let mut changed = tx.clone(); changed.input[0].previous_output.txid = Txid::from_byte_array([8;32]); mutations.push(changed);
++        let mut changed = tx.clone(); changed.input[0].sequence = Sequence(12); mutations.push(changed);
++        let mut changed = tx.clone(); changed.input[0].witness.push([1]); mutations.push(changed);
++        let mut changed = tx.clone(); changed.input.push(changed.input[0].clone()); mutations.push(changed);
++        let mut changed = tx.clone(); changed.input.clear(); mutations.push(changed);
++        let mut changed = tx.clone(); changed.output[0].value = Amount::from_sat(98_999); mutations.push(changed);
++        let mut changed = tx.clone(); changed.output[0].script_pubkey = ScriptBuf::new(); mutations.push(changed);
++        let mut changed = tx.clone(); changed.output.push(changed.output[0].clone()); mutations.push(changed);
++        let mut changed = tx.clone(); changed.output.clear(); mutations.push(changed);
++        let mut changed = tx.clone(); changed.input[0].script_sig = ScriptBuf::new(); mutations.push(changed);
++        let mut changed = tx.clone(); let mut script = changed.input[0].script_sig.clone().into_bytes();
++        script.push(0x61); changed.input[0].script_sig = ScriptBuf::from_bytes(script); mutations.push(changed);
++        // Keep the same signature and script but use a nonminimal PUSHDATA1.
++        let mut changed = tx.clone(); let script = changed.input[0].script_sig.as_bytes();
++        if script[0] < 0x4c {
++            changed.input[0].script_sig = ScriptBuf::from_bytes([vec![0x4c, script[0]], script[1..].to_vec()].concat());
++            mutations.push(changed);
++        }
++        for changed in mutations {
++            let raw = serialize(&changed);
++            assert!(contract.redemption_signature(&funding_raw, &spend, &raw).is_err());
++            assert!(contract.verify_timeout(&funding_raw, &spend, &raw).is_err());
++        }
++        let mut trailing = serialize(&tx); trailing.push(0);
++        assert!(contract.redemption_signature(&funding_raw, &spend, &trailing).is_err());
++        assert!(contract.verify_timeout(&funding_raw, &spend, &trailing).is_err());
++    }
++    assert!(contract.redemption_signature(&funding_raw, &spend, &[]).is_err());
++    assert!(contract.redemption_signature(&funding_raw, &spend, &vec![0;10_001]).is_err());
++    Ok(())
++}

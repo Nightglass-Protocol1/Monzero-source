@@ -1,0 +1,125 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/preparation/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/preparation/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/preparation/tests.rs
+@@ -0,0 +1,48 @@
++use super::*;
++use super::super::tests::{fixture,Directory};
++fn policy()->PreparationPolicy {PreparationPolicy {fee:Amount::from_sat(1000),minimum_change:Amount::from_sat(1000),minimum_confirmations:1}}
++fn account_copy(account:&PublicAccount)->Result<PublicAccount> {PublicAccount::from_descriptor(&account.descriptor(),account.network())}
++#[test]
++fn preparation_reuses_allocated_change_and_claims_after_restart()->Result<()> {
++    let (seed,account,chain,credit,payment)=fixture()?;
++    let inputs=[IncludedInput {transaction:&credit,vout:0,branch:Branch::Receive,index:3},IncludedInput {transaction:&credit,vout:1,branch:Branch::Receive,index:3}];
++    let observed=ObservedWallet::reconcile(&chain,&[credit.outputs()[0].script_pubkey.clone()],std::slice::from_ref(&credit))?;
++    let addresses=Directory::new()?;let claims=Directory::new()?;let operation=Uuid::new_v4();
++    let mut book=AddressBook::create(&addresses.0,account_copy(&account)?)?;
++    // An earlier change allocation ensures preparation uses the reserved index,
++    // rather than the preflight placeholder.
++    book.reserve(Uuid::new_v4(),Branch::Change)?;
++    let prepared=prepare_payment(&chain,&observed,&account,&inputs,&payment,&policy(),&mut book,&claims.0,operation)?;
++    assert_eq!(&prepared.transaction().output[1].script_pubkey,account.derive(Branch::Change,1)?.address().script_pubkey());
++    let commitment=prepared.signing_commitment();let tx=prepared.transaction().clone();
++    assert_eq!(book.allocated_count(Branch::Change)?,2);drop(prepared);drop(book);
++    let mut book=AddressBook::open(&addresses.0,account_copy(&account)?)?;
++    let resumed=prepare_payment(&chain,&observed,&account,&inputs,&payment,&policy(),&mut book,&claims.0,operation)?;
++    assert_eq!(resumed.transaction(),&tx);assert_eq!(resumed.signing_commitment(),commitment);
++    assert_eq!(book.allocated_count(Branch::Change)?,2);
++    assert!(resumed.approve_and_sign_on(&chain,&observed,&seed,commitment)?.input.iter().all(|input|input.witness.len()==2));Ok(())
++}
++#[test]
++fn preparation_preflights_policy_and_account_but_preserves_allocation_on_claim_conflict()->Result<()> {
++    let (seed,account,chain,credit,payment)=fixture()?;
++    let inputs=[IncludedInput {transaction:&credit,vout:0,branch:Branch::Receive,index:3},IncludedInput {transaction:&credit,vout:1,branch:Branch::Receive,index:3}];
++    let observed=ObservedWallet::reconcile(&chain,&[credit.outputs()[0].script_pubkey.clone()],std::slice::from_ref(&credit))?;
++    let addresses=Directory::new()?;let claims=Directory::new()?;let wrong_addresses=Directory::new()?;
++    let mut wrong=AddressBook::create(&wrong_addresses.0,seed.public_account(LtcNetwork::Regtest,3)?)?;
++    assert!(prepare_payment(&chain,&observed,&account,&inputs,&payment,&policy(),&mut wrong,&claims.0,Uuid::new_v4()).is_err());
++    assert_eq!(wrong.allocated_count(Branch::Change)?,0);
++    let mut book=AddressBook::create(&addresses.0,account_copy(&account)?)?;
++    let mut too_large=payment.clone();too_large.value=Amount::from_sat(200000);
++    assert!(prepare_payment(&chain,&observed,&account,&inputs,&too_large,&policy(),&mut book,&claims.0,Uuid::new_v4()).is_err());
++    assert_eq!(book.allocated_count(Branch::Change)?,0);
++    let first=prepare_payment(&chain,&observed,&account,&inputs,&payment,&policy(),&mut book,&claims.0,Uuid::new_v4())?;drop(first);
++    let conflicting=Uuid::new_v4();
++    for _ in 0..2 {
++        assert!(prepare_payment(&chain,&observed,&account,&inputs,&payment,&policy(),&mut book,&claims.0,conflicting).is_err());
++        assert_eq!(book.allocated_count(Branch::Change)?,2);
++    }
++    // An exact-match payment needs no change address.
++    let fresh_claims=Directory::new()?;let mut exact=payment.clone();exact.value=Amount::from_sat(129000);
++    let exact=prepare_payment(&chain,&observed,&account,&inputs,&exact,&policy(),&mut book,&fresh_claims.0,Uuid::new_v4())?;
++    assert_eq!(exact.transaction().output.len(),1);assert_eq!(book.allocated_count(Branch::Change)?,2);Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/preparation.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/preparation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/preparation.rs
+@@ -0,0 +1,41 @@
++//! Bind payment selection to durable change allocation and input retention.
++use super::*;
++use crate::litecoin_light::account::allocation::AddressBook;
++use super::super::claimed::ObservedClaimedSpend;
++use bitcoin::bip32::ChildNumber;
++
++pub struct PreparationPolicy {
++    pub fee:Amount,
++    pub minimum_change:Amount,
++    pub minimum_confirmations:u64,
++}
++/// The operation ID is also the address-book retry identity. Both stores must
++/// remain available for recovery. They are separately durable, not atomically
++/// committed together: a failed claim can leave an allocated change address.
++/// Do not clear that allocation or retry with a fresh identity automatically.
++/// There is no implicit signing or broadcast approval.
++pub fn prepare_payment(chain:&HeaderSequence,observed:&ObservedWallet,account:&PublicAccount,
++    candidates:&[IncludedInput<'_>],payment:&TxOut,policy:&PreparationPolicy,
++    book:&mut AddressBook,directory:&Path,operation:Uuid)->Result<ObservedClaimedSpend> {
++    ensure!(!operation.is_nil(),"missing Litecoin payment operation");
++    let (descriptor,_)=book.backup_parts()?;
++    ensure!(serde_json::to_vec(&descriptor)?==serde_json::to_vec(&account.descriptor())?,
++        "Litecoin change address book account mismatch");
++    // Preflight all selection/policy failures before allocating an address.
++    let mut selection=PaymentPolicy {fee:policy.fee,minimum_change:policy.minimum_change,
++        change_index:0,minimum_confirmations:policy.minimum_confirmations};
++    let mut review=ConfirmedSpendReview::select_payment(chain,observed,account,candidates,payment,&selection)?;
++    if review.transaction().output.len()==2 {
++        let change=book.reserve(operation,Branch::Change)?;
++        let Some(ChildNumber::Normal {index})=change.path().as_ref().last() else {
++            anyhow::bail!("invalid Litecoin reserved change derivation")
++        };
++        selection.change_index=*index;
++        review=ConfirmedSpendReview::select_payment(chain,observed,account,candidates,payment,&selection)?;
++        ensure!(&review.transaction().output[1].script_pubkey==change.address().script_pubkey(),
++            "Litecoin reserved change script mismatch");
++    }
++    review.retain_observed(chain,observed,directory,operation)
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/tests.rs
+@@ -1,10 +1,10 @@
+ use super::*;
+ use crate::litecoin_light::MerkleMatch;
+ use std::{fs,path::PathBuf,os::unix::fs::DirBuilderExt};
+-struct Directory(PathBuf);
+-impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("ltc-selection-{}",Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
++pub(super) struct Directory(pub(super) PathBuf);
++impl Directory {pub(super) fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("ltc-selection-{}",Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
+ impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
+-fn fixture()->Result<(SecretSeed,PublicAccount,HeaderSequence,IncludedTransaction,TxOut)> {
++pub(super) fn fixture()->Result<(SecretSeed,PublicAccount,HeaderSequence,IncludedTransaction,TxOut)> {
+     // Policy-only injected inclusion, not a consensus-valid funding fixture.
+     let (seed,account,mut credit,prevout)=super::super::super::super::tests::fixture()?;
+     let chain=HeaderSequence::new(LtcNetwork::Regtest)?;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection.rs
+@@ -71,3 +71,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++pub mod preparation;

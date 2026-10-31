@@ -1,0 +1,157 @@
+diff --git a/swap-machine/src/litecoin_light/session/tests.rs b/swap-machine/src/litecoin_light/session/tests.rs
+--- a/swap-machine/src/litecoin_light/session/tests.rs
++++ b/swap-machine/src/litecoin_light/session/tests.rs
+@@ -170,3 +170,77 @@
+     }
+     Ok(())
+ }
++
++fn anchored_fixture() -> (super::super::headers::HeaderSequence,InclusionRequest,Vec<u8>,Value) {
++    let (mut request,raw_header,raw,mut proof)=super::super::tests::fixture();
++    let original: Header=deserialize(&raw_header).unwrap();
++    let mut header=super::super::headers::tests::child();
++    header.merkle_root=original.merkle_root;
++    // Fixed header independently checked with hashlib.scrypt:
++    // 99cd547ec27bdf0f13b1b0c525008c735aa1205df1702730a9419aab4df7957e.
++    let mut chain=super::super::headers::HeaderSequence::new(LtcNetwork::Regtest).unwrap();
++    chain.append(&serialize(&header),u64::from(header.time)).unwrap();
++    request.height=1;request.block_hash=header.block_hash();request.id=4;
++    proof["id"]=json!(4);proof["result"]["block_height"]=json!(1);
++    (chain,request,raw,proof)
++}
++#[tokio::test]
++async fn session_selected_chain_proof_loses_confirmations_after_reorg() -> Result<()> {
++    let (mut chain,request,raw,proof)=anchored_fixture();
++    let mut responses=regtest_handshake();
++    responses.push(reply(3,json!(hex(&raw))));
++    let mut wire=serde_json::to_vec(&proof)?;wire.push(b'\n');responses.push(wire);
++    let (stream,task)=server(responses);
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let matched=session.inclusion_on(&chain,1,request.txid).await?;
++    assert_eq!(matched.txid(),request.txid);assert_eq!(matched.confirmations_on(&chain),Some(1));
++    let mut replacement=chain.fork(0)?;
++    assert_eq!(matched.confirmations_on(&replacement),None);
++    let mut alternative=super::super::headers::tests::child();alternative.nonce=0;
++    replacement.append(&serialize(&alternative),1296688902)?;
++    let descendant=decode_hex("000000209d08f789f2afaf053878d9b21add2f847fff4a9c32fb58b8c5c79ca166f94a9d111111111111111111111111111111111111111111111111111111111111111106e7494dffff7f2000000000",80)?;
++    replacement.append(&descendant,1296688902)?;
++    assert_eq!(chain.adopt(replacement)?.unwrap().common_ancestor,0);
++    assert_eq!(matched.confirmations_on(&chain),None);
++    drop(session);let requests=task.await?;
++    assert_eq!(requests.len(),4);assert_eq!(requests[2]["method"],"blockchain.transaction.get");
++    assert_eq!(requests[3]["method"],"blockchain.transaction.get_merkle");
++    assert_eq!(requests[3]["params"],json!([request.txid.to_string(),1]));
++    Ok(())
++}
++#[tokio::test]
++async fn session_selected_chain_rejects_unknown_height_and_network_without_io() -> Result<()> {
++    let (chain,request,_,_)=anchored_fixture();let (stream,task)=server(regtest_handshake());
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    for height in [2,u32::MAX] {assert!(session.inclusion_on(&chain,height,request.txid).await.is_err());}
++    let other=super::super::headers::HeaderSequence::new(LtcNetwork::Mainnet)?;
++    assert!(session.inclusion_on(&other,0,request.txid).await.is_err());
++    assert!(session.usable);drop(session);assert_eq!(task.await?.len(),2);Ok(())
++}
++#[tokio::test]
++async fn session_selected_chain_bad_proof_poisons_stream() -> Result<()> {
++    let (chain,request,raw,mut proof)=anchored_fixture();proof["result"]["block_height"]=json!(2);
++    let mut responses=regtest_handshake();responses.push(reply(3,json!(hex(&raw))));
++    let mut wire=serde_json::to_vec(&proof)?;wire.push(b'\n');responses.push(wire);
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    assert!(session.inclusion_on(&chain,1,request.txid).await.is_err());assert!(!session.usable);
++    assert!(session.inclusion_on(&chain,1,request.txid).await.is_err());
++    assert_eq!(chain.height(),1);drop(session);assert_eq!(task.await?.len(),4);Ok(())
++}
++
++#[test]
++fn selected_chain_confirmation_depth_tracks_extensions() -> Result<()> {
++    let (mut chain,request,raw,proof)=anchored_fixture();
++    let header=serialize(&chain.header(1).unwrap());
++    let matched=match_merkle_proof(&request,&header,&raw,&serde_json::to_vec(&proof)?)?;
++    assert_eq!(matched.confirmations_on(&chain),Some(1));
++    // Fixed descendant, independent Scrypt result:
++    // 70edba8ef7cab733d6d5978944d6994734cb253d2c7a667a5c2c8592ea30806b.
++    let descendant=decode_hex("00000020770d2e4fe1fc63105ef7fa9c49c16599f041afac4f8c8d91df0b56ed7691c10ca3c12fc762f95f226e93318d8d50326b90a0cc97ab8ab3fd9112d3803d3fa66406e7494dffff7f202a000000",80)?;
++    chain.append(&descendant,1296688902)?;
++    assert_eq!(matched.confirmations_on(&chain),Some(2));
++    assert_eq!(matched.confirmations_on(&chain.fork(1)?),Some(1));
++    assert_eq!(matched.confirmations_on(&chain.fork(0)?),None);
++    assert_eq!(matched.confirmations_on(&super::super::headers::HeaderSequence::new(LtcNetwork::Mainnet)?),None);
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -70,6 +70,18 @@
+         sequence.append_batch(&raw,now)
+     }
+ 
++    /// Use an already validated header rather than a peer-supplied chain anchor.
++    /// The borrow keeps the branch fixed during the request. Recheck the returned
++    /// match with confirmations_on after later chain updates; no depth is cached.
++    pub async fn inclusion_on(&mut self,chain: &super::headers::HeaderSequence,
++        height: u32,txid: Txid) -> Result<MerkleMatch> {
++        ensure!(chain.network()==self.network, "Litecoin proof network mismatch");
++        let header = chain.header(height).context("Litecoin proof height outside selected chain")?;
++        let matched = self.transaction_inclusion(height,&serialize(&header),txid).await;
++        if matched.is_err() {self.usable=false;}
++        matched
++    }
++
+     /// Fetch a header, raw transparent transaction and inclusion branch.
+     /// The expected block hash and height must come from independent chain
+     /// validation, not from this server. Returns no confirmation/unspent claim.
+@@ -84,6 +96,11 @@
+         ensure!(header.len() == 80, "invalid Electrum header length");
+         let parsed: Header = deserialize(&header)?;
+         ensure!(parsed.block_hash() == block_hash, "Electrum header differs from requested chain anchor");
++        self.transaction_inclusion(height,&header,txid).await
++    }
++    async fn transaction_inclusion(&mut self,height: u32,header: &[u8],txid: Txid) -> Result<MerkleMatch> {
++        let parsed: Header = deserialize(header)?;
++        let block_hash = parsed.block_hash();
+         let (_, bytes) = self.exchange("blockchain.transaction.get", json!([txid.to_string(), false]),
+             MAX_TRANSACTION * 2 + 1024).await?;
+         let raw = decode_hex(&result::<String>(&bytes)?, MAX_TRANSACTION)?;
+@@ -91,7 +108,7 @@
+         ensure!(transaction.compute_txid() == txid, "Electrum returned another transaction");
+         let (id, proof) = self.exchange("blockchain.transaction.get_merkle", json!([txid.to_string(), height]),
+             MAX_RESPONSE).await?;
+-        match_merkle_proof(&InclusionRequest { id, height, block_hash, txid }, &header, &raw, &proof)
++        match_merkle_proof(&InclusionRequest { id, height, block_hash, txid }, header, &raw, &proof)
+     }
+ 
+     async fn exchange(&mut self, method: &str, params: Value, limit: usize) -> Result<(u64, Vec<u8>)> {
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -1,4 +1,4 @@
+-//! Offline building blocks for a future Litecoin light-wallet backend.
++//! Read-only building blocks for a future Litecoin light-wallet backend.
+ //!
+ //! Electrum data is untrusted. A matching Merkle branch establishes only that
+ //! a transaction ID is committed by the supplied header. It does NOT validate
+@@ -28,7 +28,7 @@
+ }
+ 
+ /// Deliberately not Serialize/Deserialize and not a spendability capability.
+-/// Does not authenticate witness data or establish a confirmation count.
++/// Does not authenticate witness data. Depth must be checked against a selected chain.
+ pub struct MerkleMatch {
+     txid: Txid,
+     block_hash: BlockHash,
+@@ -38,6 +38,14 @@
+     pub fn txid(&self) -> Txid { self.txid }
+     pub fn block_hash(&self) -> BlockHash { self.block_hash }
+     pub fn claimed_height(&self) -> u32 { self.claimed_height }
++
++    /// Depth relative to this supplied branch, not network freshness or finality.
++    /// Recheck after every chain update; an orphaned proof returns None.
++    /// This does not establish transaction validity, witness data or unspentness.
++    pub fn confirmations_on(&self,chain: &headers::HeaderSequence) -> Option<u64> {
++        if !chain.contains(self.claimed_height,self.block_hash) {return None}
++        Some(u64::from(chain.height())-u64::from(self.claimed_height)+1)
++    }
+ }
+ 
+ #[derive(Deserialize)]

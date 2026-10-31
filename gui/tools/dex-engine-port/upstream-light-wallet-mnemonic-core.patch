@@ -1,0 +1,550 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1005,6 +1005,18 @@
+ ]
+ 
+ [[package]]
++name = "bip39"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "43d193de1f7487df1914d3a568b772458861d33f9c54249612cc2893d6915054"
++dependencies = [
++ "bitcoin_hashes 0.13.1",
++ "serde",
++ "unicode-normalization",
++ "zeroize",
++]
++
++[[package]]
+ name = "bit-set"
+ version = "0.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -1045,7 +1057,7 @@
+  "bitcoin-io",
+  "bitcoin-units",
+  "bitcoin_hashes 0.14.1",
+- "hex-conservative",
++ "hex-conservative 0.2.2",
+  "hex_lit",
+  "secp256k1 0.29.1",
+  "serde",
+@@ -1146,12 +1158,21 @@
+ 
+ [[package]]
+ name = "bitcoin_hashes"
++version = "0.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "446819536d8121575eeb7e89efdbadb3f055e87e4bb66c6679a6d5cc2f4b64fd"
++dependencies = [
++ "hex-conservative 0.1.2",
++]
++
++[[package]]
++name = "bitcoin_hashes"
+ version = "0.14.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "26ec84b80c482df901772e931a9a681e26a1b9ee2302edeff23cb30328745c8b"
+ dependencies = [
+  "bitcoin-io",
+- "hex-conservative",
++ "hex-conservative 0.2.2",
+  "serde",
+ ]
+ 
+@@ -4279,6 +4300,12 @@
+ dependencies = [
+  "serde",
+ ]
++
++[[package]]
++name = "hex-conservative"
++version = "0.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "212ab92002354b4819390025006c897e8140934349e8635c9b077f47b4dcbd20"
+ 
+ [[package]]
+ name = "hex-conservative"
+@@ -10895,6 +10922,7 @@
+  "anyhow",
+  "async-trait",
+  "bdk",
++ "bip39",
+  "bitcoin 0.32.8",
+  "bitcoin-harness",
+  "bitcoin-wallet",
+diff --git a/swap-machine/Cargo.toml b/swap-machine/Cargo.toml
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -4,6 +4,7 @@
+ edition = "2024"
+ 
+ [dependencies]
++bip39 = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+ chacha20poly1305 = "=0.10.1"
+ scrypt = { version = "=0.11.0", default-features = false }
+ tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+diff --git a/swap-machine/src/litecoin_light/vault.rs b/swap-machine/src/litecoin_light/vault.rs
+--- a/swap-machine/src/litecoin_light/vault.rs
++++ b/swap-machine/src/litecoin_light/vault.rs
+@@ -140,3 +140,6 @@
+ 
+ /// Explicit local raw-seed recovery; existing wallet derivation remains unchanged.
+ pub mod recovery;
++
++/// Standard BIP39 material; never reinterprets existing raw-seed vaults.
++pub mod mnemonic;
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic.rs b/swap-machine/src/litecoin_light/vault/mnemonic.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/mnemonic.rs
+@@ -0,0 +1,123 @@
++//! BIP39 recovery material, separate from legacy raw BIP32 seeds.
++//! No implicit conversion, persistence, networking or mnemonic logging.
++use super::*;
++use bip39::{Language, Mnemonic};
++
++/// Deliberately neither Debug, Clone nor Serialize. The dependency's zeroize
++/// feature erases its word indices on drop; callers must erase their copies.
++pub struct MnemonicMaterial(Mnemonic);
++impl MnemonicMaterial {
++    pub const ENCODING: &'static str = "bip39-english-v1";
++
++    /// New wallets use 256 bits of OS entropy and 24 English recovery words.
++    pub fn generate() -> Result<Self> {
++        let mut entropy = Zeroizing::new([0u8; 32]);
++        OsRng.try_fill_bytes(&mut *entropy).context("mnemonic entropy unavailable")?;
++        Self::from_entropy(&*entropy)
++    }
++
++    pub fn from_entropy(entropy: &[u8]) -> Result<Self> {
++        Mnemonic::from_entropy_in(Language::English, entropy)
++            .map(Self).map_err(|_| anyhow::anyhow!("invalid BIP39 entropy length"))
++    }
++
++    /// Import validates the word list, permitted count and checksum. Never
++    /// include a parser error or user-supplied phrase in diagnostics.
++    pub fn parse(phrase: &str) -> Result<Self> {
++        ensure!(!phrase.is_empty() && phrase.len() <= 1024, "invalid mnemonic size");
++        Mnemonic::parse_in(Language::English, phrase)
++            .map(Self).map_err(|_| anyhow::anyhow!("invalid English BIP39 recovery phrase"))
++    }
++
++    pub fn word_count(&self) -> usize { self.0.word_count() }
++
++    /// Explicit private reveal only; never insert this string in public status.
++    pub fn reveal(&self) -> Zeroizing<String> {
++        use std::fmt::Write;
++        let mut phrase = Zeroizing::new(String::with_capacity(256));
++        for (i, word) in self.0.words().enumerate() {
++            if i != 0 { phrase.push(' '); }
++            // String formatting cannot fail, and the capacity bounds all English words.
++            write!(&mut *phrase, "{word}").expect("writing a mnemonic word to String");
++        }
++        phrase
++    }
++
++    /// The optional BIP39 passphrase is distinct from the local vault password.
++    /// NFKD normalization and all 64 derived bytes are retained. Different
++    /// passphrases intentionally derive different wallets; none is a checksum.
++    pub fn derive_seed(&self, passphrase: &str) -> Result<Zeroizing<[u8; 64]>> {
++        ensure!(passphrase.len() <= 1024, "BIP39 passphrase exceeds supported limit");
++        Ok(Zeroizing::new(self.0.to_seed(passphrase)))
++    }
++
++    pub fn public_account(&self, network: impl Into<LightNetwork>, index: u32,
++                          passphrase: &str) -> Result<PublicAccount> {
++        let network = network.into();
++        let seed = self.derive_seed(passphrase)?;
++        let mut master = Xpriv::new_master(network.network_kind(), &*seed)?;
++        let account = PublicAccount::from_master(&master, network, index);
++        master.private_key.non_secure_erase();master.chain_code = [0u8; 32].into();
++        account
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bitcoin::hashes::hex::FromHex;
++    use crate::litecoin_light::{account::Branch, network::{BtcNetwork, BchNetwork, DogeNetwork}};
++
++    #[test]
++    fn official_english_vectors_match_phrase_seed_and_master_key() -> Result<()> {
++        let vectors: Vec<Vec<String>> = serde_json::from_str(include_str!("mnemonic/english-vectors.json"))?;
++        assert_eq!(vectors.len(), 24);
++        for row in vectors {
++            let entropy = Vec::<u8>::from_hex(&row[0])?;
++            let material = MnemonicMaterial::from_entropy(&entropy)?;
++            assert_eq!(&*material.reveal(), &row[1]);
++            let parsed = MnemonicMaterial::parse(&row[1])?;
++            let seed = parsed.derive_seed("TREZOR")?;
++            assert_eq!(seed.as_slice(), Vec::<u8>::from_hex(&row[2])?);
++            assert_eq!(Xpriv::new_master(bitcoin::NetworkKind::Main, &*seed)?.to_string(), row[3]);
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn checksum_counts_normalization_and_passphrase_are_enforced() -> Result<()> {
++        let material = MnemonicMaterial::from_entropy(&[0;32])?;
++        assert_eq!(material.word_count(), 24);
++        for invalid in ["", "abandon", "abandon ".repeat(12).as_str(), "xyzzy ".repeat(24).as_str(),
++                        "07".repeat(32).as_str()] {
++            assert!(MnemonicMaterial::parse(invalid).is_err());
++        }
++        assert_eq!(*material.derive_seed("caf\u{00e9}")?, *material.derive_seed("cafe\u{0301}")?);
++        assert_ne!(*material.derive_seed("")?, *material.derive_seed("TREZOR")?);
++        assert!(material.derive_seed(&"x".repeat(1025)).is_err());
++        for size in [16,20,24,28,32] {
++            let imported=MnemonicMaterial::from_entropy(&vec![1;size])?;
++            assert_eq!(MnemonicMaterial::parse(&imported.reveal())?.word_count(),size*3/4);
++        }
++        assert_eq!(MnemonicMaterial::generate()?.word_count(),24);
++        Ok(())
++    }
++
++    #[test]
++    fn recovery_preserves_each_chain_account_without_raw_seed_reinterpretation() -> Result<()> {
++        let material=MnemonicMaterial::from_entropy(&[7;32])?;
++        let imported=MnemonicMaterial::parse(&material.reveal())?;
++        let legacy=SecretSeed::from_bytes(Zeroizing::new([7;32]));
++        for network in [LightNetwork::Litecoin(LtcNetwork::Regtest), LightNetwork::Bitcoin(BtcNetwork::Regtest),
++            LightNetwork::BitcoinCash(BchNetwork::Regtest), LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
++            let account=material.public_account(network,3,"")?;
++            let recovered=imported.public_account(network,3,"")?;
++            assert_eq!(serde_json::to_vec(&account.descriptor())?,serde_json::to_vec(&recovered.descriptor())?);
++            assert_eq!(account.derive(Branch::Receive,17)?.address(),recovered.derive(Branch::Receive,17)?.address());
++            assert_ne!(account.derive(Branch::Receive,17)?.address(),legacy.public_account(network,3)?.derive(Branch::Receive,17)?.address());
++        }
++        Ok(())
++    }
++}
++
++pub mod storage;
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+@@ -0,0 +1,134 @@
++//! Versioned local mnemonic storage. Never adopts or converts a legacy vault.
++//! Public callers must explicitly select this format; desktop activation is separate.
++use super::*;
++use std::path::Path;
++use crate::litecoin_rpc::reservation::Journal;
++// Share the retained filename so neither format can shadow the other.
++const RECORD: &str = super::super::NAME;
++const MAGIC: &[u8;8] = b"MZMNEM01";
++const HEADER: usize = 128;
++const MAX_PAYLOAD: usize = 1 + 32 + 2 + 1024;
++
++pub struct MnemonicVault {
++    journal: Journal,
++    network: LightNetwork,
++    wallet: Uuid,
++    bytes: Vec<u8>,
++}
++/// Neither Debug nor serializable. The passphrase and mnemonic are both private.
++pub struct UnlockedMnemonic {
++    material: MnemonicMaterial,
++    passphrase: Zeroizing<String>,
++}
++impl UnlockedMnemonic {
++    pub fn material(&self) -> &MnemonicMaterial { &self.material }
++    pub fn passphrase(&self) -> &str { &self.passphrase }
++    pub fn public_account(&self, network: impl Into<LightNetwork>, index: u32) -> Result<PublicAccount> {
++        self.material.public_account(network,index,&self.passphrase)
++    }
++}
++impl MnemonicVault {
++    pub fn create(directory: &Path, network: impl Into<LightNetwork>, wallet: Uuid,
++                  password: &[u8], material: &MnemonicMaterial, passphrase: &str) -> Result<Self> {
++        let network=network.into();
++        ensure!(!wallet.is_nil() && passphrase.len()<=1024,"invalid mnemonic vault context");
++        let journal=Journal::open(directory)?;
++        // An explicit new format must never silently shadow an existing raw wallet.
++        match journal.read(RECORD) {
++                Err(error) if error.downcast_ref::<std::io::Error>()
++                    .is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{},
++                Err(error)=>return Err(error),
++                Ok(_)=>anyhow::bail!("wallet vault already exists"),
++        }
++        let entropy=Zeroizing::new(material.0.to_entropy());
++        let mut payload=Zeroizing::new(Vec::with_capacity(MAX_PAYLOAD+16));
++        payload.push(entropy.len() as u8);payload.extend_from_slice(&entropy);
++        payload.extend_from_slice(&(passphrase.len() as u16).to_be_bytes());
++        payload.extend_from_slice(passphrase.as_bytes());
++        let mut salt=[0u8;16];let mut nonce=[0u8;24];
++        OsRng.try_fill_bytes(&mut salt).context("mnemonic vault entropy unavailable")?;
++        OsRng.try_fill_bytes(&mut nonce).context("mnemonic vault entropy unavailable")?;
++        let mut bytes=Vec::with_capacity(HEADER+payload.len()+16);
++        bytes.extend_from_slice(MAGIC);bytes.extend_from_slice(network.storage_identity().as_bytes());
++        bytes.extend_from_slice(wallet.as_bytes());bytes.extend_from_slice(&salt);bytes.extend_from_slice(&nonce);
++        let key=super::super::key(password,&salt)?;
++        let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid mnemonic vault key"))?;
++        cipher.encrypt_in_place(XNonce::from_slice(&nonce),&bytes,&mut *payload)
++            .map_err(|_|anyhow::anyhow!("mnemonic vault encryption failed"))?;
++        bytes.extend_from_slice(&payload);
++        journal.retain(RECORD,&bytes)?;
++        Ok(Self {journal,network,wallet,bytes})
++    }
++
++    pub fn open(directory: &Path, network: impl Into<LightNetwork>, wallet: Uuid) -> Result<Self> {
++        let network=network.into();let journal=Journal::open(directory)?;
++        let bytes=journal.read(RECORD)?;check(&bytes,network,wallet)?;
++        journal.retain(RECORD,&bytes)?;
++        Ok(Self {journal,network,wallet,bytes})
++    }
++
++    pub fn unlock(&self,password:&[u8])->Result<UnlockedMnemonic> {
++        ensure!(self.journal.read(RECORD)?==self.bytes,"mnemonic vault changed; reopen required");
++        check(&self.bytes,self.network,self.wallet)?;
++        let key=super::super::key(password,&self.bytes[88..104])?;
++        let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid mnemonic vault key"))?;
++        let mut payload=Zeroizing::new(self.bytes[HEADER..].to_vec());
++        cipher.decrypt_in_place(XNonce::from_slice(&self.bytes[104..128]),&self.bytes[..HEADER],&mut *payload)
++            .map_err(|_|anyhow::anyhow!("mnemonic vault authentication failed"))?;
++        ensure!(!payload.is_empty(),"empty mnemonic payload");
++        let length=usize::from(payload[0]);
++        ensure!([16,20,24,28,32].contains(&length) && payload.len()>=length+3,"invalid mnemonic entropy record");
++        let pass_length=usize::from(u16::from_be_bytes(payload[length+1..length+3].try_into()?));
++        ensure!(pass_length<=1024 && payload.len()==length+3+pass_length,"invalid mnemonic passphrase record");
++        let material=MnemonicMaterial::from_entropy(&payload[1..length+1])?;
++        let passphrase=Zeroizing::new(std::str::from_utf8(&payload[length+3..])
++            .map_err(|_|anyhow::anyhow!("invalid mnemonic passphrase encoding"))?.to_owned());
++        Ok(UnlockedMnemonic {material,passphrase})
++    }
++}
++fn check(bytes:&[u8],network:LightNetwork,wallet:Uuid)->Result<()> {
++    ensure!(!wallet.is_nil() && bytes.len()>=HEADER+19+16 && bytes.len()<=HEADER+MAX_PAYLOAD+16
++        && &bytes[..8]==MAGIC && &bytes[8..72]==network.storage_identity().as_bytes()
++        && &bytes[72..88]==wallet.as_bytes(),"invalid mnemonic vault format or context");
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    struct Directory(std::path::PathBuf);
++    impl Drop for Directory {fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);}}
++    #[test]
++    fn encrypted_mnemonic_reopens_without_changing_keys_or_accepting_legacy_format()->Result<()> {
++        use crate::litecoin_light::network::{BtcNetwork,BchNetwork,DogeNetwork};
++        for (network,length) in [(LightNetwork::Litecoin(LtcNetwork::Regtest),16),
++            (LightNetwork::Bitcoin(BtcNetwork::Regtest),20),(LightNetwork::BitcoinCash(BchNetwork::Regtest),24),
++            (LightNetwork::Dogecoin(DogeNetwork::Regtest),32)] {
++        let temp=Directory(std::env::temp_dir().join(format!("monzero-mnemonic-{}",Uuid::new_v4())));
++        std::fs::create_dir(&temp.0)?;
++        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(&temp.0,std::fs::Permissions::from_mode(0o700))?;}
++        let wallet=Uuid::new_v4();
++        let material=MnemonicMaterial::from_entropy(&vec![7;length])?;let password=b"disposable encryption password";
++        let vault=MnemonicVault::create(&temp.0,network,wallet,password,&material,"test passphrase")?;
++        let expected=material.public_account(network,0,"test passphrase")?;
++        let unlocked=vault.unlock(password)?;
++        assert_eq!(serde_json::to_vec(&expected.descriptor())?,serde_json::to_vec(&unlocked.public_account(network,0)?.descriptor())?);
++        assert_eq!(&*unlocked.material().reveal(),&*material.reveal());assert_eq!(unlocked.passphrase(),"test passphrase");
++        assert!(vault.unlock(b"wrong").is_err());
++        let ciphertext=std::fs::read(temp.0.join(RECORD))?;
++        assert!(!ciphertext.windows(15).any(|b|b==b"test passphrase"));
++        drop(vault);
++        assert!(MnemonicVault::open(&temp.0,network,Uuid::new_v4()).is_err());
++        assert!(SeedVault::open(&temp.0,network,wallet).is_err());
++        assert!(MnemonicVault::create(&temp.0,network,wallet,password,&material,"").is_err());
++        let reopened=MnemonicVault::open(&temp.0,network,wallet)?;
++        assert_eq!(&*reopened.unlock(password)?.material().reveal(),&*material.reveal());
++        assert_eq!(std::fs::read(temp.0.join(RECORD))?,ciphertext);
++        drop(reopened);
++        let raw=SecretSeed::from_bytes(Zeroizing::new([7;32]));
++        assert!(SeedVault::create(&temp.0,network,wallet,password,&raw).is_err());
++        assert_eq!(std::fs::read(temp.0.join(RECORD))?,ciphertext);
++        }
++        Ok(())
++    }
++}
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/english-vectors.json b/swap-machine/src/litecoin_light/vault/mnemonic/english-vectors.json
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/english-vectors.json
+@@ -0,0 +1,146 @@
++[
++  [
++    "00000000000000000000000000000000",
++    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
++    "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04",
++    "xprv9s21ZrQH143K3h3fDYiay8mocZ3afhfULfb5GX8kCBdno77K4HiA15Tg23wpbeF1pLfs1c5SPmYHrEpTuuRhxMwvKDwqdKiGJS9XFKzUsAF"
++  ],
++  [
++    "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
++    "legal winner thank year wave sausage worth useful legal winner thank yellow",
++    "2e8905819b8723fe2c1d161860e5ee1830318dbf49a83bd451cfb8440c28bd6fa457fe1296106559a3c80937a1c1069be3a3a5bd381ee6260e8d9739fce1f607",
++    "xprv9s21ZrQH143K2gA81bYFHqU68xz1cX2APaSq5tt6MFSLeXnCKV1RVUJt9FWNTbrrryem4ZckN8k4Ls1H6nwdvDTvnV7zEXs2HgPezuVccsq"
++  ],
++  [
++    "80808080808080808080808080808080",
++    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
++    "d71de856f81a8acc65e6fc851a38d4d7ec216fd0796d0a6827a3ad6ed5511a30fa280f12eb2e47ed2ac03b5c462a0358d18d69fe4f985ec81778c1b370b652a8",
++    "xprv9s21ZrQH143K2shfP28KM3nr5Ap1SXjz8gc2rAqqMEynmjt6o1qboCDpxckqXavCwdnYds6yBHZGKHv7ef2eTXy461PXUjBFQg6PrwY4Gzq"
++  ],
++  [
++    "ffffffffffffffffffffffffffffffff",
++    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
++    "ac27495480225222079d7be181583751e86f571027b0497b5b5d11218e0a8a13332572917f0f8e5a589620c6f15b11c61dee327651a14c34e18231052e48c069",
++    "xprv9s21ZrQH143K2V4oox4M8Zmhi2Fjx5XK4Lf7GKRvPSgydU3mjZuKGCTg7UPiBUD7ydVPvSLtg9hjp7MQTYsW67rZHAXeccqYqrsx8LcXnyd"
++  ],
++  [
++    "000000000000000000000000000000000000000000000000",
++    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon agent",
++    "035895f2f481b1b0f01fcf8c289c794660b289981a78f8106447707fdd9666ca06da5a9a565181599b79f53b844d8a71dd9f439c52a3d7b3e8a79c906ac845fa",
++    "xprv9s21ZrQH143K3mEDrypcZ2usWqFgzKB6jBBx9B6GfC7fu26X6hPRzVjzkqkPvDqp6g5eypdk6cyhGnBngbjeHTe4LsuLG1cCmKJka5SMkmU"
++  ],
++  [
++    "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
++    "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal will",
++    "f2b94508732bcbacbcc020faefecfc89feafa6649a5491b8c952cede496c214a0c7b3c392d168748f2d4a612bada0753b52a1c7ac53c1e93abd5c6320b9e95dd",
++    "xprv9s21ZrQH143K3Lv9MZLj16np5GzLe7tDKQfVusBni7toqJGcnKRtHSxUwbKUyUWiwpK55g1DUSsw76TF1T93VT4gz4wt5RM23pkaQLnvBh7"
++  ],
++  [
++    "808080808080808080808080808080808080808080808080",
++    "letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter always",
++    "107d7c02a5aa6f38c58083ff74f04c607c2d2c0ecc55501dadd72d025b751bc27fe913ffb796f841c49b1d33b610cf0e91d3aa239027f5e99fe4ce9e5088cd65",
++    "xprv9s21ZrQH143K3VPCbxbUtpkh9pRG371UCLDz3BjceqP1jz7XZsQ5EnNkYAEkfeZp62cDNj13ZTEVG1TEro9sZ9grfRmcYWLBhCocViKEJae"
++  ],
++  [
++    "ffffffffffffffffffffffffffffffffffffffffffffffff",
++    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo when",
++    "0cd6e5d827bb62eb8fc1e262254223817fd068a74b5b449cc2f667c3f1f985a76379b43348d952e2265b4cd129090758b3e3c2c49103b5051aac2eaeb890a528",
++    "xprv9s21ZrQH143K36Ao5jHRVhFGDbLP6FCx8BEEmpru77ef3bmA928BxsqvVM27WnvvyfWywiFN8K6yToqMaGYfzS6Db1EHAXT5TuyCLBXUfdm"
++  ],
++  [
++    "0000000000000000000000000000000000000000000000000000000000000000",
++    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
++    "bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd3097170af7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8",
++    "xprv9s21ZrQH143K32qBagUJAMU2LsHg3ka7jqMcV98Y7gVeVyNStwYS3U7yVVoDZ4btbRNf4h6ibWpY22iRmXq35qgLs79f312g2kj5539ebPM"
++  ],
++  [
++    "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
++    "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title",
++    "bc09fca1804f7e69da93c2f2028eb238c227f2e9dda30cd63699232578480a4021b146ad717fbb7e451ce9eb835f43620bf5c514db0f8add49f5d121449d3e87",
++    "xprv9s21ZrQH143K3Y1sd2XVu9wtqxJRvybCfAetjUrMMco6r3v9qZTBeXiBZkS8JxWbcGJZyio8TrZtm6pkbzG8SYt1sxwNLh3Wx7to5pgiVFU"
++  ],
++  [
++    "8080808080808080808080808080808080808080808080808080808080808080",
++    "letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic bless",
++    "c0c519bd0e91a2ed54357d9d1ebef6f5af218a153624cf4f2da911a0ed8f7a09e2ef61af0aca007096df430022f7a2b6fb91661a9589097069720d015e4e982f",
++    "xprv9s21ZrQH143K3CSnQNYC3MqAAqHwxeTLhDbhF43A4ss4ciWNmCY9zQGvAKUSqVUf2vPHBTSE1rB2pg4avopqSiLVzXEU8KziNnVPauTqLRo"
++  ],
++  [
++    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
++    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote",
++    "dd48c104698c30cfe2b6142103248622fb7bb0ff692eebb00089b32d22484e1613912f0a5b694407be899ffd31ed3992c456cdf60f5d4564b8ba3f05a69890ad",
++    "xprv9s21ZrQH143K2WFF16X85T2QCpndrGwx6GueB72Zf3AHwHJaknRXNF37ZmDrtHrrLSHvbuRejXcnYxoZKvRquTPyp2JiNG3XcjQyzSEgqCB"
++  ],
++  [
++    "9e885d952ad362caeb4efe34a8e91bd2",
++    "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic",
++    "274ddc525802f7c828d8ef7ddbcdc5304e87ac3535913611fbbfa986d0c9e5476c91689f9c8a54fd55bd38606aa6a8595ad213d4c9c9f9aca3fb217069a41028",
++    "xprv9s21ZrQH143K2oZ9stBYpoaZ2ktHj7jLz7iMqpgg1En8kKFTXJHsjxry1JbKH19YrDTicVwKPehFKTbmaxgVEc5TpHdS1aYhB2s9aFJBeJH"
++  ],
++  [
++    "6610b25967cdcca9d59875f5cb50b0ea75433311869e930b",
++    "gravity machine north sort system female filter attitude volume fold club stay feature office ecology stable narrow fog",
++    "628c3827a8823298ee685db84f55caa34b5cc195a778e52d45f59bcf75aba68e4d7590e101dc414bc1bbd5737666fbbef35d1f1903953b66624f910feef245ac",
++    "xprv9s21ZrQH143K3uT8eQowUjsxrmsA9YUuQQK1RLqFufzybxD6DH6gPY7NjJ5G3EPHjsWDrs9iivSbmvjc9DQJbJGatfa9pv4MZ3wjr8qWPAK"
++  ],
++  [
++    "68a79eaca2324873eacc50cb9c6eca8cc68ea5d936f98787c60c7ebc74e6ce7c",
++    "hamster diagram private dutch cause delay private meat slide toddler razor book happy fancy gospel tennis maple dilemma loan word shrug inflict delay length",
++    "64c87cde7e12ecf6704ab95bb1408bef047c22db4cc7491c4271d170a1b213d20b385bc1588d9c7b38f1b39d415665b8a9030c9ec653d75e65f847d8fc1fc440",
++    "xprv9s21ZrQH143K2XTAhys3pMNcGn261Fi5Ta2Pw8PwaVPhg3D8DWkzWQwjTJfskj8ofb81i9NP2cUNKxwjueJHHMQAnxtivTA75uUFqPFeWzk"
++  ],
++  [
++    "c0ba5a8e914111210f2bd131f3d5e08d",
++    "scheme spot photo card baby mountain device kick cradle pact join borrow",
++    "ea725895aaae8d4c1cf682c1bfd2d358d52ed9f0f0591131b559e2724bb234fca05aa9c02c57407e04ee9dc3b454aa63fbff483a8b11de949624b9f1831a9612",
++    "xprv9s21ZrQH143K3FperxDp8vFsFycKCRcJGAFmcV7umQmcnMZaLtZRt13QJDsoS5F6oYT6BB4sS6zmTmyQAEkJKxJ7yByDNtRe5asP2jFGhT6"
++  ],
++  [
++    "6d9be1ee6ebd27a258115aad99b7317b9c8d28b6d76431c3",
++    "horn tenant knee talent sponsor spell gate clip pulse soap slush warm silver nephew swap uncle crack brave",
++    "fd579828af3da1d32544ce4db5c73d53fc8acc4ddb1e3b251a31179cdb71e853c56d2fcb11aed39898ce6c34b10b5382772db8796e52837b54468aeb312cfc3d",
++    "xprv9s21ZrQH143K3R1SfVZZLtVbXEB9ryVxmVtVMsMwmEyEvgXN6Q84LKkLRmf4ST6QrLeBm3jQsb9gx1uo23TS7vo3vAkZGZz71uuLCcywUkt"
++  ],
++  [
++    "9f6a2878b2520799a44ef18bc7df394e7061a224d2c33cd015b157d746869863",
++    "panda eyebrow bullet gorilla call smoke muffin taste mesh discover soft ostrich alcohol speed nation flash devote level hobby quick inner drive ghost inside",
++    "72be8e052fc4919d2adf28d5306b5474b0069df35b02303de8c1729c9538dbb6fc2d731d5f832193cd9fb6aeecbc469594a70e3dd50811b5067f3b88b28c3e8d",
++    "xprv9s21ZrQH143K2WNnKmssvZYM96VAr47iHUQUTUyUXH3sAGNjhJANddnhw3i3y3pBbRAVk5M5qUGFr4rHbEWwXgX4qrvrceifCYQJbbFDems"
++  ],
++  [
++    "23db8160a31d3e0dca3688ed941adbf3",
++    "cat swing flag economy stadium alone churn speed unique patch report train",
++    "deb5f45449e615feff5640f2e49f933ff51895de3b4381832b3139941c57b59205a42480c52175b6efcffaa58a2503887c1e8b363a707256bdd2b587b46541f5",
++    "xprv9s21ZrQH143K4G28omGMogEoYgDQuigBo8AFHAGDaJdqQ99QKMQ5J6fYTMfANTJy6xBmhvsNZ1CJzRZ64PWbnTFUn6CDV2FxoMDLXdk95DQ"
++  ],
++  [
++    "8197a4a47f0425faeaa69deebc05ca29c0a5b5cc76ceacc0",
++    "light rule cinnamon wrap drastic word pride squirrel upgrade then income fatal apart sustain crack supply proud access",
++    "4cbdff1ca2db800fd61cae72a57475fdc6bab03e441fd63f96dabd1f183ef5b782925f00105f318309a7e9c3ea6967c7801e46c8a58082674c860a37b93eda02",
++    "xprv9s21ZrQH143K3wtsvY8L2aZyxkiWULZH4vyQE5XkHTXkmx8gHo6RUEfH3Jyr6NwkJhvano7Xb2o6UqFKWHVo5scE31SGDCAUsgVhiUuUDyh"
++  ],
++  [
++    "066dca1a2bb7e8a1db2832148ce9933eea0f3ac9548d793112d9a95c9407efad",
++    "all hour make first leader extend hole alien behind guard gospel lava path output census museum junior mass reopen famous sing advance salt reform",
++    "26e975ec644423f4a4c4f4215ef09b4bd7ef924e85d1d17c4cf3f136c2863cf6df0a475045652c57eb5fb41513ca2a2d67722b77e954b4b3fc11f7590449191d",
++    "xprv9s21ZrQH143K3rEfqSM4QZRVmiMuSWY9wugscmaCjYja3SbUD3KPEB1a7QXJoajyR2T1SiXU7rFVRXMV9XdYVSZe7JoUXdP4SRHTxsT1nzm"
++  ],
++  [
++    "f30f8c1da665478f49b001d94c5fc452",
++    "vessel ladder alter error federal sibling chat ability sun glass valve picture",
++    "2aaa9242daafcee6aa9d7269f17d4efe271e1b9a529178d7dc139cd18747090bf9d60295d0ce74309a78852a9caadf0af48aae1c6253839624076224374bc63f",
++    "xprv9s21ZrQH143K2QWV9Wn8Vvs6jbqfF1YbTCdURQW9dLFKDovpKaKrqS3SEWsXCu6ZNky9PSAENg6c9AQYHcg4PjopRGGKmdD313ZHszymnps"
++  ],
++  [
++    "c10ec20dc3cd9f652c7fac2f1230f7a3c828389a14392f05",
++    "scissors invite lock maple supreme raw rapid void congress muscle digital elegant little brisk hair mango congress clump",
++    "7b4a10be9d98e6cba265566db7f136718e1398c71cb581e1b2f464cac1ceedf4f3e274dc270003c670ad8d02c4558b2f8e39edea2775c9e232c7cb798b069e88",
++    "xprv9s21ZrQH143K4aERa2bq7559eMCCEs2QmmqVjUuzfy5eAeDX4mqZffkYwpzGQRE2YEEeLVRoH4CSHxianrFaVnMN2RYaPUZJhJx8S5j6puX"
++  ],
++  [
++    "f585c11aec520db57dd353c69554b21a89b20fb0650966fa0a9d6f74fd989d8f",
++    "void come effort suffer camp survey warrior heavy shoot primary clutch crush open amazing screen patrol group space point ten exist slush involve unfold",
++    "01f5bced59dec48e362f2c45b5de68b9fd6c92c6634f44d6d40aab69056506f0e35524a518034ddc1192e1dacd32c1ed3eaa3c3b131c88ed8e7e54c49a5d0998",
++    "xprv9s21ZrQH143K39rnQJknpH1WEPFJrzmAqqasiDcVrNuk926oizzJDDQkdiTvNPr2FYDYzWgiMiC63YmfPAa2oPyNB23r2g7d1yiK6WpqaQS"
++  ]
++]
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/VECTORS.md b/swap-machine/src/litecoin_light/vault/mnemonic/VECTORS.md
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/VECTORS.md
+@@ -0,0 +1,5 @@
++English BIP39 reference vectors from https://raw.githubusercontent.com/trezor/python-mnemonic/master/vectors.json
++
++Original download SHA-256: `fa3b937b7cff9c9b8ecd3aa011faeb8d6dd67993174b72326e83f4de8fdb30f8`.
++The upstream python-mnemonic project is MIT licensed. These are public test
++vectors, never wallet secrets. The test passphrase is TREZOR.
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/VECTORS-LICENSE.txt b/swap-machine/src/litecoin_light/vault/mnemonic/VECTORS-LICENSE.txt
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/VECTORS-LICENSE.txt
+@@ -0,0 +1,21 @@
++The MIT License (MIT)
++
++Copyright (c) 2013-2016 Pavol Rusnak
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.

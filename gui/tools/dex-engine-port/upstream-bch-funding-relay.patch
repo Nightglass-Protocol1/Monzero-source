@@ -1,0 +1,323 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
+@@ -9,6 +9,7 @@
+ mod locks;
+ pub mod signing;
+ pub mod recovery;
++pub mod relay;
+ 
+ const TEMPLATE: &str = "monzero-bch-funding-template-v1";
+ const PIN: &str = "monzero-bch-funding-pin-v2";
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/relay.rs
+@@ -0,0 +1,128 @@
++//! Explicit funding publication, after private recovery retention. A durable
++//! attempt precedes RPC; ambiguous results never authorize automatic retry.
++use super::*;
++use crate::bch_rpc::{BchRpc,observation::FundingStatus};
++use bitcoin::{consensus::serialize,Txid};
++use serde_json::{Value,json};
++use swap_core::bch::funding::SignedFunding;
++
++const REVIEW: &str = "monzero-bch-funding-relay-review-v1";
++const ATTEMPT: &str = "monzero-bch-funding-relay-intent-v1";
++const ACK: &str = "monzero-bch-funding-relay-ack-v1";
++pub struct FundingRelayReview { pub details: Value, pub commitment: [u8;32] }
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub enum FundingRelayState {
++    /// Includes an attempt interrupted before sending. Observe the exact txid;
++    /// absence does not prove it was never broadcast or permit retransmission.
++    Attempted { txid: Txid },
++    /// The node returned the exact txid, not proof of confirmation or finality.
++    Acknowledged { txid: Txid },
++}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Intent { schema: String, review: [u8;32], approved_at: u64 }
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Ack { schema: String, intent: [u8;32], txid: Txid }
++fn optional(journal: &Journal,name: &str) -> Result<Option<Vec<u8>>> {
++    match journal.read(name) {
++        Ok(bytes) => Ok(Some(bytes)),
++        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound) => Ok(None),
++        Err(e) => Err(e),
++    }
++}
++impl AdmittedExecution<'_> {
++    fn funding_relay_materials(&self) -> Result<(FundingRelayReview,SignedFunding,u64,locks::Intent)> {
++        let prepared = self.prepared_bch_funding()?.context("BCH funding preparation is absent")?;
++        let (locked,_) = self.funding_lock_intent(&prepared)?;
++        let (signed,signed_at) = self.restore_signed_bch_funding()?.context("BCH signed funding is absent")?;
++        let recovery = self.retained_bch_recovery()?.context("BCH private recovery must be retained before funding relay")?;
++        let details = json!({"schema":REVIEW,"action":"broadcast-funding",
++            "swapId":self.quote.terms()["swapId"],"quote":self.quote.commitment(),
++            "admission":self.admission_digest()?,"deployment":locked.deployment,
++            "network":self.quote.terms()["bchNetwork"],"genesis":self.quote.terms()["bchGenesis"],
++            "expiresAt":self.quote.terms()["expiresAt"],"fundingTxid":signed.lock_outpoint().txid,
++            "contractVout":signed.lock_outpoint().vout,
++            "signedBytes":hash("monzero-bch-exact-signed-funding-v1",&serialize(signed.transaction())),
++            "preparation":prepared.commitment(),"feeAtoms":prepared.preview().fee().to_sat(),
++            "outputs":signed.transaction().output.iter().map(|o|json!({"atoms":o.value.to_sat(),
++                "script":o.script_pubkey.to_hex_string()})).collect::<Vec<_>>(),
++            "privateRecovery":recovery.commitment(),"cancelTxid":recovery.cancel().compute_txid(),
++            "refundTxid":recovery.refund_txid()?,"punishTxid":recovery.punish().compute_txid()});
++        let commitment = hash(REVIEW,&serde_json::to_vec(&details)?);
++        Ok((FundingRelayReview {details,commitment},signed,signed_at.max(recovery.prepared_at()),locked))
++    }
++
++    /// Display this independently of sign-only approval. No network mutation.
++    pub fn review_bch_funding_relay(&self,backend: &BchRpc,now: u64) -> Result<FundingRelayReview> {
++        self.quote.check_policy(self.policy,now)?;
++        let (review,_,prepared_at,locked) = self.funding_relay_materials()?;
++        ensure!(now >= prepared_at && backend.deployment_commitment()? == locked.deployment,
++            "BCH funding relay predates recovery or targets another deployment");
++        Ok(review)
++    }
++
++    fn relay_intent(&self,review: &FundingRelayReview,prepared_at: u64) -> Result<Option<(Intent,[u8;32])>> {
++        let Some(bytes) = optional(&self.metadata,&record_name(self.quote,"relay-intent"))? else {return Ok(None)};
++        ensure!(bytes.len() <= 4096,"oversized BCH relay intent");
++        let intent: Intent = serde_json::from_slice(&bytes)?;
++        ensure!(intent.schema == ATTEMPT && intent.review == review.commitment
++            && intent.approved_at >= prepared_at && serde_json::to_vec(&intent)? == bytes,
++            "BCH relay intent differs from retained approval or recovery");
++        self.quote.check_policy(self.policy,intent.approved_at)?;
++        Ok(Some((intent,hash(ATTEMPT,&bytes))))
++    }
++
++    /// Historical local attempt status, including after quote expiry. Use the
++    /// separate read-only funding observer for current chain/mempool evidence.
++    pub fn bch_funding_relay_state(&self) -> Result<Option<FundingRelayState>> {
++        let (review,signed,prepared_at,_) = self.funding_relay_materials()?;
++        let ack = optional(&self.metadata,&record_name(self.quote,"relay-ack"))?;
++        let Some((_,intent)) = self.relay_intent(&review,prepared_at)? else {
++            ensure!(ack.is_none(),"BCH relay acknowledgement has no original intent");
++            return Ok(None)
++        };
++        let txid = signed.lock_outpoint().txid;
++        let Some(bytes) = ack else {return Ok(Some(FundingRelayState::Attempted {txid}))};
++        ensure!(bytes.len() <= 4096,"oversized BCH relay acknowledgement");
++        let ack: Ack = serde_json::from_slice(&bytes)?;
++        ensure!(ack.schema == ACK && ack.intent == intent && ack.txid == txid
++            && serde_json::to_vec(&ack)? == bytes,"BCH relay acknowledgement changed");
++        Ok(Some(FundingRelayState::Acknowledged {txid}))
++    }
++
++    /// Broadcast once, only after explicit approval and fresh input checks.
++    /// Any attempt without a retained acknowledgement requires observation and
++    /// separate reconciliation; never re-sign, replace inputs or auto-retransmit.
++    pub async fn relay_bch_funding(&mut self,backend: &BchRpc,approved: &[u8;32],now: u64) -> Result<Txid> {
++        let started = std::time::Instant::now();
++        let review = self.review_bch_funding_relay(backend,now)?;
++        let expires = self.quote.terms()["expiresAt"].parse::<u64>().context("invalid BCH quote expiry")?;
++        let deadline = started.checked_add(std::time::Duration::from_secs(expires.checked_sub(now)
++            .context("BCH quote expired before relay")?)).context("BCH relay deadline overflow")?;
++        ensure!(review.commitment == *approved,"BCH funding relay approval is stale or mismatched");
++        let (_,signed,prepared_at,locked) = self.funding_relay_materials()?;
++        if let Some((intent,_)) = self.relay_intent(&review,prepared_at)? {
++            ensure!(now >= intent.approved_at,"BCH funding relay time moved backwards");
++        }
++        match self.bch_funding_relay_state()? {
++            Some(FundingRelayState::Acknowledged {txid}) => return Ok(txid),
++            Some(FundingRelayState::Attempted {..}) => anyhow::bail!("BCH funding relay has an uncertain result; observe without retransmitting"),
++            None => (),
++        }
++        ensure!(backend.observe_funding(&signed).await?.status() == FundingStatus::Unobserved,
++            "BCH funding already observed; reconcile without sending");
++        let prepared = self.prepared_bch_funding()?.context("BCH funding preparation is absent")?;
++        backend.observe_funding_inputs(prepared.preview(),&locked.change_address,locked.minimum_confirmations).await?;
++        let wallet_locks = backend.locked_outpoints().await?;
++        ensure!(prepared.preview().transaction().input.iter().all(|i|wallet_locks.contains(&i.previous_output)),
++            "BCH funding inputs lost wallet locks before relay");
++        let intent = Intent {schema:ATTEMPT.into(),review:*approved,approved_at:now};
++        let bytes = serde_json::to_vec(&intent)?;
++        self.metadata.retain(&record_name(self.quote,"relay-intent"),&bytes)?;
++        let txid = backend.relay_funding(&signed,deadline).await?;
++        let ack = Ack {schema:ACK.into(),intent:hash(ATTEMPT,&bytes),txid};
++        self.metadata.retain(&record_name(self.quote,"relay-ack"),&serde_json::to_vec(&ack)?)?;
++        Ok(txid)
++    }
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+@@ -9,7 +9,7 @@
+ #[derive(Default)]
+ struct State { locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8,
+     sign_calls: usize, sign_mode: u8, signed_candidate: Vec<u8>, sign_intent: Option<std::path::PathBuf>, observed: Option<Transaction>, observed_vout: u32,
+-    observation_mode: u8, observation_chain_calls: usize }
++    observation_mode: u8, observation_chain_calls: usize, relay_mode: u8, relay_calls: usize, relay_intent: Option<std::path::PathBuf> }
+ struct Server {
+     port: u16, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>,
+     thread: Option<std::thread::JoinHandle<Result<()>>>,
+@@ -101,9 +101,28 @@
+                     "signrawtransactionwithwallet" => match signing::reply(&request,&script,&mut state)? {
+                         Some(reply) => reply, None => continue,
+                     },
++                    "sendrawtransaction" => {
++                        use bitcoin::hex::DisplayHex;
++                        let tx = state.observed.as_ref().context("missing relay fixture")?;
++                        let txid = tx.compute_txid();
++                        ensure!(request["params"] == json!([serialize(tx).to_lower_hex_string(),false]),"wrong relay bytes or high-fee override");
++                        let intent: Value = serde_json::from_slice(&std::fs::read(
++                            state.relay_intent.as_ref().context("missing relay intent path")?)?)?;
++                        ensure!(intent["schema"] == "monzero-bch-funding-relay-intent-v1" && state.locked,
++                            "relay approval must be retained before RPC");
++                        state.relay_calls += 1;
++                        match state.relay_mode {
++                            1 => continue, // Applied, reply lost.
++                            2 => json!("00".repeat(32)),
++                            3 => {rpc_error=json!({"code":-26,"message":"fixture"}); http_status="500 Internal Server Error"; Value::Null},
++                            4 => json!({"txid":txid}),
++                            6 => {http_status="401 Unauthorized"; json!(txid)},
++                            _ => json!(txid),
++                        }
++                    },
+                     _ => anyhow::bail!("unexpected method: {method}"),
+                 };
+-                let id = if method=="getmempoolentry" && state.observation_mode==17 {
++                let id = if (method=="getmempoolentry" && state.observation_mode==17) || (method=="sendrawtransaction" && state.relay_mode==5) {
+                     json!(request["id"].as_u64().unwrap()+1)
+                 } else {request["id"].clone()};
+                 let body = serde_json::to_vec(&json!({"id":id,"error":rpc_error,"result":result}))?;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing.rs
+@@ -62,6 +62,7 @@
+     let raw = serialize(signed.transaction()); let outpoint = signed.lock_outpoint();
+     let recovery = recovery::exercise(&mut execution,setup,metadata,snapshots,&signed)?;
+     super::observation::exercise(&execution,rpc,server,&signed).await?;
++    relay::exercise(setup,metadata,snapshots,server,rpc,&signed).await?;
+     assert!(signed_path.is_file()); assert_eq!(server.state.lock().unwrap().sign_calls,1);
+     assert_eq!(execution.sign_bch_funding(rpc,&review.commitment,1013).await?.lock_outpoint(),outpoint);
+     assert_eq!(server.state.lock().unwrap().sign_calls,1);
+@@ -168,3 +169,4 @@
+ }
+ 
+ mod recovery;
++mod relay;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay.rs
+@@ -0,0 +1,90 @@
++use super::*;
++use agreement::execution::funding::relay::FundingRelayState;
++use swap_core::bch::funding::SignedFunding;
++
++pub(super) async fn exercise(setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
++    server: &Server,rpc: &BchRpc,signed: &SignedFunding) -> Result<()> {
++    let baseline: Vec<_> = std::fs::read_dir(&metadata.0)?.map(|entry| {
++        let entry = entry?; Ok((entry.file_name(),std::fs::read(entry.path())?))
++    }).collect::<std::io::Result<_>>()?;
++    let swap = &setup.quote.terms()["swapId"];
++    let txid = signed.lock_outpoint().txid;
++    for mode in 0..=6 {
++        let metadata = PrivateStore::new()?;
++        for (name,bytes) in &baseline {
++            let path = metadata.0.join(name); std::fs::write(&path,bytes)?;
++            std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;
++        }
++        let intent = metadata.0.join(format!("{swap}.bch-funding-relay-intent"));
++        let ack = metadata.0.join(format!("{swap}.bch-funding-relay-ack"));
++        let mut execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        {
++            let mut state = server.state.lock().unwrap();
++            state.observed = Some(signed.transaction().clone()); state.observed_vout = signed.lock_outpoint().vout;
++            state.observation_mode = 2; state.observation_chain_calls = 0;
++            state.relay_mode = mode; state.relay_intent = Some(intent.clone()); state.locked = true;
++        }
++        let calls = server.state.lock().unwrap().relay_calls;
++        let review = execution.review_bch_funding_relay(rpc,1018)?;
++        assert_eq!(review.details["action"],"broadcast-funding");
++        assert_eq!(review.details["fundingTxid"],txid.to_string());
++        assert_eq!(review.details["feeAtoms"],1000);
++        assert!(execution.bch_funding_relay_state()?.is_none());
++        if mode == 0 {
++            assert!(rpc.relay_funding(signed,std::time::Instant::now()).await.is_err());
++            let pin = metadata.0.join(format!("{swap}.bch-funding-recovery-pin"));
++            let saved = std::fs::read(&pin)?; std::fs::remove_file(&pin)?;
++            assert!(execution.review_bch_funding_relay(rpc,1018).is_err());
++            std::fs::write(&pin,saved)?; std::fs::set_permissions(&pin,std::fs::Permissions::from_mode(0o600))?;
++            let sign_only = execution.review_bch_funding_signing(rpc,1018)?;
++            assert!(execution.relay_bch_funding(rpc,&sign_only.commitment,1018).await.is_err());
++            assert!(execution.relay_bch_funding(rpc,&review.commitment,2000).await.is_err());
++            assert!(execution.relay_bch_funding(rpc,&review.commitment,1014).await.is_err());
++            server.state.lock().unwrap().locked = false;
++            assert!(execution.relay_bch_funding(rpc,&review.commitment,1018).await.is_err());
++            server.state.lock().unwrap().locked = true;
++            for observed in [0,1,3] {
++                server.state.lock().unwrap().observation_mode = observed;
++                assert!(execution.relay_bch_funding(rpc,&review.commitment,1018).await.is_err());
++            }
++            server.state.lock().unwrap().observation_mode = 2;
++            assert!(!intent.exists()); assert!(!ack.exists());
++            assert_eq!(server.state.lock().unwrap().relay_calls,calls);
++        }
++        let result = execution.relay_bch_funding(rpc,&review.commitment,1018).await;
++        assert_eq!(server.state.lock().unwrap().relay_calls,calls+1);
++        assert!(intent.is_file());
++        let expected = if mode == 0 {
++            assert_eq!(result?,txid); assert!(ack.is_file());
++            assert_eq!(execution.relay_bch_funding(rpc,&review.commitment,1019).await?,txid);
++            assert!(execution.relay_bch_funding(rpc,&review.commitment,1017).await.is_err());
++            FundingRelayState::Acknowledged {txid}
++        } else {
++            assert!(result.is_err()); assert!(!ack.exists());
++            assert!(execution.relay_bch_funding(rpc,&review.commitment,1019).await.is_err());
++            FundingRelayState::Attempted {txid}
++        };
++        drop(execution);
++        let mut execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        assert_eq!(execution.bch_funding_relay_state()?,Some(expected));
++        // Historical state survives expiry; submission cannot renew approval.
++        assert!(execution.relay_bch_funding(rpc,&review.commitment,2000).await.is_err());
++        if mode == 0 {
++            let saved = std::fs::read(&ack)?; std::fs::write(&ack,b"{}")?;
++            assert!(execution.bch_funding_relay_state().is_err());
++            assert!(execution.relay_bch_funding(rpc,&review.commitment,1019).await.is_err());
++            std::fs::write(&ack,saved)?;
++            let saved = std::fs::read(&intent)?; std::fs::remove_file(&intent)?;
++            assert!(execution.bch_funding_relay_state().is_err());
++            std::fs::write(&intent,saved)?; std::fs::set_permissions(&intent,std::fs::Permissions::from_mode(0o600))?;
++        } else {
++            // Even an unobserved exact transaction never permits automatic retry.
++            assert!(execution.relay_bch_funding(rpc,&review.commitment,1020).await.is_err());
++        }
++        assert_eq!(server.state.lock().unwrap().relay_calls,calls+1);
++    }
++    let mut state = server.state.lock().unwrap();
++    state.observed = None; state.observation_mode = 0; state.relay_mode = 0;
++    assert_eq!(state.sign_calls,1);
++    Ok(())
++}
+--- a/swap-machine/src/bch_rpc.rs
++++ b/swap-machine/src/bch_rpc.rs
+@@ -178,6 +178,7 @@
+ }
+ mod locks;
+ mod signing;
++mod relay;
+ pub mod observation;
+ #[cfg(test)]
+ mod tests;
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/relay.rs
+@@ -0,0 +1,20 @@
++//! BCHN v29 sendrawtransaction uses allowhighfees, not a numeric fee rate.
++use super::*;
++use bitcoin::{hex::DisplayHex,Txid};
++use swap_core::bch::funding::SignedFunding;
++
++impl BchRpc {
++    /// Only the admitted executor may call this after retaining relay approval.
++    /// An error may follow successful broadcast; never retry automatically.
++    pub(crate) async fn relay_funding(&self,signed: &SignedFunding,deadline: std::time::Instant) -> Result<Txid> {
++        ensure!(std::time::Instant::now() < deadline,"BCH funding relay quote expired before preflight");
++        self.chain_state().await?;
++        self.wallet_ready().await?;
++        let raw = serialize(signed.transaction()).to_lower_hex_string();
++        ensure!(std::time::Instant::now() < deadline,"BCH funding relay quote expired during preflight");
++        let reply = self.rpc(false,"sendrawtransaction",json!([raw,false])).await?;
++        let txid: Txid = serde_json::from_str(reply.get())?;
++        ensure!(txid == signed.lock_outpoint().txid,"BCH relay returned another transaction ID");
++        Ok(txid)
++    }
++}

@@ -1,0 +1,178 @@
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -178,3 +178,5 @@
+ pub mod history;
+ 
+ pub mod scan;
++
++pub mod wallet;
+diff --git a/swap-machine/src/litecoin_light/accounting.rs b/swap-machine/src/litecoin_light/accounting.rs
+--- a/swap-machine/src/litecoin_light/accounting.rs
++++ b/swap-machine/src/litecoin_light/accounting.rs
+@@ -45,8 +45,10 @@
+             }
+         }
+         let mut spends=BTreeSet::new();
+-        let mut output_count=0usize;
++        let mut output_count=0usize;let mut input_count=0usize;
+         for (transaction,_) in active.values() {
++            input_count=input_count.checked_add(transaction.inputs().len()).context("Litecoin input count overflow")?;
++            ensure!(input_count<=100_000,"Litecoin accounting input limit exceeded");
+             output_count=output_count.checked_add(transaction.outputs().len()).context("Litecoin output count overflow")?;
+             ensure!(output_count<=100_000,"Litecoin accounting output limit exceeded");
+             if transaction.is_coinbase() {continue}
+diff --git a/swap-machine/src/litecoin_light/session/wallet.rs b/swap-machine/src/litecoin_light/session/wallet.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet.rs
+@@ -0,0 +1,92 @@
++//! One bounded refresh against a borrowed, unchanged selected header chain.
++//! Returned amounts remain provisional: peer omissions, mempool effects and
++//! freshness are not resolved. This module grants no spend/sign capability.
++use super::*;
++use super::{history::ReportedPosition,scan::{BranchScan,ScanStop}};
++use crate::litecoin_light::{account::{PublicAccount,Branch},accounting::ObservedWallet};
++use bitcoin::{OutPoint,ScriptBuf};
++use std::collections::{BTreeMap,BTreeSet};
++
++pub struct RefreshLimits {
++    pub gap:u32,
++    pub addresses_per_branch:u32,
++    pub history_entries_per_branch:usize,
++}
++pub struct WalletObservation {
++    receive:BranchScan,
++    change:BranchScan,
++    accounting:ObservedWallet,
++    pending_reports:usize,
++}
++impl WalletObservation {
++    pub fn receive(&self)->&BranchScan {&self.receive}
++    pub fn change(&self)->&BranchScan {&self.change}
++    pub fn accounting(&self)->&ObservedWallet {&self.accounting}
++    /// Distinct unverified mempool reports, excluded from confirmed accounting.
++    /// Their spending effects have NOT been subtracted from returned amounts.
++    pub fn pending_reports(&self)->usize {self.pending_reports}
++}
++impl<S:AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
++    /// Allocated counts are receive/change high-water marks from retained state.
++    /// Both branches must reach their reported gap; otherwise no snapshot returns.
++    pub async fn refresh_wallet(&mut self,chain:&super::super::headers::HeaderSequence,
++        account:&PublicAccount,allocated:[u32;2],limits:&RefreshLimits)->Result<WalletObservation> {
++        ensure!(chain.network()==self.network && account.network()==self.network
++            && allocated.iter().all(|count|*count<=10_000)
++            && (1..=500).contains(&limits.addresses_per_branch)
++            && (1..=500).contains(&limits.gap)
++            && (1..=1000).contains(&limits.history_entries_per_branch),"invalid Litecoin wallet refresh request");
++        let result=self.refresh_inner(chain,account,allocated,limits).await;
++        if result.is_err() {self.usable=false;}
++        result
++    }
++    async fn refresh_inner(&mut self,chain:&super::super::headers::HeaderSequence,
++        account:&PublicAccount,allocated:[u32;2],limits:&RefreshLimits)->Result<WalletObservation> {
++        let receive=self.scan_branch(account,Branch::Receive,allocated[0],limits.gap,
++            limits.addresses_per_branch,limits.history_entries_per_branch).await?;
++        ensure!(receive.stop()==ScanStop::ReportedGap,"incomplete Litecoin receiving scan");
++        let change=self.scan_branch(account,Branch::Change,allocated[1],limits.gap,
++            limits.addresses_per_branch,limits.history_entries_per_branch).await?;
++        ensure!(change.stop()==ScanStop::ReportedGap,"incomplete Litecoin change scan");
++        let mut scripts=Vec::new();
++        let mut reports:BTreeMap<Txid,(ReportedPosition,BTreeSet<ScriptBuf>)>=BTreeMap::new();
++        for (branch,scan) in [(Branch::Receive,&receive),(Branch::Change,&change)] {
++            for index in 0..scan.scanned() {scripts.push(account.derive(branch,index)?.address().script_pubkey().clone());}
++            for address in scan.reported() {
++                let script=account.derive(branch,address.index())?.address().script_pubkey().clone();
++                for report in address.history() {
++                    let entry=reports.entry(report.txid()).or_insert_with(||(report.position(),BTreeSet::new()));
++                    ensure!(entry.0==report.position(),"inconsistent Litecoin history positions");
++                    entry.1.insert(script.clone());
++                }
++            }
++        }
++        let mut transactions=Vec::new();let mut pending_reports=0;let mut effects=0usize;
++        for (txid,(position,_)) in &reports {
++            if let ReportedPosition::Block(height)=position {
++                let transaction=self.transaction_on(chain,*height,*txid).await?;
++                effects=effects.checked_add(transaction.inputs().len()+transaction.outputs().len())
++                    .context("Litecoin refresh effect count overflow")?;
++                ensure!(effects<=100_000,"Litecoin refresh effect budget exhausted");
++                transactions.push(transaction);
++            } else {pending_reports+=1;}
++        }
++        let mut previous=BTreeMap::new();
++        for transaction in &transactions {
++            for (index,output) in transaction.outputs().iter().enumerate() {
++                previous.insert(OutPoint {txid:transaction.txid(),vout:index as u32},&output.script_pubkey);
++            }
++        }
++        for transaction in &transactions {
++            for script in &reports.get(&transaction.txid()).context("missing Litecoin history claim")?.1 {
++                let pays=transaction.outputs_to(script).next().is_some();
++                let spends=transaction.inputs().iter().any(|input|previous.get(input).is_some_and(|parent|*parent==script));
++                ensure!(pays || spends,"Litecoin history transaction has no proven script relation");
++            }
++        }
++        let accounting=ObservedWallet::reconcile(chain,&scripts,&transactions)?;
++        Ok(WalletObservation {receive,change,accounting,pending_reports})
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session/wallet/tests.rs b/swap-machine/src/litecoin_light/session/wallet/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet/tests.rs
+@@ -0,0 +1,52 @@
++use super::*;
++use crate::litecoin_light::{headers::HeaderSequence,session::tests::{server,reply,regtest_handshake}};
++use bitcoin::{bip32::Xpriv,NetworkKind};
++fn account()->PublicAccount {
++    PublicAccount::from_master(&Xpriv::new_master(NetworkKind::Test,&[1;32]).unwrap(),LtcNetwork::Regtest,0).unwrap()
++}
++fn limits()->RefreshLimits {RefreshLimits {gap:1,addresses_per_branch:3,history_entries_per_branch:10}}
++fn report(height:i32)->Value {json!([{"tx_hash":"11".repeat(32),"height":height}])}
++#[tokio::test]
++async fn refresh_empty_wallet_queries_both_branches_and_records_tip()->Result<()> {
++    let mut responses=regtest_handshake();responses.extend([reply(3,json!([])),reply(4,json!([]))]);
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let chain=HeaderSequence::new(LtcNetwork::Regtest)?;let account=account();
++    let result=session.refresh_wallet(&chain,&account,[0,0],&limits()).await?;
++    assert_eq!(result.accounting().observed_mature().to_sat(),0);assert_eq!(result.accounting().tip(),chain.header(0).unwrap().block_hash());
++    assert_eq!(result.pending_reports(),0);assert_eq!(result.receive().scanned(),1);assert_eq!(result.change().scanned(),1);
++    drop(session);let requests=task.await?;
++    for (index,branch) in [(2,Branch::Receive),(3,Branch::Change)] {
++        assert_eq!(requests[index]["params"],json!([script_hash(account.derive(branch,0)?.address().script_pubkey())]));
++    }
++    Ok(())
++}
++#[tokio::test]
++async fn refresh_incomplete_scan_returns_no_snapshot()->Result<()> {
++    let mut responses=regtest_handshake();responses.push(reply(3,json!([])));
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let mut limits=limits();limits.addresses_per_branch=1;
++    assert!(session.refresh_wallet(&HeaderSequence::new(LtcNetwork::Regtest)?,&account(),[2,0],&limits).await.is_err());
++    assert!(!session.usable);drop(session);assert_eq!(task.await?.len(),3);Ok(())
++}
++#[tokio::test]
++async fn refresh_rejects_inconsistent_positions_before_transaction_fetch()->Result<()> {
++    let mut responses=regtest_handshake();responses.extend([reply(3,report(1)),reply(4,json!([])),reply(5,report(2)),reply(6,json!([]))]);
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    assert!(session.refresh_wallet(&HeaderSequence::new(LtcNetwork::Regtest)?,&account(),[0,0],&limits()).await.is_err());
++    drop(session);assert_eq!(task.await?.len(),6);Ok(())
++}
++#[tokio::test]
++async fn refresh_mempool_reports_remain_explicitly_unverified()->Result<()> {
++    let mut responses=regtest_handshake();responses.extend([reply(3,report(0)),reply(4,json!([])),reply(5,report(0)),reply(6,json!([]))]);
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let result=session.refresh_wallet(&HeaderSequence::new(LtcNetwork::Regtest)?,&account(),[0,0],&limits()).await?;
++    assert_eq!(result.pending_reports(),1);assert_eq!(result.accounting().coins().len(),0);
++    drop(session);assert_eq!(task.await?.len(),6);Ok(())
++}
++#[tokio::test]
++async fn refresh_height_beyond_selected_chain_is_not_assumed_confirmed()->Result<()> {
++    let mut responses=regtest_handshake();responses.extend([reply(3,report(1)),reply(4,json!([])),reply(5,json!([]))]);
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    assert!(session.refresh_wallet(&HeaderSequence::new(LtcNetwork::Regtest)?,&account(),[0,0],&limits()).await.is_err());
++    drop(session);assert_eq!(task.await?.len(),5);Ok(())
++}

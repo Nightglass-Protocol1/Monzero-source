@@ -1,0 +1,105 @@
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -0,0 +1,100 @@
++//! Read-only light-chain helper for an app-owned worker process. No wallet keys,
++//! balance claims, signing, broadcast or live-market activation.
++#[cfg(target_os="linux")]
++mod linux {
++    use anyhow::{Context,Result,ensure};
++    use serde::Deserialize;
++    use serde_json::{Value,json};
++    use std::{fs::{File,OpenOptions},io::{Read,Write},os::unix::fs::{MetadataExt,OpenOptionsExt},
++        path::{Path,PathBuf},time::{SystemTime,UNIX_EPOCH}};
++    use swap_core::litecoin_address::LtcNetwork;
++    use swap_machine::litecoin_light::{state::ChainState,tls::TlsEndpoint};
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct Config {schema:String,network:String,cache_directory:PathBuf,maximum_height:u32,endpoint:Option<Endpoint>}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields)]
++    struct Endpoint {host:String,port:u16}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct Request {schema:String,request_id:uuid::Uuid,maximum_download_headers:Option<u32>}
++    fn now() -> Result<u64> {Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())}
++    fn config(path: &Path) -> Result<(File,Config)> {
++        ensure!(path.is_absolute() && path.canonicalize()?==path,"noncanonical light-chain configuration");
++        let file=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC|libc::O_NONBLOCK).open(path)?;
++        let before=file.metadata()?;
++        ensure!(before.is_file() && before.uid()==unsafe {libc::geteuid()} && before.nlink()==1
++            && before.mode()&0o7777==0o600 && before.len()>0 && before.len()<=4096,"unsafe light-chain configuration");
++        file.try_lock()?;
++        let mut bytes=Vec::new();(&file).take(4097).read_to_end(&mut bytes)?;
++        let after=file.metadata()?;let named=std::fs::symlink_metadata(path)?;
++        ensure!(named.is_file() && (named.dev(),named.ino())==(before.dev(),before.ino())
++            && bytes.len() as u64==before.len() && after.len()==before.len()
++            && (before.mtime(),before.mtime_nsec(),before.ctime(),before.ctime_nsec())
++                ==(after.mtime(),after.mtime_nsec(),after.ctime(),after.ctime_nsec()),"light-chain configuration changed");
++        let config: Config=serde_json::from_slice(&bytes)?;
++        ensure!(config.schema=="monzero-private-ltc-light-v1" && config.maximum_height<=10_000_000,
++            "invalid light-chain configuration");
++        Ok((file,config))
++    }
++    fn snapshot(state: &ChainState) -> Result<Value> {
++        let chain=state.chain()?;
++        let tip=chain.header(chain.height()).context("missing selected header")?;
++        Ok(json!({"network":chain.network().name(),"height":chain.height(),"tip":tip.block_hash().to_string(),
++            "chainWork":chain.chain_work().to_str_radix(10),"freshness":"unassessed"}))
++    }
++    async fn synchronize(config: &Config,network: LtcNetwork,state: &mut ChainState,budget: u32) -> Result<Value> {
++        let endpoint=config.endpoint.as_ref().context("missing explicit TLS endpoint")?;
++        let endpoint=TlsEndpoint::new(endpoint.host.clone(),endpoint.port,network)?;
++        let tip=endpoint.connect().await?.reported_tip().await?;
++        ensure!(tip.height()<=config.maximum_height,"reported tip exceeds configured height ceiling");
++        let reported_height=tip.height();let reported_tip=tip.hash();
++        let mut session=endpoint.connect().await?;
++        let mut candidate=session.begin_sync(state.chain()?,tip).await?;
++        ensure!(candidate.target_height()-candidate.height()<=budget,"candidate exceeds requested download budget");
++        let mut downloaded=0u32;
++        while !candidate.complete() {
++            downloaded=downloaded.checked_add(candidate.advance(&mut session,2016,now()?).await?)
++                .context("header download count overflow")?;
++        }
++        drop(session);
++        let changed=state.publish(candidate)?.map(|change|json!({"commonAncestor":change.common_ancestor,
++            "oldHeight":change.old_tip.0,"oldTip":change.old_tip.1.to_string(),
++            "newHeight":change.new_tip.0,"newTip":change.new_tip.1.to_string()}));
++        Ok(json!({"reportedHeight":reported_height,"reportedTip":reported_tip.to_string(),
++            "downloadedHeaders":downloaded,"change":changed,
++            "reportedTipOnSelectedChain":state.chain()?.contains(reported_height,reported_tip)}))
++    }
++    pub fn run() -> Result<()> {
++        let args: Vec<_>=std::env::args_os().collect();
++        ensure!(args.len()==3,"invalid light-chain helper arguments");
++        let sync=match args[1].to_str() {Some("--status-stdio-v1")=>false,Some("--sync-stdio-v1")=>true,
++            _=>anyhow::bail!("unsupported light-chain operation")};
++        let mut bytes=Vec::new();std::io::stdin().take(513).read_to_end(&mut bytes)?;
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid light-chain request size");
++        let request: Request=serde_json::from_slice(&bytes)?;
++        let schema=if sync {"monzero-ltc-light-sync-request-v1"} else {"monzero-ltc-light-status-request-v1"};
++        ensure!(request.schema==schema && !request.request_id.is_nil(),"invalid light-chain request identity");
++        ensure!(if sync {request.maximum_download_headers.is_some_and(|n|(1..=10_000_000).contains(&n))}
++            else {request.maximum_download_headers.is_none()},"invalid light-chain request budget");
++        let (_lease,config)=config(Path::new(&args[2]))?;
++        let network=match config.network.as_str() {"main"=>LtcNetwork::Mainnet,"test"=>LtcNetwork::Testnet,
++            "regtest"=>LtcNetwork::Regtest,_=>anyhow::bail!("unsupported Litecoin network")};
++        let mut state=ChainState::open(&config.cache_directory,network,config.maximum_height,now()?)?;
++        let synchronization=if sync {
++            let budget=request.maximum_download_headers.context("missing download budget")?;
++            Some(tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(synchronize(&config,network,&mut state,budget))?)
++        } else {None};
++        let response=json!({"schema":if sync {"monzero-ltc-light-sync-response-v1"} else {"monzero-ltc-light-status-response-v1"},
++            "requestId":request.request_id,"executable":false,"chain":snapshot(&state)?,"synchronization":synchronization});
++        let bytes=serde_json::to_vec(&response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
++        std::io::stdout().write_all(&bytes)?;Ok(())
++    }
++}
++fn main() {
++    #[cfg(target_os="linux")]
++    if linux::run().is_ok() {return}
++    eprintln!("Litecoin light-chain request failed; reload validated state before retrying");
++    std::process::exit(1);
++}

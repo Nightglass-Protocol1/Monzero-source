@@ -1,0 +1,200 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light.rs
+@@ -68,3 +68,5 @@
+ pub mod retention;
+ 
+ pub mod relay;
++
++mod source;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/retention.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/retention.rs
+@@ -13,7 +13,7 @@
+     template:Template, signed:Vec<u8>,
+ }
+ impl AdmittedExecution<'_> {
+-    fn local_record_bytes(&self)->Result<Option<Vec<u8>>> {
++    pub(super) fn local_record_bytes(&self)->Result<Option<Vec<u8>>> {
+         match self.metadata.read(&record_name(self.quote,"local-signed")) {
+             Ok(bytes)=>{ensure!(bytes.len()<=2_000_000,"oversized local BCH funding record");Ok(Some(bytes))},
+             Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>Ok(None),
+@@ -22,9 +22,10 @@
+     }
+     pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
+     fn require_node_funding_source(&self)->Result<()> {
++        ensure!(self.light_source_bytes()?.is_none(),"BCH trade selected local-wallet funding");
+         ensure!(self.local_record_bytes()?.is_none(),"BCH trade is bound to local-wallet funding");Ok(())
+     }
+-    fn require_no_node_funding_records(&self)->Result<()> {
++    pub(super) fn require_no_node_funding_records(&self)->Result<()> {
+         for suffix in ["wallet-preparation-pin","wallet-lock-intent","signing-intent","signed","reconciliation","relay-intent","relay-ack"] {
+             match self.metadata.read(&record_name(self.quote,suffix)) {
+                 Ok(_)=>anyhow::bail!("BCH trade already contains node-wallet funding records"),
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/source.rs
+@@ -0,0 +1,61 @@
++//! Early wallet-source selection under the admitted execution's metadata lease.
++//! No input reservation, signature, relay or secret material is retained here.
++use super::*;
++use crate::litecoin_light::network::LightNetwork;
++use bitcoin::hashes::{Hash,sha256};
++const SCHEMA:&str="monzero-bch-light-funding-source-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Source {schema:String,admission:[u8;32],network:String,wallet:sha256::Hash,selected_at:u64}
++impl AdmittedExecution<'_> {
++    pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
++    fn light_source_bytes(&self)->Result<Option<Vec<u8>>> {
++        match self.metadata.read(&record_name(self.quote,"light-source")) {
++            Ok(bytes)=>{ensure!(bytes.len()<=4096,"oversized BCH light source");Ok(Some(bytes))},
++            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>Ok(None),
++            Err(e)=>Err(e),
++        }
++    }
++    fn light_source(&self,network:LightNetwork,wallet:sha256::Hash)->Result<Source> {
++        self.require_no_node_funding_records()?;
++        let bytes=self.light_source_bytes()?.context("select the BCH local wallet before funding")?;
++        let source:Source=serde_json::from_slice(&bytes)?;
++        ensure!(source.schema==SCHEMA && source.admission==self.admission_digest()?
++            && source.network==network.storage_identity() && source.wallet==wallet
++            && serde_json::to_vec(&source)?==bytes,"BCH local wallet selection changed");
++        self.quote.check_policy(self.policy,source.selected_at)?;
++        ensure!(source.selected_at>=self.read_admission()?.admitted_at,"BCH source predates admission");
++        Ok(source)
++    }
++    /// The caller commits to the validated account descriptor and canonical
++    /// wallet storage locations. Exact retry only; this is not spend consent.
++    pub fn select_light_funding_source(&self,network:LightNetwork,wallet:sha256::Hash,now:u64)->Result<()> {
++        ensure!(self.role==Role::BchFunder && network==LightNetwork::from(crate::litecoin_light::network::BchNetwork::Regtest)
++            && self.quote.terms()["bchNetwork"]=="bch-regtest" && self.quote.terms()["bchGenesis"]==network.genesis(),
++            "wrong BCH light source role or network");
++        self.quote.check_policy(self.policy,now)?;
++        ensure!(now>=self.read_admission()?.admitted_at,"BCH source selection predates admission");
++        self.require_no_node_funding_records()?;
++        if self.light_source_bytes()?.is_some() {
++            ensure!(now>=self.light_source(network,wallet)?.selected_at,"BCH source time moved backwards");
++            return Ok(())
++        }
++        ensure!(self.local_record_bytes()?.is_none() && self.prepared_bch_funding()?.is_none(),
++            "existing BCH funding cannot select another source");
++        match Journal::open(&self.snapshots)?.read(&record_name(self.quote,"template")) {
++            Ok(_)=>anyhow::bail!("partial BCH preparation cannot select another source"),
++            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>(),
++            Err(e)=>return Err(e),
++        }
++        let source=Source {schema:SCHEMA.into(),admission:self.admission_digest()?,network:network.storage_identity(),wallet,selected_at:now};
++        self.metadata.retain(&record_name(self.quote,"light-source"),&serde_json::to_vec(&source)?)
++    }
++    /// Every fresh local prepare/sign/send review requires the same selected
++    /// wallet. The metadata lease remains held through async work and signing.
++    pub fn require_light_funding_source(&self,network:LightNetwork,wallet:sha256::Hash,now:u64)->Result<()> {
++        ensure!(self.role==Role::BchFunder,"wrong BCH light source role");
++        self.quote.check_policy(self.policy,now)?;
++        ensure!(now>=self.light_source(network,wallet)?.selected_at,"BCH operation predates wallet selection");
++        Ok(())
++    }
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/locks.rs
+@@ -13,6 +13,7 @@
+ 
+ impl AdmittedExecution<'_> {
+     pub(super) fn funding_lock_intent(&self, prepared: &PreparedBchFunding) -> Result<(Intent,[u8;32])> {
++        self.require_node_funding_source()?;
+         let bytes = self.metadata.read(&record_name(self.quote,"wallet-lock-intent"))?;
+         ensure!(bytes.len() <= 4096,"oversized BCH wallet lock intent");
+         let intent: Intent = serde_json::from_slice(&bytes)?;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
+@@ -132,6 +132,7 @@
+     }
+ 
+     pub(super) fn require_wallet_preparation_backend(&self,backend: &BchRpc,change: &str,minimum: u64) -> Result<()> {
++        self.require_node_funding_source()?;
+         if let Some(candidate)=self.wallet_preparation_candidate()? {
+             ensure!(candidate.deployment==backend.deployment_commitment()? && candidate.policy.change_address==change
+                 && candidate.policy.minimum_confirmations==minimum,"wallet lock differs from pinned BCH preparation policy");
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_helper.rs
+@@ -186,6 +186,16 @@
+         if relay {command.arg(if retry {"--retry"}else{"--send"});}
+         let output=command.output()?;
+         ensure!(output.status.success(),"BCH preparation probe failed: {}",String::from_utf8_lossy(&output.stderr));
++        // Selection survives helper exit and blocks node locking before RPC.
++        let mut selected_execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let listener=std::net::TcpListener::bind("127.0.0.1:0")?;listener.set_nonblocking(true)?;
++        let backend=crate::bch_rpc::BchRpc::new(listener.local_addr()?.port(),"fixture".into(),"fixture".into(),network,
++            "fixture".into(),refund.address().to_string(),refund.address().script_pubkey().clone(),"/Bitcoin Cash Node:29.0.0/".into())?;
++        let error=tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(
++            selected_execution.lock_bch_funding_inputs(&backend,clock,&refund.address().to_string(),2)).err().context("node funding must reject selected light source")?;
++        ensure!(error.to_string().contains("selected local-wallet"),"node path failed for the wrong reason: {error}");
++        ensure!(listener.accept().err().is_some_and(|e|e.kind()==std::io::ErrorKind::WouldBlock),"node gate contacted RPC");
++        drop(selected_execution);
+         if signing.is_some() {
+             let report:serde_json::Value=serde_json::from_slice(&std::fs::read(report)?)?;
+             let mut reopened=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+--- a/swap-machine/src/bin/native-ltc-light/bch_dex.rs
++++ b/swap-machine/src/bin/native-ltc-light/bch_dex.rs
+@@ -25,7 +25,7 @@
+ }
+ pub(super) fn mode(flag:&str)->Option<&str> {
+     let mode=flag.strip_prefix("--bch-dex-funding-")?.strip_suffix("-stdio-v1")?;
+-    ["terms","prepare","review","sign","observe","recovery-review","recovery-retain","send-review","send","retry-review","retry","reconcile-ack"].contains(&mode).then_some(mode)
++    ["terms","source-select","prepare","review","sign","observe","recovery-review","recovery-retain","send-review","send","retry-review","retry","reconcile-ack"].contains(&mode).then_some(mode)
+ }
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields,rename_all="camelCase")]
+@@ -50,7 +50,7 @@
+     ensure!(!input.is_empty() && input.len()<=4096,"invalid BCH terms request size");
+     let recovery:Option<RecoveryRequest>=if mode.starts_with("recovery-") {Some(serde_json::from_slice(&input)?)}else{None};
+     let observation:Option<ObservationRequest>=if matches!(mode,"observe"|"retry-review"|"retry"|"reconcile-ack") {Some(serde_json::from_slice(&input)?)}else{None};
+-    let funding:Option<FundingRequest>=if mode=="terms" || observation.is_some() || recovery.is_some() {None}else{Some(serde_json::from_slice(&input)?)};
++    let funding:Option<FundingRequest>=if matches!(mode,"terms"|"source-select") || observation.is_some() || recovery.is_some() {None}else{Some(serde_json::from_slice(&input)?)};
+     let (request_id,approved)=if let Some(request)=&recovery {
+         ensure!(!request.request_id.is_nil()
+             && request.schema==format!("monzero-bch-light-dex-funding-{mode}-request-v1")
+@@ -69,7 +69,7 @@
+         validate(request,mode)?;(request.request_id,request.approved_config_digest.clone())
+     } else {
+         let request:TermsRequest=serde_json::from_slice(&input)?;
+-        ensure!(request.schema=="monzero-bch-light-dex-funding-terms-request-v1" && !request.request_id.is_nil(),
++        ensure!(request.schema==format!("monzero-bch-light-dex-funding-{mode}-request-v1") && !request.request_id.is_nil(),
+             "invalid BCH funding terms request");
+         (request.request_id,request.approved_config_digest)
+     };drop(input);
+@@ -114,6 +114,13 @@
+         return output(&json!({"schema":format!("monzero-bch-light-dex-funding-{mode}-response-v1"),
+             "requestId":request_id,"tradeId":dex.trade_id,"configurationDigest":expected,"executable":false,"result":result}));
+     }
++    if mode=="source-select" {
++        let wallet=wallet_config.wallet.as_ref().context("missing BCH source wallet")?;
++        execution.select_light_funding_source(network,wallet_source(wallet,network)?,now()?)?;
++        return output(&json!({"schema":"monzero-bch-light-dex-funding-source-select-response-v1","requestId":request_id,
++            "tradeId":dex.trade_id,"configurationDigest":expected,"executable":false,
++            "result":{"walletSourceSelected":true,"watchOnly":true,"broadcastAuthorized":false}}));
++    }
+     let mut terms=execution.light_funding_terms(now()?)?;
+     let wallet=wallet_config.wallet.as_ref().context("missing BCH local wallet")?;
+     let account=PublicAccount::from_descriptor(&wallet.account,network)?;
+@@ -158,6 +165,7 @@
+     execution.check_light_funding_payment(&output,policy.fee,policy.minimum_change,now()?)?;
+     ensure!(policy.minimum_confirmations>=u64::from(dex.policy.bch_confirmations),"BCH input depth weakens trade policy");
+     let wallet=config.wallet.as_ref().context("missing BCH funding wallet")?;
++    execution.require_light_funding_source(network,wallet_source(wallet,network)?,now()?)?;
+     let directory=wallet.spend_directory.as_ref().context("missing BCH spend journal")?;
+     let account=PublicAccount::from_descriptor(&wallet.account,network)?;
+     let mut book=AddressBook::open(&wallet.address_book_directory,PublicAccount::from_descriptor(&wallet.account,network)?)?;
+@@ -273,3 +281,14 @@
+     result["broadcastAuthorized"]=json!(false);result["tradeFundingRetained"]=json!(true);
+     Ok(result)
+ }
++
++fn wallet_source(wallet:&WalletConfig,network:LightNetwork)->Result<sha256::Hash> {
++    let account=PublicAccount::from_descriptor(&wallet.account,network)?;
++    let spends=wallet.spend_directory.as_ref().context("missing BCH source spend directory")?;
++    for path in [&wallet.address_book_directory,spends] {
++        ensure!(path.is_absolute() && path.canonicalize()?==*path,"noncanonical BCH wallet storage");
++    }
++    Ok(sha256::Hash::hash(&serde_json::to_vec(&json!({"schema":"monzero-bch-light-wallet-identity-v1",
++        "network":network.storage_identity(),"account":account.descriptor(),
++        "addressBookDirectory":wallet.address_book_directory,"spendDirectory":spends}))?))
++}

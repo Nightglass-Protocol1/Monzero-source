@@ -1,0 +1,62 @@
+--- a/swap-machine/src/litecoin_light/session/wallet/payment.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/payment.rs
+@@ -21,6 +21,25 @@
+         }
+         Ok(inputs)
+     }
++    /// Return only the retained payment's inputs from this verified account scan.
++    /// Reject stale chains, insufficient depth and any prior submission before
++    /// exposing evidence for trade send review. This grants no relay consent.
++    pub fn funding_inputs_on(&self,chain:&HeaderSequence,prepared:&ObservedClaimedSpend,
++        minimum_confirmations:u64)->Result<Vec<IncludedInput<'_>>> {
++        ensure!(self.account.network()==chain.network()
++            && (1..=1000).contains(&minimum_confirmations)
++            && (1..=1000).contains(&prepared.transaction().input.len()),"invalid funding input context");
++        let candidates=self.payment_inputs()?;
++        let by_outpoint=candidates.iter().map(|input|(bitcoin::OutPoint {txid:input.transaction.txid(),vout:input.vout},input))
++            .collect::<BTreeMap<_,_>>();
++        let inputs=prepared.transaction().input.iter().map(|input| {
++            let found=by_outpoint.get(&input.previous_output).context("funding source is absent or observed spent")?;
++            Ok(IncludedInput {transaction:found.transaction,vout:found.vout,branch:found.branch,index:found.index})
++        }).collect::<Result<Vec<_>>>()?;
++        prepared.check_funding_inputs_on(chain,self.accounting(),&inputs,minimum_confirmations)?;
++        Ok(inputs)
++    }
++
+     /// Reopen the exact retained payment using externally retained review terms
+     /// and commitment, then revalidate only its inputs against this scan. No
+     /// selection, allocation, new claims, signing or broadcast occurs here.
+@@ -88,14 +107,7 @@
+         ensure!(self.network==chain.network() && observation.account.network()==chain.network()
+             && (1..=1000).contains(&minimum_confirmations)
+             && (1..=1000).contains(&prepared.transaction().input.len()),"invalid funding source context");
+-        let candidates=observation.payment_inputs()?;
+-        let by_outpoint=candidates.iter().map(|input|(bitcoin::OutPoint {txid:input.transaction.txid(),vout:input.vout},input))
+-            .collect::<BTreeMap<_,_>>();
+-        let inputs=prepared.transaction().input.iter().map(|input| {
+-            let found=by_outpoint.get(&input.previous_output).context("funding source is absent or observed spent")?;
+-            Ok(IncludedInput {transaction:found.transaction,vout:found.vout,branch:found.branch,index:found.index})
+-        }).collect::<Result<Vec<_>>>()?;
+-        prepared.check_funding_inputs_on(chain,observation.accounting(),&inputs,minimum_confirmations)?;
++        let inputs=observation.funding_inputs_on(chain,prepared,minimum_confirmations)?;
+         let txids=inputs.iter().map(|input|input.transaction.txid()).collect::<BTreeSet<_>>();
+         let result=async {
+             let mut sources=Vec::with_capacity(txids.len());let mut total=0usize;
+--- a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+@@ -121,6 +121,15 @@
+     let operation=uuid::Uuid::new_v4();
+     let prepared=observation.prepare_payment(chain,&payment,&policy,&mut book,&claims.0,operation)?;
+     assert_eq!(prepared.transaction().input.len(),1);
++    let funding_inputs=observation.funding_inputs_on(chain,&prepared,1)?;
++    assert_eq!(funding_inputs.len(),1);
++    assert_eq!(funding_inputs[0].transaction.txid(),prepared.transaction().input[0].previous_output.txid);
++    assert_eq!(funding_inputs[0].vout,prepared.transaction().input[0].previous_output.vout);
++    assert!(observation.funding_inputs_on(&genesis,&prepared,1).is_err());
++    assert!(observation.funding_inputs_on(chain,&prepared,100).is_err());
++    assert!(observation.funding_inputs_on(chain,&prepared,0).is_err());
++    assert!(observation.funding_inputs_on(chain,&prepared,1001).is_err());
++
+     assert_eq!(prepared.transaction().input[0].previous_output,observation.accounting().coins()[0].outpoint());
+     assert_eq!(prepared.transaction().output[0],payment);assert_eq!(prepared.fee().to_sat(),1000);
+     assert_eq!(prepared.transaction().output[1].value.to_sat(),observation.accounting().observed_mature().to_sat()-41000);

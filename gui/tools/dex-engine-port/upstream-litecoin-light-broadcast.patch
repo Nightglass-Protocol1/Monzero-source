@@ -1,0 +1,286 @@
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -1,4 +1,5 @@
+-//! Read-only building blocks for a future Litecoin light-wallet backend.
++//! Litecoin light-wallet building blocks, including explicit journaled signing
++//! and submission. Read operations never implicitly sign or send transactions.
+ //!
+ //! Electrum data is untrusted. A matching Merkle branch establishes only that
+ //! a transaction ID is committed by the supplied header. It does NOT validate
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -196,3 +196,5 @@
+ pub mod unspent;
+ 
+ pub mod fees;
++
++mod broadcast;
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/broadcast.rs
+@@ -0,0 +1,19 @@
++//! Private submission path used only after endpoint-bound durable intent.
++use super::*;
++use crate::litecoin_light::vault::signing::review::claims::broadcast::BroadcastRecord;
++impl<S:AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
++    // Consume the session: a cancelled, malformed or ambiguous response cannot
++    // leak into another request or trigger an implicit retry on this stream.
++    pub(in crate::litecoin_light) async fn submit_retained(mut self,record:&BroadcastRecord<'_>)->Result<Txid> {
++        ensure!(self.network==record.network(),"Litecoin broadcast session network mismatch");
++        record.check_intent()?;
++        let transaction=record.transaction();
++        let raw=serialize(transaction).iter().map(|byte|format!("{byte:02x}")).collect::<String>();
++        let (_,bytes)=self.exchange("blockchain.transaction.broadcast",json!([raw]),1024).await?;
++        let reported:String=result(&bytes)?;
++        let txid=transaction.compute_txid();
++        ensure!(reported==txid.to_string(),"Litecoin broadcast acknowledgement identity mismatch");
++        record.acknowledge()?;
++        Ok(txid)
++    }
++}
+--- a/swap-machine/src/litecoin_light/tls.rs
++++ b/swap-machine/src/litecoin_light/tls.rs
+@@ -1,4 +1,4 @@
+-//! Authenticated TLS connector for the read-only Litecoin Electrum session.
++//! Authenticated TLS connector with separate read and explicit send operations.
+ //! Trust roots follow the platform store (including its configured certificate
+ //! environment). There is no plaintext fallback or certificate-verification bypass.
+ use super::session::ReadSession;
+@@ -15,6 +15,23 @@
+     network: LtcNetwork,
+ }
+ impl TlsEndpoint {
++    pub(in crate::litecoin_light) fn host(&self)->&str {&self.host}
++    pub(in crate::litecoin_light) fn port(&self)->u16 {self.port}
++    pub(in crate::litecoin_light) fn network(&self)->LtcNetwork {self.network}
++
++    /// Explicitly submit the exact retained signed transaction. The caller must
++    /// obtain separate send consent and assess chain/fee policy beforehand.
++    /// Intent is durable before connecting. Errors/cancellation may follow a
++    /// successful send: inspect/reconcile the original tx, never replace claims.
++    /// Success is only this server's matching txid report, not confirmation.
++    pub async fn broadcast_retained(&self,
++        claim:&super::vault::signing::review::claims::ClaimedSpend,
++        expected:bitcoin::hashes::sha256::Hash)->Result<bitcoin::Txid> {
++        let record=super::vault::signing::review::claims::broadcast::BroadcastRecord::new(claim,self,expected)?;
++        record.retain_intent()?;
++        self.connect().await?.submit_retained(&record).await
++    }
++
+     /// A host and explicit port, not a URL. No credentials, paths or defaults.
+     pub fn new(host: String, port: u16, network: LtcNetwork) -> Result<Self> {
+         ensure!(port != 0 && !host.is_empty() && host.len() <= 253, "invalid Electrum TLS endpoint");
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -80,3 +80,5 @@
+ mod tests;
+ 
+ mod reopen;
++
++pub mod broadcast;
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/broadcast.rs
+@@ -0,0 +1,82 @@
++//! Durable, endpoint-specific submission evidence. No acknowledgement is a
++//! consensus, confirmation or mempool-membership proof. Claims are never freed.
++use super::*;
++use crate::litecoin_light::tls::TlsEndpoint;
++
++#[derive(Debug,PartialEq,Eq)]
++pub enum BroadcastStatus {
++    /// No matching local intent; this does not prove absence of other sends.
++    NoLocalAttempt,
++    /// Intent exists, but a matching acknowledgement was not durably retained.
++    OutcomeUnknown,
++    /// This endpoint returned the expected txid at some point in the past.
++    ServerAcknowledged,
++}
++
++pub(in crate::litecoin_light) struct BroadcastRecord<'a> {
++    claim:&'a ClaimedSpend,
++    signed:Transaction,
++    name:String,
++    intent:Vec<u8>,
++    acknowledgement:Vec<u8>,
++}
++impl ClaimedSpend {
++    /// Inspect only this endpoint's local evidence. No network access, vault
++    /// unlock, implicit intent creation or inference of current acceptance.
++    pub fn broadcast_status(&self,endpoint:&TlsEndpoint,expected:sha256::Hash)->Result<BroadcastStatus> {
++        BroadcastRecord::new(self,endpoint,expected)?.status()
++    }
++}
++impl<'a> BroadcastRecord<'a> {
++    pub(in crate::litecoin_light) fn new(claim:&'a ClaimedSpend,endpoint:&TlsEndpoint,
++        expected:sha256::Hash)->Result<Self> {
++        claim.check_signing_review(expected)?;
++        ensure!(claim.review.account.network()==endpoint.network(),"Litecoin broadcast network mismatch");
++        let signed=claim.load_signed()?;
++        let raw=serialize(&signed);
++        ensure!(raw.len()<=crate::litecoin_light::MAX_TRANSACTION,"oversized Litecoin broadcast transaction");
++        let scope=serde_json::to_vec(&serde_json::json!({"commitment":expected.to_string(),
++            "network":endpoint.network().genesis(),"host":endpoint.host(),"port":endpoint.port()}))?;
++        let name=format!("ltc-broadcast-{}",sha256::Hash::hash(&scope));
++        let intent=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-broadcast-intent-v1",
++            "scope":serde_json::from_slice::<serde_json::Value>(&scope)?,
++            "txid":signed.compute_txid().to_string(),"signedHash":sha256::Hash::hash(&raw).to_string()}))?;
++        let acknowledgement=serde_json::to_vec(&serde_json::json!({
++            "schema":"monzero-ltc-broadcast-ack-v1","intentHash":sha256::Hash::hash(&intent).to_string(),
++            "txid":signed.compute_txid().to_string()}))?;
++        Ok(Self {claim,signed,name,intent,acknowledgement})
++    }
++    fn matching_record(&self,suffix:&str,expected:&[u8])->Result<bool> {
++        match self.claim.journal.read(&format!("{}-{suffix}.json",self.name)) {
++            Ok(bytes)=>{ensure!(bytes==expected,"Litecoin broadcast record mismatch");Ok(true)},
++            Err(error) if error.downcast_ref::<std::io::Error>()
++                .is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>Ok(false),
++            Err(error)=>Err(error),
++        }
++    }
++    fn status(&self)->Result<BroadcastStatus> {
++        let intent=self.matching_record("intent",&self.intent)?;
++        let ack=self.matching_record("ack",&self.acknowledgement)?;
++        ensure!(!ack || intent,"Litecoin acknowledgement has no broadcast intent");
++        Ok(if ack {BroadcastStatus::ServerAcknowledged}
++            else if intent {BroadcastStatus::OutcomeUnknown} else {BroadcastStatus::NoLocalAttempt})
++    }
++    pub(in crate::litecoin_light) fn retain_intent(&self)->Result<()> {
++        self.status()?;
++        self.claim.journal.retain(&format!("{}-intent.json",self.name),&self.intent)
++    }
++    pub(in crate::litecoin_light) fn transaction(&self)->&Transaction {&self.signed}
++    pub(in crate::litecoin_light) fn network(&self)->LtcNetwork {self.claim.review.account.network()}
++    pub(in crate::litecoin_light) fn check_intent(&self)->Result<()> {
++        ensure!(self.claim.load_signed()?==self.signed,"Litecoin signed broadcast bytes changed");
++        ensure!(self.matching_record("intent",&self.intent)?,"missing Litecoin broadcast intent");
++        Ok(())
++    }
++    pub(in crate::litecoin_light) fn acknowledge(&self)->Result<()> {
++        self.check_intent()?;
++        self.claim.journal.retain(&format!("{}-ack.json",self.name),&self.acknowledgement)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/broadcast/tests.rs
+@@ -0,0 +1,119 @@
++use super::*;
++use super::super::tests::{Directory,review};
++use crate::litecoin_light::session::{ReadSession,tests::{server,reply,regtest_handshake,hex}};
++use serde_json::json;
++use std::{fs,time::Duration};
++use tokio::io::{AsyncBufReadExt,AsyncWriteExt,BufReader};
++
++fn endpoint()->Result<TlsEndpoint> {TlsEndpoint::new("localhost".into(),50002,LtcNetwork::Regtest)}
++
++#[tokio::test]
++async fn broadcast_retains_exact_intent_and_ack_across_restart_and_explicit_retry()->Result<()> {
++    let directory=Directory::new()?;let operation=Uuid::new_v4();let (seed,review)=review(&[0])?;
++    let account=seed.public_account(LtcNetwork::Regtest,2)?;let payment=review.transaction().output[0].clone();
++    let claim=ClaimedSpend::retain(&directory.0,operation,review)?;let expected=claim.signing_commitment();
++    let signed=claim.approve_and_sign(&seed,expected)?;drop(seed);
++    let endpoint=endpoint()?;
++    assert_eq!(claim.broadcast_status(&endpoint,expected)?,BroadcastStatus::NoLocalAttempt);
++    for _ in 0..2 {
++        let record=BroadcastRecord::new(&claim,&endpoint,expected)?;record.retain_intent()?;
++        let mut responses=regtest_handshake();responses.push(reply(3,json!(signed.compute_txid().to_string())));
++        let (stream,task)=server(responses);
++        assert_eq!(ReadSession::negotiate(stream,LtcNetwork::Regtest).await?.submit_retained(&record).await?,signed.compute_txid());
++        let requests=task.await?;assert_eq!(requests.len(),3);
++        assert_eq!(requests[2]["method"],"blockchain.transaction.broadcast");
++        assert_eq!(requests[2]["params"],json!([hex(&serialize(&signed))]));
++        assert_eq!(claim.broadcast_status(&endpoint,expected)?,BroadcastStatus::ServerAcknowledged);
++    }
++    drop(claim);
++    let reopened=ClaimedSpend::open(&directory.0,operation,&account,&payment,None,Amount::from_sat(1000),expected)?;
++    assert_eq!(reopened.load_signed()?,signed);
++    assert_eq!(reopened.broadcast_status(&endpoint,expected)?,BroadcastStatus::ServerAcknowledged);
++    assert_eq!(reopened.broadcast_status(&TlsEndpoint::new("localhost".into(),50003,LtcNetwork::Regtest)?,expected)?,BroadcastStatus::NoLocalAttempt);
++    Ok(())
++}
++
++#[tokio::test]
++async fn broadcast_bad_or_lost_ack_keeps_unknown_and_claims()->Result<()> {
++    for response in [reply(3,json!("00".repeat(32))),reply(3,json!(true)),reply(4,json!("wrong id")),
++        b"{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-1,\"message\":\"rejected\"}}\n".to_vec(),
++        b"not json\n".to_vec(),vec![b'x';1025]] {
++        let directory=Directory::new()?;let (seed,review)=review(&[0])?;
++        let claim=ClaimedSpend::retain(&directory.0,Uuid::new_v4(),review)?;let expected=claim.signing_commitment();
++        let signed=claim.approve_and_sign(&seed,expected)?;let endpoint=endpoint()?;
++        let record=BroadcastRecord::new(&claim,&endpoint,expected)?;record.retain_intent()?;
++        let mut responses=regtest_handshake();responses.push(response);let (stream,task)=server(responses);
++        assert!(ReadSession::negotiate(stream,LtcNetwork::Regtest).await?.submit_retained(&record).await.is_err());
++        assert_eq!(task.await?.len(),3);
++        assert_eq!(claim.broadcast_status(&endpoint,expected)?,BroadcastStatus::OutcomeUnknown);
++        assert_eq!(claim.load_signed()?,signed);
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn broadcast_cancelled_after_write_retains_unknown_after_reopen()->Result<()> {
++    let directory=Directory::new()?;let operation=Uuid::new_v4();let (seed,review)=review(&[0])?;
++    let account=seed.public_account(LtcNetwork::Regtest,2)?;let payment=review.transaction().output[0].clone();
++    let claim=ClaimedSpend::retain(&directory.0,operation,review)?;let expected=claim.signing_commitment();
++    let signed=claim.approve_and_sign(&seed,expected)?;let endpoint=endpoint()?;
++    let record=BroadcastRecord::new(&claim,&endpoint,expected)?;record.retain_intent()?;
++    let (stream,peer)=tokio::io::duplex(4096);
++    let (sent,received)=tokio::sync::oneshot::channel();
++    let task=tokio::spawn(async move {
++        let mut peer=BufReader::new(peer);
++        for response in regtest_handshake() {
++            let mut line=String::new();peer.read_line(&mut line).await?;
++            peer.get_mut().write_all(&response).await?;
++        }
++        let mut line=String::new();peer.read_line(&mut line).await?;
++        sent.send(serde_json::from_str::<serde_json::Value>(&line)?).unwrap();
++        let mut end=String::new();assert_eq!(peer.read_line(&mut end).await?,0);
++        Ok::<_,anyhow::Error>(())
++    });
++    let session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let mut submission=Box::pin(session.submit_retained(&record));
++    tokio::select! {
++        value=received=>assert_eq!(value?["params"],json!([hex(&serialize(&signed))])),
++        _=&mut submission=>panic!("submission completed without acknowledgement"),
++        _=tokio::time::sleep(Duration::from_secs(2))=>panic!("submission was not written"),
++    }
++    drop(submission);task.await??;drop(record);drop(claim);
++    let reopened=ClaimedSpend::open(&directory.0,operation,&account,&payment,None,Amount::from_sat(1000),expected)?;
++    assert_eq!(reopened.broadcast_status(&endpoint,expected)?,BroadcastStatus::OutcomeUnknown);
++    assert_eq!(reopened.load_signed()?,signed);Ok(())
++}
++
++#[tokio::test]
++async fn broadcast_requires_matching_durable_intent_before_wire_request()->Result<()> {
++    let directory=Directory::new()?;let (seed,review)=review(&[0])?;
++    let claim=ClaimedSpend::retain(&directory.0,Uuid::new_v4(),review)?;let expected=claim.signing_commitment();
++    let endpoint=endpoint()?;assert!(BroadcastRecord::new(&claim,&endpoint,expected).is_err());
++    claim.approve_and_sign(&seed,expected)?;
++    assert!(BroadcastRecord::new(&claim,&endpoint,sha256::Hash::hash(b"wrong")).is_err());
++    assert!(BroadcastRecord::new(&claim,&TlsEndpoint::new("localhost".into(),50002,LtcNetwork::Mainnet)?,expected).is_err());
++    let record=BroadcastRecord::new(&claim,&endpoint,expected)?;
++    let (stream,task)=server(regtest_handshake());
++    assert!(ReadSession::negotiate(stream,LtcNetwork::Regtest).await?.submit_retained(&record).await.is_err());
++    assert_eq!(task.await?.len(),2);
++    record.retain_intent()?;
++    fs::write(directory.0.join(format!("{}-intent.json",record.name)),b"changed")?;
++    let (stream,task)=server(regtest_handshake());
++    assert!(ReadSession::negotiate(stream,LtcNetwork::Regtest).await?.submit_retained(&record).await.is_err());
++    assert_eq!(task.await?.len(),2);
++    assert!(claim.broadcast_status(&endpoint,expected).is_err());Ok(())
++}
++
++#[test]
++fn broadcast_recovery_rejects_orphan_ack_and_changed_signed_witness()->Result<()> {
++    let directory=Directory::new()?;let (seed,review)=review(&[0])?;
++    let claim=ClaimedSpend::retain(&directory.0,Uuid::new_v4(),review)?;let expected=claim.signing_commitment();
++    claim.approve_and_sign(&seed,expected)?;let endpoint=endpoint()?;
++    let record=BroadcastRecord::new(&claim,&endpoint,expected)?;record.retain_intent()?;record.acknowledge()?;
++    let path=directory.0.join(format!("{}-intent.json",record.name));
++    fs::remove_file(&path)?;assert!(claim.broadcast_status(&endpoint,expected).is_err());
++    claim.journal.retain(&format!("{}-intent.json",record.name),&record.intent)?;
++    let mut altered=record.signed.clone();altered.input[0].witness=Witness::new();
++    fs::write(directory.0.join(format!("ltc-signed-{expected}.tx")),serialize(&altered))?;
++    assert!(record.check_intent().is_err());assert!(claim.broadcast_status(&endpoint,expected).is_err());Ok(())
++}

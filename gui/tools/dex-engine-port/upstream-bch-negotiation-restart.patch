@@ -1,0 +1,114 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -371,17 +371,30 @@
+     const MODE: &str = "MONZERO_BCH_STORAGE_TEST_MODE";
+     const DIRECTORY: &str = "MONZERO_BCH_STORAGE_TEST_DIRECTORY";
+     const PINS: &str = "MONZERO_BCH_STORAGE_TEST_PUBLIC_PINS";
+-    type PublicPin = ([u8;32],[u8;32],String);
++    use super::super::local_keys::{RetainedLocalKeys,peer::RetainedPeer};
++    #[derive(Serialize,Deserialize)]
++    struct PublicPin {
++        initial: [u8;32], selection: [u8;32], outgoing: [u8;32], received: [u8;32],
++        checkpoint: [u8;32], agreement: [u8;32], address: String,
++    }
+     let roles = [Role::BchFunder,Role::NativeFunder];
+     if let Ok(mode) = std::env::var(MODE) {
+         let directory = std::path::PathBuf::from(std::env::var(DIRECTORY)?);
+         if mode == "write" {
+             let setup = Setup::new()?;
+             let mut pins: Vec<PublicPin> = Vec::new();
+-            for role in roles {
+-                let context = agreed(&setup,role)?;
+-                let digest = storage::persist(&directory,&setup.quote,&setup.policy,role,&context)?;
+-                pins.push((digest,*context.commitment(),context.owned().wallet().address().to_string()));
++            let (b,bv,bpin) = selected_with_outgoing(&setup,&directory,0)?;
++            let (n,nv,npin) = selected_with_outgoing(&setup,&directory,1)?;
++            for (role,selected,own,peer,initial) in [
++                (Role::BchFunder,&b,&bv,&nv,bpin),(Role::NativeFunder,&n,&nv,&bv,npin)] {
++                let (wallet,received) = selected.retain_received_view(&directory,&setup.quote,&setup.policy,
++                    1003,own.commitment(),peer.frame(),peer.signature())?;
++                let ack = wallet.acknowledgement(&setup.quote)?;
++                let context = wallet.accept_agreement(&setup.quote,&setup.policy,1004,&ack,
++                    &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++                let checkpoint = storage::persist(&directory,&setup.quote,&setup.policy,role,&context)?;
++                pins.push(PublicPin {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,
++                    checkpoint,agreement:*context.commitment(),address:context.owned().wallet().address().to_string()});
+             }
+             // Test-only public metadata; no spending/view keys leave the store.
+             std::fs::write(directory.join("public-pins.json"),serde_json::to_vec(&pins)?)?;
+@@ -392,14 +405,24 @@
+         assert_eq!(pins.len(),roles.len());
+         let (policy,terms) = fixture();
+         let quote = signed(&terms,&policy,1000)?;
+-        for (role,(digest,commitment,address)) in roles.into_iter().zip(pins) {
+-            let restored = storage::restore(&directory,&quote,&policy,role,&digest)?;
+-            assert_eq!(restored.commitment(),&commitment);
+-            assert_eq!(restored.owned().wallet().address().to_string(),address);
++        for (role,pin) in roles.into_iter().zip(pins) {
++            let local = RetainedLocalKeys::restore(&directory,&quote,&policy,role,&pin.initial)?;
++            let selected = RetainedPeer::restore(&directory,&quote,&policy,local,&pin.selection)?;
++            selected.restore_signed_view(&directory,&quote,&policy,&pin.outgoing)?;
++            let wallet = selected.restore_received_view(&directory,&quote,&policy,&pin.received)?;
++            assert_eq!(wallet.wallet().address().to_string(),pin.address);
++            let ack = wallet.acknowledgement(&quote)?;
++            let reconstructed = wallet.accept_agreement(&quote,&policy,1004,&ack,
++                &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++            assert_eq!(reconstructed.commitment(),&pin.agreement);
++            let restored = storage::restore(&directory,&quote,&policy,role,&pin.checkpoint)?;
++            assert_eq!(restored.commitment(),&pin.agreement);
++            assert_eq!(restored.owned().wallet().address().to_string(),pin.address);
++            assert_eq!(*reconstructed.secret_checkpoint(&quote)?,*restored.secret_checkpoint(&quote)?);
+             // The restored local signing share remains usable for its branch.
+             restored.owned().prepare_encrypted_signature(&quote)?;
+             let checkpoint = restored.secret_checkpoint(&quote)?;
+-            assert_eq!(agreement::checkpoint::commitment(&checkpoint)?,digest);
++            assert_eq!(agreement::checkpoint::commitment(&checkpoint)?,pin.checkpoint);
+         }
+         return Ok(());
+     }
+@@ -590,19 +613,19 @@
+ }
+ 
+ #[cfg(target_os="linux")]
+-fn selected_with_outgoing(setup: &Setup, directory: &PrivateStore, index: usize)
++fn selected_with_outgoing(setup: &Setup, directory: &std::path::Path, index: usize)
+     -> Result<(super::super::local_keys::peer::RetainedPeer,super::super::local_keys::peer::OutgoingPrivateView,[u8;32])> {
+     use super::super::local_keys::RetainedLocalKeys;
+     let role = if index == 0 {Role::BchFunder} else {Role::NativeFunder};
+-    let local = RetainedLocalKeys::persist(&directory.0,&setup.quote,&setup.policy,1000,role,
++    let local = RetainedLocalKeys::persist(directory,&setup.quote,&setup.policy,1000,role,
+         bitcoin::secp256k1::SecretKey::from_slice(&[3+index as u8;32])?,setup.spend[index],setup.view[index],
+         &setup.frames[index],&setup.signatures[index])?;
+     let pin = *local.commitment();
+-    let selected = local.select_peer(&directory.0,&setup.quote,&setup.policy,1001,
++    let selected = local.select_peer(directory,&setup.quote,&setup.policy,1001,
+         &setup.frames[1-index],&setup.signatures[1-index])?;
+     let signature = SigningKey::from_bytes(&[1+index as u8;32])
+         .sign(&selected.view_signing_bytes(&setup.quote,&setup.policy,1002)?).to_bytes();
+-    let outgoing = selected.retain_signed_view(&directory.0,&setup.quote,&setup.policy,1002,&signature)?;
++    let outgoing = selected.retain_signed_view(directory,&setup.quote,&setup.policy,1002,&signature)?;
+     Ok((selected,outgoing,pin))
+ }
+ 
+@@ -611,8 +634,8 @@
+ fn received_views_restore_exact_wallet_before_acknowledgement() -> Result<()> {
+     use super::super::local_keys::{RetainedLocalKeys,peer::RetainedPeer};
+     let setup = Setup::new()?; let directory = PrivateStore::new()?;
+-    let (b,bv,bpin) = selected_with_outgoing(&setup,&directory,0)?;
+-    let (n,nv,npin) = selected_with_outgoing(&setup,&directory,1)?;
++    let (b,bv,bpin) = selected_with_outgoing(&setup,&directory.0,0)?;
++    let (n,nv,npin) = selected_with_outgoing(&setup,&directory.0,1)?;
+     let mut receipts = Vec::new();
+     for (selected,own,peer) in [(&b,&bv,&nv),(&n,&nv,&bv)] {
+         let (wallet,pin) = selected.retain_received_view(&directory.0,&setup.quote,&setup.policy,1003,
+@@ -643,8 +666,8 @@
+ #[test]
+ fn received_views_reject_equivocation_and_missing_predecessors() -> Result<()> {
+     let setup = Setup::new()?; let directory = PrivateStore::new()?;
+-    let (b,bv,_) = selected_with_outgoing(&setup,&directory,0)?;
+-    let (_n,nv,_) = selected_with_outgoing(&setup,&directory,1)?;
++    let (b,bv,_) = selected_with_outgoing(&setup,&directory.0,0)?;
++    let (_n,nv,_) = selected_with_outgoing(&setup,&directory.0,1)?;
+     let accept = |now,frame: &[u8],signature: &[u8]| b.retain_received_view(&directory.0,&setup.quote,
+         &setup.policy,now,bv.commitment(),frame,signature);
+     assert!(accept(1001,nv.frame(),nv.signature()).is_err());

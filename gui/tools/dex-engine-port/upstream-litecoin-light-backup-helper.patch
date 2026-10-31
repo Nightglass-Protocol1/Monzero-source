@@ -1,0 +1,104 @@
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -6,7 +6,7 @@
+     use anyhow::{Context,Result,ensure};
+     use serde::Deserialize;
+     use zeroize::Zeroizing;
+-    use swap_machine::litecoin_light::vault::{SeedVault,signing::review::claims::ClaimedSpend};
++    use swap_machine::litecoin_light::vault::{backup,SeedVault,signing::review::claims::ClaimedSpend};
+     use swap_machine::litecoin_light::vault::signing::review::claims::broadcast::BroadcastStatus;
+     use swap_machine::litecoin_light::session::reconciliation::PaymentPosition;
+     use serde_json::{Value,json};
+@@ -26,7 +26,7 @@
+     struct Endpoint {host:String,port:u16}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+-    struct Request {schema:String,request_id:uuid::Uuid,maximum_download_headers:Option<u32>,maximum_history_entries:Option<usize>,wallet_scan:Option<WalletScan>,payment:Option<Payment>,fee_quote:Option<FeeQuote>,retained_review:Option<RetainedReview>,signing_approval:Option<SigningApproval>,broadcast_approval:Option<BroadcastApproval>}
++    struct Request {schema:String,request_id:uuid::Uuid,maximum_download_headers:Option<u32>,maximum_history_entries:Option<usize>,wallet_scan:Option<WalletScan>,payment:Option<Payment>,fee_quote:Option<FeeQuote>,retained_review:Option<RetainedReview>,signing_approval:Option<SigningApproval>,broadcast_approval:Option<BroadcastApproval>,backup_approval:Option<BackupApproval>}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct WalletConfig {account:PublicAccountDescriptor,address_book_directory:PathBuf,spend_directory:Option<PathBuf>,vault:Option<VaultConfig>}
+@@ -49,6 +49,9 @@
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct BroadcastApproval {approved_commitment:String,approved_txid:String,host:String,port:u16}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct BackupApproval {directory:PathBuf,password:Password}
+     // Neither Debug nor Serialize. Own and erase the decoded credential; input
+     // bytes are separately erased. Parser/dependency internals may retain copies.
+     struct Password(Zeroizing<String>);
+@@ -318,16 +321,45 @@
+             "changeAtomic":tx.output.get(1).map(|out|out.value.to_sat()).unwrap_or(0).to_string()});
+         Ok(response)
+     }
++    fn wallet_backup(config:&Config,network:LtcNetwork,approval:&BackupApproval,save:bool)->Result<Value> {
++        let wallet=config.wallet.as_ref().context("missing wallet configuration")?;
++        let account=PublicAccount::from_descriptor(&wallet.account,network)?;
++        let vault_config=wallet.vault.as_ref().context("missing vault identity")?;
++        ensure!(!vault_config.wallet_id.is_nil() && approval.directory.is_absolute()
++            && approval.directory.canonicalize()?==approval.directory,"invalid backup destination");
++        let password=approval.password.0.as_bytes();
++        let info=if save {
++            let book=AddressBook::open(&wallet.address_book_directory,account)?;
++            let vault=SeedVault::open(&vault_config.directory,network,vault_config.wallet_id)?;
++            let encrypted=backup::export(&vault,&book,password)?;
++            backup::storage::save_verified(&approval.directory,&encrypted,password,network,vault_config.wallet_id)?
++        } else {
++            backup::storage::load_verified(&approval.directory,password,network,vault_config.wallet_id)?.1
++        };
++        ensure!(serde_json::to_vec(&info.account().descriptor())?==serde_json::to_vec(&wallet.account)?,
++            "backup does not match configured account");
++        let allocated=info.allocated();
++        Ok(json!({"watchOnly":true,"spendable":false,"backupVerified":true,"backupSaved":save,
++            "backupDigest":info.digest().to_string(),"walletId":info.wallet_id(),
++            "receivingAllocated":allocated[0],"changeAllocated":allocated[1],
++            "scope":"seed-and-address-allocations","allocationFreshness":"unassessed",
++            "activeSwapRecovery":false}))
++    }
++    fn output(response:&Value)->Result<()> {
++        let bytes=serde_json::to_vec(response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
++        std::io::stdout().write_all(&bytes)?;Ok(())
++    }
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
+-        let mode=match args[1].to_str() {Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
++        let mode=match args[1].to_str() {Some("--wallet-backup-save-stdio-v1")=>"wallet-backup-save",Some("--wallet-backup-verify-stdio-v1")=>"wallet-backup-verify",Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
+             Some("--wallet-reconcile-stdio-v1")=>"wallet-reconcile",Some("--wallet-broadcast-stdio-v1")=>"wallet-broadcast",Some("--wallet-broadcast-status-stdio-v1")=>"wallet-broadcast-status",
+             Some("--wallet-signed-stdio-v1")=>"wallet-signed",Some("--wallet-sign-stdio-v1")=>"wallet-sign",Some("--wallet-reopen-stdio-v1")=>"wallet-reopen",Some("--wallet-receive-stdio-v1")=>"wallet-receive",Some("--wallet-prepare-stdio-v1")=>"wallet-prepare",Some("--wallet-estimate-stdio-v1")=>"wallet-estimate",
+             Some("--wallet-init-stdio-v1")=>"wallet-init",Some("--wallet-refresh-stdio-v1")=>"wallet-refresh",
+             _=>anyhow::bail!("unsupported light-chain operation")};
++        let backup_mode=mode=="wallet-backup-save" || mode=="wallet-backup-verify";
+         let mut bytes=Zeroizing::new(Vec::new());std::io::stdin().take(8193).read_to_end(&mut bytes)?;
+-        ensure!(!bytes.is_empty() && bytes.len()<=if mode=="wallet-sign" {8192}else if mode=="wallet-reconcile" || mode=="wallet-broadcast" || mode=="wallet-broadcast-status" || mode=="wallet-signed" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" || mode=="wallet-estimate" {2048}else{512},"invalid light-chain request size");
++        ensure!(!bytes.is_empty() && bytes.len()<=if mode=="wallet-sign" || backup_mode {8192}else if mode=="wallet-reconcile" || mode=="wallet-broadcast" || mode=="wallet-broadcast-status" || mode=="wallet-signed" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" || mode=="wallet-estimate" {2048}else{512},"invalid light-chain request size");
+         let request: Request=serde_json::from_slice(&bytes)?;drop(bytes);
+         let schema=format!("monzero-ltc-light-{mode}-request-v1");
+         let sync=mode=="sync";
+@@ -345,9 +377,15 @@
+         ensure!((mode=="wallet-broadcast")==request.broadcast_approval.is_some(),"invalid Litecoin broadcast approval request");
+         ensure!(if mode=="wallet-reconcile" {request.maximum_history_entries.is_some_and(|n|(1..=1000).contains(&n))}
+             else {request.maximum_history_entries.is_none()},"invalid Litecoin payment history budget");
++        ensure!(backup_mode==request.backup_approval.is_some(),"invalid Litecoin backup approval request");
+         let (_lease,config)=config(Path::new(&args[2]))?;
+         let network=match config.network.as_str() {"main"=>LtcNetwork::Mainnet,"test"=>LtcNetwork::Testnet,
+             "regtest"=>LtcNetwork::Regtest,_=>anyhow::bail!("unsupported Litecoin network")};
++        if backup_mode {
++            let wallet=wallet_backup(&config,network,request.backup_approval.as_ref().context("missing backup approval")?,mode=="wallet-backup-save")?;
++            return output(&json!({"schema":format!("monzero-ltc-light-{mode}-response-v1"),
++                "requestId":request.request_id,"executable":false,"wallet":wallet}));
++        }
+         let mut state=ChainState::open(&config.cache_directory,network,config.maximum_height,now()?)?;
+         let synchronization=if sync || mode=="wallet-reconcile" {
+             let budget=request.maximum_download_headers.context("missing download budget")?;
+@@ -390,8 +428,7 @@
+             response.as_object_mut().context("invalid response object")?.remove("synchronization");
+             response["wallet"]=wallet;
+         }
+-        let bytes=serde_json::to_vec(&response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
+-        std::io::stdout().write_all(&bytes)?;Ok(())
++        output(&response)
+     }
+ }
+ fn main() {

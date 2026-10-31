@@ -1,0 +1,173 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet.rs
+@@ -19,7 +19,15 @@
+ /// chain observations must still be checked before funding the derived address.
+ pub struct NativeWalletKeys {
+     pair: NativePair, address: XmzAddress, view: monero::PrivateViewKey,
+-    transcript: [u8;32],
++    transcript: [u8;32], view_public: [[u8;32];2],
++}
++
++/// Locally owned secrets matched to an authenticated wallet transcript. This
++/// does not authorize signature release, funding, wallet import or chain relay.
++/// No Debug or implicit serialization; durable private storage is still required.
++pub struct OwnedNativeWallet {
++    wallet: NativeWalletKeys, role: Role, contract: zeroize::Zeroizing<[u8;32]>,
++    spend: monero::PrivateKey, view_share: monero::PrivateViewKey,
+ }
+ 
+ #[derive(Serialize,Deserialize)]
+@@ -87,6 +95,7 @@
+         ensure!(self.bch.quote_commitment == *quote.commitment(), "BCH native wallet quote mismatch");
+         let bch = self.verify_view(quote,frames[0].0,frames[0].1,Role::BchFunder)?;
+         let native = self.verify_view(quote,frames[1].0,frames[1].1,Role::NativeFunder)?;
++        let view_public = [bch,native].map(|key| monero::PublicKey::from_private_key(&key).decompress().compress().to_bytes());
+         let view = bch + native;
+         ensure!(view.as_bytes() != [0;32], "BCH native view shares cancel");
+         let spend = monero::PublicKey::from_slice(&self.spend_public)?;
+@@ -95,11 +104,35 @@
+             spend.decompress(),public_view.decompress())?;
+         let mut hash = Sha256::new(); hash.update(b"monzero-bch-xmz-native-wallet-v1\0"); hash.update(self.pair_commitment);
+         for (frame,signature) in frames { hash.update((frame.len() as u64).to_be_bytes()); hash.update(frame); hash.update(signature); }
+-        Ok(NativeWalletKeys { pair:self,address,view:monero::PrivateViewKey(view),transcript:hash.finalize().into() })
++        Ok(NativeWalletKeys { pair:self,address,view:monero::PrivateViewKey(view),transcript:hash.finalize().into(),view_public })
+     }
+ }
+ 
+ impl NativeWalletKeys {
++    pub fn bind_local(self, quote: &VerifiedBchQuote, role: Role,
++        contract: bitcoin::secp256k1::SecretKey, spend: monero::PrivateKey,
++        view_share: monero::PrivateViewKey) -> Result<OwnedNativeWallet> {
++        ensure!(self.pair.bch.quote_commitment == *quote.commitment(), "BCH local ownership quote mismatch");
++        let (own,index,signer) = match role {
++            Role::BchFunder => (&self.pair.bch,0,quote.recovery_plan().terms().bch_funder_signing_key),
++            Role::NativeFunder => (&self.pair.native,1,quote.recovery_plan().terms().native_funder_signing_key),
++        };
++        let public = bitcoin::secp256k1::PublicKey::from_secret_key(&bitcoin::secp256k1::Secp256k1::new(),&contract);
++        ensure!(public == signer, "BCH local contract secret differs from quote");
++        ensure!(monero::PublicKey::from_private_key(&spend).decompress().compress().to_bytes() == own.binding.native,
++            "BCH local spend secret differs from proof");
++        view_key(&view_share.0.as_bytes())?;
++        ensure!(monero::PublicKey::from_private_key(&view_share.0).decompress().compress().to_bytes() == self.view_public[index],
++            "BCH local view secret differs from signed frame");
++        // Also check the exact unreduced scalar on the adaptor curve.
++        let mut bytes = zeroize::Zeroizing::new(spend.as_bytes()); bytes.reverse();
++        let scalar = ecdsa_fun::fun::Scalar::from_bytes(*bytes).context("invalid local BCH adaptor scalar")?
++            .non_zero().context("zero local BCH adaptor scalar")?;
++        ensure!(ecdsa_fun::ECDSA::verify_only().verification_key_for(&scalar) == own.binding.adaptor,
++            "BCH local scalar differs from proven adaptor");
++        Ok(OwnedNativeWallet {wallet:self,role,contract:zeroize::Zeroizing::new(contract.secret_bytes()),spend,view_share})
++    }
++
+     pub fn address(&self) -> &XmzAddress { &self.address }
+     pub fn private_view_key(&self) -> &monero::PrivateViewKey { &self.view }
+     pub fn transcript_commitment(&self) -> &[u8;32] { &self.transcript }
+@@ -121,5 +154,29 @@
+     }
+ }
+ 
++impl OwnedNativeWallet {
++    pub fn wallet(&self) -> &NativeWalletKeys { &self.wallet }
++    pub fn native_spend_share(&self) -> &monero::PrivateKey { &self.spend }
++    pub fn private_view_share(&self) -> &monero::PrivateViewKey { &self.view_share }
++
++    /// Prepare an encrypted signature only for this role's quoted branch and
++    /// the authenticated peer adaptor. Protocol release policy is separate.
++    pub fn prepare_encrypted_signature(&self, quote: &VerifiedBchQuote) -> Result<EncryptedSignature> {
++        ensure!(self.wallet.pair.bch.quote_commitment == *quote.commitment(), "BCH local signing quote mismatch");
++        let (covenant,peer) = match self.role {
++            Role::BchFunder => (quote.recovery_plan().lock(),&self.wallet.pair.native),
++            Role::NativeFunder => (quote.recovery_plan().recovery(),&self.wallet.pair.bch),
++        };
++        let secret = ecdsa_fun::fun::Scalar::from_bytes(*self.contract).context("invalid held BCH contract scalar")?
++            .non_zero().context("zero held BCH contract scalar")?;
++        Ok(covenant.data_message().encrypted_sign(&secret,&peer.binding.adaptor))
++    }
++
++    pub fn recover_spend_key(&self, quote: &VerifiedBchQuote, funding: &[u8], outpoint: OutPoint,
++        spend: &[u8], encrypted: &EncryptedSignature) -> Result<monero::PrivateKey> {
++        self.wallet.recover_spend_key(quote,self.role,&self.spend,funding,outpoint,spend,encrypted)
++    }
++}
++
+ #[cfg(test)]
+ mod tests;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -28,6 +28,13 @@
+         }
+         Ok(setup)
+     }
++    fn wallet(&self) -> Result<NativeWalletKeys> {
++        let pair = self.pair()?;
++        let b = pair.view_frame(Role::BchFunder,&self.view[0])?;
++        let n = pair.view_frame(Role::NativeFunder,&self.view[1])?;
++        let bs = sign(&b,Role::BchFunder,true); let ns = sign(&n,Role::NativeFunder,true);
++        pair.finish(&self.quote,&self.policy,1000,[(&b,&bs),(&n,&ns)])
++    }
+     fn pair(&self) -> Result<NativePair> {
+         NativePair::new(&self.quote,
+             AuthenticatedNativeAdaptor::verify(&self.frames[0],&self.signatures[0],&self.quote,&self.policy,1000,Role::BchFunder)?,
+@@ -48,6 +55,12 @@
+     assert_eq!(wallet.address(),&expected);
+     assert_eq!(wallet.private_view_key().0.as_bytes(),view.as_bytes());
+     assert_eq!(wallet.transcript_commitment(),setup.pair()?.finish(&setup.quote,&setup.policy,1000,[(&b,&bs),(&n,&ns)])?.transcript_commitment());
++    let owned = [
++        setup.wallet()?.bind_local(&setup.quote,Role::BchFunder,bitcoin::secp256k1::SecretKey::from_slice(&[3;32])?,setup.spend[0],setup.view[0])?,
++        setup.wallet()?.bind_local(&setup.quote,Role::NativeFunder,bitcoin::secp256k1::SecretKey::from_slice(&[4;32])?,setup.spend[1],setup.view[1])?,
++    ];
++    assert_eq!(owned[0].wallet().address(),wallet.address());
++    assert_eq!(owned[1].private_view_share().0.as_bytes(),setup.view[1].0.as_bytes());
+     let plan = setup.quote.recovery_plan();
+     let funding = Transaction { version:Version::TWO,lock_time:absolute::LockTime::ZERO,
+         input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([7;32]),vout:0},
+@@ -57,19 +70,17 @@
+     let cancel = plan.lock().prepare_timeout(&serialize(&funding),&plan.lock_spend_terms(first))?;
+     for (local_index,role) in [(0,Role::BchFunder),(1,Role::NativeFunder)] {
+         let peer_index = 1-local_index;
+-        let peer: super::super::Frame = serde_json::from_slice(&setup.frames[peer_index])?;
+-        let (covenant,raw,outpoint,tag) = if local_index == 0 {
+-            (plan.lock(),serialize(&funding),first,3)
+-        } else { (plan.recovery(),serialize(&cancel),OutPoint {txid:cancel.compute_txid(),vout:0},4) };
+-        let secret = Scalar::from_bytes([tag;32]).unwrap().non_zero().unwrap();
+-        let encrypted = covenant.data_message().encrypted_sign(&secret,&peer.adaptor_key.into());
++        let (covenant,raw,outpoint) = if local_index == 0 {
++            (plan.lock(),serialize(&funding),first)
++        } else { (plan.recovery(),serialize(&cancel),OutPoint {txid:cancel.compute_txid(),vout:0}) };
++        let encrypted = owned[local_index].prepare_encrypted_signature(&setup.quote)?;
+         let mut decrypt = setup.spend[peer_index].as_bytes(); decrypt.reverse();
+         let decrypt = Scalar::from_bytes(decrypt).unwrap().non_zero().unwrap();
+         let signer = Point::from_bytes(covenant.terms().signing_key.serialize()).unwrap();
+         let der = covenant.data_message().decrypt(&signer,&decrypt,encrypted.clone())?;
+         let terms = if local_index == 0 {plan.lock_spend_terms(outpoint)} else {plan.recovery_spend_terms(outpoint)};
+         let tx = covenant.prepare_redemption(&raw,&terms,&der)?;
+-        assert_eq!(wallet.recover_spend_key(&setup.quote,role,&setup.spend[local_index],&raw,outpoint,&serialize(&tx),&encrypted)?.as_bytes(),spend.as_bytes());
++        assert_eq!(owned[local_index].recover_spend_key(&setup.quote,&raw,outpoint,&serialize(&tx),&encrypted)?.as_bytes(),spend.as_bytes());
+         assert!(wallet.recover_spend_key(&setup.quote,role,&setup.spend[peer_index],&raw,outpoint,&serialize(&tx),&encrypted).is_err());
+     }
+     Ok(())
+@@ -115,3 +126,24 @@
+     assert!(NativePair::new(&setup.quote,bch,native).is_err());
+     Ok(())
+ }
++
++#[test]
++fn owned_context_rejects_unrelated_contract_spend_view_role_and_quote() -> Result<()> {
++    let setup = Setup::new()?;
++    for (index,role,tag) in [(0,Role::BchFunder,3),(1,Role::NativeFunder,4)] {
++        let contract = bitcoin::secp256k1::SecretKey::from_slice(&[tag;32])?;
++        let wrong_contract = bitcoin::secp256k1::SecretKey::from_slice(&[5;32])?;
++        assert!(setup.wallet()?.bind_local(&setup.quote,role,wrong_contract,setup.spend[index],setup.view[index]).is_err());
++        assert!(setup.wallet()?.bind_local(&setup.quote,role,contract,setup.spend[1-index],setup.view[index]).is_err());
++        assert!(setup.wallet()?.bind_local(&setup.quote,role,contract,setup.spend[index],setup.view[1-index]).is_err());
++        let wrong_role = if role == Role::BchFunder {Role::NativeFunder} else {Role::BchFunder};
++        assert!(setup.wallet()?.bind_local(&setup.quote,wrong_role,contract,setup.spend[index],setup.view[index]).is_err());
++        let mut terms = setup.quote.terms().clone(); terms.insert("bchLockFeeAtoms".into(),"1001".into());
++        let other_quote = signed(&terms,&setup.policy,1000)?;
++        assert!(setup.wallet()?.bind_local(&other_quote,role,contract,setup.spend[index],setup.view[index]).is_err());
++        let owned = setup.wallet()?.bind_local(&setup.quote,role,contract,setup.spend[index],setup.view[index])?;
++        assert!(owned.prepare_encrypted_signature(&other_quote).is_err());
++        assert_eq!(owned.native_spend_share().as_bytes(),setup.spend[index].as_bytes());
++    }
++    Ok(())
++}

@@ -1,0 +1,165 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen/tests.rs
+@@ -0,0 +1,47 @@
++use super::*;
++use std::fs;
++#[test]
++fn reopen_review_and_signed_bytes_without_seed()->Result<()> {
++    let directory=super::super::tests::Directory::new()?;let operation=Uuid::new_v4();
++    let (seed,review)=super::super::tests::review(&[0,1])?;
++    let account=seed.public_account(LtcNetwork::Regtest,2)?;
++    let payment=review.transaction().output[0].clone();
++    let claim=ClaimedSpend::retain(&directory.0,operation,review)?;let commitment=claim.signing_commitment();
++    assert!(claim.load_signed().is_err());
++    let signed=claim.approve_and_sign(&seed,commitment)?;drop(seed);drop(claim);
++    let reopened=ClaimedSpend::open(&directory.0,operation,&account,&payment,None,Amount::from_sat(101000),commitment)?;
++    assert_eq!(reopened.load_signed()?,signed);assert_eq!(reopened.fee().to_sat(),101000);Ok(())
++}
++#[test]
++fn reopen_rejects_changed_policy_and_missing_claims()->Result<()> {
++    let directory=super::super::tests::Directory::new()?;let operation=Uuid::new_v4();
++    let (seed,review)=super::super::tests::review(&[0])?;
++    let account=seed.public_account(LtcNetwork::Regtest,2)?;let payment=review.transaction().output[0].clone();
++    let claim=ClaimedSpend::retain(&directory.0,operation,review)?;let commitment=claim.signing_commitment();
++    let input_name=claim.records[1].0.clone();drop(claim);
++    let open=|payment:&TxOut,max,commitment|ClaimedSpend::open(&directory.0,operation,&account,payment,None,Amount::from_sat(max),commitment);
++    assert!(open(&payment,999,commitment).is_err());
++    let mut changed=payment.clone();changed.value=Amount::from_sat(98000);assert!(open(&changed,1000,commitment).is_err());
++    assert!(open(&payment,1000,sha256::Hash::hash(b"wrong")).is_err());
++    let other=seed.public_account(LtcNetwork::Regtest,3)?;
++    assert!(ClaimedSpend::open(&directory.0,operation,&other,&payment,None,Amount::from_sat(1000),commitment).is_err());
++    fs::remove_file(directory.0.join(input_name))?;
++    assert!(open(&payment,1000,commitment).is_err());Ok(())
++}
++#[test]
++fn signed_reload_rejects_changed_outputs_signatures_and_intent()->Result<()> {
++    let directory=super::super::tests::Directory::new()?;let operation=Uuid::new_v4();
++    let (seed,review)=super::super::tests::review(&[0])?;
++    let claim=ClaimedSpend::retain(&directory.0,operation,review)?;let commitment=claim.signing_commitment();
++    let signed=claim.approve_and_sign(&seed,commitment)?;
++    let path=directory.0.join(format!("ltc-signed-{commitment}.tx"));
++    let mut altered=signed.clone();altered.output[0].value=Amount::from_sat(98000);
++    fs::write(&path,serialize(&altered))?;assert!(claim.load_signed().is_err());
++    let mut altered=signed.clone();let mut signature=altered.input[0].witness.iter().next().unwrap().to_vec();signature[10]^=1;
++    let key=altered.input[0].witness.iter().nth(1).unwrap().to_vec();
++    altered.input[0].witness=Witness::from_slice(&[signature,key]);
++    fs::write(&path,serialize(&altered))?;assert!(claim.load_signed().is_err());
++    fs::write(&path,serialize(&signed))?;assert_eq!(claim.load_signed()?,signed);
++    fs::remove_file(directory.0.join(format!("ltc-signing-{commitment}.json")))?;
++    assert!(claim.load_signed().is_err());Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs
+@@ -0,0 +1,83 @@
++//! Reload under the journal lease, with externally supplied review expectations.
++use super::*;
++use bitcoin::consensus::deserialize;
++use serde::Deserialize;
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Manifest {
++    schema:String,operation:Uuid,network:String,account:PublicAccountDescriptor,
++    transaction:Vec<u8>,inputs:Vec<Input>,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Input {outpoint:String,prevout:Vec<u8>,branch:u8,index:u32}
++impl ClaimedSpend {
++    /// Reload an existing preparation without signing or creating records.
++    /// Payment/change/fee policy and the commitment come from the caller's
++    /// retained review context, never inferred as approval from disk contents.
++    pub fn open(directory:&Path,operation:Uuid,account:&PublicAccount,payment:&TxOut,
++        change_index:Option<u32>,maximum_fee:Amount,expected:sha256::Hash)->Result<Self> {
++        ensure!(!operation.is_nil(),"missing Litecoin spend operation");
++        let journal=Journal::open(directory)?;
++        let bytes=journal.read(&format!("ltc-spend-{operation}.json"))?;
++        ensure!(sha256::Hash::hash(&bytes)==expected,"Litecoin signing review commitment mismatch");
++        let manifest:Manifest=serde_json::from_slice(&bytes)?;
++        ensure!(manifest.schema=="monzero-ltc-spend-claim-v1" && manifest.operation==operation
++            && manifest.network==account.network().genesis(),"Litecoin recovered spend context mismatch");
++        let imported=PublicAccount::from_descriptor(&manifest.account,account.network())?;
++        ensure!(serde_json::to_vec(&imported.descriptor())?==serde_json::to_vec(&account.descriptor())?,
++            "Litecoin recovered spend account mismatch");
++        ensure!(!manifest.inputs.is_empty() && manifest.inputs.len()<=1000,"invalid Litecoin recovered input count");
++        let transaction:Transaction=deserialize(&manifest.transaction)?;
++        ensure!(serialize(&transaction)==manifest.transaction,"noncanonical Litecoin recovered transaction");
++        let mut inputs=Vec::with_capacity(manifest.inputs.len());
++        for input in manifest.inputs {
++            let prevout:TxOut=deserialize(&input.prevout)?;
++            ensure!(serialize(&prevout)==input.prevout,"noncanonical Litecoin recovered prevout");
++            let branch=match input.branch {0=>Branch::Receive,1=>Branch::Change,_=>anyhow::bail!("invalid Litecoin recovered branch")};
++            inputs.push(OwnedInput {outpoint:input.outpoint.parse()?,prevout,branch,index:input.index});
++        }
++        let review=SpendReview::new(account,transaction,inputs,payment,change_index,maximum_fee)?;
++        let records=records(operation,&review)?;
++        for (name,expected) in &records {
++            ensure!(journal.read(name)?==*expected,"Litecoin recovered claim mismatch");
++        }
++        Ok(Self {journal,review,records})
++    }
++    /// Verify a retained signed transaction without unlocking the seed. Missing
++    /// intent/bytes is an error, never permission to replace or release inputs.
++    /// Verification proves signatures against retained prevouts, not unspentness.
++    pub fn load_signed(&self)->Result<Transaction> {
++        for (name,bytes) in &self.records {
++            ensure!(self.journal.read(name)?==*bytes,"Litecoin spend claim changed; reopen required");
++        }
++        let commitment=self.signing_commitment();
++        let approval=serde_json::to_vec(&serde_json::json!({
++            "schema":"monzero-ltc-signing-intent-v1","commitment":commitment.to_string()
++        }))?;
++        ensure!(self.journal.read(&format!("ltc-signing-{commitment}.json"))?==approval,
++            "Litecoin retained signing intent mismatch");
++        let bytes=self.journal.read(&format!("ltc-signed-{commitment}.tx"))?;
++        let signed:Transaction=deserialize(&bytes)?;
++        ensure!(serialize(&signed)==bytes,"noncanonical Litecoin signed transaction");
++        let mut unsigned=signed.clone();
++        for input in &mut unsigned.input {input.witness=Witness::new();}
++        ensure!(unsigned==self.review.transaction,"Litecoin signed transaction content mismatch");
++        let secp=Secp256k1::verification_only();
++        for (index,owned) in self.review.inputs.iter().enumerate() {
++            let witness=&signed.input[index].witness;
++            ensure!(witness.len()==2,"invalid Litecoin signed witness");
++            let mut items=witness.iter();
++            let signature=ecdsa::Signature::from_slice(items.next().context("missing Litecoin signature")?)?;
++            let key=self.review.account.derive(owned.branch,owned.index)?.public_key();
++            ensure!(signature.sighash_type==EcdsaSighashType::All
++                && items.next()==Some(key.0.serialize().as_slice()),"Litecoin signed witness ownership mismatch");
++            let hash=SighashCache::new(&signed).p2wpkh_signature_hash(index,&owned.prevout.script_pubkey,
++                owned.prevout.value,EcdsaSighashType::All)?;
++            secp.verify_ecdsa(&Message::from(hash),&signature.signature,&key.0)?;
++        }
++        Ok(signed)
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
+@@ -1,9 +1,9 @@
+ use super::*;
+ use std::{fs,path::PathBuf,os::unix::fs::DirBuilderExt};
+-struct Directory(PathBuf);
+-impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("ltc-claims-{}",Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
++pub(super) struct Directory(pub(super) PathBuf);
++impl Directory {pub(super) fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("ltc-claims-{}",Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
+ impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
+-fn review(indices:&[u32])->Result<(SecretSeed,SpendReview)> {
++pub(super) fn review(indices:&[u32])->Result<(SecretSeed,SpendReview)> {
+     let (seed,account,mut tx,prevout)=super::super::super::tests::fixture()?;
+     let template=tx.input[0].clone();tx.input.clear();let mut inputs=Vec::new();
+     for index in indices {let mut input=template.clone();input.previous_output.vout=*index;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -65,3 +65,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++mod reopen;

@@ -1,0 +1,210 @@
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index 590f427e1..b2451aeb0 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -16,6 +16,7 @@ pub mod spend_journal;
+ pub mod spend_recovery;
+ pub mod topup_dispatch;
+ pub mod topup_journal;
++pub mod topup_recovery;
+ pub mod wallet_session;
+ use anyhow::{Context, Result, ensure};
+ use serde_json::{Value, json};
+diff --git a/swap-machine/src/native_funding_rpc/topup_recovery.rs b/swap-machine/src/native_funding_rpc/topup_recovery.rs
+new file mode 100644
+index 000000000..02bd81b3a
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/topup_recovery.rs
+@@ -0,0 +1,192 @@
++//! Read-only recovery evidence for the buyer's top-up dispatch, never retry
++//! authority. Trusts a dedicated local wallet/daemon and an exclusively
++//! controlled persistent journal directory. Mirrors `spend_recovery.rs`'s
++//! `RecoveryRecord`, since `TopUpJournal` shares its shape (full request,
++//! single destination, receipt-based) -- not `exact_net_recovery.rs`, whose
++//! two-destination accounting does not apply here.
++use super::{NativeFundingRpc, number, string};
++use crate::xmz_funding::{ChainSnapshot, FundingObserver};
++use anyhow::{Result, ensure};
++use serde_json::{Value, json};
++use std::path::Path;
++use swap_core::{xmz::XmzAmount, xmz_address::XmzAddress};
++
++pub struct TopUpRecovery {
++    genesis: String,
++    buyer_wallet: XmzAddress,
++    destination: XmzAddress,
++    lock_txid: String,
++    txid: String,
++    amount: u64,
++    fee: u64,
++    account: u64,
++}
++
++impl TopUpRecovery {
++    #[cfg(unix)]
++    pub fn load(directory: &Path, genesis: &str, buyer_wallet: XmzAddress, lock_txid: &str) -> Result<Self> {
++        let (intent, prepared) = super::spend_recovery::load_records(directory, genesis, &buyer_wallet, lock_txid)?;
++        Self::decode(intent, prepared, genesis, buyer_wallet, lock_txid)
++    }
++
++    #[cfg(not(unix))]
++    pub fn load(_: &Path, _: &str, _: XmzAddress, _: &str) -> Result<Self> {
++        anyhow::bail!("top-up recovery reader not implemented on this platform")
++    }
++
++    fn decode(intent: Value, prepared: Value, genesis: &str, buyer_wallet: XmzAddress, lock_txid: &str) -> Result<Self> {
++        ensure!(intent.as_object().is_some_and(|v| v.len() == 9)
++            && intent["schema"] == "monzero-topup-dispatch-intent-v1"
++            && intent["genesis"] == genesis && intent["buyerWallet"] == buyer_wallet.to_string()
++            && intent["lockTxid"] == lock_txid, "top-up recovery intent identity mismatch");
++        let destination = XmzAddress::parse(buyer_wallet.network(), &string(&intent, "destination")?)?;
++        ensure!(destination != buyer_wallet, "top-up recovery destination must differ from the buyer's own wallet");
++        let amount = atoms(&intent, "reserveAtoms")?;
++        let maximum_fee = atoms(&intent, "maximumFeeAtoms")?;
++        let account = number(&intent, "account")?;
++        ensure!(account <= u32::MAX as u64 && (1..=4).contains(&number(&intent, "priority")?),
++            "invalid top-up recovery account/priority");
++        ensure!(prepared.as_object().is_some_and(|v| v.len() == 4)
++            && prepared["schema"] == "monzero-topup-dispatch-prepared-v1", "invalid top-up prepared record");
++        let txid = string(&prepared, "txid")?;
++        let fee = atoms(&prepared, "feeAtoms")?;
++        ensure!(canonical_hash(&txid) && fee <= maximum_fee && amount.checked_add(fee).is_some()
++            && number(&prepared, "weight")? > 0, "invalid prepared top-up amounts/hash");
++        Ok(Self { genesis: genesis.into(), buyer_wallet, destination, lock_txid: lock_txid.into(),
++            txid, amount, fee, account })
++    }
++
++    pub fn txid(&self) -> &str { &self.txid }
++    pub fn lock_txid(&self) -> &str { &self.lock_txid }
++
++    /// Errors, absence, pending transactions and changed tips are unresolved.
++    /// No wallet open/close, refresh, signing, broadcast or journal writes occur.
++    pub async fn reconcile(&self, client: &NativeFundingRpc, minimum_confirmations: u64) -> Result<super::spend_recovery::ConfirmedSpend> {
++        ensure!(minimum_confirmations > 0, "zero top-up recovery confirmation policy");
++        let before = client.snapshot().await?;
++        ensure!(before.genesis == self.genesis && canonical_hash(&before.tip_hash), "unexpected top-up recovery chain");
++        ensure!(client.opened_wallet(self.buyer_wallet.network()).await?.as_ref() == Some(&self.buyer_wallet),
++            "unexpected top-up recovery wallet");
++        let response = client.rpc(client.wallet, "get_transfer_by_txid",
++            json!({"txid":self.txid, "account_index":self.account})).await?;
++        let confirmations = self.verify_transfer(&response["transfer"], &before, minimum_confirmations)?;
++        ensure!(client.opened_wallet(self.buyer_wallet.network()).await?.as_ref() == Some(&self.buyer_wallet),
++            "top-up recovery wallet changed");
++        ensure!(client.snapshot().await? == before, "top-up recovery chain changed");
++        Ok(super::spend_recovery::ConfirmedSpend { txid: self.txid.clone(), confirmations })
++    }
++
++    fn verify_transfer(&self, transfer: &Value, tip: &ChainSnapshot, minimum: u64) -> Result<u64> {
++        ensure!(transfer["txid"] == self.txid && transfer["type"] == "out"
++            && number(transfer, "amount")? == self.amount && number(transfer, "fee")? == self.fee
++            && number(transfer, "unlock_time")? == 0
++            && number(&transfer["subaddr_index"], "major")? == self.account, "recovered top-up transfer differs from intent");
++        let destinations = transfer["destinations"].as_array().ok_or_else(|| anyhow::anyhow!("missing top-up recovery destinations"))?;
++        ensure!(destinations.len() == 1 && destinations[0]["address"] == self.destination.to_string()
++            && number(&destinations[0], "amount")? == self.amount, "recovered top-up destination mismatch");
++        let height = number(transfer, "height")?;
++        let confirmations = number(transfer, "confirmations")?;
++        ensure!(height > 0 && height <= tip.tip_height && confirmations >= minimum
++            && tip.tip_height.checked_sub(height).and_then(|v| v.checked_add(1)) == Some(confirmations),
++            "recovered top-up transfer is not sufficiently confirmed at this tip");
++        Ok(confirmations)
++    }
++}
++
++fn atoms(value: &Value, field: &str) -> Result<u64> {
++    let text = string(value, field)?;
++    let amount = XmzAmount::from_atom_string(&text).map_err(|_| anyhow::anyhow!("invalid top-up recovery amount"))?;
++    ensure!(amount.atoms() > 0, "zero top-up recovery amount");
++    Ok(amount.atoms())
++}
++
++fn canonical_hash(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use swap_core::xmz_address::XmzNetwork;
++
++    fn addresses() -> Vec<XmzAddress> {
++        include_str!("../../../swap-core/src/xmz_address_vectors.txt").lines()
++            .take(3).map(|s| XmzAddress::parse(XmzNetwork::Mainnet, s).unwrap()).collect()
++    }
++
++    fn records() -> (Value, Value, XmzAddress, XmzAddress) {
++        let addresses = addresses();
++        let (buyer, destination) = (addresses[0].clone(), addresses[1].clone());
++        (json!({"schema":"monzero-topup-dispatch-intent-v1", "genesis":"a".repeat(64),
++            "buyerWallet":buyer.to_string(), "lockTxid":"b".repeat(64), "destination":destination.to_string(),
++            "reserveAtoms":"10", "account":0, "priority":1, "maximumFeeAtoms":"2"}),
++        json!({"schema":"monzero-topup-dispatch-prepared-v1", "txid":"c".repeat(64), "feeAtoms":"1", "weight":10}),
++        buyer, destination)
++    }
++
++    #[test]
++    fn recovery_rejects_altered_intent_and_prepared_record() -> Result<()> {
++        let (intent, prepared, buyer, _) = records();
++        for (field, value) in [("genesis",json!("0".repeat(64))), ("lockTxid",json!("0".repeat(64))),
++            ("buyerWallet",json!(addresses()[2].to_string())), ("destination",json!(buyer.to_string())),
++            ("reserveAtoms",json!("0")), ("account",json!(-1)), ("priority",json!(0)),
++            ("priority",json!(5)), ("maximumFeeAtoms",json!("0"))] {
++            let mut invalid = intent.clone(); invalid[field] = value;
++            assert!(TopUpRecovery::decode(invalid, prepared.clone(), &"a".repeat(64), buyer.clone(), &"b".repeat(64)).is_err());
++        }
++        for (field, value) in [("txid",json!("invalid")), ("feeAtoms",json!("3")), ("weight",json!(0))] {
++            let mut invalid = prepared.clone(); invalid[field] = value;
++            assert!(TopUpRecovery::decode(intent.clone(), invalid, &"a".repeat(64), buyer.clone(), &"b".repeat(64)).is_err());
++        }
++        TopUpRecovery::decode(intent, prepared, &"a".repeat(64), buyer, &"b".repeat(64))?;
++        Ok(())
++    }
++
++    #[test]
++    fn confirmation_requires_exact_payment_and_current_tip() -> Result<()> {
++        let (intent, prepared, buyer, destination) = records();
++        let record = TopUpRecovery::decode(intent, prepared, &"a".repeat(64), buyer, &"b".repeat(64))?;
++        let tip = ChainSnapshot { genesis:"a".repeat(64), tip_hash:"d".repeat(64), tip_height:100 };
++        let value = json!({"txid":"c".repeat(64), "type":"out", "amount":10,"fee":1,"unlock_time":0,
++            "subaddr_index":{"major":0}, "height":91,"confirmations":10,
++            "destinations":[{"address":destination.to_string(),"amount":10}]});
++        assert_eq!(record.verify_transfer(&value, &tip, 10)?, 10);
++        assert!(record.verify_transfer(&value, &tip, 11).is_err());
++        for (field, changed) in [("txid",json!("e".repeat(64))), ("type",json!("pending")),
++            ("amount",json!(11)), ("fee",json!(2)), ("height",json!(90)), ("confirmations",json!(11)),
++            ("unlock_time",json!(1)), ("destinations",json!([])), ("subaddr_index",json!({"major":1}))] {
++            let mut invalid = value.clone(); invalid[field] = changed;
++            assert!(record.verify_transfer(&invalid, &tip, 10).is_err());
++        }
++        Ok(())
++    }
++
++    /// `PreparedTransfer` has no public constructor outside `relay.rs` (it is
++    /// only produced by a live `relay.prepare()` RPC round trip), so a pure
++    /// unit test cannot reach the `.prepared` record this reads. That full
++    /// reserve -> prepare -> load -> reconcile path is proven by the Python
++    /// fixture against real fakechain wallet-rpc, not here. This test only
++    /// proves the reader correctly refuses to reconcile a bare reservation.
++    #[cfg(unix)]
++    #[test]
++    fn load_refuses_to_reconcile_before_a_prepared_record_exists() -> Result<()> {
++        use std::os::unix::fs::DirBuilderExt;
++        use super::super::topup_journal::{TopUpJournal, TopUpRequest};
++        struct Owned(std::path::PathBuf);
++        impl Drop for Owned { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
++        let root = Owned(std::env::temp_dir().canonicalize()?.join(format!("xmz-topup-recovery-{}", uuid::Uuid::new_v4())));
++        std::fs::DirBuilder::new().mode(0o700).create(&root.0)?;
++        let addresses = addresses();
++        let genesis = "a".repeat(64);
++        let request = TopUpRequest { buyer_wallet: addresses[0].clone(), destination: addresses[1].clone(),
++            lock_txid: "b".repeat(64), reserve: XmzAmount::from_atoms(10),
++            maximum_fee: XmzAmount::from_atoms(2), account: 0, priority: 1 };
++        assert!(TopUpRecovery::load(&root.0, &genesis, request.buyer_wallet.clone(), &request.lock_txid).is_err(),
++            "must not reconcile before any journal exists");
++        let journal = TopUpJournal::reserve(&root.0, &genesis, &request)?;
++        assert!(TopUpRecovery::load(&root.0, &genesis, request.buyer_wallet.clone(), &request.lock_txid).is_err(),
++            "must not reconcile before a prepared record exists");
++        drop(journal);
++        Ok(())
++    }
++}

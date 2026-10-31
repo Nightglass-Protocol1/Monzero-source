@@ -1,0 +1,377 @@
+diff --git a/swap-machine/src/bch_quote.rs b/swap-machine/src/bch_quote.rs
+--- a/swap-machine/src/bch_quote.rs
++++ b/swap-machine/src/bch_quote.rs
+@@ -19,8 +19,11 @@
+ /// Local operator configuration, never taken from a peer's quote. Genesis alone
+ /// cannot distinguish BCH from Bitcoin; the BCH node must also be authenticated
+ /// and its covenant activation checked by the future chain adapter.
++#[derive(Clone, serde::Serialize, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
+ pub struct Policy {
+     pub bch_network: String, pub bch_genesis: String,
++    #[serde(with="policy_xmz_network")]
+     pub xmz_network: XmzNetwork, pub xmz_genesis: String,
+     pub bch_confirmations: u32, pub xmz_confirmations: u32,
+     pub cancel_blocks: u16, pub punish_blocks: u16,
+@@ -179,3 +182,17 @@
+ 
+ #[cfg(test)]
+ pub(crate) mod tests;
++
++mod policy_xmz_network {
++    use super::XmzNetwork;
++    use serde::{Deserialize,Serializer,Deserializer};
++    pub fn serialize<S: Serializer>(value: &XmzNetwork,s: S)->Result<S::Ok,S::Error> {
++        s.serialize_str(match value { XmzNetwork::Mainnet=>"xmz-mainnet",XmzNetwork::Testnet=>"xmz-testnet",XmzNetwork::Stagenet=>"xmz-stagenet" })
++    }
++    pub fn deserialize<'de,D: Deserializer<'de>>(d: D)->Result<XmzNetwork,D::Error> {
++        match String::deserialize(d)?.as_str() {
++            "xmz-mainnet"=>Ok(XmzNetwork::Mainnet),"xmz-testnet"=>Ok(XmzNetwork::Testnet),"xmz-stagenet"=>Ok(XmzNetwork::Stagenet),
++            _=>Err(serde::de::Error::custom("invalid native deployment")),
++        }
++    }
++}
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -0,0 +1,339 @@
++//! Private app boundary for BCH negotiation admission. No wallet or chain RPC.
++#[cfg(target_os="linux")]
++mod linux {
++    use anyhow::{Context, Result, ensure};
++    use serde::Deserialize;
++    use std::{fs::{File, OpenOptions}, io::{Read, Write},
++        os::unix::fs::{MetadataExt, OpenOptionsExt}, path::{Path, PathBuf}};
++    use swap_machine::{bch_quote::{Policy, VerifiedBchQuote},
++        bch_key_recovery::authenticated::{Role, native_wallet::agreement::execution::{
++            AdmittedExecution, NegotiationPins, approval::review_admission}}};
++
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields, rename_all="camelCase")]
++    struct Config {
++        schema: String, helper: PathBuf, helper_digest: String,
++        quote_file: PathBuf, quote_commitment: String, admitted_at: u64,
++        trade_id: uuid::Uuid, identity_pins: [[u8;32];2], policy: Policy, role: Role,
++        metadata_directory: PathBuf, snapshot_directory: PathBuf,
++        negotiation_pins: NegotiationPins,
++    }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields, rename_all="camelCase")]
++    struct Request {
++        schema: String, request_id: uuid::Uuid,
++        #[serde(default)] commitment: Option<String>,
++    }
++    #[derive(Clone, Copy)]
++    enum Mode { Review, Submit }
++    impl Mode {
++        fn parse(value: &str) -> Result<Self> {
++            match value {
++                "--admission-review-stdio-v1" => Ok(Self::Review),
++                "--admission-submit-stdio-v1" => Ok(Self::Submit),
++                _ => anyhow::bail!("unsupported BCH admission mode"),
++            }
++        }
++        fn action(self) -> &'static str {
++            match self { Self::Review => "review", Self::Submit => "submit" }
++        }
++    }
++    fn parse_digest(value: &str) -> Result<[u8;32]> {
++        ensure!(value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
++            "invalid BCH admission digest");
++        let mut bytes = [0;32];
++        for (index,byte) in bytes.iter_mut().enumerate() {
++            *byte = u8::from_str_radix(&value[index*2..index*2+2],16)?;
++        }
++        Ok(bytes)
++    }
++    fn request(bytes: &[u8], mode: Mode) -> Result<Request> {
++        ensure!(!bytes.is_empty() && bytes.len() <= 512,"invalid BCH admission request size");
++        let request: Request = serde_json::from_slice(bytes)?;
++        ensure!(!request.request_id.is_nil()
++            && request.schema == format!("monzero-bch-admission-{}-request-v1",mode.action()),
++            "invalid BCH admission request context");
++        match mode {
++            Mode::Review => ensure!(request.commitment.is_none(),"unexpected admission approval"),
++            Mode::Submit => { parse_digest(request.commitment.as_deref().context("missing admission approval")?)?; }
++        }
++        Ok(request)
++    }
++    // Keep both leases until the operation completes. Never follow a symlink,
++    // read an unbounded special file or treat producer-owned credentials as config.
++    fn private_bytes(path: &Path) -> Result<(File,zeroize::Zeroizing<Vec<u8>>)> {
++        ensure!(path.is_absolute() && path.canonicalize()? == path,"invalid private admission path");
++        let file = OpenOptions::new().read(true)
++            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)?;
++        let before = file.metadata()?;
++        // SAFETY: geteuid takes no pointers and has no memory preconditions.
++        let uid = unsafe {libc::geteuid()};
++        ensure!(before.is_file() && before.uid() == uid && before.nlink() == 1
++            && before.mode() & 0o7777 == 0o600 && before.len() > 0 && before.len() <= 16384,
++            "unsafe private admission file");
++        file.try_lock()?;
++        let mut bytes = zeroize::Zeroizing::new(Vec::new());
++        (&file).take(16385).read_to_end(&mut bytes)?;
++        let after = file.metadata()?;
++        let named = std::fs::symlink_metadata(path)?;
++        ensure!(named.is_file() && (named.dev(),named.ino()) == (before.dev(),before.ino())
++            && bytes.len() as u64 == before.len() && before.len() == after.len()
++            && (before.mtime(),before.mtime_nsec(),before.ctime(),before.ctime_nsec())
++                == (after.mtime(),after.mtime_nsec(),after.ctime(),after.ctime_nsec()),
++            "private admission file changed");
++        Ok((file,bytes))
++    }
++    fn load(path: &Path) -> Result<(File,Config)> {
++        let (lease,bytes) = private_bytes(path)?;
++        let config: Config = serde_json::from_slice(&bytes)?;
++        ensure!(config.schema == "monzero-private-bch-admission-v1" && !config.trade_id.is_nil(),
++            "invalid BCH admission configuration");
++        ensure!(config.policy.bch_network == "bch-regtest",
++            "BCH admission helper is limited to isolated-chain development");
++        ensure!(config.helper.is_absolute() && config.helper.canonicalize()? == std::env::current_exe()?.canonicalize()?,
++            "wrong configured BCH helper");
++        // The launcher must independently check its trusted executable's digest;
++        // a self-declared value cannot establish provenance inside the process.
++        parse_digest(&config.helper_digest)?;
++        parse_digest(&config.quote_commitment)?;
++        Ok((lease,config))
++    }
++    fn handle(config: &Config, request: &Request, mode: Mode, now: u64) -> Result<serde_json::Value> {
++        let (_quote_lease,bytes) = private_bytes(&config.quote_file)?;
++        let quote = VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()? == config.trade_id,
++            "BCH quote belongs to another trade");
++        let review = review_admission(&quote,&config.policy,config.role,&config.negotiation_pins,now)?;
++        let commitment: String = review.commitment.iter().map(|b| format!("{b:02x}")).collect();
++        if matches!(mode,Mode::Submit) {
++            let approved = parse_digest(request.commitment.as_deref().context("missing admission approval")?)?;
++            let _execution = AdmittedExecution::admit_reviewed(&config.metadata_directory,
++                &config.snapshot_directory,&quote,&config.policy,config.role,&approved,
++                config.negotiation_pins.clone(),now)?;
++        }
++        Ok(serde_json::json!({
++            "schema":format!("monzero-bch-admission-{}-response-v1",mode.action()),
++            "requestId":request.request_id,"tradeId":config.trade_id,
++            "admitted":matches!(mode,Mode::Submit),"executable":false,
++            "review":{"details":review.details,"commitment":commitment}}))
++    }
++    pub fn run() -> Result<()> {
++        let args: Vec<_> = std::env::args_os().collect();
++        ensure!(args.len() == 3,"expected mode and private configuration path");
++        let mode = Mode::parse(args[1].to_str().context("invalid admission mode")?)?;
++        let mut bytes = Vec::new();
++        std::io::stdin().take(513).read_to_end(&mut bytes)?;
++        let request = request(&bytes,mode)?;
++        let (_lease,config) = load(Path::new(&args[2]))?;
++        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        let output = serde_json::to_vec(&handle(&config,&request,mode,now)?)?;
++        ensure!(output.len() <= 16384,"oversized BCH admission response");
++        std::io::stdout().write_all(&output)?;
++        Ok(())
++    }
++
++    #[cfg(test)]
++    mod tests {
++use super::*;
++use std::collections::BTreeMap;
++use swap_core::xmz_address::XmzNetwork;
++use bitcoin::secp256k1::PublicKey;
++use ed25519_dalek::{Signer, SigningKey};
++use bitcoin::secp256k1::{Secp256k1, SecretKey};
++fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
++pub(crate) fn fixture() -> (Policy, BTreeMap<String,String>) {
++    let policy = Policy { bch_network:"bch-regtest".into(), bch_genesis:"b".repeat(64),
++        xmz_network:XmzNetwork::Mainnet, xmz_genesis:"a".repeat(64),
++        bch_confirmations:2, xmz_confirmations:10, cancel_blocks:20, punish_blocks:30,
++        maximum_bch_atoms:1_000_000, maximum_xmz_atoms:2_000_000,
++        maximum_bch_funding_fee:5000, maximum_xmz_fee:1000,
++        minimum_covenant_fee:500, maximum_covenant_fee:3000, minimum_output_atoms:546 };
++    let identity = |tag| hex(&SigningKey::from_bytes(&[tag;32]).verifying_key().to_bytes());
++    let key = |tag| hex(&PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[tag;32]).unwrap()).serialize());
++    let xmz = include_str!("../../../swap-core/src/xmz_address_vectors.txt").lines().next().unwrap();
++    let t = serde_json::json!({"schema":"monzero-native-bch-xmz-quote-v1",
++        "quoteId":"11111111-1111-4111-8111-111111111111", "swapId":"22222222-2222-4222-8222-222222222222",
++        "bchFunder":identity(1), "xmzFunder":identity(2), "bchNetwork":policy.bch_network,
++        "bchGenesis":policy.bch_genesis, "xmzNetwork":"xmz-mainnet", "xmzGenesis":policy.xmz_genesis,
++        "bchAtoms":"100000", "xmzAtoms":"101000", "xmzPayoutAtoms":"100000",
++        "bchPayoutScript":format!("76a914{}88ac","03".repeat(20)),
++        "bchRefundScript":format!("76a914{}88ac","04".repeat(20)), "xmzPayout":xmz, "xmzRefund":xmz,
++        "bchSigningKey":key(3), "xmzSigningKey":key(4), "bchFundingFeeMaxAtoms":"5000",
++        "bchLockFeeAtoms":"1000", "bchRecoveryFeeAtoms":"2000", "xmzFundingFeeMaxAtoms":"1000",
++        "xmzClaimFeeMaxAtoms":"1000", "xmzRefundFeeMaxAtoms":"1000", "bchConfirmations":"2",
++        "xmzConfirmations":"10", "cancelBlocks":"20", "punishBlocks":"30",
++        "bchMinimumOutputAtoms":"546", "expiresAt":"2000", "appFeeXmzAtoms":"0"});
++    (policy, serde_json::from_value(t).unwrap())
++}
++pub(crate) fn signed(t: &BTreeMap<String,String>, p: &Policy, now: u64) -> Result<VerifiedBchQuote> {
++    let payload = serde_json::to_vec(t)?;
++    let b = SigningKey::from_bytes(&[1;32]); let x = SigningKey::from_bytes(&[2;32]);
++    let message = |role| {
++        let d = format!("monzero-native-bch-xmz-quote-v1-{role}");
++        let mut m = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:",d.len(),d,payload.len()).into_bytes();
++        m.extend_from_slice(&payload); m
++    };
++    VerifiedBchQuote::verify(&payload, now, p, &b.verifying_key().to_bytes(), &x.verifying_key().to_bytes(),
++        &b.sign(&message("bch-funder")).to_bytes(), &x.sign(&message("xmz-funder")).to_bytes())
++}
++
++    use std::os::unix::fs::PermissionsExt;
++    struct Directory(PathBuf);
++    impl Directory {
++        fn new() -> Result<Self> {
++            let path = std::env::temp_dir().join(format!("bch-admission-helper-{}",uuid::Uuid::new_v4()));
++            std::fs::create_dir(&path)?;
++            std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o700))?;
++            Ok(Self(path))
++        }
++        fn file(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
++            let path = self.0.join(name);
++            let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
++            file.write_all(bytes)?; file.sync_all()?;
++            Ok(path)
++        }
++    }
++    impl Drop for Directory {
++        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
++    }
++    fn config(directory: &Directory) -> Result<PathBuf> {
++        let (policy,terms) = fixture(); let quote = signed(&terms,&policy,1000)?;
++        let quote_file = directory.file("quote.json",&quote.record()?)?;
++        directory.file("config.json",&serde_json::to_vec(&serde_json::json!({
++            "schema":"monzero-private-bch-admission-v1",
++            "helper":std::env::current_exe()?.canonicalize()?,"helperDigest":"aa".repeat(32),
++            "quoteFile":quote_file,"quoteCommitment":hex(quote.commitment()),"admittedAt":1000,
++            "tradeId":terms["swapId"],"identityPins":[
++                SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++                SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++            "policy":policy,"role":"native-funder",
++            "metadataDirectory":directory.0.join("absent-metadata"),
++            "snapshotDirectory":directory.0.join("absent-snapshots"),
++            "negotiationPins":{"initial":([1u8;32]),"selection":([2u8;32]),"outgoing":([3u8;32]),
++                "received":([4u8;32]),"agreement":([5u8;32])}}))?)
++    }
++    fn review_request() -> Result<Request> {
++        request(&serde_json::to_vec(&serde_json::json!({
++            "schema":"monzero-bch-admission-review-request-v1","requestId":uuid::Uuid::new_v4()}))?,Mode::Review)
++    }
++    #[test]
++    fn request_boundary_rejects_ambiguous_or_wrong_operations() -> Result<()> {
++        let base = serde_json::json!({"schema":"monzero-bch-admission-review-request-v1",
++            "requestId":uuid::Uuid::new_v4()});
++        assert!(request(&serde_json::to_vec(&base)?,Mode::Review).is_ok());
++        assert!(request(&serde_json::to_vec(&base)?,Mode::Submit).is_err());
++        for (key,value) in [("requestId",serde_json::json!(uuid::Uuid::nil())),
++            ("commitment",serde_json::json!("ab".repeat(32))),
++            ("tradeId",serde_json::json!(uuid::Uuid::new_v4())),
++            ("schema",serde_json::json!("monzero-bch-admission-submit-request-v1"))] {
++            let mut changed = base.clone(); changed[key] = value;
++            assert!(request(&serde_json::to_vec(&changed)?,Mode::Review).is_err());
++        }
++        let duplicate = format!("{{\"schema\":\"x\",\"schema\":\"monzero-bch-admission-review-request-v1\",\"requestId\":\"{}\"}}",uuid::Uuid::new_v4());
++        assert!(request(duplicate.as_bytes(),Mode::Review).is_err());
++        assert!(request(&[b' ';513],Mode::Review).is_err());
++        assert!(request(b"",Mode::Review).is_err());
++        let mut submit = base;
++        submit["schema"] = serde_json::json!("monzero-bch-admission-submit-request-v1");
++        for digest in ["ab".repeat(32),"AB".repeat(32),"a".repeat(63),"g".repeat(64)] {
++            submit["commitment"] = serde_json::json!(digest);
++            assert_eq!(request(&serde_json::to_vec(&submit)?,Mode::Submit).is_ok(),digest == "ab".repeat(32));
++        }
++        assert!(Mode::parse("--funding-submit-stdio-v1").is_err());
++        Ok(())
++    }
++    #[test]
++    fn private_files_enforce_permissions_identity_size_and_lease() -> Result<()> {
++        let directory = Directory::new()?;
++        let path = directory.file("private",b"{}")?;
++        let (lease,_) = private_bytes(&path)?;
++        assert!(private_bytes(&path).is_err()); drop(lease);
++        for mode in [0o644,0o400,0o660] {
++            std::fs::set_permissions(&path,std::fs::Permissions::from_mode(mode))?;
++            assert!(private_bytes(&path).is_err());
++        }
++        std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600))?;
++        let alias = directory.0.join("alias"); std::os::unix::fs::symlink(&path,&alias)?;
++        assert!(private_bytes(&alias).is_err()); std::fs::remove_file(&alias)?;
++        std::fs::hard_link(&path,&alias)?;
++        assert!(private_bytes(&path).is_err()); std::fs::remove_file(&alias)?;
++        assert!(private_bytes(&directory.file("empty",b"")?).is_err());
++        assert!(private_bytes(&directory.file("oversized",&vec![b' ';16385])?).is_err());
++        assert!(private_bytes(&directory.0).is_err());
++        assert!(private_bytes(&path)?.1.as_slice() == b"{}");
++        Ok(())
++    }
++    #[test]
++    fn verified_quote_review_and_submission_consent_reach_storage_only_when_approved() -> Result<()> {
++        let directory = Directory::new()?;
++        let path = config(&directory)?; let (_lease,config) = load(&path)?;
++        let request = review_request()?;
++        let result = handle(&config,&request,Mode::Review,1000)?;
++        assert_eq!(result["requestId"],request.request_id.to_string());
++        assert_eq!(result["tradeId"],config.trade_id.to_string());
++        assert_eq!(result["admitted"],false); assert_eq!(result["executable"],false);
++        assert_eq!(result["review"]["details"]["terms"]["bchAtoms"],"100000");
++        assert!(!config.metadata_directory.exists()); assert!(!config.snapshot_directory.exists());
++        assert!(handle(&config,&request,Mode::Review,999).is_err());
++        assert!(handle(&config,&request,Mode::Review,2000).is_err());
++        let mut submit = Request {schema:"monzero-bch-admission-submit-request-v1".into(),
++            request_id:uuid::Uuid::new_v4(),commitment:Some("00".repeat(32))};
++        let error = handle(&config,&submit,Mode::Submit,1000).unwrap_err();
++        assert!(error.to_string().contains("approval changed"));
++        submit.commitment = Some(result["review"]["commitment"].as_str().context("missing review digest")?.into());
++        let error = handle(&config,&submit,Mode::Submit,1000).unwrap_err();
++        assert_eq!(error.downcast_ref::<std::io::Error>().context("expected missing storage")?.kind(),
++            std::io::ErrorKind::NotFound);
++        assert!(!config.metadata_directory.exists());
++        Ok(())
++    }
++    #[test]
++    fn independent_admission_context_rejects_retained_quote_tampering() -> Result<()> {
++        let directory = Directory::new()?; let path = config(&directory)?;
++        let request = review_request()?;
++        for field in 0..4 {
++            let (_lease,mut config) = load(&path)?;
++            match field {
++                0 => config.trade_id = uuid::Uuid::new_v4(),
++                1 => config.admitted_at += 1,
++                2 => config.quote_commitment = "00".repeat(32),
++                _ => config.identity_pins.swap(0,1),
++            }
++            assert!(handle(&config,&request,Mode::Review,1000).is_err());
++        }
++        let (_lease,config) = load(&path)?;
++        let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&config.quote_file)?)?;
++        record["terms"]["bchAtoms"] = serde_json::json!("100001");
++        std::fs::write(&config.quote_file,serde_json::to_vec(&record)?)?;
++        assert!(handle(&config,&request,Mode::Review,1000).is_err());
++        Ok(())
++    }
++    #[test]
++    fn configuration_rejects_foreign_helpers_networks_and_unknown_policy() -> Result<()> {
++        let directory = Directory::new()?; let path = config(&directory)?;
++        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
++        for change in 0..6 {
++            let mut value = original.clone();
++            match change {
++                0 => value["helper"] = serde_json::json!("/bin/false"),
++                1 => value["policy"]["bch_network"] = serde_json::json!("bch-mainnet"),
++                2 => value["policy"]["xmz_network"] = serde_json::json!("mainnet"),
++                3 => value["policy"]["unknown"] = serde_json::json!(1),
++                4 => value["helperDigest"] = serde_json::json!("AA".repeat(32)),
++                _ => value["tradeId"] = serde_json::json!(uuid::Uuid::nil()),
++            }
++            std::fs::write(&path,serde_json::to_vec(&value)?)?;
++            assert!(load(&path).is_err());
++        }
++        Ok(())
++    }
++
++    }
++}
++fn main() {
++    #[cfg(target_os="linux")]
++    if linux::run().is_ok() { return; }
++    eprintln!("BCH admission request failed; inspect retained state before retrying");
++    std::process::exit(1);
++}

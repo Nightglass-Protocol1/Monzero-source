@@ -1404,6 +1404,11 @@ namespace cryptonote
   {
     RPC_TRACKER(start_mining);
     CHECK_CORE_READY();
+#ifdef MONZERO_NO_MINING
+    res.status = "Mining is disabled in this build";
+    LOG_PRINT_L0(res.status);
+    return true;
+#endif
     cryptonote::address_parse_info info;
     if(!get_account_address_from_str(info, nettype(), req.miner_address))
     {

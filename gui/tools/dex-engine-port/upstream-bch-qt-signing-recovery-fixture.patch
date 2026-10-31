@@ -1,0 +1,33 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
+@@ -60,23 +60,23 @@
+         "preparationConfigFile":path,"recoveredTransactionFile":candidate}))?)?;
+     // Neither review nor import may open the unavailable RPC descriptor.
+     std::fs::remove_file(rpc_path)?;
+-    let recovered=invoke(helper,&recovery_path,"signing-recovery-review",None,true)?;
++    let recovered=invoke(program,&recovery_path,"signing-recovery-review",None,true)?;
+     assert_eq!(recovered["review"]["details"]["action"],"retain-recovered-signature-only");
+     assert_eq!(recovered["review"]["details"]["fundingTxid"],expected["txid"]);
+     assert!(recovered["signedFunding"].is_null());
+     assert_eq!(recovered["signingIntent"],uncertain["signingIntent"]);
+     let recovery_approval=recovered["review"]["commitment"].as_str().context("missing recovery review")?;
+-    invoke(helper,&recovery_path,"signing-recovery-submit",None,false)?;
+-    invoke(helper,&recovery_path,"signing-recovery-submit",Some(approved),false)?;
++    invoke(program,&recovery_path,"signing-recovery-submit",None,false)?;
++    invoke(program,&recovery_path,"signing-recovery-submit",Some(approved),false)?;
+     let mut altered=raw.clone();let last=altered.len()-1;altered[last]^=1;save(&candidate,&altered)?;
+-    invoke(helper,&recovery_path,"signing-recovery-submit",Some(recovery_approval),false)?;
++    invoke(program,&recovery_path,"signing-recovery-submit",Some(recovery_approval),false)?;
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     save(&candidate,&raw)?;
+-    let retained=invoke(helper,&recovery_path,"signing-recovery-submit",Some(recovery_approval),true)?;
++    let retained=invoke(program,&recovery_path,"signing-recovery-submit",Some(recovery_approval),true)?;
+     assert_eq!(retained["signedFunding"],expected);
+     assert_eq!(retained["review"],recovered["review"]);
+     let retained_records=contents(&metadata.0)?;
+-    invoke(helper,&recovery_path,"signing-recovery-submit",Some(recovery_approval),true)?;
++    invoke(program,&recovery_path,"signing-recovery-submit",Some(recovery_approval),true)?;
+     assert_eq!(contents(&metadata.0)?,retained_records);
+     save(rpc_path,&serde_json::to_vec(descriptor)?)?;
+     let restored=invoke(program,path,"signing-status",None,true)?;

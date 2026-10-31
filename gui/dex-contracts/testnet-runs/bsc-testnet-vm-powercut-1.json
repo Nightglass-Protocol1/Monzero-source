@@ -1,0 +1,46 @@
+{
+  "run": "two machines: owner on the host, claimer on the mz-dexlab VM (Debian 13), accounts #4/#5; key exchange over libp2p through an SSH tunnel (host firewall blocks VM inbound)",
+  "owner": {
+    "bnbTxs": {
+      "new_swap": [
+        "0x0e3523fd96437f7cc9697ed70871d65a656c52784470b1d234741c7346c2cfd7"
+      ],
+      "set_ready": [
+        "0x94dbedb4efd7d088365f4c6da8d9e30b5c4afe9602c82b01069b3764fce68c8f"
+      ]
+    },
+    "final": "Done(Swapped)",
+    "role": "owner",
+    "sharedXmzAddress": "KhLBkLmhEJdVgtcFvb7TRJfLgdhLPnTJWN3U45fApsEdZFNZU3pJm4bfWSBARxDFUG1BuzsEbzj4AAAvTKvFVBe1Uxzapzk",
+    "tradeId": "0xf1811caaf46327af28c97dfc5610d8b14cb0602a240c6cf82e6d3485bf201f1d"
+  },
+  "claimer": {
+    "final": "Done(Swapped)",
+    "bnbTxs": {
+      "claim": [
+        "0x9aed85067331d09e5523e6bfa7144d6599afcd06e2373328bb9c26c823b74935"
+      ]
+    },
+    "xmzLock": "b55b4ea4722a819e (prefix)"
+  },
+  "ownerXmzSweep": [
+    "de90f049ca92aa527cad7863fbb1cbfabac5ef3f5d9ace9c7b2e1d7e7d73151a"
+  ],
+  "powerCuts": [
+    {
+      "at": "18:42:16 UTC",
+      "when": "claimer had just sent its XMZ lock (VBoxManage controlvm poweroff)",
+      "after": "journal (XmzLockSent, approval) and XMZ record (lock tx) intact; plain log lost its last line. The shared view wallet file was left empty and could not be reopened or regenerated: engine fixed (243d7a54b) to rebuild it from the trade keys under the next name; claimer then resumed."
+    },
+    {
+      "at": "~19:10 UTC",
+      "when": "claimer had just sent its claim",
+      "after": "journal (ClaimSent, one retained claim) intact; claim already on chain; claimer resumed and finished Done(Swapped)."
+    }
+  ],
+  "verified": {
+    "ownerXmzWallet": "19.9903168 tXMZ unlocked (XMZ has 11 decimals)",
+    "claimerBnb": "#5 0.02 -> 0.039995587 tBNB (0.02 less claim gas)",
+    "oncePerTransaction": true
+  }
+}

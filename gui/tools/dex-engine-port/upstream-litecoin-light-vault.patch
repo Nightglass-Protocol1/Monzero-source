@@ -1,0 +1,211 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10898,6 +10898,7 @@
+  "bitcoin 0.32.8",
+  "bitcoin-harness",
+  "bitcoin-wallet",
++ "chacha20poly1305",
+  "curve25519-dalek-ng",
+  "digest_auth",
+  "ecdsa_fun",
+diff --git a/swap-machine/Cargo.toml b/swap-machine/Cargo.toml
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -4,6 +4,7 @@
+ edition = "2024"
+ 
+ [dependencies]
++chacha20poly1305 = "=0.10.1"
+ scrypt = { version = "=0.11.0", default-features = false }
+ tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
+ rustls-native-certs = "=0.8.3"
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -131,3 +131,6 @@
+ pub mod transaction;
+ 
+ pub mod accounting;
++
++#[cfg(target_os="linux")]
++pub mod vault;
+diff --git a/swap-machine/src/litecoin_light/vault.rs b/swap-machine/src/litecoin_light/vault.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault.rs
+@@ -0,0 +1,93 @@
++//! Password-encrypted fixed-size Litecoin seed storage. No mnemonic/backup UI,
++//! password recovery, signing, or secure-memory guarantee. Dependency internals
++//! may copy secrets; owned seed, derived key and plaintext buffers are erased.
++use anyhow::{Context,Result,ensure};
++use bitcoin::{bip32::Xpriv,NetworkKind};
++use chacha20poly1305::{XChaCha20Poly1305,XNonce,aead::{AeadInPlace,KeyInit}};
++use rand::{RngCore,rngs::OsRng};
++use std::path::Path;
++use swap_core::litecoin_address::LtcNetwork;
++use uuid::Uuid;
++use zeroize::Zeroizing;
++use super::account::PublicAccount;
++use crate::litecoin_rpc::reservation::Journal;
++const NAME:&str="litecoin-seed.vault";
++const HEADER:usize=128;
++const LENGTH:usize=HEADER+32+16;
++const MAGIC:&[u8;8]=b"MZLTCV01";
++
++/// Deliberately neither Clone, Debug nor serializable.
++pub struct SecretSeed(Zeroizing<[u8;32]>);
++pub struct SeedVault {journal:Journal,network:LtcNetwork,wallet:Uuid,bytes:Vec<u8>}
++impl SecretSeed {
++    pub fn generate()->Result<Self> {
++        let mut bytes=Zeroizing::new([0u8;32]);OsRng.try_fill_bytes(&mut *bytes).context("seed entropy unavailable")?;
++        Ok(Self(bytes))
++    }
++    /// Restore caller-owned entropy. The caller is responsible for its source
++    /// and for erasing any other copies; never use public fixture seeds.
++    pub fn from_bytes(bytes:Zeroizing<[u8;32]>)->Self {Self(bytes)}
++    pub fn public_account(&self,network:LtcNetwork,index:u32)->Result<PublicAccount> {
++        let mut root=Xpriv::new_master(if network==LtcNetwork::Mainnet {NetworkKind::Main}else{NetworkKind::Test},&*self.0)?;
++        let account=PublicAccount::from_master(&root,network,index);
++        root.private_key.non_secure_erase();root.chain_code=[0u8;32].into();account
++    }
++}
++impl SeedVault {
++    /// Explicit creation; never replaces another vault. Retain caller seed for
++    /// the required backup ceremony, which is not implemented by this API.
++    pub fn create(directory:&Path,network:LtcNetwork,wallet:Uuid,password:&[u8],seed:&SecretSeed)->Result<Self> {
++        let journal=Journal::open(directory)?;
++        let mut salt=[0u8;16];let mut nonce=[0u8;24];
++        OsRng.try_fill_bytes(&mut salt).context("vault entropy unavailable")?;
++        OsRng.try_fill_bytes(&mut nonce).context("vault entropy unavailable")?;
++        let bytes=seal(seed,password,network,wallet,salt,nonce)?;
++        journal.retain(NAME,&bytes)?;
++        Ok(Self {journal,network,wallet,bytes})
++    }
++    /// Missing/invalid state is an error. Recover a potentially uncertain
++    /// publication by syncing the existing record before it can be unlocked.
++    pub fn open(directory:&Path,network:LtcNetwork,wallet:Uuid)->Result<Self> {
++        let journal=Journal::open(directory)?;let bytes=journal.read(NAME)?;
++        check(&bytes,network,wallet)?;journal.retain(NAME,&bytes)?;
++        Ok(Self {journal,network,wallet,bytes})
++    }
++    pub fn unlock(&self,password:&[u8])->Result<SecretSeed> {
++        ensure!(self.journal.read(NAME)?==self.bytes,"Litecoin seed vault changed outside its lease");
++        unlock(&self.bytes,password,self.network,self.wallet)
++    }
++}
++fn key(password:&[u8],salt:&[u8])->Result<Zeroizing<[u8;32]>> {
++    ensure!(!password.is_empty() && password.len()<=1024,"invalid vault password length");
++    // Fixed versioned cost: 128 MiB (N=2^17, r=8, p=1). Never accept KDF
++    // parameters from a file that could trigger unbounded work or a downgrade.
++    let params=scrypt::Params::new(17,8,1,32).map_err(|_|anyhow::anyhow!("invalid vault KDF"))?;
++    let mut result=Zeroizing::new([0u8;32]);
++    scrypt::scrypt(password,salt,&params,&mut *result).map_err(|_|anyhow::anyhow!("vault KDF failed"))?;Ok(result)
++}
++fn check(bytes:&[u8],network:LtcNetwork,wallet:Uuid)->Result<()> {
++    ensure!(!wallet.is_nil() && bytes.len()==LENGTH && &bytes[..8]==MAGIC
++        && &bytes[8..72]==network.genesis().as_bytes() && &bytes[72..88]==wallet.as_bytes(),
++        "invalid Litecoin seed vault context");Ok(())
++}
++fn seal(seed:&SecretSeed,password:&[u8],network:LtcNetwork,wallet:Uuid,salt:[u8;16],nonce:[u8;24])->Result<Vec<u8>> {
++    ensure!(!wallet.is_nil(),"missing Litecoin wallet identity");
++    let mut header=Vec::with_capacity(LENGTH);header.extend_from_slice(MAGIC);
++    header.extend_from_slice(network.genesis().as_bytes());header.extend_from_slice(wallet.as_bytes());
++    header.extend_from_slice(&salt);header.extend_from_slice(&nonce);ensure!(header.len()==HEADER,"invalid vault header");
++    let key=key(password,&salt)?;let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid vault key"))?;
++    let mut payload=Zeroizing::new(Vec::with_capacity(48));payload.extend_from_slice(&*seed.0);
++    cipher.encrypt_in_place(XNonce::from_slice(&nonce),&header,&mut *payload).map_err(|_|anyhow::anyhow!("vault encryption failed"))?;
++    header.extend_from_slice(&payload);Ok(header)
++}
++fn unlock(bytes:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<SecretSeed> {
++    check(bytes,network,wallet)?;let key=key(password,&bytes[88..104])?;
++    let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid vault key"))?;
++    let mut payload=Zeroizing::new(bytes[HEADER..].to_vec());
++    cipher.decrypt_in_place(XNonce::from_slice(&bytes[104..128]),&bytes[..HEADER],&mut *payload)
++        .map_err(|_|anyhow::anyhow!("vault authentication failed"))?;
++    ensure!(payload.len()==32,"invalid vault seed length");
++    let mut seed=Zeroizing::new([0u8;32]);seed.copy_from_slice(&payload);Ok(SecretSeed(seed))
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/tests.rs b/swap-machine/src/litecoin_light/vault/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/tests.rs
+@@ -0,0 +1,64 @@
++use super::*;
++use std::{fs,os::unix::fs::PermissionsExt,path::PathBuf};
++fn hex(text:&str)->Vec<u8> {(0..text.len()).step_by(2).map(|i|u8::from_str_radix(&text[i..i+2],16).unwrap()).collect()}
++fn fixture()->(SecretSeed,Vec<u8>,Vec<u8>,Uuid) {
++    let value:serde_json::Value=serde_json::from_str(include_str!("fixture.json")).unwrap();
++    let mut seed=Zeroizing::new([0u8;32]);seed.copy_from_slice(&hex(value["seed"].as_str().unwrap()));
++    (SecretSeed::from_bytes(seed),hex(value["vault"].as_str().unwrap()),value["password"].as_str().unwrap().as_bytes().to_vec(),value["wallet"].as_str().unwrap().parse().unwrap())
++}
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {
++    let path=std::env::temp_dir().join(format!("monzero-seed-vault-{}",Uuid::new_v4()));fs::create_dir(&path)?;
++    fs::set_permissions(&path,fs::Permissions::from_mode(0o700))?;Ok(Self(path.canonicalize()?))
++}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++#[test]
++fn vault_matches_independent_scrypt_libsodium_vector()->Result<()> {
++    let (seed,expected,password,wallet)=fixture();
++    let bytes=seal(&seed,&password,LtcNetwork::Regtest,wallet,std::array::from_fn(|i|i as u8),std::array::from_fn(|i|i as u8))?;
++    assert_eq!(bytes,expected);let restored=unlock(&expected,&password,LtcNetwork::Regtest,wallet)?;
++    assert_eq!(*restored.0,*seed.0);
++    assert_eq!(serde_json::to_vec(&restored.public_account(LtcNetwork::Regtest,0)?.descriptor())?,
++        serde_json::to_vec(&seed.public_account(LtcNetwork::Regtest,0)?.descriptor())?);
++    Ok(())
++}
++#[test]
++fn vault_rejects_wrong_password_context_and_tampering()->Result<()> {
++    let (_,bytes,password,wallet)=fixture();
++    assert!(unlock(&bytes,b"wrong password",LtcNetwork::Regtest,wallet).is_err());
++    for index in [0,8,72,88,104,128,175] {
++        let mut changed=bytes.clone();changed[index]^=1;
++        assert!(unlock(&changed,&password,LtcNetwork::Regtest,wallet).is_err());
++    }
++    assert!(unlock(&bytes,&password,LtcNetwork::Testnet,wallet).is_err());
++    assert!(unlock(&bytes,&password,LtcNetwork::Regtest,Uuid::new_v4()).is_err());
++    assert!(unlock(&bytes,&password,LtcNetwork::Regtest,Uuid::nil()).is_err());
++    for length in [0,8,127,128,175] {assert!(unlock(&bytes[..length],&password,LtcNetwork::Regtest,wallet).is_err());}
++    let mut appended=bytes;appended.push(0);assert!(unlock(&appended,&password,LtcNetwork::Regtest,wallet).is_err());Ok(())
++}
++#[test]
++fn vault_persists_ciphertext_reopens_and_never_overwrites()->Result<()> {
++    let dir=Directory::new()?;let (seed,_,password,wallet)=fixture();
++    assert!(SeedVault::open(&dir.0,LtcNetwork::Regtest,wallet).is_err());
++    let vault=SeedVault::create(&dir.0,LtcNetwork::Regtest,wallet,&password,&seed)?;
++    let bytes=fs::read(dir.0.join(NAME))?;assert_eq!(bytes.len(),LENGTH);
++    assert!(!bytes.windows(32).any(|part|part==&*seed.0));
++    assert!(SeedVault::open(&dir.0,LtcNetwork::Regtest,wallet).is_err());
++    assert_eq!(*vault.unlock(&password)?.0,*seed.0);drop(vault);
++    assert!(SeedVault::create(&dir.0,LtcNetwork::Regtest,wallet,&password,&seed).is_err());
++    assert_eq!(fs::read(dir.0.join(NAME))?,bytes);
++    let vault=SeedVault::open(&dir.0,LtcNetwork::Regtest,wallet)?;
++    assert_eq!(*vault.unlock(&password)?.0,*seed.0);
++    fs::write(dir.0.join(NAME),b"changed")?;assert!(vault.unlock(&password).is_err());drop(vault);
++    assert!(SeedVault::open(&dir.0,LtcNetwork::Regtest,wallet).is_err());Ok(())
++}
++#[test]
++fn vault_password_limits_and_randomized_encryption()->Result<()> {
++    let (seed,_,password,wallet)=fixture();
++    for invalid in [vec![],vec![1;1025]] {assert!(seal(&seed,&invalid,LtcNetwork::Regtest,wallet,[0;16],[0;24]).is_err());}
++    let a=Directory::new()?;let b=Directory::new()?;
++    let first=SeedVault::create(&a.0,LtcNetwork::Regtest,wallet,&password,&seed)?;
++    let second=SeedVault::create(&b.0,LtcNetwork::Regtest,wallet,&password,&seed)?;
++    assert_ne!(first.bytes,second.bytes);assert_eq!(*first.unlock(&password)?.0,*second.unlock(&password)?.0);
++    let generated=SecretSeed::generate()?;assert!(generated.public_account(LtcNetwork::Regtest,0).is_ok());Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/fixture.json b/swap-machine/src/litecoin_light/vault/fixture.json
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/fixture.json
+@@ -0,0 +1,7 @@
++{
++  "warning": "PUBLIC TEST DATA; never use for funds",
++  "wallet": "11111111-2222-4333-8444-555555555555",
++  "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
++  "password": "PUBLIC TEST PASSWORD ONLY",
++  "vault": "4d5a4c54435630313533303832376633386639336234336564313261663062336164323561323838646330326564373464366437383537383632646635316663353663343136663911111111222243338444555555555555000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f10111213141516170d97c11d46756bb5a2d4c0e4413a4135b9b28d5cc180f228d0ba31ae4e72794e66630c4be599f93cd4ff3dc8b7575a1e"
++}

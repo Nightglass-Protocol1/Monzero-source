@@ -50,6 +50,8 @@ Rectangle {
         anchors.topMargin: 0
         spacing: 0
 
+        MonzeroComponents.PublicWalletProfile { wallet: appWindow.currentWallet; Layout.bottomMargin: 24 }
+
         MonzeroComponents.SettingsListItem {
             iconText: FontAwesome.lock
             description: qsTr("Locks the wallet on demand.") + translationManager.emptyString

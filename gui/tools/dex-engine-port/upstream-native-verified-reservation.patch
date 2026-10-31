@@ -1,0 +1,65 @@
+diff --git a/swap-machine/src/native_quote_reservation.rs b/swap-machine/src/native_quote_reservation.rs
+index a12d0124a..db0b9a200 100644
+--- a/swap-machine/src/native_quote_reservation.rs
++++ b/swap-machine/src/native_quote_reservation.rs
+@@ -3,6 +3,23 @@ use anyhow::{Result, ensure};
+ use std::path::Path;
+ use uuid::Uuid;
+ 
++/// Read and validate commercial terms against trusted caller expectations.
++/// This is not a successful-approval acknowledgement, replay claim or funding
++/// permit. Recovery must not use this fresh-quote entry point.
++pub fn read_verified_quote(
++    directory: &Path, quote_id: Uuid, swap_id: Uuid, expected_commitment: &[u8; 32],
++    now: u64, btc_key: &[u8; 32], xmz_key: &[u8; 32],
++    btc_network: bitcoin::Network, xmz_network: swap_core::xmz_address::XmzNetwork,
++    policy: &crate::native_trade_quote::DeploymentPolicy,
++) -> Result<crate::native_trade_quote::VerifiedQuote> {
++    let bytes = read_record_bytes(directory, quote_id, swap_id)?;
++    let quote = crate::native_trade_quote::VerifiedQuote::from_gui_reservation(
++        &bytes, now, btc_key, xmz_key, btc_network, xmz_network)?;
++    ensure!(quote.commitment() == expected_commitment, "unexpected reservation commitment");
++    quote.check_deployment(policy, now)?;
++    Ok(quote)
++}
++
+ /// The directory and its ancestors must be exclusively controlled by the caller.
+ /// Returned bytes still require signature, deployment and freshness validation.
+ /// No record is repaired, consumed or removed; a previous failed GUI fsync can
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index a925f1ed9..09abf850f 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -269,6 +269,32 @@ mod tests {
+         assert!(VerifiedQuote::from_gui_reservation(bytes, 200, &b, &x, Network::Bitcoin, XmzNetwork::Mainnet).is_err());
+         assert!(VerifiedQuote::from_gui_reservation(bytes, 100, &x, &b, Network::Bitcoin, XmzNetwork::Mainnet).is_err());
+         assert!(VerifiedQuote::from_gui_reservation(bytes, 100, &b, &x, Network::Regtest, XmzNetwork::Mainnet).is_err());
++        // Explicit fixture policy, not policy derived from an untrusted record.
++        let policy = DeploymentPolicy {
++            btc_genesis: "c".repeat(64), xmz_genesis: "d".repeat(64),
++            btc_network: "btc-mainnet".into(), xmz_network: "xmz-fakechain".into(),
++            btc_confirmations: 3, xmz_confirmations: 10, cancel_blocks: 72, punish_blocks: 72,
++            maximum_btc_principal: 500000, maximum_xmz_principal: 200000000000,
++            maximum_btc_native_fee: 10000, maximum_xmz_native_fee: 1000000000,
++        };
++        let read = |commitment: &[u8; 32], now, btc_key: &[u8; 32], policy: &DeploymentPolicy| {
++            crate::native_quote_reservation::read_verified_quote(&directory.0,
++                quote.terms()["quoteId"].parse()?, quote.terms()["swapId"].parse()?,
++                commitment, now, btc_key, &x, Network::Bitcoin, XmzNetwork::Mainnet, policy)
++        };
++        assert_eq!(read(quote.commitment(), 100, &b, &policy)?.commitment(), quote.commitment());
++        assert!(read(&[0; 32], 100, &b, &policy).is_err());
++        assert!(read(quote.commitment(), 200, &b, &policy).is_err());
++        assert!(read(quote.commitment(), 100, &x, &policy).is_err());
++        let mut wrong_policy = policy.clone();
++        wrong_policy.maximum_btc_principal = 499999;
++        assert!(read(quote.commitment(), 100, &b, &wrong_policy).is_err());
++        wrong_policy = policy.clone();
++        wrong_policy.xmz_genesis = "c".repeat(64);
++        assert!(read(quote.commitment(), 100, &b, &wrong_policy).is_err());
++        // Validation neither consumes nor changes the GUI's record.
++        assert_eq!(read(quote.commitment(), 100, &b, &policy)?.commitment(), quote.commitment());
++        assert_eq!(std::fs::read(directory.0.join(format!("quote-{}.json", quote.terms()["quoteId"])))?, bytes);
+         Ok(())
+     }
+ 

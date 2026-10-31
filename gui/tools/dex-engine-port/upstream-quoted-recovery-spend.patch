@@ -1,0 +1,182 @@
+diff --git a/swap-machine/src/native_funding_rpc/spendable.rs b/swap-machine/src/native_funding_rpc/spendable.rs
+index 4c6f66182..3b9e4fc2c 100644
+--- a/swap-machine/src/native_funding_rpc/spendable.rs
++++ b/swap-machine/src/native_funding_rpc/spendable.rs
+@@ -45,6 +45,46 @@ pub struct SpendOutcome {
+     pub wallet_closed: bool,
+ }
+ 
++/// The trusted settlement driver selects this from observed protocol outcome,
++/// never from an unauthenticated peer or a GUI-controlled destination string.
++#[derive(Clone, Copy)]
++pub enum RecoveryDestination { Payout, Refund }
++
++impl SpendRequest {
++    /// Conservative partial-recovery bounds, not proof of complete proceeds or
++    /// settlement outcome. The caller still binds wallet/lock/keys to engine state.
++    pub fn check_recorded_recovery_limits(&self,
++        quote: &crate::native_trade_quote::RecordedQuote, role: RecoveryDestination,
++        expected_genesis: &str,
++    ) -> Result<()> {
++        let expected=match role {
++            RecoveryDestination::Payout=>&quote.destinations().xmz_payout,
++            RecoveryDestination::Refund=>&quote.destinations().xmz_refund,
++        };
++        ensure!(&self.destination==expected && self.wallet.network()==expected.network()
++            && quote.terms()["xmzGenesis"]==expected_genesis,"recovery destination or chain differs from quote");
++        let cap:u64=quote.terms()["xmzNativeFeeMaxAtoms"].parse()?;
++        let principal:u64=quote.terms()["xmzAtoms"].parse()?;
++        ensure!(self.maximum_fee.atoms()>0 && self.maximum_fee.atoms()<=cap,
++            "recovery fee budget exceeds quote");
++        ensure!(self.amount.atoms()>0
++            && u128::from(self.amount.atoms())+u128::from(self.maximum_fee.atoms())<=u128::from(principal),
++            "recovery payment and fee budget exceed quoted lock principal");
++        Ok(())
++    }
++}
++
++/// Enforce retained quote limits before restoration, journal writes or RPC work.
++/// This does not establish user authorization or prove the caller-selected role.
++pub async fn swap_wallet_spendable_for_quote(
++    daemon: u16, wallet_port: u16, username: String, password: String,
++    network: XmzNetwork, expected_genesis: &str, request: SpendRequest,
++    quote: &crate::native_trade_quote::RecordedQuote, role: RecoveryDestination,
++) -> Result<SpendOutcome> {
++    request.check_recorded_recovery_limits(quote,role,expected_genesis)?;
++    swap_wallet_spendable(daemon,wallet_port,username,password,network,expected_genesis,request).await
++}
++
+ /// Connects three independent RPC clients to the same wallet-rpc/daemon
+ /// service, one per primitive, matching this module's existing convention
+ /// that each primitive exclusively owns its own client rather than sharing
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index fa9cfae38..7a59f53be 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -100,7 +100,8 @@ async fn native_fee_estimation() -> Result<()> {
+ #[tokio::test]
+ #[ignore = "requires the owned funded fakechain wallet fixture"]
+ async fn native_swap_wallet_spendable() -> Result<()> {
+-    use swap_machine::native_funding_rpc::spendable::{SpendRequest, swap_wallet_spendable};
++    use swap_machine::native_funding_rpc::spendable::{SpendRequest, swap_wallet_spendable,
++        swap_wallet_spendable_for_quote,RecoveryDestination};
+     use swap_machine::native_funding_rpc::wallet_session::SwapWalletId;
+     use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
+ 
+@@ -117,14 +118,47 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+     let genesis = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
+     let (daemon, wallet_port, username, password) = native_rpc::fixture_connection()?;
+ 
++    let retained=if std::env::var_os("MONZERO_TEST_QT_QUOTE_DRIVER").is_some() {
++        let path=std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_SPEND_QUOTE_CONTEXT")
++            .context("missing retained spending quote")?);
++        let expected=serde_json::from_str(&std::env::var("MONZERO_TEST_SPEND_QUOTE_FINGERPRINT")?)?;
++        let association=quote_fixture::load_association(&path,expected)?;
++        let role=match std::env::var("MONZERO_TEST_SPEND_QUOTE_ROLE")?.as_str() {
++            "payout"=>RecoveryDestination::Payout,"refund"=>RecoveryDestination::Refund,
++            _=>anyhow::bail!("invalid spending fixture role"),
++        };
++        Some((association.verify_record(quote_fixture::now()?)?,role))
++    } else {None};
++    let maximum_fee=match &retained {
++        Some((quote,_))=>XmzAmount::from_atom_string(&quote.terms()["xmzNativeFeeMaxAtoms"])
++            .map_err(|_|anyhow::anyhow!("invalid quoted fee limit"))?,
++        None=>XmzAmount::from_atoms(10_000_000_000),
++    };
++
+     let request = |id: SwapWalletId| SpendRequest {
+         journal_directory: std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_SPEND_RESULT")
+             .expect("private fixture result path")).parent().expect("fixture directory").to_owned(),
+         id, password: "fixture-password".into(), spend_key: spend_key.clone(), view_key: view_key.clone(),
+         restore_height, lock_txid: lock_txid.clone(), wallet: wallet.clone(), destination: destination.clone(),
+-        amount, maximum_fee: XmzAmount::from_atoms(10_000_000_000), account: 0, priority: 1,
++        amount, maximum_fee, account: 0, priority: 1,
+     };
+ 
++    if let Some((quote,role))=&retained {
++        for case in 0..3 {
++            let mut changed=request(SwapWalletId::new(Uuid::new_v4())?);
++            let expected=match case {
++                0=>{changed.destination=wallet.clone(); "recovery destination or chain differs from quote"}
++                1=>{changed.maximum_fee=XmzAmount::from_atoms(maximum_fee.atoms().checked_add(1).context("fee overflow")?);
++                    "recovery fee budget exceeds quote"}
++                _=>{changed.amount=XmzAmount::from_atoms(quote.terms()["xmzAtoms"].parse()?);
++                    "recovery payment and fee budget exceed quoted lock principal"}
++            };
++            let error=swap_wallet_spendable_for_quote(0,0,String::new(),String::new(),XmzNetwork::Mainnet,
++                genesis,changed,quote,*role).await.err().context("invalid recovery limits accepted")?;
++            anyhow::ensure!(error.to_string()==expected,"recovery limit rejection occurred after quote boundary");
++        }
++    }
++
+     // Rejected restoration must not close a wallet that was already open,
+     // even when its address happens to match the requested swap wallet.
+     let mut existing = swap_machine::native_funding_rpc::wallet_session::NativeWalletSession::new(
+@@ -149,8 +183,12 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+ 
+     // A second attempt (different swap wallet id, same underlying keys) proves
+     // the first attempt's wallet was actually closed, not left wedged open.
+-    let relayed = swap_wallet_spendable(daemon, wallet_port, username, password,
+-        XmzNetwork::Mainnet, genesis, request(SwapWalletId::new(Uuid::new_v4())?)).await?;
++    let relayed = match &retained {
++        Some((quote,role))=>swap_wallet_spendable_for_quote(daemon,wallet_port,username,password,
++            XmzNetwork::Mainnet,genesis,request(SwapWalletId::new(Uuid::new_v4())?),quote,*role).await?,
++        None=>swap_wallet_spendable(daemon, wallet_port, username, password,
++            XmzNetwork::Mainnet, genesis, request(SwapWalletId::new(Uuid::new_v4())?)).await?,
++    };
+     anyhow::ensure!(relayed.receipt_persisted && relayed.wallet_closed, "spend cleanup or receipt failed");
+     anyhow::ensure!(relayed.transfer.fee.atoms() > 0 && relayed.transfer.weight > 0, "invalid relayed transfer");
+     // A new retry UUID cannot bypass the durable lock identity reservation.
+@@ -369,6 +407,7 @@ async fn settlement(refund: bool) -> Result<()> {
+         anyhow::ensure!(quote_fixture::read(&wrong,swap_id).is_err(),"accepted wrong fixture commitment");
+         let marker=serde_json::to_string(&serde_json::json!({
+             "commitment":owner.context()["commitment"],"swapId":swap_id.to_string(),
++            "associationFingerprint":alice3.association().context("missing negotiated quote association")?.fingerprint()?,
+             "xmzPayout":quote.destinations().xmz_payout.to_string(),
+             "xmzRefund":quote.destinations().xmz_refund.to_string()}))?;
+         anyhow::ensure!(export_fixture("MONZERO_TEST_QUOTE_CHECKED",&marker)?,"missing quote check marker path");
+@@ -705,18 +744,8 @@ async fn resume_pending_in_child() -> Result<()> {
+         std::env::var("MONZERO_TEST_CHILD_LOCK")?.parse()?, &policy)?;
+     match std::env::var("MONZERO_TEST_CHILD_REQUIRE_QUOTE")?.as_str() {
+         "1"=>{
+-            use std::os::unix::fs::MetadataExt;
+-            let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK)
+-                .open(input.with_extension("quote-context"))?;
+-            let metadata=file.metadata()?;
+-            anyhow::ensure!(metadata.is_file() && metadata.uid()==unsafe {libc::geteuid()}
+-                && metadata.mode()&0o077==0 && metadata.nlink()==1 && metadata.len()<=131072,
+-                "invalid retained fixture quote file");
+-            let mut bytes=Vec::new(); (&mut file).take(131073).read_to_end(&mut bytes)?;
+-            anyhow::ensure!(bytes.len()<=131072,"oversized retained fixture quote");
+-            let association:quote_fixture::Association=serde_json::from_slice(&bytes)?;
+             let expected:[u8;32]=serde_json::from_str(&std::env::var("MONZERO_TEST_CHILD_QUOTE_FINGERPRINT")?)?;
+-            anyhow::ensure!(association.fingerprint()?==expected,"retained fixture quote fingerprint mismatch");
++            let association=quote_fixture::load_association(&input.with_extension("quote-context"),expected)?;
+             pending.check_recorded_quote(&association.verify_record(quote_fixture::now()?)?)?;
+         }
+         "0"=>{},
+diff --git a/swap-machine/tests/quote_fixture.rs b/swap-machine/tests/quote_fixture.rs
+index 049c467b3..f72017b34 100644
+--- a/swap-machine/tests/quote_fixture.rs
++++ b/swap-machine/tests/quote_fixture.rs
+@@ -34,6 +34,20 @@ pub fn check_association(expected: &Option<Association>, found: &Option<Associat
+     Ok(())
+ }
+ 
++pub fn load_association(path: &std::path::Path, expected: [u8;32]) -> Result<Association> {
++    use std::{io::Read,os::unix::fs::{OpenOptionsExt,MetadataExt}};
++    let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(path)?;
++    let metadata=file.metadata()?;
++    ensure!(metadata.is_file() && metadata.uid()==unsafe {libc::geteuid()}
++        && metadata.mode()&0o077==0 && metadata.nlink()==1 && metadata.len()<=131072,
++        "invalid retained fixture quote file");
++    let mut bytes=Vec::new(); (&mut file).take(131073).read_to_end(&mut bytes)?;
++    ensure!(bytes.len()<=131072,"oversized retained fixture quote");
++    let association:Association=serde_json::from_slice(&bytes)?;
++    ensure!(association.fingerprint()?==expected,"retained fixture quote fingerprint mismatch");
++    Ok(association)
++}
++
+ /// Private test transport adapter; transcript state is deliberately not a
+ /// production restart record. Never expose frames containing view-key shares.
+ pub struct Negotiation {

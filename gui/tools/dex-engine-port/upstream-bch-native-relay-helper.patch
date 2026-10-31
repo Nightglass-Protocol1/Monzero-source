@@ -1,0 +1,229 @@
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -553,6 +553,85 @@
+             && info["outgoing_connections_count"].as_u64()==Some(0),"native preparation requires offline fakechain");
+         Ok(())
+     }
++    fn native_relay_request(bytes: &[u8],action: &str) -> Result<Request> {
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid native relay request size");
++        let request: Request=serde_json::from_slice(bytes)?;
++        ensure!(matches!(action,"review"|"submit"|"status") && !request.request_id.is_nil()
++            && request.schema==format!("monzero-bch-native-relay-{action}-request-v1"),"invalid native relay request");
++        if action=="submit" {parse_digest(request.commitment.as_deref().context("missing native relay approval")?)?;}
++        else {ensure!(request.commitment.is_none(),"unexpected native relay approval");}
++        Ok(request)
++    }
++    async fn native_relay_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
++        use swap_machine::{native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
++            bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::native::{
++                NativeFundingSource,relay::NativeRelayState}};
++        let request=native_relay_request(bytes,action)?;
++        let (_wrapper_lease,bytes)=private_bytes(path)?;
++        let wrapper=native_preparation_config(&bytes)?;
++        let deployment=parse_digest(&wrapper.deployment_commitment)?;
++        let (_admission_lease,config)=load(&wrapper.admission_config_file)?;
++        ensure!(matches!(config.role,Role::NativeFunder),"native preparation requires native funder");
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"native preparation trade changed");
++        let source=NativeFundingSource {wallet:swap_core::xmz_address::XmzAddress::parse(config.policy.xmz_network,&wrapper.wallet)?,
++            account:wrapper.account,priority:wrapper.priority};
++        let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        let saved=execution.saved_bch_native_preparation()?.context("native relay requires saved preparation")?;
++        let payment=saved.payment.context("native preparation result is uncertain")?;
++        let details=&saved.review.details;
++        ensure!(details["wallet"]==source.wallet.to_string() && details["account"]==wrapper.account
++            && details["priority"]==wrapper.priority && details["safetyBlocks"]==wrapper.safety_blocks
++            && details["deployment"]==serde_json::json!(deployment),"saved native preparation configuration changed");
++        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        let checked=if action=="status" {execution.saved_bch_native_relay_review(&deployment)?}
++            else {
++                ensure!(execution.bch_native_relay_state()?.is_none(),"native relay already attempted; check saved status");
++                execution.review_bch_native_relay_for_deployment(&deployment,now)?
++            };
++        if action=="submit" {
++            let approved=parse_digest(request.commitment.as_deref().context("missing native relay consent")?)?;
++            ensure!(approved==checked.commitment,"native relay consent changed");
++            // Approval precedes credentials; descriptor leases cover dispatch.
++                let (_bch_lease,bytes)=private_bytes(&wrapper.bch_rpc_file)?;
++                let descriptor: FundingRpc=serde_json::from_slice(&bytes)?;
++                let (_cookie_lease,cookie)=private_file(&descriptor.cookie_file,true)?;
++                let bch=descriptor.backend(&cookie)?;
++                ensure!(bch.deployment_commitment()?==deployment,"native preparation BCH observer changed");
++                let (_native_lease,bytes)=private_bytes(&wrapper.native_rpc_file)?;
++                let native: NativePreparationRpc=serde_json::from_slice(&bytes)?;
++                ensure!(native.schema=="monzero-private-bch-native-rpc-v1" && native.daemon_port>0
++                    && native.wallet_port>0 && native.daemon_port!=native.wallet_port
++                    && native.login_file.is_absolute(),"invalid native RPC descriptor");
++                isolated_native_preparation(native.daemon_port).await?;
++                let (_login_lease,login)=private_file(&native.login_file,true)?;
++                let text=std::str::from_utf8(&login)?;
++                let text=text.strip_suffix('\n').unwrap_or(text);
++                let (user,password)=text.split_once(':').context("invalid native RPC credentials")?;
++                ensure!(!user.is_empty() && !password.is_empty() && !text.bytes().any(|b|b.is_ascii_control()),"invalid native RPC login");
++                let mut relay=NativeTransferRelay::new(NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?);
++                let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                execution.relay_bch_native_funding(&mut relay,&bch,&approved,dispatch).await?;
++        }
++        let relay=execution.bch_native_relay_state()?.map(|state|match state {
++            NativeRelayState::Attempted {txid}=>serde_json::json!({"state":"attempted","txid":txid}),
++            NativeRelayState::Acknowledged {txid}=>serde_json::json!({"state":"acknowledged","txid":txid}),
++        });
++        let review=serde_json::json!({"details":checked.details,
++            "commitment":checked.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
++        let prepared_review=serde_json::json!({"details":details,
++            "commitment":saved.review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
++        let preparation=serde_json::json!({"state":"prepared","attemptedAt":saved.attempted_at.to_string(),
++            "payment":{"txid":payment.txid,"feeAtoms":payment.fee.atom_string(),"weight":payment.weight}});
++        Ok(serde_json::json!({"schema":format!("monzero-bch-native-relay-{action}-response-v1"),
++            "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
++            "review":review,"preparationReview":prepared_review,"preparation":preparation,"relay":relay}))
++    }
++
+     async fn native_preparation_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
+         use swap_machine::{native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::native::NativeFundingSource};
+@@ -935,7 +1014,16 @@
+             "--native-preparation-status-stdio-v1"=>Some("status"),
+             _=>None,
+         };
+-        let result = if let Some(operation)=native_preparation_action {
++        let native_relay_action=match action {
++            "--native-relay-review-stdio-v1"=>Some("review"),
++            "--native-relay-submit-stdio-v1"=>Some("submit"),
++            "--native-relay-status-stdio-v1"=>Some("status"),
++            _=>None,
++        };
++        let result = if let Some(operation)=native_relay_action {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(native_relay_operation(Path::new(&args[2]),&bytes,operation))?
++        } else if let Some(operation)=native_preparation_action {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(native_preparation_operation(Path::new(&args[2]),&bytes,operation))?
+         } else if let Some(operation)=receipt_action {
+@@ -990,6 +1078,20 @@
+                 assert!(super::native_preparation_request(&serde_json::to_vec(&value)?,action).is_err());
+             }
+             assert!(super::native_preparation_request(&vec![b' ';513],"status").is_err());
++            Ok(())
++        }
++        #[test]
++        fn native_relay_requests_require_exact_consent() -> anyhow::Result<()> {
++            for action in ["review","submit","status"] {
++                let mut value=serde_json::json!({"schema":format!("monzero-bch-native-relay-{action}-request-v1"),
++                    "requestId":"11111111-1111-4111-8111-111111111111"});
++                assert_eq!(super::native_relay_request(&serde_json::to_vec(&value)?,action).is_ok(),action!="submit");
++                value["commitment"]=serde_json::json!("ab".repeat(32));
++                assert_eq!(super::native_relay_request(&serde_json::to_vec(&value)?,action).is_ok(),action=="submit");
++                value["privateKey"]=serde_json::json!("forbidden");
++                assert!(super::native_relay_request(&serde_json::to_vec(&value)?,action).is_err());
++            }
++            assert!(super::native_relay_request(&vec![b' ';513],"status").is_err());
+             Ok(())
+         }
+         #[test]
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -163,6 +163,7 @@
+         "txid":txid.to_string(),"lockVout":signed.lock_outpoint().vout,"lockScript":setup.quote.recovery_plan().lock().script_pubkey().to_hex_string(),
+         "authenticatedHandoff":handoff,"fundingReceiptApprovalVerified":handoff,"fundingReceiptHelperVerified":helper_receipt,"fundingReceiptQtVerified":helper_receipt && std::env::var_os("MONZERO_BCH_QT_FUNDING_RECEIPT_PROBE").is_some(),"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff && !paired,"pairedNativeFunding":paired,
+         "nativePreparationQtVerified":paired && std::env::var_os("MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE").is_some(),
++        "nativeRelayHelperVerified":paired && std::env::var("MONZERO_BCH_NATIVE_PREPARATION_PAIRED").as_deref()==Ok("1"),
+         "nativePreparationHelperVerified":paired && std::env::var("MONZERO_BCH_NATIVE_PREPARATION_PAIRED").as_deref()==Ok("1"),
+         "principalAtoms":100000,"feeAtoms":fee,"productionWalletLockSignRelay":true,"restartSavedBytes":true,
+         "inputs":inputs.iter().map(|p|json!({"txid":p.txid.to_string(),"vout":p.vout})).collect::<Vec<_>>() }))?)?;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/preparation_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/preparation_helper.rs
+@@ -67,10 +67,44 @@
+     let approval=review["review"]["commitment"].as_str().context("review commitment")?;
+     let prepared=call("submit",Some(approval),true)?;
+     assert_eq!(prepared["preparation"]["state"],"prepared");assert_eq!(prepared["review"],review["review"]);
++    let relay_call=|action: &str,approval: Option<&str>,success: bool| -> Result<Value> {
++        let id=uuid::Uuid::new_v4();
++        let mut request=json!({"schema":format!("monzero-bch-native-relay-{action}-request-v1"),"requestId":id});
++        if let Some(approval)=approval {request["commitment"]=approval.into();}
++        let mut child=Command::new(&helper).arg(format!("--native-relay-{action}-stdio-v1")).arg(&wrapper)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("relay helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++        if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++        assert!(output.stderr.is_empty() && output.stdout.len()<=16384);
++        let value:Value=serde_json::from_slice(&output.stdout)?;
++        assert_eq!(value.as_object().unwrap().len(),9);assert_eq!(value["requestId"],id.to_string());
++        assert_eq!(value["schema"],format!("monzero-bch-native-relay-{action}-response-v1"));
++        assert_eq!(value["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(value["executable"],false);assert_eq!(value["chainObserved"],false);
++        assert_eq!(value["preparationReview"],prepared["review"]);
++        assert_eq!(value["preparation"],prepared["preparation"]);Ok(value)
++    };
++    assert!(relay_call("status",None,true)?["relay"].is_null());
++    let relay_review=relay_call("review",None,true)?;
++    assert_eq!(relay_review["review"]["details"]["txid"],prepared["preparation"]["payment"]["txid"]);
++    let before=contents(&metadata.0)?;let private=contents(&snapshots.0)?;
++    relay_call("submit",Some(&"00".repeat(32)),false)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,private);
++    let relay_approval=relay_review["review"]["commitment"].as_str().context("relay approval")?;
++    let sent=relay_call("submit",Some(relay_approval),true)?;
++    assert_eq!(sent["review"],relay_review["review"]);assert_eq!(sent["relay"]["state"],"acknowledged");
++    assert_eq!(sent["relay"]["txid"],prepared["preparation"]["payment"]["txid"]);
++    let acknowledged=contents(&metadata.0)?;let acknowledged_private=contents(&snapshots.0)?;
++    relay_call("submit",Some(relay_approval),false)?;relay_call("review",None,false)?;
++    assert_eq!(contents(&metadata.0)?,acknowledged);assert_eq!(contents(&snapshots.0)?,acknowledged_private);
+     let retained=contents(&metadata.0)?;let private=contents(&snapshots.0)?;
+     call("submit",Some(approval),false)?;call("review",None,false)?;
+     std::fs::remove_file(&native)?;std::fs::remove_file(&bch)?;
+     std::fs::remove_file(&login)?;std::fs::remove_file(&cookie)?;
++    let relay_saved=relay_call("status",None,true)?;
++    assert_eq!(relay_saved["relay"],sent["relay"]);assert_eq!(relay_saved["review"],sent["review"]);
+     let saved=call("status",None,true)?;
+     assert_eq!(saved["preparation"],prepared["preparation"]);assert_eq!(saved["review"],prepared["review"]);
+     assert_eq!(contents(&metadata.0)?,retained);assert_eq!(contents(&snapshots.0)?,private);
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay.rs
+@@ -17,6 +17,14 @@
+         *fixture.relay_intent.lock().unwrap() = Some(intent.clone());
+         let before = fixture.calls.lock().unwrap().len();
+         let review = execution.review_bch_native_relay(rpc,1025)?;
++        let deployment=rpc.deployment_commitment()?;
++        assert_eq!(execution.review_bch_native_relay_for_deployment(&deployment,1025)?.commitment,review.commitment);
++        assert_eq!(execution.saved_bch_native_relay_review(&deployment)?.commitment,review.commitment);
++        assert!(execution.review_bch_native_relay_for_deployment(&deployment,2000).is_err());
++        assert!(execution.review_bch_native_relay_for_deployment(&deployment,1023).is_err());
++        let mut changed=deployment;changed[0]^=1;
++        assert!(execution.review_bch_native_relay_for_deployment(&changed,1025).is_err());
++        assert!(execution.saved_bch_native_relay_review(&changed).is_err());
+         assert_eq!(review.details["action"],"broadcast-xmz-funding");
+         assert_eq!(review.details["amountAtoms"],"101000");
+         assert_eq!(review.details["feeAtoms"],"900");
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/relay.rs
+@@ -45,10 +45,24 @@
+     /// Read-only review, with no transaction key or relay metadata exposed.
+     /// The caller must obtain explicit user approval of this exact commitment.
+     pub fn review_bch_native_relay(&self,bch: &BchRpc,now: u64) -> Result<NativeRelayReview> {
++        self.review_bch_native_relay_for_deployment(&bch.deployment_commitment()?,now)
++    }
++
++    /// Offline review under current quote validity. This does not establish BCH
++    /// confirmation; relay still rechecks the actual chain and source wallet.
++    pub fn review_bch_native_relay_for_deployment(&self,deployment: &[u8;32],now: u64) -> Result<NativeRelayReview> {
+         self.quote.check_policy(self.policy,now)?;
+         let (review,intent,_) = self.native_relay_materials()?;
+-        ensure!(now >= intent.admitted_at && bch.deployment_commitment()? == intent.deployment,
++        ensure!(now >= intent.admitted_at && *deployment == intent.deployment,
+             "native relay predates preparation or changes BCH observer");
++        Ok(review)
++    }
++
++    /// Saved public payment terms after expiry; never new broadcast authority.
++    /// Dispatch state is obtained separately through bch_native_relay_state.
++    pub fn saved_bch_native_relay_review(&self,deployment: &[u8;32]) -> Result<NativeRelayReview> {
++        let (review,intent,_) = self.native_relay_materials()?;
++        ensure!(*deployment == intent.deployment,"saved native relay BCH observer changed");
+         Ok(review)
+     }
+ 

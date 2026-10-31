@@ -27,6 +27,7 @@
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <QApplication>
+#include <QFontDatabase>
 #include <QQmlApplicationEngine>
 #include <QtQml>
 #include <QStandardPaths>
@@ -73,6 +74,16 @@
 #include "qt/NetworkAccessBlockingFactory.h"
 #ifdef WITH_DEX_PROTOTYPE
 #include "dex/DexEngine.h"
+#include "dex/DexDeployment.h"
+#include "dex/DexRiskControl.h"
+#include "dex/DexTradeFolders.h"
+#include "LightWalletHelper.h"
+#include "dex/LitecoinPeerStartup.h"
+#include "dex/PrivateBackendConfig.h"
+#include "dex/NativeQuoteConfig.h"
+#include "dex/NativeQuoteCoordinator.h"
+#include "dex/SwapWalletSession.h"
+#include <memory>
 #endif
 #ifdef QML_TESTS
 #include "QmlTestHarness.h"
@@ -194,7 +205,8 @@ int main(int argc, char *argv[])
 #endif
 
     // detect low graphics mode (start-low-graphics-mode.bat)
-    if(qgetenv("QMLSCENE_DEVICE") == "softwarecontext")
+    if (qgetenv("QMLSCENE_DEVICE") == "softwarecontext"
+        || qgetenv("QT_QUICK_BACKEND") == "software")
         isOpenGL = false;
 
 #ifdef Q_OS_MAC
@@ -228,6 +240,13 @@ int main(int argc, char *argv[])
     }
 
     MainApp app(argc, argv);
+
+    // Load the bundled outline fonts before any QML/control is constructed.
+    // Windows raster-font defaults such as Fixedsys cannot be drawn by DirectWrite.
+    for (const char *font : {":/fonts/Roboto-Regular.ttf", ":/fonts/Roboto-Bold.ttf",
+                             ":/fonts/RobotoMono-Regular.ttf", ":/fonts/RobotoMono-Bold.ttf"})
+        QFontDatabase::addApplicationFont(QString::fromLatin1(font));
+    app.setFont(QFont(QStringLiteral("Roboto"), 10));
 
 #if defined(Q_OS_WIN)
     if (isOpenGL)
@@ -294,17 +313,156 @@ int main(int argc, char *argv[])
     parser.addOption(disableCheckUpdatesOption);
     QCommandLineOption socksProxyOption("socks5-proxy", "Enable socks5 proxy. Used for remote node connection (advanced mode), updates downloading and fetching price sources.", "address:port");
     parser.addOption(socksProxyOption);
-    QCommandLineOption testQmlOption("test-qml");
+    // Keep a startup-only alias distinct from the QML_TESTS harness interception.
+    QCommandLineOption testQmlOption(QStringList() << "test-qml" << "startup-smoke-test");
     testQmlOption.setFlags(QCommandLineOption::HiddenFromHelp);
     parser.addOption(logPathOption);
     parser.addOption(testQmlOption);
+    QCommandLineOption smokeDelayOption("startup-smoke-delay-ms", "Bounded event-loop delay for isolated startup tests.", "milliseconds", "0");
+    smokeDelayOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(smokeDelayOption);
 #ifdef WITH_DEX_PROTOTYPE
     QCommandLineOption dexSelfTestOption("dex-self-test");
     dexSelfTestOption.setFlags(QCommandLineOption::HiddenFromHelp);
     parser.addOption(dexSelfTestOption);
+    QCommandLineOption dexBackendOption("dex-private-backend", "Start a separate experimental DEX wallet service from a private local config.", "config");
+    dexBackendOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBackendOption);
+    QCommandLineOption dexQuoteOption("dex-private-quote", "Review one signed native quote from trusted private local configuration; no trading.", "config");
+    dexQuoteOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexQuoteOption);
+    QCommandLineOption dexBchFundingReceiptOption("dex-bch-funding-receipt", "Attach private native-funder BCH funding receipt; startup reads saved status only.", "config");
+    dexBchFundingReceiptOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchFundingReceiptOption);
+    QCommandLineOption dexBchNativePreparationOption("dex-bch-native-preparation", "Attach private XMZ deposit preparation; startup reads saved status only.", "config");
+    dexBchNativePreparationOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchNativePreparationOption);
+    QCommandLineOption dexBchNativeRelayOption("dex-bch-native-relay", "Attach private XMZ funding broadcast; startup reads saved status only.", "config");
+    dexBchNativeRelayOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchNativeRelayOption);
+    QCommandLineOption dexBchNativeProofOption("dex-bch-native-proof", "Attach private XMZ payment proof receipt; startup restores context and reads saved status only.", "config");
+    dexBchNativeProofOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchNativeProofOption);
+    QCommandLineOption dexBchNativeObservationOption("dex-bch-native-observation", "Attach private XMZ payment observation; chain checks require an explicit request.", "config");
+    dexBchNativeObservationOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchNativeObservationOption);
+    QCommandLineOption dexEvmTradeOption("dex-evm-trade", "Attach a private XMZ<->BNB/ETH trade (prototype); needs --dex-evm-seed-file.", "config");
+    dexEvmTradeOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexEvmTradeOption);
+    QCommandLineOption dexEvmSeedOption("dex-evm-seed-file", "Private file with the wallet seed (hex) for the XMZ<->BNB/ETH prototype, until the vault supplies it.", "file");
+    dexEvmSeedOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexEvmSeedOption);
+    QCommandLineOption dexBchPublicationRepairOption("dex-bch-publication-repair", "Attach private BCH record repair; requires explicit review and approval.", "config");
+    dexBchPublicationRepairOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchPublicationRepairOption);
+    QCommandLineOption dexBchSuccessPreparationOption("dex-bch-success-preparation", "Attach private BCH settlement preparation; requires explicit review and approval.", "config");
+    dexBchSuccessPreparationOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchSuccessPreparationOption);
+    QCommandLineOption dexBchSuccessReleaseReviewOption("dex-bch-success-release-review", "Attach private BCH settlement review; requires an explicit request.", "config");
+    dexBchSuccessReleaseReviewOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchSuccessReleaseReviewOption);
+    QCommandLineOption dexBchSuccessSignatureReviewOption("dex-bch-success-signature-review", "Attach private BCH signature retention review; requires an explicit request.", "config");
+    dexBchSuccessSignatureReviewOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchSuccessSignatureReviewOption);
+    QCommandLineOption dexBchSuccessSignedReleaseReviewOption("dex-bch-success-signed-release-review", "Attach private BCH signed settlement release review; requires an explicit request.", "config");
+    dexBchSuccessSignedReleaseReviewOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchSuccessSignedReleaseReviewOption);
+    QCommandLineOption dexBchRefundProtectionOption("dex-bch-refund-protection", "Attach private BCH peer refund protection; startup reads saved status only.", "config");
+    dexBchRefundProtectionOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchRefundProtectionOption);
+    QCommandLineOption dexBchRecoveryRetentionOption("dex-bch-recovery-retention", "Attach private BCH private recovery retention; startup reads saved status only.", "config");
+    dexBchRecoveryRetentionOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchRecoveryRetentionOption);
+    QCommandLineOption dexBchPunishmentSubmissionOption("dex-bch-punishment-submission", "Attach private approved BCH timeout-recovery send; requires review and observation configurations.", "config");
+    dexBchPunishmentSubmissionOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchPunishmentSubmissionOption);
+    QCommandLineOption dexBchPunishmentObservationOption("dex-bch-punishment-observation", "Attach private BCH timeout-recovery chain checks; requires punishment configuration.", "config");
+    dexBchPunishmentObservationOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchPunishmentObservationOption);
+    QCommandLineOption dexBchRefundWalletOption("dex-bch-refund-wallet", "Attach private historical XMZ refund-wallet status; startup reads local records only.", "config");
+    dexBchRefundWalletOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchRefundWalletOption);
+    QCommandLineOption dexBchRefundWalletReviewOption("dex-bch-refund-wallet-review", "Attach explicit fresh refund-wallet review configuration; no startup review or wallet mutation.", "config");
+    dexBchRefundWalletReviewOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchRefundWalletReviewOption);
+    QCommandLineOption dexBchRefundWalletServiceOption("dex-bch-refund-wallet-service", "Bind and start the app-owned recovery-wallet service for the configured trade; resumes only a cleanly stopped directory.", "config");
+    dexBchRefundWalletServiceOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchRefundWalletServiceOption);
+    QCommandLineOption dexBchPunishmentOption("dex-bch-punishment", "Attach private offline BCH punishment review; startup reads saved status only.", "config");
+    dexBchPunishmentOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchPunishmentOption);
+    QCommandLineOption dexBchCancellationOption("dex-bch-cancellation", "Attach private BCH cancellation review; startup reads saved status only.", "config");
+    dexBchCancellationOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchCancellationOption);
+    QCommandLineOption dexBchCancellationSubmitOption("dex-bch-cancellation-submit", "Attach private BCH explicit cancellation submission; startup reads saved status only.", "config");
+    dexBchCancellationSubmitOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchCancellationSubmitOption);
+    QCommandLineOption dexBchRefundReleaseOption("dex-bch-refund-release", "Attach private BCH refund-release review; startup reads saved status only.", "config");
+    dexBchRefundReleaseOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchRefundReleaseOption);
+    QCommandLineOption dexBchRefundReleaseSubmitOption("dex-bch-refund-release-submit", "Attach private BCH explicit refund-release submission; startup reads saved status only.", "config");
+    dexBchRefundReleaseSubmitOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchRefundReleaseSubmitOption);
+    QCommandLineOption dexBchAdmissionOption("dex-bch-admission", "Attach a private BCH regtest negotiation admission configuration; no funding or broadcast.", "config");
+    dexBchAdmissionOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchAdmissionOption);
+    for (const auto &coin:QStringList{"btc","bch","doge"}) {
+        QCommandLineOption option("dex-"+coin+"-light","Attach a private local light-wallet configuration; no automatic network requests or payments.","config");
+        option.setFlags(QCommandLineOption::HiddenFromHelp);parser.addOption(option);
+    }
+    for (const auto &name:QStringList{"dex-light-setup-helper","dex-light-setup-digest"}) {
+        QCommandLineOption option(name,"Trusted local wallet setup helper installation.","value");
+        option.setFlags(QCommandLineOption::HiddenFromHelp);parser.addOption(option);
+    }
+    QCommandLineOption dexLtcLightOption("dex-ltc-light", "Attach private Litecoin light-chain configuration; startup reads saved headers only.", "config");
+    dexLtcLightOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexLtcLightOption);
+    QCommandLineOption dexBchPreparationOption("dex-bch-preparation", "Attach private BCH unsigned preparation configuration; startup reads saved status only.", "config");
+    dexBchPreparationOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchPreparationOption);
+    QCommandLineOption dexBchSigningRecoveryOption("dex-bch-signing-recovery", "Attach a private recovered BCH transaction; importing requires separate review and approval.", "config");
+    dexBchSigningRecoveryOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchSigningRecoveryOption);
+    QCommandLineOption dexBchFundingOption("dex-bch-funding", "Attach a private BCH retained funding review configuration; no broadcast.", "config");
+    dexBchFundingOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchFundingOption);
+    QCommandLineOption dexBchFundingSubmitOption("dex-bch-funding-submit", "Attach caller-owned private BCH regtest funding relay configuration; sending requires separate approval.", "config");
+    dexBchFundingSubmitOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBchFundingSubmitOption);
+    QCommandLineOption dexLtcAppOption("dex-ltc-app", "Attach one private Litecoin trade setup covering startup, peer and settlement phases.", "config");
+    dexLtcAppOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexLtcAppOption);
+    QCommandLineOption dexLtcJournalOption("dex-ltc-journal", "Attach a private Litecoin trade configuration for isolated startup, journal review or separately approved payments.", "config");
+    dexLtcJournalOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexLtcJournalOption);
+    QCommandLineOption dexLtcPeerOption("dex-ltc-peer", "Attach private Litecoin identity and pinned TLS configuration; connects after the reviewed trade is saved.", "config");
+    dexLtcPeerOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexLtcPeerOption);
+    QCommandLineOption dexLtcReservationOption("dex-ltc-reservation", "Configure isolated Litecoin input reservation and recovery exchange; no funding broadcast.", "config");
+    dexLtcReservationOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexLtcReservationOption);
+    QCommandLineOption dexLtcNetworkOption("dex-ltc-network", "Swap chain network: regtest (default) or testnet for Litecoin, btc-regtest, btc-testnet4 or btc-signet for Bitcoin. Mainnet is not available.", "network");
+    dexLtcNetworkOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexLtcNetworkOption);
+    QCommandLineOption dexControlFileOption("dex-control-file", "Signed operator control document (kill switch and trade limits) from a private local file.", "file");
+    dexControlFileOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexControlFileOption);
+    QCommandLineOption dexControlUrlOption("dex-control-url", "HTTPS URL polled for the signed operator control document.", "url");
+    dexControlUrlOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexControlUrlOption);
+    QCommandLineOption dexTradeOption("dex-trade", "Reopen this trade folder (trade id) instead of the single active one.", "trade-id");
+    dexTradeOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexTradeOption);
+    QCommandLineOption dexTradeRootOption("dex-trade-root", "Directory holding trade folders (default: application data dex/trades).", "directory");
+    dexTradeRootOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexTradeRootOption);
 #endif
     parser.addHelpOption();
     parser.process(app);
+    bool smokeDelayOk=false;
+    const int smokeDelay=parser.value(smokeDelayOption).toInt(&smokeDelayOk);
+    if (!smokeDelayOk || smokeDelay<0 || smokeDelay>15000
+        || (parser.isSet(smokeDelayOption) && !parser.isSet(testQmlOption))) return 1;
 
 #ifdef WITH_DEX_PROTOTYPE
     if (parser.isSet(dexSelfTestOption)) {
@@ -489,13 +647,313 @@ int main(int argc, char *argv[])
     engine.rootContext()->setContextProperty("isTails", isTails);
     engine.rootContext()->setContextProperty("isARM", isARM);
 
+    bool miningEnabled = true;
+#ifdef MONZERO_NO_MINING
+    miningEnabled = false;
+#endif
+    engine.rootContext()->setContextProperty("miningEnabled", miningEnabled);
+
     bool dexPrototypeEnabled = false;
 #ifdef WITH_DEX_PROTOTYPE
     dexPrototypeEnabled = qgetenv("MONZERO_ENABLE_PRIVATE_DEX") == "I_UNDERSTAND_THIS_IS_A_LOCAL_PROTOTYPE";
 #endif
     engine.rootContext()->setContextProperty("dexPrototypeEnabled", dexPrototypeEnabled);
 #ifdef WITH_DEX_PROTOTYPE
+    if (parser.isSet(dexLtcNetworkOption)) {
+        if (!dexPrototypeEnabled || !DexDeployment::selectLitecoinStage(parser.value(dexLtcNetworkOption))) {
+            qCritical("Swap network rejected; only regtest, testnet, btc-regtest, btc-testnet4 or btc-signet is available");return 1;
+        }
+    }
+    DexDeployment::lockLitecoinStage();
     DexEngine dexEngine;
+    {
+        // New-trade limits. The ledger is local; the control key is pinned at build time.
+        const QString dexData=QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("dex");
+        if (!QDir().mkpath(dexData) || !QFile::setPermissions(dexData,QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner)
+            || !dexEngine.riskControl()->setLedgerFile(QDir(dexData).filePath("started-trades.json"))
+            || !dexEngine.riskControl()->setPublicKey(QStringLiteral(MONZERO_DEX_CONTROL_PUBKEY))) {
+            qCritical("DEX trade-limit storage or control key is invalid");return 1;
+        }
+        if (parser.isSet(dexControlFileOption) && (!dexPrototypeEnabled || !dexEngine.riskControl()->loadControlFile(parser.value(dexControlFileOption)))) {
+            qCritical("DEX operator control document rejected");return 1;
+        }
+        if (parser.isSet(dexControlUrlOption) && (!dexPrototypeEnabled || !dexEngine.riskControl()->startPolling(parser.value(dexControlUrlOption)))) {
+            qCritical("DEX operator control URL rejected; HTTPS is required");return 1;
+        }
+    }
+    for (const auto &coin:QStringList{"btc","bch","doge"}) {
+        const auto option="dex-"+coin+"-light";
+        if (parser.isSet(option) && (!dexPrototypeEnabled || !dexEngine.configureLightWallet(coin,parser.value(option)))) {
+            qCritical("Invalid private light-wallet configuration or missing prototype opt-in");return 1;
+        }
+    }
+    if (parser.isSet(dexLtcLightOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureLitecoinLight(parser.value(dexLtcLightOption))) {
+            qCritical("Invalid private Litecoin light-chain configuration or missing prototype opt-in");
+            return 1;
+        }
+        QTimer::singleShot(0,&dexEngine,[&dexEngine]{dexEngine.requestLitecoinLightStatus();});
+    }
+    if (parser.isSet("dex-light-setup-helper") || parser.isSet("dex-light-setup-digest")) {
+        if (!dexPrototypeEnabled || !parser.isSet("dex-light-setup-helper") || !parser.isSet("dex-light-setup-digest")
+            || !dexEngine.configureLightWalletSetup(parser.value("dex-light-setup-helper"),parser.value("dex-light-setup-digest"))) {
+            qCritical("Invalid trusted light-wallet setup helper or missing prototype opt-in");return 1;
+        }
+    }
+    if (dexPrototypeEnabled && !parser.isSet("dex-light-setup-helper") && !parser.isSet("dex-light-setup-digest")
+        && BundledLightWalletHelper::sha256[0] != '\0') {
+        const auto helper=QCoreApplication::applicationDirPath()+QString::fromLatin1(BundledLightWalletHelper::relativePath);
+        if (!dexEngine.configureLightWalletSetup(helper,QString::fromLatin1(BundledLightWalletHelper::sha256))) {
+            qCritical("Bundled light-wallet helper verification failed");return 1;
+        }
+    }
+    if (parser.isSet(dexBchPreparationOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchPreparation(parser.value(dexBchPreparationOption))) {
+            qCritical("Invalid private BCH preparation configuration or missing prototype opt-in");
+            return 1;
+        }
+    }
+
+    if (parser.isSet(dexBchSigningRecoveryOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchSigningRecovery(parser.value(dexBchSigningRecoveryOption))) {
+            qCritical("Invalid private BCH signing recovery configuration or missing preparation/prototype opt-in");
+            return 1;
+        }
+    }
+
+    if (parser.isSet(dexBchFundingOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchFunding(parser.value(dexBchFundingOption))) {
+            qCritical("Invalid private BCH funding review configuration or missing prototype opt-in");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchFundingSubmitOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchFundingSubmission(parser.value(dexBchFundingSubmitOption))) {
+            qCritical("Invalid private BCH funding submission configuration or missing prototype opt-in");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchAdmissionOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchAdmission(parser.value(dexBchAdmissionOption))) {
+            qCritical() << "Private BCH admission configuration rejected";
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchFundingReceiptOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchFundingReceipt(parser.value(dexBchFundingReceiptOption))) {
+            qCritical("Private BCH funding receipt configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchNativePreparationOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchNativePreparation(parser.value(dexBchNativePreparationOption))) {
+            qCritical("Private BCH native preparation configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchNativeRelayOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchNativeRelay(parser.value(dexBchNativeRelayOption))) {
+            qCritical("Private BCH native relay configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchNativeProofOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchNativeProof(parser.value(dexBchNativeProofOption))) {
+            qCritical("Private BCH native proof configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexEvmTradeOption) || parser.isSet(dexEvmSeedOption)) {
+        if (!dexPrototypeEnabled || !parser.isSet(dexEvmTradeOption) || !parser.isSet(dexEvmSeedOption)
+            || !dexEngine.configureEvmTrade(parser.value(dexEvmTradeOption),parser.value(dexEvmSeedOption))) {
+            qCritical("Private XMZ<->EVM trade configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchNativeObservationOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchNativeObservation(parser.value(dexBchNativeObservationOption))) {
+            qCritical("Private BCH native observation configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchPublicationRepairOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchPublicationRepair(parser.value(dexBchPublicationRepairOption))) {
+            qCritical("Private BCH publication repair configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchSuccessPreparationOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchSuccessPreparation(parser.value(dexBchSuccessPreparationOption))) {
+            qCritical("Private BCH success preparation configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchSuccessReleaseReviewOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchSuccessReleaseReview(parser.value(dexBchSuccessReleaseReviewOption))) {
+            qCritical("Private BCH success release review configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchSuccessSignatureReviewOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchSuccessSignatureReview(parser.value(dexBchSuccessSignatureReviewOption))) {
+            qCritical("Private BCH success signature review configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchSuccessSignedReleaseReviewOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchSuccessSignedReleaseReview(parser.value(dexBchSuccessSignedReleaseReviewOption))) {
+            qCritical("Private BCH success signed release review configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchRefundProtectionOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchRefundProtection(parser.value(dexBchRefundProtectionOption))) {
+            qCritical("Private BCH refund protection configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchRecoveryRetentionOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchRecoveryRetention(parser.value(dexBchRecoveryRetentionOption))) {
+            qCritical("Private BCH recovery retention configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBchRefundWalletOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchRefundWallet(parser.value(dexBchRefundWalletOption))) {
+            qCritical("Private BCH refund-wallet status configuration rejected");return 1;
+        }
+    }
+    if (parser.isSet(dexBchRefundWalletReviewOption)) {
+        if (!dexPrototypeEnabled || !parser.isSet(dexBchRefundWalletOption)
+            || !dexEngine.configureBchRefundWalletReview(parser.value(dexBchRefundWalletReviewOption))) {
+            qCritical("Invalid private refund-wallet review configuration or missing status configuration");return 1;
+        }
+    }
+    if (parser.isSet(dexBchRefundWalletServiceOption)) {
+        if (!dexPrototypeEnabled || !parser.isSet(dexBchRefundWalletOption) || parser.isSet(dexBchRefundWalletReviewOption)
+            || !dexEngine.configureBchRefundWalletService(parser.value(dexBchRefundWalletServiceOption))) {
+            qCritical("Invalid private refund-wallet service configuration, missing status configuration or conflicting review configuration");return 1;
+        }
+        QObject::connect(&app,&QCoreApplication::aboutToQuit,&dexEngine,&DexEngine::shutdownBchRefundWalletService);
+    }
+
+    if (parser.isSet(dexBchPunishmentOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchPunishment(parser.value(dexBchPunishmentOption))) {
+            qCritical("Private BCH punishment configuration rejected");return 1;
+        }
+    }
+    if (parser.isSet(dexBchPunishmentObservationOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchPunishmentObservation(parser.value(dexBchPunishmentObservationOption))) {
+            qCritical("Private BCH punishment observation configuration rejected");return 1;
+        }
+    }
+    if (parser.isSet(dexBchPunishmentSubmissionOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchPunishmentSubmission(parser.value(dexBchPunishmentSubmissionOption))) {
+            qCritical("Private BCH punishment submission configuration rejected");return 1;
+        }
+    }
+    if (parser.isSet(dexBchCancellationOption)) {
+        if (!dexPrototypeEnabled || parser.isSet(dexBchCancellationSubmitOption)
+            || !dexEngine.configureBchCancellation(parser.value(dexBchCancellationOption))) {
+            qCritical("Private BCH cancellation configuration rejected");return 1;
+        }
+    }
+    if (parser.isSet(dexBchCancellationSubmitOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchCancellationSubmission(parser.value(dexBchCancellationSubmitOption))) {
+            qCritical("Private BCH cancellation submission configuration rejected");return 1;
+        }
+    }
+    if (parser.isSet(dexBchRefundReleaseOption)) {
+        if (!dexPrototypeEnabled || parser.isSet(dexBchRefundReleaseSubmitOption)
+            || !dexEngine.configureBchRefundRelease(parser.value(dexBchRefundReleaseOption))) {
+            qCritical("Private BCH refund configuration rejected");return 1;
+        }
+    }
+    if (parser.isSet(dexBchRefundReleaseSubmitOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBchRefundReleaseSubmission(parser.value(dexBchRefundReleaseSubmitOption))) {
+            qCritical("Private BCH refund submission configuration rejected");return 1;
+        }
+    }
+    dexEngine.requestBchStartupChecks();
+    if (dexPrototypeEnabled && !parser.isSet(dexLtcAppOption) && !parser.isSet(dexLtcJournalOption)
+        && !parser.isSet(dexLtcPeerOption) && !parser.isSet(dexLtcReservationOption)) {
+        const auto root=parser.isSet(dexTradeRootOption)?parser.value(dexTradeRootOption):DexTradeFolders::defaultRoot();
+        if (!dexEngine.openTradeFolders(root,parser.value(dexTradeOption))) {
+            qCritical("Requested trade folder could not be opened");return 1;
+        }
+    } else if (parser.isSet(dexTradeOption)) {
+        qCritical("--dex-trade cannot be combined with explicit Litecoin trade configuration");return 1;
+    }
+    if (parser.isSet(dexLtcAppOption)) {
+        if (!dexPrototypeEnabled || parser.isSet(dexLtcJournalOption) || parser.isSet(dexLtcPeerOption)
+            || parser.isSet(dexLtcReservationOption) || !dexEngine.configureLitecoinApp(QFileInfo(parser.value(dexLtcAppOption)).absoluteFilePath())) {
+            qCritical() << "Private Litecoin app configuration rejected";
+            return 1;
+        }
+        const auto root=parser.isSet(dexTradeRootOption)?parser.value(dexTradeRootOption):DexTradeFolders::defaultRoot();
+        if (!dexEngine.registerConfiguredLitecoinApp(root,QFileInfo(parser.value(dexLtcAppOption)).absoluteFilePath())) {
+            qCritical("Private Litecoin app could not be registered for reopening");return 1;
+        }
+        dexEngine.requestLitecoinJournalCheck();
+    }
+    if (parser.isSet(dexLtcJournalOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureLitecoinJournal(parser.value(dexLtcJournalOption))) {
+            qCritical() << "Private Litecoin journal configuration rejected";
+            return 1;
+        }
+        dexEngine.requestLitecoinJournalCheck();
+    }
+    std::unique_ptr<LitecoinPeerStartup> dexLtcPeer;
+    if (parser.isSet(dexLtcPeerOption)) {
+        dexLtcPeer=std::make_unique<LitecoinPeerStartup>(dexEngine);
+        if (!dexPrototypeEnabled || !parser.isSet(dexLtcJournalOption)
+            || !dexLtcPeer->configure(parser.value(dexLtcPeerOption),parser.value(dexLtcJournalOption))) {
+            qCritical() << "Private Litecoin peer configuration rejected";
+            return 1;
+        }
+    }
+    if (parser.isSet(dexLtcReservationOption)) {
+        if (!dexPrototypeEnabled || !parser.isSet(dexLtcPeerOption) || !parser.isSet(dexLtcJournalOption)
+            || !dexEngine.configureLitecoinReservation(parser.value(dexLtcReservationOption),parser.value(dexLtcJournalOption))) {
+            qCritical() << "Private Litecoin reservation configuration rejected";
+            return 1;
+        }
+    }
+    std::unique_ptr<SwapWalletRpcProcess> dexOwner;
+    std::unique_ptr<SwapWalletSession> dexSession;
+    std::unique_ptr<NativeQuoteCoordinator> dexQuote;
+    if (parser.isSet(dexQuoteOption)) {
+        NativeQuoteConfig config;
+        if (!dexPrototypeEnabled || !NativeQuoteConfig::load(parser.value(dexQuoteOption), QDateTime::currentSecsSinceEpoch(), config)) {
+            qCritical() << "Private DEX quote configuration rejected";
+            return 1;
+        }
+        dexQuote = std::make_unique<NativeQuoteCoordinator>(config.helper, config.helperDigest,
+            config.directory, config.policy, config.btcPeer, config.xmzPeer);
+        if (!dexEngine.attachNativeQuoteCoordinator(dexQuote.get())
+            || !dexQuote->begin(config.payload, config.btcSignature, config.xmzSignature)) {
+            qCritical() << "Private DEX quote review rejected";
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBackendOption)) {
+        PrivateBackendConfig config;
+        if (!dexPrototypeEnabled || !PrivateBackendConfig::load(parser.value(dexBackendOption),config)) {
+            qCritical() << "Private DEX backend configuration rejected";
+            return 1;
+        }
+        dexOwner=std::make_unique<SwapWalletRpcProcess>();
+        dexSession=std::make_unique<SwapWalletSession>(dexOwner.get(),config.helper,config.genesis);
+        if (!dexSession->pinHelperDigest(config.helperDigest)
+            || !dexSession->pinRecoveryDirectory(config.directory)
+            || !dexEngine.attachSwapWalletSession(dexSession.get())
+            || !dexOwner->startFreshWithDigest(config.rpc,config.rpcDigest,config.directory,
+                config.daemonPort,config.walletPort)) {
+            qCritical() << "Private DEX backend startup rejected";
+            return 1;
+        }
+        QObject::connect(&app,&QCoreApplication::aboutToQuit,dexOwner.get(),&SwapWalletRpcProcess::stop);
+    }
     engine.rootContext()->setContextProperty("dexEngine", &dexEngine);
 #endif
 
@@ -556,8 +1014,22 @@ int main(int argc, char *argv[])
     }
 
     // QML loaded successfully.
-    if (parser.isSet(testQmlOption))
-        return 0;
+    if (parser.isSet(testQmlOption)) {
+        if (smokeDelay==0) return 0;
+        QTimer::singleShot(smokeDelay,&app,&QCoreApplication::quit);
+        const int status = app.exec();
+#ifdef WITH_DEX_PROTOTYPE
+        if (dexQuote) {
+            if (status != 0 || dexQuote->state() != NativeQuoteCoordinator::Ready
+                || dexEngine.nativeQuoteReview().isEmpty()) {
+                qCritical() << "Private native quote startup verification failed";
+                return 1;
+            }
+            qWarning() << "Private native quote review verified; no reservation or funding";
+        }
+#endif
+        return status;
+    }
 
 #ifdef WITH_SCANNER
     QObject *qmlCamera = rootObject->findChild<QObject*>("qrCameraQML");

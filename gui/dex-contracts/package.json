@@ -1,0 +1,16 @@
+{
+  "name": "monzero-dex-contracts",
+  "private": true,
+  "description": "XMZ <-> EVM atomic swap contract and tests (see DEX_XMZ_EVM_SWAP_DESIGN.md)",
+  "license": "BSD-3-Clause",
+  "scripts": {
+    "build": "hardhat compile",
+    "test": "hardhat test"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "3.0.8",
+    "chai": "4.5.0",
+    "ethers": "6.13.4",
+    "hardhat": "2.22.17"
+  }
+}

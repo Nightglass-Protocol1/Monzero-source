@@ -1,0 +1,229 @@
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index fa31ef585..69109d730 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -13,6 +13,7 @@ pub mod relay;
+ pub mod spendable;
+ pub mod spend_journal;
+ pub mod spend_recovery;
++pub mod topup_journal;
+ pub mod wallet_session;
+ use anyhow::{Context, Result, ensure};
+ use serde_json::{Value, json};
+diff --git a/swap-machine/src/native_funding_rpc/topup_journal.rs b/swap-machine/src/native_funding_rpc/topup_journal.rs
+new file mode 100644
+index 000000000..eb9d15c48
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/topup_journal.rs
+@@ -0,0 +1,211 @@
++//! Buyer-funded top-up dispatch journal: a durable, single-use intent for the
++//! buyer's own wallet to pay the recovered swap destination before the final
++//! two-source exact-net claim (see `full_proceeds::preview_exact_net_with_top_up`
++//! and `exact_net_journal`). This journal reserves the buyer's side of that
++//! delayed top-up. It has no claim authority over the swap lock: identity is
++//! keyed by the buyer's own wallet, never the swap/source wallet, so it cannot
++//! collide with or substitute for `SpendJournal`/`ExactNetJournal`, which
++//! reserve the lock itself. No secret persistence.
++use anyhow::{ensure, Result};
++use serde_json::{json, Value};
++use std::{fs::File, path::Path};
++#[cfg(unix)]
++use std::io::Write;
++use swap_core::{xmz::XmzAmount, xmz_address::XmzAddress};
++
++/// Buyer-approved top-up budget and destination, bound to one trade lock.
++/// `destination` is the recovered swap address, never the buyer's own change.
++#[derive(Clone)]
++pub struct TopUpRequest {
++    pub buyer_wallet: XmzAddress,
++    pub destination: XmzAddress,
++    pub lock_txid: String,
++    pub reserve: XmzAmount,
++    pub maximum_fee: XmzAmount,
++    pub account: u32,
++    pub priority: u32,
++}
++
++pub struct PreparedTopUp {
++    pub txid: String,
++    pub fee: XmzAmount,
++    pub weight: u64,
++}
++
++pub struct RelayedTopUp {
++    pub txid: String,
++    pub fee: XmzAmount,
++    pub weight: u64,
++}
++
++pub struct TopUpJournal {
++    directory: File,
++    receipt: String,
++    intent: Value,
++}
++
++impl TopUpJournal {
++    /// Durably reserves the buyer's top-up dispatch before any relay is attempted.
++    /// Filename excludes the mutable prepared fee/weight deliberately.
++    #[cfg(unix)]
++    pub fn reserve(directory: &Path, genesis: &str, request: &TopUpRequest) -> Result<Self> {
++        ensure!(request.buyer_wallet != request.destination,
++            "top-up destination must differ from the buyer's own wallet");
++        ensure!(request.reserve.atoms() > 0 && request.maximum_fee.atoms() > 0,
++            "invalid top-up reserve or fee ceiling");
++        ensure!((1..=4).contains(&request.priority), "invalid top-up priority");
++        let wallet = request.buyer_wallet.to_string();
++        let intent = json!({"schema":"monzero-topup-dispatch-intent-v1", "genesis":genesis,
++            "buyerWallet":wallet, "lockTxid":request.lock_txid,
++            "destination":request.destination.to_string(), "reserveAtoms":request.reserve.atom_string(),
++            "account":request.account, "priority":request.priority,
++            "maximumFeeAtoms":request.maximum_fee.atom_string()});
++        let (parent, identity) = super::spend_journal::reserve_intent(
++            directory, genesis, &wallet, &request.lock_txid, &intent)?;
++        Ok(Self { directory: parent, receipt: format!("{identity}.receipt"), intent })
++    }
++
++    #[cfg(not(unix))]
++    pub fn reserve(_: &Path, _: &str, _: &TopUpRequest) -> Result<Self> {
++        anyhow::bail!("top-up dispatch journal not implemented on this platform")
++    }
++
++    /// Persist the exact prepared transaction identity before relay. No private
++    /// metadata is stored. If a crash loses that metadata, absence on-chain is
++    /// not permission to construct a replacement top-up.
++    #[cfg(unix)]
++    pub fn record_prepared(&self, prepared: &PreparedTopUp) -> Result<()> {
++        ensure!(hash(&prepared.txid), "invalid prepared top-up hash");
++        let maximum_fee: u64 = self.intent["maximumFeeAtoms"].as_str()
++            .ok_or_else(|| anyhow::anyhow!("invalid journal fee limit"))?.parse()?;
++        ensure!(prepared.fee.atoms() <= maximum_fee, "prepared top-up fee exceeds journal approval");
++        let value = json!({"schema":"monzero-topup-dispatch-prepared-v1", "txid":prepared.txid,
++            "feeAtoms":prepared.fee.atom_string(), "weight":prepared.weight});
++        let name = self.receipt.strip_suffix(".receipt").expect("internal receipt suffix");
++        let mut file = super::spend_journal::create_record(&self.directory, &format!("{name}.prepared"))?;
++        file.write_all(&serde_json::to_vec(&value)?)?;
++        file.sync_all()?;
++        self.directory.sync_all()?;
++        Ok(())
++    }
++
++    #[cfg(not(unix))]
++    pub fn record_prepared(&self, _: &PreparedTopUp) -> Result<()> {
++        anyhow::bail!("top-up dispatch journal not implemented on this platform")
++    }
++
++    /// Receipt failure must never erase a successful broadcast result. Caller
++    /// reports persistence health separately and reconciles the retained intent.
++    #[cfg(unix)]
++    pub fn record_relay(&self, transfer: &RelayedTopUp) -> Result<()> {
++        ensure!(hash(&transfer.txid), "invalid journal relay hash");
++        let value = json!({"schema":"monzero-topup-dispatch-receipt-v1", "txid":transfer.txid,
++            "feeAtoms":transfer.fee.atom_string(), "weight":transfer.weight});
++        let mut file = super::spend_journal::create_record(&self.directory, &self.receipt)?;
++        file.write_all(&serde_json::to_vec(&value)?)?;
++        file.sync_all()?;
++        self.directory.sync_all()?;
++        Ok(())
++    }
++
++    #[cfg(not(unix))]
++    pub fn record_relay(&self, _: &RelayedTopUp) -> Result<()> {
++        anyhow::bail!("top-up dispatch journal not implemented on this platform")
++    }
++}
++
++fn hash(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++#[cfg(all(test, unix))]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
++    use swap_core::xmz_address::XmzNetwork;
++
++    fn addresses() -> Vec<XmzAddress> {
++        include_str!("../../../swap-core/src/xmz_address_vectors.txt").lines()
++            .take(3).map(|s| XmzAddress::parse(XmzNetwork::Mainnet, s).unwrap()).collect()
++    }
++    fn request() -> TopUpRequest {
++        let addresses = addresses();
++        TopUpRequest { buyer_wallet: addresses[0].clone(), destination: addresses[1].clone(),
++            lock_txid: "a".repeat(64), reserve: XmzAmount::from_atoms(10),
++            maximum_fee: XmzAmount::from_atoms(2), account: 0, priority: 1 }
++    }
++
++    struct PrivateDirectory(std::path::PathBuf);
++    impl PrivateDirectory {
++        fn new() -> Self {
++            let path = std::env::temp_dir().canonicalize().unwrap().join(format!("xmz-topup-{}", uuid::Uuid::new_v4()));
++            std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
++            Self(path)
++        }
++    }
++    impl Drop for PrivateDirectory {
++        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
++    }
++
++    #[test]
++    fn rejects_self_destination_and_empty_reserve_or_fee() {
++        let directory = PrivateDirectory::new();
++        let genesis = "a".repeat(64);
++        let mut same = request(); same.destination = same.buyer_wallet.clone();
++        assert!(TopUpJournal::reserve(&directory.0, &genesis, &same).is_err());
++        let mut zero_reserve = request(); zero_reserve.reserve = XmzAmount::from_atoms(0);
++        assert!(TopUpJournal::reserve(&directory.0, &genesis, &zero_reserve).is_err());
++        let mut zero_fee = request(); zero_fee.maximum_fee = XmzAmount::from_atoms(0);
++        assert!(TopUpJournal::reserve(&directory.0, &genesis, &zero_fee).is_err());
++        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
++    }
++
++    #[test]
++    fn private_directory_and_write_once_receipt_are_required() -> Result<()> {
++        let directory = PrivateDirectory::new();
++        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o755))?;
++        assert!(TopUpJournal::reserve(&directory.0, &"a".repeat(64), &request()).is_err());
++        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))?;
++        let journal = TopUpJournal::reserve(&directory.0, &"a".repeat(64), &request())?;
++        let transfer = RelayedTopUp { txid: "c".repeat(64), fee: XmzAmount::from_atoms(1), weight: 1 };
++        journal.record_relay(&transfer)?;
++        assert!(journal.record_relay(&transfer).is_err());
++        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.0.join(&journal.receipt))?)?;
++        assert_eq!(value["txid"], transfer.txid);
++        Ok(())
++    }
++
++    #[test]
++    fn prepared_fee_must_not_exceed_journal_approval() -> Result<()> {
++        let directory = PrivateDirectory::new();
++        let journal = TopUpJournal::reserve(&directory.0, &"a".repeat(64), &request())?;
++        let over_budget = PreparedTopUp { txid: "c".repeat(64), fee: XmzAmount::from_atoms(3), weight: 1 };
++        assert!(journal.record_prepared(&over_budget).is_err());
++        let invalid_hash = PreparedTopUp { txid: "not-a-hash".into(), fee: XmzAmount::from_atoms(1), weight: 1 };
++        assert!(journal.record_prepared(&invalid_hash).is_err());
++        let within_budget = PreparedTopUp { txid: "c".repeat(64), fee: XmzAmount::from_atoms(2), weight: 1 };
++        journal.record_prepared(&within_budget)?;
++        Ok(())
++    }
++
++    #[test]
++    fn buyer_and_seller_journals_for_the_same_lock_do_not_collide() -> Result<()> {
++        // The buyer's top-up dispatch is keyed by the buyer's own wallet, so it
++        // must never share an identity with the seller-side claim journal for
++        // the same trade lock, even though both name the same lock_txid.
++        let directory = PrivateDirectory::new();
++        let genesis = "a".repeat(64);
++        let top_up = TopUpJournal::reserve(&directory.0, &genesis, &request())?;
++        let addresses = addresses();
++        let spend_request = super::super::spendable::SpendRequest {
++            journal_directory: directory.0.clone(),
++            id: super::super::wallet_session::SwapWalletId::new(uuid::Uuid::new_v4()).unwrap(),
++            password: String::new(), spend_key: String::new(), view_key: String::new(), restore_height: 0,
++            lock_txid: request().lock_txid, destination: addresses[1].clone(), wallet: addresses[2].clone(),
++            amount: XmzAmount::from_atoms(1), maximum_fee: XmzAmount::from_atoms(1), account: 0, priority: 1 };
++        let claim = super::super::spend_journal::SpendJournal::reserve(&directory.0, &genesis, &spend_request)?;
++        drop(top_up); drop(claim);
++        assert_eq!(std::fs::read_dir(&directory.0)?.count(), 2);
++        Ok(())
++    }
++}

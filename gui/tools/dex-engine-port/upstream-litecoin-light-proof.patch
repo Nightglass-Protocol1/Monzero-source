@@ -1,0 +1,255 @@
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -380,3 +380,5 @@
+ pub mod litecoin_negotiation;
+ 
+ pub mod dogecoin_rpc;
++
++pub mod litecoin_light;
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light.rs
+@@ -0,0 +1,111 @@
++//! Offline building blocks for a future Litecoin light-wallet backend.
++//!
++//! Electrum data is untrusted. A matching Merkle branch establishes only that
++//! a transaction ID is committed by the supplied header. It does NOT validate
++//! Litecoin Scrypt work, difficulty, chain selection, header height, witness,
++//! confirmations, current unspentness, or transaction consensus validity.
++//! Nothing here creates `litecoin_rpc::VerifiedLiveLock` or grants signing.
++//!
++//! Wire format: ElectrumX protocol 1.4 `blockchain.transaction.get_merkle`.
++//! https://electrumx.readthedocs.io/en/latest/protocol-methods.html
++use anyhow::{Context, Result, ensure};
++use bitcoin::{BlockHash, Script, Transaction, Txid, block::Header,
++    consensus::{deserialize, serialize}, hashes::{Hash, sha256, sha256d}};
++use serde::Deserialize;
++
++const MAX_RESPONSE: usize = 16_384;
++const MAX_TRANSACTION: usize = 1_000_000;
++const MAX_BRANCH: usize = 32;
++
++/// Caller-selected identity, never learned from the same proof response.
++/// The caller must independently establish the header's network, height and
++/// active-chain membership before using this match in any chain observation.
++pub struct InclusionRequest {
++    pub id: u64,
++    pub height: u32,
++    pub block_hash: BlockHash,
++    pub txid: Txid,
++}
++
++/// Deliberately not Serialize/Deserialize and not a spendability capability.
++/// Does not authenticate witness data or establish a confirmation count.
++pub struct MerkleMatch {
++    txid: Txid,
++    block_hash: BlockHash,
++    claimed_height: u32,
++}
++impl MerkleMatch {
++    pub fn txid(&self) -> Txid { self.txid }
++    pub fn block_hash(&self) -> BlockHash { self.block_hash }
++    pub fn claimed_height(&self) -> u32 { self.claimed_height }
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Envelope {
++    jsonrpc: String,
++    id: u64,
++    result: Branch,
++    error: Option<serde_json::Value>,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Branch {
++    block_height: u32,
++    pos: u32,
++    merkle: Vec<String>,
++}
++
++/// Electrum uses reversed SHA256(scriptPubKey), not an address hash.
++pub fn script_hash(script: &Script) -> String {
++    let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
++    digest.reverse();
++    digest.iter().map(|b| format!("{b:02x}")).collect()
++}
++
++/// Match exact requested non-witness transaction identity and header identity.
++/// All payloads are bounded before deserialization. The supplied block hash is
++/// SHA256d header identity, NOT Litecoin's Scrypt proof-of-work hash.
++pub fn match_merkle_proof(request: &InclusionRequest, header_bytes: &[u8],
++    transaction_bytes: &[u8], response: &[u8]) -> Result<MerkleMatch> {
++    ensure!(header_bytes.len() == 80, "invalid Litecoin header length");
++    ensure!(!transaction_bytes.is_empty() && transaction_bytes.len() <= MAX_TRANSACTION,
++        "invalid Litecoin transaction size");
++    ensure!(!response.is_empty() && response.len() <= MAX_RESPONSE,
++        "invalid Electrum proof response size");
++    let header: Header = deserialize(header_bytes).context("invalid Litecoin header")?;
++    ensure!(header.block_hash() == request.block_hash, "Litecoin proof header changed");
++    let transaction: Transaction = deserialize(transaction_bytes).context("unsupported or invalid Litecoin transaction")?;
++    ensure!(serialize(&transaction) == transaction_bytes && transaction.compute_txid() == request.txid,
++        "Litecoin proof transaction changed");
++    // A 64-byte non-witness transaction can be confused with a Merkle internal
++    // node. Reject it even if a server supplies an otherwise matching branch.
++    ensure!(transaction.base_size() != 64, "ambiguous 64-byte Merkle leaf");
++    let envelope: Envelope = serde_json::from_slice(response).context("invalid Electrum proof response")?;
++    ensure!(envelope.jsonrpc == "2.0" && envelope.id == request.id && envelope.error.is_none(),
++        "Electrum proof request mismatch or error");
++    let proof = envelope.result;
++    ensure!(proof.block_height == request.height && proof.merkle.len() <= MAX_BRANCH,
++        "Electrum proof height or depth mismatch");
++    let mut position = u64::from(proof.pos);
++    let mut current = request.txid.to_byte_array();
++    for sibling in proof.merkle {
++        ensure!(sibling.len() == 64 && sibling.bytes().all(|b| b.is_ascii_hexdigit()),
++            "invalid Electrum Merkle hash");
++        let sibling: Txid = sibling.parse().context("invalid Electrum Merkle hash")?;
++        let sibling = sibling.to_byte_array();
++        let mut pair = [0; 64];
++        let (left, right) = if position & 1 == 0 { (current, sibling) } else { (sibling, current) };
++        pair[..32].copy_from_slice(&left);
++        pair[32..].copy_from_slice(&right);
++        current = sha256d::Hash::hash(&pair).to_byte_array();
++        position >>= 1;
++    }
++    ensure!(position == 0 && current == header.merkle_root.to_byte_array(),
++        "Electrum Merkle root or position mismatch");
++    Ok(MerkleMatch { txid: request.txid, block_hash: request.block_hash,
++        claimed_height: proof.block_height })
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/tests.rs b/swap-machine/src/litecoin_light/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/tests.rs
+@@ -0,0 +1,125 @@
++//! Synthetic vectors computed independently with Python hashlib, not a mined
++//! Litecoin block. Matching them explicitly makes no chain-validity claim.
++use super::*;
++use serde_json::{Value, json};
++
++fn bytes(hex: &str) -> Vec<u8> {
++    (0..hex.len()).step_by(2).map(|i|u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect()
++}
++fn fixture() -> (InclusionRequest, Vec<u8>, Vec<u8>, Value) {
++    let request = InclusionRequest { id: 7, height: 123,
++        block_hash: "fb6f54079ea63c4c7cf866ea10086c9bf31b34b681fcdf261f7b8e77f53e8260".parse().unwrap(),
++        txid: "c7446fb712e90d850729417cc8004058d45d479dd3b12a571d7d00fb3c04cf36".parse().unwrap() };
++    let response = json!({"jsonrpc":"2.0","id":7,"result":{
++        "block_height":123,"pos":1,"merkle":["1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100","3f3e3d3c3b3a393837363534333231302f2e2d2c2b2a29282726252423222120"]}});
++    (request, bytes("020000003333333333333333333333333333333333333333333333333333333333333333a3c12fc762f95f226e93318d8d50326b90a0cc97ab8ab3fd9112d3803d3fa66400f15365f0ff0f1e01000000"), bytes("020000000122222222222222222222222222222222222222222222222222222222222222220000000000feffffff01a086010000000000160014111111111111111111111111111111111111111100000000"), response)
++}
++fn check(request: &InclusionRequest, header: &[u8], raw: &[u8], response: &Value) -> Result<MerkleMatch> {
++    match_merkle_proof(request, header, raw, &serde_json::to_vec(response)?)
++}
++#[test]
++fn light_proof_matches_independent_vector_and_script_hash() -> Result<()> {
++    let (request, header, raw, response) = fixture();
++    let matched = check(&request, &header, &raw, &response)?;
++    assert_eq!(matched.txid(), request.txid);
++    assert_eq!(matched.block_hash(), request.block_hash);
++    assert_eq!(matched.claimed_height(), 123);
++    let tx: Transaction = deserialize(&raw)?;
++    assert_eq!(script_hash(&tx.output[0].script_pubkey), "5b977c73e66bf91562beb8b84d89a4e12130e7ab1bfe4b02f342d5deb9c7d282");
++    Ok(())
++}
++#[test]
++fn light_proof_rejects_wrong_request_header_and_transaction() {
++    let (mut request, header, raw, response) = fixture();
++    request.id += 1; assert!(check(&request, &header, &raw, &response).is_err()); request.id -= 1;
++    request.height += 1; assert!(check(&request, &header, &raw, &response).is_err()); request.height -= 1;
++    request.txid = Txid::all_zeros(); assert!(check(&request, &header, &raw, &response).is_err());
++    let (request, mut header, raw, response) = fixture();
++    header[76] ^= 1; assert!(check(&request, &header, &raw, &response).is_err()); header[76] ^= 1;
++    let mut changed = raw.clone(); changed[0] ^= 1;
++    assert!(check(&request, &header, &changed, &response).is_err());
++    let mut trailing = raw; trailing.push(0);
++    assert!(check(&request, &header, &trailing, &response).is_err());
++}
++#[test]
++fn light_proof_rejects_wrong_endianness_order_position_and_depth() {
++    let (request, header, raw, original) = fixture();
++    let mut altered = original.clone();
++    let first = altered["result"]["merkle"][0].as_str().unwrap();
++    let mut reversed = bytes(first); reversed.reverse();
++    altered["result"]["merkle"][0] = json!(reversed.iter().map(|b|format!("{b:02x}")).collect::<String>());
++    assert!(check(&request, &header, &raw, &altered).is_err());
++    for pos in [0,2,5,u32::MAX] {
++        let mut altered = original.clone(); altered["result"]["pos"] = json!(pos);
++        assert!(check(&request, &header, &raw, &altered).is_err());
++    }
++    let mut altered = original.clone(); altered["result"]["merkle"].as_array_mut().unwrap().reverse();
++    assert!(check(&request, &header, &raw, &altered).is_err());
++    for hashes in [vec![],vec!["00".repeat(32);33],vec!["gg".repeat(32)],vec!["0".repeat(63)]] {
++        let mut altered = original.clone(); altered["result"]["merkle"] = json!(hashes);
++        assert!(check(&request, &header, &raw, &altered).is_err());
++    }
++}
++#[test]
++fn light_proof_rejects_ambiguous_envelopes_and_server_errors() -> Result<()> {
++    let (request, header, raw, original) = fixture();
++    for (field,value) in [("jsonrpc",json!("1.0")),("id",json!("7")),("id",json!(7.0)),
++        ("id",json!(-1)),("error",json!({"code":-1,"message":"missing"})),
++        ("unexpected",json!(true)),("result",Value::Null)] {
++        let mut altered = original.clone(); altered[field] = value;
++        assert!(check(&request, &header, &raw, &altered).is_err());
++    }
++    for (field,value) in [("block_height",json!(-1)),("pos",json!(1.0)),("pos",json!(4294967296u64)),
++        ("confirmed",json!(true))] {
++        let mut altered = original.clone(); altered["result"][field] = value;
++        assert!(check(&request, &header, &raw, &altered).is_err());
++    }
++    let encoded = serde_json::to_string(&original)?.replacen("{", "{\"id\":7,", 1);
++    assert!(match_merkle_proof(&request, &header, &raw, encoded.as_bytes()).is_err());
++    let mut null_error = original; null_error["error"] = Value::Null;
++    check(&request, &header, &raw, &null_error)?;
++    Ok(())
++}
++#[test]
++fn light_proof_bounds_payloads_before_parsing() -> Result<()> {
++    let (request, header, raw, response) = fixture();
++    let response = serde_json::to_vec(&response)?;
++    for header in [vec![],vec![0;79],vec![0;81]] {
++        assert!(match_merkle_proof(&request,&header,&raw,&response).is_err());
++    }
++    for raw in [vec![],vec![0;MAX_TRANSACTION+1]] {
++        assert!(match_merkle_proof(&request,&header,&raw,&response).is_err());
++    }
++    for response in [vec![],vec![b' ';MAX_RESPONSE+1]] {
++        assert!(match_merkle_proof(&request,&header,&raw,&response).is_err());
++    }
++    Ok(())
++}
++#[test]
++fn light_proof_handles_single_leaf_but_rejects_64_byte_leaf() -> Result<()> {
++    let (mut request, header, raw, _) = fixture();
++    let mut header: Header = deserialize(&header)?;
++    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array(request.txid.to_byte_array());
++    request.block_hash = header.block_hash();
++    let response = json!({"jsonrpc":"2.0","id":7,"result":{"block_height":123,"pos":0,"merkle":[]}});
++    check(&request, &serialize(&header), &raw, &response)?;
++    let mut tx: Transaction = deserialize(&raw)?;
++    tx.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0;4]);
++    assert_eq!(tx.base_size(),64);
++    request.txid = tx.compute_txid();
++    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array(request.txid.to_byte_array());
++    request.block_hash = header.block_hash();
++    assert!(check(&request,&serialize(&header),&serialize(&tx),&response).is_err());
++    Ok(())
++}
++#[test]
++fn light_proof_does_not_claim_to_authenticate_witness() -> Result<()> {
++    let (request, header, raw, response) = fixture();
++    let mut tx: Transaction = deserialize(&raw)?;
++    tx.input[0].witness.push([1,2,3]);
++    assert_eq!(tx.compute_txid(),request.txid);
++    check(&request,&header,&serialize(&tx),&response)?;
++    tx.input[0].witness.clear(); tx.input[0].witness.push([9]);
++    check(&request,&header,&serialize(&tx),&response)?;
++    Ok(())
++}

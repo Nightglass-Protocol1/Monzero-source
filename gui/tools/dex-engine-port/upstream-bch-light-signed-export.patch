@@ -1,0 +1,193 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light.rs
+@@ -34,3 +34,33 @@
+         Ok(())
+     }
+ }
++
++impl AdmittedExecution<'_> {
++    /// Verify locally retained signed funding against the admitted BCH exchange.
++    /// No journal publication, chain observation, signing or relay occurs here.
++    pub fn verify_light_signed_funding(&self,claim:&crate::litecoin_light::vault::signing::review::claims::ClaimedSpend,
++        network:crate::litecoin_light::network::LightNetwork,expected:bitcoin::hashes::sha256::Hash,
++        sources:&[&[u8]],now:u64)->Result<swap_core::bch::funding::SignedFunding> {
++        use crate::litecoin_light::network::{LightNetwork,BchNetwork};
++        let quote_network=match network {
++            LightNetwork::BitcoinCash(BchNetwork::Mainnet)=>"bch-mainnet",
++            LightNetwork::BitcoinCash(BchNetwork::Testnet)=>"bch-testnet",
++            LightNetwork::BitcoinCash(BchNetwork::Regtest)=>"bch-regtest",
++            _=>anyhow::bail!("wrong local BCH funding chain"),
++        };
++        ensure!(quote_network==self.quote.terms()["bchNetwork"]
++            && network.genesis()==self.quote.terms()["bchGenesis"],"BCH local funding chain differs from quote");
++        let retained=claim.retained_bch_funding(network,self.quote.terms()["swapId"].parse()?,expected)?;
++        let unsigned=retained.unsigned();
++        let payment=unsigned.output.first().context("missing BCH local payment")?;
++        let minimum=self.quote.terms()["bchMinimumOutputAtoms"].parse::<u64>()?;
++        self.check_light_funding_payment(payment,claim.fee(),Amount::from_sat(minimum),now)?;
++        // SpendReview already established ownership of any second (change) output.
++        let change=unsigned.output.get(1).or_else(||retained.previous_outputs().first())
++            .context("missing BCH local change policy")?;
++        let preview=self.validate_bch_funding_preview(now,&bitcoin::consensus::serialize(unsigned),sources,
++            &change.script_pubkey,claim.fee().to_sat(),minimum)?;
++        ensure!(preview.previous_outputs()==retained.previous_outputs(),"BCH local funding prevouts differ from wallet claims");
++        preview.verify_signed(&bitcoin::consensus::serialize(retained.signed()))
++    }
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -874,3 +874,57 @@
+ 
+ #[cfg(target_os="linux")]
+ mod admission_helper;
++
++#[cfg(target_os="linux")]
++#[test]
++fn admitted_bch_trade_verifies_exact_local_wallet_signed_funding()->Result<()> {
++    use agreement::execution::{AdmittedExecution,NegotiationPins};
++    use crate::litecoin_light::{network::BchNetwork,account::Branch,vault::{SecretSeed,
++        signing::review::{SpendReview,OwnedInput,claims::ClaimedSpend}}};
++    use bitcoin::hashes::sha256;
++    for (rpc_network,light_network) in [
++        (crate::bch_rpc::BchNetwork::Regtest {checkpoint_height:1,checkpoint:bitcoin::BlockHash::from_byte_array([7;32])},BchNetwork::Regtest),
++        (crate::bch_rpc::BchNetwork::Mainnet,BchNetwork::Mainnet),
++        (crate::bch_rpc::BchNetwork::Testnet,BchNetwork::Testnet)] {
++    let setup=Setup::with_network(Some(rpc_network))?;
++    let snapshots=PrivateStore::new()?;let metadata=PrivateStore::new()?;let claims=PrivateStore::new()?;
++    let (selected,own,initial)=selected_with_outgoing(&setup,&snapshots.0,0)?;
++    let (_,peer,_)=selected_with_outgoing(&setup,&snapshots.0,1)?;
++    let (wallet,received)=selected.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++        1003,own.commitment(),peer.frame(),peer.signature())?;
++    let ack=wallet.acknowledgement(&setup.quote)?;
++    let agreed=wallet.accept_agreement(&setup.quote,&setup.policy,1004,&ack,
++        &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++    let agreement=agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder,&agreed)?;
++    let pins=NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
++    let execution=AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++        Role::BchFunder,setup.quote.commitment(),pins,1005)?;
++    let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([42;32]));
++    let account=seed.public_account(light_network,0)?;
++    let amount=setup.quote.recovery_plan().terms().locked_atoms;
++    let parent=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
++            script_sig:Default::default(),sequence:Sequence::MAX,witness:Default::default()}],
++        output:vec![TxOut {value:Amount::from_sat(amount+1000),
++            script_pubkey:account.derive(Branch::Receive,0)?.address().script_pubkey().clone()}]};
++    let mut unsigned=parent.clone();unsigned.input[0].previous_output=OutPoint {txid:parent.compute_txid(),vout:0};
++    unsigned.output=vec![TxOut {value:Amount::from_sat(amount),script_pubkey:setup.quote.recovery_plan().lock().script_pubkey()}];
++    let payment=unsigned.output[0].clone();let operation=setup.quote.terms()["swapId"].parse()?;
++    let claim=ClaimedSpend::retain(&claims.0,operation,SpendReview::new(&account,unsigned.clone(),
++        vec![OwnedInput {outpoint:unsigned.input[0].previous_output,prevout:parent.output[0].clone(),
++            branch:Branch::Receive,index:0}],&payment,None,Amount::from_sat(1000))?)?;
++    let commitment=claim.signing_commitment();let sources=serialize(&parent);let network=light_network.into();
++    assert!(execution.verify_light_signed_funding(&claim,network,commitment,&[&sources],1006).is_err());
++    let signed=claim.approve_and_sign(&seed,commitment)?;
++    let accepted=execution.verify_light_signed_funding(&claim,network,commitment,&[&sources],1006)?;
++    assert_eq!(accepted.transaction(),&signed);assert_ne!(signed.compute_txid(),unsigned.compute_txid());
++    assert!(execution.verify_light_signed_funding(&claim,network,sha256::Hash::hash(b"wrong"),&[&sources],1006).is_err());
++    let wrong_network=if light_network==BchNetwork::Mainnet {BchNetwork::Testnet}else{BchNetwork::Mainnet};
++    assert!(execution.verify_light_signed_funding(&claim,wrong_network.into(),commitment,&[&sources],1006).is_err());
++    assert!(execution.verify_light_signed_funding(&claim,network,commitment,&[b"changed"],1006).is_err());
++    assert!(execution.verify_light_signed_funding(&claim,network,commitment,&[&sources],1004).is_err());
++    assert!(execution.verify_light_signed_funding(&claim,network,commitment,&[&sources],2000).is_err());
++    assert!(execution.prepared_bch_funding()?.is_none());
++    }
++    Ok(())
++}
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
+@@ -74,3 +74,46 @@
+     assert!(reopened.approve_and_sign(&seed,commitment).is_err());
+     assert_eq!(fs::read(&approval)?,b"conflicting intent");Ok(())
+ }
++
++#[test]
++fn retained_bch_funding_exports_exact_signed_identity_and_rejects_changed_claims()->Result<()> {
++    use crate::litecoin_light::network::{BchNetwork,DogeNetwork};
++    use bitcoin::{absolute,transaction::Version,TxIn,Sequence,Txid,ScriptBuf};
++    let directory=Directory::new()?;let operation=Uuid::new_v4();
++    let seed=SecretSeed::from_bytes(Zeroizing::new([42;32]));
++    let account=seed.public_account(BchNetwork::Regtest,0)?;
++    let prevout=TxOut {value:Amount::from_sat(100000),
++        script_pubkey:account.derive(Branch::Receive,0)?.address().script_pubkey().clone()};
++    let mut contract=vec![0xaa,0x20];contract.extend([7;32]);contract.push(0x87);
++    let payment=TxOut {value:Amount::from_sat(99000),script_pubkey:ScriptBuf::from_bytes(contract)};
++    let unsigned=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
++            script_sig:Default::default(),sequence:Sequence::MAX,witness:Default::default()}],output:vec![payment.clone()]};
++    let review=||SpendReview::new(&account,unsigned.clone(),vec![OwnedInput {
++        outpoint:unsigned.input[0].previous_output,prevout:prevout.clone(),branch:Branch::Receive,index:0}],
++        &payment,None,Amount::from_sat(1000));
++    let claim=ClaimedSpend::retain(&directory.0,operation,review()?)?;
++    let commitment=claim.signing_commitment();let network=BchNetwork::Regtest.into();
++    assert!(claim.retained_bch_funding(network,operation,commitment).is_err());
++    assert!(claim.retained_funding_psbt(network,operation,commitment).is_err());
++    let signed=claim.approve_and_sign(&seed,commitment)?;
++    assert_ne!(signed.compute_txid(),unsigned.compute_txid());
++    let snapshot=||->Result<std::collections::BTreeMap<String,Vec<u8>>> {
++        fs::read_dir(&directory.0)?.map(|entry| {let p=entry?.path();
++            Ok((p.file_name().unwrap().to_string_lossy().into_owned(),fs::read(p)?))}).collect()
++    };
++    let before=snapshot()?;
++    let exported=claim.retained_bch_funding(network,operation,commitment)?;
++    assert_eq!(exported.unsigned(),&unsigned);assert_eq!(exported.signed(),&signed);
++    assert_eq!(exported.previous_outputs(),&[prevout]);
++    assert!(claim.retained_bch_funding(network,Uuid::new_v4(),commitment).is_err());
++    assert!(claim.retained_bch_funding(network,operation,sha256::Hash::hash(b"wrong")).is_err());
++    assert!(claim.retained_bch_funding(BchNetwork::Mainnet.into(),operation,commitment).is_err());
++    assert!(claim.retained_bch_funding(DogeNetwork::Regtest.into(),operation,commitment).is_err());
++    assert_eq!(snapshot()?,before);drop(claim);
++    let reopened=ClaimedSpend::open(&directory.0,operation,&account,&payment,None,Amount::from_sat(1000),commitment)?;
++    assert_eq!(reopened.retained_bch_funding(network,operation,commitment)?.signed(),&signed);
++    fs::write(directory.0.join(format!("ltc-spend-{operation}.json")),b"changed")?;
++    assert!(reopened.retained_bch_funding(network,operation,commitment).is_err());
++    Ok(())
++}
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -3,6 +3,20 @@
+ use super::*;
+ use bitcoin::{consensus::serialize,hashes::{Hash,sha256}};
+ pub struct ClaimedSpend {journal:Journal,review:SpendReview,records:Vec<(String,Vec<u8>)>}
++/// Historical local BCH funding, verified under the wallet's input-claim lease.
++/// This proves owned inputs and retained signatures, not live spendability,
++/// trade admission, recovery readiness or permission to relay.
++pub struct RetainedBchFunding {
++    unsigned:Transaction,
++    signed:Transaction,
++    previous_outputs:Vec<TxOut>,
++}
++impl RetainedBchFunding {
++    pub fn unsigned(&self)->&Transaction {&self.unsigned}
++    pub fn signed(&self)->&Transaction {&self.signed}
++    pub fn previous_outputs(&self)->&[TxOut] {&self.previous_outputs}
++}
++
+ fn records(operation:Uuid,review:&SpendReview)->Result<Vec<(String,Vec<u8>)>> {
+     ensure!(!operation.is_nil(),"missing Litecoin spend operation");
+     let inputs=review.inputs.iter().map(|input|serde_json::json!({"outpoint":input.outpoint.to_string(),
+@@ -55,6 +69,24 @@
+             input.witness_utxo=Some(owned.prevout.clone());
+         }
+         Ok(psbt)
++    }
++    /// Export already-signed BCH funding without unlocking, signing or mutation.
++    /// The DEX must validate the covenant and policy before admitting these bytes.
++    /// Operation, chain, account-owned inputs and every durable claim are checked;
++    /// the final transaction ID must come from `signed`, never `unsigned`.
++    pub fn retained_bch_funding(&self,network:LightNetwork,operation:Uuid,expected:sha256::Hash)
++        ->Result<RetainedBchFunding> {
++        self.check_signing_review(expected)?;
++        ensure!(network==self.review.account.network()
++            && network.script_kind()==crate::litecoin_light::network::ScriptKind::P2pkhForkId,
++            "wrong retained BCH funding network");
++        ensure!(!operation.is_nil() && self.records[0].0==format!("ltc-spend-{operation}.json"),
++            "BCH funding claim belongs to another operation");
++        ensure!(self.review.inputs.iter().all(|input|input.prevout.script_pubkey.is_p2pkh()),
++            "unsupported retained BCH funding input");
++        let signed=self.load_signed()?;
++        Ok(RetainedBchFunding {unsigned:self.transaction().clone(),signed,
++            previous_outputs:self.review.inputs.iter().map(|input|input.prevout.clone()).collect()})
+     }
+     pub fn transaction(&self)->&Transaction {self.review.transaction()}
+     pub fn fee(&self)->Amount {self.review.fee()}

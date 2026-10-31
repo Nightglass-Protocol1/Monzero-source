@@ -1,0 +1,131 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -25,6 +25,12 @@
+     enum Action {Send,Retransmit}
+     fn valid_request(request:&Request,mode:&str)->bool {
+         let (schema,action,approval,funding)=match mode {
++            "--native-recovery-cancel-review-stdio-v1"=>("monzero-ltc-native-recovery-cancel-review-request-v1",false,false,false),
++            "--native-recovery-cancel-submit-stdio-v1"=>("monzero-ltc-native-recovery-cancel-submit-request-v1",false,true,false),
++            "--native-recovery-cancel-check-stdio-v1"=>("monzero-ltc-native-recovery-cancel-check-request-v1",false,false,false),
++            "--native-recovery-punish-review-stdio-v1"=>("monzero-ltc-native-recovery-punish-review-request-v1",false,false,false),
++            "--native-recovery-punish-submit-stdio-v1"=>("monzero-ltc-native-recovery-punish-submit-request-v1",false,true,false),
++            "--native-recovery-punish-check-stdio-v1"=>("monzero-ltc-native-recovery-punish-check-request-v1",false,false,false),
+             "--redemption-review-stdio-v1"=>("monzero-ltc-redemption-review-request-v1",false,false,false),
+             "--redemption-submit-stdio-v1"=>("monzero-ltc-redemption-submit-request-v1",false,true,false),
+             "--redemption-check-stdio-v1"=>("monzero-ltc-redemption-check-request-v1",false,false,false),
+@@ -792,6 +798,55 @@
+         Ok(serde_json::json!({"schema":"monzero-ltc-redemption-submit-response-v1","requestId":request.request_id,
+             "snapshot":execution.saved_status()?,"outcome":outcome}))
+     }
++    fn native_recovery_mode(mode:&str)->Option<(swap_machine::litecoin_negotiation::execution::recovery_relay::RecoverySpend,&'static str,&'static str)> {
++        use swap_machine::litecoin_negotiation::execution::recovery_relay::RecoverySpend;
++        match mode {
++            "--native-recovery-cancel-review-stdio-v1"=>Some((RecoverySpend::Cancel,"cancel","review")),
++            "--native-recovery-cancel-submit-stdio-v1"=>Some((RecoverySpend::Cancel,"cancel","submit")),
++            "--native-recovery-cancel-check-stdio-v1"=>Some((RecoverySpend::Cancel,"cancel","check")),
++            "--native-recovery-punish-review-stdio-v1"=>Some((RecoverySpend::Punish,"punish","review")),
++            "--native-recovery-punish-submit-stdio-v1"=>Some((RecoverySpend::Punish,"punish","submit")),
++            "--native-recovery-punish-check-stdio-v1"=>Some((RecoverySpend::Punish,"punish","check")),
++            _=>None,
++        }
++    }
++    // Native-funder recovery uses only the retained agreement and Litecoin node.
++    // An unavailable native wallet or expired commercial quote must not prevent
++    // cancellation or the agreed punishment path. No new funding is authorized.
++    async fn native_recovery_rpc(config:&Config,execution:&mut Execution,request:&Request,mode:&str)->Result<serde_json::Value> {
++        use swap_machine::litecoin_rpc::LitecoinRpc;
++        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        ensure!(valid_request(request,mode),"invalid native-funder recovery request");
++        let (kind,name,operation)=native_recovery_mode(mode).context("invalid native-funder recovery mode")?;
++        ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder"
++            && config.policy.ltc_network==LtcNetwork::Regtest,"recovery requires isolated native funder configuration");
++        let schema=format!("monzero-ltc-native-recovery-{name}-{operation}-response-v1");
++        if operation=="review" {
++            let review=execution.review_recovery_spend(kind)?;
++            return Ok(serde_json::json!({"schema":schema,"requestId":request.request_id,
++                "snapshot":execution.saved_status()?,"review":{"details":review.details,
++                    "commitment":review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()}}));
++        }
++        let approved=if operation=="submit" {
++            let approved=parse_commitment(request.commitment.as_deref().context("missing recovery approval")?)?;
++            ensure!(execution.review_recovery_spend(kind)?.commitment==approved,"native-funder recovery review changed");
++            Some(approved)
++        } else { None };
++        let (_rpc,bytes)=private_bytes(config.funding_rpc_file.as_deref().context("missing recovery RPC configuration")?,false)?;
++        let rpc:FundingRpc=serde_json::from_slice(&bytes)?;
++        ensure!(rpc.valid(),"invalid native-funder recovery RPC configuration");
++        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
++            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        if operation=="check" {
++            let observation=execution.check_recovery_spend(&ltc,kind).await?;
++            return Ok(serde_json::json!({"schema":schema,"requestId":request.request_id,
++                "snapshot":execution.saved_status()?,"observation":observation}));
++        }
++        let outcome=execution.submit_reviewed_recovery_spend(&ltc,kind,approved.context("missing recovery approval")?).await?;
++        Ok(serde_json::json!({"schema":schema,"requestId":request.request_id,
++            "snapshot":execution.saved_status()?,"outcome":outcome}))
++    }
+     #[cfg(test)]
+     mod tests {
+         use super::*;
+@@ -812,6 +867,34 @@
+                 assert!(preparation_config_valid(&format!("{prefix}-v4"),&prefix,Some(&observer),1,2,3));
+                 assert!(!preparation_config_valid(&format!("{prefix}-v4"),&prefix,None,1,2,3));
+             }
++            Ok(())
++        }
++        #[test]
++        fn native_recovery_requests_bind_role_operation_and_approval()->Result<()> {
++            for kind in ["cancel","punish"] {for operation in ["review","submit","check"] {
++                let mode=format!("--native-recovery-{kind}-{operation}-stdio-v1");
++                assert!(native_recovery_mode(&mode).is_some());
++                let mut value=serde_json::json!({"schema":format!("monzero-ltc-native-recovery-{kind}-{operation}-request-v1"),
++                    "requestId":uuid::Uuid::new_v4()});
++                if operation=="submit" {value["commitment"]=serde_json::json!("a".repeat(64));}
++                assert!(valid_request(&serde_json::from_value(value.clone())?,&mode));
++                for other_kind in ["cancel","punish","refund"] {for other_op in ["review","submit","check"] {
++                    assert_eq!(valid_request(&serde_json::from_value(value.clone())?,
++                        &format!("--native-recovery-{other_kind}-{other_op}-stdio-v1")),kind==other_kind && operation==other_op);
++                }}
++                for key in ["action","priority","safetyBlocks","requestId","commitment"] {
++                    let mut changed=value.clone();
++                    changed[key]=match key {
++                        "action"=>serde_json::json!("send"),"requestId"=>serde_json::json!(uuid::Uuid::nil()),
++                        "commitment"=>if operation=="submit" {serde_json::json!("invalid")} else {serde_json::json!("a".repeat(64))},
++                        _=>serde_json::json!(1),
++                    };
++                    assert!(!valid_request(&serde_json::from_value(changed)?,&mode));
++                }
++                assert!(!valid_request(&serde_json::from_value(value.clone())?,"--redemption-submit-stdio-v1"));
++            }}
++            for mode in ["--native-recovery-refund-review-stdio-v1","--recovery-cancel-review-stdio-v1",
++                "--native-recovery-punish-prepare-stdio-v1"] {assert!(native_recovery_mode(mode).is_none());}
+             Ok(())
+         }
+         #[test]
+@@ -1030,6 +1113,23 @@
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
++        if args.len()==4 && args[2]=="--config-file"
++            && args[1].to_str().and_then(native_recovery_mode).is_some() {
++            let mut input=Vec::new();std::io::stdin().take(513).read_to_end(&mut input)?;
++            ensure!(input.len()<=512,"oversized native-funder recovery request");
++            let request:Request=serde_json::from_slice(&input)?;
++            let mode=args[1].to_str().context("invalid recovery mode")?;
++            ensure!(valid_request(&request,mode),"invalid native-funder recovery request");
++            let (_lease,config)=load(Path::new(&args[3]))?;
++            ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder",
++                "invalid native-funder recovery configuration role");
++            let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,config.trade_id,
++                &config.policy,LocalRole::NativeFunder,config.pins)?;
++            let response=tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(native_recovery_rpc(&config,&mut execution,&request,mode))?;
++            let output=serde_json::to_vec(&response)?;ensure!(output.len()<=8192,"oversized recovery response");
++            std::io::stdout().write_all(&output)?;return Ok(());
++        }
+         if args.len()==4 && ["--redemption-review-stdio-v1","--redemption-submit-stdio-v1","--redemption-check-stdio-v1"].iter().any(|m|args[1]==*m) && args[2]=="--config-file" {
+             let mut input=Vec::new();std::io::stdin().take(513).read_to_end(&mut input)?;
+             ensure!(input.len()<=512,"oversized redemption request");

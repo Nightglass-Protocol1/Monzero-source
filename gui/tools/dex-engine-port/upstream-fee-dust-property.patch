@@ -1,0 +1,27 @@
+--- a/swap-core/src/bitcoin.rs
++++ b/swap-core/src/bitcoin.rs
+@@ -480,10 +480,13 @@
+             let fee_rate = FeeRate::from_sat_per_vb(sat_per_vb).unwrap();
+ 
+             let relay_fee = FeeRate::from_sat_per_vb(1).unwrap();
+-            let is_fee = estimate_fee(weight, Some(amount), fee_rate, relay_fee).unwrap();
+-
+-            // weight / 4 * 100 = 10,000 sats which is always lower than MAX_ABSOLUTE_TX_FEE
+-            assert!(is_fee <= MAX_ABSOLUTE_TX_FEE);
++            let fee = estimate_fee(weight, Some(amount), fee_rate, relay_fee);
++            if amount <= bitcoin_wallet::DUST_AMOUNT {
++                assert!(fee.is_err());
++            } else {
++                // The accepted-amount branch retains the absolute fee bound.
++                assert!(fee.unwrap() <= MAX_ABSOLUTE_TX_FEE);
++            }
+         }
+     }
+ 
+--- a/swap-core/proptest-regressions/bitcoin.txt
++++ b/swap-core/proptest-regressions/bitcoin.txt
+@@ -5,3 +5,4 @@
+ # It is recommended to check this file in to source control so that
+ # everyone who runs the test benefits from these saved cases.
+ cc dd09112d3bef8c0fb013a7fc8a1e2bb68e9a5db3041b954c7b7723e8fcace068 # shrinks to funding_amount = 3000, num_utxos = 1, sats_per_vb = 1, key = Xpriv { network: Test, depth: 0, parent_fingerprint: 00000000, child_number: Normal { index: 0 }, private_key: SecretKey(#dc659542f09c329f), chain_code: c94a49bbee951f7f7401c801db73c23cf17b0b3aa2f6246a8616fe2205a6ca51 }, alice = Point<Normal,Public,NonZero>(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798), bob = Point<Normal,Public,NonZero>(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)
++cc 590ecd262b26d62ccac1bf92f5381bf18208f92a5aaf6588bf0b6906d1913bf7 # shrinks to amount = 1

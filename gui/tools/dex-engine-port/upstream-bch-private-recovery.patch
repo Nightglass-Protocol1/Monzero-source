@@ -1,0 +1,257 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
+@@ -8,6 +8,7 @@
+ mod claims;
+ mod locks;
+ pub mod signing;
++pub mod recovery;
+ 
+ const TEMPLATE: &str = "monzero-bch-funding-template-v1";
+ const PIN: &str = "monzero-bch-funding-pin-v2";
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
+@@ -64,7 +64,7 @@
+         Ok(self.restore_signed_bch_funding()?.map(|(signed,_)|signed))
+     }
+ 
+-    fn restore_signed_bch_funding(&self) -> Result<Option<(SignedFunding,u64)>> {
++    pub(super) fn restore_signed_bch_funding(&self) -> Result<Option<(SignedFunding,u64)>> {
+         let Some(bytes) = optional(&self.metadata,&record_name(self.quote,"signed"))? else {return Ok(None)};
+         let (review,prepared,locked) = self.signing_review()?;
+         let intent_bytes = self.metadata.read(&record_name(self.quote,"signing-intent"))?;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/refund.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/refund.rs
+@@ -120,8 +120,14 @@
+     /// Historical restoration revalidates the original admission time, never
+     /// renews quote expiry and never publishes a signature or funding bytes.
+     pub fn received_bch_refund_adaptor(&self) -> Result<Option<EncryptedSignature>> {
++        Ok(self.received_bch_refund_record()?.map(|(encrypted,_,_)|encrypted))
++    }
++
++    pub(super) fn received_bch_refund_record(&self) -> Result<Option<(EncryptedSignature,[u8;32],u64)>> {
+         ensure!(self.role == Role::BchFunder,"wrong BCH refund receipt owner");
+-        optional(&self.metadata,&name(self.quote,self.role,"authenticated"))?
+-            .map(|bytes|self.refund_receipt(&bytes).map(|(_,encrypted)|encrypted)).transpose()
++        let Some(bytes) = optional(&self.metadata,&name(self.quote,self.role,"authenticated"))? else {return Ok(None)};
++        let (receipt,encrypted) = self.refund_receipt(&bytes)?;
++        let mut hash = Sha256::new(); hash.update(b"monzero-bch-refund-receipt-v1\0"); hash.update(&bytes);
++        Ok(Some((encrypted,hash.finalize().into(),receipt.signed.admitted_at)))
+     }
+ }
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing.rs
+@@ -59,6 +59,7 @@
+     }).collect::<std::io::Result<_>>()?;
+     let signed = execution.sign_bch_funding(rpc,&review.commitment,1012).await?;
+     let raw = serialize(signed.transaction()); let outpoint = signed.lock_outpoint();
++    let recovery = recovery::exercise(&mut execution,setup,metadata,snapshots,&signed)?;
+     assert!(signed_path.is_file()); assert_eq!(server.state.lock().unwrap().sign_calls,1);
+     assert_eq!(execution.sign_bch_funding(rpc,&review.commitment,1013).await?.lock_outpoint(),outpoint);
+     assert_eq!(server.state.lock().unwrap().sign_calls,1);
+@@ -66,6 +67,7 @@
+     drop(execution);
+     let execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+     assert_eq!(serialize(execution.signed_bch_funding()?.unwrap().transaction()),raw);
++    assert_eq!(execution.retained_bch_recovery()?.unwrap().commitment(),&recovery);
+     assert!(execution.review_bch_funding_signing(rpc,2000).is_err());
+     let record = std::fs::read(&signed_path)?;
+     std::fs::write(&signed_path,b"{}")?;
+@@ -97,3 +99,5 @@
+     }
+     Ok(())
+ }
++
++mod recovery;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery.rs
+@@ -0,0 +1,117 @@
++//! Private recovery transactions bound to exact retained signed funding and
++//! authenticated refund protection. No chain maturity, release or relay grant.
++use super::*;
++use bitcoin::{consensus::{serialize,deserialize},OutPoint,Transaction,Txid};
++use ecdsa_fun::fun::{Point,Scalar};
++use zeroize::{Zeroize,Zeroizing};
++
++const RECORD: &str = "monzero-bch-private-recovery-v1";
++const PIN: &str = "monzero-bch-private-recovery-pin-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Record {
++    schema: String, admission: [u8;32], funding: [u8;32], receipt: [u8;32], prepared_at: u64,
++    cancel: Vec<u8>, refund: Vec<u8>, punish: Vec<u8>,
++}
++impl Drop for Record { fn drop(&mut self) { self.refund.zeroize(); } }
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Pin { schema: String, admission: [u8;32], record: [u8;32] }
++
++/// No Debug/Serialize: publishing the refund reveals the BCH funder's native
++/// spend share to its peer. Keep it private until an explicit refund release
++/// decision backed by both-chain observations and confirmation policy.
++pub struct PrivateRecovery {
++    cancel: Transaction, refund: Zeroizing<Vec<u8>>, punish: Transaction,
++    commitment: [u8;32], prepared_at: u64,
++}
++impl PrivateRecovery {
++    pub fn cancel(&self) -> &Transaction { &self.cancel }
++    pub fn punish(&self) -> &Transaction { &self.punish }
++    pub fn commitment(&self) -> &[u8;32] { &self.commitment }
++    pub fn prepared_at(&self) -> u64 { self.prepared_at }
++    pub fn refund_txid(&self) -> Result<Txid> {
++        Ok(deserialize::<Transaction>(self.refund_bytes())?.compute_txid())
++    }
++    pub(crate) fn refund_bytes(&self) -> &[u8] { &self.refund }
++}
++fn optional(journal: &Journal,name: &str) -> Result<Option<Vec<u8>>> {
++    match journal.read(name) {
++        Ok(bytes) => Ok(Some(bytes)),
++        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound) => Ok(None),
++        Err(e) => Err(e),
++    }
++}
++impl AdmittedExecution<'_> {
++    fn recovery_record(&self,now: u64) -> Result<Record> {
++        ensure!(self.role == Role::BchFunder,"only BCH funder prepares private BCH refund");
++        self.quote.check_policy(self.policy,now)?;
++        let (signed,signed_at) = self.restore_signed_bch_funding()?.context("missing exact signed BCH funding")?;
++        let (encrypted,receipt,received_at) = self.received_bch_refund_record()?.context("missing authenticated BCH refund protection")?;
++        ensure!(now >= signed_at && now >= received_at,"BCH recovery preparation predates funding or refund receipt");
++        let agreed = self.restore_agreement()?;
++        let plan = self.quote.recovery_plan();
++        let funding = serialize(signed.transaction());
++        let cancel = plan.lock().prepare_timeout(&funding,&plan.lock_spend_terms(signed.lock_outpoint()))?;
++        let cancel_raw = serialize(&cancel);
++        let outpoint = OutPoint {txid:cancel.compute_txid(),vout:0};
++        let terms = plan.recovery_spend_terms(outpoint);
++        let mut secret = Zeroizing::new(agreed.owned().native_spend_share().as_bytes()); secret.reverse();
++        let decrypt = Scalar::from_bytes(*secret).context("invalid owned BCH adaptor scalar")?
++            .non_zero().context("zero owned BCH adaptor scalar")?;
++        let signer = Point::from_bytes(plan.recovery().terms().signing_key.serialize()).context("invalid BCH refund signer")?;
++        let signature = Zeroizing::new(plan.recovery().data_message().decrypt(&signer,&decrypt,encrypted)?);
++        let refund = plan.recovery().prepare_redemption(&cancel_raw,&terms,&signature)?;
++        let punish = plan.recovery().prepare_timeout(&cancel_raw,&terms)?;
++        Ok(Record {schema:RECORD.into(),admission:self.admission_digest()?,
++            funding:hash("monzero-bch-exact-signed-funding-v1",&funding),receipt,prepared_at:now,
++            cancel:cancel_raw,refund:serialize(&refund),punish:serialize(&punish)})
++    }
++
++    fn check_recovery_record(&self,bytes: &[u8]) -> Result<PrivateRecovery> {
++        ensure!(bytes.len() <= 100_000,"oversized private BCH recovery record");
++        let record: Record = serde_json::from_slice(bytes)?;
++        let expected = self.recovery_record(record.prepared_at)?;
++        ensure!(Zeroizing::new(serde_json::to_vec(&expected)?).as_slice() == bytes,
++            "private BCH recovery differs from retained funding, refund or admission");
++        Ok(PrivateRecovery {cancel:deserialize(&record.cancel)?,refund:Zeroizing::new(record.refund.clone()),
++            punish:deserialize(&record.punish)?,commitment:hash(RECORD,bytes),prepared_at:record.prepared_at})
++    }
++
++    /// Persist secret-bearing recovery bytes before publishing their trusted
++    /// metadata pin. An orphan snapshot can only finish its identical original
++    /// publication; it never selects a new funding transaction or refund proof.
++    pub fn retain_bch_recovery(&mut self,now: u64) -> Result<PrivateRecovery> {
++        self.quote.check_policy(self.policy,now)?;
++        if let Some(existing) = self.retained_bch_recovery()? {
++            ensure!(now >= existing.prepared_at,"BCH recovery time moved backwards");
++            return Ok(existing)
++        }
++        let slot = record_name(self.quote,"private-recovery");
++        let existing = optional(&Journal::open(&self.snapshots)?,&slot)?;
++        let bytes = match existing {
++            Some(bytes) => Zeroizing::new(bytes),
++            None => Zeroizing::new(serde_json::to_vec(&self.recovery_record(now)?)?),
++        };
++        let recovery = self.check_recovery_record(&bytes)?;
++        ensure!(now >= recovery.prepared_at,"BCH recovery publication predates preparation");
++        Journal::open(&self.snapshots)?.retain(&slot,&bytes)?;
++        let pin = Pin {schema:PIN.into(),admission:self.admission_digest()?,record:recovery.commitment};
++        self.metadata.retain(&record_name(self.quote,"recovery-pin"),&serde_json::to_vec(&pin)?)?;
++        Ok(recovery)
++    }
++
++    /// Restore historical protection after expiry without granting new funding
++    /// or releasing the private refund. A missing pin is not input-retry or
++    /// re-signing permission; a retained orphan still occupies its fixed slot.
++    pub fn retained_bch_recovery(&self) -> Result<Option<PrivateRecovery>> {
++        let Some(bytes) = optional(&self.metadata,&record_name(self.quote,"recovery-pin"))? else {return Ok(None)};
++        ensure!(bytes.len() <= 4096,"oversized BCH recovery pin");
++        let pin: Pin = serde_json::from_slice(&bytes)?;
++        ensure!(pin.schema == PIN && pin.admission == self.admission_digest()?
++            && serde_json::to_vec(&pin)? == bytes,"BCH recovery pin changed");
++        let bytes = Zeroizing::new(Journal::open(&self.snapshots)?.read(&record_name(self.quote,"private-recovery"))?);
++        ensure!(hash(RECORD,&bytes) == pin.record,"BCH private recovery digest mismatch");
++        Ok(Some(self.check_recovery_record(&bytes)?))
++    }
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/recovery.rs
+@@ -0,0 +1,70 @@
++use super::*;
++use swap_core::bch::funding::SignedFunding;
++
++pub(super) fn exercise(execution: &mut AdmittedExecution<'_>,setup: &Setup,metadata: &PrivateStore,
++    snapshots: &PrivateStore,signed: &SignedFunding) -> Result<[u8;32]> {
++    assert!(execution.retain_bch_recovery(1013).is_err()); // No refund protection yet.
++    assert!(execution.retained_bch_recovery()?.is_none());
++    let (n,nv,initial) = selected_with_outgoing(setup,&snapshots.0,1)?;
++    let (_,bv,_) = selected_with_outgoing(setup,&snapshots.0,0)?;
++    let (wallet,received) = n.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++        1003,nv.commitment(),bv.frame(),bv.signature())?;
++    let ack = wallet.acknowledgement(&setup.quote)?;
++    let agreed = wallet.accept_agreement(&setup.quote,&setup.policy,1004,&ack,
++        &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++    let agreement = agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder,&agreed)?;
++    let pins = NegotiationPins {initial,selection:*n.commitment(),outgoing:*nv.commitment(),received,agreement};
++    let nmeta = PrivateStore::new()?;
++    let mut native = AdmittedExecution::admit(&nmeta.0,&snapshots.0,&setup.quote,&setup.policy,
++        Role::NativeFunder,setup.quote.commitment(),pins,1005)?;
++    let frame = native.prepare_bch_refund_adaptor(1006)?;
++    let key = SigningKey::from_bytes(&[2;32]);
++    let signature = key.sign(&agreement::refund::signing_bytes(&frame)?).to_bytes();
++    let outgoing = native.retain_outgoing_bch_refund(1007,&signature)?;
++    let encrypted = execution.accept_bch_refund_adaptor(1014,outgoing.frame(),outgoing.signature())?;
++    assert!(execution.retain_bch_recovery(1013).is_err());
++    assert!(native.retain_bch_recovery(1015).is_err());
++    let recovery = execution.retain_bch_recovery(1015)?;
++    assert_eq!(recovery.cancel().input[0].previous_output,signed.lock_outpoint());
++    assert_ne!(recovery.cancel().input[0].previous_output.txid,
++        execution.prepared_bch_funding()?.unwrap().preview().transaction().compute_txid());
++    let plan = setup.quote.recovery_plan();
++    assert_eq!(recovery.cancel().input[0].sequence,Sequence(20));
++    assert_eq!(recovery.cancel().output[0].value.to_sat(),99_000);
++    assert_eq!(recovery.punish().input[0].sequence,Sequence(30));
++    assert_eq!(recovery.punish().output[0].value.to_sat(),97_000);
++    let refund: Transaction = deserialize(recovery.refund_bytes())?;
++    assert_eq!(refund.compute_txid(),recovery.refund_txid()?);
++    assert_eq!(refund.input[0].previous_output,recovery.punish().input[0].previous_output);
++    assert_eq!(refund.output[0].script_pubkey,plan.terms().bch_funder_refund);
++    assert_eq!(refund.output[0].value.to_sat(),97_000);
++    // The private refund really reveals the BCH share to its native peer once
++    // published. This is why the production bundle has no public refund bytes.
++    let recovered = native.restore_agreement()?.owned().recover_spend_key(&setup.quote,
++        &serialize(recovery.cancel()),refund.input[0].previous_output,recovery.refund_bytes(),&encrypted)?;
++    assert_eq!(recovered.as_bytes(),(setup.spend[0]+setup.spend[1]).as_bytes());
++    let digest = *recovery.commitment();
++    assert_eq!(execution.retain_bch_recovery(1016)?.commitment(),&digest);
++    assert!(execution.retain_bch_recovery(1014).is_err());
++    assert!(execution.retain_bch_recovery(2000).is_err());
++    assert_eq!(execution.retained_bch_recovery()?.unwrap().commitment(),&digest);
++    let record = snapshots.0.join(format!("{}.bch-funding-private-recovery",setup.quote.terms()["swapId"]));
++    let pin = metadata.0.join(format!("{}.bch-funding-recovery-pin",setup.quote.terms()["swapId"]));
++    let original = zeroize::Zeroizing::new(std::fs::read(&record)?);
++    // Simulate private-snapshot-written/metadata-pin-not-published interruption.
++    std::fs::remove_file(&pin)?;
++    assert!(execution.retained_bch_recovery()?.is_none());
++    let restored = execution.retain_bch_recovery(1017)?;
++    assert_eq!(restored.commitment(),&digest); assert_eq!(restored.prepared_at(),1015);
++    std::fs::write(&record,b"{}")?;
++    assert!(execution.retained_bch_recovery().is_err());
++    assert!(execution.retain_bch_recovery(1018).is_err());
++    std::fs::write(&record,&original)?;
++    assert_eq!(execution.retained_bch_recovery()?.unwrap().commitment(),&digest);
++    let receipt = metadata.0.join(format!("{}.bch-refund-bch-funder-authenticated",setup.quote.terms()["swapId"]));
++    let original = std::fs::read(&receipt)?; std::fs::remove_file(&receipt)?;
++    assert!(execution.retained_bch_recovery().is_err());
++    std::fs::write(&receipt,original)?; std::fs::set_permissions(&receipt,std::fs::Permissions::from_mode(0o600))?;
++    assert_eq!(execution.retained_bch_recovery()?.unwrap().commitment(),&digest);
++    Ok(digest)
++}

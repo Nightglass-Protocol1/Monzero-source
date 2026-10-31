@@ -1,0 +1,111 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ed7afff3b..d8b018b05 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10881,6 +10881,7 @@ dependencies = [
+  "curve25519-dalek-ng",
+  "digest_auth",
+  "ecdsa_fun",
++ "ed25519-dalek",
+  "libc",
+  "libp2p",
+  "monero-address",
+diff --git a/swap-machine/Cargo.toml b/swap-machine/Cargo.toml
+index c13086d9e..5b6b30578 100644
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -4,6 +4,7 @@ version = "4.0.0"
+ edition = "2024"
+ 
+ [dependencies]
++ed25519-dalek = "=2.2.0"
+ zeroize = { workspace = true }
+ digest_auth = "=0.3.1"
+ reqwest = { workspace = true }
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+index 2aeaf928e..a64e22f09 100644
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -4,6 +4,7 @@ pub mod common;
+ pub mod xmz_funding;
+ pub mod native_funding_rpc;
+ pub mod native_quote_destinations;
++pub mod native_quote_signatures;
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/swap-machine/src/native_quote_signatures.rs b/swap-machine/src/native_quote_signatures.rs
+new file mode 100644
+index 000000000..d871f9cf3
+--- /dev/null
++++ b/swap-machine/src/native_quote_signatures.rs
+@@ -0,0 +1,69 @@
++//! Signature boundary only: no term semantics, freshness, deployment or funding authority.
++use anyhow::{Result, ensure};
++use ed25519_dalek::{Signature, VerifyingKey};
++use sha2::{Digest, Sha256};
++
++const DOMAIN: &str = "monzero-native-btc-xmz-quote-v1";
++
++fn message(payload: &[u8], role: &str) -> Vec<u8> {
++    let domain = format!("{DOMAIN}-{role}");
++    let mut bytes = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:", domain.len(), domain, payload.len()).into_bytes();
++    bytes.extend_from_slice(payload);
++    bytes
++}
++
++fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
++}
++
++/// Expected keys are native caller pins, not identities chosen from the payload.
++/// Returned commitment binds signed bytes but is never an executable quote token.
++pub fn verify(
++    payload: &[u8], btc_key: &[u8; 32], xmz_key: &[u8; 32],
++    btc_signature: &[u8], xmz_signature: &[u8],
++) -> Result<[u8; 32]> {
++    ensure!(!payload.is_empty() && payload.len() <= 8192 && btc_key != xmz_key,
++        "invalid native quote signature input");
++    let value: serde_json::Value = serde_json::from_slice(payload)?;
++    ensure!(value.is_object() && serde_json::to_vec(&value)? == payload,
++        "noncanonical signed quote");
++    ensure!(value["schema"] == DOMAIN && value["btcFunder"] == hex(btc_key)
++        && value["xmzFunder"] == hex(xmz_key), "wrong quote signing context");
++    VerifyingKey::from_bytes(btc_key)?.verify_strict(&message(payload, "btc-funder"), &Signature::from_slice(btc_signature)?)?;
++    VerifyingKey::from_bytes(xmz_key)?.verify_strict(&message(payload, "xmz-funder"), &Signature::from_slice(xmz_signature)?)?;
++    let mut hash = Sha256::new();
++    hash.update(DOMAIN.as_bytes()); hash.update([0]); hash.update(payload);
++    Ok(hash.finalize().into())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use ed25519_dalek::{Signer, SigningKey};
++    #[test]
++    fn strict_role_and_identity_binding() {
++        // Disposable fixed test keys; never wallet keys.
++        let btc = SigningKey::from_bytes(&[1; 32]);
++        let xmz = SigningKey::from_bytes(&[2; 32]);
++        let b = btc.verifying_key().to_bytes(); let x = xmz.verifying_key().to_bytes();
++        let payload = serde_json::to_vec(&serde_json::json!({"schema": DOMAIN,
++            "btcFunder": hex(&b), "xmzFunder": hex(&x), "amount": "test-only"})).unwrap();
++        let bs = btc.sign(&message(&payload, "btc-funder")).to_bytes();
++        let xs = xmz.sign(&message(&payload, "xmz-funder")).to_bytes();
++        // Independently generated PyNaCl/libsodium vectors with Qt's framing.
++        assert_eq!(hex(&bs), "a39ca536c47b02f1f0fe6c5702848469750323d12e9e1caf73a88a6f4d96173067fbea50891d8e540adb1aea15f0b59cfbc4fb4921fdf7d62cdef1662d7d3e00");
++        assert_eq!(hex(&xs), "180287704bd9cb834fd9e9e428f8bb2148ec43dd38727e7be8bf06e27c4b94832bbbe61481ac65ea91595456bc7c6dac32eab3a834409a21abf62454cdf86a0b");
++        assert_eq!(hex(&verify(&payload, &b, &x, &bs, &xs).unwrap()),
++            "b1f0828afbb1a95e9d4a6f845c16d7cc0564ad276aa62ca14e322e932acd5a0f");
++        assert!(verify(&payload, &b, &x, &bs, &xs).is_ok());
++        assert!(verify(&payload, &b, &x, &xs, &bs).is_err());
++        assert!(verify(&payload, &x, &b, &bs, &xs).is_err());
++        assert!(verify(&payload, &b, &b, &bs, &bs).is_err());
++        assert!(verify(&payload, &b, &x, &[], &xs).is_err());
++        let wrong = btc.sign(&message(&payload, "xmz-funder")).to_bytes();
++        assert!(verify(&payload, &b, &x, &wrong, &xs).is_err());
++        let mut ambiguous = payload.clone();
++        ambiguous.splice(1..1, b"\"amount\":\"ignored\",".iter().copied());
++        assert!(verify(&ambiguous, &b, &x, &bs, &xs).is_err());
++    }
++}

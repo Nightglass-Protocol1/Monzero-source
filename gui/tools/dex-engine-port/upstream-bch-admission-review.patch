@@ -1,0 +1,149 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
+@@ -117,3 +117,5 @@
+ }
+ 
+ pub mod refund;
++
++pub mod approval;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/approval.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/approval.rs
+@@ -0,0 +1,135 @@
++//! Public consent for execution admission, separate from transaction approvals.
++use super::*;
++use sha2::{Digest, Sha256};
++
++pub struct AdmissionReview {
++    pub details: serde_json::Value,
++    pub commitment: [u8;32],
++}
++
++fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
++fn commitment(details: &serde_json::Value) -> Result<[u8;32]> {
++    let mut digest = Sha256::new();
++    digest.update(b"MONZERO-BCH-EXECUTION-ADMISSION-APPROVAL-V1\0");
++    digest.update(serde_json::to_vec(details)?);
++    Ok(digest.finalize().into())
++}
++
++/// Builds a displayable review without reading keys, writing state or making RPC
++/// calls. Negotiation pins are independently retained inputs, not peer claims.
++/// Admission revalidates their secret records; this review does not prove that
++/// negotiation has completed or that either chain has been observed.
++pub fn review_admission(quote: &VerifiedBchQuote, policy: &Policy, role: Role,
++    pins: &NegotiationPins, now: u64) -> Result<AdmissionReview> {
++    quote.check_policy(policy,now)?;
++    ensure!(now >= quote.admitted_at(),"BCH admission review predates quote admission");
++    // Exhaustive destructuring makes a new policy field a compile error until it
++    // is included in the consent format. Amounts stay strings across Qt/JSON.
++    let Policy { bch_network, bch_genesis, xmz_network, xmz_genesis,
++        bch_confirmations, xmz_confirmations, cancel_blocks, punish_blocks,
++        maximum_bch_atoms, maximum_xmz_atoms, maximum_bch_funding_fee,
++        maximum_xmz_fee, minimum_covenant_fee, maximum_covenant_fee,
++        minimum_output_atoms } = policy;
++    let native = match xmz_network {
++        swap_core::xmz_address::XmzNetwork::Mainnet => "xmz-mainnet",
++        swap_core::xmz_address::XmzNetwork::Testnet => "xmz-testnet",
++        swap_core::xmz_address::XmzNetwork::Stagenet => "xmz-stagenet",
++    };
++    let details = serde_json::json!({
++        "schema":"monzero-bch-execution-admission-review-v1",
++        "action":"admit-bch-execution", "role":role,
++        "quoteCommitment":hex(quote.commitment()), "terms":quote.terms(),
++        "negotiationPins":{
++            "initial":hex(&pins.initial), "selection":hex(&pins.selection),
++            "outgoing":hex(&pins.outgoing), "received":hex(&pins.received),
++            "agreement":hex(&pins.agreement)},
++        "policy":{
++            "bchNetwork":bch_network,"bchGenesis":bch_genesis,
++            "xmzNetwork":native,"xmzGenesis":xmz_genesis,
++            "bchConfirmations":bch_confirmations,"xmzConfirmations":xmz_confirmations,
++            "cancelBlocks":cancel_blocks,"punishBlocks":punish_blocks,
++            "maximumBchAtoms":maximum_bch_atoms.to_string(),
++            "maximumXmzAtoms":maximum_xmz_atoms.to_string(),
++            "maximumBchFundingFee":maximum_bch_funding_fee.to_string(),
++            "maximumXmzFee":maximum_xmz_fee.to_string(),
++            "minimumCovenantFee":minimum_covenant_fee.to_string(),
++            "maximumCovenantFee":maximum_covenant_fee.to_string(),
++            "minimumOutputAtoms":minimum_output_atoms.to_string()},
++        "chainObserved":false,"negotiationVerified":false,"executable":false});
++    Ok(AdmissionReview {commitment:commitment(&details)?,details})
++}
++
++impl<'a> AdmittedExecution<'a> {
++    /// For app/helper callers: reject changed consent before opening storage,
++    /// then use the existing admission path to validate all negotiation records.
++    /// This grants no permission to sign, lock inputs or broadcast transactions.
++    pub fn admit_reviewed(metadata: &Path, snapshots: &Path, quote: &'a VerifiedBchQuote,
++        policy: &'a Policy, role: Role, approved: &[u8;32], pins: NegotiationPins,
++        now: u64) -> Result<Self> {
++        ensure!(&review_admission(quote,policy,role,&pins,now)?.commitment == approved,
++            "BCH execution admission approval changed");
++        Self::admit(metadata,snapshots,quote,policy,role,quote.commitment(),pins,now)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn bch_admission_approval_binds_context_before_storage() -> Result<()> {
++        let (mut policy,terms) = crate::bch_quote::tests::fixture();
++        let quote = crate::bch_quote::tests::signed(&terms,&policy,1000)?;
++        let pins = NegotiationPins {initial:[1;32],selection:[2;32],outgoing:[3;32],
++            received:[4;32],agreement:[5;32]};
++        let role = Role::NativeFunder;
++        let review = review_admission(&quote,&policy,role,&pins,1000)?;
++        assert_eq!(review.details["terms"],serde_json::to_value(&terms)?);
++        assert_eq!(review.details["executable"],false);
++        assert_eq!(review.details["chainObserved"],false);
++        assert_eq!(review.details["negotiationVerified"],false);
++        assert_eq!(review.details["policy"]["maximumXmzAtoms"],"2000000");
++        assert_eq!(review.commitment,review_admission(&quote,&policy,role,&pins,1001)?.commitment);
++        let absent = std::env::temp_dir().join(format!("bch-approval-{}",uuid::Uuid::new_v4()));
++        let reject = |p: &Policy, r, approved: &[u8;32], pins, now| -> Result<()> {
++            let error = AdmittedExecution::admit_reviewed(&absent,&absent,&quote,p,r,approved,pins,now)
++                .err().context("changed admission consent accepted")?;
++            assert!(error.to_string().contains(if now < 1000 {"predates"}
++                else if now >= 2000 {"validity window"} else {"approval changed"}));
++            assert!(!absent.exists());
++            Ok(())
++        };
++        reject(&policy,Role::BchFunder,&review.commitment,pins.clone(),1000)?;
++        reject(&policy,role,&[0;32],pins.clone(),1000)?;
++        reject(&policy,role,&review.commitment,pins.clone(),999)?;
++        reject(&policy,role,&review.commitment,pins.clone(),2000)?;
++        for index in 0..5 {
++            let mut changed = pins.clone();
++            [&mut changed.initial,&mut changed.selection,&mut changed.outgoing,
++                &mut changed.received,&mut changed.agreement][index][0] ^= 1;
++            reject(&policy,role,&review.commitment,changed,1000)?;
++        }
++        policy.maximum_xmz_atoms += 1;
++        reject(&policy,role,&review.commitment,pins.clone(),1000)?;
++        policy.maximum_xmz_atoms -= 1;
++        let mut changed_terms = terms.clone();
++        changed_terms.insert("bchLockFeeAtoms".into(),"1001".into());
++        let changed_quote = crate::bch_quote::tests::signed(&changed_terms,&policy,1000)?;
++        let error = AdmittedExecution::admit_reviewed(&absent,&absent,&changed_quote,&policy,
++            role,&review.commitment,pins.clone(),1000).err().context("changed quote accepted")?;
++        assert!(error.to_string().contains("approval changed"));
++        // Exact consent passes the review gate and reaches the existing storage
++        // validator. It must not fabricate a completed negotiation from pins.
++        let error = AdmittedExecution::admit_reviewed(&absent,&absent,&quote,&policy,
++            role,&review.commitment,pins,1000).err().context("missing negotiation accepted")?;
++        assert_eq!(error.downcast_ref::<std::io::Error>().context("expected missing store")?.kind(),
++            std::io::ErrorKind::NotFound);
++        assert!(!absent.exists());
++        // Each displayed field is part of the hash, including explicit limits
++        // on what this review proves. No secret record enters this public value.
++        for field in review.details.as_object().unwrap().keys() {
++            let mut altered = review.details.clone(); altered[field] = serde_json::json!("changed");
++            assert_ne!(review.commitment,commitment(&altered)?);
++        }
++        Ok(())
++    }
++}

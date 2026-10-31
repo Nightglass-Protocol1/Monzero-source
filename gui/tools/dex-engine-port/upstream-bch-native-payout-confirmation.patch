@@ -1,0 +1,213 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval/relay/observation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval/relay/observation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval/relay/observation.rs
+@@ -0,0 +1,49 @@
++//! Fresh settlement evidence after an attempted native payout. Read-only:
++//! no acknowledgement fabrication, journal updates, construction or retransmission.
++use super::*;
++use crate::{bch_rpc::confirmed::ConfirmedTransaction,xmz_funding::ChainSnapshot};
++
++pub struct ConfirmedNativePayout {
++    quote: [u8;32],admission: [u8;32],review: [u8;32],txid: String,
++    confirmations: u64,native: ChainSnapshot,bch: ConfirmedTransaction,
++}
++impl ConfirmedNativePayout {
++    pub fn quote(&self) -> &[u8;32] {&self.quote}
++    pub fn admission(&self) -> &[u8;32] {&self.admission}
++    pub fn review(&self) -> &[u8;32] {&self.review}
++    pub fn txid(&self) -> &str {&self.txid}
++    pub fn confirmations(&self) -> u64 {self.confirmations}
++    pub fn native_snapshot(&self) -> &ChainSnapshot {&self.native}
++    pub fn bch_confirmation(&self) -> &ConfirmedTransaction {&self.bch}
++}
++impl AdmittedExecution<'_> {
++    /// A saved relay acknowledgement is not required. A retained, validated
++    /// attempt is required; confirmation never authorizes another dispatch.
++    pub async fn observe_bch_native_payout(&self,native: &impl FundingObserver,bch: &BchRpc,
++        block: Option<BlockHash>,now: u64,session: NativeWalletSession) -> Result<ConfirmedNativePayout> {
++        let (review,prepared,intent,deployment)=self.native_payout_relay_materials()?;
++        self.native_payout_state(&review,&intent)?.context("missing BCH native payout relay attempt")?;
++        let (attempt,_)=self.native_payout_attempt(&review,&intent)?.context("missing BCH native payout relay attempt")?;
++        ensure!(now>=attempt.approved_at && bch.deployment_commitment()?==deployment,
++            "BCH native payout observation predates dispatch or changes observer");
++        let claim=self.recover_bch_native_claim(native,bch,intent.redemption,block,now).await?;
++        ensure!(claim.native_receipt==intent.native_receipt && claim.native_txid==prepared.terms()["lockTxid"]
++            && claim.address.to_string()==prepared.terms()["wallet"],"BCH native payout claim changed");
++        let deadline=claim.observed_at.checked_add(std::time::Duration::from_secs(30)).context("native payout observation deadline overflow")?;
++        let txid=prepared.terms()["txid"].as_str().context("missing saved native payout identity")?.to_owned();
++        let (confirmations,snapshot,confirmed)=tokio::time::timeout_at(deadline.into(),async {
++            // Read-only spend-key check; do not import or rescan a wallet here.
++            session.verify_spend_key(&claim.spend,&claim.address).await?;
++            let observer=session.into_payout_relay()?;
++            let (confirmations,snapshot)=observer.confirm_native_payout_evidence(&prepared,u64::from(self.policy.xmz_confirmations)).await?;
++            let confirmed=bch.confirmed_transaction(intent.redemption,claim.block,u64::from(self.policy.bch_confirmations)).await?;
++            ensure!(confirmed.deployment()==&deployment && confirmed.block()==claim.block,
++                "BCH native payout redemption changed during confirmation");
++            observer.recheck_native_payout_snapshot(&snapshot).await?;
++            Ok::<_,anyhow::Error>((confirmations,snapshot,confirmed))
++        }).await.context("BCH native payout confirmation timed out")??;
++        ensure!(std::time::Instant::now()<deadline,"BCH native payout evidence expired");
++        Ok(ConfirmedNativePayout {quote:*self.quote.commitment(),admission:intent.admission,review:review.commitment,
++            txid,confirmations,native:snapshot,bch:confirmed})
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval/relay.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval/relay.rs
+@@ -82,3 +82,5 @@
+         Ok(result.txid)
+     }
+ }
++
++pub mod observation;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout/relay.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout/relay.rs
+@@ -1,6 +1,17 @@
+ use super::*;
+ use crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::success::native_claim::wallet::payout::preparation::approval::relay::NativePayoutRelayState;
+ use std::sync::atomic::Ordering;
++use sha2::{Digest,Sha256};
++
++fn store_hashes(path: &std::path::Path) -> Result<std::collections::BTreeMap<std::ffi::OsString,[u8;32]>> {
++    let mut hashes=std::collections::BTreeMap::new();
++    for entry in std::fs::read_dir(path)? {
++        let entry=entry?;if entry.file_type()?.is_file() {
++            hashes.insert(entry.file_name(),Sha256::digest(std::fs::read(entry.path())?).into());
++        }
++    }
++    Ok(hashes)
++}
+ 
+ pub(super) async fn exercise(metadata: &std::path::Path,setup: &Setup,snapshots: &PrivateStore,
+     observer_fixture: &Fixture,rpc: &BchRpc,wallet: &WalletFixture) -> Result<()> {
+@@ -12,6 +23,7 @@
+         let mut execution=AdmittedExecution::resume(&copied.0,&private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+         let review=execution.review_bch_native_payout_relay(rpc,2051)?;
+         assert!(execution.bch_native_payout_relay_state()?.is_none());
++        assert!(execution.observe_bch_native_payout(&observer,rpc,block,2051,wallet.payout_session(&observer)?).await.is_err());
+         let transfers=wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="transfer").count();
+         let relays=wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="relay_tx").count();
+         {
+@@ -38,12 +50,27 @@
+         drop(execution);
+         let mut execution=AdmittedExecution::resume(&copied.0,&private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+         let calls=wallet.state.lock().unwrap().calls.len();let observations=observer_fixture.calls.lock().unwrap().len();
+-        assert_eq!(execution.bch_native_payout_relay_state()?,Some(expected));
++        assert_eq!(execution.bch_native_payout_relay_state()?,Some(expected.clone()));
+         let retry=execution.relay_bch_native_payout(&observer,rpc,block,&review.commitment,2053,wallet.payout_session(&observer)?).await;
+         if lost {assert!(retry.is_err());} else {assert_eq!(retry?,"dd".repeat(32));}
+         assert_eq!(wallet.state.lock().unwrap().calls.len(),calls,"relay replay sent another wallet request");
+         assert_eq!(observer_fixture.calls.lock().unwrap().len(),observations,"relay replay performed chain observations");
+         assert_eq!(wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="transfer").count(),transfers);
++        let public_before=store_hashes(&copied.0)?;let private_before=store_hashes(&private.0)?;
++        if !lost {
++            wallet.state.lock().unwrap().payout_confirmations=1;
++            assert!(execution.observe_bch_native_payout(&observer,rpc,block,2054,wallet.payout_session(&observer)?).await.is_err());
++        }
++        wallet.state.lock().unwrap().payout_confirmations=10;
++        let evidence=execution.observe_bch_native_payout(&observer,rpc,block,2054,wallet.payout_session(&observer)?).await?;
++        assert_eq!(evidence.txid(),"dd".repeat(32));assert_eq!(evidence.confirmations(),10);
++        assert_eq!(evidence.quote(),setup.quote.commitment());assert_eq!(evidence.review(),&review.commitment);
++        assert_eq!(evidence.native_snapshot().genesis,setup.policy.xmz_genesis);
++        assert_eq!(evidence.bch_confirmation().block(),BlockHash::from_byte_array([6;32]));
++        assert_eq!(execution.bch_native_payout_relay_state()?,Some(expected));
++        assert_eq!(store_hashes(&copied.0)?,public_before);assert_eq!(store_hashes(&private.0)?,private_before);
++        let methods=wallet.state.lock().unwrap().calls[calls..].to_vec();
++        assert!(methods.iter().all(|s|matches!(s.as_str(),"get_address"|"query_key"|"check_tx_key")),"confirmation mutated the wallet");
+         if !lost {
+             let saved=std::fs::read(&ack)?;std::fs::write(&ack,b"{}")?;
+             assert!(execution.bch_native_payout_relay_state().is_err());std::fs::write(&ack,saved)?;
+diff --git a/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs b/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs
+--- a/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs
++++ b/swap-machine/src/native_funding_rpc/relay/lock_checkpoint.rs
+@@ -249,6 +249,7 @@
+                         calls.lock().unwrap().push(method.into());
+                         let result=match method {
+                             "get_block_header_by_height"=>json!({"block_header":{"hash":genesis}}),
++                            "get_version"=>json!({"version":(3u64<<16)|7}),
+                             "get_last_block_header"=>json!({"block_header":{"hash":"ef".repeat(32),"height":109}}),
+                             "get_address"=>json!({"address":if incoming.load(Ordering::SeqCst) {destination.to_string()} else {wallet.to_string()}}),
+                             "get_balance"=>{
+diff --git a/swap-machine/src/native_funding_rpc/relay/payout.rs b/swap-machine/src/native_funding_rpc/relay/payout.rs
+--- a/swap-machine/src/native_funding_rpc/relay/payout.rs
++++ b/swap-machine/src/native_funding_rpc/relay/payout.rs
+@@ -35,6 +35,10 @@
+     /// Current authenticated source-wallet evidence, not a cached relay receipt.
+     /// No construction, replacement, or automatic retransmission occurs here.
+     pub(crate) async fn confirm_native_payout(&self,prepared:&PreparedLockPayout,minimum:u64)->Result<u64> {
++        Ok(self.confirm_native_payout_evidence(prepared,minimum).await?.0)
++    }
++    pub(crate) async fn confirm_native_payout_evidence(&self,prepared:&PreparedLockPayout,minimum:u64)
++        ->Result<(u64,crate::xmz_funding::ChainSnapshot)> {
+         ensure!(minimum>0,"zero payout confirmation requirement");
+         let before=self.client.snapshot().await?;
+         ensure!(prepared.terms["genesis"]==before.genesis && canonical_hash(&before.tip_hash),"unexpected native payout chain");
+@@ -59,7 +63,11 @@
+         };
+         ensure!(self.client.opened_wallet(request.wallet.network()).await?.as_ref()==Some(&request.wallet),"native payout wallet changed");
+         ensure!(self.client.snapshot().await?==before,"native chain changed during payout reconciliation");
+-        Ok(confirmations)
++        Ok((confirmations,before))
++    }
++    pub(crate) async fn recheck_native_payout_snapshot(&self,expected:&crate::xmz_funding::ChainSnapshot)->Result<()> {
++        ensure!(self.client.snapshot().await?==*expected,"native chain changed after payout confirmation");
++        Ok(())
+     }
+ }
+ fn checked_payment_proofs(payout:&Value,reserve:&Value,prepared:&PreparedLockPayout,tip:u64,minimum:u64)->Result<u64> {
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs b/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
+--- a/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
++++ b/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
+@@ -15,6 +15,7 @@
+     pub intent: Option<std::path::PathBuf>,
+     pub payout: Option<Payout>,pub lose_payout: bool,
+     pub relay_intent: Option<std::path::PathBuf>,pub lose_relay: bool,
++    pub payout_confirmations: u64,pub payout_proof_mode: u8,
+ }
+ pub(crate) struct Fixture {
+     pub state: Arc<Mutex<State>>,daemon: tokio::net::TcpListener,wallet: u16,
+@@ -113,6 +114,21 @@
+                                 "tx_metadata":"abcd","tx_key":"01".to_owned()+&"00".repeat(31),
+                                 "tx_blob":"","unsigned_txset":"","multisig_txset":""})
+                         },
++                        "check_tx_key"=>{
++                            let payout=state.payout.as_ref().context("unexpected payout proof query")?;
++                            let r=&payout.request;let destination=p["address"].as_str().context("missing proof destination")?;
++                            ensure!(state.opened && p["txid"]=="dd".repeat(32)
++                                && p["tx_key"]=="01".to_owned()+&"00".repeat(31),"wrong payout proof identity or key");
++                            let combined=r.source.destination==r.reserve_return;
++                            let amount=if destination==r.source.destination.to_string() {
++                                if combined {r.source.locked.atoms()-payout.fee} else {r.principal.atoms()}
++                            } else {
++                                ensure!(destination==r.reserve_return.to_string(),"wrong payout reserve owner");
++                                r.source.locked.atoms()-r.principal.atoms()-payout.fee
++                            };
++                            json!({"received":amount+u64::from(state.payout_proof_mode==2),"confirmations":state.payout_confirmations,
++                                "in_pool":state.payout_proof_mode==1})
++                        },
+                         "relay_tx"=>{
+                             let path=state.relay_intent.as_ref().context("unapproved fixture payout relay")?;
+                             let intent:serde_json::Value=serde_json::from_slice(&std::fs::read(path)?)?;
+@@ -242,6 +258,20 @@
+         if lost {assert!(result.err().context("lost reply was accepted")?.is::<BroadcastOutcomeUnknown>());}
+         else {assert_eq!(result?.txid,"dd".repeat(32));}
+         assert!(relay.dispatch_native_payout(&prepared).await.is_err());
++        wallet.state.lock().unwrap().payout_confirmations=10;
++        let (depth,snapshot)=relay.confirm_native_payout_evidence(&prepared,10).await?;
++        assert_eq!(depth,10);assert_eq!(snapshot.genesis,"aa".repeat(32));
++        relay.recheck_native_payout_snapshot(&snapshot).await?;
++        let mut changed=snapshot;changed.tip_hash="bb".repeat(32);
++        assert!(relay.recheck_native_payout_snapshot(&changed).await.is_err());
++        for mode in [1,2] {
++            wallet.state.lock().unwrap().payout_proof_mode=mode;
++            assert!(relay.confirm_native_payout_evidence(&prepared,10).await.is_err());
++        }
++        wallet.state.lock().unwrap().payout_proof_mode=0;wallet.state.lock().unwrap().payout_confirmations=1;
++        assert!(relay.confirm_native_payout_evidence(&prepared,10).await.is_err());
++        wallet.state.lock().unwrap().payout_confirmations=10;
++        assert_eq!(relay.confirm_native_payout(&prepared,10).await?,10);
+         let state=wallet.state.lock().unwrap();
+         assert_eq!(state.calls.iter().filter(|s|s.as_str()=="transfer").count(),1);
+         assert_eq!(state.calls.iter().filter(|s|s.as_str()=="relay_tx").count(),1);

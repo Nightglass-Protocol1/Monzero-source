@@ -1,0 +1,209 @@
+diff --git a/swap-machine/src/native_execution_claim/checkpoint.rs b/swap-machine/src/native_execution_claim/checkpoint.rs
+index b7b37493c..d3a36848f 100644
+--- a/swap-machine/src/native_execution_claim/checkpoint.rs
++++ b/swap-machine/src/native_execution_claim/checkpoint.rs
+@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
+ 
+ const DOMAIN: &[u8] = b"monzero-native-bob-pending-checkpoint-v1\0";
+ const LOCK_DOMAIN: &[u8] = b"monzero-native-bob-bitcoin-lock-v1\0";
++const ALICE_DOMAIN: &[u8] = b"monzero-native-alice-negotiated-v1\0";
+ const MAX_BYTES: usize = 1_048_576 + DOMAIN.len() + 32;
+ const PIN_DOMAIN: &[u8] = b"monzero-pending-pin-v1\0";
+ 
+@@ -117,6 +118,21 @@ impl PreparedCheckpoint<'_> {
+ }
+ 
+ impl ExecutionClaim {
++    /// Preserve Alice's negotiated secret state before funding. The caller must
++    /// use Alice's own private execution namespace, not another party's claim.
++    #[cfg(target_os = "linux")]
++    pub fn prepare_alice_negotiated(&self, state: &crate::alice::State3) -> Result<PreparedCheckpoint<'_>> {
++        let quote=self.checkpoint_quote.as_ref().context("legacy claim cannot store a guarded checkpoint")?;
++        state.check_recorded_quote(quote)?;
++        self.prepare_record(ALICE_DOMAIN,format!("{}.alice-negotiated",filename(quote)?),
++            Zeroizing::new(serde_json::to_vec(state)?))
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub fn prepare_alice_negotiated(&self, _: &crate::alice::State3) -> Result<PreparedCheckpoint<'_>> {
++        anyhow::bail!("Alice checkpoint storage is not implemented on this platform")
++    }
++
+     /// Preserve negotiated Bob recovery state BEFORE signing/broadcasting the
+     /// Bitcoin lock. Does not save a signed transaction or authorize broadcast.
+     #[cfg(target_os = "linux")]
+@@ -178,6 +194,32 @@ impl ExecutionClaim {
+ }
+ 
+ impl RecoveryLease {
++    /// Load immutable Alice recovery state, not a funding/broadcast permit or
++    /// proof that either chain has settled. Keep the lease for subsequent work.
++    #[cfg(target_os = "linux")]
++    pub fn load_alice_negotiated(&self, store: &CheckpointPinStore, expected_lock: bitcoin::Txid)
++        -> Result<crate::alice::State3> {
++        store.separate_from(&self.directory)?;
++        let quote=self.record.quote();
++        let name=format!("{}.alice-negotiated",filename(quote)?);
++        let pin_bytes=read_private(&store.directory,&format!("{name}.pin"))?;
++        let pin=decode_pin(&pin_bytes,quote.terms()["swapId"].parse()?,quote.commitment())?;
++        let bytes=read_pinned(&self.directory,&name,&pin)?;
++        ensure!(bytes.len()>ALICE_DOMAIN.len()+32 && bytes.starts_with(ALICE_DOMAIN)
++            && &bytes[ALICE_DOMAIN.len()..ALICE_DOMAIN.len()+32]==quote.commitment(),
++            "Alice checkpoint envelope mismatch");
++        let state:crate::alice::State3=serde_json::from_slice(&bytes[ALICE_DOMAIN.len()+32..])
++            .map_err(|_|anyhow::anyhow!("invalid Alice checkpoint"))?;
++        ensure!(state.tx_lock.txid()==expected_lock,"Alice checkpoint transaction mismatch");
++        state.check_recorded_quote(quote)?;
++        Ok(state)
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub fn load_alice_negotiated(&self, _: &CheckpointPinStore, _: bitcoin::Txid) -> Result<crate::alice::State3> {
++        anyhow::bail!("Alice checkpoint recovery is not implemented on this platform")
++    }
++
+     /// Historical pre-lock recovery data only. This does NOT prove whether the
+     /// lock was signed, broadcast, mined or spent, and permits no funding retry.
+     /// Caller must reconcile the exact transaction with the expected chain.
+diff --git a/swap-machine/tests/alice_peer/mod.rs b/swap-machine/tests/alice_peer/mod.rs
+index 706734dab..ac7831e44 100644
+--- a/swap-machine/tests/alice_peer/mod.rs
++++ b/swap-machine/tests/alice_peer/mod.rs
+@@ -46,6 +46,7 @@ pub struct AlicePeer {
+     wire: RefCell<Wire>, owner: OwnedProcess,
+     funding: (monero_oxide_ext::PublicKey, monero_oxide_ext::PublicKey, u64),
+     association: Option<Association>,
++    lock: bitcoin::Txid,
+ }
+ struct OwnedProcess { child: Child, directory: PathBuf }
+ impl Drop for OwnedProcess {
+@@ -81,6 +82,11 @@ impl AlicePeer {
+             .env("MONZERO_TEST_ALICE_ID",id.to_string())
+             .env("MONZERO_TEST_ALICE_RESUME","1")
+             .env("MONZERO_TEST_ALICE_SEQUENCE",sequence.to_string())
++            .env("MONZERO_TEST_ALICE_SIGNED",if self.association.is_some() {"1"} else {"0"})
++            .env("MONZERO_TEST_ALICE_LOCK",self.lock.to_string())
++            .env("MONZERO_TEST_ALICE_ASSOCIATION",serde_json::to_string(&self.association.as_ref()
++                .map(Association::fingerprint).transpose()?)?)
++            .env("MONZERO_TEST_ALICE_QUOTE",serde_json::to_string(&self.association.as_ref().map(|a|a.quote))?)
+             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+         let deadline=Instant::now()+Duration::from_secs(15);
+         let socket=loop {
+@@ -116,6 +122,9 @@ impl AlicePeer {
+         let child=Command::new(std::env::current_exe()?)
+             .args(["--exact","alice_peer_process","--ignored"])
+             .env("MONZERO_TEST_ALICE_SOCKET",&path).env("MONZERO_TEST_ALICE_ID",id.to_string())
++            .env_remove("MONZERO_TEST_ALICE_RESUME").env_remove("MONZERO_TEST_ALICE_SEQUENCE")
++            .env_remove("MONZERO_TEST_ALICE_SIGNED").env_remove("MONZERO_TEST_ALICE_LOCK")
++            .env_remove("MONZERO_TEST_ALICE_ASSOCIATION").env_remove("MONZERO_TEST_ALICE_QUOTE")
+             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+         let mut owner=OwnedProcess {child,directory};
+         let deadline=Instant::now()+Duration::from_secs(15);
+@@ -147,7 +156,8 @@ impl AlicePeer {
+         check_association(&negotiation.completed()?,&association)?;
+         ensure!(funding.2==xmz_atoms && bob2.xmr.as_pico()==xmz_atoms
+             && bob2.tx_lock.lock_amount()==btc_amount,"negotiated fixture amounts differ from request");
+-        Ok((Self {wire:RefCell::new(wire),owner,funding,association},bob2))
++        let lock=bob2.tx_lock.txid();
++        Ok((Self {wire:RefCell::new(wire),owner,funding,association,lock},bob2))
+     }
+     pub fn lock_xmr_transfer_request(&self)->swap_core::monero::TransferRequest {
+         swap_core::monero::TransferRequest {public_spend_key:self.funding.0,
+@@ -212,13 +222,41 @@ pub fn serve()->Result<()> {
+     socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+     let id=std::env::var("MONZERO_TEST_ALICE_ID")?.parse()?;
+     let mut wire=Wire {socket,id,sequence:0};
++    let mut execution_owner=None;
++    let mut recovery_owner=None;
++    let execution_directory=checkpoint_directory.join("execution");
++    let pin_directory=checkpoint_directory.join("pins");
+     let (state,association)=if std::env::var("MONZERO_TEST_ALICE_RESUME").as_deref()==Ok("1") {
+         let expected_sequence: u64=std::env::var("MONZERO_TEST_ALICE_SEQUENCE")?.parse()?;
+         let checkpoint=checkpoint_directory.join(format!("checkpoint-{expected_sequence}.json"));
+         let mut bytes=Vec::new();
+         std::fs::File::open(&checkpoint)?.take(1_048_577).read_to_end(&mut bytes)?;
+         ensure!(bytes.len()<=1_048_576,"oversized Alice fixture checkpoint");
+-        let (saved_id,sequence,state,association): (Uuid,u64,alice::State3,Option<Association>)=serde_json::from_slice(&bytes)?;
++        let (saved_id,sequence,state,association)=match std::env::var("MONZERO_TEST_ALICE_SIGNED")?.as_str() {
++            "1"=>{
++                // Signed restart metadata contains no private State3.
++                let (saved_id,sequence,association):(Uuid,u64,Association)=serde_json::from_slice(&bytes)?;
++                let expected:Option<[u8;32]>=serde_json::from_str(&std::env::var("MONZERO_TEST_ALICE_ASSOCIATION")?)?;
++                let quote:Option<[u8;32]>=serde_json::from_str(&std::env::var("MONZERO_TEST_ALICE_QUOTE")?)?;
++                ensure!(Some(association.fingerprint()?)==expected && Some(association.quote)==quote,
++                    "Alice retained association changed");
++                let lease=crate::quote_fixture::acquire_execution_recovery(&execution_directory,id,&association.quote)?;
++                ensure!(crate::quote_fixture::acquire_execution_recovery(&execution_directory,id,&association.quote).is_err(),
++                    "Alice recovery ownership overlapped");
++                let store=swap_machine::native_execution_claim::checkpoint::CheckpointPinStore::open(&pin_directory)?;
++                ensure!(lease.load_alice_negotiated(&store,"00".repeat(32).parse()?).is_err(),
++                    "Alice checkpoint accepted wrong lock");
++                let state=lease.load_alice_negotiated(&store,std::env::var("MONZERO_TEST_ALICE_LOCK")?.parse()?)?;
++                recovery_owner=Some(lease);
++                (saved_id,sequence,state,Some(association))
++            }
++            "0"=>{
++                let legacy:(Uuid,u64,alice::State3,Option<Association>)=serde_json::from_slice(&bytes)?;
++                ensure!(legacy.3.is_none(),"signed checkpoint cannot use legacy recovery");
++                legacy
++            }
++            _=>anyhow::bail!("invalid Alice recovery mode"),
++        };
+         ensure!(saved_id==id && sequence==expected_sequence,"Alice checkpoint context mismatch");
+         if let Some(association)=&association {
+             let terms=association.verify_record(crate::quote_fixture::now()?)?;
+@@ -283,11 +321,28 @@ pub fn serve()->Result<()> {
+                 ensure!(association.as_ref().is_some_and(|a|&a.quote==quote.commitment()),
+                     "quote differs from negotiated association");
+                 state.check_native_quote(&quote,&crate::quote_fixture::policy(),crate::quote_fixture::now()?)?;
++                if execution_owner.is_none() && recovery_owner.is_none() {
++                    std::fs::DirBuilder::new().mode(0o700).create(&execution_directory)?;
++                    std::fs::DirBuilder::new().mode(0o700).create(&pin_directory)?;
++                    std::fs::File::open(checkpoint_directory)?.sync_all()?;
++                    let association=association.as_ref().context("missing Alice association")?;
++                    let claim=crate::quote_fixture::reserve_fixture_execution(&execution_directory,id,quote,&association.record)?;
++                    let store=swap_machine::native_execution_claim::checkpoint::CheckpointPinStore::open(&pin_directory)?;
++                    claim.prepare_alice_negotiated(&state)?.persist_with_pin_store(&store)?;
++                    ensure!(claim.prepare_alice_negotiated(&state)?.persist_with_pin_store(&store).is_err(),
++                        "Alice negotiated checkpoint was overwritten");
++                    ensure!(crate::quote_fixture::acquire_execution_recovery(&execution_directory,id,&association.quote).is_err(),
++                        "Alice recovery overlapped live claim");
++                    execution_owner=Some(claim);
++                }
+                 wire.send(kind,true)?;
+             }
+             "checkpoint"=>{
+                 use std::os::unix::fs::OpenOptionsExt;
+-                let bytes=serde_json::to_vec(&(id,wire.sequence+1,&state,&association))?;
++                let bytes=if let Some(association)=&association {
++                    ensure!(execution_owner.is_some() || recovery_owner.is_some(),"Alice checkpoint has no owner");
++                    serde_json::to_vec(&(id,wire.sequence+1,association))?
++                } else {serde_json::to_vec(&(id,wire.sequence+1,&state,&association))?};
+                 ensure!(bytes.len()<=1_048_576,"oversized Alice fixture checkpoint");
+                 let checkpoint=checkpoint_directory.join(format!("checkpoint-{}.json",wire.sequence+1));
+                 let mut file=std::fs::OpenOptions::new().write(true).create_new(true)
+diff --git a/swap-machine/tests/quote_fixture.rs b/swap-machine/tests/quote_fixture.rs
+index c3709990e..317e4abfd 100644
+--- a/swap-machine/tests/quote_fixture.rs
++++ b/swap-machine/tests/quote_fixture.rs
+@@ -220,6 +220,20 @@ impl QuoteFixture {
+     pub fn context(&self) -> &Value { &self.context }
+ }
+ 
++/// Trusted fixture pins, not identities or policy adopted from a checkpoint.
++pub fn reserve_fixture_execution(directory:&std::path::Path,swap:Uuid,quote:VerifiedQuote,record:&[u8])
++    -> Result<swap_machine::native_execution_claim::ExecutionClaim> {
++    let commitment=*quote.commitment();
++    let b=SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes();
++    let x=SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes();
++    let policy=policy();
++    let context=swap_machine::native_execution_claim::RecoveryContext {
++        swap_id:swap,commitment:&commitment,policy:&policy,btc_key:&b,xmz_key:&x,
++        btc_network:bitcoin::Network::Regtest,xmz_network:swap_core::xmz_address::XmzNetwork::Mainnet,
++    };
++    swap_machine::native_execution_claim::ExecutionClaim::reserve_recoverable(directory,quote,&context,now()?,record)
++}
++
+ /// Trusted fixture pins, not identities or policy adopted from a checkpoint.
+ pub fn acquire_execution_recovery(directory:&std::path::Path,swap:Uuid,commitment:&[u8;32])
+     -> Result<swap_machine::native_execution_claim::RecoveryLease> {

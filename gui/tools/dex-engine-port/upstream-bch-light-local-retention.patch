@@ -1,0 +1,239 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light.rs
+@@ -64,3 +64,5 @@
+         preview.verify_signed(&bitcoin::consensus::serialize(retained.signed()))
+     }
+ }
++
++pub mod retention;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/retention.rs
+@@ -0,0 +1,111 @@
++//! Durable local-wallet source binding. Retain exact bytes before preparation;
++//! partial publication can resume only the same record. No signing or relay.
++use super::*;
++use crate::litecoin_light::{network::{LightNetwork,BchNetwork},vault::signing::review::claims::ClaimedSpend};
++use bitcoin::{consensus::serialize,hashes::{Hash,sha256}};
++use swap_core::bch::funding::SignedFunding;
++
++const LOCAL:&str="monzero-bch-local-signed-funding-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct LocalRecord {
++    schema:String, admission:[u8;32], network:String, claim:[u8;32],
++    template:Template, signed:Vec<u8>,
++}
++impl AdmittedExecution<'_> {
++    fn local_record_bytes(&self)->Result<Option<Vec<u8>>> {
++        match self.metadata.read(&record_name(self.quote,"local-signed")) {
++            Ok(bytes)=>{ensure!(bytes.len()<=2_000_000,"oversized local BCH funding record");Ok(Some(bytes))},
++            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>Ok(None),
++            Err(e)=>Err(e),
++        }
++    }
++    pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
++    fn require_node_funding_source(&self)->Result<()> {
++        ensure!(self.local_record_bytes()?.is_none(),"BCH trade is bound to local-wallet funding");Ok(())
++    }
++    fn require_no_node_funding_records(&self)->Result<()> {
++        for suffix in ["wallet-preparation-pin","wallet-lock-intent","signing-intent","signed","reconciliation"] {
++            match self.metadata.read(&record_name(self.quote,suffix)) {
++                Ok(_)=>anyhow::bail!("BCH trade already contains node-wallet funding records"),
++                Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>(),
++                Err(e)=>return Err(e),
++            }
++        }
++        match Journal::open(&self.snapshots)?.read(&record_name(self.quote,"wallet-preparation")) {
++            Ok(_)=>anyhow::bail!("BCH trade contains a node-wallet preparation candidate"),
++            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>Ok(()),
++            Err(e)=>Err(e),
++        }
++    }
++    fn validate_local_record(&self,bytes:&[u8])->Result<(LocalRecord,SignedFunding)> {
++        self.require_no_node_funding_records()?;
++        let record:LocalRecord=serde_json::from_slice(bytes)?;
++        let admission=self.admission_digest()?;
++        let network=match self.quote.terms()["bchNetwork"].as_str() {
++            "bch-mainnet"=>LightNetwork::from(BchNetwork::Mainnet),
++            "bch-testnet"=>LightNetwork::from(BchNetwork::Testnet),
++            "bch-regtest"=>LightNetwork::from(BchNetwork::Regtest),
++            _=>anyhow::bail!("unsupported BCH local funding network"),
++        };
++        ensure!(record.schema==LOCAL && record.admission==admission && record.template.admission==admission
++            && record.template.schema==TEMPLATE && record.network==network.storage_identity()
++            && network.genesis()==self.quote.terms()["bchGenesis"] && serde_json::to_vec(&record)?==bytes,
++            "local BCH funding context changed");
++        let sources=record.template.sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
++        let preview=self.validate_bch_funding_preview(record.template.prepared_at,&record.template.unsigned,&sources,
++            bitcoin::Script::from_bytes(&record.template.change),record.template.maximum_fee,record.template.minimum_change)?;
++        ensure!(record.template.minimum_change==self.quote.terms()["bchMinimumOutputAtoms"].parse::<u64>()?
++            && record.template.maximum_fee==preview.fee().to_sat(),"local BCH funding policy changed");
++        let signed=preview.verify_signed(&record.signed)?;
++        Ok((record,signed))
++    }
++    /// Bind already-approved local signatures to this trade before publishing
++    /// preparation. A retry retains original time and exact bytes; never re-sign.
++    pub fn retain_light_signed_funding(&mut self,claim:&ClaimedSpend,network:LightNetwork,
++        expected:sha256::Hash,sources:&[&[u8]],now:u64)->Result<SignedFunding> {
++        let signed=self.verify_light_signed_funding(claim,network,expected,sources,now)?;
++        self.require_no_node_funding_records()?;
++        let saved=self.local_record_bytes()?;
++        let prepared_at=if let Some(bytes)=&saved {
++            let (record,_)=self.validate_local_record(bytes)?;
++            ensure!(now>=record.template.prepared_at,"local BCH funding time moved backwards");
++            record.template.prepared_at
++        } else {
++            ensure!(self.prepared_bch_funding()?.is_none(),"existing BCH preparation cannot change funding source");
++            match Journal::open(&self.snapshots)?.read(&record_name(self.quote,"template")) {
++                Ok(_)=>anyhow::bail!("partial BCH preparation cannot change funding source"),
++                Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>(),
++                Err(e)=>return Err(e),
++            }
++            now
++        };
++        let retained=claim.retained_bch_funding(network,self.quote.terms()["swapId"].parse()?,expected)?;
++        let change=retained.unsigned().output.get(1).or_else(||retained.previous_outputs().first())
++            .context("missing local BCH change policy")?;
++        let admission=self.admission_digest()?;
++        let record=LocalRecord {schema:LOCAL.into(),admission,network:network.storage_identity(),
++            claim:expected.to_byte_array(),template:Template {schema:TEMPLATE.into(),admission,prepared_at,
++                unsigned:serialize(retained.unsigned()),sources:sources.iter().map(|s|s.to_vec()).collect(),
++                change:change.script_pubkey.as_bytes().to_vec(),maximum_fee:claim.fee().to_sat(),
++                minimum_change:self.quote.terms()["bchMinimumOutputAtoms"].parse()?},signed:serialize(signed.transaction())};
++        let bytes=serde_json::to_vec(&record)?;
++        ensure!(bytes.len()<=2_000_000,"local BCH funding exceeds durable record limit");
++        self.validate_local_record(&bytes)?;
++        self.metadata.retain(&record_name(self.quote,"local-signed"),&bytes)?;
++        self.retain_bch_funding_preparation(prepared_at,&record.template.unsigned,sources,
++            bitcoin::Script::from_bytes(&record.template.change),record.template.maximum_fee,record.template.minimum_change)?;
++        self.restore_local_signed_funding()?.map(|(signed,_)|signed).context("local BCH funding publication incomplete")
++    }
++    /// Historical exact funding for existing recovery code, including after
++    /// expiry. Missing preparation is a partial publication, never relay consent.
++    pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
++    fn restore_local_signed_funding(&self)->Result<Option<(SignedFunding,u64)>> {
++        let Some(bytes)=self.local_record_bytes()? else {return Ok(None)};
++        let (record,signed)=self.validate_local_record(&bytes)?;
++        let prepared=self.prepared_bch_funding()?.context("local BCH funding publication incomplete")?;
++        ensure!(*prepared.commitment()==hash(TEMPLATE,&serde_json::to_vec(&record.template)?),
++            "local BCH funding differs from retained preparation");
++        Ok(Some((signed,record.template.prepared_at)))
++    }
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/locks.rs
+@@ -31,6 +31,7 @@
+     /// an ambiguous result; only missing original inputs are ever locked.
+     pub async fn lock_bch_funding_inputs(&mut self, backend: &BchRpc, now: u64,
+         change_address: &str, minimum_confirmations: u64) -> Result<FundingInputsObservation> {
++        self.require_node_funding_source()?;
+         self.quote.check_policy(self.policy,now)?;
+         self.require_wallet_preparation_backend(backend,change_address,minimum_confirmations)?;
+         ensure!(backend.network().quote_name() == self.quote.terms()["bchNetwork"]
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
+@@ -60,6 +60,7 @@
+     /// it is not fresh chain evidence or permission to lock, sign or broadcast.
+     pub async fn prepare_bch_funding_from_wallet(&mut self,backend: &BchRpc,now: u64,
+         policy: &WalletPreparationPolicy) -> Result<PreparedBchFunding> {
++        self.require_node_funding_source()?;
+         ensure!(self.role==Role::BchFunder,"wrong BCH wallet preparation role");
+         self.quote.check_policy(self.policy,now)?;
+         ensure!(now>=self.read_admission()?.admitted_at && policy.minimum_confirmations>0
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
+@@ -100,6 +100,7 @@
+     }
+ 
+     pub(super) fn restore_signed_bch_funding(&self) -> Result<Option<(SignedFunding,u64)>> {
++        if let Some(local)=self.restore_local_signed_funding()? { return Ok(Some(local)); }
+         let Some(bytes) = optional(&self.metadata,&record_name(self.quote,"signed"))? else {return Ok(None)};
+         let (prepared,intent_bytes,intent) = self.retained_signing_intent()?;
+         let record: Record = serde_json::from_slice(&bytes)?;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -897,7 +897,7 @@
+         &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
+     let agreement=agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder,&agreed)?;
+     let pins=NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
+-    let execution=AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++    let mut execution=AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
+         Role::BchFunder,setup.quote.commitment(),pins,1005)?;
+     let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([42;32]));
+     let account=seed.public_account(light_network,0)?;
+@@ -925,6 +925,72 @@
+     assert!(execution.verify_light_signed_funding(&claim,network,commitment,&[&sources],1004).is_err());
+     assert!(execution.verify_light_signed_funding(&claim,network,commitment,&[&sources],2000).is_err());
+     assert!(execution.prepared_bch_funding()?.is_none());
+-    }
+-    Ok(())
+-}
++    assert_eq!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],1007)?.transaction(),&signed);
++    let local_path=metadata.0.join(format!("{operation}.bch-funding-local-signed"));
++    let local_bytes=std::fs::read(&local_path)?;
++    assert_eq!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],1008)?.transaction(),&signed);
++    assert_eq!(std::fs::read(&local_path)?,local_bytes);
++    assert!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],1006).is_err());
++    assert!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],2000).is_err());
++    // A different correctly signed payment for the same trade cannot replace it.
++    let replacement_dir=PrivateStore::new()?;
++    let mut replacement_parent=parent.clone();replacement_parent.input[0].previous_output.txid=Txid::from_byte_array([10;32]);
++    let mut replacement_unsigned=unsigned.clone();replacement_unsigned.input[0].previous_output.txid=replacement_parent.compute_txid();
++    let replacement=ClaimedSpend::retain(&replacement_dir.0,operation,SpendReview::new(&account,replacement_unsigned.clone(),
++        vec![OwnedInput {outpoint:replacement_unsigned.input[0].previous_output,prevout:parent.output[0].clone(),branch:Branch::Receive,index:0}],
++        &payment,None,Amount::from_sat(1000))?)?;
++    replacement.approve_and_sign(&seed,replacement.signing_commitment())?;
++    assert!(execution.retain_light_signed_funding(&replacement,network,replacement.signing_commitment(),&[&serialize(&replacement_parent)],1008).is_err());
++    assert_eq!(std::fs::read(&local_path)?,local_bytes);
++    drop(execution);
++    let mut execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    assert_eq!(execution.signed_bch_funding()?.unwrap().transaction(),&signed);
++    // Interrupted publication cannot masquerade as completed funding; exact retry repairs it.
++    let pin_path=metadata.0.join(format!("{operation}.bch-funding-pin"));
++    std::fs::remove_file(&pin_path)?;
++    assert!(execution.signed_bch_funding().is_err());
++    assert_eq!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],1009)?.transaction(),&signed);
++    assert_eq!(std::fs::read(&local_path)?,local_bytes);
++    // A node-wallet marker cannot coexist with a local source.
++    let node_path=metadata.0.join(format!("{operation}.bch-funding-wallet-lock-intent"));
++    std::fs::write(&node_path,b"conflicting node source")?;
++    assert!(execution.signed_bch_funding().is_err());
++    std::fs::remove_file(node_path)?;
++    assert_eq!(execution.signed_bch_funding()?.unwrap().transaction(),&signed);
++    std::fs::write(&local_path,b"changed")?;
++    assert!(execution.signed_bch_funding().is_err());
++    std::fs::write(&local_path,&local_bytes)?;
++    assert_eq!(execution.signed_bch_funding()?.unwrap().transaction(),&signed);
++    // Existing authenticated refund protection consumes this local signed source.
++    assert!(execution.review_bch_recovery(1010).is_err());
++    let (native_peer,native_view,native_initial)=selected_with_outgoing(&setup,&snapshots.0,1)?;
++    let (_,bch_view,_)=selected_with_outgoing(&setup,&snapshots.0,0)?;
++    let (native_wallet,native_received)=native_peer.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++        1003,native_view.commitment(),bch_view.frame(),bch_view.signature())?;
++    let native_ack=native_wallet.acknowledgement(&setup.quote)?;
++    let native_agreed=native_wallet.accept_agreement(&setup.quote,&setup.policy,1004,&native_ack,
++        &ack_sign(&native_ack,Role::BchFunder),&ack_sign(&native_ack,Role::NativeFunder))?;
++    let native_agreement=agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder,&native_agreed)?;
++    let native_meta=PrivateStore::new()?;
++    let mut native=AdmittedExecution::admit(&native_meta.0,&snapshots.0,&setup.quote,&setup.policy,
++        Role::NativeFunder,setup.quote.commitment(),NegotiationPins {initial:native_initial,
++            selection:*native_peer.commitment(),outgoing:*native_view.commitment(),received:native_received,
++            agreement:native_agreement},1005)?;
++    let frame=native.prepare_bch_refund_adaptor(1006)?;
++    let signature=SigningKey::from_bytes(&[2;32]).sign(&agreement::refund::signing_bytes(&frame)?).to_bytes();
++    let outgoing=native.retain_outgoing_bch_refund(1007,&signature)?;
++    let encrypted=execution.accept_bch_refund_adaptor(1011,outgoing.frame(),outgoing.signature())?;
++    let review=execution.review_bch_recovery(1012)?;
++    let recovery=execution.retain_reviewed_bch_recovery(1012,&review.commitment)?;
++    assert_eq!(recovery.cancel().input[0].previous_output.txid,signed.compute_txid());
++    assert_ne!(recovery.cancel().input[0].previous_output.txid,unsigned.compute_txid());
++    let refund:Transaction=bitcoin::consensus::deserialize(recovery.refund_bytes())?;
++    let recovered=native.restore_agreement()?.owned().recover_spend_key(&setup.quote,
++        &serialize(recovery.cancel()),refund.input[0].previous_output,recovery.refund_bytes(),&encrypted)?;
++    assert_eq!(recovered.as_bytes(),(setup.spend[0]+setup.spend[1]).as_bytes());
++    let recovery_commitment=*recovery.commitment();drop(execution);
++    let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    assert_eq!(execution.retained_bch_recovery()?.unwrap().commitment(),&recovery_commitment);
++    }
++    Ok(())
++}

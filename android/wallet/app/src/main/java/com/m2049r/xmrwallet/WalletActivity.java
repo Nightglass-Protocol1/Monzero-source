@@ -627,21 +627,32 @@ public class WalletActivity extends BaseActivity implements WalletFragment.Liste
 
     @Override
     public void onWalletStarted(final Wallet.Status walletStatus) {
-        runOnUiThread(() -> {
-            dismissProgressDialog();
-            if (walletStatus == null) {
-                // guess what went wrong
-                Toast.makeText(WalletActivity.this, getString(R.string.status_wallet_connect_failed), Toast.LENGTH_LONG).show();
-            } else {
-                if (Wallet.ConnectionStatus.ConnectionStatus_WrongVersion == walletStatus.getConnectionStatus())
-                    Toast.makeText(WalletActivity.this, getString(R.string.status_wallet_connect_wrongversion), Toast.LENGTH_LONG).show();
-                else if (!walletStatus.isOk())
-                    Toast.makeText(WalletActivity.this, walletStatus.getErrorString(), Toast.LENGTH_LONG).show();
-            }
-        });
         if ((walletStatus == null) || (Wallet.ConnectionStatus.ConnectionStatus_Connected != walletStatus.getConnectionStatus())) {
-            finish();
+            // Monerujo closed the wallet with a short toast, and with no message at all when the
+            // node was simply unreachable: users saw the wallet open and close. Explain why and
+            // close only when they have read it.
+            final String reason;
+            if (walletStatus == null)
+                reason = getString(R.string.status_wallet_open_failed);
+            else if (Wallet.ConnectionStatus.ConnectionStatus_WrongVersion == walletStatus.getConnectionStatus())
+                reason = getString(R.string.status_wallet_connect_wrongversion);
+            else if (!walletStatus.isOk() && (walletStatus.getErrorString() != null) && !walletStatus.getErrorString().trim().isEmpty())
+                reason = walletStatus.getErrorString();
+            else
+                reason = getString(R.string.status_wallet_node_unreachable, WalletManager.getInstance().getDaemonAddress());
+            Timber.w("closing wallet: not connected (%s)", reason);
+            runOnUiThread(() -> {
+                dismissProgressDialog();
+                if (isFinishing() || isDestroyed()) return;
+                new MaterialAlertDialogBuilder(WalletActivity.this)
+                        .setTitle(R.string.status_wallet_not_connected_title)
+                        .setMessage(reason + "\n\n" + getString(R.string.status_wallet_not_connected_help))
+                        .setCancelable(false)
+                        .setPositiveButton(R.string.label_ok, (dialog, which) -> finish())
+                        .show();
+            });
         } else {
+            runOnUiThread(this::dismissProgressDialog);
             haveWallet = true;
             invalidateOptionsMenu();
 

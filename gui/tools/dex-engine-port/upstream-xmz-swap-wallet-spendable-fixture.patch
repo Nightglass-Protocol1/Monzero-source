@@ -1,0 +1,105 @@
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 8d8f7e0..885736d 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -85,6 +85,51 @@ async fn native_fee_estimation() -> Result<()> {
+     Ok(())
+ }
+ 
++#[cfg(unix)]
++#[tokio::test]
++#[ignore = "requires the owned funded fakechain wallet fixture"]
++async fn native_swap_wallet_spendable() -> Result<()> {
++    use swap_machine::native_funding_rpc::spendable::{SpendRequest, swap_wallet_spendable};
++    use swap_machine::native_funding_rpc::wallet_session::SwapWalletId;
++    use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
++
++    let wallet = XmzAddress::parse(XmzNetwork::Mainnet, &std::env::var("MONZERO_TEST_SPEND_WALLET")?)?;
++    let destination = XmzAddress::parse(XmzNetwork::Mainnet, &std::env::var("MONZERO_TEST_SPEND_DESTINATION")?)?;
++    anyhow::ensure!(wallet != destination, "fixture requires distinct wallet and destination");
++    let spend_key = std::env::var("MONZERO_TEST_SPEND_KEY")?;
++    let view_key = std::env::var("MONZERO_TEST_SPEND_VIEW_KEY")?;
++    let restore_height: u64 = std::env::var("MONZERO_TEST_SPEND_RESTORE_HEIGHT")?.parse()?;
++    let lock_txid = std::env::var("MONZERO_TEST_SPEND_LOCK_TXID")?;
++    anyhow::ensure!(lock_txid.len() == 64, "invalid spend fixture lock txid");
++    let amount = XmzAmount::from_atom_string(&std::env::var("MONZERO_TEST_SPEND_ATOMS")?)
++        .map_err(|_| anyhow::anyhow!("invalid spend fixture amount"))?;
++    let genesis = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
++    let (daemon, wallet_port, username, password) = native_rpc::fixture_connection()?;
++
++    let request = |id: SwapWalletId| SpendRequest {
++        id, password: "fixture-password".into(), spend_key: spend_key.clone(), view_key: view_key.clone(),
++        restore_height, lock_txid: lock_txid.clone(), wallet: wallet.clone(), destination: destination.clone(),
++        amount, account: 0, priority: 1,
++    };
++
++    // Restore and import must succeed even under a chain-policy mismatch that
++    // only the later fee-estimate step can detect; nothing should be relayed,
++    // and the wallet this leaves open must not block the next attempt.
++    let error = swap_wallet_spendable(daemon, wallet_port, username.clone(), password.clone(),
++        XmzNetwork::Mainnet, &"0".repeat(64), request(SwapWalletId::new(Uuid::new_v4())?)).await
++        .err().context("accepted wrong spend chain")?;
++    anyhow::ensure!(error.to_string() == "unexpected fee-estimation chain", "unexpected chain rejection");
++
++    // A second attempt (different swap wallet id, same underlying keys) proves
++    // the first attempt's wallet was actually closed, not left wedged open.
++    let relayed = swap_wallet_spendable(daemon, wallet_port, username, password,
++        XmzNetwork::Mainnet, genesis, request(SwapWalletId::new(Uuid::new_v4())?)).await?;
++    anyhow::ensure!(relayed.fee.atoms() > 0 && relayed.weight > 0, "invalid relayed transfer");
++    anyhow::ensure!(export_fixture("MONZERO_TEST_SPEND_RESULT", &format!("{}\n", relayed.txid))?,
++        "missing spend fixture result path");
++    Ok(())
++}
++
+ #[cfg(unix)]
+ #[tokio::test]
+ #[ignore = "requires a disposable authenticated wallet RPC and private credential file"]
+diff --git a/swap-machine/tests/native_rpc.rs b/swap-machine/tests/native_rpc.rs
+index 711759b..e024589 100644
+--- a/swap-machine/tests/native_rpc.rs
++++ b/swap-machine/tests/native_rpc.rs
+@@ -66,20 +66,29 @@ impl swap_machine::xmz_funding::BitcoinLockObserver for BitcoinRpc {
+ 
+ pub use swap_machine::native_funding_rpc::NativeFundingRpc as NativeRpc;
+ 
++/// Raw connection pieces for fixtures that construct several independent
++/// `NativeFundingRpc` clients themselves (e.g. `spendable::swap_wallet_spendable`,
++/// which needs one per composed primitive) rather than a single shared one.
++#[cfg(unix)]
++pub fn fixture_connection() -> Result<(u16, u16, String, String)> {
++    use std::io::Read;
++    use std::os::unix::fs::PermissionsExt;
++    let path = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_WALLET_RPC_LOGIN")
++        .context("missing private fixture credential path")?);
++    let metadata = std::fs::symlink_metadata(&path)?;
++    ensure!(metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
++        "nonprivate fixture credentials");
++    let mut bytes = Vec::new();
++    std::fs::File::open(path)?.take(1025).read_to_end(&mut bytes)?;
++    ensure!(bytes.len() <= 1024, "oversized fixture credentials");
++    let text = std::str::from_utf8(&bytes)?;
++    let (username, password) = text.split_once(':').context("invalid fixture credentials")?;
++    Ok((std::env::var("MONZERO_TEST_DAEMON_RPC_PORT")?.parse()?,
++        std::env::var("MONZERO_TEST_WALLET_RPC_PORT")?.parse()?, username.into(), password.into()))
++}
++
+ #[cfg(unix)]
+ pub fn authenticated_fixture() -> Result<NativeRpc> {
+-        use std::io::Read;
+-        use std::os::unix::fs::PermissionsExt;
+-        let path = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_WALLET_RPC_LOGIN")
+-            .context("missing private fixture credential path")?);
+-        let metadata = std::fs::symlink_metadata(&path)?;
+-        ensure!(metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
+-            "nonprivate fixture credentials");
+-        let mut bytes = Vec::new();
+-        std::fs::File::open(path)?.take(1025).read_to_end(&mut bytes)?;
+-        ensure!(bytes.len() <= 1024, "oversized fixture credentials");
+-        let text = std::str::from_utf8(&bytes)?;
+-        let (username, password) = text.split_once(':').context("invalid fixture credentials")?;
+-        NativeRpc::new(std::env::var("MONZERO_TEST_DAEMON_RPC_PORT")?.parse()?,
+-            std::env::var("MONZERO_TEST_WALLET_RPC_PORT")?.parse()?, username.into(), password.into())
+-    }
++    let (daemon, wallet, username, password) = fixture_connection()?;
++    NativeRpc::new(daemon, wallet, username, password)
++}

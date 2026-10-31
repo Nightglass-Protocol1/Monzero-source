@@ -1,8 +1,10 @@
 # XMZ settlement-fee enforcement: unresolved protocol requirement
 
-Status: design blocker for live settlement, not a deployed vulnerability.
-All execution remains disabled. The required outcome remains success-only XMZ
-fees for trades through this protocol, including acquisition without prior XMZ.
+Status: unresolved fee-bearing design, not a deployed vulnerability.
+The user has since approved a [first release without mandatory app trading
+fees](DEX_FIRST_RELEASE_SCOPE.md). The findings below still apply to the earlier
+fee-bearing construction; they are not a fee-enforcement gate for that revised
+first release. All live execution remains disabled pending working settlement.
 
 ## Reference and inference
 
@@ -39,6 +41,10 @@ secure conditional refund construction is proved.
 
 ## Required construction and tests
 
+The [consensus options assessment](DEX_CONSENSUS_OPTIONS.md) explores a narrow
+conditional-output candidate and its unresolved cross-chain/refund obligations.
+Permission to explore it is not permission to change or activate consensus.
+
 The [settlement review brief](DEX_SETTLEMENT_REVIEW_BRIEF.md) turns this gap into
 role definitions, proof obligations and an executable acceptance package. Existing
 transport and real-node tests do not substitute for that protocol work.
@@ -62,4 +68,4 @@ cannot collect that fee. A zero-XMZ buyer must still be able to acquire XMZ.
 External/external pairs retain the additional multi-chain atomicity problem.
 Sequential routes must disclose partial-completion risk and cannot be called one
 atomic swap. No consensus change or custodial workaround is authorized by this
-document. The mandatory-fee objective is not being relaxed.
+document. The subsequent first-release decision is recorded in the linked scope.

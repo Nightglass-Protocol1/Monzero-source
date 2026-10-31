@@ -25,8 +25,10 @@ private:
     QVariantMap m_details;
 };
 
-// Proves that XMZ delivery and the protocol fee are destinations of one sender
-// wallet transaction. This is evidence only and cannot construct or relay it.
+// Checks delivery/fee metadata from a trusted local sender wallet against node
+// inclusion evidence. This does NOT independently prove confidential destinations
+// or amounts from raw chain data. Never accept peer-supplied wallet JSON as a
+// payment proof. Evidence only: cannot construct/relay or enforce fee collection.
 QVariantMap validate(const QJsonObject &walletResult,
                      const QJsonObject &blockResult,
                      const QJsonObject &nodeInfo,

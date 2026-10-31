@@ -1,0 +1,164 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 03d7e53f5..d0b7c5ab9 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -11,6 +11,7 @@ mod linux {
+     struct Config {
+         schema:String,helper:PathBuf,helper_digest:String,metadata_directory:PathBuf,snapshot_directory:PathBuf,
+         trade_id:uuid::Uuid,role:String,pins:[[u8;32];2],policy:Policy,
++        #[serde(default)] start_quote_file:Option<PathBuf>,
+         #[serde(default)] refund_rpc_file:Option<PathBuf>,
+         #[serde(default)] payout_rpc_file:Option<PathBuf>,
+         #[serde(default)] funding_rpc_file:Option<PathBuf>,
+@@ -25,6 +26,8 @@ mod linux {
+     fn valid_request(request:&Request,mode:&str)->bool {
+         let (schema,action,approval,funding)=match mode {
+             "--snapshot-stdio-v1"=>("monzero-ltc-journal-request-v1",false,false,false),
++            "--start-review-stdio-v1"=>("monzero-ltc-start-review-request-v1",false,false,false),
++            "--start-submit-stdio-v1"=>("monzero-ltc-start-submit-request-v1",false,true,false),
+             "--refund-review-stdio-v1"=>("monzero-ltc-refund-review-request-v1",true,false,false),
+             "--refund-submit-stdio-v1"=>("monzero-ltc-refund-submit-request-v1",true,true,false),
+             "--refund-check-stdio-v1"=>("monzero-ltc-refund-check-request-v1",false,false,false),
+@@ -63,7 +66,9 @@ mod linux {
+                 ==(after.mtime(),after.mtime_nsec(),after.ctime(),after.ctime_nsec()),"configuration changed");
+         Ok((file,bytes))
+     }
+-    fn valid_config_mode(schema:&str,role:&str,refund:bool,payout:bool,funding:bool)->bool {
++    fn valid_config_mode(schema:&str,role:&str,refund:bool,payout:bool,funding:bool,start:bool)->bool {
++        if start {return schema=="monzero-private-ltc-journal-v5" && !refund && !payout && !funding
++            && (role=="native-funder" || role=="litecoin-funder");}
+         match schema {
+             "monzero-private-ltc-journal-v1"=>!refund && !payout && !funding
+                 && (role=="native-funder" || role=="litecoin-funder"),
+@@ -77,7 +82,7 @@ mod linux {
+         let (file,bytes)=private_bytes(path,false)?;
+         let config:Config=serde_json::from_slice(&bytes)?;
+         ensure!(!config.trade_id.is_nil() && valid_config_mode(&config.schema,&config.role,
+-            config.refund_rpc_file.is_some(),config.payout_rpc_file.is_some(),config.funding_rpc_file.is_some()),
++            config.refund_rpc_file.is_some(),config.payout_rpc_file.is_some(),config.funding_rpc_file.is_some(),config.start_quote_file.is_some()),
+             "invalid configuration schema or trade");
+         ensure!(config.helper.is_absolute() && config.helper.canonicalize()?==std::env::current_exe()?.canonicalize()?,"wrong configured helper");
+         ensure!(config.helper_digest.len()==64 && config.helper_digest.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid helper digest");
+@@ -85,6 +90,28 @@ mod linux {
+         // starting it. A process cannot establish its own provenance from this file.
+         Ok((file,config))
+     }
++    fn start_trade(config:&Config,request:&Request,role:LocalRole,submit:bool,now:u64)->Result<serde_json::Value> {
++        use swap_machine::{litecoin_quote::VerifiedLtcQuote,litecoin_negotiation::execution::start_approval::review_start};
++        ensure!(config.schema=="monzero-private-ltc-journal-v5"
++            && config.policy.ltc_network==swap_core::litecoin_address::LtcNetwork::Regtest,
++            "trade startup helper is limited to isolated-chain development");
++        let (_quote_lease,bytes)=private_bytes(config.start_quote_file.as_deref().context("missing startup quote")?,false)?;
++        let quote=VerifiedLtcQuote::from_envelope(&bytes,now,&config.policy,config.pins)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"startup quote belongs to another trade");
++        let review=review_start(&quote,&config.policy,role,now)?;
++        let commitment=review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>();
++        if !submit {
++            return Ok(serde_json::json!({"schema":"monzero-ltc-start-review-response-v1","requestId":request.request_id,
++                "review":{"details":review.details,"commitment":commitment}}));
++        }
++        let approved=parse_commitment(request.commitment.as_deref().context("missing startup approval")?)?;
++        // This revalidates consent before storage opens. An attempted start must
++        // never be retried by generating replacement keys; resume saved state.
++        let execution=Execution::begin_reviewed(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,role,approved,now,&mut rand::rngs::OsRng)?;
++        Ok(serde_json::json!({"schema":"monzero-ltc-start-submit-response-v1","requestId":request.request_id,
++            "snapshot":execution.saved_status()?,"review":{"details":review.details,"commitment":commitment}}))
++    }
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct RefundRpc {
+@@ -273,6 +300,8 @@ mod linux {
+         #[test]
+         fn payment_request_modes_reject_cross_operation_and_extra_authority()->Result<()> {
+             let modes=[("--snapshot-stdio-v1","monzero-ltc-journal-request-v1",false,false,false),
++                ("--start-review-stdio-v1","monzero-ltc-start-review-request-v1",false,false,false),
++                ("--start-submit-stdio-v1","monzero-ltc-start-submit-request-v1",false,true,false),
+                 ("--refund-review-stdio-v1","monzero-ltc-refund-review-request-v1",true,false,false),
+                 ("--refund-submit-stdio-v1","monzero-ltc-refund-submit-request-v1",true,true,false),
+                 ("--refund-check-stdio-v1","monzero-ltc-refund-check-request-v1",false,false,false),
+@@ -303,18 +332,19 @@ mod linux {
+         }
+         #[test]
+         fn funding_configuration_cannot_grant_refund_or_payout_authority() {
+-            for version in 0..=5 {
++            for version in 0..=6 {
+                 for role in ["native-funder","litecoin-funder","unknown"] {
+-                    for bits in 0..8 {
++                    for bits in 0..16 {
+                         let expected=match version {
+                             1=>bits==0 && role!="unknown",
+                             2=>bits==1 && role=="native-funder",
+                             3=>bits==2 && role=="litecoin-funder",
+                             4=>bits==4 && role=="native-funder",
++                            5=>bits==8 && role!="unknown",
+                             _=>false,
+                         };
+                         assert_eq!(valid_config_mode(&format!("monzero-private-ltc-journal-v{version}"),
+-                            role,bits&1!=0,bits&2!=0,bits&4!=0),expected);
++                            role,bits&1!=0,bits&2!=0,bits&4!=0,bits&8!=0),expected);
+                     }
+                 }
+             }
+@@ -344,7 +374,7 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
+-        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
++        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
+             && args[2]=="--config-file","invalid journal helper arguments");
+         let review_mode=args[1]=="--refund-review-stdio-v1";
+         let payout_review_mode=args[1]=="--payout-review-stdio-v1";
+@@ -362,6 +392,14 @@ mod linux {
+         ensure!(valid_request(&request,args[1].to_str().context("invalid request mode")?),"invalid journal request mode");
+         let role=match config.role.as_str() {"litecoin-funder"=>LocalRole::LitecoinFunder,
+             "native-funder"=>LocalRole::NativeFunder,_=>anyhow::bail!("invalid journal role")};
++        if args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" {
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            let response=start_trade(&config,&request,role,args[1]=="--start-submit-stdio-v1",now)?;
++            let result=serde_json::to_vec(&response)?;
++            ensure!(result.len()<=8192,"oversized startup response");
++            std::io::stdout().write_all(&result)?;
++            return Ok(());
++        }
+         let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
+             config.trade_id,&config.policy,role,config.pins)?;
+         let response=if funding_review_mode {
+diff --git a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+index 8939a0ceb..bb5e7fc54 100644
+--- a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
++++ b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+@@ -46,6 +46,16 @@ async fn actual_paired_chain_execution()->Result<()> {
+     let pins=[bob_identity.verifying_key().to_bytes(),alice_identity.verifying_key().to_bytes()];
+     let bm=root.join("bob-meta");let bs=root.join("bob-secrets");
+     let am=root.join("alice-meta");let als=root.join("alice-secrets");let reservations=root.join("reservations");
++    if request.action=="prepare_start" {
++        for path in [&bm,&bs,&am,&als,&reservations] {std::fs::DirBuilder::new().mode(0o700).create(path)?;}
++        let quote=crate::litecoin_quote::tests::signed(&request.terms,&request.policy,now)?;
++        std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
++            .open(root.join("start-quote.json"))?.write_all(&quote.to_envelope()?)?;
++        std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
++            .open(root.join("prepare_start-result.json"))?.write_all(&serde_json::to_vec(&serde_json::json!({
++                "schema":"monzero-paired-chain-fixture-v1","action":"prepare_start","executable":false}))?)?;
++        return Ok(());
++    }
+     let (mut bob,mut alice)=if request.action=="begin" {
+         for path in [&bm,&bs,&am,&als,&reservations] {std::fs::DirBuilder::new().mode(0o700).create(path)?;}
+         let quote=crate::litecoin_quote::tests::signed(&request.terms,&request.policy,now)?;
+@@ -66,9 +76,15 @@ async fn actual_paired_chain_execution()->Result<()> {
+         (Execution::resume(&bm,&bs,trade,&request.policy,LocalRole::LitecoinFunder,pins)?,
+          Execution::resume(&am,&als,trade,&request.policy,LocalRole::NativeFunder,pins)?)
+     };
++    if request.action=="begin_prepared" {
++        let first=bob.outgoing(&bob_identity,now)?;
++        alice.accept_peer(first.bytes(),first.signature(),now)?;
++        let second=alice.outgoing(&alice_identity,now)?;
++        bob.accept_peer(second.bytes(),second.signature(),now)?;
++    }
+     let mut result=serde_json::json!({"schema":"monzero-paired-chain-fixture-v1","action":request.action,"executable":false});
+     match request.action.as_str() {
+-        "begin"=>{
++        "begin"|"begin_prepared"=>{
+             result["startApprovalBound"]=serde_json::json!(true);
+             let keys=bob.completed_keys()?;
+             ensure!(keys.transcript_commitment()==alice.completed_keys()?.transcript_commitment(),"fixture key disagreement");

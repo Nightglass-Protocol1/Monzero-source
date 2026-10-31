@@ -1,0 +1,80 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+@@ -29,7 +29,18 @@
+     let frame=native.prepare_bch_native_proof(now+4)?;
+     let signature=SigningKey::from_bytes(&[2;32]).sign(&proof::signing_bytes(&frame)?).to_bytes();
+     native.retain_outgoing_bch_native_proof(now+5,&signature)?;
+-    sender.accept_bch_native_proof(now+6,&frame,&signature)?;
++    let review=sender.review_bch_native_proof(now+6,&frame,&signature)?;
++    assert_eq!(review.details.as_object().unwrap().len(),13);
++    assert_eq!(review.details["txid"],sent.txid);assert_eq!(review.details["amountAtoms"],"200000000000");
++    assert!(native.review_bch_native_proof(now+6,&frame,&signature).is_err());
++    assert!(sender.review_bch_native_proof(now+6,&frame,&[0;64]).is_err());
++    assert!(sender.received_bch_native_proof()?.is_none());
++    assert!(sender.accept_reviewed_bch_native_proof(now+6,&frame,&signature,&[0;32]).is_err());
++    assert!(sender.received_bch_native_proof()?.is_none());
++    sender.accept_reviewed_bch_native_proof(now+6,&frame,&signature,&review.commitment)?;
++    let saved=sender.saved_bch_native_proof_review()?.context("missing public proof review")?;
++    assert_eq!(saved.review.commitment,review.commitment);assert_eq!(saved.received_at,now+6);
++
+     let observer=observer_backend()?;
+     assert!(sender.observe_bch_native_payment(&observer).await.is_err());
+     let pending=event.with_extension("pending");
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof.rs
+@@ -219,3 +219,5 @@
+         Ok(NativePaymentConfirmation {funding,quote:frame.quote,agreement:frame.agreement})
+     }
+ }
++
++pub mod approval;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof/approval.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof/approval.rs
+@@ -0,0 +1,43 @@
++//! Public consent for retaining an authenticated private native payment proof.
++//! Review exposes no transaction key and grants no release/confirmation authority.
++use super::*;
++const REVIEW: &str = "monzero-bch-native-proof-review-v1";
++pub struct NativeProofReview {pub details: serde_json::Value,pub commitment: [u8;32]}
++pub struct SavedNativeProof {pub review: NativeProofReview,pub received_at: u64}
++impl AdmittedExecution<'_> {
++    fn native_proof_review(&self,bytes: &[u8],signature: &[u8]) -> Result<NativeProofReview> {
++        ensure!(self.role==Role::BchFunder,"wrong native proof review role");
++        self.authenticate_native_proof(bytes,signature)?;
++        let frame=self.check_native_proof(bytes)?;
++        let details=json!({"schema":REVIEW,"action":"retain-native-payment-proof",
++            "swapId":frame.swap,"quote":frame.quote,"agreement":frame.agreement,
++            "admission":self.admission_digest()?,"bchFundingOutpoint":format!("{}:{}",frame.bch_txid,frame.bch_vout),
++            "genesis":frame.genesis,"destination":frame.destination,"amountAtoms":frame.amount.to_string(),
++            "txid":frame.proof.tx_hash.0,"message":hash(FRAME,bytes),"signature":hash("monzero-bch-native-proof-signature-v1",signature)});
++        let commitment=hash(REVIEW,&serde_json::to_vec(&details)?);
++        Ok(NativeProofReview {details,commitment})
++    }
++    /// Proof handoff may finish after expiry; this never renews trading authority.
++    pub fn review_bch_native_proof(&self,now: u64,bytes: &[u8],signature: &[u8]) -> Result<NativeProofReview> {
++        let review=self.native_proof_review(bytes,signature)?;
++        let (_,_,earliest)=self.native_proof_context()?;
++        ensure!(now>=earliest,"native proof review predates funding");
++        if let Some((saved,pin))=self.retained_native_proof("received")? {
++            ensure!(now>=pin.at && saved.frame==bytes && saved.signature.as_deref()==Some(signature),
++                "native proof already received differently");
++        }
++        Ok(review)
++    }
++    pub fn accept_reviewed_bch_native_proof(&mut self,now: u64,bytes: &[u8],signature: &[u8],approved: &[u8;32]) -> Result<()> {
++        let review=self.review_bch_native_proof(now,bytes,signature)?;
++        ensure!(review.commitment==*approved,"native proof consent changed");
++        self.accept_bch_native_proof(now,bytes,signature)
++    }
++    pub fn saved_bch_native_proof_review(&self) -> Result<Option<SavedNativeProof>> {
++        ensure!(self.role==Role::BchFunder,"wrong saved native proof review role");
++        self.retained_native_proof("received")?.map(|(record,pin)| {
++            let review=self.native_proof_review(&record.frame,record.signature.as_deref().context("missing native proof signature")?)?;
++            Ok(SavedNativeProof {review,received_at:pin.at})
++        }).transpose()
++    }
++}

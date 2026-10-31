@@ -1,0 +1,109 @@
+diff --git a/swap-machine/src/litecoin_light/vault.rs b/swap-machine/src/litecoin_light/vault.rs
+--- a/swap-machine/src/litecoin_light/vault.rs
++++ b/swap-machine/src/litecoin_light/vault.rs
+@@ -128,3 +128,5 @@
+ mod tests;
+ 
+ pub mod backup;
++
++pub mod signing;
+diff --git a/swap-machine/src/litecoin_light/vault/signing.rs b/swap-machine/src/litecoin_light/vault/signing.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing.rs
+@@ -0,0 +1,43 @@
++//! Low-level owned-input signing. No coin selection, fee/consent policy,
++//! unspentness proof, transaction publication or live-trading authority.
++use super::*;
++use crate::litecoin_light::account::Branch;
++use bitcoin::{Transaction,TxOut,Witness,EcdsaSighashType,sighash::SighashCache,
++    secp256k1::{Secp256k1,Message},ecdsa};
++
++impl SecretSeed {
++    /// Sign exactly one native P2WPKH input, committing to all outputs. The
++    /// caller must authenticate the supplied prevout, review the entire spend
++    /// and enforce reservation/fee/recovery policy before using the witness.
++    pub fn sign_p2wpkh_input(&self,account:&PublicAccount,branch:Branch,index:u32,
++        transaction:&Transaction,input:usize,prevout:&TxOut)->Result<Witness> {
++        ensure!(!transaction.input.is_empty() && transaction.input.len()<=1000
++            && !transaction.output.is_empty() && transaction.output.len()<=1000,
++            "invalid Litecoin signing transaction size");
++        ensure!(transaction.input.iter().all(|i|!i.previous_output.is_null() && i.script_sig.is_empty()),
++            "Litecoin signing requires native witness inputs");
++        let target=transaction.input.get(input).context("missing Litecoin signing input")?;
++        ensure!(target.witness.is_empty(),"Litecoin input already has a witness");
++        let mut seen=std::collections::HashSet::new();
++        ensure!(transaction.input.iter().all(|i|seen.insert(i.previous_output)),"duplicate Litecoin signing input");
++        let actual=self.public_account(account.network(),account.account_index())?;
++        ensure!(serde_json::to_vec(&actual.descriptor())?==serde_json::to_vec(&account.descriptor())?,
++            "Litecoin signing seed does not match account");
++        let address=account.derive(branch,index)?;
++        ensure!(prevout.value.to_sat()>0 && &prevout.script_pubkey==address.address().script_pubkey(),
++            "Litecoin signing prevout does not match derived address");
++        let sighash=SighashCache::new(transaction).p2wpkh_signature_hash(input,&prevout.script_pubkey,
++            prevout.value,EcdsaSighashType::All)?;
++        let secp=Secp256k1::new();
++        let mut root=Xpriv::new_master(if account.network()==LtcNetwork::Mainnet {NetworkKind::Main}else{NetworkKind::Test},&*self.0)?;
++        let child=root.derive_priv(&secp,address.path());
++        root.private_key.non_secure_erase();root.chain_code=[0u8;32].into();
++        let mut child=child?;
++        let signature=secp.sign_ecdsa(&Message::from(sighash),&child.private_key);
++        child.private_key.non_secure_erase();child.chain_code=[0u8;32].into();
++        secp.verify_ecdsa(&Message::from(sighash),&signature,&address.public_key().0)?;
++        Ok(Witness::p2wpkh(&ecdsa::Signature {signature,sighash_type:EcdsaSighashType::All},&address.public_key().0))
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/tests.rs b/swap-machine/src/litecoin_light/vault/signing/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/tests.rs
+@@ -0,0 +1,47 @@
++use super::*;
++use bitcoin::{absolute,transaction,TxIn,OutPoint,ScriptBuf,Sequence,Amount,Txid,hashes::Hash};
++fn fixture()->Result<(SecretSeed,PublicAccount,Transaction,TxOut)> {
++    let seed=SecretSeed::from_bytes(Zeroizing::new([42;32]));
++    let account=seed.public_account(LtcNetwork::Regtest,2)?;
++    let prevout=TxOut {value:Amount::from_sat(100000),script_pubkey:account.derive(Branch::Receive,3)?.address().script_pubkey().clone()};
++    let tx=Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([1;32]),vout:0},
++            script_sig:ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++        output:vec![TxOut {value:Amount::from_sat(99000),script_pubkey:account.derive(Branch::Change,0)?.address().script_pubkey().clone()}]};
++    Ok((seed,account,tx,prevout))
++}
++#[test]
++fn owned_input_signature_commits_to_outputs_and_prevout_amount()->Result<()> {
++    let (seed,account,tx,prevout)=fixture()?;
++    let witness=seed.sign_p2wpkh_input(&account,Branch::Receive,3,&tx,0,&prevout)?;
++    assert_eq!(witness.len(),2);let signature=ecdsa::Signature::from_slice(witness.iter().next().unwrap())?;
++    assert_eq!(signature.sighash_type,EcdsaSighashType::All);
++    let key=account.derive(Branch::Receive,3)?.public_key();
++    assert_eq!(witness.iter().nth(1).unwrap(),key.0.serialize());
++    let verify=|tx:&Transaction,value:Amount|->Result<bool> {
++        let hash=SighashCache::new(tx).p2wpkh_signature_hash(0,&prevout.script_pubkey,value,EcdsaSighashType::All)?;
++        Ok(Secp256k1::verification_only().verify_ecdsa(&Message::from(hash),&signature.signature,&key.0).is_ok())
++    };
++    assert!(verify(&tx,prevout.value)?);
++    assert!(!verify(&tx,Amount::from_sat(99999))?);
++    let mut changed=tx.clone();changed.output[0].value=Amount::from_sat(98000);assert!(!verify(&changed,prevout.value)?);
++    changed=tx.clone();changed.input[0].previous_output.vout=1;assert!(!verify(&changed,prevout.value)?);
++    let mut signed=tx.clone();signed.input[0].witness=witness;
++    assert_eq!(signed.compute_txid(),tx.compute_txid());assert_ne!(signed.compute_wtxid(),tx.compute_wtxid());Ok(())
++}
++#[test]
++fn signing_refuses_wrong_ownership_and_invalid_inputs()->Result<()> {
++    let (seed,account,tx,prevout)=fixture()?;
++    assert!(seed.sign_p2wpkh_input(&account,Branch::Change,3,&tx,0,&prevout).is_err());
++    assert!(seed.sign_p2wpkh_input(&account,Branch::Receive,4,&tx,0,&prevout).is_err());
++    assert!(seed.sign_p2wpkh_input(&account,Branch::Receive,3,&tx,1,&prevout).is_err());
++    let other=SecretSeed::from_bytes(Zeroizing::new([43;32]));
++    assert!(other.sign_p2wpkh_input(&account,Branch::Receive,3,&tx,0,&prevout).is_err());
++    for mode in 0..4 {
++        let mut bad=tx.clone();
++        match mode {0=>bad.input.push(bad.input[0].clone()),1=>bad.input[0].previous_output=OutPoint::null(),
++            2=>bad.input[0].witness.push([1]),_=>bad.output.clear()}
++        assert!(seed.sign_p2wpkh_input(&account,Branch::Receive,3,&bad,0,&prevout).is_err());
++    }
++    Ok(())
++}

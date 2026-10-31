@@ -1,0 +1,171 @@
+diff --git a/swap-machine/tests/alice_peer/mod.rs b/swap-machine/tests/alice_peer/mod.rs
+index f55becfd5..13361be39 100644
+--- a/swap-machine/tests/alice_peer/mod.rs
++++ b/swap-machine/tests/alice_peer/mod.rs
+@@ -9,7 +9,7 @@ use std::{cell::RefCell, io::{Read, Write}, os::unix::{fs::DirBuilderExt, net::{
+ use swap_machine::{alice, bob};
+ use swap_env::env::{GetConfig, Regtest};
+ use uuid::Uuid;
+-use crate::quote_fixture::{Message, Negotiation};
++use crate::quote_fixture::{Message, Negotiation, Association, check_association};
+ 
+ struct Wire { socket: UnixStream, id: Uuid, sequence: u64 }
+ impl Wire {
+@@ -45,6 +45,7 @@ impl Wire {
+ pub struct AlicePeer {
+     wire: RefCell<Wire>, owner: OwnedProcess,
+     funding: (monero_oxide_ext::PublicKey, monero_oxide_ext::PublicKey, u64),
++    association: Option<Association>,
+ }
+ struct OwnedProcess { child: Child, directory: PathBuf }
+ impl Drop for OwnedProcess {
+@@ -95,8 +96,9 @@ impl AlicePeer {
+         socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+         socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+         let mut wire=Wire {socket,id,sequence};
+-        let funding: (monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey,u64)=wire.receive("resume")?;
++        let (funding,association): ((monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey,u64),Option<Association>)=wire.receive("resume")?;
+         ensure!(funding==self.funding,"Alice resumed with different funding keys");
++        check_association(&self.association,&association)?;
+         wire.sequence+=1;
+         self.wire=RefCell::new(wire);
+         Ok(())
+@@ -139,12 +141,12 @@ impl AlicePeer {
+         let response=wire.call("message2",negotiation.encode(Message::Bob2(bob1.next_message()))?)?;
+         let Message::Alice3(message)=negotiation.decode(response)? else { anyhow::bail!("expected Alice3"); };
+         let bob2=bob1.receive(message)?;
+-        let (funding,commitment): ((monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey,u64),Option<[u8;32]>)=
++        let (funding,association): ((monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey,u64),Option<Association>)=
+             wire.call("message4",negotiation.encode(Message::Bob4(bob2.next_message()?))?)?;
+-        ensure!(commitment==negotiation.completed()?,"fixture transcript commitments differ");
++        check_association(&negotiation.completed()?,&association)?;
+         ensure!(funding.2==xmz_atoms && bob2.xmr.as_pico()==xmz_atoms
+             && bob2.tx_lock.lock_amount()==btc_amount,"negotiated fixture amounts differ from request");
+-        Ok((Self {wire:RefCell::new(wire),owner,funding},bob2))
++        Ok((Self {wire:RefCell::new(wire),owner,funding,association},bob2))
+     }
+     pub fn lock_xmr_transfer_request(&self)->swap_core::monero::TransferRequest {
+         swap_core::monero::TransferRequest {public_spend_key:self.funding.0,
+@@ -209,19 +211,19 @@ pub fn serve()->Result<()> {
+     socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+     let id=std::env::var("MONZERO_TEST_ALICE_ID")?.parse()?;
+     let mut wire=Wire {socket,id,sequence:0};
+-    let state=if std::env::var("MONZERO_TEST_ALICE_RESUME").as_deref()==Ok("1") {
++    let (state,association)=if std::env::var("MONZERO_TEST_ALICE_RESUME").as_deref()==Ok("1") {
+         let expected_sequence: u64=std::env::var("MONZERO_TEST_ALICE_SEQUENCE")?.parse()?;
+         let checkpoint=checkpoint_directory.join(format!("checkpoint-{expected_sequence}.json"));
+         let mut bytes=Vec::new();
+         std::fs::File::open(&checkpoint)?.take(1_048_577).read_to_end(&mut bytes)?;
+         ensure!(bytes.len()<=1_048_576,"oversized Alice fixture checkpoint");
+-        let (saved_id,sequence,state): (Uuid,u64,alice::State3)=serde_json::from_slice(&bytes)?;
++        let (saved_id,sequence,state,association): (Uuid,u64,alice::State3,Option<Association>)=serde_json::from_slice(&bytes)?;
+         ensure!(saved_id==id && sequence==expected_sequence,"Alice checkpoint context mismatch");
+         wire.sequence=sequence;
+         let funding=state.lock_xmr_transfer_request();
+-        wire.send("resume",(funding.public_spend_key,funding.public_view_key.0,funding.amount.as_pico()))?;
++        wire.send("resume",((funding.public_spend_key,funding.public_view_key.0,funding.amount.as_pico()),&association))?;
+         wire.sequence+=1;
+-        state
++        (state,association)
+     } else {
+     let init: Value=wire.receive("init")?;
+     let quote=init.get("quote").context("missing fixture negotiation mode")?;
+@@ -255,7 +257,7 @@ pub fn serve()->Result<()> {
+     let funding=state.lock_xmr_transfer_request();
+     wire.send("message4",((funding.public_spend_key,funding.public_view_key.0,funding.amount.as_pico()),
+         negotiation.completed()?))?; wire.sequence+=1;
+-    state
++    (state,negotiation.completed()?)
+     };
+     // Post-negotiation operations remain fixture-only and retain Alice's keys here.
+     loop {
+@@ -272,12 +274,14 @@ pub fn serve()->Result<()> {
+         match kind {
+             "check-quote"=>{
+                 let quote=crate::quote_fixture::read(&value["payload"],id)?;
++                ensure!(association.as_ref().is_some_and(|a|&a.quote==quote.commitment()),
++                    "quote differs from negotiated association");
+                 state.check_native_quote(&quote,&crate::quote_fixture::policy(),crate::quote_fixture::now()?)?;
+                 wire.send(kind,true)?;
+             }
+             "checkpoint"=>{
+                 use std::os::unix::fs::OpenOptionsExt;
+-                let bytes=serde_json::to_vec(&(id,wire.sequence+1,&state))?;
++                let bytes=serde_json::to_vec(&(id,wire.sequence+1,&state,&association))?;
+                 ensure!(bytes.len()<=1_048_576,"oversized Alice fixture checkpoint");
+                 let checkpoint=checkpoint_directory.join(format!("checkpoint-{}.json",wire.sequence+1));
+                 let mut file=std::fs::OpenOptions::new().write(true).create_new(true)
+diff --git a/swap-machine/tests/quote_fixture.rs b/swap-machine/tests/quote_fixture.rs
+index 872d6c2f0..0d2821502 100644
+--- a/swap-machine/tests/quote_fixture.rs
++++ b/swap-machine/tests/quote_fixture.rs
+@@ -9,19 +9,32 @@ use swap_env::env::{GetConfig, Regtest};
+ use uuid::Uuid;
+ pub use swap_machine::native_negotiation::Message;
+ 
++#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Association { pub quote: [u8;32], pub transcript: [u8;32] }
++
++pub fn check_association(expected: &Option<Association>, found: &Option<Association>) -> Result<()> {
++    ensure!(expected==found,"fixture quote/transcript association changed");
++    Ok(())
++}
++
+ /// Private test transport adapter; transcript state is deliberately not a
+ /// production restart record. Never expose frames containing view-key shares.
+ pub struct Negotiation {
+     transcript: Option<swap_machine::native_negotiation::Transcript>,
+     btc_sender: bool,
++    quote: Option<[u8;32]>,
+ }
+ impl Negotiation {
+     pub fn new(context: Option<&Value>, swap: Uuid, btc_sender: bool) -> Result<Self> {
+-        let transcript=match context {
+-            Some(context)=>Some(swap_machine::native_negotiation::Transcript::new(&read(context,swap)?,&policy(),now()?)?),
+-            None=>None,
++        let (transcript,quote)=match context {
++            Some(context)=>{
++                let quote=read(context,swap)?;
++                (Some(swap_machine::native_negotiation::Transcript::new(&quote,&policy(),now()?)?),Some(*quote.commitment()))
++            }
++            None=>(None,None),
+         };
+-        Ok(Self {transcript,btc_sender})
++        Ok(Self {transcript,btc_sender,quote})
+     }
+     pub fn encode(&mut self, message: Message) -> Result<Value> {
+         let Some(transcript)=&mut self.transcript else { return Ok(serde_json::to_value(message)?); };
+@@ -44,14 +57,30 @@ impl Negotiation {
+         ensure!(transcript.accept(&signed.frame,&damaged).is_err(),"accepted damaged fixture signature");
+         transcript.accept(&signed.frame,&signed.signature)
+     }
+-    pub fn completed(&self) -> Result<Option<[u8;32]>> {
++    pub fn completed(&self) -> Result<Option<Association>> {
+         match &self.transcript {
+-            Some(t)=>Ok(Some(t.completed_commitment().context("incomplete fixture transcript")?)),
++            Some(t)=>Ok(Some(Association {quote:self.quote.context("missing fixture quote association")?,
++                transcript:t.completed_commitment().context("incomplete fixture transcript")?})),
+             None=>Ok(None),
+         }
+     }
+ }
+ 
++#[test]
++fn association_rejects_loss_substitution_and_unknown_fields() -> Result<()> {
++    let expected=Some(Association {quote:[1;32],transcript:[2;32]});
++    let bytes=serde_json::to_vec(&expected)?;
++    check_association(&expected,&serde_json::from_slice(&bytes)?)?;
++    ensure!(check_association(&expected,&None).is_err(),"accepted association downgrade");
++    ensure!(check_association(&None,&expected).is_err(),"accepted unrequested association");
++    for changed in [Association {quote:[3;32],transcript:[2;32]},Association {quote:[1;32],transcript:[3;32]}] {
++        ensure!(check_association(&expected,&Some(changed)).is_err(),"accepted altered association");
++    }
++    let mut extra=serde_json::to_value(expected)?; extra["unknown"]=true.into();
++    ensure!(serde_json::from_value::<Association>(extra).is_err(),"accepted unknown association field");
++    Ok(())
++}
++
+ pub fn now() -> Result<u64> {
+     Ok(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())
+ }

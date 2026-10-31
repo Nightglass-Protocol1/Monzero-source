@@ -1,0 +1,281 @@
+--- a/swap-core/src/bch/funding.rs
++++ b/swap-core/src/bch/funding.rs
+@@ -1,6 +1,7 @@
+ //! Unsigned native-BCH funding review. Previous transaction bytes bind input
+ //! amounts/scripts, but are not proof of chain membership, maturity, wallet
+-//! ownership or availability. No signature, reservation or relay is performed.
++//! ownership or availability. Signature verification is in `signed`; no signing,
++//! reservation or relay is performed.
+ use anyhow::{Context,Result,ensure};
+ use bitcoin::{absolute,consensus::{deserialize,serialize},transaction::Version,
+     Amount,Script,Transaction,TxOut,Sequence};
+@@ -149,3 +150,6 @@
+         Ok(())
+     }
+ }
++
++mod signed;
++pub use signed::SignedFunding;
+--- /dev/null
++++ b/swap-core/src/bch/funding/signed.rs
+@@ -0,0 +1,87 @@
++//! Native BCH P2PKH funding signatures: strict DER, low S, ALL|FORKID (0x41).
++//! Reviewed against BCHN 89a591f7c5b1fd110c0819377ad8f2647d656800,
++//! src/script/interpreter.cpp SignatureHash. CashTokens are not supported.
++use super::*;
++use bitcoin::{consensus::Encodable,hashes::{Hash,sha256d,hash160},
++    secp256k1::{self,ecdsa::Signature},OutPoint};
++
++/// Exact signed bytes matching a retained template. This is cryptographic
++/// evidence only: it proves neither live inputs nor approval nor relay status.
++pub struct SignedFunding { transaction: Transaction, lock_vout: u32, fee: Amount }
++impl SignedFunding {
++    pub fn transaction(&self) -> &Transaction { &self.transaction }
++    pub fn fee(&self) -> Amount { self.fee }
++    /// Unlike the template ID, this ID includes the verified legacy signatures.
++    /// Retain these exact bytes before using the outpoint in recovery messages.
++    pub fn lock_outpoint(&self) -> OutPoint {
++        OutPoint {txid:self.transaction.compute_txid(),vout:self.lock_vout}
++    }
++}
++
++impl FundingPreview {
++    /// Accept only exact reviewed fields and independently verified P2PKH input
++    /// signatures. Other preview-supported scripts require their own verifier;
++    /// no generic script acceptance or BCH consensus validity is implied here.
++    pub fn verify_signed(&self, raw: &[u8]) -> Result<SignedFunding> {
++        let transaction = decode(raw)?;
++        let mut unsigned = transaction.clone();
++        for input in &mut unsigned.input { input.script_sig = bitcoin::ScriptBuf::new(); }
++        ensure!(unsigned == self.transaction,"signed BCH funding differs from reviewed template");
++        let secp = secp256k1::Secp256k1::verification_only();
++        for (index,(input,previous)) in transaction.input.iter().zip(&self.previous_outputs).enumerate() {
++            ensure!(previous.script_pubkey.is_p2pkh(),"BCH funding signature verification requires P2PKH inputs");
++            let (der,key) = unlocking(input.script_sig.as_bytes())?;
++            let signature = Signature::from_der(der).context("invalid BCH funding DER signature")?;
++            ensure!(signature.serialize_der().as_ref() == der,"noncanonical BCH funding DER signature");
++            let mut normalized = signature; normalized.normalize_s();
++            ensure!(normalized == signature,"BCH funding signature must have low S");
++            let public = secp256k1::PublicKey::from_slice(key)?;
++            ensure!(hash160::Hash::hash(key).as_byte_array().as_slice() == &previous.script_pubkey.as_bytes()[3..23],
++                "BCH funding signature key differs from source");
++            let message = secp256k1::Message::from_digest(signature_hash(&transaction,index,previous,0x41)?);
++            secp.verify_ecdsa(&message,&signature,&public).context("invalid BCH ALL|FORKID funding signature")?;
++        }
++        Ok(SignedFunding {transaction,lock_vout:self.lock_vout,fee:self.fee})
++    }
++}
++
++fn unlocking(bytes: &[u8]) -> Result<(&[u8],&[u8])> {
++    let length = usize::from(*bytes.first().context("missing BCH funding signature")?);
++    ensure!((9..=73).contains(&length) && bytes.len() > length+1,"invalid BCH funding signature push");
++    ensure!(bytes[length] == 0x41,"BCH funding requires SIGHASH_ALL|FORKID");
++    let key_length = usize::from(bytes[length+1]);
++    ensure!((key_length == 33 || key_length == 65) && bytes.len() == length+2+key_length,
++        "BCH funding requires exactly two minimal pushes");
++    let key = &bytes[length+2..];
++    ensure!((key_length == 33 && matches!(key[0],2|3)) || (key_length == 65 && key[0] == 4),
++        "noncanonical BCH funding public key");
++    Ok((&bytes[1..length],key))
++}
++
++// High fork-id bits are accepted here only to check the pinned BCHN vectors;
++// the production caller and unlocking parser always require exactly 0x41.
++fn signature_hash(tx: &Transaction,index: usize,previous: &TxOut,hash_type: u32) -> Result<[u8;32]> {
++    ensure!(hash_type & 0xff == 0x41,"unsupported BCH funding signature hash mode");
++    let input = tx.input.get(index).context("missing BCH signature input")?;
++    let mut prevouts = Vec::new(); let mut sequences = Vec::new(); let mut outputs = Vec::new();
++    for input in &tx.input {
++        input.previous_output.consensus_encode(&mut prevouts)?;
++        input.sequence.consensus_encode(&mut sequences)?;
++    }
++    for output in &tx.output { output.consensus_encode(&mut outputs)?; }
++    let mut preimage = Vec::new();
++    tx.version.consensus_encode(&mut preimage)?;
++    preimage.extend(sha256d::Hash::hash(&prevouts).to_byte_array());
++    preimage.extend(sha256d::Hash::hash(&sequences).to_byte_array());
++    input.previous_output.consensus_encode(&mut preimage)?;
++    previous.script_pubkey.consensus_encode(&mut preimage)?;
++    previous.value.to_sat().consensus_encode(&mut preimage)?;
++    input.sequence.consensus_encode(&mut preimage)?;
++    preimage.extend(sha256d::Hash::hash(&outputs).to_byte_array());
++    tx.lock_time.consensus_encode(&mut preimage)?;
++    hash_type.consensus_encode(&mut preimage)?;
++    Ok(sha256d::Hash::hash(&preimage).to_byte_array())
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-core/src/bch/funding/signed/tests.rs
+@@ -0,0 +1,133 @@
++use super::*;
++use bitcoin::{ScriptBuf,TxIn,Txid,Witness};
++use crate::bch::covenant::CovenantTerms;
++
++fn fixture(uncompressed: bool) -> Result<(FundingPreview,secp256k1::SecretKey)> {
++    let secret = secp256k1::SecretKey::from_slice(&[3;32])?;
++    let public = secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(),&secret);
++    let public = bitcoin::PublicKey {compressed:!uncompressed,inner:public};
++    let script = ScriptBuf::new_p2pkh(&public.pubkey_hash());
++    let covenant = Covenant::new(CovenantTerms {fee_atoms:1000,delay_blocks:20,
++        signing_key:public.inner,redeem_destination:script.clone(),timeout_destination:script.clone()})?;
++    let parent = Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
++            script_sig:ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++        output:vec![TxOut {value:Amount::from_sat(60_000),script_pubkey:script.clone()};2]};
++    let mut tx = parent.clone(); tx.input.push(tx.input[0].clone());
++    for (vout,input) in tx.input.iter_mut().enumerate() {
++        input.previous_output = OutPoint {txid:parent.compute_txid(),vout:vout as u32};
++    }
++    tx.output = vec![TxOut {value:Amount::from_sat(19_000),script_pubkey:script.clone()},
++        TxOut {value:Amount::from_sat(100_000),script_pubkey:covenant.script_pubkey()}];
++    let parent = serialize(&parent);
++    Ok((FundingPreview::verify(&serialize(&tx),&[&parent,&parent],&covenant,100_000,&script,1000,546)?,secret))
++}
++fn sign(preview: &FundingPreview, secret: &secp256k1::SecretKey, uncompressed: bool,
++    wrong_amount: bool) -> Result<Transaction> {
++    let mut tx = preview.transaction().clone(); let secp = secp256k1::Secp256k1::new();
++    let public = secp256k1::PublicKey::from_secret_key(&secp,secret);
++    let key = if uncompressed {public.serialize_uncompressed().to_vec()} else {public.serialize().to_vec()};
++    for index in 0..tx.input.len() {
++        let mut previous = preview.previous_outputs()[index].clone();
++        if wrong_amount { previous.value += Amount::from_sat(1); }
++        let digest = signature_hash(&tx,index,&previous,0x41)?;
++        let signature = secp.sign_ecdsa(&secp256k1::Message::from_digest(digest),secret).serialize_der();
++        let mut bytes = vec![(signature.len()+1) as u8]; bytes.extend(signature.as_ref());
++        bytes.push(0x41); bytes.push(key.len() as u8); bytes.extend(&key);
++        tx.input[index].script_sig = ScriptBuf::from_bytes(bytes);
++    }
++    Ok(tx)
++}
++
++#[test]
++fn forkid_all_matches_four_pinned_bchn_vectors() -> Result<()> {
++    // BCHN src/test/sighash_tests.cpp uses amount zero and preserves scriptCode
++    // for FORKID. Hash strings in its JSON are displayed in reversed byte order.
++    use bitcoin::hex::FromHex;
++    let vectors: Vec<(String,String,usize,i64,String,String)> = serde_json::from_str(
++        include_str!("../bchn-forkid-all-vectors.json"))?;
++    assert_eq!(vectors.len(),4);
++    for (raw,script,index,mode,expected,_) in vectors {
++        let tx: Transaction = deserialize(&Vec::<u8>::from_hex(&raw)?)?;
++        let previous = TxOut {value:Amount::ZERO,script_pubkey:ScriptBuf::from_hex(&script)?};
++        let digest = signature_hash(&tx,index,&previous,mode as u32)?;
++        assert_eq!(sha256d::Hash::from_byte_array(digest).to_string(),expected);
++    }
++    Ok(())
++}
++
++#[test]
++fn signed_funding_verifies_every_input_and_uses_final_legacy_txid() -> Result<()> {
++    for uncompressed in [false,true] {
++        let (preview,secret) = fixture(uncompressed)?;
++        let tx = sign(&preview,&secret,uncompressed,false)?;
++        let signed = preview.verify_signed(&serialize(&tx))?;
++        assert_eq!(signed.transaction(),&tx); assert_eq!(signed.fee().to_sat(),1000);
++        assert_eq!(signed.lock_outpoint(),OutPoint {txid:tx.compute_txid(),vout:1});
++        assert_ne!(signed.lock_outpoint().txid,preview.transaction().compute_txid());
++        assert!(preview.verify_signed(&serialize(&sign(&preview,&secret,uncompressed,true)?)).is_err());
++        let wrong_key = secp256k1::SecretKey::from_slice(&[4;32])?;
++        assert!(preview.verify_signed(&serialize(&sign(&preview,&wrong_key,uncompressed,false)?)).is_err());
++    }
++    Ok(())
++}
++
++#[test]
++fn signed_funding_rejects_changed_template_modes_and_noncanonical_unlocking() -> Result<()> {
++    let (preview,secret) = fixture(false)?; let tx = sign(&preview,&secret,false,false)?;
++    let mut variants = Vec::new();
++    let mut t = tx.clone(); t.output[0].value -= Amount::from_sat(1); variants.push(t);
++    let mut t = tx.clone(); t.output.swap(0,1); variants.push(t);
++    let mut t = tx.clone(); t.input.swap(0,1); variants.push(t);
++    let mut t = tx.clone(); t.input[1].previous_output.vout = 2; variants.push(t);
++    let mut t = tx.clone(); t.input[1].sequence = Sequence::ZERO; variants.push(t);
++    let mut t = tx.clone(); t.version = Version::ONE; variants.push(t);
++    let mut t = tx.clone(); t.lock_time = absolute::LockTime::from_consensus(1); variants.push(t);
++    let mut t = tx.clone(); t.input[1].witness.push([1]); variants.push(t);
++    let mut t = tx.clone(); t.input[1].script_sig = ScriptBuf::new(); variants.push(t);
++    for mode in [0x01,0x42,0x43,0xc1,0x61] {
++        let mut t = tx.clone(); let mut bytes = t.input[1].script_sig.to_bytes();
++        let index = bytes[0] as usize; bytes[index] = mode;
++        t.input[1].script_sig = ScriptBuf::from_bytes(bytes); variants.push(t);
++    }
++    for mutation in 0..4 {
++        let mut t = tx.clone(); let mut bytes = t.input[1].script_sig.to_bytes();
++        match mutation {
++            0 => bytes.push(0), // Extra stack item.
++            1 => bytes.insert(0,0x4c), // Nonminimal PUSHDATA1.
++            2 => bytes[8] ^= 1, // Invalid ECDSA signature.
++            _ => { let at = bytes[0] as usize; bytes.insert(at,0); bytes[0] += 1; }, // Noncanonical DER.
++        }
++        t.input[1].script_sig = ScriptBuf::from_bytes(bytes); variants.push(t);
++    }
++    for invalid in variants { assert!(preview.verify_signed(&serialize(&invalid)).is_err()); }
++    let mut trailing = serialize(&tx); trailing.push(0);
++    assert!(preview.verify_signed(&trailing).is_err());
++    Ok(())
++}
++
++#[test]
++fn signed_funding_rejects_high_s_and_hybrid_public_keys() -> Result<()> {
++    use bitcoin::hex::FromHex;
++    let (preview,secret) = fixture(true)?; let tx = sign(&preview,&secret,true,false)?;
++    let bytes = tx.input[0].script_sig.as_bytes(); let (der,key) = unlocking(bytes)?;
++    let mut compact = Signature::from_der(der)?.serialize_compact();
++    let order = Vec::<u8>::from_hex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")?;
++    let mut borrow = 0i16;
++    for index in (0..32).rev() {
++        let value = i16::from(order[index])-i16::from(compact[index+32])-borrow;
++        compact[index+32] = value.rem_euclid(256) as u8;
++        borrow = i16::from(value < 0);
++    }
++    let high = Signature::from_compact(&compact)?;
++    let mut low = high; low.normalize_s(); assert_ne!(high,low);
++    let der = high.serialize_der(); let mut script = vec![(der.len()+1) as u8];
++    script.extend(der.as_ref()); script.push(0x41); script.push(key.len() as u8); script.extend(key);
++    let mut changed = tx.clone(); changed.input[0].script_sig = ScriptBuf::from_bytes(script);
++    assert!(preview.verify_signed(&serialize(&changed)).is_err());
++    let mut script = bytes.to_vec(); let key_at = script[0] as usize+2;
++    script[key_at] = 6 | (script[script.len()-1] & 1);
++    changed.input[0].script_sig = ScriptBuf::from_bytes(script);
++    assert!(preview.verify_signed(&serialize(&changed)).is_err());
++    Ok(())
++}
+--- /dev/null
++++ b/swap-core/src/bch/funding/bchn-forkid-all-vectors.json
+@@ -0,0 +1,34 @@
++[
++  [
++    "13938a7d011e4545c281cbd8c6c85c796194285adb908ab052755cf65b60c5f7fc7e0e125c020000000953530000ac6a526a00d36774ce04d94bb802000000000600516353ac63f9f9fe000000000000b0123a05000000000251ace0b7c10400000000055351abab6300000000",
++    "5300655100",
++    0,
++    467995457,
++    "6bfb3e169f83f480b12c45223182650ae9dfa1e6be45e42a70b4bfdbf75cf923",
++    "327c5e882d46eac88b09e3db5c8ef7bc5221991cd2712aca5682859fcb3093b2"
++  ],
++  [
++    "753ca84702758209899178670a37c457207494591a31ece76b9654e35d9e38e3e0879462e2030000000952ab515253acab63656d0120aae21ec8043302ace9d58d296672649452875895946eaf44942c410b16df1cef2f020000000400635200ffffffff0348b17202000000000665526a525365d8ada10300000000056563510051d47f54030000000009536aab65abac0052652963ff8d",
++    "",
++    0,
++    -1911846847,
++    "d550d784646703f7db64c8755a5cd58b8ea736e6e344542bd206c21cc569a82e",
++    "6426e3525e0b34f696760644ea65911f90645ce69dad2821eed8ad1516b0914e"
++  ],
++  [
++    "ddadc1eb045d16b79907449cc9f00f7f74e4b8dc891417c1ffed225d5f6665980ca500d3df0000000005acab53ac5277506c8885fe8846264f4e1d2721b4a4d0795bd55d2cf5a43164713a42b813995408024d0200000007abab00635353abffffffff6992b2678018777756025009c13fec6e53b7d1b59ae5f36cb771c61a43a8161d010000000353ababffffffff0c59a711c690c00a13a9d3a9125d3b45db372c26841d9b902932310246695b1c01000000046a51ac006176e522016ef66d0300000000010000000000",
++    "ab6a6a63516aac65",
++    0,
++    -1625231295,
++    "d6fe4e12b301525576c14ca489d6edb914c5326f02c63ed5097b78ad6c51d827",
++    "53c6c3de77c3bc462207a99964b2a12062d5d379412a27f5c1b919c657375ad1"
++  ],
++  [
++    "b70fefc0023bff2a865f7dada7a5f57b8ea9351a4cae4dd639de6cd5ae4e0156df0e4628b4010000000763655153526365ffffffff3a1fbc317ab7a6a7cfcb6e28fef05f5a7c0da6b874d8e61259da947d14a0e9070000000003ac65abffffffff0291e50903000000000251ac299d31050000000002630000000000",
++    "ab6aacacac5200",
++    1,
++    -358440639,
++    "b23f645bdf00519876d9e9fad62f25e94403ee8add3af9294c9acda93ea3e5b9",
++    "6e7b71a8925c9495e06cc7139e10b514d944e3112cbd3b275534ffecc89de661"
++  ]
++]

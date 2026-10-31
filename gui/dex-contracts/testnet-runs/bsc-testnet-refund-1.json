@@ -1,0 +1,55 @@
+{
+  "bnb": {
+    "claimerAfter": "39995587000000000",
+    "claimerBefore": "39995587000000000",
+    "ownerAfter": "59953638250000000",
+    "ownerBefore": "59989550000000000"
+  },
+  "claimer": {
+    "bnbTxs": {},
+    "final": "Done(Refunded)",
+    "xmzLock": "fde9a3ed7f59ba136e198ed54255e40f9f2be4ca5621b7b66b4e517b1a1d16f5",
+    "xmzSweep": [
+      {
+        "tx_hash": "ebf73a42ae0c2180c85d68035694db603e8f3727be24686200d385112a326c02"
+      }
+    ]
+  },
+  "contract": "0xf7c19f735C3494b356091eFBeFf3ab53617190b7",
+  "mode": "refund",
+  "owner": {
+    "bnbTxs": {
+      "new_swap": [
+        "0xd90509e7249cdfa38cc8993bcc8136c043d85e6695f30560145af8b5c585be6e"
+      ],
+      "refund": [
+        "0x515cc69b73b961377b2bec18f2b00654268ed45494836b3f016cf105cf08f302"
+      ],
+      "set_ready": [
+        "0xd363ac0f88b178053f5a8316f080d130487604122e8caf14a1dcb983a3bb9889"
+      ]
+    },
+    "final": "Done(Refunded)",
+    "xmz": null
+  },
+  "ownerXmzAddress": "KfJtkciGHyWAaUGQcGYrZXG54RAferaajdmoB5xzJHR93cnhwwjZq6NMEBZUxNzhftd5xDbKaKDXNR5GGriEgpJiLDFGL6e",
+  "sharedXmzAddress": "Kb1APFGArnd9Ra38EZWvJoau2gMwkrJgm1Z2zawcXX2r9JVcw5Yw49x2ZZA3nMBmsAHjbvdJuj6aH94h3qhvbDfC4ZePxXB",
+  "tradeId": "0x68ee553f5de781751c02e9dffc491f8df286fe215210fb9953756412f474c95a",
+  "verified": {
+    "claimerXmzWallet": "29.9806208 tXMZ unlocked: funded 30, locked 20 (fee 0.0096768), swept back 19.9902976 (fee 0.0097024); XMZ has 11 decimals at XMZ testnet height 2720",
+    "ownerBnb": "lost only gas (0.0000359 tBNB for newSwap, setReady and refund); the 0.02 tBNB lock was refunded",
+    "bothFinal": "Done(Refunded)"
+  },
+  "timeline": [
+    "12:42:57 UTC owner locked 0.02 tBNB (duration1 40 min, duration2 20 min)",
+    "12:42:58 claimer locked 20 tXMZ",
+    "12:55:41 owner setReady after 10 XMZ confirmations; claimer goes offline",
+    "13:42:39 owner refund (after timeout2), confirmed 13:42:55",
+    "13:43:02 claimer back: refund secret read from the chain, sweeping back",
+    "14:05:00 claimer's sweep confirmed (10 XMZ confirmations)"
+  ],
+  "notes": [
+    "Accounts #2 (owner) and #3 (claimer); both on bsc-testnet-rpc.publicnode.com",
+    "One owner tick failed with HTTP 401 from its XMZ wallet RPC (rotated digest nonce) at 12:45:55; retried next tick; engine fixed in ba13ddf22"
+  ]
+}

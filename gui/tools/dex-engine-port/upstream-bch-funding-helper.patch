@@ -1,0 +1,133 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/relay.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/relay.rs
+@@ -55,9 +55,17 @@
+ 
+     /// Display this independently of sign-only approval. No network mutation.
+     pub fn review_bch_funding_relay(&self,backend: &BchRpc,now: u64) -> Result<FundingRelayReview> {
++        self.review_bch_funding_relay_for_deployment(&backend.deployment_commitment()?,now)
++    }
++
++    /// Offline app review against an independently pinned deployment. This does
++    /// not authenticate a running node or observe inputs. Relay still requires
++    /// the actual backend and fresh wallet/chain checks in `relay_bch_funding`.
++    pub fn review_bch_funding_relay_for_deployment(&self,deployment: &[u8;32],now: u64)
++        -> Result<FundingRelayReview> {
+         self.quote.check_policy(self.policy,now)?;
+         let (review,_,prepared_at,locked) = self.funding_relay_materials()?;
+-        ensure!(now >= prepared_at && backend.deployment_commitment()? == locked.deployment,
++        ensure!(now >= prepared_at && *deployment == locked.deployment,
+             "BCH funding relay predates recovery or targets another deployment");
+         self.funding_message_material()?; // Check new publication, not historical relay status.
+         Ok(review)
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -1,4 +1,4 @@
+-//! Private app boundary for BCH negotiation admission. No wallet or chain RPC.
++//! Private app boundary for BCH admission and retained funding review. No RPC.
+ #[cfg(target_os="linux")]
+ mod linux {
+     use anyhow::{Context, Result, ensure};
+@@ -129,16 +129,66 @@
+             "admitted":matches!(mode,Mode::Submit),"executable":false,
+             "review":{"details":review.details,"commitment":commitment}}))
+     }
++    // A separate wrapper preserves the strict admission configuration format.
++    // It carries a deployment digest, never RPC credentials or peer defaults.
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields, rename_all="camelCase")]
++    struct FundingConfig {
++        schema: String, admission_config_file: PathBuf, deployment_commitment: String,
++    }
++    fn funding_request(bytes: &[u8]) -> Result<Request> {
++        ensure!(!bytes.is_empty() && bytes.len() <= 512,"invalid BCH funding request size");
++        let request: Request = serde_json::from_slice(bytes)?;
++        ensure!(request.schema == "monzero-bch-funding-review-request-v1"
++            && !request.request_id.is_nil() && request.commitment.is_none(),
++            "invalid BCH funding review request");
++        Ok(request)
++    }
++    fn funding_config(bytes: &[u8]) -> Result<FundingConfig> {
++        let config: FundingConfig = serde_json::from_slice(bytes)?;
++        ensure!(config.schema == "monzero-private-bch-funding-v1"
++            && config.admission_config_file.is_absolute(),"invalid BCH funding configuration");
++        ensure!(parse_digest(&config.deployment_commitment)? != [0;32],"missing BCH deployment pin");
++        Ok(config)
++    }
++    fn funding_review(path: &Path, bytes: &[u8], now: u64) -> Result<serde_json::Value> {
++        let request = funding_request(bytes)?;
++        let (_funding_lease,bytes) = private_bytes(path)?;
++        let funding = funding_config(&bytes)?;
++        let (_admission_lease,config) = load(&funding.admission_config_file)?;
++        ensure!(matches!(config.role,Role::BchFunder),"BCH funding requires the BCH funder");
++        let (_quote_lease,bytes) = private_bytes(&config.quote_file)?;
++        let quote = VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()? == config.trade_id,
++            "BCH funding quote belongs to another trade");
++        let execution = AdmittedExecution::resume(&config.metadata_directory,
++            &config.snapshot_directory,&quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        let review = execution.review_bch_funding_relay_for_deployment(
++            &parse_digest(&funding.deployment_commitment)?,now)?;
++        let commitment: String = review.commitment.iter().map(|b|format!("{b:02x}")).collect();
++        Ok(serde_json::json!({"schema":"monzero-bch-funding-review-response-v1",
++            "requestId":request.request_id,"tradeId":config.trade_id,
++            "executable":false,"chainObserved":false,
++            "review":{"details":review.details,"commitment":commitment}}))
++    }
+     pub fn run() -> Result<()> {
+         let args: Vec<_> = std::env::args_os().collect();
+         ensure!(args.len() == 3,"expected mode and private configuration path");
+-        let mode = Mode::parse(args[1].to_str().context("invalid admission mode")?)?;
++        let action = args[1].to_str().context("invalid admission mode")?;
+         let mut bytes = Vec::new();
+         std::io::stdin().take(513).read_to_end(&mut bytes)?;
+-        let request = request(&bytes,mode)?;
+-        let (_lease,config) = load(Path::new(&args[2]))?;
+         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+-        let output = serde_json::to_vec(&handle(&config,&request,mode,now)?)?;
++        let result = if action == "--funding-review-stdio-v1" {
++            funding_review(Path::new(&args[2]),&bytes,now)?
++        } else {
++            let mode = Mode::parse(action)?;
++            let request = request(&bytes,mode)?;
++            let (_lease,config) = load(Path::new(&args[2]))?;
++            handle(&config,&request,mode,now)?
++        };
++        let output = serde_json::to_vec(&result)?;
+         ensure!(output.len() <= 16384,"oversized BCH admission response");
+         std::io::stdout().write_all(&output)?;
+         Ok(())
+@@ -147,6 +197,30 @@
+     #[cfg(test)]
+     mod tests {
+ use super::*;
++#[test]
++fn funding_review_protocol_rejects_approval_and_unpinned_deployment() {
++    let valid = serde_json::json!({"schema":"monzero-bch-funding-review-request-v1",
++        "requestId":uuid::Uuid::new_v4()});
++    assert!(funding_request(&serde_json::to_vec(&valid).unwrap()).is_ok());
++    for (key,value) in [("commitment",serde_json::json!("11".repeat(32))),
++        ("schema",serde_json::json!("monzero-bch-admission-review-request-v1")),
++        ("requestId",serde_json::json!(uuid::Uuid::nil())),("broadcast",serde_json::json!(true))] {
++        let mut bad = valid.clone(); bad[key] = value;
++        assert!(funding_request(&serde_json::to_vec(&bad).unwrap()).is_err());
++    }
++    assert!(funding_request(&vec![b' ';513]).is_err());
++    let valid = serde_json::json!({"schema":"monzero-private-bch-funding-v1",
++        "admissionConfigFile":"/private/admission.json","deploymentCommitment":"11".repeat(32)});
++    assert!(funding_config(&serde_json::to_vec(&valid).unwrap()).is_ok());
++    for (key,value) in [("deploymentCommitment",serde_json::json!("00".repeat(32))),
++        ("deploymentCommitment",serde_json::json!("AA".repeat(32))),
++        ("admissionConfigFile",serde_json::json!("relative.json")),
++        ("rpcPassword",serde_json::json!("unexpected")),
++        ("schema",serde_json::json!("monzero-private-bch-admission-v1"))] {
++        let mut bad = valid.clone(); bad[key] = value;
++        assert!(funding_config(&serde_json::to_vec(&bad).unwrap()).is_err());
++    }
++}
+ use std::collections::BTreeMap;
+ use swap_core::xmz_address::XmzNetwork;
+ use bitcoin::secp256k1::PublicKey;

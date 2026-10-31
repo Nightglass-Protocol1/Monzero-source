@@ -1,0 +1,160 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs
+@@ -6,7 +6,7 @@
+ pub mod proof;
+ pub mod approval;
+ mod observer;
+-use observer::NativeFundingObserver;
++pub(super) use observer::NativeFundingObserver;
+ use crate::bch_rpc::observer::OwnedBchObserver;
+ use crate::{bch_rpc::BchRpc,native_funding_rpc::relay::{NativeTransferRelay,RelayRequest,RelayedTransfer,
+     lock_checkpoint::PreparedNativeLock}};
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/observer.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/observer.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/observer.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/observer.rs
+@@ -1,18 +1,33 @@
+ //! Internal dispatch only; no persisted schema or authority migration.
+ use super::*;
+-pub(super) enum NativeFundingObserver<'a> {
++pub(in super::super) enum NativeFundingObserver<'a> {
+     Node(&'a BchRpc),
+     Walletless(&'a OwnedBchObserver),
+ }
+ impl NativeFundingObserver<'_> {
+-    pub(super) fn deployment_commitment(&self)->Result<[u8;32]> {
++    pub(in super::super) fn deployment_commitment(&self)->Result<[u8;32]> {
+         match self {Self::Node(rpc)=>rpc.deployment_commitment(),Self::Walletless(observer)=>observer.deployment_commitment()}
+     }
+-    pub(super) async fn check(&self,execution:&AdmittedExecution<'_>,now:u64,safety_blocks:u32)->Result<()> {
++    pub(in super::super) async fn check(&self,execution:&AdmittedExecution<'_>,now:u64,safety_blocks:u32)->Result<()> {
+         match self {
+             Self::Node(rpc)=>{execution.check_bch_lock_for_native_funding(rpc,now,safety_blocks).await?;},
+             Self::Walletless(observer)=>{execution.check_light_bch_lock_for_native_funding(observer,now,safety_blocks).await?;},
+         }
+         Ok(())
+     }
++    pub(in super::super) async fn confirmed_transaction(&self,txid:bitcoin::Txid,block:bitcoin::BlockHash,minimum:u64)
++        ->Result<crate::bch_rpc::confirmed::ConfirmedTransaction> {
++        match self {
++            Self::Node(rpc)=>rpc.confirmed_transaction(txid,block,minimum).await,
++            Self::Walletless(observer)=>observer.confirmed_transaction(txid,block,minimum).await,
++        }
++    }
++    pub(in super::super) async fn indexed_confirmed_transaction(&self,txid:bitcoin::Txid,minimum:u64)
++        ->Result<crate::bch_rpc::confirmed::ConfirmedTransaction> {
++        match self {
++            Self::Node(rpc)=>rpc.indexed_confirmed_transaction(txid,minimum).await,
++            Self::Walletless(observer)=>observer.indexed_confirmed_transaction(txid,minimum).await,
++        }
++    }
++
+ }
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund.rs
+@@ -4,6 +4,8 @@
+ use bitcoin::BlockHash;
+ use crate::{bch_rpc::BchRpc,xmz_funding::{self,FundingObserver}};
+ use serde_json::json;
++use super::super::native::NativeFundingObserver;
++use crate::bch_rpc::observer::OwnedBchObserver;
+ 
+ /// Keys remain private; wallet operations must use an owned local session.
+ /// No Debug, Clone or Serialize implementation.
+@@ -29,6 +31,18 @@
+     /// A lost native relay reply must not strand a confirmed payment.
+     pub async fn recover_bch_native_refund(&self,native: &impl FundingObserver,bch: &BchRpc,
+         refund: Txid,block: Option<BlockHash>,now: u64) -> Result<NativeRefund> {
++        self.recover_bch_native_refund_with_observer(native,NativeFundingObserver::Node(bch),refund,block,now).await
++    }
++
++    /// Recover through the owned observer pinned before native payment construction.
++    /// Requires fresh confirmation on both chains, including after uncertain relay.
++    pub async fn recover_light_bch_native_refund(&self,native:&impl FundingObserver,bch:&OwnedBchObserver,
++        refund:Txid,block:Option<BlockHash>,now:u64)->Result<NativeRefund> {
++        self.recover_bch_native_refund_with_observer(native,NativeFundingObserver::Walletless(bch),refund,block,now).await
++    }
++
++    async fn recover_bch_native_refund_with_observer(&self,native:&impl FundingObserver,bch:NativeFundingObserver<'_>,
++        refund:Txid,block:Option<BlockHash>,now:u64)->Result<NativeRefund> {
+         ensure!(self.role==Role::NativeFunder,"wrong BCH native refund owner");
+         let agreed=self.restore_agreement()?;
+         let (outgoing,signed_at)=self.outgoing_bch_refund_record()?.context("missing original BCH refund adaptor")?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native.rs
+@@ -19,7 +19,7 @@
+ }
+ pub(super) async fn exercise(sender: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,setup: &Setup,
+     metadata: &PrivateStore,snapshots: &PrivateStore,rpc: &BchRpc,server: &Server) -> Result<()> {
+-    walletless::exercise(setup,metadata,snapshots,rpc,server).await?;
++    walletless::exercise(sender,setup,metadata,snapshots,rpc,server).await?;
+     let wallet = XmzAddress::parse(setup.policy.xmz_network,&setup.quote.terms()["xmzPayout"])?;
+     let destination = native.restore_agreement()?.owned().wallet().address().clone();
+     let mut fixture = Fixture::new(wallet.clone(),destination.clone(),setup.policy.xmz_genesis.clone(),101_000,900).await?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless.rs
+@@ -1,9 +1,10 @@
+ //! Native wallet fixture with BCH reads through the distinct owned observer.
+ use super::*;
++mod refund;
+ use crate::bch_rpc::observer::OwnedBchObserver;
+ use agreement::execution::funding::native::relay::NativeRelayState;
+ 
+-pub(super) async fn exercise(setup:&Setup,original_metadata:&PrivateStore,original_snapshots:&PrivateStore,
++pub(super) async fn exercise(sender:&AdmittedExecution<'_>,setup:&Setup,original_metadata:&PrivateStore,original_snapshots:&PrivateStore,
+     rpc:&BchRpc,server:&Server)->Result<()> {
+     let observer=OwnedBchObserver::new(server.port,"user".into(),"pass".into(),rpc.network(),"/Bitcoin Cash Node:29.0.0/".into())?;
+     let deployment=observer.deployment_commitment()?;
+@@ -80,6 +81,7 @@
+             assert_eq!(fixture.calls.lock().unwrap().len(),before);
+             assert_eq!(fixture.calls.lock().unwrap().iter().filter(|v|v.as_str()=="relay_tx").count(),relays+1);
+             assert_eq!(fixture.calls.lock().unwrap().iter().filter(|v|v.as_str()=="transfer").count(),1);
++            refund::exercise(sender,&execution,setup,&fixture,rpc,&observer,server).await?;
+         }
+     }
+     Ok(())
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund.rs
+@@ -0,0 +1,37 @@
++//! Recovery for both acknowledged and uncertain native payment relay.
++use super::*;
++pub(super) async fn exercise(sender:&AdmittedExecution<'_>,native:&AdmittedExecution<'_>,setup:&Setup,
++    fixture:&Fixture,rpc:&BchRpc,bch:&OwnedBchObserver,server:&Server)->Result<()> {
++    let recovery=sender.retained_bch_recovery()?.context("missing BCH refund fixture")?;
++    let transaction:Transaction=bitcoin::consensus::deserialize(recovery.refund_bytes())?;
++    let txid=transaction.compute_txid();let block=Some(BlockHash::from_byte_array([6;32]));
++    server.state.lock().unwrap().refund=Some(transaction);
++    let observer=fixture.funding_client()?;
++    let calls=fixture.calls.lock().unwrap().len();
++    assert!(sender.recover_light_bch_native_refund(&observer,bch,txid,block,2030).await.is_err());
++    assert!(native.recover_bch_native_refund(&observer,rpc,txid,block,2030).await.is_err());
++    assert_eq!(fixture.calls.lock().unwrap().len(),calls);
++    fixture.incoming.store(true,Ordering::SeqCst);fixture.confirmed.store(false,Ordering::SeqCst);
++    assert!(native.recover_light_bch_native_refund(&observer,bch,txid,block,2030).await.is_err());
++    fixture.confirmed.store(true,Ordering::SeqCst);
++    assert!(native.recover_light_bch_native_refund(&observer,bch,txid,block,1000).await.is_err());
++    let recovered=native.recover_light_bch_native_refund(&observer,bch,txid,block,2030).await?;
++    assert_eq!(recovered.spend_key(),&(setup.spend[0]+setup.spend[1]).as_bytes());
++    assert_eq!(recovered.view_key(),&native.restore_agreement()?.owned().wallet().private_view_key().0.as_bytes());
++    assert_eq!(recovered.address(),native.restore_agreement()?.owned().wallet().address());
++    assert_eq!(recovered.native_txid(),"ab".repeat(32));assert_eq!(recovered.refund_txid(),txid);
++    assert_eq!(native.recover_light_bch_native_refund(&observer,bch,txid,None,2031).await?.commitment(),recovered.commitment());
++    for mode in [1,2,3] {
++        server.state.lock().unwrap().redemption_confirmation_mode=mode;
++        assert!(native.recover_light_bch_native_refund(&observer,bch,txid,block,2031).await.is_err());
++    }
++    server.state.lock().unwrap().redemption_confirmation_mode=0;
++    fixture.incoming_unlock.store(500,Ordering::SeqCst);
++    assert!(native.recover_light_bch_native_refund(&observer,bch,txid,block,2031).await.is_err());
++    fixture.incoming_unlock.store(0,Ordering::SeqCst);
++    assert_eq!(native.recover_light_bch_native_refund(&observer,bch,txid,block,2031).await?.commitment(),recovered.commitment());
++    fixture.incoming.store(false,Ordering::SeqCst);fixture.confirmed.store(false,Ordering::SeqCst);
++    server.state.lock().unwrap().refund=None;
++    assert!(!fixture.calls.lock().unwrap()[calls..].iter().any(|v|v=="transfer" || v=="relay_tx"));
++    Ok(())
++}

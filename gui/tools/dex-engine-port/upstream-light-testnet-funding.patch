@@ -1,0 +1,60 @@
+diff --git a/swap-machine/src/bin/native-ltc-light/dex.rs b/swap-machine/src/bin/native-ltc-light/dex.rs
+index 7774ef120..08f9bb357 100644
+--- a/swap-machine/src/bin/native-ltc-light/dex.rs
++++ b/swap-machine/src/bin/native-ltc-light/dex.rs
+@@ -47,20 +47,30 @@ fn context_digest(dex:&[u8],wallet:&[u8])->Result<sha256::Hash> {
+ fn public_review(review:swap_machine::litecoin_negotiation::execution::lock_approval::LockFundingReview)->Value {
+     json!({"details":review.details,"commitment":sha256::Hash::from_byte_array(review.commitment).to_string()})
+ }
++/// The only deployments light DEX funding accepts: isolated regtest paired with
++/// the XMZ fakechain, or Litecoin testnet paired with XMZ testnet. Never mainnet.
++fn staged_network(policy:&Policy)->Result<LtcNetwork> {
++    use swap_core::xmz_address::XmzNetwork;
++    match (policy.ltc_network,policy.xmz_network) {
++        (LtcNetwork::Regtest,XmzNetwork::Mainnet) => Ok(LtcNetwork::Regtest),
++        (LtcNetwork::Testnet,XmzNetwork::Testnet) => Ok(LtcNetwork::Testnet),
++        _ => anyhow::bail!("light DEX funding is limited to Litecoin regtest or testnet test deployments"),
++    }
++}
+ pub(super) fn run(path:&Path,mode:&str)->Result<()> {
+     let mut input=Zeroizing::new(Vec::new());std::io::stdin().take(8193).read_to_end(&mut input)?;
+     ensure!(!input.is_empty() && input.len()<=8192,"invalid light DEX request size");
+     if mode=="terms" {return terms(path,&input);}
+     let request:DexRequest=serde_json::from_slice(&input)?;drop(input);validate(&request,mode)?;
+     let (_lease,bytes)=private_config(path)?;let dex:DexConfig=serde_json::from_slice(&bytes)?;
+-    ensure!(dex.schema=="monzero-private-ltc-light-dex-v1" && !dex.trade_id.is_nil()
+-        && dex.policy.ltc_network==LtcNetwork::Regtest,"light DEX helper is limited to isolated Litecoin regtest");
++    ensure!(dex.schema=="monzero-private-ltc-light-dex-v1" && !dex.trade_id.is_nil(),"invalid light DEX configuration");
++    let staged=staged_network(&dex.policy)?;
+     let (_wallet_lease,wallet_bytes)=private_config(&dex.wallet_config_file)?;
+     let expected=context_digest(&bytes,&wallet_bytes)?;
+     ensure!(expected==digest(&request.approved_config_digest)?,"light DEX configuration changed");
+     let wallet_config=parse_config(&wallet_bytes,"ltc")?;
+     let network=network_for("ltc",&wallet_config.network)?;
+-    ensure!(network==LightNetwork::from(LtcNetwork::Regtest),"wrong light DEX wallet network");
++    ensure!(network==LightNetwork::from(staged),"wrong light DEX wallet network");
+     let mut execution=Execution::resume(&dex.metadata_directory,&dex.snapshot_directory,dex.trade_id,
+         &dex.policy,LocalRole::LitecoinFunder,dex.pins)?;
+     let result=tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+@@ -88,17 +98,17 @@ fn terms(path:&Path,input:&[u8])->Result<()> {
+     let request:TermsRequest=serde_json::from_slice(input)?;
+     ensure!(request.schema=="monzero-ltc-light-dex-funding-terms-request-v1" && !request.request_id.is_nil(),"invalid funding terms request");
+     let (_lease,bytes)=private_config(path)?;let dex:DexConfig=serde_json::from_slice(&bytes)?;
+-    ensure!(dex.schema=="monzero-private-ltc-light-dex-v1" && !dex.trade_id.is_nil()
+-        && dex.policy.ltc_network==LtcNetwork::Regtest,"light DEX terms require isolated Litecoin regtest");
++    ensure!(dex.schema=="monzero-private-ltc-light-dex-v1" && !dex.trade_id.is_nil(),"invalid light DEX configuration");
++    let staged=staged_network(&dex.policy)?;
+     let (_wallet_lease,wallet_bytes)=private_config(&dex.wallet_config_file)?;
+     let expected=context_digest(&bytes,&wallet_bytes)?;
+     ensure!(expected==digest(&request.approved_config_digest)?,"light DEX configuration changed");
+     let config=parse_config(&wallet_bytes,"ltc")?;
+-    ensure!(network_for("ltc",&config.network)?==LightNetwork::from(LtcNetwork::Regtest),"wrong funding terms wallet network");
++    ensure!(network_for("ltc",&config.network)?==LightNetwork::from(staged),"wrong funding terms wallet network");
+     let execution=Execution::resume(&dex.metadata_directory,&dex.snapshot_directory,dex.trade_id,
+         &dex.policy,LocalRole::LitecoinFunder,dex.pins)?;
+     let terms=execution.light_funding_terms(now()?)?;
+-    verify_refund_wallet(&config,LightNetwork::from(LtcNetwork::Regtest),&terms)?;
++    verify_refund_wallet(&config,LightNetwork::from(staged),&terms)?;
+     let response=json!({"schema":"monzero-ltc-light-dex-funding-terms-response-v1","requestId":request.request_id,
+         "tradeId":dex.trade_id,"configurationDigest":expected,"executable":false,"result":terms});
+     let bytes=serde_json::to_vec(&response)?;ensure!(bytes.len()<=4096,"oversized funding terms response");

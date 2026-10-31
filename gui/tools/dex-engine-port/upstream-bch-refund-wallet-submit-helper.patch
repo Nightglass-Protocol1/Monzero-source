@@ -1,0 +1,195 @@
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -1267,8 +1267,9 @@
+         let args: Vec<_> = std::env::args_os().collect();
+         ensure!(args.len() == 3,"expected mode and private configuration path");
+         let action = args[1].to_str().context("invalid admission mode")?;
+-        let mut bytes = Vec::new();
+-        std::io::stdin().take(513).read_to_end(&mut bytes)?;
++        let mut bytes = zeroize::Zeroizing::new(Vec::new());
++        let input_limit=if action=="--native-refund-wallet-submit-stdio-v1" {4097} else {513};
++        std::io::stdin().take(input_limit).read_to_end(&mut bytes)?;
+         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+         let preparation_action=match action {
+             "--funding-signing-recovery-review-stdio-v1"=>Some("signing-recovery-review"),
+@@ -1334,7 +1335,10 @@
+             "--native-proof-context-stdio-v1"=>Some("context"),
+             _=>None,
+         };
+-        let result = if action=="--native-refund-wallet-review-stdio-v1" {
++        let result = if action=="--native-refund-wallet-submit-stdio-v1" {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(refund_wallet::submit_operation(Path::new(&args[2]),&bytes))?
++        } else if action=="--native-refund-wallet-review-stdio-v1" {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(refund_wallet::review_operation(Path::new(&args[2]),&bytes))?
+         } else if action=="--native-refund-wallet-status-stdio-v1" {
+--- a/swap-machine/src/bin/native-bch-admission/refund_wallet.rs
++++ b/swap-machine/src/bin/native-bch-admission/refund_wallet.rs
+@@ -110,3 +110,7 @@
+ pub(super) async fn review_operation(path:&Path,bytes:&[u8])->Result<serde_json::Value> {
+     review::operation(path,bytes).await
+ }
++
++pub(super) async fn submit_operation(path:&Path,bytes:&[u8])->Result<serde_json::Value> {
++    review::submit_operation(path,bytes).await
++}
+--- a/swap-machine/src/bin/native-bch-admission/refund_wallet/review.rs
++++ b/swap-machine/src/bin/native-bch-admission/refund_wallet/review.rs
+@@ -1,4 +1,5 @@
+-// Fresh, public review only. Never opens/restores a wallet or exports recovered keys.
++// Fresh public reviews and separately approved local wallet operations.
++// Only submit_operation may open/restore/check; neither path exports recovered keys.
+ use super::*;
+ use swap_machine::{native_funding_rpc::{NativeFundingRpc,wallet_session::NativeWalletSession},
+     bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::recovery::native_refund::wallet::review::RefundWalletAction};
+@@ -57,7 +58,11 @@
+     Ok(value)
+ }
+ pub(super) async fn operation(path:&Path,bytes:&[u8])->Result<serde_json::Value> {
+-    let request=request(bytes)?;
++    execute(path,request(bytes)?,None).await
++}
++// Private caller must exclusively own the selected wallet service and retain its
++// operation token until a verified reply; the file lease alone is not ownership.
++async fn execute(path:&Path,request:ReviewRequest,submission:Option<submit::Submission>)->Result<serde_json::Value> {
+     let (_review_lease,bytes)=private_bytes(path)?;let review_config=config(&bytes)?;
+     let (_wrapper_lease,bytes)=private_bytes(&review_config.status_config_file)?;let wrapper=super::config(&bytes)?;
+     let deployment=parse_digest(&wrapper.deployment_commitment)?;
+@@ -67,7 +72,7 @@
+     let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
+         &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
+     ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"wallet review trade changed");
+-    let execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,&quote,&config.policy,config.role)?;
++    let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,&quote,&config.policy,config.role)?;
+     execution.saved_admission_review(&config.negotiation_pins)?;
+     let refund=wrapper.refund_txid.parse()?;
+     let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+@@ -89,14 +94,42 @@
+     let (user,password)=text.split_once(':').context("invalid wallet review login")?;
+     ensure!(!user.is_empty() && !password.is_empty() && !text.bytes().any(|b|b.is_ascii_control()),"invalid wallet review credentials");
+     let observer=NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?;
+-    // This descriptor-only session is never used to call a wallet method.
+-    let session=NativeWalletSession::new(NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?,config.policy.xmz_network);
++    // Review uses only this descriptor. Submit may use wallet methods after approval.
++    let mut session=NativeWalletSession::new(NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?,config.policy.xmz_network);
+     let observed=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+     let recovered=execution.recover_light_bch_native_refund(&observer,&bch,refund,None,observed).await?;
+     let review=execution.review_recovered_bch_refund_wallet(&recovered,request.action.engine(),&session,observed)?;
+     let details=public_review(review.details,&request.action,config.trade_id,&deployment,&wrapper.refund_txid)?;
+     ensure!(details["walletBackend"]==serde_json::json!({"schema":"monzero-local-wallet-endpoint-v1","host":"127.0.0.1",
+         "daemonPort":native.daemon_port,"walletPort":native.wallet_port}),"wallet review service changed");
++    if let Some(mut submission)=submission {
++        ensure!(review.commitment==submission.approved,"refund wallet approval changed");
++        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        match request.action {
++            Action::Restore=>execution.restore_approved_light_bch_refund_wallet(&observer,&bch,refund,None,now,
++                &mut session,std::mem::take(&mut *submission.password),&submission.approved).await?,
++            Action::Open=>execution.open_approved_light_bch_refund_wallet(&observer,&bch,refund,None,now,
++                &mut session,std::mem::take(&mut *submission.password),&submission.approved).await?,
++            Action::Check=>execution.check_approved_light_bch_refund_wallet(&observer,&bch,refund,None,now,
++                &mut session,&submission.approved).await?,
++        }
++        let wallet=super::public_status(execution.bch_native_refund_wallet_status(refund,now)?)?;
++        ensure!(wallet["state"]=="ready","refund wallet operation did not reach verified readiness");
++        for field in ["swapId","quote","admission","walletFile","address","nativePayment","walletBinding",
++            "bchDeployment","bchNetwork","bchGenesis","xmzNetwork"] {
++            ensure!(wallet[field]==details[field],"refund wallet result binding changed");
++        }
++        ensure!(wallet["refundHint"]==details["refund"],"refund wallet result transaction changed");
++        if !details["walletIntent"].is_null() {
++            ensure!(wallet["walletIntent"]==details["walletIntent"],"refund wallet intent changed");
++        }
++        // Return saved status, not a claim that a pre-operation chain observation
++        // remains fresh after potentially slow wallet RPCs. No balance authority.
++        return Ok(serde_json::json!({"schema":"monzero-bch-native-refund-wallet-submit-response-v1",
++            "requestId":request.request_id,"tradeId":config.trade_id,"action":request.action.name(),
++            "approvedCommitment":submission.approved.iter().map(|byte|format!("{byte:02x}")).collect::<String>(),
++            "executable":false,"chainObserved":false,"wallet":wallet}));
++    }
+     Ok(serde_json::json!({"schema":"monzero-bch-native-refund-wallet-review-response-v1",
+         "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":true,"observedAt":observed,
+         "review":{"details":details,"commitment":review.commitment.iter().map(|byte|format!("{byte:02x}")).collect::<String>()}}))
+@@ -158,3 +191,9 @@
+         let mut v=base;v["password"]=json!("unexpected");assert!(config(&serde_json::to_vec(&v)?).is_err());Ok(())
+     }
+ }
++
++mod submit {include!("submit.rs");}
++pub(super) async fn submit_operation(path:&Path,bytes:&[u8])->Result<serde_json::Value> {
++    let (request,submission)=submit::request(bytes)?;
++    execute(path,request,Some(submission)).await
++}
+--- /dev/null
++++ b/swap-machine/src/bin/native-bch-admission/refund_wallet/submit.rs
+@@ -0,0 +1,70 @@
++// Explicit local wallet operations; no payout, export or automatic retry.
++use super::*;
++use zeroize::Zeroizing;
++
++pub(super) struct Submission {pub approved:[u8;32],pub password:Zeroizing<String>}
++fn secret<'de,D:serde::Deserializer<'de>>(deserializer:D)->std::result::Result<Zeroizing<String>,D::Error> {
++    String::deserialize(deserializer).map(Zeroizing::new)
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct Request {
++    schema:String,request_id:uuid::Uuid,action:Action,commitment:String,
++    #[serde(deserialize_with="secret")]
++    password:Zeroizing<String>,
++}
++pub(super) fn request(bytes:&[u8])->Result<(ReviewRequest,Submission)> {
++    ensure!(!bytes.is_empty() && bytes.len()<=4096,"invalid refund wallet submission size");
++    let value:Request=serde_json::from_slice(bytes)?;
++    ensure!(value.schema=="monzero-bch-native-refund-wallet-submit-request-v1" && !value.request_id.is_nil(),
++        "invalid refund wallet submission context");
++    let approved=parse_digest(&value.commitment)?;
++    ensure!(approved!=[0;32],"missing refund wallet approval");
++    ensure!(value.password.len()<=1024 && !value.password.chars().any(char::is_control),"invalid refund wallet password");
++    match value.action {
++        Action::Restore|Action::Open=>ensure!(!value.password.is_empty(),"missing refund wallet password"),
++        Action::Check=>ensure!(value.password.is_empty(),"unexpected check password"),
++    }
++    Ok((ReviewRequest {schema:"monzero-bch-native-refund-wallet-review-request-v1".into(),
++        request_id:value.request_id,action:value.action},Submission {approved,password:value.password}))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++    fn fixture(action:&str)->serde_json::Value {
++        json!({"schema":"monzero-bch-native-refund-wallet-submit-request-v1","requestId":uuid::Uuid::new_v4(),
++            "action":action,"commitment":"ab".repeat(32),"password":if action=="check" {""} else {"fixture password"}})
++    }
++    fn accepts(value:&serde_json::Value)->bool {request(&serde_json::to_vec(value).unwrap()).is_ok()}
++    #[test]
++    fn submit_requires_exact_approval_and_explicit_context() {
++        for action in ["restore","open","check"] {
++            let base=fixture(action);assert!(accepts(&base));
++            for (field,bad) in [("schema",json!("monzero-bch-native-refund-wallet-review-request-v1")),
++                ("requestId",json!(uuid::Uuid::nil())),("action",json!("send")),
++                ("commitment",json!("AB".repeat(32))),("commitment",json!("0".repeat(64))),
++                ("commitment",json!("ab")),("commitment",serde_json::Value::Null),
++                ("spendKey",json!("unexpected")),("retry",json!(true))] {
++                let mut changed=base.clone();changed[field]=bad;assert!(!accepts(&changed),"{field}");
++            }
++            for field in ["schema","requestId","action","commitment","password"] {
++                let mut changed=base.clone();changed.as_object_mut().unwrap().remove(field);assert!(!accepts(&changed),"{field}");
++            }
++        }
++    }
++    #[test]
++    fn submit_password_is_action_bound_and_bounded() {
++        for action in ["restore","open","check"] {
++            let base=fixture(action);
++            for bad in [json!("a".repeat(1025)),json!("bad\u{0}password"),json!("bad\npassword"),json!(false),serde_json::Value::Null] {
++                let mut changed=base.clone();changed["password"]=bad;assert!(!accepts(&changed));
++            }
++            let mut changed=base;changed["password"]=json!(if action=="check" {"unexpected"} else {""});assert!(!accepts(&changed));
++        }
++        assert!(request(&[]).is_err());assert!(request(&vec![b' ';4097]).is_err());
++        let mut value=fixture("restore");value["password"]=json!("a".repeat(1024));assert!(accepts(&value));
++        let mut value=fixture("open");value["password"]=json!("local π password");assert!(accepts(&value));
++    }
++}

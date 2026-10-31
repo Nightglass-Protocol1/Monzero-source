@@ -1,0 +1,308 @@
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -14,6 +14,7 @@
+ pub mod bch_key_recovery;
+ pub mod bch_quote_signatures;
+ pub mod bch_quote;
++pub mod bch_rpc;
+ 
+ #[cfg(test)]
+ mod tests {
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
+@@ -30,6 +30,20 @@
+     format!("{}.bch-funding-{suffix}",quote.terms()["swapId"])
+ }
+ impl AdmittedExecution<'_> {
++    /// Observe only the retained preparation with the quote's network binding.
++    /// The backend remains caller-owned; its checkpoint and wallet anchor must
++    /// be independently configured. Observation never authorizes signing/relay.
++    pub async fn observe_bch_funding_inputs(&self, backend: &crate::bch_rpc::BchRpc,
++        now: u64, change_address: &str, minimum_confirmations: u64)
++        -> Result<crate::bch_rpc::FundingInputsObservation> {
++        self.quote.check_policy(self.policy,now)?;
++        ensure!(backend.network().quote_name() == self.quote.terms()["bchNetwork"]
++            && backend.network().genesis() == self.quote.terms()["bchGenesis"],"BCH backend differs from admitted quote chain");
++        let prepared = self.prepared_bch_funding()?.context("BCH funding preparation is absent")?;
++        ensure!(now >= prepared.prepared_at,"BCH input observation predates preparation");
++        backend.observe_funding_inputs(prepared.preview(),change_address,minimum_confirmations).await
++    }
++
+     fn admission_digest(&self) -> Result<[u8;32]> {
+         Ok(hash(SCHEMA,&serde_json::to_vec(&self.read_admission()?)?))
+     }
+--- /dev/null
++++ b/swap-machine/src/bch_rpc.rs
+@@ -0,0 +1,165 @@
++//! Read-only RPC for a caller-authenticated, owned loopback Bitcoin Cash Node.
++//! Authenticate the local process before supplying credentials. RPC identity
++//! checks cannot authenticate a port or prove consensus activation/settlement.
++//! Reviewed against BCHN v29.0.0, commit 89a591f7c5b1fd110c0819377ad8f2647d656800.
++use anyhow::{Context,Result,ensure};
++use bitcoin::{BlockHash,ScriptBuf,TxOut,hashes::{Hash,sha256},consensus::serialize};
++use serde::Deserialize;
++use serde_json::{Value,json,value::RawValue};
++use std::{str::FromStr,sync::atomic::{AtomicU64,Ordering}};
++use zeroize::Zeroizing;
++use swap_core::bch::funding::FundingPreview;
++
++#[derive(Clone,Copy)]
++pub enum BchNetwork { Mainnet, Testnet, Regtest { checkpoint_height: u64, checkpoint: BlockHash } }
++impl BchNetwork {
++    pub fn quote_name(self) -> &'static str {match self {Self::Mainnet=>"mainnet",Self::Testnet=>"testnet",Self::Regtest{..}=>"regtest"}}
++    fn chain(self) -> &'static str {match self {Self::Mainnet=>"main",Self::Testnet=>"test",Self::Regtest{..}=>"regtest"}}
++    fn prefix(self) -> &'static str {match self {Self::Mainnet=>"bitcoincash:",Self::Testnet=>"bchtest:",Self::Regtest{..}=>"bchreg:"}}
++    pub fn genesis(self) -> &'static str {match self {
++        Self::Mainnet=>"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
++        Self::Testnet=>"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
++        Self::Regtest{..}=>"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"}}
++    // BCHN pinned chainparams.cpp: first Upgrade 9 blocks. Genesis alone cannot
++    // distinguish the public BCH chains from BTC. Regtest needs an owned pin.
++    fn checkpoint(self) -> Result<(u64,BlockHash)> {Ok(match self {
++        Self::Mainnet=>(792773,BlockHash::from_str("000000000000000002fc0cdadaef1857bbd2936d37ea94f80ba3db4a5e8353e8")?),
++        Self::Testnet=>(1552788,BlockHash::from_str("000000007bc92323648b95ea8401a2247e977b653b13adb9e40748ce06b30a5e")?),
++        Self::Regtest {checkpoint_height,checkpoint}=>{ensure!(checkpoint_height>0 && checkpoint!=BlockHash::all_zeros(),"missing owned BCH regtest checkpoint");(checkpoint_height,checkpoint)}
++    })}
++}
++
++pub struct BchRpc {
++    client: reqwest::Client, port: u16, username: Zeroizing<String>, password: Zeroizing<String>,
++    network: BchNetwork, wallet: String, anchor_address: String, anchor_script: ScriptBuf,
++    subversion: String, request_id: AtomicU64,
++}
++/// A point-in-time observation, never approval, reservation or a relay permit.
++/// Mempool changes can occur even while the chain tip remains unchanged.
++pub struct FundingInputsObservation { tip: BlockHash, template: sha256::Hash }
++impl FundingInputsObservation {
++    pub fn tip(&self) -> BlockHash { self.tip }
++    pub fn template_hash(&self) -> sha256::Hash { self.template }
++}
++#[derive(Deserialize)]
++struct Envelope { id: u64, error: Option<Value>, result: Box<RawValue> }
++#[derive(Deserialize)]
++struct Chain { chain: String, blocks: u64, headers: u64, bestblockhash: BlockHash, initialblockdownload: bool }
++#[derive(Deserialize)]
++struct OutputScript { hex: String, addresses: Vec<String> }
++#[derive(Deserialize)]
++struct Output {
++    bestblock: BlockHash, confirmations: u64, value: Box<RawValue>, coinbase: bool,
++    #[serde(rename="scriptPubKey")] script: OutputScript,
++    #[serde(rename="tokenData")] tokens: Option<Value>,
++}
++
++impl BchRpc {
++    /// Anchor address/script and exact expected BCHN subversion are caller-pinned
++    /// deployment context, never peer-supplied defaults. No process is launched.
++    pub fn new(port: u16, username: String, password: String, network: BchNetwork,
++        wallet: String, anchor_address: String, anchor_script: ScriptBuf, subversion: String) -> Result<Self> {
++        let username=Zeroizing::new(username);let password=Zeroizing::new(password);
++        ensure!(port>0 && !username.is_empty() && !password.is_empty() && !username.contains(':')
++            && username.len()+password.len()<=1024,"invalid BCH RPC credentials or port");
++        ensure!(!wallet.is_empty() && wallet.len()<=64 && wallet.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'||b==b'-'),"invalid BCH wallet name");
++        ensure!(subversion.starts_with("/Bitcoin Cash Node:") && subversion.ends_with('/') && subversion.len()<=128,
++            "expected owned Bitcoin Cash Node subversion required");
++        ensure!(!anchor_script.is_empty() && anchor_script.len()<=35,"invalid BCH wallet anchor script");
++        address_shape(network,&anchor_address)?;network.checkpoint()?;
++        Ok(Self {client:reqwest::Client::builder().no_proxy().pool_max_idle_per_host(0)
++            .redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(15)).build()?,
++            port,username,password,network,wallet,anchor_address,anchor_script,subversion,request_id:AtomicU64::new(0)})
++    }
++    pub fn network(&self) -> BchNetwork {self.network}
++    async fn rpc(&self, wallet: bool, method: &str, params: Value) -> Result<Box<RawValue>> {
++        let id=self.request_id.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|v|v.checked_add(1))
++            .map_err(|_|anyhow::anyhow!("BCH RPC identity exhausted"))?;
++        let path=if wallet {format!("/wallet/{}",self.wallet)} else {String::new()};
++        let mut response=self.client.post(format!("http://127.0.0.1:{}{}",self.port,path))
++            .basic_auth(self.username.as_str(),Some(self.password.as_str()))
++            .json(&json!({"jsonrpc":"1.0","id":id,"method":method,"params":params})).send().await
++            .map_err(|_|anyhow::anyhow!("BCH local RPC transport failed"))?;
++        ensure!(response.status().is_success(),"BCH local RPC HTTP rejection");
++        let mut bytes=Vec::new();
++        while let Some(chunk)=response.chunk().await.map_err(|_|anyhow::anyhow!("BCH RPC response failed"))? {
++            ensure!(bytes.len()+chunk.len()<=2_000_000,"oversized BCH RPC response");bytes.extend_from_slice(&chunk);
++        }
++        let reply:Envelope=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid BCH RPC envelope"))?;
++        ensure!(reply.id==id && reply.error.is_none(),"BCH RPC rejection or identity mismatch");
++        Ok(reply.result)
++    }
++    async fn chain(&self) -> Result<BlockHash> {
++        let info:Value=serde_json::from_str(self.rpc(false,"getnetworkinfo",json!([])).await?.get())?;
++        ensure!(info["subversion"].as_str()==Some(self.subversion.as_str()) && info["networkactive"]==true,
++            "unexpected or offline BCH deployment");
++        let chain:Chain=serde_json::from_str(self.rpc(false,"getblockchaininfo",json!([])).await?.get())?;
++        let (height,checkpoint)=self.network.checkpoint()?;
++        ensure!(chain.chain==self.network.chain() && !chain.initialblockdownload && chain.blocks==chain.headers
++            && chain.blocks>=height && chain.bestblockhash!=BlockHash::all_zeros(),"BCH chain is not synchronized to expected deployment");
++        let genesis:BlockHash=serde_json::from_str(self.rpc(false,"getblockhash",json!([0])).await?.get())?;
++        let anchor:BlockHash=serde_json::from_str(self.rpc(false,"getblockhash",json!([height])).await?.get())?;
++        ensure!(genesis.to_string()==self.network.genesis() && anchor==checkpoint,"BCH genesis or fork checkpoint mismatch");
++        Ok(chain.bestblockhash)
++    }
++    async fn owned_address(&self,address:&str,script:&bitcoin::Script) -> Result<()> {
++        address_shape(self.network,address)?;
++        let info:Value=serde_json::from_str(self.rpc(true,"getaddressinfo",json!([address])).await?.get())?;
++        ensure!(info["ismine"]==true && info["iswatchonly"]==false
++            && info["scriptPubKey"].as_str()==Some(script.to_hex_string().as_str()),"BCH address/script is not owned by the pinned wallet");
++        Ok(())
++    }
++    async fn wallet_ready(&self) -> Result<()> {
++        let info:Value=serde_json::from_str(self.rpc(true,"getwalletinfo",json!([])).await?.get())?;
++        // BCHN v29 does not provide Litecoin's scanning field here.
++        ensure!(info["walletname"].as_str()==Some(self.wallet.as_str()) && info["private_keys_enabled"]==true,
++            "unexpected BCH wallet or disabled private keys");
++        self.owned_address(&self.anchor_address,&self.anchor_script).await
++    }
++    /// Read-only check of wallet ownership and confirmed inputs including known
++    /// mempool spends. Reobserve after delays and before any wallet mutation.
++    pub async fn observe_funding_inputs(&self,preview:&FundingPreview,change_address:&str,
++        minimum_confirmations:u64) -> Result<FundingInputsObservation> {
++        ensure!(minimum_confirmations>0,"BCH input confirmations must be positive");
++        let tip=self.chain().await?;self.wallet_ready().await?;
++        for (input,expected) in preview.transaction().input.iter().zip(preview.previous_outputs()) {
++            let raw=self.rpc(false,"gettxout",json!([input.previous_output.txid.to_string(),input.previous_output.vout,true])).await?;
++            let output:Option<Output>=serde_json::from_str(raw.get())?;
++            let output=output.context("BCH funding input is absent or spent")?;
++            check_output(&output,expected,tip,minimum_confirmations)?;
++            self.owned_address(&output.script.addresses[0],&expected.script_pubkey).await?;
++        }
++        for (index,output) in preview.transaction().output.iter().enumerate() {
++            if index!=preview.lock_vout() as usize {self.owned_address(change_address,&output.script_pubkey).await?;}
++        }
++        self.wallet_ready().await?;
++        ensure!(self.chain().await?==tip,"BCH tip changed during funding input observation");
++        Ok(FundingInputsObservation {tip,template:sha256::Hash::hash(&serialize(preview.transaction()))})
++    }
++}
++fn address_shape(network:BchNetwork,address:&str) -> Result<()> {
++    ensure!(address.starts_with(network.prefix()) && address.len()>network.prefix().len()
++        && address.len()<=200 && address.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b':'),
++        "BCH address must use the expected explicit CashAddr prefix");
++    // Checksum/script correspondence is checked by the owned node, not claimed
++    // by this lexical guard. No peer-provided address is an ownership proof.
++    Ok(())
++}
++fn atoms(raw:&str) -> Result<u64> {
++    let (whole,fraction)=raw.split_once('.').unwrap_or((raw,""));
++    ensure!(!whole.is_empty() && whole.bytes().all(|b|b.is_ascii_digit()) && fraction.len()<=8
++        && fraction.bytes().all(|b|b.is_ascii_digit()) && (!raw.contains('.')||!fraction.is_empty()),"invalid exact BCH amount");
++    let whole:u64=whole.parse()?;let part:u64=if fraction.is_empty(){0}else{fraction.parse()?};
++    let value=whole.checked_mul(100_000_000).and_then(|v|v.checked_add(part*10u64.pow(8-fraction.len() as u32)))
++        .context("BCH amount overflow")?;
++    ensure!(value<=2_100_000_000_000_000,"BCH amount exceeds monetary range");Ok(value)
++}
++fn check_output(output:&Output,expected:&TxOut,tip:BlockHash,minimum:u64) -> Result<()> {
++    ensure!(output.bestblock==tip && output.confirmations>=minimum && (!output.coinbase||output.confirmations>=100)
++        && output.tokens.is_none() && output.script.addresses.len()==1
++        && atoms(output.value.get())?==expected.value.to_sat()
++        && ScriptBuf::from_hex(&output.script.hex)?==expected.script_pubkey,"BCH input observation differs from retained source or maturity policy");
++    Ok(())
++}
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/tests.rs
+@@ -0,0 +1,104 @@
++use super::*;
++use bitcoin::{absolute,transaction::Version,Amount,OutPoint,Sequence,Transaction,Txid,TxIn,Witness};
++use crate::bch_quote::tests::{fixture,signed};
++
++fn preview() -> Result<(FundingPreview,ScriptBuf,OutPoint)> {
++    let (policy,terms)=fixture();let quote=signed(&terms,&policy,1000)?;
++    let script=quote.recovery_plan().recovery().terms().redeem_destination.clone();
++    let parent=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
++            script_sig:ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++        output:vec![TxOut {value:Amount::from_sat(120_000),script_pubkey:script.clone()}]};
++    let outpoint=OutPoint {txid:parent.compute_txid(),vout:0};
++    let mut tx=parent.clone();tx.input[0].previous_output=outpoint;
++    tx.output=vec![TxOut {value:Amount::from_sat(100_000),script_pubkey:quote.recovery_plan().lock().script_pubkey()},
++        TxOut {value:Amount::from_sat(19_000),script_pubkey:script.clone()}];
++    Ok((FundingPreview::verify(&serialize(&tx),&[&serialize(&parent)],quote.recovery_plan().lock(),100_000,&script,1000,546)?,script,outpoint))
++}
++#[test]
++fn exact_amounts_and_explicit_chain_pins_are_required() -> Result<()> {
++    assert_eq!(atoms("0.00000001")?,1);assert_eq!(atoms("21000000.00000000")?,2_100_000_000_000_000);
++    for raw in ["1e-8","\"0.01\"","-1","1.000000001","21000001","1.",".1"] {assert!(atoms(raw).is_err());}
++    assert_eq!(BchNetwork::Mainnet.checkpoint()?.0,792773);
++    assert_eq!(BchNetwork::Testnet.checkpoint()?.0,1552788);
++    assert!(BchNetwork::Regtest {checkpoint_height:0,checkpoint:BlockHash::all_zeros()}.checkpoint().is_err());
++    Ok(())
++}
++#[tokio::test]
++async fn owned_bchn_input_observation_rejects_deployment_wallet_and_utxo_mismatches() -> Result<()> {
++    use std::{net::TcpListener,io::{BufRead,BufReader,Read,Write},sync::{Arc,atomic::AtomicBool}};
++    for case in 0..22 {
++        let (preview,script,outpoint)=preview()?;
++        let network=BchNetwork::Regtest {checkpoint_height:1,checkpoint:BlockHash::from_byte_array([7;32])};
++        let listener=TcpListener::bind("127.0.0.1:0")?;listener.set_nonblocking(true)?;
++        let rpc=BchRpc::new(listener.local_addr()?.port(),"user".into(),"pass".into(),network,
++            "test".into(),"bchreg:qanchor".into(),script.clone(),"/Bitcoin Cash Node:29.0.0/".into())?;
++        let stop=Arc::new(AtomicBool::new(false));let signal=stop.clone();
++        let server=std::thread::spawn(move || -> Result<usize> {
++            let mut chain_calls=0;let mut count=0;
++            while !signal.load(Ordering::Relaxed) {
++                let (mut socket,_)=match listener.accept() {
++                    Ok(connection)=>connection,
++                    Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{
++                        std::thread::sleep(std::time::Duration::from_millis(2));continue;
++                    },Err(error)=>return Err(error.into()),
++                };
++                socket.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
++                socket.set_write_timeout(Some(std::time::Duration::from_secs(3)))?;
++                let mut reader=BufReader::new(socket.try_clone()?);let mut line=String::new();reader.read_line(&mut line)?;
++                let path=line.split_whitespace().nth(1).context("missing RPC path")?.to_owned();
++                let mut length=None;let mut auth=false;
++                loop {
++                    line.clear();ensure!(reader.read_line(&mut line)?>0,"missing RPC headers");
++                    if line=="\r\n" {break;}
++                    let lower=line.to_ascii_lowercase();
++                    if let Some(value)=lower.strip_prefix("content-length:") {length=Some(value.trim().parse::<usize>()?);}
++                    if lower.starts_with("authorization:") {auth=line.trim().ends_with("Basic dXNlcjpwYXNz");}
++                }
++                ensure!(auth,"missing authenticated RPC request");
++                let length=length.context("missing RPC content length")?;ensure!(length<4096,"oversized request");
++                let mut body=vec![0;length];reader.read_exact(&mut body)?;let request:Value=serde_json::from_slice(&body)?;
++                let method=request["method"].as_str().context("missing RPC method")?;
++                let wallet=matches!(method,"getwalletinfo"|"getaddressinfo");
++                ensure!(path==if wallet {"/wallet/test"} else {"/"},"wrong wallet RPC route");
++                let result=match method {
++                    "getnetworkinfo"=>json!({"subversion":if case==1 {"/Satoshi:29.0.0/"} else {"/Bitcoin Cash Node:29.0.0/"},"networkactive":true}),
++                    "getblockchaininfo"=>{chain_calls+=1;json!({"chain":if case==2 {"main"} else {"regtest"},
++                        "blocks":200,"headers":200,"initialblockdownload":case==5,
++                        "bestblockhash":if case==6 && chain_calls>1 {"09".repeat(32)} else {"08".repeat(32)}})},
++                    "getblockhash"=>{let height=request["params"][0].as_u64().unwrap();ensure!(height==0||height==1,"unexpected chain pin height");
++                        json!(if (height==0 && case==3)||(height==1 && case==4) {"00".repeat(32)}
++                        else if height==0 {network.genesis().into()} else {"07".repeat(32)})},
++                    "getwalletinfo"=>json!({"walletname":if case==12 {"other"} else {"test"},"private_keys_enabled":true}),
++                    "getaddressinfo"=>{
++                        let address=request["params"][0].as_str().unwrap();
++                        ensure!(["bchreg:qanchor","bchreg:qinput","bchreg:qchange"].contains(&address),"unexpected ownership request");
++                        json!({"ismine":!(case==17 && address=="bchreg:qchange"),"iswatchonly":case==13,"scriptPubKey":script.to_hex_string()})},
++                    "gettxout"=>{
++                        ensure!(request["params"]==json!([outpoint.txid.to_string(),outpoint.vout,true]),"gettxout must include pending spends");
++                        let mut v=json!({"bestblock":"08".repeat(32),"confirmations":if case==16 {0} else if case==10 {99} else {100},
++                            "value":0.0012,"coinbase":case==10||case==18,"scriptPubKey":{"hex":script.to_hex_string(),"addresses":["bchreg:qinput"]}});
++                        match case {7=>v["value"]=json!(0.001201),8=>v["scriptPubKey"]["hex"]=json!("51"),
++                            9=>v["tokenData"]=json!({"category":"01".repeat(32),"amount":"1"}),11=>v=Value::Null,
++                            15=>v["value"]=json!("0.0012"),20=>v["scriptPubKey"]["addresses"]=json!([]),
++                            21=>v["scriptPubKey"]["addresses"]=json!(["bitcoincash:qinput"]),_=>()};v},
++                    _=>anyhow::bail!("unexpected or mutating BCH RPC method"),
++                };
++                count+=1;
++                let reply=json!({"id":if case==14 {json!(999)} else {request["id"].clone()},
++                    "error":if case==19 {json!({"code":-1,"message":"fixture"})} else {Value::Null},"result":result});
++                let body=serde_json::to_vec(&reply)?;
++                write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;socket.write_all(&body)?;
++            }
++            Ok(count)
++        });
++        let result=rpc.observe_funding_inputs(&preview,"bchreg:qchange",3).await;
++        stop.store(true,Ordering::Relaxed);let calls=server.join().unwrap()?;
++        assert!(calls>0);
++        if case==0||case==18 {
++            let observation=result?;assert_eq!(observation.tip(),BlockHash::from_byte_array([8;32]));
++            assert_eq!(observation.template_hash(),sha256::Hash::hash(&serialize(preview.transaction())));
++        } else {assert!(result.is_err(),"case {case}");}
++    }
++    Ok(())
++}

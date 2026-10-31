@@ -411,6 +411,13 @@ enable_testing()
 
 option(BUILD_DOCUMENTATION "Build the Doxygen documentation." ON)
 option(BUILD_TESTS "Build tests." OFF)
+# Wallet-only builds (e.g. for the Microsoft Store, whose policy 10.2.6 forbids
+# on-device mining) keep consensus/RandomX verification but refuse to mine.
+option(MONZERO_DISABLE_MINING "Build without the ability to mine (wallet/node only)." OFF)
+if (MONZERO_DISABLE_MINING)
+  add_definitions("-DMONZERO_NO_MINING")
+  message(STATUS "Mining is disabled in this build")
+endif()
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(DEFAULT_BUILD_DEBUG_UTILITIES ON)
 else()

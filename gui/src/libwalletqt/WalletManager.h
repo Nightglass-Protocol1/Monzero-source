@@ -161,6 +161,8 @@ public:
     Q_INVOKABLE void miningStatusAsync();
     Q_INVOKABLE bool startMining(const QString &address, quint32 threads, bool backgroundMining, bool ignoreBattery);
     Q_INVOKABLE bool stopMining();
+    Q_INVOKABLE void localMiningCommandAsync(const QString &endpoint, const QString &address, quint32 threads, bool start, const QJSValue &callback);
+    Q_INVOKABLE void localMiningStatusAsync(const QString &endpoint, const QJSValue &callback);
 
     // QML missing such functionality, implementing these helpers here
     Q_INVOKABLE QString urlToLocalPath(const QUrl &url) const;

@@ -1,0 +1,131 @@
+diff --git a/swap-machine/src/bin/native-fee-preview.rs b/swap-machine/src/bin/native-fee-preview.rs
+index fa7566f51..a75d84e01 100644
+--- a/swap-machine/src/bin/native-fee-preview.rs
++++ b/swap-machine/src/bin/native-fee-preview.rs
+@@ -40,7 +40,9 @@ mod linux {
+ 
+     pub async fn run() -> Result<()> {
+         let args: Vec<_> = std::env::args_os().collect();
+-        ensure!(args.len() == 4 && (args[1] == "--fee-preview-stdio-v1" || args[1] == "--wallet-control-stdio-v1") && args[2] == "--session-file",
++        let recovery = args.get(1).is_some_and(|arg| arg == "--recovery-stdio-v1");
++        ensure!((args.len() == 4 && (args[1] == "--fee-preview-stdio-v1" || args[1] == "--wallet-control-stdio-v1")
++            || args.len() == 6 && recovery && args[4] == "--journal-directory") && args[2] == "--session-file",
+             "invalid helper arguments");
+         let (_session_lock, mut session) = load(Path::new(&args[3]))?;
+         let network = match session.network.as_str() {
+@@ -53,6 +55,22 @@ mod linux {
+         // without leaving runtime shutdown waiting for a sender to close stdin.
+         let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)?;
+         let mut writer = tokio::net::unix::pipe::Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)?;
++        if recovery {
++            use tokio::io::{AsyncReadExt, AsyncWriteExt};
++            use swap_machine::native_funding_rpc::spend_recovery::execute_recovery;
++            return tokio::time::timeout(std::time::Duration::from_secs(30), async {
++                let mut bytes = Vec::new();
++                reader.take(2049).read_to_end(&mut bytes).await?;
++                ensure!(bytes.len() <= 2048, "oversized recovery command");
++                let reply = execute_recovery(&client, Path::new(&args[5]), network,
++                    &session.genesis, &bytes).await?;
++                let output = serde_json::to_vec(&reply)?;
++                ensure!(output.len() <= 2048, "oversized recovery reply");
++                writer.write_all(&output).await?;
++                writer.flush().await?;
++                Ok(())
++            }).await?;
++        }
+         if args[1] == "--wallet-control-stdio-v1" {
+             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+             use swap_machine::native_funding_rpc::wallet_session::NativeWalletSession;
+@@ -88,6 +106,8 @@ fn main() {
+         // Never expose credentials, raw RPC responses or session contents.
+         if std::env::args_os().nth(1).is_some_and(|arg| arg == "--wallet-control-stdio-v1") {
+             eprintln!("Native wallet control failed");
++        } else if std::env::args_os().nth(1).is_some_and(|arg| arg == "--recovery-stdio-v1") {
++            eprintln!("Native recovery check failed");
+         } else {
+             eprintln!("Native fee preview failed");
+         }
+diff --git a/swap-machine/src/native_funding_rpc/spend_recovery.rs b/swap-machine/src/native_funding_rpc/spend_recovery.rs
+index e9dcc9aca..83fa90fe4 100644
+--- a/swap-machine/src/native_funding_rpc/spend_recovery.rs
++++ b/swap-machine/src/native_funding_rpc/spend_recovery.rs
+@@ -24,6 +24,50 @@ pub struct ConfirmedSpend {
+     pub confirmations: u64,
+ }
+ 
++#[derive(serde::Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct RecoveryCommand {
++    schema: String,
++    request_id: String,
++    genesis: String,
++    wallet: String,
++    lock_txid: String,
++    txid: String,
++    minimum_confirmations: String,
++}
++
++impl RecoveryCommand {
++    fn decode(bytes: &[u8], genesis: &str) -> Result<Self> {
++        ensure!(bytes.len() <= 2048, "oversized recovery command");
++        let request: Self = serde_json::from_slice(bytes)?;
++        let id = uuid::Uuid::parse_str(&request.request_id)?;
++        ensure!(!id.is_nil() && id.to_string() == request.request_id
++            && request.schema == "monzero-native-recovery-request-v1"
++            && canonical_hash(genesis) && request.genesis == genesis
++            && canonical_hash(&request.lock_txid) && canonical_hash(&request.txid),
++            "invalid recovery command identity");
++        let minimum: u64 = request.minimum_confirmations.parse()?;
++        ensure!(minimum > 0 && minimum.to_string() == request.minimum_confirmations,
++            "invalid recovery confirmation policy");
++        Ok(request)
++    }
++}
++
++/// Directory and genesis are launcher-owned configuration, not request authority.
++/// Caller must bound the entire operation with a deadline and own the RPC service.
++pub async fn execute_recovery(client: &NativeFundingRpc, directory: &Path,
++    network: swap_core::xmz_address::XmzNetwork, genesis: &str, bytes: &[u8]) -> Result<Value> {
++    let request = RecoveryCommand::decode(bytes, genesis)?;
++    let wallet = XmzAddress::parse(network, &request.wallet)?;
++    let record = RecoveryRecord::load(directory, genesis, wallet, &request.lock_txid)?;
++    ensure!(record.txid() == request.txid, "unexpected prepared recovery transaction");
++    let confirmed = record.reconcile(client, request.minimum_confirmations.parse()?).await?;
++    Ok(json!({"schema":"monzero-native-recovery-v1", "requestId":request.request_id,
++        "source":"local-wallet-reconciliation", "status":"confirmed", "genesis":genesis,
++        "wallet":request.wallet, "lockTxid":request.lock_txid, "txid":confirmed.txid,
++        "confirmations":confirmed.confirmations.to_string(), "retryAllowed":false, "executable":false}))
++}
++
+ impl RecoveryRecord {
+     #[cfg(unix)]
+     pub fn load(directory: &Path, genesis: &str, wallet: XmzAddress, lock_txid: &str) -> Result<Self> {
+@@ -126,6 +170,28 @@ fn canonical_hash(value: &str) -> bool {
+ mod tests {
+     use super::*;
+     use swap_core::xmz_address::XmzNetwork;
++    #[test]
++    fn command_rejects_untrusted_configuration_and_ambiguous_identity() -> Result<()> {
++        let genesis = "a".repeat(64);
++        let request = json!({"schema":"monzero-native-recovery-request-v1",
++            "requestId":"12345678-1234-1234-1234-123456789abc", "genesis":genesis,
++            "wallet":wallet().to_string(),"lockTxid":"b".repeat(64),"txid":"c".repeat(64),
++            "minimumConfirmations":"10"});
++        RecoveryCommand::decode(&serde_json::to_vec(&request)?, &genesis)?;
++        for (field, value) in [("journalDirectory",json!("/tmp")), ("minimumConfirmations",json!("0")),
++            ("minimumConfirmations",json!("01")), ("minimumConfirmations",json!("18446744073709551616")),
++            ("minimumConfirmations",json!(10)), ("genesis",json!("d".repeat(64))),
++            ("txid",json!("invalid")), ("requestId",json!("00000000-0000-0000-0000-000000000000"))] {
++            let mut invalid = request.clone(); invalid[field] = value;
++            assert!(RecoveryCommand::decode(&serde_json::to_vec(&invalid)?, &genesis).is_err());
++        }
++        let bytes = serde_json::to_vec(&request)?;
++        let mut duplicate = b"{\"txid\":\"invalid\",".to_vec();
++        duplicate.extend_from_slice(&bytes[1..]);
++        assert!(RecoveryCommand::decode(&duplicate, &genesis).is_err());
++        assert!(RecoveryCommand::decode(&vec![b' ';2049], &genesis).is_err());
++        Ok(())
++    }
+     fn wallet() -> XmzAddress {
+         XmzAddress::parse(XmzNetwork::Mainnet,
+             "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H").unwrap()

@@ -1,0 +1,86 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
+@@ -121,3 +121,5 @@
+ pub mod success;
+ 
+ pub mod preparation;
++
++pub mod light;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light.rs
+@@ -0,0 +1,36 @@
++//! Public payment terms for a local BCH wallet. No input reservation or secrets.
++use super::*;
++use bitcoin::{Amount,TxOut};
++
++impl AdmittedExecution<'_> {
++    /// Derive the exact covenant payment from the revalidated admitted exchange.
++    /// Script bytes are used because BCH covenant destinations need not be P2PKH.
++    pub fn light_funding_terms(&self,now:u64)->Result<serde_json::Value> {
++        let plan=self.quote.recovery_plan();
++        let payment=TxOut {value:Amount::from_sat(plan.terms().locked_atoms),
++            script_pubkey:plan.lock().script_pubkey()};
++        let fee=self.quote.terms()["bchFundingFeeMaxAtoms"].parse::<u64>()?;
++        let minimum=self.quote.terms()["bchMinimumOutputAtoms"].parse::<u64>()?;
++        self.check_light_funding_payment(&payment,Amount::from_sat(fee),Amount::from_sat(minimum),now)?;
++        Ok(serde_json::json!({"schema":"monzero-bch-light-funding-terms-v1",
++            "tradeId":self.quote.terms()["swapId"],"quoteCommitment":hex(self.quote.commitment()),
++            "network":self.quote.terms()["bchNetwork"],"genesis":self.quote.terms()["bchGenesis"],
++            "contractScript":hex(payment.script_pubkey.as_bytes()),"amountAtomic":payment.value.to_sat().to_string(),
++            "maximumFeeAtomic":fee.to_string(),"minimumChangeAtomic":minimum.to_string(),
++            "lockConfirmations":self.policy.bch_confirmations,"refundScript":self.quote.terms()["bchRefundScript"],
++            "expiresAt":self.quote.terms()["expiresAt"],"watchOnly":true,"broadcastAuthorized":false}))
++    }
++
++    /// Validate payment policy before a local wallet allocates change or inputs.
++    /// Ownership, fresh chain evidence, signing and relay remain separate checks.
++    pub fn check_light_funding_payment(&self,payment:&TxOut,fee:Amount,
++        minimum_change:Amount,now:u64)->Result<()> {
++        ensure!(self.role==Role::BchFunder,"wrong BCH light funding role");
++        ensure!(now>=self.read_admission()?.admitted_at,"BCH light funding predates admission");
++        self.restore_agreement()?.check_bch_funding(self.quote,self.policy,now,
++            &payment.script_pubkey,payment.value.to_sat(),fee.to_sat())?;
++        ensure!(minimum_change.to_sat()>=self.quote.terms()["bchMinimumOutputAtoms"].parse::<u64>()?
++            && minimum_change.to_sat()<=21_000_000*100_000_000,"BCH light funding change policy mismatch");
++        Ok(())
++    }
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -772,6 +772,36 @@
+         funding.input[0].previous_output = OutPoint {txid:source.compute_txid(),vout:0};
+         funding.output = vec![TxOut {value:Amount::from_sat(amount),script_pubkey:setup.quote.recovery_plan().lock().script_pubkey()},
+             TxOut {value:Amount::from_sat(10_000),script_pubkey:change.clone()}];
++        // Light-wallet terms come from admitted negotiation, without reserving inputs.
++        let before=std::fs::read_dir(&metadata.0)?.count();
++        let terms=execution.light_funding_terms(1006);
++        if role==Role::BchFunder {
++            let terms=terms?;
++            assert_eq!(terms["contractScript"],hex(funding.output[0].script_pubkey.as_bytes()));
++            assert_eq!(terms["amountAtomic"],amount.to_string());
++            assert_eq!(terms["refundScript"],setup.quote.terms()["bchRefundScript"]);
++            assert_eq!(terms["broadcastAuthorized"],false);
++            assert_eq!(terms["lockConfirmations"],setup.policy.bch_confirmations);
++            let check=|payment:&TxOut,fee,minimum,now| execution.check_light_funding_payment(
++                payment,Amount::from_sat(fee),Amount::from_sat(minimum),now);
++            let payment=&funding.output[0];
++            assert!(check(payment,1000,546,1006).is_ok());
++            assert!(check(payment,0,546,1006).is_err());
++            assert!(check(payment,5001,546,1006).is_err());
++            assert!(check(payment,1000,545,1006).is_err());
++            assert!(check(payment,1000,u64::MAX,1006).is_err());
++            let mut changed=payment.clone();changed.value=Amount::from_sat(amount+1);
++            assert!(check(&changed,1000,546,1006).is_err());
++            changed=payment.clone();changed.script_pubkey=change.clone();
++            assert!(check(&changed,1000,546,1006).is_err());
++        } else {
++            assert!(terms.is_err());
++            assert!(execution.check_light_funding_payment(&funding.output[0],Amount::from_sat(1000),
++                Amount::from_sat(546),1006).is_err());
++        }
++        assert!(execution.light_funding_terms(1004).is_err());
++        assert!(execution.light_funding_terms(2000).is_err());
++        assert_eq!(std::fs::read_dir(&metadata.0)?.count(),before);
+         let raw = serialize(&funding); let parent = serialize(&source);
+         let preview = execution.validate_bch_funding_preview(1006,&raw,&[&parent],&change,1000,546);
+         if role == Role::BchFunder { assert_eq!(preview?.fee().to_sat(),1000); }

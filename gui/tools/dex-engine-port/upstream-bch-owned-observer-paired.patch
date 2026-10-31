@@ -1,0 +1,161 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+@@ -3,7 +3,7 @@
+ use crate::native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay};
+ use agreement::execution::funding::{native::{NativeFundingSource,relay::NativeRelayState,proof}};
+ pub(super) async fn exercise(config: &Value,setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
+-    bch: &BchRpc,native: &mut AdmittedExecution<'_>,sender: &mut AdmittedExecution<'_>,
++    bch: &BchRpc,owned: Option<&crate::bch_rpc::observer::OwnedBchObserver>,native: &mut AdmittedExecution<'_>,sender: &mut AdmittedExecution<'_>,
+     event: &std::path::Path,gate: &std::path::Path,bch_txid: Txid,now: u64,
+     sender_metadata: &PrivateStore,pins: &NegotiationPins,base: u64) -> Result<()> {
+     let field=|name: &str| -> Result<&str> {config[name].as_str().context("missing native fixture field")};
+@@ -18,14 +18,37 @@
+     drop(session);drop(agreement);
+     let mut relay=NativeTransferRelay::new(backend()?);
+     let source=NativeFundingSource {wallet:XmzAddress::parse(setup.policy.xmz_network,field("source")?)?,account:0,priority:1};
+-    let prepared=native.prepare_bch_native_funding(&mut relay,bch,source,5,now).await?;
++    let helper_prepared=std::env::var("MONZERO_BCH_NATIVE_PREPARATION_PAIRED").as_deref()==Ok("1");
++    let retained=if helper_prepared {Some(native.recover_bch_native_funding()?)} else {None};
++    let retained_metadata=contents(&metadata.0)?;let retained_private=contents(&snapshots.0)?;
++    let prepared=if let Some(owned)=owned {
++        native.prepare_light_bch_native_funding(&mut relay,owned,source,5,now).await?
++    } else {native.prepare_bch_native_funding(&mut relay,bch,source,5,now).await?};
+     ensure!(prepared.fee.atoms()>0 && prepared.fee.atoms()<=10_000_000_000,"native fee exceeds quote");
+-    let review=native.review_bch_native_relay(bch,now+1)?;
+-    assert!(native.relay_bch_native_funding(&mut relay,bch,&[0;32],now+2).await.is_err());
+-    let sent=native.relay_bch_native_funding(&mut relay,bch,&review.commitment,now+2).await?;
++    let deployment=if let Some(owned)=owned {owned.deployment_commitment()?} else {bch.deployment_commitment()?};
++    let review=native.review_bch_native_relay_for_deployment(&deployment,now+1)?;
++    if let Some(owned)=owned {
++        assert!(native.relay_light_bch_native_funding(&mut relay,owned,&[0;32],now+2).await.is_err());
++    } else {assert!(native.relay_bch_native_funding(&mut relay,bch,&[0;32],now+2).await.is_err());}
++    let sent=if let Some(owned)=owned {
++        native.relay_light_bch_native_funding(&mut relay,owned,&review.commitment,now+2).await?
++    } else {native.relay_bch_native_funding(&mut relay,bch,&review.commitment,now+2).await?};
+     assert_eq!(sent.txid,prepared.txid);assert_eq!(sent.fee,prepared.fee);
++    if let Some(retained)=retained {
++        assert_eq!(prepared.txid,retained.txid);assert_eq!(prepared.fee,retained.fee);
++        assert_eq!(contents(&metadata.0)?,retained_metadata);
++        assert_eq!(contents(&snapshots.0)?,retained_private);
++    }
++    if owned.is_some() {
++        assert!(native.review_bch_native_relay(bch,now+2).is_err());
++        assert!(native.relay_bch_native_funding(&mut relay,bch,&review.commitment,now+2).await.is_err());
++        assert_eq!(contents(&metadata.0)?,retained_metadata);
++    }
+     let before=contents(&metadata.0)?;
+-    assert_eq!(native.relay_bch_native_funding(&mut relay,bch,&review.commitment,now+3).await?.txid,sent.txid);
++    let repeated=if let Some(owned)=owned {
++        native.relay_light_bch_native_funding(&mut relay,owned,&review.commitment,now+3).await?
++    } else {native.relay_bch_native_funding(&mut relay,bch,&review.commitment,now+3).await?};
++    assert_eq!(repeated.txid,sent.txid);
+     assert_eq!(contents(&metadata.0)?,before);
+     let context=sender.bch_native_proof_public_context()?;
+     assert_eq!(context.as_object().unwrap().len(),4);
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/preparation_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/preparation_helper.rs
+@@ -1,7 +1,12 @@
+ //! Actual helper construction, offline restart and no repeat preparation.
+ use super::*;
+ pub(super) fn exercise(context: &Value,setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
+-    pins: &NegotiationPins,base: u64,rpc: &BchRpc) -> Result<()> {
++    pins: &NegotiationPins,base: u64,rpc: &BchRpc,observer: Option<&crate::bch_rpc::observer::OwnedBchObserver>) -> Result<()> {
++    if observer.is_some() {
++        ensure!(["MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE","MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE_SHA256",
++            "MONZERO_BCH_QT_NATIVE_RELAY_PROBE","MONZERO_BCH_QT_NATIVE_RELAY_PROBE_SHA256"]
++            .iter().all(|name|std::env::var_os(name).is_none()),"owned observer fixture excludes v1 Qt probes");
++    }
+     let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
+     let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper
+@@ -30,6 +35,11 @@
+     save(&bch,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-funding-rpc-v1",
+         "port":context["port"],"wallet":"fixture","anchor":context["anchor"],"anchorScript":context["anchorScript"],
+         "cookieFile":cookie,"checkpointHeight":1,"checkpoint":context["checkpoint"],"subversion":context["subversion"]}))?)?;
++    if observer.is_some() {
++        save(&bch,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-observer-rpc-v1",
++            "port":context["port"],"cookieFile":cookie,"checkpointHeight":1,
++            "checkpoint":context["checkpoint"],"subversion":context["subversion"]}))?)?;
++    }
+     let n=&context["native"];let login=files.0.join("native.login");
+     save(&login,format!("{}:{}",n["username"].as_str().context("username")?,n["password"].as_str().context("password")?).as_bytes())?;
+     let native=files.0.join("native.json");
+@@ -40,11 +50,20 @@
+         "admissionConfigFile":admission,"bchRpcFile":bch,"nativeRpcFile":native,
+         "deploymentCommitment":hex(&rpc.deployment_commitment()?),"wallet":n["source"],
+         "account":0,"priority":1,"safetyBlocks":5}))?)?;
++    if let Some(observer)=observer {
++        let mut value:Value=serde_json::from_slice(&std::fs::read(&wrapper)?)?;
++        value["schema"]="monzero-private-bch-native-preparation-v2".into();
++        value["bchObserverKind"]="owned-node".into();
++        value["deploymentCommitment"]=hex(&observer.deployment_commitment()?).into();
++        save(&wrapper,&serde_json::to_vec(&value)?)?;
++    }
+     let call=|action: &str,approval: Option<&str>,success: bool| -> Result<Value> {
+         let id=uuid::Uuid::new_v4();
+         let mut request=json!({"schema":format!("monzero-bch-native-preparation-{action}-request-v1"),"requestId":id});
+         if let Some(approval)=approval {request["commitment"]=approval.into();}
+-        let mut child=Command::new(&program).arg(format!("--native-preparation-{action}-stdio-v1")).arg(&wrapper)
++        let mut child=Command::new(&program).env_clear()
++            .envs(std::env::vars_os().filter(|(name,_)|matches!(name.to_str(),Some("LD_LIBRARY_PATH"|"PATH"|"QT_QPA_PLATFORM"))))
++            .arg(format!("--native-preparation-{action}-stdio-v1")).arg(&wrapper)
+             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+         child.stdin.take().context("helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
+         let output=child.wait_with_output()?;
+@@ -60,6 +79,10 @@
+     let before=contents(&metadata.0)?;let private=contents(&snapshots.0)?;
+     assert!(call("status",None,true)?["preparation"].is_null());
+     let review=call("review",None,true)?;
++    let deployment=if let Some(observer)=observer {observer.deployment_commitment()?} else {rpc.deployment_commitment()?};
++    assert_eq!(review["review"]["details"]["deployment"],json!(deployment));
++    if observer.is_some() {assert_ne!(deployment,rpc.deployment_commitment()?);}
++
+     assert_eq!(review["review"]["details"]["amountAtoms"],"200000000000");
+     assert_eq!(review["review"]["details"]["maximumFeeAtoms"],"10000000000");
+     call("submit",Some(&"00".repeat(32)),false)?;
+@@ -82,7 +105,9 @@
+         let id=uuid::Uuid::new_v4();
+         let mut request=json!({"schema":format!("monzero-bch-native-relay-{action}-request-v1"),"requestId":id});
+         if let Some(approval)=approval {request["commitment"]=approval.into();}
+-        let mut child=Command::new(&relay_program).arg(format!("--native-relay-{action}-stdio-v1")).arg(&wrapper)
++        let mut child=Command::new(&relay_program).env_clear()
++            .envs(std::env::vars_os().filter(|(name,_)|matches!(name.to_str(),Some("LD_LIBRARY_PATH"|"PATH"|"QT_QPA_PLATFORM"))))
++            .arg(format!("--native-relay-{action}-stdio-v1")).arg(&wrapper)
+             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+         child.stdin.take().context("relay helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
+         let output=child.wait_with_output()?;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -149,13 +149,16 @@
+         assert_eq!(checked.destination(),native.restore_agreement()?.owned().wallet().address());
+         if paired {
+             let helper_preparation=std::env::var("MONZERO_BCH_NATIVE_PREPARATION_PAIRED").as_deref()==Ok("1");
++            let owned_mode=std::env::var("MONZERO_BCH_NATIVE_OWNED_OBSERVER_PAIRED").as_deref()==Ok("1");
++            ensure!(!owned_mode || helper_preparation,"owned observer fixture requires helper preparation");
++            let native_observer=owned_mode.then_some(&observer);
+             let payment_time=if helper_preparation {
+                 drop(native);
+-                preparation_helper::exercise(&config,&setup,&native_metadata,&snapshots,&native_pins,base,&rpc)?;
++                preparation_helper::exercise(&config,&setup,&native_metadata,&snapshots,&native_pins,base,&rpc,native_observer)?;
+                 native=AdmittedExecution::resume(&native_metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
+                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()
+             } else {base+19};
+-            native_payment(&config["native"],&setup,&native_metadata,&snapshots,&rpc,&mut native,&mut restored,
++            native_payment(&config["native"],&setup,&native_metadata,&snapshots,&rpc,native_observer,&mut native,&mut restored,
+                 &event,&gate,txid,payment_time,&metadata,&pins,base).await?;
+         } else {
+         phase(&event,&gate,"observed","aged",txid).await?;
+@@ -171,10 +174,11 @@
+     save(&report,&serde_json::to_vec(&json!({"schema":"monzero-bch-node-executor-result-v1","executable":false,
+         "txid":txid.to_string(),"lockVout":signed.lock_outpoint().vout,"lockScript":setup.quote.recovery_plan().lock().script_pubkey().to_hex_string(),
+         "authenticatedHandoff":handoff,"fundingReceiptApprovalVerified":handoff,"fundingReceiptHelperVerified":helper_receipt,"fundingReceiptQtVerified":helper_receipt && std::env::var_os("MONZERO_BCH_QT_FUNDING_RECEIPT_PROBE").is_some(),"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff && !paired,"pairedNativeFunding":paired,
+-        "nativePreparationQtVerified":paired && std::env::var_os("MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE").is_some(),
+-        "nativeRelayQtVerified":paired && std::env::var_os("MONZERO_BCH_QT_NATIVE_RELAY_PROBE").is_some(),
++        "nativePreparationQtVerified":paired && std::env::var("MONZERO_BCH_NATIVE_PREPARATION_PAIRED").as_deref()==Ok("1") && std::env::var_os("MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE").is_some(),
++        "nativeRelayQtVerified":paired && std::env::var("MONZERO_BCH_NATIVE_PREPARATION_PAIRED").as_deref()==Ok("1") && std::env::var_os("MONZERO_BCH_QT_NATIVE_RELAY_PROBE").is_some(),
+         "nativeRelayHelperVerified":paired && std::env::var("MONZERO_BCH_NATIVE_PREPARATION_PAIRED").as_deref()==Ok("1"),
+         "nativePreparationHelperVerified":paired && std::env::var("MONZERO_BCH_NATIVE_PREPARATION_PAIRED").as_deref()==Ok("1"),
++        "nativeOwnedObserverVerified":paired && std::env::var("MONZERO_BCH_NATIVE_OWNED_OBSERVER_PAIRED").as_deref()==Ok("1"),
+         "principalAtoms":100000,"feeAtoms":fee,"productionWalletLockSignRelay":true,"restartSavedBytes":true,
+         "inputs":inputs.iter().map(|p|json!({"txid":p.txid.to_string(),"vout":p.vout})).collect::<Vec<_>>() }))?)?;
+     Ok(())

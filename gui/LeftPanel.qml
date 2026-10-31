@@ -118,13 +118,30 @@ Rectangle {
                 height: 490
                 width: 260
 
-                Image {
+                Rectangle {
                     id: card
-                    visible: !isOpenGL || MonzeroComponents.Style.blackTheme
                     width: 260
                     height: 135
-                    fillMode: Image.PreserveAspectFit
-                    source: MonzeroComponents.Style.blackTheme ? "qrc:///images/card-background-black" + (currentAccountIndex % MonzeroComponents.Style.accountColors.length) + ".png" : "qrc:///images/card-background-white.png"
+                    radius: 10
+                    border.color: MonzeroComponents.Style.inputBorderColorInActive
+                    gradient: Gradient {
+                        GradientStop { position: 0; color: MonzeroComponents.Style.blackTheme ? "#14545B" : "#CCF3EF" }
+                        GradientStop { position: 1; color: MonzeroComponents.Style.blackTheme ? "#08262E" : "#EAFBF8" }
+                    }
+                    Image {
+                        anchors { right: parent.right; bottom: parent.bottom; margins: 8 }
+                        width: 115; height: 115
+                        source: "qrc:///images/monzero-xmz-coin.png"
+                        fillMode: Image.PreserveAspectFit
+                        opacity: 0.16
+                        mipmap: true
+                    }
+                    Image {
+                        x: 20; y: 20; width: 32; height: 32
+                        source: "qrc:///images/monzero-xmz-coin.png"
+                        fillMode: Image.PreserveAspectFit
+                        mipmap: true
+                    }
                 }
 
                 DropShadow {
@@ -515,7 +532,7 @@ Rectangle {
                 visible: appWindow.walletMode >= 2
                 anchors.left: parent.left
                 anchors.right: parent.right
-                text: qsTr("Advanced") + translationManager.emptyString
+                text: qsTr("Mining / tools") + translationManager.emptyString
                 symbol: (isMac ? "⌃" : qsTr("Ctrl+")) + "D" + translationManager.emptyString
                 onClicked: {
                     parent.previousButton.checked = false

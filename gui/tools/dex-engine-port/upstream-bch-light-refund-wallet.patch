@@ -1,0 +1,175 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/retention.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/retention.rs
+@@ -62,9 +62,12 @@
+     }
+     /// Bind already-approved local signatures to this trade before publishing
+     /// preparation. A retry retains original time and exact bytes; never re-sign.
+-    pub fn retain_light_signed_funding(&mut self,claim:&ClaimedSpend,network:LightNetwork,
++    pub fn retain_light_signed_funding(&mut self,claim:&ClaimedSpend,book:&crate::litecoin_light::account::allocation::AddressBook,network:LightNetwork,
+         expected:sha256::Hash,sources:&[&[u8]],now:u64)->Result<SignedFunding> {
+         let signed=self.verify_light_signed_funding(claim,network,expected,sources,now)?;
++        let refund=crate::litecoin_light::network::LightAddress::from_script(network,
++            &self.quote.recovery_plan().terms().bch_funder_refund)?;
++        claim.check_allocated_destination(book,&refund,expected)?;
+         self.require_no_node_funding_records()?;
+         let saved=self.local_record_bytes()?;
+         let prepared_at=if let Some(bytes)=&saved {
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -25,6 +25,10 @@
+         Self::with_native_context(network,now,expires,None)
+     }
+     fn with_native_context(network: Option<crate::bch_rpc::BchNetwork>, now: u64, expires: u64, native: Option<&serde_json::Value>) -> Result<Self> {
++        Self::with_context_and_refund(network,now,expires,native,None)
++    }
++    fn with_context_and_refund(network: Option<crate::bch_rpc::BchNetwork>,now:u64,expires:u64,
++        native:Option<&serde_json::Value>,refund:Option<&bitcoin::Script>)->Result<Self> {
+         let (mut policy,mut terms) = fixture();
+         terms.insert("expiresAt".into(),expires.to_string());
+         if let Some(network) = network {
+@@ -42,6 +46,7 @@
+                 terms.insert(name.into(),value.into());
+             }
+         }
++        if let Some(refund)=refund {terms.insert("bchRefundScript".into(),refund.to_hex_string());}
+         let quote = signed(&terms,&policy,now)?;
+         let mut setup = Self {policy,quote,spend:vec![],view:vec![],frames:vec![],signatures:vec![]};
+         for role in [Role::BchFunder,Role::NativeFunder] {
+@@ -886,7 +891,12 @@
+         (crate::bch_rpc::BchNetwork::Regtest {checkpoint_height:1,checkpoint:bitcoin::BlockHash::from_byte_array([7;32])},BchNetwork::Regtest),
+         (crate::bch_rpc::BchNetwork::Mainnet,BchNetwork::Mainnet),
+         (crate::bch_rpc::BchNetwork::Testnet,BchNetwork::Testnet)] {
+-    let setup=Setup::with_network(Some(rpc_network))?;
++    let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([42;32]));
++    let account=seed.public_account(light_network,0)?;
++    let refund=account.derive(Branch::Receive,0)?;
++    let setup=Setup::with_context_and_refund(Some(rpc_network),1000,2000,None,Some(refund.address().script_pubkey()))?;
++    let addresses=PrivateStore::new()?;
++    let mut book=crate::litecoin_light::account::allocation::AddressBook::create(&addresses.0,seed.public_account(light_network,0)?)?;
+     let snapshots=PrivateStore::new()?;let metadata=PrivateStore::new()?;let claims=PrivateStore::new()?;
+     let (selected,own,initial)=selected_with_outgoing(&setup,&snapshots.0,0)?;
+     let (_,peer,_)=selected_with_outgoing(&setup,&snapshots.0,1)?;
+@@ -899,8 +909,6 @@
+     let pins=NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
+     let mut execution=AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
+         Role::BchFunder,setup.quote.commitment(),pins,1005)?;
+-    let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([42;32]));
+-    let account=seed.public_account(light_network,0)?;
+     let amount=setup.quote.recovery_plan().terms().locked_atoms;
+     let parent=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
+         input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
+@@ -925,13 +933,24 @@
+     assert!(execution.verify_light_signed_funding(&claim,network,commitment,&[&sources],1004).is_err());
+     assert!(execution.verify_light_signed_funding(&claim,network,commitment,&[&sources],2000).is_err());
+     assert!(execution.prepared_bch_funding()?.is_none());
+-    assert_eq!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],1007)?.transaction(),&signed);
++    assert!(execution.retain_light_signed_funding(&claim,&book,network,commitment,&[&sources],1007).is_err());
++    assert!(execution.prepared_bch_funding()?.is_none());
++    assert!(!metadata.0.join(format!("{operation}.bch-funding-local-signed")).exists());
++    book.reserve(uuid::Uuid::new_v4(),Branch::Receive)?;
++    let wrong_addresses=PrivateStore::new()?;
++    let mut wrong_book=crate::litecoin_light::account::allocation::AddressBook::create(&wrong_addresses.0,seed.public_account(light_network,1)?)?;
++    wrong_book.reserve(uuid::Uuid::new_v4(),Branch::Receive)?;
++    assert!(execution.retain_light_signed_funding(&claim,&wrong_book,network,commitment,&[&sources],1007).is_err());
++    assert!(!metadata.0.join(format!("{operation}.bch-funding-local-signed")).exists());
++    let address_bytes=std::fs::read(addresses.0.join("litecoin-address-book.json"))?;
++    assert_eq!(execution.retain_light_signed_funding(&claim,&book,network,commitment,&[&sources],1007)?.transaction(),&signed);
++    assert_eq!(std::fs::read(addresses.0.join("litecoin-address-book.json"))?,address_bytes);
+     let local_path=metadata.0.join(format!("{operation}.bch-funding-local-signed"));
+     let local_bytes=std::fs::read(&local_path)?;
+-    assert_eq!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],1008)?.transaction(),&signed);
++    assert_eq!(execution.retain_light_signed_funding(&claim,&book,network,commitment,&[&sources],1008)?.transaction(),&signed);
+     assert_eq!(std::fs::read(&local_path)?,local_bytes);
+-    assert!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],1006).is_err());
+-    assert!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],2000).is_err());
++    assert!(execution.retain_light_signed_funding(&claim,&book,network,commitment,&[&sources],1006).is_err());
++    assert!(execution.retain_light_signed_funding(&claim,&book,network,commitment,&[&sources],2000).is_err());
+     // A different correctly signed payment for the same trade cannot replace it.
+     let replacement_dir=PrivateStore::new()?;
+     let mut replacement_parent=parent.clone();replacement_parent.input[0].previous_output.txid=Txid::from_byte_array([10;32]);
+@@ -940,7 +959,7 @@
+         vec![OwnedInput {outpoint:replacement_unsigned.input[0].previous_output,prevout:parent.output[0].clone(),branch:Branch::Receive,index:0}],
+         &payment,None,Amount::from_sat(1000))?)?;
+     replacement.approve_and_sign(&seed,replacement.signing_commitment())?;
+-    assert!(execution.retain_light_signed_funding(&replacement,network,replacement.signing_commitment(),&[&serialize(&replacement_parent)],1008).is_err());
++    assert!(execution.retain_light_signed_funding(&replacement,&book,network,replacement.signing_commitment(),&[&serialize(&replacement_parent)],1008).is_err());
+     assert_eq!(std::fs::read(&local_path)?,local_bytes);
+     drop(execution);
+     let mut execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+@@ -949,7 +968,7 @@
+     let pin_path=metadata.0.join(format!("{operation}.bch-funding-pin"));
+     std::fs::remove_file(&pin_path)?;
+     assert!(execution.signed_bch_funding().is_err());
+-    assert_eq!(execution.retain_light_signed_funding(&claim,network,commitment,&[&sources],1009)?.transaction(),&signed);
++    assert_eq!(execution.retain_light_signed_funding(&claim,&book,network,commitment,&[&sources],1009)?.transaction(),&signed);
+     assert_eq!(std::fs::read(&local_path)?,local_bytes);
+     // A node-wallet marker cannot coexist with a local source.
+     let node_path=metadata.0.join(format!("{operation}.bch-funding-wallet-lock-intent"));
+@@ -985,6 +1004,7 @@
+     assert_eq!(recovery.cancel().input[0].previous_output.txid,signed.compute_txid());
+     assert_ne!(recovery.cancel().input[0].previous_output.txid,unsigned.compute_txid());
+     let refund:Transaction=bitcoin::consensus::deserialize(recovery.refund_bytes())?;
++    assert_eq!(refund.output[0].script_pubkey,account.derive(Branch::Receive,0)?.address().script_pubkey().clone());
+     let recovered=native.restore_agreement()?.owned().recover_spend_key(&setup.quote,
+         &serialize(recovery.cancel()),refund.input[0].previous_output,recovery.refund_bytes(),&encrypted)?;
+     assert_eq!(recovered.as_bytes(),(setup.spend[0]+setup.spend[1]).as_bytes());
+--- a/swap-machine/src/litecoin_light/account/allocation/tests.rs
++++ b/swap-machine/src/litecoin_light/account/allocation/tests.rs
+@@ -127,3 +127,24 @@
+     fs::write(dir.0.join(NAME),before)?;
+     assert!(book.contains_allocated_address(receive.address()).is_err());Ok(())
+ }
++
++#[test]
++fn refund_account_rejects_same_xpub_on_another_coin()->Result<()> {
++    use crate::litecoin_light::network::{BchNetwork,BtcNetwork};
++    let master=Xpriv::new_master(NetworkKind::Test,&[43;32])?;
++    let account=PublicAccount::from_master(&master,BchNetwork::Regtest,0)?;
++    let mut descriptor=serde_json::to_value(account.descriptor())?;
++    descriptor["schema"]=serde_json::json!("monzero-btc-public-account-v1");
++    let bitcoin=PublicAccount::from_descriptor(&serde_json::from_value(descriptor)?,BtcNetwork::Regtest)?;
++    // Historical address-book identity shares the common genesis; the new
++    // refund check must separately distinguish the selected coin/network.
++    assert_eq!(identity(&account),identity(&bitcoin));
++    let dir=Directory::new()?;
++    let mut book=AddressBook::create(&dir.0,PublicAccount::from_master(&master,BchNetwork::Regtest,0)?)?;
++    let address=book.reserve(Uuid::new_v4(),Branch::Receive)?;
++    let before=fs::read(dir.0.join(NAME))?;
++    book.require_allocated_address(&account,address.address())?;
++    assert!(book.require_allocated_address(&bitcoin,address.address()).is_err());
++    assert_eq!(fs::read(dir.0.join(NAME))?,before);
++    Ok(())
++}
+--- a/swap-machine/src/litecoin_light/account/allocation.rs
++++ b/swap-machine/src/litecoin_light/account/allocation.rs
+@@ -69,6 +69,14 @@
+         }
+         ensure!(self.journal.read(NAME)?==self.bytes,"address book changed during ownership check");
+         Ok(found)
++    }
++    /// Require the retained destination to belong to the selected funding account.
++    /// Public membership only: no key unlock, allocation or network request.
++    pub fn require_allocated_address(&self,account:&PublicAccount,address:&LightAddress)->Result<()> {
++        ensure!(account.network()==self.account.network() && identity(account)==identity(&self.account),
++            "refund address book belongs to another account or network");
++        ensure!(self.contains_allocated_address(address)?,"refund address is not allocated by this wallet");
++        Ok(())
+     }
+     /// Number of allocated indices that discovery must cover on this branch.
+     pub fn allocated_count(&self,branch:Branch)->Result<u32> {
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -102,6 +102,13 @@
+         }
+         Ok(())
+     }
++    /// Check a refund destination against this exact retained claim's account.
++    /// This is read-only; it neither approves signing nor releases input claims.
++    pub fn check_allocated_destination(&self,book:&crate::litecoin_light::account::allocation::AddressBook,
++        address:&crate::litecoin_light::network::LightAddress,expected:sha256::Hash)->Result<()> {
++        self.check_signing_review(expected)?;
++        book.require_allocated_address(&self.review.account,address)
++    }
+     /// Observed-policy callers check the chain before entering this method.
+     /// Validate retained claims before unlocking; wrong password/account cannot
+     /// publish signing intent. The unlocked seed stays inside this call.

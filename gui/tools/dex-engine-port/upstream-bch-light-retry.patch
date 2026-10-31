@@ -1,0 +1,221 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/relay.rs
+@@ -13,6 +13,7 @@
+         chain:&HeaderSequence,observed:&ObservedWallet,inputs:&[IncludedInput<'_>],
+         expected:sha256::Hash,endpoint:&TlsEndpoint,now:u64)->Result<FundingRelayReview> {
+         self.quote.check_policy(self.policy,now)?;
++        ensure!(self.local_send_intent_bytes()?.is_none(),"BCH trade has a retained send attempt; reconcile first");
+         ensure!(endpoint.network()==chain.network(),"wrong BCH light relay endpoint network");
+         spend.check_funding_inputs_on(chain,observed,inputs,u64::from(self.policy.bch_confirmations))?;
+         let claim=spend.retained_claim();
+@@ -42,6 +43,9 @@
+         expected:sha256::Hash,endpoint:&TlsEndpoint,approved:&[u8;32],now:u64)->Result<Txid> {
+         let review=self.review_light_bch_funding_send(spend,chain,observed,inputs,expected,endpoint,now)?;
+         ensure!(review.commitment==*approved,"BCH local funding send approval is stale or changed");
++        self.retain_local_send_intent(spend.retained_claim(),endpoint,expected,&review,now)?;
+         spend.broadcast_on(chain,observed,endpoint,expected).await
+     }
+ }
++
++mod retry;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/relay/retry.rs
+@@ -0,0 +1,107 @@
++//! Cold observation and separately approved exact-byte retry. The trade intent
++//! binds the original endpoint before wallet/network publication can be interrupted.
++use super::*;
++use crate::litecoin_light::{network::LightNetwork,session::{ReadSession,reconciliation::{PaymentObservation,PaymentPosition}},
++    vault::signing::review::claims::ClaimedSpend};
++use tokio::io::{AsyncRead,AsyncWrite};
++use swap_core::bch::funding::SignedFunding;
++
++const INTENT:&str="monzero-bch-local-send-intent-v1";
++const REVIEW:&str="monzero-bch-light-relay-review-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct LocalSendIntent {
++    schema:String,admission:[u8;32],approved_at:u64,commitment:[u8;32],details:serde_json::Value,
++}
++impl AdmittedExecution<'_> {
++    pub(super) fn local_send_intent_bytes(&self)->Result<Option<Vec<u8>>> {
++        match self.metadata.read(&record_name(self.quote,"local-relay-intent")) {
++            Ok(bytes)=>{ensure!(bytes.len()<=16384,"oversized BCH local relay intent");Ok(Some(bytes))},
++            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>Ok(None),
++            Err(e)=>Err(e),
++        }
++    }
++    pub(super) fn retain_local_send_intent(&self,claim:&ClaimedSpend,endpoint:&TlsEndpoint,
++        expected:sha256::Hash,review:&FundingRelayReview,now:u64)->Result<()> {
++        self.require_local_funding_claim(claim,endpoint.network(),expected)?;
++        let record=LocalSendIntent {schema:INTENT.into(),admission:self.admission_digest()?,approved_at:now,
++            commitment:review.commitment,details:review.details.clone()};
++        self.metadata.retain(&record_name(self.quote,"local-relay-intent"),&serde_json::to_vec(&record)?)
++    }
++    fn retained_send(&self,claim:&ClaimedSpend,network:LightNetwork,expected:sha256::Hash,
++        endpoint:&TlsEndpoint)->Result<(SignedFunding,[u8;32],u64)> {
++        ensure!(endpoint.network()==network,"wrong BCH retry endpoint network");
++        let bytes=self.local_send_intent_bytes()?.context("no retained BCH send intent")?;
++        let record:LocalSendIntent=serde_json::from_slice(&bytes)?;
++        ensure!(record.schema==INTENT && record.admission==self.admission_digest()?
++            && serde_json::to_vec(&record)?==bytes && record.commitment==hash(REVIEW,&serde_json::to_vec(&record.details)?),
++            "BCH send intent changed");
++        self.quote.check_policy(self.policy,record.approved_at)?;
++        let (signed,signed_at)=self.require_local_funding_claim(claim,network,expected)?;
++        let recovery=self.retained_bch_recovery()?.context("missing retained BCH private recovery")?;
++        ensure!(record.approved_at>=signed_at && record.approved_at>=recovery.prepared_at(),"BCH send intent predates recovery");
++        let height=record.details["observedHeight"].as_u64().context("missing BCH send observation height")?;
++        ensure!(height<=u64::from(u32::MAX),"invalid BCH send observation height");
++        let tip:bitcoin::BlockHash=record.details["observedTip"].as_str().context("missing BCH send observation tip")?.parse()?;
++        let expected_details=serde_json::json!({"schema":REVIEW,"action":"send",
++            "tradeId":self.quote.terms()["swapId"],"quoteCommitment":hex(self.quote.commitment()),
++            "claimCommitment":expected,"txid":signed.transaction().compute_txid(),
++            "signedDigest":sha256::Hash::hash(&serialize(signed.transaction())),
++            "privateRecovery":hex(recovery.commitment()),"cancelTxid":recovery.cancel().compute_txid(),
++            "refundTxid":recovery.refund_txid()?,"punishTxid":recovery.punish().compute_txid(),
++            "minimumConfirmations":self.policy.bch_confirmations,"observedHeight":height,
++            "observedTip":tip,"endpoint":{"network":endpoint.network().storage_identity(),
++                "host":endpoint.host(),"port":endpoint.port()}});
++        ensure!(record.details==expected_details,"BCH retry differs from original endpoint or approved funding");
++        Ok((signed,hash(INTENT,&bytes),record.approved_at))
++    }
++
++    /// Read-only observation of the exact retained transaction, including after
++    /// expiry. No vault access, intent creation, replacement or broadcast.
++    pub async fn observe_light_bch_funding_on<S:AsyncRead+AsyncWrite+Unpin>(&self,
++        claim:&ClaimedSpend,chain:&HeaderSequence,expected:sha256::Hash,
++        session:&mut ReadSession<S>,maximum_history:usize)->Result<PaymentObservation> {
++        let (signed,_)=self.require_local_funding_claim(claim,chain.network(),expected)?;
++        let observation=claim.observe_payment_on(session,chain,maximum_history).await?;
++        ensure!(self.require_local_funding_claim(claim,chain.network(),expected)?.0.transaction()==signed.transaction(),
++            "BCH retained funding changed during observation");
++        Ok(observation)
++    }
++
++    /// Retry may newly publish funding, so current quote policy is required.
++    /// Pending/absent reports are not proof of unspentness or network absence.
++    /// The durable trade intent also covers interruption before wallet intent.
++    pub fn review_light_bch_funding_retry(&self,claim:&ClaimedSpend,chain:&HeaderSequence,
++        expected:sha256::Hash,endpoint:&TlsEndpoint,observation:&PaymentObservation,now:u64)->Result<FundingRelayReview> {
++        self.quote.check_policy(self.policy,now)?;
++        let (signed,intent,approved_at)=self.retained_send(claim,chain.network(),expected,endpoint)?;
++        ensure!(now>=approved_at,"BCH retry predates original approval");
++        ensure!(observation.txid()==signed.transaction().compute_txid(),"BCH retry observation targets another transaction");
++        let position=match observation.position_on(chain)? {
++            PaymentPosition::NotReported=>"not-reported",
++            PaymentPosition::ReportedPending=>"reported-pending",
++            PaymentPosition::Included {..}=>anyhow::bail!("BCH funding already included; reconcile settlement"),
++        };
++        let status=match claim.broadcast_status(endpoint,expected)? {
++            BroadcastStatus::NoLocalAttempt=>"trade-intent-only",
++            BroadcastStatus::OutcomeUnknown=>"outcome-unknown",
++            BroadcastStatus::ServerAcknowledged=>"server-acknowledged",
++        };
++        let details=serde_json::json!({"schema":REVIEW,"action":"retry",
++            "tradeId":self.quote.terms()["swapId"],"quoteCommitment":hex(self.quote.commitment()),
++            "claimCommitment":expected,"originalIntent":hex(&intent),"txid":signed.transaction().compute_txid(),
++            "signedDigest":sha256::Hash::hash(&serialize(signed.transaction())),
++            "endpoint":{"network":endpoint.network().storage_identity(),"host":endpoint.host(),"port":endpoint.port()},
++            "localStatus":status,"reportedPosition":position,"observedHeight":observation.selected_height(),
++            "observedTip":observation.selected_tip()});
++        Ok(FundingRelayReview {commitment:hash(REVIEW,&serde_json::to_vec(&details)?),details})
++    }
++
++    pub async fn retry_light_bch_funding(&self,claim:&ClaimedSpend,chain:&HeaderSequence,
++        expected:sha256::Hash,endpoint:&TlsEndpoint,observation:&PaymentObservation,
++        approved:&[u8;32],now:u64)->Result<Txid> {
++        let review=self.review_light_bch_funding_retry(claim,chain,expected,endpoint,observation,now)?;
++        ensure!(review.commitment==*approved,"BCH funding retry approval is stale or changed");
++        endpoint.broadcast_retained(claim,expected).await
++    }
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_send.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_send.rs
+@@ -67,6 +67,9 @@
+     std::fs::rename(saved_pin,recovery_pin)?;
+     assert!(execution.send_light_bch_funding(&spend,&chain,&observed,&inputs,expected,&endpoint,&[0;32],1013).await.is_err());
+     assert_eq!(spend.retained_claim().broadcast_status(&endpoint,expected)?,BroadcastStatus::NoLocalAttempt);
++    let unseen=observe(execution,spend.retained_claim(),&chain,expected,None).await?;
++    assert!(execution.review_light_bch_funding_retry(spend.retained_claim(),&chain,expected,&endpoint,&unseen,1013).is_err());
++    assert!(!metadata.join(format!("{operation}.bch-funding-local-relay-intent")).exists());
+     // Cancel a real owned-loopback TLS connection attempt after intent is durable.
+     let outcome=tokio::time::timeout(Duration::from_millis(200),execution.send_light_bch_funding(
+         &spend,&chain,&observed,&inputs,expected,&endpoint,&review.commitment,1013)).await;
+@@ -76,5 +79,78 @@
+     // Endpoint-local absence must not bypass the wallet's global submission marker.
+     assert_eq!(spend.retained_claim().broadcast_status(&other,expected)?,BroadcastStatus::NoLocalAttempt);
+     assert!(execution.review_light_bch_funding_send(&spend,&chain,&observed,&inputs,expected,&other,1013).is_err());
++    let signed=spend.retained_signed()?;drop(spend);
++    let claim=ClaimedSpend::open(claims,operation,account,payment,None,Amount::from_sat(1000),expected)?;
++    let pending=observe(execution,&claim,&chain,expected,Some(0)).await?;
++    let retry=execution.review_light_bch_funding_retry(&claim,&chain,expected,&endpoint,&pending,1014)?;
++    assert_eq!(retry.details["localStatus"],"outcome-unknown");
++    assert_eq!(retry.details["reportedPosition"],"reported-pending");
++    assert!(execution.review_light_bch_funding_retry(&claim,&chain,expected,&other,&pending,1014).is_err());
++    assert!(execution.review_light_bch_funding_retry(&claim,&chain,expected,&endpoint,&pending,1012).is_err());
++    assert!(execution.review_light_bch_funding_retry(&claim,&chain,expected,&endpoint,&pending,2000).is_err());
++    assert!(execution.retry_light_bch_funding(&claim,&chain,expected,&endpoint,&pending,&[0;32],1014).await.is_err());
++    let trade_intent=metadata.join(format!("{operation}.bch-funding-local-relay-intent"));
++    let original=std::fs::read(&trade_intent)?;
++    std::fs::write(&trade_intent,b"changed")?;
++    assert!(execution.review_light_bch_funding_retry(&claim,&chain,expected,&endpoint,&pending,1014).is_err());
++    std::fs::write(&trade_intent,&original)?;
++    // Simulate interruption after the trade intent but before wallet publication.
++    let mut removed=Vec::new();
++    for entry in std::fs::read_dir(claims)? {
++        let path=entry?.path();let name=path.file_name().unwrap().to_string_lossy().into_owned();
++        if name.starts_with("ltc-submission-") || (name.starts_with("ltc-broadcast-") && name.ends_with("-intent.json")) {
++            let bytes=std::fs::read(&path)?;std::fs::rename(&path,claims.join(format!("held-{name}")))?;
++            removed.push((path,bytes));
++        }
++    }
++    assert_eq!(removed.len(),2);
++    assert_eq!(claim.broadcast_status(&endpoint,expected)?,BroadcastStatus::NoLocalAttempt);
++    let gap=execution.review_light_bch_funding_retry(&claim,&chain,expected,&endpoint,&pending,1014)?;
++    assert_eq!(gap.details["localStatus"],"trade-intent-only");
++    assert_ne!(retry.commitment,gap.commitment);
++    assert!(execution.review_light_bch_funding_retry(&claim,&chain,expected,&other,&pending,1014).is_err());
++    assert!(execution.retry_light_bch_funding(&claim,&chain,expected,&endpoint,&pending,&retry.commitment,1014).await.is_err());
++    let retried=tokio::time::timeout(Duration::from_millis(200),execution.retry_light_bch_funding(
++        &claim,&chain,expected,&endpoint,&pending,&gap.commitment,1014)).await;
++    assert!(retried.is_err());
++    assert_eq!(claim.load_signed()?,signed);
++    assert_eq!(std::fs::read(&trade_intent)?,original);
++    for (path,bytes) in removed {assert_eq!(std::fs::read(path)?,bytes);}
++    assert_eq!(claim.broadcast_status(&endpoint,expected)?,BroadcastStatus::OutcomeUnknown);
++    let mut included_header=chain.header(chain.height()).unwrap();included_header.prev_blockhash=included_header.block_hash();
++    included_header.merkle_root=bitcoin::TxMerkleNode::from_byte_array(signed.compute_txid().to_byte_array());
++    included_header.time+=1;included_header.nonce=0;
++    while included_header.validate_pow(included_header.target()).is_err() {included_header.nonce+=1;}
++    chain.append(&serialize(&included_header),u64::from(included_header.time)+7201)?;
++    assert!(execution.review_light_bch_funding_retry(&claim,&chain,expected,&endpoint,&pending,1014).is_err());
++    let included_payment=observe(execution,&claim,&chain,expected,Some(chain.height() as i32)).await?;
++    assert!(execution.review_light_bch_funding_retry(&claim,&chain,expected,&endpoint,&included_payment,1014).is_err());
+     drop(held_listener);Ok(())
+ }
++
++async fn observe(execution:&AdmittedExecution<'_>,claim:&ClaimedSpend,chain:&HeaderSequence,
++    expected:sha256::Hash,position:Option<i32>)->Result<crate::litecoin_light::session::reconciliation::PaymentObservation> {
++    let signed=claim.load_signed()?;let txid=signed.compute_txid();
++    let mut responses=vec![
++        ("server.version",serde_json::json!(["fixture","1.4"])),
++        ("server.features",serde_json::json!({"genesis_hash":chain.network().genesis(),"hash_function":"sha256"})),
++        ("blockchain.scripthash.get_history",match position {
++            None=>serde_json::json!([]),Some(height)=>serde_json::json!([{"tx_hash":txid,"height":height}])})];
++    if let Some(height)=position {
++        responses.push(("blockchain.transaction.get",serde_json::json!(hex(&serialize(&signed)))));
++        if height>0 {responses.push(("blockchain.transaction.get_merkle",serde_json::json!({"block_height":height,"pos":0,"merkle":[]})));}
++    }
++    let (client,server)=tokio::io::duplex(65536);
++    let server=tokio::spawn(async move {
++        let mut stream=BufReader::new(server);
++        for (method,result) in responses {
++            let mut line=String::new();assert!(stream.read_line(&mut line).await.unwrap()>0);
++            let request:serde_json::Value=serde_json::from_str(&line).unwrap();assert_eq!(request["method"],method);
++            let mut reply=serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})).unwrap();
++            reply.push(b'\n');stream.get_mut().write_all(&reply).await.unwrap();
++        }
++    });
++    let mut session=ReadSession::negotiate(client,chain.network()).await?;
++    let observation=execution.observe_light_bch_funding_on(claim,chain,expected,&mut session,10).await?;
++    drop(session);server.await?;Ok(observation)
++}

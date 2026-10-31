@@ -1,0 +1,68 @@
+--- a/swap-machine/src/bin/native-ltc-light/bch_dex.rs
++++ b/swap-machine/src/bin/native-ltc-light/bch_dex.rs
+@@ -122,7 +122,7 @@
+     let observation=session.refresh_wallet(state.chain()?,&account,
+         [book.allocated_count(Branch::Receive)?,book.allocated_count(Branch::Change)?],
+         &RefreshLimits {gap:request.wallet_scan.gap,addresses_per_branch:request.wallet_scan.addresses_per_branch,
+-            history_entries_per_branch:request.wallet_scan.history_entries_per_branch}).await?;drop(session);
++            history_entries_per_branch:request.wallet_scan.history_entries_per_branch}).await?;
+     // Synchronization may take time. Recheck commercial validity before claims.
+     execution.check_light_funding_payment(&output,policy.fee,policy.minimum_change,now()?)?;
+     let prepared=if let Some((expected,change))=retained {
+@@ -130,7 +130,14 @@
+     } else {observation.prepare_payment(state.chain()?,&output,&policy,&mut book,directory,dex.trade_id)?};
+     ensure!(prepared.fee()==policy.fee && prepared.transaction().output.get(1).is_none_or(|o|o.value>=policy.minimum_change),
+         "BCH prepared payment policy changed");
++    let sources=session.funding_sources_on(state.chain()?,&observation,&prepared,policy.minimum_confirmations).await?;
++    drop(session);
++    let change=prepared.transaction().output.get(1).map(|o|o.script_pubkey.as_script()).unwrap_or(refund.as_script());
++    let source_refs=sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
++    execution.validate_bch_funding_preview(now()?,&bitcoin::consensus::serialize(prepared.transaction()),
++        &source_refs,change,policy.fee.to_sat(),policy.minimum_change.to_sat())?;
+     let mut result=payment_view(network,&address.to_string(),&output,prepared.transaction(),prepared.fee(),prepared.signing_commitment())?;
++    result["fundingVerified"]=json!(true);result["sourceTransactions"]=json!(sources.len());
+     // P2PKH signatures change the eventual txid; never label this as final.
+     result["unsignedTxid"]=result["txid"].take();result.as_object_mut().context("invalid BCH payment view")?.remove("txid");
+     result["operation"]=json!(mode);result["tradeId"]=json!(dex.trade_id);
+--- a/swap-machine/src/litecoin_light/session/wallet/payment.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/payment.rs
+@@ -77,3 +77,39 @@
+         prepare_payment(chain,&self.accounting,&self.account,&inputs,payment,policy,book,directory,operation)
+     }
+ }
++
++impl<S:AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
++    /// Export only this prepared payment's verified input transactions. The
++    /// selected chain and scan are borrowed throughout. Raw txids must match the
++    /// inclusion evidence; this does not authenticate witness data or prove a
++    /// complete server history. No claims, signatures or broadcasts are written.
++    pub async fn funding_sources_on(&mut self,chain:&HeaderSequence,observation:&WalletObservation,
++        prepared:&ObservedClaimedSpend,minimum_confirmations:u64)->Result<Vec<Vec<u8>>> {
++        ensure!(self.network==chain.network() && observation.account.network()==chain.network()
++            && (1..=1000).contains(&minimum_confirmations)
++            && (1..=1000).contains(&prepared.transaction().input.len()),"invalid funding source context");
++        let candidates=observation.payment_inputs()?;
++        let by_outpoint=candidates.iter().map(|input|(bitcoin::OutPoint {txid:input.transaction.txid(),vout:input.vout},input))
++            .collect::<BTreeMap<_,_>>();
++        let inputs=prepared.transaction().input.iter().map(|input| {
++            let found=by_outpoint.get(&input.previous_output).context("funding source is absent or observed spent")?;
++            Ok(IncludedInput {transaction:found.transaction,vout:found.vout,branch:found.branch,index:found.index})
++        }).collect::<Result<Vec<_>>>()?;
++        prepared.check_funding_inputs_on(chain,observation.accounting(),&inputs,minimum_confirmations)?;
++        let txids=inputs.iter().map(|input|input.transaction.txid()).collect::<BTreeSet<_>>();
++        let result=async {
++            let mut sources=Vec::with_capacity(txids.len());let mut total=0usize;
++            for txid in txids {
++                let transaction=self.reported_transaction(txid).await?;
++                let raw=bitcoin::consensus::serialize(&transaction);
++                total=total.checked_add(raw.len()).context("funding source size overflow")?;
++                ensure!(total<=2_000_000,"funding source byte budget exceeded");
++                sources.push(raw);
++            }
++            prepared.check_funding_inputs_on(chain,observation.accounting(),&inputs,minimum_confirmations)?;
++            Ok(sources)
++        }.await;
++        if result.is_err() {self.usable=false;}
++        result
++    }
++}

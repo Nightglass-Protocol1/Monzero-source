@@ -1,0 +1,259 @@
+diff --git a/swap-machine/src/native_funding_rpc/relay.rs b/swap-machine/src/native_funding_rpc/relay.rs
+index 0a45a54a9..7d3736404 100644
+--- a/swap-machine/src/native_funding_rpc/relay.rs
++++ b/swap-machine/src/native_funding_rpc/relay.rs
+@@ -28,6 +28,25 @@ pub struct RelayedTransfer {
+     pub weight: u64,
+ }
+ 
++/// Private signed metadata never enters QML, logs or the public journal.
++/// Only this module can construct a prepared transfer; callers can inspect its
++/// public summary before approving relay of precisely this transaction.
++pub struct PreparedTransfer {
++    request: RelayRequest,
++    genesis: String,
++    summary: RelayedTransfer,
++    metadata: zeroize::Zeroizing<String>,
++}
++
++impl PreparedTransfer {
++    pub fn summary(&self) -> &RelayedTransfer { &self.summary }
++    pub(crate) fn journal_terms(&self) -> Value {
++        json!({"genesis":self.genesis, "wallet":self.request.wallet.to_string(),
++            "destination":self.request.destination.to_string(), "amountAtoms":self.request.amount.atom_string(),
++            "account":self.request.account, "priority":self.request.priority})
++    }
++}
++
+ pub struct NativeTransferRelay {
+     client: NativeFundingRpc,
+     dispatched: bool,
+@@ -60,6 +79,11 @@ impl NativeTransferRelay {
+     /// with the same request shape and accepting its preview); this call does
+     /// not itself present anything for approval.
+     pub async fn relay(&mut self, request: RelayRequest, expected_genesis: &str) -> Result<RelayedTransfer> {
++        self.preflight(&request, expected_genesis).await?;
++        self.broadcast(request).await
++    }
++
++    async fn preflight(&self, request: &RelayRequest, expected_genesis: &str) -> Result<()> {
+         ensure!(!self.dispatched, "relay instance already dispatched; reconcile before retrying");
+         ensure!(canonical_hash(expected_genesis), "invalid relay chain policy");
+         ensure!(request.amount.atoms() > 0 && (1..=4).contains(&request.priority),
+@@ -68,10 +92,36 @@ impl NativeTransferRelay {
+         let before = self.client.snapshot().await?;
+         ensure!(before.genesis == expected_genesis && canonical_hash(&before.tip_hash),
+             "unexpected relay chain");
+-        self.check_wallet(&request).await?;
++        self.check_wallet(request).await?;
+         let balance = self.balance(request.account).await?;
+         ensure!(balance.1 >= request.amount.atoms(), "insufficient unlocked principal");
+-        self.broadcast(request).await
++        Ok(())
++    }
++
++    /// Constructs once with relay disabled. The explicit ceiling comes from
++    /// trusted local approval, not a peer quote or an arbitrary GUI field.
++    pub async fn prepare(&mut self, request: RelayRequest, expected_genesis: &str,
++        maximum_fee: XmzAmount) -> Result<PreparedTransfer> {
++        ensure!(maximum_fee.atoms() > 0, "zero approved fee ceiling");
++        self.preflight(&request, expected_genesis).await?;
++        let response = self.client.rpc(self.client.wallet, "transfer", prepare_params(&request)).await?;
++        let (summary, metadata) = parse_prepared(response, request.amount, maximum_fee)?;
++        self.check_wallet(&request).await?;
++        Ok(PreparedTransfer { request, genesis: expected_genesis.into(), summary, metadata })
++    }
++
++    /// No transaction reconstruction here: relay exactly the previously
++    /// prepared metadata and require its returned hash to match the intent.
++    pub async fn relay_prepared(&mut self, prepared: PreparedTransfer) -> Result<RelayedTransfer> {
++        self.preflight(&prepared.request, &prepared.genesis).await?;
++        self.dispatched = true;
++        let response = self.client.rpc(self.client.wallet, "relay_tx",
++            json!({"hex":prepared.metadata.as_str()})).await
++            .map_err(|_| BroadcastOutcomeUnknown)?;
++        if response.get("tx_hash").and_then(Value::as_str) != Some(prepared.summary.txid.as_str()) {
++            return Err(BroadcastOutcomeUnknown.into());
++        }
++        Ok(prepared.summary)
+     }
+ 
+     async fn broadcast(&mut self, request: RelayRequest) -> Result<RelayedTransfer> {
+@@ -96,6 +146,28 @@ impl NativeTransferRelay {
+     }
+ }
+ 
++fn prepare_params(request: &RelayRequest) -> Value {
++    let mut params = relay_params(request);
++    params["do_not_relay"] = json!(true);
++    params["get_tx_metadata"] = json!(true);
++    params
++}
++
++fn parse_prepared(mut response: Value, amount: XmzAmount, maximum_fee: XmzAmount)
++    -> Result<(RelayedTransfer, zeroize::Zeroizing<String>)> {
++    let metadata = match response.get_mut("tx_metadata").map(Value::take) {
++        Some(Value::String(value)) => zeroize::Zeroizing::new(value),
++        _ => anyhow::bail!("missing private prepared metadata"),
++    };
++    ensure!(!metadata.is_empty() && metadata.len() <= 524288 && metadata.len() % 2 == 0
++        && metadata.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
++        "invalid private prepared metadata");
++    response["tx_metadata"] = json!("");
++    let summary = parse_relay(&response, amount)?;
++    ensure!(summary.fee.atoms() <= maximum_fee.atoms(), "prepared fee exceeds approved ceiling");
++    Ok((summary, metadata))
++}
++
+ fn classify_broadcast(response: Result<Value>, amount: XmzAmount) -> Result<RelayedTransfer> {
+     // Even a malformed success reply may follow a completed broadcast. Keep
+     // pre-dispatch errors distinct, but never label a dispatch error "not sent".
+@@ -208,6 +280,27 @@ mod tests {
+         assert!(classify_broadcast(Ok(response()), amount).is_ok());
+     }
+ 
++    #[test]
++    fn preparation_is_nonrelaying_and_enforces_fee_ceiling() -> Result<()> {
++        let request = RelayRequest { wallet: address(), destination: address(),
++            amount: XmzAmount::from_atoms(200000000000), account: 0, priority: 1 };
++        let params = prepare_params(&request);
++        assert_eq!(params["do_not_relay"], true);
++        assert_eq!(params["get_tx_metadata"], true);
++        assert_eq!(params["get_tx_key"], false);
++        assert_eq!(params["get_tx_hex"], false);
++        let mut candidate = response();
++        candidate["tx_metadata"] = json!("abcd");
++        assert!(parse_prepared(candidate.clone(), request.amount, XmzAmount::from_atoms(249999999)).is_err());
++        let (summary, _) = parse_prepared(candidate.clone(), request.amount, XmzAmount::from_atoms(250000000))?;
++        assert_eq!(summary.txid, "a".repeat(64));
++        for invalid in ["", "abc", "ABCD", "not metadata"] {
++            candidate["tx_metadata"] = json!(invalid);
++            assert!(parse_prepared(candidate.clone(), request.amount, XmzAmount::from_atoms(250000000)).is_err());
++        }
++        Ok(())
++    }
++
+     #[tokio::test]
+     async fn cancellation_after_dispatch_prevents_second_submission() -> Result<()> {
+         let wallet = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+diff --git a/swap-machine/src/native_funding_rpc/spend_journal.rs b/swap-machine/src/native_funding_rpc/spend_journal.rs
+index 2fabfff33..4aa5baff2 100644
+--- a/swap-machine/src/native_funding_rpc/spend_journal.rs
++++ b/swap-machine/src/native_funding_rpc/spend_journal.rs
+@@ -10,6 +10,7 @@ use super::{relay::RelayedTransfer, spendable::SpendRequest};
+ pub struct SpendJournal {
+     directory: File,
+     receipt: String,
++    intent: serde_json::Value,
+ }
+ 
+ impl SpendJournal {
+@@ -37,14 +38,15 @@ impl SpendJournal {
+         let intent = json!({"schema":"monzero-native-spend-intent-v1", "genesis":genesis,
+             "wallet":wallet, "lockTxid":request.lock_txid,
+             "destination":request.destination.to_string(), "amountAtoms":request.amount.atom_string(),
+-            "account":request.account, "priority":request.priority});
++            "account":request.account, "priority":request.priority,
++            "maximumFeeAtoms":request.maximum_fee.atom_string()});
+         // O_EXCL is the cross-process reservation. Existing, malformed and
+         // truncated records all fail closed. Never truncate or remove them.
+         let mut file = create_record(&parent, &format!("{identity}.intent"))?;
+         file.write_all(&serde_json::to_vec(&intent)?)?;
+         file.sync_all()?;
+         parent.sync_all()?;
+-        Ok(Self { directory: parent, receipt: format!("{identity}.receipt") })
++        Ok(Self { directory: parent, receipt: format!("{identity}.receipt"), intent })
+     }
+ 
+     #[cfg(not(unix))]
+@@ -52,6 +54,34 @@ impl SpendJournal {
+         anyhow::bail!("native spend journal not implemented on this platform")
+     }
+ 
++    /// Persist the exact transaction identity before relay. No private metadata
++    /// is stored. If a crash loses that metadata, absence on-chain is not
++    /// permission to construct a replacement payment.
++    #[cfg(unix)]
++    pub fn record_prepared(&self, prepared: &super::relay::PreparedTransfer) -> Result<()> {
++        let transfer = prepared.summary();
++        let terms = prepared.journal_terms();
++        for field in ["genesis", "wallet", "destination", "amountAtoms", "account", "priority"] {
++            ensure!(terms.get(field) == self.intent.get(field), "prepared transaction differs from durable intent");
++        }
++        let maximum_fee: u64 = self.intent["maximumFeeAtoms"].as_str()
++            .ok_or_else(|| anyhow::anyhow!("invalid journal fee limit"))?.parse()?;
++        ensure!(transfer.fee.atoms() <= maximum_fee, "prepared fee exceeds journal approval");
++        let value = json!({"schema":"monzero-native-spend-prepared-v1", "txid":transfer.txid,
++            "feeAtoms":transfer.fee.atom_string(), "weight":transfer.weight});
++        let name = self.receipt.strip_suffix(".receipt").expect("internal receipt suffix");
++        let mut file = create_record(&self.directory, &format!("{name}.prepared"))?;
++        file.write_all(&serde_json::to_vec(&value)?)?;
++        file.sync_all()?;
++        self.directory.sync_all()?;
++        Ok(())
++    }
++
++    #[cfg(not(unix))]
++    pub fn record_prepared(&self, _: &super::relay::PreparedTransfer) -> Result<()> {
++        anyhow::bail!("native spend journal not implemented on this platform")
++    }
++
+     /// Receipt failure must never erase a successful broadcast result. Caller
+     /// reports persistence health separately and reconciles the retained intent.
+     #[cfg(unix)]
+@@ -101,7 +131,7 @@ mod tests {
+         SpendRequest { journal_directory: directory.into(), id: SwapWalletId::new(uuid::Uuid::new_v4()).unwrap(),
+             password: String::new(), spend_key: String::new(), view_key: String::new(), restore_height: 0,
+             lock_txid: "b".repeat(64), destination: wallet.clone(), wallet,
+-            amount: XmzAmount::from_atoms(1), account: 0, priority: 1 }
++            amount: XmzAmount::from_atoms(1), maximum_fee: XmzAmount::from_atoms(1), account: 0, priority: 1 }
+     }
+ 
+     struct PrivateDirectory(std::path::PathBuf);
+diff --git a/swap-machine/src/native_funding_rpc/spendable.rs b/swap-machine/src/native_funding_rpc/spendable.rs
+index e4ac8b898..4c6f66182 100644
+--- a/swap-machine/src/native_funding_rpc/spendable.rs
++++ b/swap-machine/src/native_funding_rpc/spendable.rs
+@@ -1,8 +1,7 @@
+ //! One orchestration entry point mirroring upstream's `Wallets::swap_wallet_spendable`:
+ //! restore a wallet from a swap's recovered keys, import its lock transaction so
+-//! the wallet knows about that specific output, estimate the intended spend, and
+-//! broadcast a separately constructed transfer with the same principal and
+-//! destination. The estimate is advisory: fee/weight equality is not enforced.
++//! the wallet knows about that specific output, prepare a fee-capped transfer,
++//! durably record its identity, and relay that exact prepared transaction.
+ //! This is a fixed-principal recovery primitive, not a sweep, a negotiated lock
+ //! driver, or a complete swap execution/recovery protocol.
+ //!
+@@ -35,6 +34,7 @@ pub struct SpendRequest {
+     pub wallet: XmzAddress,
+     pub destination: XmzAddress,
+     pub amount: XmzAmount,
++    pub maximum_fee: XmzAmount,
+     pub account: u32,
+     pub priority: u32,
+ }
+@@ -89,7 +89,9 @@ async fn import_and_spend(session: &mut NativeWalletSession, daemon: u16, wallet
+         amount: request.amount, account: request.account, priority: request.priority };
+     let journal = super::spend_journal::SpendJournal::reserve(
+         &request.journal_directory, expected_genesis, request)?;
+-    let transfer = relay.relay(spend, expected_genesis).await?;
++    let prepared = relay.prepare(spend, expected_genesis, request.maximum_fee).await?;
++    journal.record_prepared(&prepared)?;
++    let transfer = relay.relay_prepared(prepared).await?;
+     let receipt_persisted = journal.record_relay(&transfer).is_ok();
+     Ok(SpendOutcome { transfer, receipt_persisted, wallet_closed: false })
+ }
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index a85078a2a..c564dcc71 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -111,7 +111,7 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+             .expect("private fixture result path")).parent().expect("fixture directory").to_owned(),
+         id, password: "fixture-password".into(), spend_key: spend_key.clone(), view_key: view_key.clone(),
+         restore_height, lock_txid: lock_txid.clone(), wallet: wallet.clone(), destination: destination.clone(),
+-        amount, account: 0, priority: 1,
++        amount, maximum_fee: XmzAmount::from_atoms(10_000_000_000), account: 0, priority: 1,
+     };
+ 
+     // Rejected restoration must not close a wallet that was already open,

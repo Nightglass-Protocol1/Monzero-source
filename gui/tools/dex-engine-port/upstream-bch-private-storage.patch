@@ -1,0 +1,132 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement.rs
+@@ -2,6 +2,8 @@
+ //! protocol precondition, not user approval, chain evidence or relay authority.
+ use super::*;
+ pub mod checkpoint;
++#[cfg(target_os="linux")]
++pub mod storage;
+ 
+ const DOMAIN: &str = "monzero-bch-xmz-key-agreement-v1";
+ const MAX_ACK: usize = 4096;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -287,3 +287,77 @@
+     assert!(AgreedNativeWallet::restore_secret_checkpoint(&record,&digest,&other_quote,&setup.policy,Role::BchFunder).is_err());
+     Ok(())
+ }
++
++#[cfg(target_os="linux")]
++struct PrivateStore(std::path::PathBuf);
++#[cfg(target_os="linux")]
++impl PrivateStore {
++    fn new() -> Result<Self> {
++        use std::os::unix::fs::DirBuilderExt;
++        let path = std::env::temp_dir().canonicalize()?.join(format!("bch-private-store-{}",uuid::Uuid::new_v4()));
++        std::fs::DirBuilder::new().mode(0o700).create(&path)?; Ok(Self(path))
++    }
++}
++#[cfg(target_os="linux")]
++impl Drop for PrivateStore {
++    fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);}
++}
++
++#[cfg(target_os="linux")]
++#[test]
++fn private_storage_reopens_exact_agreement_and_never_replaces_valid_alternatives() -> Result<()> {
++    use agreement::storage;
++    use std::os::unix::fs::MetadataExt;
++    let mut setup = Setup::new()?; let directory = PrivateStore::new()?;
++    let first = agreed(&setup,Role::BchFunder)?; let agreement = *first.commitment();
++    assert!(storage::persist(&directory.0,&setup.quote,&setup.policy,Role::NativeFunder,&first).is_err());
++    assert_eq!(std::fs::read_dir(&directory.0)?.count(),0);
++    let digest = storage::persist(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&first)?;
++    let path = std::fs::read_dir(&directory.0)?.next().unwrap()?.path();
++    let inode = std::fs::metadata(&path)?.ino();
++    assert_eq!(storage::persist(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&first)?,digest);
++    assert_eq!(std::fs::metadata(&path)?.ino(),inode);
++    assert_eq!(std::fs::metadata(&path)?.mode()&0o777,0o600);
++    drop(first);
++    let restored = storage::restore(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&digest)?;
++    assert_eq!(*restored.commitment(),agreement);
++    assert!(storage::restore(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&[0;32]).is_err());
++    assert!(storage::restore(&directory.0,&setup.quote,&setup.policy,Role::NativeFunder,&digest).is_err());
++    let lease = crate::litecoin_rpc::reservation::Journal::open(&directory.0)?;
++    assert!(storage::restore(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&digest).is_err());
++    drop(lease);
++    setup.view[0] = monero::PrivateViewKey::new_random(&mut rand::thread_rng());
++    let alternative = agreed(&setup,Role::BchFunder)?;
++    assert_ne!(alternative.commitment(),&agreement);
++    assert!(storage::persist(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&alternative).is_err());
++    assert_eq!(*storage::restore(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&digest)?.commitment(),agreement);
++    Ok(())
++}
++
++#[cfg(target_os="linux")]
++#[test]
++fn private_storage_rejects_insecure_links_torn_and_missing_records() -> Result<()> {
++    use agreement::storage;
++    use std::os::unix::fs::{PermissionsExt,symlink};
++    let setup = Setup::new()?; let directory = PrivateStore::new()?;
++    let original = agreed(&setup,Role::BchFunder)?;
++    let digest = storage::persist(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&original)?;
++    let path = std::fs::read_dir(&directory.0)?.next().unwrap()?.path();
++    let fails = || storage::restore(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&digest).is_err();
++    std::fs::set_permissions(&directory.0,std::fs::Permissions::from_mode(0o755))?;
++    assert!(fails());
++    std::fs::set_permissions(&directory.0,std::fs::Permissions::from_mode(0o700))?;
++    std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o644))?;
++    assert!(fails());
++    std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600))?;
++    let backup = directory.0.join("other-link");
++    std::fs::hard_link(&path,&backup)?; assert!(fails()); std::fs::remove_file(&backup)?;
++    std::fs::rename(&path,&backup)?; symlink(&backup,&path)?; assert!(fails());
++    std::fs::remove_file(&path)?; std::fs::rename(&backup,&path)?;
++    assert!(!fails());
++    std::fs::write(&path,b"{")?; assert!(fails());
++    assert!(storage::persist(&directory.0,&setup.quote,&setup.policy,Role::BchFunder,&original).is_err());
++    assert_eq!(std::fs::read(&path)?,b"{");
++    std::fs::remove_file(&path)?; assert!(fails());
++    Ok(())
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/storage.rs
+@@ -0,0 +1,38 @@
++//! Private immutable completed-exchange records. Reuses the established journal
++//! filesystem primitive only; it invokes no Litecoin RPC or coin-specific logic.
++//! The driver must separately pin the returned digest in its trusted execution
++//! record before funding. No directory scan or automatic replacement is allowed.
++use super::*;
++use crate::litecoin_rpc::reservation::Journal;
++use std::path::Path;
++use zeroize::Zeroizing;
++
++fn name(quote: &VerifiedBchQuote, role: Role) -> String {
++    let role = match role {Role::BchFunder=>0,Role::NativeFunder=>1};
++    format!("{}.bch-owned-agreement-{role}",quote.terms()["swapId"])
++}
++
++/// One write-once slot per trade/role prevents a later valid exchange from
++/// replacing the keys used for the original funding. Identical retries are safe.
++/// Publication is atomic and synced; failure must not authorize funding/retry.
++/// The directory must be canonical, caller-owned and private (0700).
++pub fn persist(directory: &Path, quote: &VerifiedBchQuote, policy: &Policy,
++    role: Role, agreed: &AgreedNativeWallet) -> Result<[u8;32]> {
++    let journal = Journal::open(directory)?;
++    let bytes = agreed.secret_checkpoint(quote)?;
++    let digest = checkpoint::commitment(&bytes)?;
++    // Revalidate the complete context before creating any secret record.
++    AgreedNativeWallet::restore_secret_checkpoint(&bytes,&digest,quote,policy,role)?;
++    journal.retain(&name(quote,role),&bytes)?;
++    Ok(digest)
++}
++
++/// Reopen only the requested trade/role slot and require the independently
++/// retained digest. Missing/corrupt/insecure data never starts another exchange.
++/// Recovery material is not execution-state, wallet-import or relay authority.
++pub fn restore(directory: &Path, quote: &VerifiedBchQuote, policy: &Policy,
++    role: Role, expected: &[u8;32]) -> Result<AgreedNativeWallet> {
++    let journal = Journal::open(directory)?;
++    let bytes = Zeroizing::new(journal.read(&name(quote,role))?);
++    AgreedNativeWallet::restore_secret_checkpoint(&bytes,expected,quote,policy,role)
++}

@@ -1,0 +1,66 @@
+name: ci
+
+# One workflow for the whole repository: each job builds or tests one part.
+on:
+  push:
+    paths-ignore: ['**/*.md', 'core/docs/**']
+  pull_request:
+    paths-ignore: ['**/*.md', 'core/docs/**']
+
+env:
+  APT_CORE: build-essential cmake pkg-config libboost-all-dev libssl-dev libzmq3-dev libunbound-dev libsodium-dev libunwind8-dev libhidapi-dev libusb-1.0-0-dev libprotobuf-dev protobuf-compiler libreadline-dev libexpat1-dev ccache
+
+jobs:
+  core-linux:
+    name: 'Core (Linux)'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: install dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_CORE
+      - name: build node and wallets
+        run: |
+          cmake -S core -B build/core -D ARCH=default -D CMAKE_BUILD_TYPE=Release
+          cmake --build build/core -j"$(nproc)" --target daemon simplewallet wallet_rpc_server
+
+  gui-linux:
+    name: 'Desktop GUI (Linux)'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $APT_CORE libgcrypt20-dev \
+            qtbase5-dev qtdeclarative5-dev qttools5-dev-tools libqt5svg5-dev \
+            qml-module-qtqml-models2 qml-module-qtquick-controls qml-module-qtquick-controls2 \
+            qml-module-qtquick-dialogs qml-module-qtquick-xmllistmodel qml-module-qt-labs-settings \
+            qml-module-qt-labs-platform qml-module-qt-labs-folderlistmodel qml-module-qtquick-templates2
+      - name: build (gui/monero links to ../core)
+        working-directory: gui
+        run: make release -j"$(nproc)"
+
+  dex-engine:
+    name: 'DEX engine (Rust)'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: monzero-evm-keys
+        working-directory: gui/dex-contracts/evm-keys
+        run: cargo test --locked
+      - name: XMZ <-> EVM swap engine (library tests; no network)
+        working-directory: gui/dex-contracts/engine
+        run: cargo test --locked --lib
+
+  dex-contracts:
+    name: 'DEX swap contract (Hardhat)'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: gui/dex-contracts/package-lock.json }
+      - working-directory: gui/dex-contracts
+        run: npm ci && npx hardhat test

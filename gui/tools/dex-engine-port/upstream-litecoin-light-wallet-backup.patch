@@ -1,0 +1,233 @@
+diff --git a/swap-machine/src/litecoin_light/vault.rs b/swap-machine/src/litecoin_light/vault.rs
+--- a/swap-machine/src/litecoin_light/vault.rs
++++ b/swap-machine/src/litecoin_light/vault.rs
+@@ -126,3 +126,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++pub mod backup;
+diff --git a/swap-machine/src/litecoin_light/account/allocation.rs b/swap-machine/src/litecoin_light/account/allocation.rs
+--- a/swap-machine/src/litecoin_light/account/allocation.rs
++++ b/swap-machine/src/litecoin_light/account/allocation.rs
+@@ -34,18 +34,21 @@
+     /// Missing or invalid state is an error, never implicit initialization.
+     pub fn open(directory:&Path,account:PublicAccount)->Result<Self> {
+         let journal=Journal::open(directory)?;let bytes=journal.read(NAME)?;
+-        let record:Record=serde_json::from_slice(&bytes)?;
+-        ensure!(record.schema=="monzero-ltc-address-book-v1" && record.account==identity(&account)
+-            && record.entries.len()<=MAX_ENTRIES,"Litecoin address book identity or limit mismatch");
+-        let mut next=[0u32;2];let mut requests=BTreeSet::new();
+-        for entry in &record.entries {
+-            ensure!(entry.branch<=1 && !entry.request.is_nil() && requests.insert(entry.request),"invalid Litecoin address allocation identity");
+-            ensure!(entry.index==next[entry.branch as usize],"nonsequential Litecoin address allocation");
+-            next[entry.branch as usize]+=1;
+-        }
++        let record=validate_record(&account,&bytes)?;
+         // Reconcile a rename whose directory sync may previously have failed.
+         // The identical-record path syncs both the existing file and directory.
+         journal.retain(NAME,&bytes)?;
++        Ok(Self {journal,account,record,bytes,usable:true})
++    }
++    pub(in crate::litecoin_light) fn backup_parts(&self)->Result<(super::descriptor::PublicAccountDescriptor,Vec<u8>)> {
++        ensure!(self.usable && self.journal.read(NAME)?==self.bytes,"address book changed before backup");
++        Ok((self.account.descriptor(),self.bytes.clone()))
++    }
++    pub(in crate::litecoin_light) fn restore_preflight(journal:&Journal,account:&PublicAccount,bytes:&[u8])->Result<()> {
++        validate_record(account,bytes)?;journal.compatible(NAME,bytes)
++    }
++    pub(in crate::litecoin_light) fn restore_record(journal:Journal,account:PublicAccount,bytes:Vec<u8>)->Result<Self> {
++        let record=validate_record(&account,&bytes)?;journal.retain(NAME,&bytes)?;
+         Ok(Self {journal,account,record,bytes,usable:true})
+     }
+     /// Number of allocated indices that discovery must cover on this branch.
+@@ -80,6 +83,19 @@
+         self.record=record;self.bytes=bytes;self.usable=true;Ok(address)
+     }
+ }
++fn validate_record(account:&PublicAccount,bytes:&[u8])->Result<Record> {
++        ensure!(bytes.len()<=2_000_000,"oversized address backup");
++        let record:Record=serde_json::from_slice(bytes)?;
++        ensure!(record.schema=="monzero-ltc-address-book-v1" && record.account==identity(account)
++            && record.entries.len()<=MAX_ENTRIES,"Litecoin address book identity or limit mismatch");
++        let mut next=[0u32;2];let mut requests=BTreeSet::new();
++        for entry in &record.entries {
++            ensure!(entry.branch<=1 && !entry.request.is_nil() && requests.insert(entry.request),"invalid Litecoin address allocation identity");
++            ensure!(entry.index==next[entry.branch as usize],"nonsequential Litecoin address allocation");
++            next[entry.branch as usize]+=1;
++        }
++        Ok(record)
++}
+ fn identity(account:&PublicAccount)->String {
+     let mut bytes=b"monzero-ltc-public-account-v1\0".to_vec();
+     bytes.extend_from_slice(account.network.genesis().as_bytes());
+diff --git a/swap-machine/src/litecoin_rpc/reservation.rs b/swap-machine/src/litecoin_rpc/reservation.rs
+--- a/swap-machine/src/litecoin_rpc/reservation.rs
++++ b/swap-machine/src/litecoin_rpc/reservation.rs
+@@ -69,7 +69,7 @@
+         ensure!(bytes.len() <= 2_000_000, "oversized Litecoin journal record");
+         Ok(bytes)
+     }
+-    fn compatible(&self, name: &str, bytes: &[u8]) -> Result<()> {
++    pub(crate) fn compatible(&self, name: &str, bytes: &[u8]) -> Result<()> {
+         match self.read(name) {
+             Ok(existing) => ensure!(existing == bytes, "conflicting or incomplete Litecoin reservation"),
+             Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => (),
+diff --git a/swap-machine/src/litecoin_light/vault/backup.rs b/swap-machine/src/litecoin_light/vault/backup.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/backup.rs
+@@ -0,0 +1,70 @@
++//! Encrypted single-account recovery bundle: seed vault plus allocated indices.
++//! Not a swap-recovery backup: it excludes active trades and transaction state.
++//! A valid older backup cannot reveal allocations made after it was exported.
++use super::*;
++use crate::litecoin_light::account::allocation::AddressBook;
++const BUNDLE_MAGIC:&[u8;8]=b"MZLTCB01";
++const MAX_RECORD:usize=2_000_000;
++const PREFIX:usize=LENGTH+8;
++const MAX_BUNDLE:usize=HEADER+PREFIX+MAX_RECORD+16;
++
++/// Authenticate account ownership and both retained records under their leases.
++/// The returned bytes are encrypted; the caller must save and verify them at
++/// the chosen backup destination before claiming that a backup exists.
++pub fn export(vault:&SeedVault,book:&AddressBook,password:&[u8])->Result<Vec<u8>> {
++    let (descriptor,record)=book.backup_parts()?;
++    let account=PublicAccount::from_descriptor(&descriptor,vault.network)?;
++    drop(vault.unlock_for_account(password,&descriptor)?);
++    let seed_vault=vault.encrypted_backup(password)?;
++    let mut payload=Zeroizing::new(Vec::with_capacity(PREFIX+record.len()));
++    payload.extend_from_slice(&seed_vault);payload.extend_from_slice(&account.account_index().to_be_bytes());
++    payload.extend_from_slice(&(record.len() as u32).to_be_bytes());payload.extend_from_slice(&record);
++    encrypt(&payload,password,vault.network,vault.wallet)
++}
++/// Preflight both destinations before writing either. Publication spans two
++/// private directories, so errors can leave the vault alone published. Retrying
++/// the identical bundle completes it without overwriting different records.
++/// Callers must not activate the wallet unless this whole operation succeeds.
++pub fn restore(vault_directory:&Path,book_directory:&Path,network:LtcNetwork,wallet:Uuid,
++    password:&[u8],bundle:&[u8])->Result<(SeedVault,AddressBook)> {
++    let payload=decrypt(bundle,password,network,wallet)?;
++    ensure!(payload.len()>PREFIX,"truncated Litecoin wallet backup");
++    let account_index=u32::from_be_bytes(payload[LENGTH..LENGTH+4].try_into()?);
++    let length=u32::from_be_bytes(payload[LENGTH+4..PREFIX].try_into()?) as usize;
++    ensure!(length<=MAX_RECORD && payload.len()==PREFIX+length,"invalid address backup length");
++    let seed=unlock(&payload[..LENGTH],password,network,wallet)?;
++    let account=seed.public_account(network,account_index)?;drop(seed);
++    let vault_journal=Journal::open(vault_directory)?;
++    let book_journal=Journal::open(book_directory)?;
++    vault_journal.compatible(NAME,&payload[..LENGTH])?;
++    AddressBook::restore_preflight(&book_journal,&account,&payload[PREFIX..])?;
++    vault_journal.retain(NAME,&payload[..LENGTH])?;
++    let book=AddressBook::restore_record(book_journal,account,payload[PREFIX..].to_vec())?;
++    let vault=SeedVault {journal:vault_journal,network,wallet,bytes:payload[..LENGTH].to_vec(),usable:true};
++    Ok((vault,book))
++}
++fn encrypt(payload:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<Vec<u8>> {
++    ensure!(!wallet.is_nil() && payload.len()>PREFIX && payload.len()<=PREFIX+MAX_RECORD,"invalid wallet backup payload");
++    let mut salt=[0u8;16];let mut nonce=[0u8;24];
++    OsRng.try_fill_bytes(&mut salt).context("backup entropy unavailable")?;
++    OsRng.try_fill_bytes(&mut nonce).context("backup entropy unavailable")?;
++    let mut header=Vec::with_capacity(HEADER+payload.len()+16);
++    header.extend_from_slice(BUNDLE_MAGIC);header.extend_from_slice(network.genesis().as_bytes());header.extend_from_slice(wallet.as_bytes());
++    header.extend_from_slice(&salt);header.extend_from_slice(&nonce);
++    let key=key(password,&salt)?;let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid backup key"))?;
++    let mut encrypted=Zeroizing::new(Vec::with_capacity(payload.len()+16));encrypted.extend_from_slice(payload);
++    cipher.encrypt_in_place(XNonce::from_slice(&nonce),&header,&mut *encrypted).map_err(|_|anyhow::anyhow!("backup encryption failed"))?;
++    header.extend_from_slice(&encrypted);Ok(header)
++}
++fn decrypt(bundle:&[u8],password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<Zeroizing<Vec<u8>>> {
++    ensure!(!wallet.is_nil() && bundle.len()>HEADER+PREFIX+16 && bundle.len()<=MAX_BUNDLE
++        && &bundle[..8]==BUNDLE_MAGIC && &bundle[8..72]==network.genesis().as_bytes()
++        && &bundle[72..88]==wallet.as_bytes(),"invalid wallet backup context or length");
++    let key=key(password,&bundle[88..104])?;
++    let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid backup key"))?;
++    let mut payload=Zeroizing::new(bundle[HEADER..].to_vec());
++    cipher.decrypt_in_place(XNonce::from_slice(&bundle[104..128]),&bundle[..HEADER],&mut *payload)
++        .map_err(|_|anyhow::anyhow!("wallet backup authentication failed"))?;Ok(payload)
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/backup/tests.rs b/swap-machine/src/litecoin_light/vault/backup/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/backup/tests.rs
+@@ -0,0 +1,78 @@
++use super::*;
++use crate::litecoin_light::account::Branch;
++use std::{fs,os::unix::fs::PermissionsExt,path::PathBuf};
++const PASSWORD:&[u8]=b"PUBLIC TEST PASSWORD";
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {
++    let path=std::env::temp_dir().join(format!("monzero-wallet-backup-{}",Uuid::new_v4()));fs::create_dir(&path)?;
++    fs::set_permissions(&path,fs::Permissions::from_mode(0o700))?;Ok(Self(path.canonicalize()?))
++}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++fn seed()->SecretSeed {SecretSeed::from_bytes(Zeroizing::new(std::array::from_fn(|i|i as u8)))}
++#[test]
++fn wallet_backup_restores_seed_account_and_allocation_retry_identities()->Result<()> {
++    let source=Directory::new()?;let allocations=Directory::new()?;let wallet=Uuid::new_v4();let seed=seed();
++    let vault=SeedVault::create(&source.0,LtcNetwork::Regtest,wallet,PASSWORD,&seed)?;
++    let mut book=AddressBook::create(&allocations.0,seed.public_account(LtcNetwork::Regtest,2)?)?;
++    let request=Uuid::new_v4();let address=book.reserve(request,Branch::Receive)?.address().to_string();
++    book.reserve(Uuid::new_v4(),Branch::Receive)?;book.reserve(Uuid::new_v4(),Branch::Change)?;
++    let bundle=export(&vault,&book,PASSWORD)?;
++    let destination=Directory::new()?;let destination_book=Directory::new()?;
++    let (restored,mut restored_book)=restore(&destination.0,&destination_book.0,LtcNetwork::Regtest,wallet,PASSWORD,&bundle)?;
++    assert_eq!(*restored.unlock(PASSWORD)?.0,*seed.0);
++    assert_eq!(restored_book.allocated_count(Branch::Receive)?,2);assert_eq!(restored_book.allocated_count(Branch::Change)?,1);
++    assert_eq!(restored_book.reserve(request,Branch::Receive)?.address().to_string(),address);
++    assert_eq!(restored_book.reserve(Uuid::new_v4(),Branch::Receive)?.path().to_string(),"84'/1'/2'/0/2");
++    assert_eq!(restored_book.reserve(Uuid::new_v4(),Branch::Change)?.path().to_string(),"84'/1'/2'/1/1");
++    drop(restored);drop(restored_book);
++    // A now-older backup cannot overwrite allocations made after this restore.
++    assert!(restore(&destination.0,&destination_book.0,LtcNetwork::Regtest,wallet,PASSWORD,&bundle).is_err());Ok(())
++}
++#[test]
++fn wallet_backup_rejects_mismatch_tampering_and_invalid_metadata_before_publication()->Result<()> {
++    let source=Directory::new()?;let allocations=Directory::new()?;let wallet=Uuid::new_v4();let seed=seed();
++    let vault=SeedVault::create(&source.0,LtcNetwork::Regtest,wallet,PASSWORD,&seed)?;
++    let book=AddressBook::create(&allocations.0,seed.public_account(LtcNetwork::Regtest,0)?)?;
++    let bundle=export(&vault,&book,PASSWORD)?;
++    let destination=Directory::new()?;let destination_book=Directory::new()?;
++    assert!(restore(&destination.0,&destination_book.0,LtcNetwork::Regtest,wallet,b"wrong",&bundle).is_err());
++    let mut changed=bundle.clone();*changed.last_mut().unwrap()^=1;
++    assert!(restore(&destination.0,&destination_book.0,LtcNetwork::Regtest,wallet,PASSWORD,&changed).is_err());
++    assert!(restore(&destination.0,&destination_book.0,LtcNetwork::Testnet,wallet,PASSWORD,&bundle).is_err());
++    let mut payload=decrypt(&bundle,PASSWORD,LtcNetwork::Regtest,wallet)?;
++    payload[LENGTH+3]=1; // Account 1 cannot authenticate account 0's allocation record.
++    let invalid=encrypt(&payload,PASSWORD,LtcNetwork::Regtest,wallet)?;
++    assert!(restore(&destination.0,&destination_book.0,LtcNetwork::Regtest,wallet,PASSWORD,&invalid).is_err());
++    assert!(!destination.0.join(NAME).exists());assert!(!destination_book.0.join("litecoin-address-book.json").exists());
++    let unrelated=Directory::new()?;
++    let other=SecretSeed::from_bytes(Zeroizing::new([42;32]));
++    let wrong_book=AddressBook::create(&unrelated.0,other.public_account(LtcNetwork::Regtest,0)?)?;
++    assert!(export(&vault,&wrong_book,PASSWORD).is_err());Ok(())
++}
++#[test]
++fn wallet_backup_restore_is_retryable_after_only_vault_record_exists()->Result<()> {
++    let source=Directory::new()?;let allocations=Directory::new()?;let wallet=Uuid::new_v4();let seed=seed();
++    let vault=SeedVault::create(&source.0,LtcNetwork::Regtest,wallet,PASSWORD,&seed)?;
++    let book=AddressBook::create(&allocations.0,seed.public_account(LtcNetwork::Regtest,0)?)?;
++    let bundle=export(&vault,&book,PASSWORD)?;
++    let destination=Directory::new()?;let destination_book=Directory::new()?;
++    // Simulate interruption after publication of the first of the two records.
++    drop(SeedVault::restore_encrypted(&destination.0,LtcNetwork::Regtest,wallet,PASSWORD,&vault.encrypted_backup(PASSWORD)?)?);
++    let (restored,restored_book)=restore(&destination.0,&destination_book.0,LtcNetwork::Regtest,wallet,PASSWORD,&bundle)?;
++    let first=export(&restored,&restored_book,PASSWORD)?;assert_ne!(first,bundle);drop(restored);drop(restored_book);
++    let (_,book)=restore(&destination.0,&destination_book.0,LtcNetwork::Regtest,wallet,PASSWORD,&bundle)?;
++    assert_eq!(book.allocated_count(Branch::Receive)?,0);Ok(())
++}
++#[test]
++fn wallet_backup_preflights_conflicting_address_record_before_seed_write()->Result<()> {
++    let source=Directory::new()?;let allocations=Directory::new()?;let wallet=Uuid::new_v4();let seed=seed();
++    let vault=SeedVault::create(&source.0,LtcNetwork::Regtest,wallet,PASSWORD,&seed)?;
++    let book=AddressBook::create(&allocations.0,seed.public_account(LtcNetwork::Regtest,0)?)?;
++    let bundle=export(&vault,&book,PASSWORD)?;
++    let destination=Directory::new()?;let destination_book=Directory::new()?;
++    let mut occupied=AddressBook::create(&destination_book.0,seed.public_account(LtcNetwork::Regtest,0)?)?;
++    occupied.reserve(Uuid::new_v4(),Branch::Receive)?;drop(occupied);
++    let record=fs::read(destination_book.0.join("litecoin-address-book.json"))?;
++    assert!(restore(&destination.0,&destination_book.0,LtcNetwork::Regtest,wallet,PASSWORD,&bundle).is_err());
++    assert!(!destination.0.join(NAME).exists());assert_eq!(fs::read(destination_book.0.join("litecoin-address-book.json"))?,record);Ok(())
++}

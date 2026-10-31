@@ -1,0 +1,108 @@
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index 81d0366e6..590f427e1 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -7,6 +7,7 @@
+ //! Credentials are required and intentionally have no Debug or serialization API.
+ pub mod fee_estimation;
+ pub mod full_proceeds;
++pub mod exact_net_claim;
+ pub mod exact_net_journal;
+ pub mod exact_net_recovery;
+ pub mod relay;
+diff --git a/swap-machine/src/native_funding_rpc/exact_net_claim.rs b/swap-machine/src/native_funding_rpc/exact_net_claim.rs
+new file mode 100644
+index 000000000..7ff5be005
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/exact_net_claim.rs
+@@ -0,0 +1,90 @@
++//! Orchestrates the two-source exact-net claim once a buyer top-up has been
++//! dispatched and confirmed (see `topup_dispatch::dispatch_topup`): restore
++//! the recovered swap wallet, import both the original lock and the top-up
++//! transaction, then construct, journal and relay the single transaction
++//! that delivers the exact quoted principal and returns unused reserve.
++//! Mirrors `spendable.rs`'s restore/import/construct/journal/relay sequence
++//! for the fixed-principal recovery spend, extended to two sources.
++//!
++//! Like `spendable.rs`, this file's orchestration shape is this codebase's
++//! own design, not a mechanical port of an upstream call; treat it with the
++//! same scrutiny.
++use super::exact_net_journal::ExactNetJournal;
++use super::full_proceeds::{ExactNetRequest, FullProceedsRequest};
++use super::relay::{NativeTransferRelay, RelayedTransfer};
++use super::wallet_session::{NativeWalletSession, SwapWalletId};
++use super::NativeFundingRpc;
++use anyhow::{ensure, Result};
++use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
++
++pub struct ExactNetClaimRequest {
++    pub journal_directory: std::path::PathBuf,
++    pub id: SwapWalletId,
++    pub password: String,
++    pub spend_key: String,
++    pub view_key: String,
++    pub restore_height: u64,
++    /// The recovered swap wallet holding both the original lock and the
++    /// confirmed top-up, never the buyer's own separate wallet.
++    pub wallet: XmzAddress,
++    pub destination: XmzAddress,
++    pub reserve_return: XmzAddress,
++    pub lock_txid: String,
++    pub top_up_txid: String,
++    /// Sum already available on the recovered wallet: lock principal plus
++    /// top-up reserve. Not a reinterpretation of either source amount alone.
++    pub locked: XmzAmount,
++    pub principal: XmzAmount,
++    pub maximum_fee: XmzAmount,
++    pub account: u32,
++    pub priority: u32,
++}
++
++pub struct ExactNetClaimOutcome {
++    pub transfer: RelayedTransfer,
++    pub wallet_closed: bool,
++}
++
++/// After a successful restore, attempts to close that wallet on normal
++/// return, success or failure, matching `swap_wallet_spendable`. A failed
++/// restore must not close a pre-existing wallet. The journal is reserved
++/// before construction, so a crash before relay retains recoverable intent;
++/// reconciliation after relay is `exact_net_recovery`'s job, not this
++/// function's -- it returns only what `relay_exact_net` itself confirms.
++pub async fn claim_exact_net_with_topup(daemon: u16, wallet_port: u16, username: String, password: String,
++    network: XmzNetwork, expected_genesis: &str, request: ExactNetClaimRequest) -> Result<ExactNetClaimOutcome> {
++    ensure!(request.wallet.network() == network && request.destination.network() == network
++        && request.reserve_return.network() == network, "exact-net claim request network mismatch");
++    let mut session = NativeWalletSession::new(
++        NativeFundingRpc::new(daemon, wallet_port, username.clone(), password.clone())?, network);
++    session.restore(&request.id, request.spend_key.clone(), request.view_key.clone(), request.restore_height,
++        request.password.clone(), &request.wallet).await?;
++    let result = import_and_claim(&mut session, daemon, wallet_port, username, password,
++        expected_genesis, &request).await;
++    let wallet_closed = session.close(&request.wallet).await.is_ok();
++    result.map(|transfer| ExactNetClaimOutcome { transfer, wallet_closed })
++}
++
++async fn import_and_claim(session: &mut NativeWalletSession, daemon: u16, wallet_port: u16,
++    username: String, password: String, expected_genesis: &str,
++    request: &ExactNetClaimRequest) -> Result<RelayedTransfer> {
++    session.import_transaction(&request.lock_txid, &request.wallet).await?;
++    session.import_transaction(&request.top_up_txid, &request.wallet).await?;
++
++    let exact_request = ExactNetRequest {
++        source: FullProceedsRequest { wallet: request.wallet.clone(), destination: request.destination.clone(),
++            lock_txid: request.lock_txid.clone(), locked: request.locked, maximum_fee: request.maximum_fee,
++            account: request.account, priority: request.priority },
++        principal: request.principal, reserve_return: request.reserve_return.clone() };
++
++    let journal = ExactNetJournal::reserve(&request.journal_directory, expected_genesis,
++        &exact_request, &request.top_up_txid)?;
++
++    let construction = NativeFundingRpc::new(daemon, wallet_port, username.clone(), password.clone())?;
++    let prepared = super::full_proceeds::prepare_exact_net_with_top_up(
++        &construction, &exact_request, expected_genesis, &request.top_up_txid).await?;
++    let journaled = journal.authorize_relay(prepared)?;
++
++    let mut relay = NativeTransferRelay::new(NativeFundingRpc::new(daemon, wallet_port, username, password)?);
++    relay.relay_exact_net(journaled).await
++}

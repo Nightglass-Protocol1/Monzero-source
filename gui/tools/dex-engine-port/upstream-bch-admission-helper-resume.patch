@@ -1,0 +1,288 @@
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -25,17 +25,18 @@
+         #[serde(default)] commitment: Option<String>,
+     }
+     #[derive(Clone, Copy)]
+-    enum Mode { Review, Submit }
++    enum Mode { Review, Submit, Status }
+     impl Mode {
+         fn parse(value: &str) -> Result<Self> {
+             match value {
+                 "--admission-review-stdio-v1" => Ok(Self::Review),
+                 "--admission-submit-stdio-v1" => Ok(Self::Submit),
++                "--admission-status-stdio-v1" => Ok(Self::Status),
+                 _ => anyhow::bail!("unsupported BCH admission mode"),
+             }
+         }
+         fn action(self) -> &'static str {
+-            match self { Self::Review => "review", Self::Submit => "submit" }
++            match self { Self::Review => "review", Self::Submit => "submit", Self::Status => "status" }
+         }
+     }
+     fn parse_digest(value: &str) -> Result<[u8;32]> {
+@@ -54,7 +55,7 @@
+             && request.schema == format!("monzero-bch-admission-{}-request-v1",mode.action()),
+             "invalid BCH admission request context");
+         match mode {
+-            Mode::Review => ensure!(request.commitment.is_none(),"unexpected admission approval"),
++            Mode::Review | Mode::Status => ensure!(request.commitment.is_none(),"unexpected admission approval"),
+             Mode::Submit => { parse_digest(request.commitment.as_deref().context("missing admission approval")?)?; }
+         }
+         Ok(request)
+@@ -104,6 +105,16 @@
+             &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
+         ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()? == config.trade_id,
+             "BCH quote belongs to another trade");
++        if matches!(mode,Mode::Status) {
++            let execution = AdmittedExecution::resume(&config.metadata_directory,
++                &config.snapshot_directory,&quote,&config.policy,config.role)?;
++            let saved = execution.saved_admission_review(&config.negotiation_pins)?;
++            let commitment: String = saved.review.commitment.iter().map(|b| format!("{b:02x}")).collect();
++            return Ok(serde_json::json!({"schema":"monzero-bch-admission-status-response-v1",
++                "requestId":request.request_id,"tradeId":config.trade_id,
++                "admitted":true,"admittedAt":saved.admitted_at,"executable":false,
++                "review":{"details":saved.review.details,"commitment":commitment}}));
++        }
+         let review = review_admission(&quote,&config.policy,config.role,&config.negotiation_pins,now)?;
+         let commitment: String = review.commitment.iter().map(|b| format!("{b:02x}")).collect();
+         if matches!(mode,Mode::Submit) {
+@@ -240,6 +251,11 @@
+             submit["commitment"] = serde_json::json!(digest);
+             assert_eq!(request(&serde_json::to_vec(&submit)?,Mode::Submit).is_ok(),digest == "ab".repeat(32));
+         }
++        let mut status = serde_json::json!({"schema":"monzero-bch-admission-status-request-v1",
++            "requestId":uuid::Uuid::new_v4()});
++        assert!(request(&serde_json::to_vec(&status)?,Mode::Status).is_ok());
++        status["commitment"] = serde_json::json!("ab".repeat(32));
++        assert!(request(&serde_json::to_vec(&status)?,Mode::Status).is_err());
+         assert!(Mode::parse("--funding-submit-stdio-v1").is_err());
+         Ok(())
+     }
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/approval.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/approval.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/approval.rs
+@@ -59,7 +59,26 @@
+     Ok(AdmissionReview {commitment:commitment(&details)?,details})
+ }
+ 
++pub struct SavedAdmissionReview {
++    pub review: AdmissionReview,
++    pub admitted_at: u64,
++}
++
+ impl<'a> AdmittedExecution<'a> {
++    /// Read-only historical admission evidence. The app independently retains
++    /// the expected negotiation pins; a different saved negotiation is rejected.
++    /// Quote expiry does not hide a previously admitted exchange on restart.
++    pub fn saved_admission_review(&self, expected: &NegotiationPins) -> Result<SavedAdmissionReview> {
++        let admission = self.read_admission()?;
++        ensure!(serde_json::to_vec(&admission.pins)? == serde_json::to_vec(expected)?,
++            "BCH saved admission negotiation differs from configured pins");
++        self.restore_agreement()?;
++        Ok(SavedAdmissionReview {
++            review:review_admission(self.quote,self.policy,self.role,expected,admission.admitted_at)?,
++            admitted_at:admission.admitted_at,
++        })
++    }
++
+     /// For app/helper callers: reject changed consent before opening storage,
+     /// then use the existing admission path to validate all negotiation records.
+     /// This grants no permission to sign, lock inputs or broadcast transactions.
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -19,13 +19,17 @@
+         Self::with_network(None)
+     }
+     fn with_network(network: Option<crate::bch_rpc::BchNetwork>) -> Result<Self> {
++        Self::with_network_at(network,1000,2000)
++    }
++    fn with_network_at(network: Option<crate::bch_rpc::BchNetwork>, now: u64, expires: u64) -> Result<Self> {
+         let (mut policy,mut terms) = fixture();
++        terms.insert("expiresAt".into(),expires.to_string());
+         if let Some(network) = network {
+             policy.bch_network = network.quote_name().into(); policy.bch_genesis = network.genesis().into();
+             terms.insert("bchNetwork".into(),policy.bch_network.clone());
+             terms.insert("bchGenesis".into(),policy.bch_genesis.clone());
+         }
+-        let quote = signed(&terms,&policy,1000)?;
++        let quote = signed(&terms,&policy,now)?;
+         let mut setup = Self {policy,quote,spend:vec![],view:vec![],frames:vec![],signatures:vec![]};
+         for role in [Role::BchFunder,Role::NativeFunder] {
+             let scalar = monero::Scalar::random(&mut rand::thread_rng());
+@@ -624,17 +628,23 @@
+ #[cfg(target_os="linux")]
+ fn selected_with_outgoing(setup: &Setup, directory: &std::path::Path, index: usize)
+     -> Result<(super::super::local_keys::peer::RetainedPeer,super::super::local_keys::peer::OutgoingPrivateView,[u8;32])> {
++    selected_with_outgoing_at(setup,directory,index,1000)
++}
++
++#[cfg(target_os="linux")]
++fn selected_with_outgoing_at(setup: &Setup, directory: &std::path::Path, index: usize, now: u64)
++    -> Result<(super::super::local_keys::peer::RetainedPeer,super::super::local_keys::peer::OutgoingPrivateView,[u8;32])> {
+     use super::super::local_keys::RetainedLocalKeys;
+     let role = if index == 0 {Role::BchFunder} else {Role::NativeFunder};
+-    let local = RetainedLocalKeys::persist(directory,&setup.quote,&setup.policy,1000,role,
++    let local = RetainedLocalKeys::persist(directory,&setup.quote,&setup.policy,now,role,
+         bitcoin::secp256k1::SecretKey::from_slice(&[3+index as u8;32])?,setup.spend[index],setup.view[index],
+         &setup.frames[index],&setup.signatures[index])?;
+     let pin = *local.commitment();
+-    let selected = local.select_peer(directory,&setup.quote,&setup.policy,1001,
++    let selected = local.select_peer(directory,&setup.quote,&setup.policy,now+1,
+         &setup.frames[1-index],&setup.signatures[1-index])?;
+     let signature = SigningKey::from_bytes(&[1+index as u8;32])
+-        .sign(&selected.view_signing_bytes(&setup.quote,&setup.policy,1002)?).to_bytes();
+-    let outgoing = selected.retain_signed_view(directory,&setup.quote,&setup.policy,1002,&signature)?;
++        .sign(&selected.view_signing_bytes(&setup.quote,&setup.policy,now+2)?).to_bytes();
++    let outgoing = selected.retain_signed_view(directory,&setup.quote,&setup.policy,now+2,&signature)?;
+     Ok((selected,outgoing,pin))
+ }
+ 
+@@ -818,3 +828,6 @@
+ 
+ #[cfg(target_os="linux")]
+ mod refund;
++
++#[cfg(target_os="linux")]
++mod admission_helper;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/admission_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/admission_helper.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/admission_helper.rs
+@@ -0,0 +1,134 @@
++//! Real helper processes over full cryptographic negotiation records, no nodes.
++use super::*;
++use agreement::execution::{AdmittedExecution, NegotiationPins};
++use std::{collections::BTreeMap, fs::OpenOptions, io::Write,
++    os::unix::fs::OpenOptionsExt, path::{Path,PathBuf}, process::{Command,Stdio}};
++use sha2::{Digest,Sha256};
++
++fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b|format!("{b:02x}")).collect() }
++fn helper() -> Result<(PathBuf,String)> {
++    let path = PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
++    ensure!(path.is_absolute() && path.canonicalize()? == path,"helper path is not canonical");
++    let expected = std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
++    ensure!(hex(&Sha256::digest(std::fs::read(&path)?)) == expected,"helper binary digest mismatch");
++    Ok((path,expected))
++}
++fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
++    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
++    file.write_all(bytes)?; file.sync_all()?; Ok(())
++}
++fn contents(path: &Path) -> Result<BTreeMap<String,String>> {
++    std::fs::read_dir(path)?.map(|entry| {
++        let entry = entry?;
++        Ok((entry.file_name().into_string().map_err(|_|anyhow::anyhow!("non-UTF8 fixture entry"))?,
++            hex(&Sha256::digest(std::fs::read(entry.path())?))))
++    }).collect()
++}
++fn invoke(helper: &Path, config: &Path, action: &str, approval: Option<&str>, success: bool)
++    -> Result<serde_json::Value> {
++    let request_id = uuid::Uuid::new_v4();
++    let mut request = serde_json::json!({"schema":format!("monzero-bch-admission-{action}-request-v1"),
++        "requestId":request_id});
++    if let Some(approval) = approval {request["commitment"] = serde_json::json!(approval);}
++    let mut child = Command::new(helper).arg(format!("--admission-{action}-stdio-v1")).arg(config)
++        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++    child.stdin.take().context("missing helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++    let output = child.wait_with_output()?;
++    ensure!(output.status.success() == success,"unexpected helper outcome for {action}");
++    if !success {
++        ensure!(output.stdout.is_empty(),"failed helper disclosed stdout");
++        ensure!(output.stderr == b"BCH admission request failed; inspect retained state before retrying\n",
++            "unexpected helper error output");
++        return Ok(serde_json::Value::Null);
++    }
++    ensure!(output.stderr.is_empty() && output.stdout.len() <= 16384,"unexpected helper output");
++    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
++    assert_eq!(response["requestId"],request_id.to_string());
++    assert_eq!(response["schema"],format!("monzero-bch-admission-{action}-response-v1"));
++    assert_eq!(response["executable"],false);
++    Ok(response)
++}
++
++fn roundtrip(historical: bool) -> Result<()> {
++    let (helper,helper_digest) = helper()?;
++    let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    let base = clock.checked_sub(if historical {7200} else {10}).context("invalid test clock")?;
++    let setup = Setup::with_network_at(None,base,base+3500)?;
++    let snapshots = PrivateStore::new()?;
++    let (b,bv,bpin) = selected_with_outgoing_at(&setup,&snapshots.0,0,base)?;
++    let (n,nv,npin) = selected_with_outgoing_at(&setup,&snapshots.0,1,base)?;
++    for (role,selected,own,peer,initial) in [
++        (Role::BchFunder,&b,&bv,&nv,bpin),(Role::NativeFunder,&n,&nv,&bv,npin)] {
++        let metadata = PrivateStore::new()?; let config_store = PrivateStore::new()?;
++        let (wallet,received) = selected.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++            base+3,own.commitment(),peer.frame(),peer.signature())?;
++        let ack = wallet.acknowledgement(&setup.quote)?;
++        let agreed = wallet.accept_agreement(&setup.quote,&setup.policy,base+4,&ack,
++            &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++        let agreement = agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,role,&agreed)?;
++        let pins = NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
++        let quote_file = config_store.0.join("quote.json"); write_new(&quote_file,&setup.quote.record()?)?;
++        let config_file = config_store.0.join("config.json");
++        let config = serde_json::json!({"schema":"monzero-private-bch-admission-v1",
++            "helper":helper,"helperDigest":helper_digest,"quoteFile":quote_file,
++            "quoteCommitment":hex(setup.quote.commitment()),"admittedAt":base,
++            "tradeId":setup.quote.terms()["swapId"],"identityPins":[
++                SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++                SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++            "policy":setup.policy,"role":role,"metadataDirectory":metadata.0,
++            "snapshotDirectory":snapshots.0,"negotiationPins":pins});
++        write_new(&config_file,&serde_json::to_vec(&config)?)?;
++        let secret_before = contents(&snapshots.0)?;
++        let expected = agreement::execution::approval::review_admission(&setup.quote,&setup.policy,role,&pins,base+5)?;
++        let expected_commitment = hex(&expected.commitment);
++        if historical {
++            // Seed a genuinely historically valid record, then ask today's
++            // helper to recover it without renewing an expired quote.
++            drop(AdmittedExecution::admit_reviewed(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++                role,&expected.commitment,pins.clone(),base+5)?);
++            invoke(&helper,&config_file,"review",None,false)?;
++            invoke(&helper,&config_file,"submit",Some(&expected_commitment),false)?;
++        } else {
++            invoke(&helper,&config_file,"status",None,false)?;
++            let review = invoke(&helper,&config_file,"review",None,true)?;
++            assert_eq!(review["review"]["details"],expected.details);
++            assert_eq!(review["review"]["commitment"],expected_commitment);
++            assert_eq!(review["admitted"],false);
++            invoke(&helper,&config_file,"submit",Some(&"00".repeat(32)),false)?;
++            assert!(contents(&metadata.0)?.is_empty());
++            let submitted = invoke(&helper,&config_file,"submit",Some(&expected_commitment),true)?;
++            assert_eq!(submitted["admitted"],true);
++            assert_eq!(submitted["review"],review["review"]);
++        }
++        let metadata_before = contents(&metadata.0)?;
++        assert_eq!(metadata_before.len(),1);
++        let status = invoke(&helper,&config_file,"status",None,true)?;
++        assert_eq!(status["admitted"],true);
++        assert_eq!(status["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(status["review"]["commitment"],expected_commitment);
++        assert!(status["admittedAt"].as_u64().context("missing saved admission time")? >= base+5);
++        if historical {assert_eq!(status["admittedAt"],base+5);}
++        assert_eq!(contents(&metadata.0)?,metadata_before);
++        assert_eq!(contents(&snapshots.0)?,secret_before);
++        // Restart respects the process lease and independently pinned history.
++        let execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role)?;
++        invoke(&helper,&config_file,"status",None,false)?; drop(execution);
++        let mut changed = config.clone(); changed["negotiationPins"]["received"][0] = serde_json::json!(received[0]^1);
++        std::fs::write(&config_file,serde_json::to_vec(&changed)?)?;
++        invoke(&helper,&config_file,"status",None,false)?;
++        std::fs::write(&config_file,serde_json::to_vec(&config)?)?;
++        let admission_file = metadata.0.join(metadata_before.keys().next().unwrap());
++        std::fs::write(&admission_file,b"{")?;
++        invoke(&helper,&config_file,"status",None,false)?;
++        assert_eq!(contents(&snapshots.0)?,secret_before);
++    }
++    Ok(())
++}
++
++#[test]
++#[ignore = "requires independently hashed native-bch-admission executable; offline cryptographic fixture"]
++fn bch_admission_helper_roundtrip_retained_negotiation() -> Result<()> { roundtrip(false) }
++
++#[test]
++#[ignore = "requires independently hashed native-bch-admission executable; offline cryptographic fixture"]
++fn bch_admission_helper_roundtrip_expired_negotiation() -> Result<()> { roundtrip(true) }

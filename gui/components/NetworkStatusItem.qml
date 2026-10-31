@@ -39,6 +39,7 @@ Rectangle {
     property var connected: Wallet.ConnectionStatus_Disconnected
 
     function getConnectionStatusString(status) {
+        if (appWindow.localNodeCheckInProgress) return qsTr("Checking local node");
         switch (appWindow.daemonStartStopInProgress)
         {
             case 1:
@@ -56,7 +57,12 @@ Rectangle {
                     return qsTr("Remote node") + " + " + qsTr("Mining");
                 if (persistentSettings.useRemoteNode)
                     return qsTr("Remote node");
-                return appWindow.isMining ? qsTr("Connected") + " + " + qsTr("Mining"): qsTr("Connected");
+                if (appWindow.isMining) {
+                    return appWindow.miningHashRate > 0
+                        ? qsTr("Mining: %1 H/s").arg(appWindow.miningHashRate)
+                        : qsTr("Connected + miner enabled");
+                }
+                return qsTr("Connected");
             case Wallet.ConnectionStatus_WrongVersion:
                 return qsTr("Wrong version");
             case Wallet.ConnectionStatus_Disconnected:
@@ -105,7 +111,7 @@ Rectangle {
                     visible: appWindow.walletMode >= 2
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
-                        if(!appWindow.isMining) {
+                        if(!appWindow.isMining || !miningEnabled) {
                             middlePanel.settingsView.settingsStateViewState = "Node";
                             appWindow.showPageRequest("Settings");
                         } else {
@@ -151,7 +157,7 @@ Rectangle {
                     visible: appWindow.walletMode >= 2
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
-                        if(!appWindow.isMining) {
+                        if(!appWindow.isMining || !miningEnabled) {
                             middlePanel.settingsView.settingsStateViewState = "Node";
                             appWindow.showPageRequest("Settings");
                         } else {

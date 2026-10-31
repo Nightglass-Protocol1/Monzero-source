@@ -1,0 +1,295 @@
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -127,6 +127,18 @@
+         super::transaction::IncludedTransaction::new(matched,&transaction)
+     }
+ 
++    // Raw transaction identity is checked, but mempool membership and witness
++    // validity remain peer claims. Used only by provisional wallet refresh.
++    async fn reported_transaction(&mut self,txid:Txid)->Result<Transaction> {
++        let (_,bytes)=self.exchange("blockchain.transaction.get",json!([txid.to_string(),false]),
++            MAX_TRANSACTION*2+1024).await?;
++        let raw=decode_hex(&result::<String>(&bytes)?,MAX_TRANSACTION)?;
++        let transaction:Transaction=deserialize(&raw)?;
++        ensure!(serialize(&transaction)==raw && transaction.compute_txid()==txid,
++            "Litecoin pending transaction identity changed");
++        Ok(transaction)
++    }
++
+     async fn exchange(&mut self, method: &str, params: Value, limit: usize) -> Result<(u64, Vec<u8>)> {
+         ensure!(self.usable, "Electrum session requires a new connection");
+         // Set before the first await so dropping a pending future also poisons
+diff --git a/swap-machine/src/litecoin_light/accounting.rs b/swap-machine/src/litecoin_light/accounting.rs
+--- a/swap-machine/src/litecoin_light/accounting.rs
++++ b/swap-machine/src/litecoin_light/accounting.rs
+@@ -26,6 +26,8 @@
+     coins:Vec<ObservedCoin>,
+     mature:Amount,
+     immature:Amount,
++    pending_spent:Amount,
++    pending_received:Amount,
+ }
+ impl ObservedWallet {
+     /// Recompute after every chain/observation change; old snapshots stay old.
+@@ -75,8 +77,11 @@
+         }
+         mature.checked_add(immature).context("Litecoin combined observed amount overflow")?;
+         Ok(Self {tip:chain.header(chain.height()).context("missing Litecoin selected tip")?.block_hash(),
+-            height:chain.height(),coins,mature:Amount::from_sat(mature),immature:Amount::from_sat(immature)})
++            height:chain.height(),coins,mature:Amount::from_sat(mature),immature:Amount::from_sat(immature),
++            pending_spent:Amount::ZERO,pending_received:Amount::ZERO})
+     }
++    pub fn reported_pending_spent(&self)->Amount {self.pending_spent}
++    pub fn reported_pending_received(&self)->Amount {self.pending_received}
+     pub fn tip(&self)->BlockHash {self.tip}
+     pub fn height(&self)->u32 {self.height}
+     pub fn coins(&self)->&[ObservedCoin] {&self.coins}
+@@ -85,3 +90,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++mod pending;
+diff --git a/swap-machine/src/litecoin_light/accounting/tests.rs b/swap-machine/src/litecoin_light/accounting/tests.rs
+--- a/swap-machine/src/litecoin_light/accounting/tests.rs
++++ b/swap-machine/src/litecoin_light/accounting/tests.rs
+@@ -58,3 +58,43 @@
+     }
+     Ok(())
+ }
++
++#[test]
++fn accounting_pending_chain_counts_only_terminal_outputs_and_restores_on_refresh()->Result<()> {
++    let chain=chain()?;let credit=included(&chain,0,external(),100);
++    let pending=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:credit.txid(),vout:0},..Default::default()}],
++        output:vec![TxOut {value:Amount::from_sat(60),script_pubkey:script()}]};
++    let mut child=pending.clone();child.input[0].previous_output=OutPoint {txid:pending.compute_txid(),vout:0};child.output[0].value=Amount::from_sat(30);
++    let confirmed=[credit];
++    let observed=ObservedWallet::reconcile_with_pending(&chain,&[script()],&confirmed,&[child,pending])?;
++    assert_eq!(observed.observed_mature().to_sat(),0);assert_eq!(observed.reported_pending_spent().to_sat(),100);
++    assert_eq!(observed.reported_pending_received().to_sat(),30);
++    let restored=ObservedWallet::reconcile_with_pending(&chain,&[script()],&confirmed,&[])?;
++    assert_eq!(restored.observed_mature().to_sat(),100);assert_eq!(restored.reported_pending_spent().to_sat(),0);
++    Ok(())
++}
++#[test]
++fn accounting_rejects_pending_conflicts_and_coinbase()->Result<()> {
++    let chain=chain()?;
++    let pending=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:external(),..Default::default()}],
++        output:vec![TxOut {value:Amount::from_sat(60),script_pubkey:script()}]};
++    let mut replacement=pending.clone();replacement.output[0].value=Amount::from_sat(50);
++    assert!(ObservedWallet::reconcile_with_pending(&chain,&[script()],&[],&[pending.clone(),replacement]).is_err());
++    assert!(ObservedWallet::reconcile_with_pending(&chain,&[script()],&[],&[pending.clone(),pending.clone()]).is_err());
++    let confirmed=included(&chain,1,external(),90);
++    assert!(ObservedWallet::reconcile_with_pending(&chain,&[script()],&[confirmed],&[pending.clone()]).is_err());
++    let mut coinbase=pending;coinbase.input[0].previous_output=OutPoint::null();
++    assert!(ObservedWallet::reconcile_with_pending(&chain,&[script()],&[],&[coinbase]).is_err());Ok(())
++}
++
++#[test]
++fn accounting_rejects_confirmed_child_of_reported_pending_parent()->Result<()> {
++    let chain=chain()?;
++    let parent=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:external(),..Default::default()}],
++        output:vec![TxOut {value:Amount::from_sat(60),script_pubkey:script()}]};
++    let child=included(&chain,1,OutPoint {txid:parent.compute_txid(),vout:0},30);
++    assert!(ObservedWallet::reconcile_with_pending(&chain,&[script()],&[child],&[parent]).is_err());Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/accounting/pending.rs b/swap-machine/src/litecoin_light/accounting/pending.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/accounting/pending.rs
+@@ -0,0 +1,60 @@
++use super::*;
++impl ObservedWallet {
++    /// Apply unauthenticated mempool effects conservatively. Reported spends
++    /// remove coins; reported receipts never enter confirmed amounts.
++    /// Conflicting reports fail rather than guessing replacement ordering.
++    pub fn reconcile_with_pending(chain:&headers::HeaderSequence,scripts:&[ScriptBuf],
++        confirmed:&[IncludedTransaction],pending:&[Transaction])->Result<Self> {
++        ensure!(pending.len()<=10_000,"Litecoin pending transaction limit exceeded");
++        let mut result=Self::reconcile(chain,scripts,confirmed)?;
++        let active=confirmed.iter().filter(|tx|tx.confirmations_on(chain).is_some())
++            .map(|tx|(tx.txid(),tx)).collect::<BTreeMap<_,_>>();
++        let mut reported=BTreeMap::new();let mut count=0usize;
++        for tx in pending {
++            count=count.checked_add(tx.input.len()+tx.output.len()).context("Litecoin pending effect overflow")?;
++            ensure!(count<=100_000 && !tx.is_coinbase() && !tx.input.is_empty() && !tx.output.is_empty(),
++                "invalid Litecoin pending transaction effects");
++            let txid=tx.compute_txid();
++            ensure!(!active.contains_key(&txid) && reported.insert(txid,tx).is_none(),
++                "duplicate Litecoin pending transaction identity");
++        }
++        let confirmed_spends=active.values().filter(|tx|!tx.is_coinbase())
++            .flat_map(|tx|tx.inputs().iter().copied()).collect::<BTreeSet<_>>();
++        ensure!(confirmed_spends.iter().all(|input|!reported.contains_key(&input.txid)),
++            "confirmed Litecoin spend has a reported pending parent");
++        let mut spends=BTreeSet::new();
++        for (txid,tx) in &reported {
++            for input in &tx.input {
++                let outpoint=input.previous_output;
++                ensure!(!outpoint.is_null() && outpoint.txid!=*txid && !confirmed_spends.contains(&outpoint)
++                    && spends.insert(outpoint),"conflicting Litecoin pending spend");
++                if let Some(parent)=active.get(&outpoint.txid) {
++                    ensure!((outpoint.vout as usize)<parent.outputs().len(),"invalid pending parent output");
++                    ensure!(!parent.is_coinbase() || parent.confirmations_on(chain).context("missing pending parent depth")?>=100,
++                        "pending spend of immature coinbase");
++                }
++                if let Some(parent)=reported.get(&outpoint.txid) {
++                    ensure!((outpoint.vout as usize)<parent.output.len(),"invalid pending parent output");
++                }
++            }
++        }
++        let mut retained=Vec::new();let mut removed=0u64;
++        for coin in result.coins {
++            if spends.contains(&coin.outpoint) {
++                removed=removed.checked_add(coin.amount.to_sat()).context("Litecoin pending spent overflow")?;
++                let total=if coin.maturity_satisfied() {&mut result.mature}else{&mut result.immature};
++                *total=Amount::from_sat(total.to_sat().checked_sub(coin.amount.to_sat()).context("Litecoin pending subtraction failed")?);
++            } else {retained.push(coin);}
++        }
++        let scripts=scripts.iter().collect::<BTreeSet<_>>();let mut received=0u64;
++        for (txid,tx) in &reported {
++            for (index,output) in tx.output.iter().enumerate() {
++                if scripts.contains(&output.script_pubkey) && !spends.contains(&OutPoint {txid:*txid,vout:index as u32}) {
++                    received=received.checked_add(output.value.to_sat()).context("Litecoin pending receipt overflow")?;
++                }
++            }
++        }
++        result.coins=retained;result.pending_spent=Amount::from_sat(removed);
++        result.pending_received=Amount::from_sat(received);Ok(result)
++    }
++}
+diff --git a/swap-machine/src/litecoin_light/session/wallet.rs b/swap-machine/src/litecoin_light/session/wallet.rs
+--- a/swap-machine/src/litecoin_light/session/wallet.rs
++++ b/swap-machine/src/litecoin_light/session/wallet.rs
+@@ -1,5 +1,5 @@
+ //! One bounded refresh against a borrowed, unchanged selected header chain.
+-//! Returned amounts remain provisional: peer omissions, mempool effects and
++//! Returned amounts remain provisional: peer omissions, mempool authenticity and
+ //! freshness are not resolved. This module grants no spend/sign capability.
+ use super::*;
+ use super::{history::ReportedPosition,scan::{BranchScan,ScanStop}};
+@@ -23,7 +23,7 @@
+     pub fn change(&self)->&BranchScan {&self.change}
+     pub fn accounting(&self)->&ObservedWallet {&self.accounting}
+     /// Distinct unverified mempool reports, excluded from confirmed accounting.
+-    /// Their spending effects have NOT been subtracted from returned amounts.
++    /// Their reported spending effects are subtracted; receipts stay separate.
+     pub fn pending_reports(&self)->usize {self.pending_reports}
+ }
+ impl<S:AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
+@@ -61,7 +61,7 @@
+                 }
+             }
+         }
+-        let mut transactions=Vec::new();let mut pending_reports=0;let mut effects=0usize;
++        let mut transactions=Vec::new();let mut pending=Vec::new();let mut effects=0usize;
+         for (txid,(position,_)) in &reports {
+             if let ReportedPosition::Block(height)=position {
+                 let transaction=self.transaction_on(chain,*height,*txid).await?;
+@@ -69,12 +69,23 @@
+                     .context("Litecoin refresh effect count overflow")?;
+                 ensure!(effects<=100_000,"Litecoin refresh effect budget exhausted");
+                 transactions.push(transaction);
+-            } else {pending_reports+=1;}
++            } else {
++                let transaction=self.reported_transaction(*txid).await?;
++                effects=effects.checked_add(transaction.input.len()+transaction.output.len())
++                    .context("Litecoin pending effect count overflow")?;
++                ensure!(effects<=100_000,"Litecoin refresh effect budget exhausted");
++                pending.push(transaction);
++            }
+         }
+         let mut previous=BTreeMap::new();
+         for transaction in &transactions {
+             for (index,output) in transaction.outputs().iter().enumerate() {
+                 previous.insert(OutPoint {txid:transaction.txid(),vout:index as u32},&output.script_pubkey);
++            }
++        }
++        for transaction in &pending {
++            for (index,output) in transaction.output.iter().enumerate() {
++                previous.insert(OutPoint {txid:transaction.compute_txid(),vout:index as u32},&output.script_pubkey);
+             }
+         }
+         for transaction in &transactions {
+@@ -84,7 +95,15 @@
+                 ensure!(pays || spends,"Litecoin history transaction has no proven script relation");
+             }
+         }
+-        let accounting=ObservedWallet::reconcile(chain,&scripts,&transactions)?;
++        for transaction in &pending {
++            for script in &reports.get(&transaction.compute_txid()).context("missing pending history claim")?.1 {
++                let pays=transaction.output.iter().any(|output|output.script_pubkey==*script);
++                let spends=transaction.input.iter().any(|input|previous.get(&input.previous_output).is_some_and(|parent|*parent==script));
++                ensure!(pays || spends,"Litecoin pending history has no script relation");
++            }
++        }
++        let pending_reports=pending.len();
++        let accounting=ObservedWallet::reconcile_with_pending(chain,&scripts,&transactions,&pending)?;
+         Ok(WalletObservation {receive,change,accounting,pending_reports})
+     }
+ }
+diff --git a/swap-machine/src/litecoin_light/session/wallet/tests.rs b/swap-machine/src/litecoin_light/session/wallet/tests.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/tests.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/tests.rs
+@@ -36,14 +36,6 @@
+     drop(session);assert_eq!(task.await?.len(),6);Ok(())
+ }
+ #[tokio::test]
+-async fn refresh_mempool_reports_remain_explicitly_unverified()->Result<()> {
+-    let mut responses=regtest_handshake();responses.extend([reply(3,report(0)),reply(4,json!([])),reply(5,report(0)),reply(6,json!([]))]);
+-    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+-    let result=session.refresh_wallet(&HeaderSequence::new(LtcNetwork::Regtest)?,&account(),[0,0],&limits()).await?;
+-    assert_eq!(result.pending_reports(),1);assert_eq!(result.accounting().coins().len(),0);
+-    drop(session);assert_eq!(task.await?.len(),6);Ok(())
+-}
+-#[tokio::test]
+ async fn refresh_height_beyond_selected_chain_is_not_assumed_confirmed()->Result<()> {
+     let mut responses=regtest_handshake();responses.extend([reply(3,report(1)),reply(4,json!([])),reply(5,json!([]))]);
+     let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
+diff --git a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+@@ -64,3 +64,38 @@
+ async fn funded_refresh_rejects_proven_but_unrelated_history_claim()->Result<()> {run(false,true,false).await}
+ #[tokio::test]
+ async fn funded_refresh_rejects_invalid_inclusion_without_snapshot()->Result<()> {run(false,false,true).await}
++
++#[tokio::test]
++async fn funded_refresh_subtracts_pending_spend_and_separates_change()->Result<()> {
++    let (fixture,account,chain)=fixture()?;let chain=chain.fork(1)?;
++    let credit=&fixture.blocks[0];let spend=&fixture.blocks[1];
++    let pending=json!({"tx_hash":spend.txid.to_string(),"height":0});
++    let mut responses=regtest_handshake();
++    responses.extend([reply(3,json!([{"tx_hash":credit.txid.to_string(),"height":1},pending])),
++        reply(4,json!([])),reply(5,json!([pending])),reply(6,json!([]))]);
++    let mut id=7;
++    for block in fixture.blocks.iter().map(|block|(block.txid,block)).collect::<BTreeMap<_,_>>().values() {
++        responses.push(reply(id,json!(block.transaction)));id+=1;
++        if block.height==1 {responses.push(reply(id,json!({"block_height":1,"pos":0,"merkle":[]})));id+=1;}
++    }
++    let expected=responses.len();let (stream,task)=server(responses);
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let result=session.refresh_wallet(&chain,&account,[1,1],&limits()).await?;
++    assert_eq!(result.pending_reports(),1);let accounting=result.accounting();
++    assert_eq!(accounting.observed_mature().to_sat(),0);assert!(accounting.coins().is_empty());
++    assert_eq!(accounting.reported_pending_spent().to_sat(),100000);
++    assert_eq!(accounting.reported_pending_received().to_sat(),60000);
++    drop(session);let requests=task.await?;assert_eq!(requests.len(),expected);
++    assert_eq!(requests.iter().filter(|r|r["method"]=="blockchain.transaction.get_merkle").count(),1);
++    Ok(())
++}
++#[tokio::test]
++async fn pending_refresh_rejects_wrong_raw_transaction()->Result<()> {
++    let (fixture,account,chain)=fixture()?;
++    let pending=json!({"tx_hash":fixture.blocks[1].txid.to_string(),"height":0});
++    let mut responses=regtest_handshake();responses.extend([reply(3,json!([pending])),reply(4,json!([])),
++        reply(5,json!([])),reply(6,json!(fixture.blocks[0].transaction))]);
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    assert!(session.refresh_wallet(&chain,&account,[0,0],&limits()).await.is_err());
++    assert!(!session.usable);drop(session);assert_eq!(task.await?.len(),6);Ok(())
++}

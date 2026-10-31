@@ -1,0 +1,61 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+@@ -84,7 +84,8 @@
+     assert!(sender.prepare_reviewed_bch_success_release(&observer,bch,5,release_time,&[0;32]).await.is_err());
+     assert_eq!(contents(&sender_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     success_release_helper::exercise(setup,sender_metadata,snapshots,pins,base,&deployment,&release.details,&release.commitment)?;
+-    success_identity_fixture::reviews(setup,sender_metadata,snapshots,pins,base,&deployment,None,None)?;
++    let proof_public=json!({"details":saved.review.details,"commitment":hex(&saved.review.commitment)});
++    success_identity_fixture::reviews(setup,sender_metadata,snapshots,pins,base,&deployment,None,None,&proof_public,&context)?;
+     let adaptor=sender.prepare_reviewed_bch_success_release(&observer,bch,5,release_time,&release.commitment).await?;
+     assert!(!adaptor.is_empty());
+     let signature=success_identity_fixture::sign(&adaptor)?;
+@@ -94,7 +95,7 @@
+     assert_eq!(signing.details["action"],"retain-bch-success-signature");
+     assert_ne!(signing.commitment,release.commitment);
+     let signing_public=json!({"details":signing.details,"commitment":hex(&signing.commitment)});
+-    success_identity_fixture::reviews(setup,sender_metadata,snapshots,pins,base,&deployment,Some(&signing_public),None)?;
++    success_identity_fixture::reviews(setup,sender_metadata,snapshots,pins,base,&deployment,Some(&signing_public),None,&proof_public,&context)?;
+     assert!(sender.review_signed_bch_success_release(&deployment,5,signing_time).is_err());
+     // Preparation approval cannot authorize identity retention, even with a valid signature.
+     for wrong in [[0;32],release.commitment] {
+@@ -109,7 +110,7 @@
+     assert_eq!(outgoing.details["action"],"release-signed-bch-success");
+     assert_ne!(outgoing.commitment,release.commitment);assert_ne!(outgoing.commitment,signing.commitment);
+     let release_public=json!({"details":outgoing.details,"commitment":hex(&outgoing.commitment)});
+-    success_identity_fixture::reviews(setup,sender_metadata,snapshots,pins,base,&deployment,Some(&signing_public),Some(&release_public))?;
++    success_identity_fixture::reviews(setup,sender_metadata,snapshots,pins,base,&deployment,Some(&signing_public),Some(&release_public),&proof_public,&context)?;
+     let before=contents(&sender_metadata.0)?;let secrets=contents(&snapshots.0)?;
+     for wrong in [[0;32],release.commitment,signing.commitment] {
+         assert!(sender.recover_reviewed_bch_success_release(&observer,bch,5,signing_time,&wrong).await.is_err());
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs
+@@ -25,7 +25,7 @@
+ 
+ /// Public review modes use private retained state but never export its frames.
+ pub(super) fn reviews(setup: &Setup,original: &PrivateStore,snapshots: &PrivateStore,
+-    pins: &NegotiationPins,base: u64,deployment: &[u8;32],signing: Option<&Value>,release: Option<&Value>) -> Result<()> {
++    pins: &NegotiationPins,base: u64,deployment: &[u8;32],signing: Option<&Value>,release: Option<&Value>,proof: &Value,context: &Value) -> Result<()> {
+     let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
+     let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper
+@@ -46,11 +46,16 @@
+     let wrapper=config.0.join("review.json");
+     save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-success-release-review-v1",
+         "admissionConfigFile":admission,"deploymentCommitment":hex(deployment),"safetyBlocks":5}))?)?;
++    let program=PathBuf::from(std::env::var("MONZERO_BCH_QT_SUCCESS_SIGNING_REVIEW_PROBE")?);
++    ensure!(program.is_absolute() && program.canonicalize()?==program
++        && hex(&Sha256::digest(std::fs::read(&program)?))==std::env::var("MONZERO_BCH_QT_SUCCESS_SIGNING_REVIEW_PROBE_SHA256")?,"Qt signing review probe changed");
++    save(&PathBuf::from(format!("{}.public-context.json",wrapper.display())),&serde_json::to_vec(context)?)?;
++    save(&PathBuf::from(format!("{}.public-proof.json",wrapper.display())),&serde_json::to_vec(proof)?)?;
+     let before=contents(&metadata.0)?;let secrets=contents(&private.0)?;
+     for (action,expected) in [("signature",signing),("signed-release",release)] {
+         let id=uuid::Uuid::new_v4();
+         let request=json!({"schema":format!("monzero-bch-success-{action}-review-request-v1"),"requestId":id});
+-        let mut child=Command::new(&helper).arg(format!("--success-{action}-review-stdio-v1")).arg(&wrapper)
++        let mut child=Command::new(&program).arg(format!("--success-{action}-review-stdio-v1")).arg(&wrapper)
+             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+         child.stdin.take().context("signing review stdin")?.write_all(&serde_json::to_vec(&request)?)?;
+         let output=child.wait_with_output()?;

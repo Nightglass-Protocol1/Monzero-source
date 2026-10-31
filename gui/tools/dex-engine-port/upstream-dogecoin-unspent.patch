@@ -1,0 +1,185 @@
+diff --git a/swap-machine/src/dogecoin_rpc.rs b/swap-machine/src/dogecoin_rpc.rs
+--- a/swap-machine/src/dogecoin_rpc.rs
++++ b/swap-machine/src/dogecoin_rpc.rs
+@@ -2,7 +2,7 @@
+ //! RPC shape follows dogecoin/dogecoin v1.14.9 src/rpc/{blockchain,rawtransaction}.cpp.
+ //! This boundary neither signs nor broadcasts and cannot authorize settlement.
+ use anyhow::{Context, Result, ensure};
+-use bitcoin::{BlockHash, Transaction, Txid, consensus::encode::{deserialize, serialize_hex}, hex::FromHex};
++use bitcoin::{Amount, Denomination, OutPoint, ScriptBuf, TxOut, BlockHash, Transaction, Txid, consensus::encode::{deserialize, serialize_hex}, hex::FromHex};
+ use serde::{Deserialize, de::DeserializeOwned};
+ use serde_json::{Value, json, value::RawValue};
+ use std::sync::atomic::{AtomicU64, Ordering};
+@@ -35,6 +35,28 @@
+     pub fn transaction(&self) -> &Transaction { &self.transaction }
+ }
+ 
++/// Point-in-time evidence only. A pending spend arriving after observation can
++/// invalidate it. This establishes neither timelock safety nor swap completion.
++pub struct ConfirmedUnspentOutput {
++    funding: ConfirmedTransaction,
++    outpoint: OutPoint,
++}
++impl ConfirmedUnspentOutput {
++    pub fn funding(&self) -> &ConfirmedTransaction { &self.funding }
++    pub fn outpoint(&self) -> OutPoint { self.outpoint }
++}
++
++#[derive(Deserialize)]
++struct OutputScript { hex: String }
++#[derive(Deserialize)]
++struct UnspentOutput {
++    bestblock: BlockHash,
++    confirmations: u64,
++    value: Box<RawValue>,
++    #[serde(rename = "scriptPubKey")]
++    script: OutputScript,
++}
++
+ #[derive(Deserialize)]
+ struct Envelope { id: u64, error: Option<Value>, result: Box<RawValue> }
+ #[derive(Deserialize)]
+@@ -65,7 +87,7 @@
+     }
+ 
+     async fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+-        ensure!(matches!(method, "getblockchaininfo" | "getblockhash" | "getrawtransaction" | "getblockheader"),
++        ensure!(matches!(method, "getblockchaininfo" | "getblockhash" | "getrawtransaction" | "getblockheader" | "gettxout"),
+             "unsupported Dogecoin observation RPC");
+         let id = self.request_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+             .map_err(|_| anyhow::anyhow!("Dogecoin RPC identity exhausted"))?;
+@@ -90,6 +112,32 @@
+         self.network.verify_chain(&info.chain, &genesis)?;
+         ensure!(!info.initialblockdownload && info.blocks == info.headers, "Dogecoin node is not synchronized");
+         Ok(info)
++    }
++
++    /// Bind an expected output to confirmed legacy bytes and the current UTXO
++    /// view, including pending spends. Reobserve before any subsequent action.
++    /// This does not establish CLTV activation, coinbase maturity or refund safety.
++    pub async fn confirmed_unspent_output(&self, outpoint: OutPoint, block: BlockHash,
++        minimum: u64, expected: &TxOut) -> Result<ConfirmedUnspentOutput> {
++        ensure!(!outpoint.is_null() && expected.value > Amount::ZERO
++            && expected.value.to_sat() <= 1_000_000_000_000_000_000,
++            "invalid Dogecoin output expectation");
++        let funding = self.confirmed_transaction(outpoint.txid, block, minimum).await?;
++        ensure!(funding.transaction.output.get(outpoint.vout as usize) == Some(expected),
++            "Dogecoin funding output differs from expected terms");
++        let observed: Option<UnspentOutput> = self.rpc("gettxout",
++            json!([outpoint.txid.to_string(), outpoint.vout, true])).await?;
++        let observed = observed.context("Dogecoin output absent or spent, including pending spends")?;
++        ensure!(observed.bestblock == funding.tip && observed.confirmations == funding.confirmations,
++            "Dogecoin output observation differs from confirmed funding");
++        // Parse the original decimal JSON token without converting through f64.
++        let amount = Amount::from_str_in(observed.value.get(), Denomination::Bitcoin)
++            .context("invalid exact Dogecoin output amount")?;
++        ensure!(amount == expected.value && ScriptBuf::from_hex(&observed.script.hex)? == expected.script_pubkey,
++            "Dogecoin unspent output differs from confirmed funding");
++        let after = self.chain().await?;
++        ensure!(after.bestblockhash == funding.tip, "Dogecoin tip changed during output observation");
++        Ok(ConfirmedUnspentOutput { funding, outpoint })
+     }
+ 
+     /// Requires the node's transaction index for spent historical transactions.
+diff --git a/swap-machine/src/dogecoin_rpc/tests.rs b/swap-machine/src/dogecoin_rpc/tests.rs
+--- a/swap-machine/src/dogecoin_rpc/tests.rs
++++ b/swap-machine/src/dogecoin_rpc/tests.rs
+@@ -35,13 +35,14 @@
+ #[tokio::test]
+ async fn observation_checks_rpc_context_and_stable_tip() -> Result<()> {
+     use std::{net::TcpListener, io::{BufRead, BufReader, Read, Write}};
+-    for case in 0..8 {
++    for case in 0..18 {
+         let tx = transaction(); let txid = tx.compute_txid(); let block = BlockHash::from_byte_array([7;32]);
+         let listener = TcpListener::bind("127.0.0.1:0")?; let port = listener.local_addr()?.port();
+         listener.set_nonblocking(true)?;
+         let server = std::thread::spawn(move || -> Result<()> {
+-            let methods = ["getblockchaininfo", "getblockhash", "getrawtransaction", "getblockheader", "getblockchaininfo", "getblockhash"];
+-            let count = match case { 2..=4 => 2, 5..=7 => 1, _ => 6 };
++            let methods = ["getblockchaininfo", "getblockhash", "getrawtransaction", "getblockheader", "getblockchaininfo", "getblockhash",
++                "gettxout", "getblockchaininfo", "getblockhash"];
++            let count = match case { 2..=4 => 2, 5..=7 => 1, 8 | 14 => 9, 9..=13 | 17 => 7, _ => 6 };
+             for (i, method) in methods.iter().take(count).enumerate() {
+                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                 let (mut socket, _) = loop {
+@@ -66,10 +67,25 @@
+                 ensure!(request["method"] == *method, "unexpected RPC method");
+                 let result = match *method {
+                     "getblockchaininfo" => json!({"chain":"regtest", "blocks":100, "headers":if case == 4 {101} else {100}, "initialblockdownload":case == 3,
+-                        "bestblockhash": if case == 1 && i == 4 { "09".repeat(32) } else { "08".repeat(32) }}),
++                        "bestblockhash": if (case == 1 && i == 4) || (case == 14 && i == 7) { "09".repeat(32) } else { "08".repeat(32) }}),
+                     "getblockhash" => {ensure!(request["params"] == json!([0]), "wrong genesis request"); json!(if case == 2 {DogeNetwork::Mainnet.genesis()} else {DogeNetwork::Regtest.genesis()})},
+                     "getrawtransaction" => {ensure!(request["params"] == json!([txid.to_string(),true]), "wrong raw lookup");
+                         json!({"hex":serialize_hex(&tx), "txid":txid, "hash":txid, "blockhash":block, "confirmations":3})},
++                    "gettxout" => {
++                        ensure!(request["params"] == json!([txid.to_string(),0,true]), "pending spends must be included");
++                        let mut result = json!({"bestblock":"08".repeat(32),"confirmations":3,
++                            "value":9.99,"scriptPubKey":{"hex":""}});
++                        match case {
++                            9 => result = Value::Null,
++                            10 => result["bestblock"] = json!("09".repeat(32)),
++                            11 => result["confirmations"] = json!(2),
++                            12 => result["value"] = json!(9.99000001),
++                            13 => result["scriptPubKey"]["hex"] = json!("51"),
++                            17 => result["value"] = json!("9.99"),
++                            _ => (),
++                        }
++                        result
++                    },
+                     _ => {ensure!(request["params"] == json!([block.to_string(),true]), "wrong block lookup");
+                         json!({"hash":block, "height":98, "confirmations":3})},
+                 };
+@@ -83,10 +99,24 @@
+             Ok(())
+         });
+         let rpc = DogecoinRpc::new(port,"fixture".into(),"fixture".into(),DogeNetwork::Regtest)?;
+-        let result = rpc.confirmed_transaction(txid,block,3).await;
+-        server.join().unwrap()?;
+-        if case != 0 { assert!(result.is_err(), "case {case}"); } else {
+-            let observed = result?; assert_eq!(observed.transaction().compute_txid(),txid); assert_eq!(observed.confirmations(),3);
++        if case >= 8 {
++            let mut expected = transaction().output[0].clone();
++            if case == 15 { expected.value = Amount::from_sat(1); }
++            let outpoint = OutPoint { txid, vout: if case == 16 { 1 } else { 0 } };
++            let result = rpc.confirmed_unspent_output(outpoint, block, 3, &expected).await;
++            server.join().unwrap()?;
++            if case == 8 {
++                let observed = result?;
++                assert_eq!(observed.outpoint(), outpoint);
++                assert_eq!(observed.funding().transaction().compute_txid(), txid);
++                assert_eq!(observed.funding().confirmations(), 3);
++            } else { assert!(result.is_err(), "case {case}"); }
++        } else {
++            let result = rpc.confirmed_transaction(txid,block,3).await;
++            server.join().unwrap()?;
++            if case != 0 { assert!(result.is_err(), "case {case}"); } else {
++                let observed = result?; assert_eq!(observed.transaction().compute_txid(),txid); assert_eq!(observed.confirmations(),3);
++            }
+         }
+     }
+     Ok(())
+@@ -100,7 +130,7 @@
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields, rename_all = "camelCase")]
+     struct Request { schema: String, request_id: uuid::Uuid, port: u16, cookie: String,
+-        txid: Txid, block: BlockHash, minimum: u64, expected_hex: String }
++        txid: Txid, block: BlockHash, minimum: u64, expected_hex: String, unspent_vout: Option<u32> }
+     let input = std::env::var_os("MONZERO_DOGE_OBSERVATION_REQUEST").context("missing observation request")?;
+     let output = std::env::var_os("MONZERO_DOGE_OBSERVATION_RESPONSE").context("missing observation response")?;
+     let mut bytes = Vec::new(); std::fs::File::open(input)?.take(500_001).read_to_end(&mut bytes)?;
+@@ -118,8 +148,14 @@
+         }
+         Err(_) => json!({"confirmed":false}),
+     };
++    let unspent = if let Some(vout) = request.unspent_vout {
++        let expected: Transaction = deserialize(&Vec::<u8>::from_hex(&request.expected_hex)?)?;
++        let output = expected.output.get(vout as usize).context("missing expected fixture output")?;
++        Some(rpc.confirmed_unspent_output(OutPoint { txid: request.txid, vout },
++            request.block, request.minimum, output).await.is_ok())
++    } else { None };
+     let response = json!({"schema":"monzero-doge-observation-response-v1", "requestId":request.request_id,
+-        "observation":result,"executable":false});
++        "observation":result,"unspent":unspent,"executable":false});
+     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(output)?;
+     file.write_all(&serde_json::to_vec(&response)?)?; file.sync_all()?;
+     Ok(())

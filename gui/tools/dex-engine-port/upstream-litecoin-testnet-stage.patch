@@ -1,0 +1,355 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index bc961ca46..9a5555d6d 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -118,7 +118,7 @@ mod linux {
+     fn start_trade(config:&Config,request:&Request,role:LocalRole,submit:bool,now:u64)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_quote::VerifiedLtcQuote,litecoin_negotiation::execution::start_approval::review_start};
+         ensure!(config.schema=="monzero-private-ltc-journal-v5"
+-            && config.policy.ltc_network==swap_core::litecoin_address::LtcNetwork::Regtest,
++            && staged(&config.policy),
+             "trade startup helper is limited to isolated-chain development");
+         let (_quote_lease,bytes)=private_bytes(config.start_quote_file.as_deref().context("missing startup quote")?,false)?;
+         let quote=VerifiedLtcQuote::from_envelope(&bytes,now,&config.policy,config.pins)?;
+@@ -185,7 +185,7 @@ mod linux {
+ 
+     fn negotiate(config:&Config,input:&[u8],now:u64,mode:&str)->Result<serde_json::Value> {
+         ensure!(config.schema=="monzero-private-ltc-journal-v5"
+-            && config.policy.ltc_network==swap_core::litecoin_address::LtcNetwork::Regtest,
++            && staged(&config.policy),
+             "peer admission helper requires isolated trade startup configuration");
+         let role=match config.role.as_str() {"litecoin-funder"=>LocalRole::LitecoinFunder,
+             "native-funder"=>LocalRole::NativeFunder,_=>anyhow::bail!("invalid peer admission role")};
+@@ -250,7 +250,7 @@ mod linux {
+         ltc_cookie_file:PathBuf,reservation_directory:PathBuf,fee_rate_atoms_per_kb:u64}
+     async fn reserve_litecoin(path:&Path,input:&[u8],mode:&str)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_quote::VerifiedLtcQuote,litecoin_rpc::LitecoinRpc};
+-        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        use swap_core::litecoin_address::LtcSegwitAddress;
+         use swap_machine::litecoin_negotiation::execution::recovery_relay::RecoverySpend;
+         let request:Request=serde_json::from_slice(input)?;
+         let recovery=match mode {
+@@ -273,7 +273,7 @@ mod linux {
+         ensure!(wrapper.schema=="monzero-private-ltc-reservation-v1","invalid reservation configuration");
+         let (_journal,config)=load(&wrapper.journal_config_file)?;
+         ensure!(config.schema=="monzero-private-ltc-journal-v5" && config.role=="litecoin-funder"
+-            && config.policy.ltc_network==LtcNetwork::Regtest,"reservation requires isolated Litecoin funder startup configuration");
++            && staged(&config.policy),"reservation requires isolated Litecoin funder startup configuration");
+         let (_rpc,bytes)=private_bytes(&wrapper.rpc_file,false)?;
+         let rpc:ReservationRpc=serde_json::from_slice(&bytes)?;
+         ensure!(rpc.schema=="monzero-private-ltc-reservation-rpc-v1" && rpc.ltc_port>0
+@@ -282,8 +282,8 @@ mod linux {
+         let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
+             config.trade_id,&config.policy,LocalRole::LitecoinFunder,config.pins)?;
+         let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let adapter=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
+-            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let adapter=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet.clone(),
++            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
+         if let Some((kind,operation,name))=recovery {
+             if operation=="check" {
+                 let observation=execution.check_recovery_spend(&adapter,kind).await?;
+@@ -343,7 +343,7 @@ mod linux {
+     impl Drop for FundingProofRequest {fn drop(&mut self) {use zeroize::Zeroize;self.proof_hex.zeroize();}}
+     async fn release_litecoin(path:&Path,input:&[u8],mode:&str)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::NativeFundingRpc};
+-        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        use swap_core::litecoin_address::LtcSegwitAddress;
+         let reviewing=mode=="--redeem-review-stdio-v1";
+         let (request_id,incoming,proof)=if mode=="--funding-proof-accept-stdio-v1" {
+             let request:FundingProofRequest=serde_json::from_slice(input)?;
+@@ -370,7 +370,7 @@ mod linux {
+         ensure!(wrapper.schema=="monzero-private-ltc-redeem-v1","invalid redeem configuration");
+         let (_journal,config)=load(&wrapper.journal_config_file)?;
+         ensure!(config.schema=="monzero-private-ltc-journal-v5" && config.role=="litecoin-funder"
+-            && config.policy.ltc_network==LtcNetwork::Regtest,"redeem release requires isolated Litecoin funder startup configuration");
++            && staged(&config.policy),"redeem release requires isolated Litecoin funder startup configuration");
+         let (_rpc,bytes)=private_bytes(&wrapper.rpc_file,false)?;
+         let rpc:RedeemRpc=serde_json::from_slice(&bytes)?;
+         ensure!(rpc.schema=="monzero-private-ltc-redeem-rpc-v1" && rpc.ltc_port>0 && rpc.native_daemon_port>0
+@@ -379,8 +379,8 @@ mod linux {
+         let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
+             config.trade_id,&config.policy,LocalRole::LitecoinFunder,config.pins)?;
+         let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
+-            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet,
++            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
+         let (_login,user,password)=credentials(&rpc.observer_login_file)?;
+         let native=NativeFundingRpc::new(rpc.native_daemon_port,rpc.observer_wallet_port,user,password)?;
+         if let Some(proof)=proof {
+@@ -478,7 +478,16 @@ mod linux {
+         for (i,byte) in result.iter_mut().enumerate() {*byte=u8::from_str_radix(&text[2*i..2*i+2],16)?;}
+         Ok(result)
+     }
+-    async fn isolated_native(port:u16)->Result<()> {
++    /// Accepted deployments: owned Litecoin regtest with an offline XMZ fakechain
++    /// (lab quotes name "xmz-mainnet"), or public Litecoin testnet with an XMZ
++    /// testnet daemon. Litecoin mainnet is never accepted by this helper.
++    fn staged(policy:&Policy)->bool {
++        use swap_core::{litecoin_address::LtcNetwork,xmz_address::XmzNetwork};
++        matches!((policy.ltc_network,policy.xmz_network),
++            (LtcNetwork::Regtest,XmzNetwork::Mainnet)|(LtcNetwork::Testnet,XmzNetwork::Testnet))
++    }
++    async fn isolated_native(port:u16,policy:&Policy)->Result<()> {
++        ensure!(staged(policy),"native settlement outside an accepted test deployment");
+         let client=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+             .timeout(std::time::Duration::from_secs(15)).build()?;
+         let mut response=client.post(format!("http://127.0.0.1:{port}/json_rpc"))
+@@ -489,17 +498,29 @@ mod linux {
+         let envelope:serde_json::Value=serde_json::from_slice(&bytes)?;
+         ensure!(envelope["id"]=="isolated-refund-check" && envelope.get("error").is_none(),"invalid isolation response");
+         let info=&envelope["result"];
+-        ensure!(info["nettype"]=="fakechain" && info["offline"]==true
+-            && info["incoming_connections_count"].as_u64()==Some(0)
+-            && info["outgoing_connections_count"].as_u64()==Some(0),"refund GUI requires offline native fakechain");
++        if policy.ltc_network==swap_core::litecoin_address::LtcNetwork::Regtest {
++            ensure!(info["nettype"]=="fakechain" && info["offline"]==true
++                && info["incoming_connections_count"].as_u64()==Some(0)
++                && info["outgoing_connections_count"].as_u64()==Some(0),"refund GUI requires offline native fakechain");
++            return Ok(());
++        }
++        ensure!(info["nettype"]=="testnet" && info["synchronized"]==true,"native settlement requires a synchronized XMZ testnet daemon");
++        let mut response=client.post(format!("http://127.0.0.1:{port}/json_rpc"))
++            .json(&serde_json::json!({"jsonrpc":"2.0","id":"native-genesis-check","method":"get_block_header_by_height","params":{"height":0}})).send().await?;
++        ensure!(response.status().is_success(),"native genesis check failed");
++        let mut bytes=Vec::new();
++        while let Some(chunk)=response.chunk().await? {ensure!(bytes.len()+chunk.len()<=65536,"oversized genesis response");bytes.extend_from_slice(&chunk);}
++        let envelope:serde_json::Value=serde_json::from_slice(&bytes)?;
++        ensure!(envelope["id"]=="native-genesis-check" && envelope.get("error").is_none()
++            && envelope["result"]["block_header"]["hash"].as_str()==Some(policy.xmz_genesis.as_str()),"XMZ daemon genesis differs from the trade");
+         Ok(())
+     }
+     async fn recovered_wallet(config:&Config,execution:&mut Execution,request:&Request,payout:bool,operation:&str)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,
+             relay::NativeTransferRelay,wallet_session::NativeWalletSession}};
+-        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        use swap_core::litecoin_address::LtcSegwitAddress;
+         ensure!(config.role==if payout {"litecoin-funder"} else {"native-funder"}
+-            && config.policy.ltc_network==LtcNetwork::Regtest,"invalid recovered wallet role or deployment");
++            && staged(&config.policy),"invalid recovered wallet role or deployment");
+         ensure!(matches!(operation,"restore"|"open"|"check"),"invalid recovered wallet operation");
+         let rpc_path=if payout {config.payout_rpc_file.as_deref()} else {config.refund_rpc_file.as_deref()}
+             .context("recovered wallet configuration missing")?;
+@@ -528,9 +549,9 @@ mod linux {
+             ensure!(bytes.len()<=1024 && !bytes.contains(&0),"invalid recovered wallet password");
+             Some(zeroize::Zeroizing::new(std::str::from_utf8(&bytes)?.to_owned()))
+         };
+-        isolated_native(daemon).await?;
++        isolated_native(daemon,&config.policy).await?;
+         let (_ltc_lease,user,secret)=credentials(&cookie)?;
+-        let ltc=LitecoinRpc::new(port,user,secret,LtcNetwork::Regtest,wallet,LtcSegwitAddress::parse(LtcNetwork::Regtest,&anchor)?)?;
++        let ltc=LitecoinRpc::new(port,user,secret,config.policy.ltc_network,wallet,LtcSegwitAddress::parse(config.policy.ltc_network,&anchor)?)?;
+         let block=match block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
+         let (_observer_lease,user,secret)=credentials(&observer.login_file)?;
+         let observer=NativeFundingRpc::new(daemon,observer.wallet_port,user,secret)?;
+@@ -565,8 +586,8 @@ mod linux {
+         let preparing=matches!(operation,PaymentOperation::Prepare);
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             litecoin_negotiation::execution::refund_approval::RefundAction};
+-        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
+-        ensure!(config.role=="native-funder" && config.policy.ltc_network==LtcNetwork::Regtest,
++        use swap_core::litecoin_address::LtcSegwitAddress;
++        ensure!(config.role=="native-funder" && staged(&config.policy),
+             "refund GUI submission is limited to isolated-chain development");
+         let approval=if preparing {
+             ensure!(execution.saved_status()?["nativeRefundPayout"]["attempted"]==false,"cannot prepare an attempted payment");
+@@ -583,10 +604,10 @@ mod linux {
+         ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-refund-rpc",rpc.preparation_observer.as_ref(),
+             rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
+             && payment_location_valid(&rpc.schema,"monzero-private-ltc-refund-rpc",rpc.ltc_refund_block,rpc.wallet_password_file.is_some()),"invalid refund RPC configuration");
+-        isolated_native(rpc.native_daemon_port).await?;
++        isolated_native(rpc.native_daemon_port,&config.policy).await?;
+         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
+-            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet,
++            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
+         let block=match rpc.ltc_refund_block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
+         let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
+         if preparing {
+@@ -625,8 +646,8 @@ mod linux {
+         let preparing=matches!(operation,PaymentOperation::Prepare);
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             litecoin_negotiation::execution::payout_approval::PayoutAction};
+-        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
+-        ensure!(config.role=="litecoin-funder" && config.policy.ltc_network==LtcNetwork::Regtest,
++        use swap_core::litecoin_address::LtcSegwitAddress;
++        ensure!(config.role=="litecoin-funder" && staged(&config.policy),
+             "payout GUI submission is limited to isolated-chain development");
+         let approval=if preparing {
+             ensure!(execution.saved_status()?["nativePayout"]["attempted"]==false,"cannot prepare an attempted payment");
+@@ -643,10 +664,10 @@ mod linux {
+         ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-payout-rpc",rpc.preparation_observer.as_ref(),
+             rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
+             && payment_location_valid(&rpc.schema,"monzero-private-ltc-payout-rpc",rpc.ltc_redeem_block,rpc.wallet_password_file.is_some()),"invalid payout RPC configuration");
+-        isolated_native(rpc.native_daemon_port).await?;
++        isolated_native(rpc.native_daemon_port,&config.policy).await?;
+         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
+-            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet,
++            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
+         let block=match rpc.ltc_redeem_block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
+         let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
+         if preparing {
+@@ -686,8 +707,8 @@ mod linux {
+         let preparing=matches!(operation,FundingOperation::Prepare);
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             litecoin_negotiation::execution::{funding_approval::FundingAction,lock_funding::NativeFundingSource}};
+-        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
+-        ensure!(config.role=="native-funder" && config.policy.ltc_network==LtcNetwork::Regtest,
++        use swap_core::litecoin_address::LtcSegwitAddress;
++        ensure!(config.role=="native-funder" && staged(&config.policy),
+             "funding GUI submission is limited to isolated-chain development");
+         let safety=request.safety_blocks.context("missing funding safety blocks")?;
+         let approval=if preparing {
+@@ -719,7 +740,7 @@ mod linux {
+             ensure!(rpc.matches_source(&execution.review_native_lock_payment(action,safety)?.details),"funding source differs from configured source");
+             None
+         };
+-        isolated_native(rpc.native_daemon_port).await?;
++        isolated_native(rpc.native_daemon_port,&config.policy).await?;
+         let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
+         let mut native=NativeTransferRelay::new(NativeFundingRpc::new(rpc.native_daemon_port,rpc.native_wallet_port,user,password)?);
+         if exporting {
+@@ -742,8 +763,8 @@ mod linux {
+                 "review":{"details":review.details,"commitment":commitment}}));
+         }
+         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
+-            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet.clone(),
++            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
+         if preparing {
+             let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+             let payment=execution.prepare_native_lock(&mut native,&ltc,source.context("missing preparation source")?,safety,now).await?;
+@@ -762,9 +783,9 @@ mod linux {
+     async fn redemption_rpc(config:&Config,execution:&mut Execution,request:&Request,mode:&str)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             litecoin_negotiation::execution::funding_approval::FundingAction};
+-        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        use swap_core::litecoin_address::LtcSegwitAddress;
+         ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder"
+-            && config.policy.ltc_network==LtcNetwork::Regtest,"redemption requires isolated native funder funding configuration");
++            && staged(&config.policy),"redemption requires isolated native funder funding configuration");
+         if mode=="--redemption-review-stdio-v1" {
+             let review=execution.review_completed_redeem()?;
+             return Ok(serde_json::json!({"schema":"monzero-ltc-redemption-review-response-v1","requestId":request.request_id,
+@@ -780,8 +801,8 @@ mod linux {
+         let (_rpc,bytes)=private_bytes(config.funding_rpc_file.as_deref().context("missing redemption RPC configuration")?,false)?;
+         let rpc:FundingRpc=serde_json::from_slice(&bytes)?;ensure!(rpc.valid(),"invalid redemption RPC configuration");
+         let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
+-            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet.clone(),
++            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
+         if checking {
+             let observation=execution.check_completed_redeem(&ltc).await?;
+             return Ok(serde_json::json!({"schema":"monzero-ltc-redemption-check-response-v1","requestId":request.request_id,
+@@ -791,7 +812,7 @@ mod linux {
+         // prepare, sign or send native funds, nor impose a new lock margin.
+         ensure!(rpc.matches_source(&execution.review_native_lock_payment(FundingAction::Retransmit,1)?.details),
+             "redemption native source differs from configured source");
+-        isolated_native(rpc.native_daemon_port).await?;
++        isolated_native(rpc.native_daemon_port,&config.policy).await?;
+         let (_login,user,password)=credentials(&rpc.native_login_file)?;
+         let native=NativeTransferRelay::new(NativeFundingRpc::new(rpc.native_daemon_port,rpc.native_wallet_port,user,password)?);
+         let outcome=execution.submit_reviewed_completed_redeem(&native,&ltc,approved.context("missing redemption approval")?).await?;
+@@ -815,11 +836,11 @@ mod linux {
+     // cancellation or the agreed punishment path. No new funding is authorized.
+     async fn native_recovery_rpc(config:&Config,execution:&mut Execution,request:&Request,mode:&str)->Result<serde_json::Value> {
+         use swap_machine::litecoin_rpc::LitecoinRpc;
+-        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        use swap_core::litecoin_address::LtcSegwitAddress;
+         ensure!(valid_request(request,mode),"invalid native-funder recovery request");
+         let (kind,name,operation)=native_recovery_mode(mode).context("invalid native-funder recovery mode")?;
+         ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder"
+-            && config.policy.ltc_network==LtcNetwork::Regtest,"recovery requires isolated native funder configuration");
++            && staged(&config.policy),"recovery requires isolated native funder configuration");
+         let schema=format!("monzero-ltc-native-recovery-{name}-{operation}-response-v1");
+         if operation=="review" {
+             let review=execution.review_recovery_spend(kind)?;
+@@ -836,8 +857,8 @@ mod linux {
+         let rpc:FundingRpc=serde_json::from_slice(&bytes)?;
+         ensure!(rpc.valid(),"invalid native-funder recovery RPC configuration");
+         let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet,
+-            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet,
++            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
+         if operation=="check" {
+             let observation=execution.check_recovery_spend(&ltc,kind).await?;
+             return Ok(serde_json::json!({"schema":schema,"requestId":request.request_id,
+@@ -1248,6 +1269,25 @@ mod linux {
+         std::io::stdout().write_all(&result)?;
+         Ok(())
+     }
++    #[cfg(test)]
++    mod deployment_tests {
++        use super::*;
++        fn policy(ltc:&str,xmz:&str)->Policy {
++            serde_json::from_value(serde_json::json!({"ltc_network":ltc,"xmz_network":xmz,"xmz_genesis":"ab".repeat(32),
++                "ltc_confirmations":2,"xmz_confirmations":10,"cancel_blocks":20,"punish_blocks":10,
++                "maximum_ltc_atoms":1,"maximum_xmz_atoms":1,"maximum_ltc_funding_fee":1,"maximum_ltc_recovery_fee":1,
++                "maximum_xmz_fee":1,"minimum_ltc_output":1,"minimum_relay_fee_atoms_per_kb":1})).unwrap()
++        }
++        #[test]
++        fn only_lab_and_testnet_pairs_are_accepted() {
++            assert!(staged(&policy("ltc-regtest","xmz-mainnet")));
++            assert!(staged(&policy("ltc-testnet","xmz-testnet")));
++            for (ltc,xmz) in [("ltc-mainnet","xmz-mainnet"),("ltc-mainnet","xmz-testnet"),("ltc-testnet","xmz-mainnet"),
++                    ("ltc-regtest","xmz-testnet"),("ltc-testnet","xmz-stagenet")] {
++                assert!(!staged(&policy(ltc,xmz)),"{ltc}/{xmz} must be refused");
++            }
++        }
++    }
+ }
+ fn main() {
+     #[cfg(target_os="linux")]
+diff --git a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+index 74b4828aa..7e7cd80e4 100644
+--- a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
++++ b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+@@ -1,4 +1,5 @@
+-//! Explicitly invoked adapter for caller-owned Litecoin regtest/XMZ fakechain.
++//! Explicitly invoked adapter for caller-owned Litecoin regtest/XMZ fakechain,
++//! or caller-run Litecoin testnet/XMZ testnet nodes (testnet coins only).
+ //! Public test identity seeds are unsuitable for live trading. No chain evidence
+ //! is fabricated here: production controllers query the supplied local services.
+ use super::*;
+@@ -17,6 +18,8 @@ struct Request {
+     anchor:String,native_source:String,
+     #[serde(default)] block:Option<bitcoin::BlockHash>,
+     #[serde(default)] password:String,
++    /// Testnet nodes are not created by the fixture; regtest uses its owned datadir.
++    #[serde(default)] ltc_cookie:Option<std::path::PathBuf>,
+ }
+ impl Drop for Request {fn drop(&mut self) {use zeroize::Zeroize;self.password.zeroize();}}
+ fn native(root:&Path,request:&Request,port:u16)->Result<NativeFundingRpc> {
+@@ -25,7 +28,7 @@ fn native(root:&Path,request:&Request,port:u16)->Result<NativeFundingRpc> {
+     NativeFundingRpc::new(request.native_port,port,user.into(),password.into())
+ }
+ fn litecoin(root:&Path,request:&Request)->Result<LitecoinRpc> {
+-    let bytes=zeroize::Zeroizing::new(std::fs::read(root.join("ltc/regtest/.cookie"))?);
++    let bytes=zeroize::Zeroizing::new(std::fs::read(request.ltc_cookie.clone().unwrap_or_else(||root.join("ltc/regtest/.cookie")))?);
+     let (user,password)=std::str::from_utf8(&bytes)?.trim().split_once(':').context("fixture Litecoin credentials")?;
+     LitecoinRpc::new(request.ltc_port,user.into(),password.into(),request.policy.ltc_network,"fixture".into(),
+         swap_core::litecoin_address::LtcSegwitAddress::parse(request.policy.ltc_network,&request.anchor)?)
+@@ -38,8 +41,14 @@ async fn actual_paired_chain_execution()->Result<()> {
+     std::fs::File::open(root.join("request.json"))?.take(32769).read_to_end(&mut bytes)?;
+     ensure!(bytes.len()<=32768,"oversized paired fixture request");
+     let mut request:Request=serde_json::from_slice(&bytes)?;
+-    ensure!(request.policy.ltc_network==swap_core::litecoin_address::LtcNetwork::Regtest,
+-        "paired fixture requires Litecoin regtest");
++    {
++        use swap_core::{litecoin_address::LtcNetwork,xmz_address::XmzNetwork};
++        ensure!(matches!((request.policy.ltc_network,request.policy.xmz_network),
++            (LtcNetwork::Regtest,XmzNetwork::Mainnet)|(LtcNetwork::Testnet,XmzNetwork::Testnet)),
++            "paired fixture requires Litecoin regtest or the testnet pair");
++        ensure!(request.ltc_cookie.is_none()==(request.policy.ltc_network==LtcNetwork::Regtest),
++            "testnet fixture requires an explicit node cookie");
++    }
+     let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+     let trade:uuid::Uuid=request.terms["swapId"].parse()?;
+     let bob_identity=SigningKey::from_bytes(&[1;32]);let alice_identity=SigningKey::from_bytes(&[2;32]);

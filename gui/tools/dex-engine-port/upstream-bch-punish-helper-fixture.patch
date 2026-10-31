@@ -1,0 +1,114 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/punish.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/punish.rs
+@@ -1,9 +1,11 @@
+ use super::*;
++mod helper;
+ use crate::bch_rpc::contract_relay::OwnedBchContractRelay;
+ use agreement::execution::funding::recovery::punish::observation::relay::PunishRelayState;
+ 
+ pub(super) async fn exercise(metadata: &PrivateStore,snapshots: &PrivateStore,setup: &Setup,
+     fixture: &Fixture,rpc: &OwnedBchObserver,server: &Server,cancel:&Transaction,transaction: &Transaction) -> Result<()> {
++    helper::exercise(metadata,snapshots,setup,rpc)?;
+     {let mut state=server.state.lock().unwrap();
+         ensure!(state.cancel.is_none() && state.punish.is_none() && !state.punishment_mature
+             && !state.recovery_output_spent && state.relay_mode==0 && state.redemption_confirmation_mode==0,"unexpected punishment fixture state");
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/punish/helper.rs
+@@ -0,0 +1,97 @@
++//! Real helper cancellation relay against the owned loopback RPC fixture.
++use super::*;
++use std::{path::PathBuf,process::{Command,Stdio},os::unix::fs::PermissionsExt};
++use sha2::{Digest,Sha256};
++fn hex(bytes:&[u8])->String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
++fn save(path:&std::path::Path,bytes:&[u8])->Result<()> {
++    std::fs::write(path,bytes)?;std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;Ok(())
++}
++fn contents(path:&std::path::Path)->Result<std::collections::BTreeMap<std::ffi::OsString,Vec<u8>>> {
++    std::fs::read_dir(path)?.map(|entry| {let entry=entry?;
++        Ok((entry.file_name(),std::fs::read(entry.path())?))}).collect()
++}
++fn invoke(helper: &std::path::Path,path: &std::path::Path,action: &str,
++    commitment: Option<&str>,success: bool) -> Result<Value> {
++    let id=uuid::Uuid::new_v4();
++    let mut request=json!({"schema":format!("monzero-bch-punish-{action}-request-v1"),"requestId":id});
++    if let Some(commitment)=commitment {request["commitment"]=json!(commitment);}
++    let mut child=Command::new(helper).env_clear()
++        .envs(std::env::vars_os().filter(|(key,_)|matches!(key.to_str(),Some("PATH"|"LD_LIBRARY_PATH"))))
++        .arg(format!("--punish-{action}-stdio-v1")).arg(path)
++        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++    let written=child.stdin.take().context("missing helper stdin")?.write_all(&serde_json::to_vec(&request)?);
++    if let Err(error)=written {
++        if success || error.kind()!=std::io::ErrorKind::BrokenPipe {
++            let _=child.kill();let _=child.wait();return Err(error.into())
++        }
++    }
++    let output=child.wait_with_output()?;
++    assert_eq!(output.status.success(),success,"unexpected punishment {action}: {}",String::from_utf8_lossy(&output.stderr));
++    if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++    assert!(output.stderr.is_empty());assert!(output.stdout.len()<=16384);
++    let response:Value=serde_json::from_slice(&output.stdout)?;
++    assert_eq!(response.as_object().unwrap().len(),8);
++    assert_eq!(response["schema"],format!("monzero-bch-punish-{action}-response-v1"));
++    assert_eq!(response["requestId"],id.to_string());assert_eq!(response["executable"],false);
++    assert_eq!(response["chainObserved"],action=="observe");
++    Ok(response)
++}
++pub(super) fn exercise(metadata:&PrivateStore,snapshots:&PrivateStore,setup:&Setup,rpc:&OwnedBchObserver)->Result<()> {
++    let Some(helper)=std::env::var_os("MONZERO_BCH_PUNISH_HELPER") else {
++        ensure!(std::env::var_os("MONZERO_BCH_QT_PUNISH_PROBE").is_none(),"punishment probe lacks helper");return Ok(())
++    };
++    let helper=PathBuf::from(helper);let digest=std::env::var("MONZERO_BCH_PUNISH_HELPER_SHA256")?;
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper
++        && hex(&Sha256::digest(std::fs::read(&helper)?))==digest,"punishment helper pin changed");
++    let original_metadata=metadata;let original_snapshots=snapshots;
++    let original_records=contents(&metadata.0)?;let original_secrets=contents(&snapshots.0)?;
++    // The parent still owns the original journal. Helpers get independent copies.
++    let copied_metadata=copy_store(metadata)?;let copied_snapshots=copy_store(snapshots)?;
++    let metadata=&copied_metadata;let snapshots=&copied_snapshots;
++    let config=PrivateStore::new()?;let quote_path=config.0.join("quote.json");
++    let record=setup.quote.record()?;save(&quote_path,&record)?;
++    let quote:Value=serde_json::from_slice(&record)?;
++    let name=format!("{}.bch-execution-admission-{}",setup.quote.terms()["swapId"],Role::NativeFunder.domain());
++    let retained:Value=serde_json::from_slice(&std::fs::read(metadata.0.join(name))?)?;
++    let admission=config.0.join("admission.json");
++    save(&admission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-admission-v1",
++        "helper":helper,"helperDigest":digest,"quoteFile":quote_path,"quoteCommitment":hex(setup.quote.commitment()),
++        "admittedAt":quote["admittedAt"],"tradeId":setup.quote.terms()["swapId"],
++        "identityPins":[SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++        "policy":setup.policy,"role":"native-funder","metadataDirectory":metadata.0,
++        "snapshotDirectory":snapshots.0,"negotiationPins":retained["pins"]}))?)?;
++    let wrapper=config.0.join("punish.json");
++    save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-punish-v1",
++        "admissionConfigFile":admission,"deploymentCommitment":hex(&rpc.deployment_commitment()?)}))?)?;
++    let mut programs=vec![helper];
++    match (std::env::var_os("MONZERO_BCH_QT_PUNISH_PROBE"),std::env::var("MONZERO_BCH_QT_PUNISH_PROBE_SHA256")) {
++        (None,Err(std::env::VarError::NotPresent))=>{},
++        (Some(path),Ok(digest))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && hex(&Sha256::digest(std::fs::read(&path)?))==digest,"punishment Qt probe pin changed");
++            programs.push(path);
++        },
++        _=>anyhow::bail!("incomplete punishment probe pin"),
++    }
++    let before=contents(&metadata.0)?;let private=contents(&snapshots.0)?;
++    let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++    let expected=execution.review_light_bch_punish_relay(rpc,2030)?;
++    drop(execution);
++    for program in programs {
++        for action in ["review","status"] {
++            let value=invoke(&program,&wrapper,action,None,true)?;
++            assert_eq!(value["tradeId"],setup.quote.terms()["swapId"]);
++            assert_eq!(value["review"]["details"],expected.details);
++            assert_eq!(value["review"]["commitment"],hex(&expected.commitment));
++            assert_eq!(value["relay"],json!({"state":"not-attempted","txid":expected.details["txid"],"confirmed":false}));
++            assert!(value["observation"].is_null());
++            invoke(&program,&wrapper,action,Some(&"00".repeat(32)),false)?;
++        }
++        invoke(&program,&wrapper,"submit",Some(&hex(&expected.commitment)),false)?;
++        assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,private);
++    }
++    assert_eq!(contents(&original_metadata.0)?,original_records);
++    assert_eq!(contents(&original_snapshots.0)?,original_secrets);
++    Ok(())
++}

@@ -176,8 +176,7 @@ bool DaemonManager::startWatcher(NetworkType::Type nettype, const QString &dataD
         if(!running(nettype, dataDir)) {
             qDebug() << "daemon not running. checking again in 2 seconds.";
         } else {
-            qDebug() << "daemon is started. Waiting 5 seconds to let daemon catch up";
-            QThread::sleep(5);
+            qDebug() << "daemon RPC is ready; resume wallet refresh";
             return true;
         }
     }
@@ -285,11 +284,19 @@ bool DaemonManager::sendCommand(const QStringList &cmd, NetworkType::Type nettyp
 
 
     p.start(m_monerod, external_cmd);
-
-    bool started = p.waitForFinished(-1);
+    // These are one-shot commands, never interactive console sessions. An
+    // inherited open stdin or a stuck child must not stall the startup watcher.
+    p.closeWriteChannel();
+    if (!p.waitForStarted(10000) || !p.waitForFinished(15000)) {
+        p.kill();
+        p.waitForFinished(5000);
+        message = tr("Local node command did not finish in time.");
+        emit daemonConsoleUpdated(message);
+        return false;
+    }
     message = p.readAllStandardOutput();
     emit daemonConsoleUpdated(message);
-    return started;
+    return p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0;
 }
 
 void DaemonManager::sendCommandAsync(const QStringList &cmd, NetworkType::Type nettype, const QString &dataDir, const QJSValue& callback) const

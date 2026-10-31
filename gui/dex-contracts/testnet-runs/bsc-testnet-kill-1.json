@@ -1,0 +1,80 @@
+{
+  "bnb": {
+    "claimerAfter": "59991174000000000",
+    "claimerBefore": "39995587000000000",
+    "ownerAfter": "39945288250000000",
+    "ownerBefore": "59953638250000000"
+  },
+  "claimer": {
+    "bnbTxs": {
+      "claim": [
+        "0x4243f8c3eb10d624e4fa9d9039d12f529fdbd2c6a773cf42fddcee9def4d0eb6"
+      ]
+    },
+    "final": "Done(Swapped)",
+    "xmzLock": "8fe30fc63bf839024d8433bfcd24aeb7911cc99bfb0db6d930e9283a9e3665fc",
+    "xmzSweep": null
+  },
+  "contract": "0xf7c19f735C3494b356091eFBeFf3ab53617190b7",
+  "mode": "swap",
+  "owner": {
+    "bnbTxs": {
+      "new_swap": [
+        "0xdeb00a614caede960f783d9f688a0aeb0a5be7aceae88c505380057dfbab64aa"
+      ],
+      "set_ready": [
+        "0xdae16870d9a5d37d455e702cf54b9bba40795b4a7b8b710bb603182e7f401fc7"
+      ]
+    },
+    "final": "Done(Swapped)",
+    "xmz": [
+      {
+        "tx_hash": "09e907bba8fea097b9ba9b6fbe1052c2bdb5ec9b9741f18fb13d11d5f4129838"
+      }
+    ]
+  },
+  "ownerXmzAddress": "Kd3TWuxs85AZvN2CiWB8XgReM2m46qoLWgAGnzvBRemPQ1z777GzFqpCG3NoWpKrkJCJz3ccWpC6uK1EqvUyU7XxTSdFWjW",
+  "sharedXmzAddress": "KeLbaqpMtyr3q27EQJUHFPSBX4jT4GWLFVRT8Mr28ZFDcgi2uyC65WB6m3m47DEfFGGT9oyKVYmNgRN7fZXKwd3s711ECLw",
+  "tradeId": "0x75cd3901036e8685fb66e00ef023c6c0db1e25a559122e8acb58dcb987cf7b6c",
+  "kills": {
+    "total": 22,
+    "random": 10,
+    "onNewStage": 12,
+    "log": [
+      "14:56:48 KILL #1 (random)",
+      "14:57:21 KILL #2 (new stage: owner -> LockSent)",
+      "14:57:27 KILL #3 (new stage: ",
+      "14:57:36 KILL #4 (new stage: ",
+      "14:57:41 KILL #5 (new stage: ",
+      "14:58:17 KILL #6 (new stage: owner -> Locked)",
+      "14:58:47 KILL #7 (new stage: owner -> Locked)",
+      "14:59:33 KILL #8 (new stage: claimer -> XmzLockSent)",
+      "15:03:10 KILL #9 (random)",
+      "15:07:56 KILL #10 (random)",
+      "15:12:34 KILL #11 (random)",
+      "15:13:10 KILL #12 (new stage: owner -> ReadySent)",
+      "15:13:48 KILL #13 (new stage: owner -> Ready)",
+      "15:14:30 KILL #14 (new stage: owner -> Sweeping)",
+      "15:15:07 KILL #15 (new stage: claimer -> Done(Swapped))",
+      "15:16:02 KILL #16 (random)",
+      "15:18:55 KILL #17 (random)",
+      "15:22:35 KILL #18 (random)",
+      "15:25:54 KILL #19 (random)",
+      "15:30:26 KILL #20 (random)",
+      "15:34:55 KILL #21 (random)",
+      "15:35:53 KILL #22 (new stage: owner -> Done(Swapped))"
+    ]
+  },
+  "verified": {
+    "ownerXmzWallet": "19.990304 tXMZ unlocked (20 less the sweep fee; XMZ has 11 decimals)",
+    "claimerBnbGain": "0.019995587 tBNB (0.02 less claim gas)",
+    "oncePerTransaction": "journals hold exactly one newSwap, setReady and claim; one XMZ lock and one XMZ sweep",
+    "bothFinal": "Done(Swapped)"
+  },
+  "notes": [
+    "SIGKILL to the runner and all four XMZ wallet RPCs (systemd cgroup) at the first appearance of each stage plus random moments; not a power cut (no lost disk writes)",
+    "Kills #2-#5 came back to back on LockSent because of a supervisor counting bug (fixed mid-run); they are kept as an extra stress case",
+    "One claimer tick at 15:03:38 failed: relay_tx 'Pending transaction inputs do not match the open wallet' (wallet killed before saving reopened behind); the next tick succeeded; engine now refreshes before giving up",
+    "Supervisor: engine/examples/bsc-testnet-killrun.sh; runner with Driver::start/resume and approval"
+  ]
+}

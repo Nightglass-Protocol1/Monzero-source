@@ -1,0 +1,185 @@
+diff --git a/swap-machine/src/litecoin_light/session/wallet.rs b/swap-machine/src/litecoin_light/session/wallet.rs
+--- a/swap-machine/src/litecoin_light/session/wallet.rs
++++ b/swap-machine/src/litecoin_light/session/wallet.rs
+@@ -13,6 +13,8 @@
+     pub history_entries_per_branch:usize,
+ }
+ pub struct WalletObservation {
++    allocated:[u32;2],
++    gap:u32,
+     receive:BranchScan,
+     change:BranchScan,
+     accounting:ObservedWallet,
+@@ -111,7 +113,7 @@
+         }
+         let pending_reports=pending.len();
+         let accounting=ObservedWallet::reconcile_with_pending(chain,&scripts,&transactions,&pending)?;
+-        Ok(WalletObservation {receive,change,accounting,pending_reports,origins,transactions,
++        Ok(WalletObservation {allocated,gap:limits.gap,receive,change,accounting,pending_reports,origins,transactions,
+             account:PublicAccount::from_descriptor(&account.descriptor(),account.network())?})
+     }
+ }
+@@ -120,3 +122,6 @@
+ 
+ #[cfg(target_os="linux")]
+ mod payment;
++
++#[cfg(target_os="linux")]
++pub mod recovery;
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery.rs b/swap-machine/src/litecoin_light/session/wallet/recovery.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery.rs
+@@ -0,0 +1,78 @@
++//! Reviewed, bounded recovery of address allocations from a wallet observation.
++//! A server-reported gap never proves complete history or absence of funds.
++use super::*;
++use crate::litecoin_light::{headers::HeaderSequence,account::allocation::AddressBook};
++use bitcoin::hashes::{Hash,sha256};
++use serde_json::{Value,json};
++
++/// Constructed only from a successful two-branch observation. No deserialization
++/// or public constructor: caller-supplied scan claims cannot become coverage.
++pub struct RecoveryCoverage {
++    review:Value,
++    commitment:sha256::Hash,
++    before:sha256::Hash,
++    target:[u32;2],
++    account:PublicAccount,
++    height:u32,
++    tip:bitcoin::BlockHash,
++}
++impl RecoveryCoverage {
++    pub fn review(&self)->&Value {&self.review}
++    pub fn commitment(&self)->sha256::Hash {self.commitment}
++    pub fn allocated_after(&self)->[u32;2] {self.target}
++
++    /// Requires exact approval and the unchanged selected chain. Existing
++    /// allocation identities survive. An exact completed retry is a no-op;
++    /// unrelated allocation changes require a fresh scan/review. This neither
++    /// activates an imported wallet nor refreshes its encrypted backup.
++    pub fn retain_on(&self,chain:&HeaderSequence,book:&mut AddressBook,approved:sha256::Hash)->Result<()> {
++        ensure!(approved==self.commitment,"recovery coverage differs from approval");
++        ensure!(chain.network()==self.account.network() && chain.height()==self.height
++            && chain.contains(self.height,self.tip),"recovery coverage chain changed");
++        let (descriptor,bytes)=book.backup_parts()?;
++        ensure!(serde_json::to_vec(&descriptor)?==serde_json::to_vec(&self.account.descriptor())?,
++            "recovery coverage account changed");
++        let current=[book.allocated_count(Branch::Receive)?,book.allocated_count(Branch::Change)?];
++        if sha256::Hash::hash(&bytes)!=self.before {
++            ensure!(current==self.target,"recovery allocations changed since review");
++            return Ok(());
++        }
++        book.retain_discovered(self.target)
++    }
++}
++impl WalletObservation {
++    /// Recover all scanned indices, including apparently unused addresses.
++    /// `known_minimum` is an explicit prior allocation bound, not a balance or
++    /// completeness assertion. Both scans must have covered that bound and the
++    /// existing book before counting their reported gap.
++    pub fn review_recovery_coverage(&self,chain:&HeaderSequence,book:&AddressBook,known_minimum:[u32;2])->Result<RecoveryCoverage> {
++        ensure!(chain.network()==self.account.network() && chain.height()==self.accounting.height()
++            && chain.contains(self.accounting.height(),self.accounting.tip()),"recovery discovery chain changed");
++        let (descriptor,bytes)=book.backup_parts()?;
++        ensure!(serde_json::to_vec(&descriptor)?==serde_json::to_vec(&self.account.descriptor())?,
++            "recovery discovery account mismatch");
++        let current=[book.allocated_count(Branch::Receive)?,book.allocated_count(Branch::Change)?];
++        let scans=[&self.receive,&self.change];
++        let target=[self.receive.scanned(),self.change.scanned()];
++        ensure!(target[0].checked_add(target[1]).is_some_and(|total|total<=10_000),"recovery allocation capacity exceeded");
++        for branch in 0..2 {
++            ensure!(self.allocated[branch]>=known_minimum[branch] && self.allocated[branch]>=current[branch]
++                && scans[branch].stop()==ScanStop::ReportedGap
++                && self.allocated[branch].checked_add(self.gap).is_some_and(|end|target[branch]>=end),
++                "recovery scan does not cover required allocations and gap");
++        }
++        let before=sha256::Hash::hash(&bytes);
++        let review=json!({"schema":format!("monzero-{}-recovery-coverage-v1",self.account.network().tag()),
++            "network":self.account.network().name(),"account":descriptor,
++            "height":self.accounting.height(),"tip":self.accounting.tip().to_string(),
++            "allocationDigest":before.to_string(),"allocatedBefore":current,"knownMinimum":known_minimum,
++            "scanAllocatedMinimum":self.allocated,"reportedGap":self.gap,"allocatedAfter":target,
++            "historyCompleteness":"unproven","activeSwapRecovery":false,"backupRefreshRequired":true});
++        let commitment=sha256::Hash::hash(&serde_json::to_vec(&review)?);
++        Ok(RecoveryCoverage {review,commitment,before,target,
++            account:PublicAccount::from_descriptor(&self.account.descriptor(),self.account.network())?,
++            height:self.accounting.height(),tip:self.accounting.tip()})
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs b/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs
+@@ -0,0 +1,69 @@
++use super::*;
++use crate::litecoin_light::{network::{BtcNetwork,BchNetwork,DogeNetwork},session::tests::{reply,server}};
++use bitcoin::{bip32::Xpriv,NetworkKind};
++use std::{fs,path::PathBuf,os::unix::fs::PermissionsExt};
++use uuid::Uuid;
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().join(format!("recovery-coverage-{}",Uuid::new_v4()));
++    fs::create_dir(&path)?;fs::set_permissions(&path,fs::Permissions::from_mode(0o700))?;Ok(Self(path.canonicalize()?))}}
++impl Drop for Directory {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
++fn account(network:LightNetwork,seed:u8)->Result<PublicAccount> {
++    PublicAccount::from_master(&Xpriv::new_master(NetworkKind::Test,&[seed;32])?,network,0)
++}
++async fn empty_scan(network:LightNetwork,minimum:[u32;2])->Result<(HeaderSequence,WalletObservation)> {
++    let mut responses=vec![reply(1,json!(["fixture","1.4"])),reply(2,json!({"genesis_hash":network.genesis(),
++        "hash_function":"sha256","server_version":"fixture","protocol_min":"1.4","protocol_max":"1.4.3","hosts":{}}))];
++    for id in 3..3+minimum[0]+minimum[1]+4 {responses.push(reply(id as u64,json!([])));}
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,network).await?;
++    let chain=HeaderSequence::new(network)?;
++    let observation=session.refresh_wallet(&chain,&account(network,1)?,minimum,
++        &RefreshLimits {gap:2,addresses_per_branch:10,history_entries_per_branch:10}).await?;
++    drop(session);task.await?;Ok((chain,observation))
++}
++#[tokio::test]
++async fn approved_recovery_reserves_empty_scanned_ranges_and_preserves_existing_requests()->Result<()> {
++    for network in [LightNetwork::Litecoin(LtcNetwork::Regtest),LightNetwork::Bitcoin(BtcNetwork::Regtest),
++        LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
++        let directory=Directory::new()?;let mut book=AddressBook::create(&directory.0,account(network,1)?)?;
++        let existing=Uuid::new_v4();let first=book.reserve(existing,Branch::Receive)?.address().to_string();
++        let (chain,observation)=empty_scan(network,[2,1]).await?;
++        assert!(observation.review_recovery_coverage(&chain,&book,[3,1]).is_err());
++        let review=observation.review_recovery_coverage(&chain,&book,[2,1])?;
++        assert_eq!(review.allocated_after(),[4,3]);
++        assert_eq!(review.review()["historyCompleteness"],"unproven");
++        assert_eq!(review.review()["backupRefreshRequired"],true);
++        let before=fs::read(directory.0.join("litecoin-address-book.json"))?;
++        assert!(review.retain_on(&chain,&mut book,sha256::Hash::hash(b"wrong approval")).is_err());
++        assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,before);
++        let wrong_chain=HeaderSequence::new(if network==LightNetwork::Litecoin(LtcNetwork::Regtest) {
++            LightNetwork::Bitcoin(BtcNetwork::Regtest)}else{LightNetwork::Litecoin(LtcNetwork::Regtest)})?;
++        assert!(review.retain_on(&wrong_chain,&mut book,review.commitment()).is_err());
++        let other=Directory::new()?;let mut other_book=AddressBook::create(&other.0,account(network,2)?)?;
++        assert!(review.retain_on(&chain,&mut other_book,review.commitment()).is_err());
++        review.retain_on(&chain,&mut book,review.commitment())?;
++        assert_eq!(book.reserved(existing,Branch::Receive)?.unwrap().address().to_string(),first);
++        let retained=fs::read(directory.0.join("litecoin-address-book.json"))?;drop(book);
++        let mut reopened=AddressBook::open(&directory.0,account(network,1)?)?;
++        review.retain_on(&chain,&mut reopened,review.commitment())?;
++        assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,retained);
++        assert!(reopened.reserve(Uuid::new_v4(),Branch::Receive)?.path().to_string().ends_with("/0/4"));
++        assert!(reopened.reserve(Uuid::new_v4(),Branch::Change)?.path().to_string().ends_with("/1/3"));
++        let later=fs::read(directory.0.join("litecoin-address-book.json"))?;
++        assert!(review.retain_on(&chain,&mut reopened,review.commitment()).is_err());
++        assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,later);
++    }
++    Ok(())
++}
++#[tokio::test]
++async fn recovery_review_rejects_book_allocations_not_covered_before_gap()->Result<()> {
++    let network=LightNetwork::Litecoin(LtcNetwork::Regtest);
++    let directory=Directory::new()?;let mut book=AddressBook::create(&directory.0,account(network,1)?)?;
++    let (chain,observation)=empty_scan(network,[0,0]).await?;
++    let review=observation.review_recovery_coverage(&chain,&book,[0,0])?;
++    book.reserve(Uuid::new_v4(),Branch::Receive)?;
++    assert!(observation.review_recovery_coverage(&chain,&book,[0,0]).is_err());
++    let before=fs::read(directory.0.join("litecoin-address-book.json"))?;
++    assert!(review.retain_on(&chain,&mut book,review.commitment()).is_err());
++    assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,before);
++    Ok(())
++}

@@ -1,0 +1,114 @@
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index ed1ca837f..c743b1f31 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -374,6 +374,109 @@ async fn native_exact_net_top_up_preview() -> Result<()> {
+     Ok(())
+ }
+ 
++#[cfg(unix)]
++#[tokio::test]
++#[ignore = "requires an open buyer fixture wallet holding at least the reserve"]
++async fn native_topup_dispatch() -> Result<()> {
++    use swap_machine::native_funding_rpc::topup_dispatch::dispatch_topup;
++    use swap_machine::native_funding_rpc::topup_journal::TopUpRequest;
++    use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
++    let address = |name| -> Result<XmzAddress> {
++        Ok(XmzAddress::parse(XmzNetwork::Mainnet, &std::env::var(name)?)?)
++    };
++    let buyer_wallet = address("MONZERO_TEST_TOPUP_BUYER_WALLET")?;
++    let destination = address("MONZERO_TEST_TOPUP_DESTINATION")?;
++    anyhow::ensure!(buyer_wallet != destination, "fixture requires distinct buyer wallet and destination");
++    let lock_txid = std::env::var("MONZERO_TEST_TOPUP_LOCK")?;
++    anyhow::ensure!(lock_txid.len() == 64, "invalid topup fixture lock txid");
++    let reserve = XmzAmount::from_atom_string(&std::env::var("MONZERO_TEST_TOPUP_RESERVE_ATOMS")?)
++        .map_err(|_| anyhow::anyhow!("invalid topup fixture reserve"))?;
++    let maximum_fee = XmzAmount::from_atom_string(&std::env::var("MONZERO_TEST_TOPUP_MAX_FEE_ATOMS")?)
++        .map_err(|_| anyhow::anyhow!("invalid topup fixture fee ceiling"))?;
++    let genesis = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
++    let journal_directory = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_TOPUP_JOURNAL")
++        .context("missing topup fixture journal directory")?);
++    let request = TopUpRequest { buyer_wallet: buyer_wallet.clone(), destination: destination.clone(),
++        lock_txid: lock_txid.clone(), reserve, maximum_fee, account: 0, priority: 1 };
++
++    // Wrong chain must fail before broadcast; the buyer's wallet stays untouched.
++    let error = dispatch_topup(native_rpc::authenticated_fixture()?, &journal_directory,
++        &"0".repeat(64), request.clone()).await.err().context("accepted wrong topup chain")?;
++    anyhow::ensure!(error.to_string() == "unexpected relay chain", "unexpected topup chain rejection");
++
++    let outcome = dispatch_topup(native_rpc::authenticated_fixture()?, &journal_directory,
++        genesis, request.clone()).await?;
++    anyhow::ensure!(outcome.receipt_persisted, "topup receipt not persisted");
++    anyhow::ensure!(outcome.transfer.fee.atoms() > 0 && outcome.transfer.weight > 0, "invalid dispatched topup transfer");
++
++    // The same approved intent must never dispatch a second payment: the
++    // durable reservation itself rejects it before any RPC call.
++    let error = dispatch_topup(native_rpc::authenticated_fixture()?, &journal_directory,
++        genesis, request).await.err().context("accepted duplicate topup dispatch")?;
++    anyhow::ensure!(error.downcast_ref::<std::io::Error>().map(std::io::Error::kind)
++        == Some(std::io::ErrorKind::AlreadyExists), "unexpected duplicate-dispatch rejection: {error}");
++
++    anyhow::ensure!(export_fixture("MONZERO_TEST_TOPUP_RESULT", &format!("{}\n", outcome.transfer.txid))?,
++        "missing topup fixture result path");
++    Ok(())
++}
++
++#[cfg(unix)]
++#[tokio::test]
++#[ignore = "requires a recovered swap wallet funded by a lock and a confirmed top-up"]
++async fn native_exact_net_claim() -> Result<()> {
++    use swap_machine::native_funding_rpc::exact_net_claim::{ExactNetClaimRequest, claim_exact_net_with_topup};
++    use swap_machine::native_funding_rpc::wallet_session::SwapWalletId;
++    use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
++    let address = |name| -> Result<XmzAddress> {
++        Ok(XmzAddress::parse(XmzNetwork::Mainnet, &std::env::var(name)?)?)
++    };
++    let wallet = address("MONZERO_TEST_CLAIM_WALLET")?;
++    let destination = address("MONZERO_TEST_CLAIM_DESTINATION")?;
++    let reserve_return = address("MONZERO_TEST_CLAIM_RETURN")?;
++    anyhow::ensure!(wallet != destination && wallet != reserve_return && destination != reserve_return,
++        "fixture requires distinct claim wallet, destination and return addresses");
++    let spend_key = std::env::var("MONZERO_TEST_CLAIM_SPEND_KEY")?;
++    let view_key = std::env::var("MONZERO_TEST_CLAIM_VIEW_KEY")?;
++    let restore_height: u64 = std::env::var("MONZERO_TEST_CLAIM_RESTORE_HEIGHT")?.parse()?;
++    let lock_txid = std::env::var("MONZERO_TEST_CLAIM_LOCK_TXID")?;
++    let top_up_txid = std::env::var("MONZERO_TEST_CLAIM_TOPUP_TXID")?;
++    anyhow::ensure!(lock_txid.len() == 64 && top_up_txid.len() == 64, "invalid claim fixture transaction ids");
++    let locked = XmzAmount::from_atom_string(&std::env::var("MONZERO_TEST_CLAIM_LOCKED_ATOMS")?)
++        .map_err(|_| anyhow::anyhow!("invalid claim fixture locked amount"))?;
++    let principal = XmzAmount::from_atom_string(&std::env::var("MONZERO_TEST_CLAIM_PRINCIPAL_ATOMS")?)
++        .map_err(|_| anyhow::anyhow!("invalid claim fixture principal"))?;
++    let maximum_fee = XmzAmount::from_atom_string(&std::env::var("MONZERO_TEST_CLAIM_MAX_FEE_ATOMS")?)
++        .map_err(|_| anyhow::anyhow!("invalid claim fixture fee ceiling"))?;
++    let genesis = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
++    let journal_directory = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_CLAIM_JOURNAL")
++        .context("missing claim fixture journal directory")?);
++    let (daemon, wallet_port, username, password) = native_rpc::fixture_connection()?;
++    let request = |id: SwapWalletId| ExactNetClaimRequest {
++        journal_directory: journal_directory.clone(), id, password: "fixture-password".into(),
++        spend_key: spend_key.clone(), view_key: view_key.clone(), restore_height,
++        wallet: wallet.clone(), destination: destination.clone(), reserve_return: reserve_return.clone(),
++        lock_txid: lock_txid.clone(), top_up_txid: top_up_txid.clone(), locked, principal, maximum_fee,
++        account: 0, priority: 1 };
++
++    // Wrong chain must fail after restore/import, without leaving the wallet open.
++    let error = claim_exact_net_with_topup(daemon, wallet_port, username.clone(), password.clone(),
++        XmzNetwork::Mainnet, &"0".repeat(64), request(SwapWalletId::new(Uuid::new_v4())?)).await
++        .err().context("accepted wrong claim chain")?;
++    anyhow::ensure!(error.to_string() == "unexpected exact-net chain", "unexpected claim chain rejection");
++    anyhow::ensure!(native_rpc::authenticated_fixture()?.opened_wallet(XmzNetwork::Mainnet).await?.is_none(),
++        "rejected claim left the recovered wallet open");
++
++    let outcome = claim_exact_net_with_topup(daemon, wallet_port, username, password,
++        XmzNetwork::Mainnet, genesis, request(SwapWalletId::new(Uuid::new_v4())?)).await?;
++    anyhow::ensure!(outcome.wallet_closed, "claim did not close the recovered wallet");
++    anyhow::ensure!(outcome.transfer.fee.atoms() > 0 && outcome.transfer.weight > 0, "invalid claim transfer");
++
++    anyhow::ensure!(export_fixture("MONZERO_TEST_CLAIM_RESULT", &format!("{}\n", outcome.transfer.txid))?,
++        "missing claim fixture result path");
++    Ok(())
++}
++
+ #[cfg(unix)]
+ #[tokio::test]
+ #[ignore = "requires a disposable authenticated wallet RPC and private credential file"]

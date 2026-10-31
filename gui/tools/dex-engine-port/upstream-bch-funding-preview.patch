@@ -1,0 +1,272 @@
+--- a/swap-core/src/bch.rs
++++ b/swap-core/src/bch.rs
+@@ -77,3 +77,5 @@
+ pub mod covenant;
+ pub mod spend;
+ pub mod recovery;
++
++pub mod funding;
+--- a/swap-core/src/bch/covenant.rs
++++ b/swap-core/src/bch/covenant.rs
+@@ -96,7 +96,7 @@
+     }
+ }
+ 
+-fn supported_destination(script: &Script) -> bool {
++pub(super) fn supported_destination(script: &Script) -> bool {
+     let bytes = script.as_bytes();
+     script.is_p2pkh() || script.is_p2sh()
+         || (bytes.len() == 35 && bytes[..2] == [0xaa, 0x20] && bytes[34] == 0x87)
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
+@@ -6,7 +6,7 @@
+ use crate::litecoin_rpc::reservation::Journal;
+ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt};
+ 
+-const SCHEMA: &str = "monzero-bch-execution-admission-v1";
++const SCHEMA: &str = "monzero-bch-execution-admission-v2";
+ 
+ #[derive(Clone,Serialize,Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -16,7 +16,7 @@
+ }
+ #[derive(Serialize,Deserialize)]
+ #[serde(deny_unknown_fields)]
+-struct Admission { schema: String, trade: String, quote: [u8;32], role: Role, pins: NegotiationPins }
++struct Admission { schema: String, trade: String, quote: [u8;32], role: Role, admitted_at: u64, pins: NegotiationPins }
+ 
+ /// One live controller holds the metadata directory's nonblocking process lease.
+ /// The caller must trust that directory independently of its secret snapshots.
+@@ -50,6 +50,21 @@
+ }
+ 
+ impl<'a> AdmittedExecution<'a> {
++    /// Review an unsigned BCH-funder template against the complete admitted
++    /// exchange. The wallet adapter must establish change/input ownership and
++    /// live chain state; this method does not reserve inputs or authorize signing.
++    pub fn validate_bch_funding_preview(&self, now: u64, unsigned: &[u8], sources: &[&[u8]],
++        change: &bitcoin::Script, maximum_fee: u64, minimum_change: u64)
++        -> Result<swap_core::bch::funding::FundingPreview> {
++        let admission = self.read_admission()?;
++        ensure!(now >= admission.admitted_at,"BCH funding review predates execution admission");
++        let agreed = self.restore_agreement()?;
++        let plan = self.quote.recovery_plan();
++        let amount = plan.terms().locked_atoms;
++        agreed.check_bch_funding(self.quote,self.policy,now,&plan.lock().script_pubkey(),amount,maximum_fee)?;
++        swap_core::bch::funding::FundingPreview::verify(unsigned,sources,plan.lock(),amount,change,maximum_fee,minimum_change)
++    }
++
+     /// Admit only a currently valid reviewed quote and an entirely revalidated
+     /// negotiation. The reviewed digest is an input from the separate review UI,
+     /// not evidence that the user approved funding or any particular transaction.
+@@ -62,7 +77,7 @@
+         let agreed = validate(snapshots,quote,policy,role,&pins)?;
+         ensure!(now >= agreed.agreed_at,"BCH execution admission predates agreement");
+         let admission = Admission {schema:SCHEMA.into(),trade:quote.terms()["swapId"].clone(),
+-            quote:*reviewed_quote,role,pins};
++            quote:*reviewed_quote,role,admitted_at:now,pins};
+         metadata.retain(&name(quote,role),&serde_json::to_vec(&admission)?)?;
+         Ok(Self {metadata,snapshots:snapshots.into(),quote,policy,role})
+     }
+@@ -79,12 +94,19 @@
+     /// Revalidate every predecessor under the metadata lease before exposing
+     /// recovery material. Funding still requires its separate policy/state flow.
+     pub fn restore_agreement(&self) -> Result<AgreedNativeWallet> {
++        let admission = self.read_admission()?;
++        let agreed = validate(&self.snapshots,self.quote,self.policy,self.role,&admission.pins)?;
++        ensure!(admission.admitted_at >= agreed.agreed_at,"BCH execution admission predates agreement");
++        Ok(agreed)
++    }
++    fn read_admission(&self) -> Result<Admission> {
+         let bytes = self.metadata.read(&name(self.quote,self.role))?;
+         ensure!(bytes.len() <= 4096,"oversized BCH execution admission");
+         let admission: Admission = serde_json::from_slice(&bytes)?;
+         ensure!(admission.schema == SCHEMA && admission.trade == self.quote.terms()["swapId"]
+             && admission.quote == *self.quote.commitment() && admission.role == self.role
+             && serde_json::to_vec(&admission)? == bytes,"BCH execution admission context mismatch");
+-        validate(&self.snapshots,self.quote,self.policy,self.role,&admission.pins)
++        self.quote.check_policy(self.policy,admission.admitted_at)?;
++        Ok(admission)
+     }
+ }
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -730,6 +730,24 @@
+         drop(execution);
+         let execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role)?;
+         assert_eq!(execution.restore_agreement()?.commitment(),agreed.commitment());
++        let change = setup.quote.recovery_plan().recovery().terms().redeem_destination.clone();
++        let amount = setup.quote.recovery_plan().terms().locked_atoms;
++        let source = Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++            input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
++                script_sig:bitcoin::ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++            output:vec![TxOut {value:Amount::from_sat(amount+11_000),script_pubkey:change.clone()}]};
++        let mut funding = source.clone();
++        funding.input[0].previous_output = OutPoint {txid:source.compute_txid(),vout:0};
++        funding.output = vec![TxOut {value:Amount::from_sat(amount),script_pubkey:setup.quote.recovery_plan().lock().script_pubkey()},
++            TxOut {value:Amount::from_sat(10_000),script_pubkey:change.clone()}];
++        let raw = serialize(&funding); let parent = serialize(&source);
++        let preview = execution.validate_bch_funding_preview(1006,&raw,&[&parent],&change,1000,546);
++        if role == Role::BchFunder { assert_eq!(preview?.fee().to_sat(),1000); }
++        else { assert!(preview.is_err()); }
++        assert!(execution.validate_bch_funding_preview(1004,&raw,&[&parent],&change,1000,546).is_err());
++        assert!(execution.validate_bch_funding_preview(2000,&raw,&[&parent],&change,1000,546).is_err());
++        assert!(execution.validate_bch_funding_preview(1006,&raw,&[&parent],&change,5001,546).is_err());
++        assert!(execution.validate_bch_funding_preview(1006,&raw,&[&parent],&change,999,546).is_err());
+         drop(execution);
+         // An identical admission is an idempotent retry, not a replacement.
+         drop(admit(&metadata.0,setup.quote.commitment(),pins,1005)?);
+--- /dev/null
++++ b/swap-core/src/bch/funding.rs
+@@ -0,0 +1,151 @@
++//! Unsigned native-BCH funding review. Previous transaction bytes bind input
++//! amounts/scripts, but are not proof of chain membership, maturity, wallet
++//! ownership or availability. No signature, reservation or relay is performed.
++use anyhow::{Context,Result,ensure};
++use bitcoin::{absolute,consensus::{deserialize,serialize},transaction::Version,
++    Amount,Script,Transaction,TxOut,Sequence};
++use std::collections::HashSet;
++use super::covenant::{Covenant,supported_destination};
++
++const MAX_MONEY: u64 = 2_100_000_000_000_000;
++const MAX_BYTES: usize = 2_000_000;
++
++/// Immutable reviewed template. Its transaction ID is provisional: BCH legacy
++/// input signatures change it. Never use the unsigned ID for a recovery spend.
++pub struct FundingPreview { transaction: Transaction, previous_outputs: Vec<TxOut>, fee: Amount, lock_vout: u32 }
++impl FundingPreview {
++    pub fn transaction(&self) -> &Transaction { &self.transaction }
++    pub fn previous_outputs(&self) -> &[TxOut] { &self.previous_outputs }
++    pub fn fee(&self) -> Amount { self.fee }
++    pub fn lock_vout(&self) -> u32 { self.lock_vout }
++
++    /// Sources must be full canonical previous transactions in input order.
++    /// The caller supplies a wallet-owned change script and explicit fee/dust
++    /// policy; source bytes alone cannot prove ownership or live spendability.
++    pub fn verify(raw: &[u8], sources: &[&[u8]], covenant: &Covenant, locked_atoms: u64,
++        change: &Script, maximum_fee: u64, minimum_change: u64) -> Result<Self> {
++        ensure!(locked_atoms > 0 && locked_atoms <= MAX_MONEY && maximum_fee > 0
++            && maximum_fee <= MAX_MONEY && minimum_change > 0 && minimum_change <= MAX_MONEY,
++            "invalid BCH funding amount policy");
++        let lock = covenant.script_pubkey();
++        ensure!(supported_destination(change) && change != lock.as_script(),"invalid BCH funding change destination");
++        let transaction = decode(raw)?;
++        ensure!(transaction.version == Version::TWO && transaction.lock_time == absolute::LockTime::ZERO
++            && !transaction.input.is_empty() && transaction.input.len() <= 128
++            && sources.len() == transaction.input.len() && (1..=2).contains(&transaction.output.len()),
++            "unexpected BCH funding template shape");
++        let source_bytes = sources.iter().try_fold(0usize,|sum,source|sum.checked_add(source.len()))
++            .context("BCH funding source size overflow")?;
++        ensure!(source_bytes <= 8_000_000,"oversized BCH funding source bundle");
++        let mut seen = HashSet::new(); let mut previous_outputs = Vec::new(); let mut input_total = 0u64;
++        for (input,source) in transaction.input.iter().zip(sources) {
++            ensure!(!input.previous_output.is_null() && seen.insert(input.previous_output)
++                && input.sequence == Sequence::MAX && input.script_sig.is_empty() && input.witness.is_empty(),
++                "duplicate, nonfinal or signed BCH funding input");
++            let parent = decode(source)?;
++            ensure!(parent.compute_txid() == input.previous_output.txid,"BCH input source transaction mismatch");
++            let output = parent.output.get(input.previous_output.vout as usize).context("missing BCH funding source output")?;
++            ensure!(output.value > Amount::ZERO && supported_destination(&output.script_pubkey),
++                "unsupported BCH funding source output");
++            input_total = input_total.checked_add(output.value.to_sat()).context("BCH funding input total overflow")?;
++            ensure!(input_total <= MAX_MONEY,"BCH funding inputs exceed monetary range");
++            previous_outputs.push(output.clone());
++        }
++        let locks: Vec<_> = transaction.output.iter().enumerate().filter(|(_,o)|o.script_pubkey == lock).collect();
++        ensure!(locks.len() == 1 && locks[0].1.value.to_sat() == locked_atoms,"BCH funding contract or principal mismatch");
++        let lock_vout = locks[0].0 as u32;
++        for (index,output) in transaction.output.iter().enumerate() {
++            if index != lock_vout as usize {
++                ensure!(output.script_pubkey.as_script() == change && output.value.to_sat() >= minimum_change,
++                    "BCH funding change differs from wallet policy");
++            }
++        }
++        let output_total = total(&transaction)?;
++        let fee = input_total.checked_sub(output_total).context("BCH funding creates value")?;
++        ensure!(fee > 0 && fee <= maximum_fee,"BCH funding fee exceeds reviewed cap or is zero");
++        Ok(Self {transaction,previous_outputs,fee:Amount::from_sat(fee),lock_vout})
++    }
++}
++fn total(tx: &Transaction) -> Result<u64> {
++    let sum = tx.output.iter().try_fold(0u64,|sum,o|sum.checked_add(o.value.to_sat()))
++        .context("BCH transaction output total overflow")?;
++    ensure!(sum <= MAX_MONEY,"BCH transaction exceeds monetary range");
++    Ok(sum)
++}
++fn decode(raw: &[u8]) -> Result<Transaction> {
++    ensure!(!raw.is_empty() && raw.len() <= MAX_BYTES,"invalid BCH funding transaction size");
++    let tx: Transaction = deserialize(raw).context("invalid BCH funding transaction encoding")?;
++    ensure!(serialize(&tx) == raw && !tx.input.is_empty() && !tx.output.is_empty()
++        && tx.input.iter().all(|i|i.witness.is_empty()),"noncanonical or witness BCH transaction");
++    ensure!(tx.output.iter().all(|o|o.script_pubkey.as_bytes().first() != Some(&0xef)),
++        "CashToken-bearing sources/funding are unsupported for native BCH swaps");
++    total(&tx)?;
++    Ok(tx)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::bch::covenant::CovenantTerms;
++    use bitcoin::{hashes::Hash,OutPoint,Txid,TxIn,ScriptBuf,Witness,secp256k1};
++    fn script(byte: u8) -> ScriptBuf {
++        let mut bytes=vec![0x76,0xa9,0x14];bytes.extend([byte;20]);bytes.extend([0x88,0xac]);ScriptBuf::from_bytes(bytes)
++    }
++    fn fixture() -> Result<(Covenant,Transaction,Transaction)> {
++        let contract=Covenant::new(CovenantTerms {fee_atoms:1000,delay_blocks:20,
++            signing_key:secp256k1::PublicKey::from_secret_key(&secp256k1::Secp256k1::new(),&secp256k1::SecretKey::from_slice(&[3;32])?),
++            redeem_destination:script(1),timeout_destination:script(2)})?;
++        let parent=Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++            input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
++                script_sig:ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++            output:vec![TxOut {value:Amount::from_sat(120_000),script_pubkey:script(3)}]};
++        let mut tx=parent.clone();tx.input[0].previous_output=OutPoint {txid:parent.compute_txid(),vout:0};
++        tx.output=vec![TxOut {value:Amount::from_sat(100_000),script_pubkey:contract.script_pubkey()},
++            TxOut {value:Amount::from_sat(19_000),script_pubkey:script(4)}];
++        Ok((contract,parent,tx))
++    }
++    #[test]
++    fn exact_funding_accounts_for_sources_change_and_fee() -> Result<()> {
++        let (c,parent,mut tx)=fixture()?;let raw=serialize(&parent);
++        let check=|tx:&Transaction,cap| FundingPreview::verify(&serialize(tx),&[&raw],&c,100_000,&script(4),cap,546);
++        let preview=check(&tx,1000)?;assert_eq!(preview.fee().to_sat(),1000);assert_eq!(preview.lock_vout(),0);
++        assert_eq!(preview.previous_outputs(),parent.output);assert_eq!(preview.transaction(),&tx);
++        tx.output.swap(0,1);assert_eq!(check(&tx,1000)?.lock_vout(),1);
++        tx.output.remove(0);assert_eq!(check(&tx,20_000)?.fee().to_sat(),20_000);
++        assert!(check(&tx,19_999).is_err());
++        Ok(())
++    }
++    #[test]
++    fn rejects_changed_inputs_outputs_and_unsigned_shape() -> Result<()> {
++        let (c,parent,tx)=fixture()?;let raw=serialize(&parent);
++        let check=|t:&Transaction| FundingPreview::verify(&serialize(t),&[&raw],&c,100_000,&script(4),2000,546);
++        let mut variants=Vec::new();
++        let mut t=tx.clone();t.input[0].previous_output.vout=1;variants.push(t);
++        let mut t=tx.clone();t.input[0].previous_output.txid=Txid::from_byte_array([8;32]);variants.push(t);
++        let mut t=tx.clone();t.input[0].sequence=Sequence::ZERO;variants.push(t);
++        let mut t=tx.clone();t.input[0].script_sig=ScriptBuf::from_bytes(vec![0x51]);variants.push(t);
++        let mut t=tx.clone();t.input[0].witness.push([1]);variants.push(t);
++        let mut t=tx.clone();t.output[0].value=Amount::from_sat(99_999);variants.push(t);
++        let mut t=tx.clone();t.output[1].script_pubkey=script(5);variants.push(t);
++        let mut t=tx.clone();t.output[1].value=Amount::from_sat(545);variants.push(t);
++        let mut t=tx.clone();t.output[1]=t.output[0].clone();variants.push(t);
++        let mut t=tx.clone();t.output[1].value=Amount::from_sat(20_001);variants.push(t);
++        let mut t=tx.clone();t.output[1].value=Amount::from_sat(20_000);variants.push(t);
++        for invalid in variants {assert!(check(&invalid).is_err());}
++        let mut duplicate=tx.clone();duplicate.input.push(duplicate.input[0].clone());
++        assert!(FundingPreview::verify(&serialize(&duplicate),&[&raw,&raw],&c,100_000,&script(4),2000,546).is_err());
++        Ok(())
++    }
++    #[test]
++    fn rejects_forged_source_values_tokens_and_trailing_bytes() -> Result<()> {
++        let (c,parent,mut tx)=fixture()?;
++        let mut forged=parent.clone();forged.output[0].value=Amount::from_sat(121_000);
++        assert!(FundingPreview::verify(&serialize(&tx),&[&serialize(&forged)],&c,100_000,&script(4),2000,546).is_err());
++        let mut token=parent;token.output[0].script_pubkey=ScriptBuf::from_bytes(vec![0xef,0x51]);
++        tx.input[0].previous_output.txid=token.compute_txid();
++        assert!(FundingPreview::verify(&serialize(&tx),&[&serialize(&token)],&c,100_000,&script(4),2000,546).is_err());
++        let mut trailing=serialize(&tx);trailing.push(0);
++        assert!(FundingPreview::verify(&trailing,&[&serialize(&token)],&c,100_000,&script(4),2000,546).is_err());
++        Ok(())
++    }
++}

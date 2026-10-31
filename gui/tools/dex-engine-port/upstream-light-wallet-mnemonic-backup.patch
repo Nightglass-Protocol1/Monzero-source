@@ -1,0 +1,206 @@
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+--- a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+@@ -89,11 +89,15 @@
+ 
+     pub fn unlock(&self,password:&[u8])->Result<UnlockedMnemonic> {
+         ensure!(self.journal.read(RECORD)?==self.bytes,"mnemonic vault changed; reopen required");
+-        check(&self.bytes,self.network,self.wallet)?;
+-        let key=super::super::key(password,&self.bytes[88..104])?;
++        decode_record(&self.bytes,password,self.network,self.wallet)
++    }
++}
++fn decode_record(bytes:&[u8],password:&[u8],network:LightNetwork,wallet:Uuid)->Result<UnlockedMnemonic> {
++        check(bytes,network,wallet)?;
++        let key=super::super::key(password,&bytes[88..104])?;
+         let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid mnemonic vault key"))?;
+-        let mut payload=Zeroizing::new(self.bytes[HEADER..].to_vec());
+-        cipher.decrypt_in_place(XNonce::from_slice(&self.bytes[104..128]),&self.bytes[..HEADER],&mut *payload)
++        let mut payload=Zeroizing::new(bytes[HEADER..].to_vec());
++        cipher.decrypt_in_place(XNonce::from_slice(&bytes[104..128]),&bytes[..HEADER],&mut *payload)
+             .map_err(|_|anyhow::anyhow!("mnemonic vault authentication failed"))?;
+         ensure!(!payload.is_empty(),"empty mnemonic payload");
+         let length=usize::from(payload[0]);
+@@ -104,8 +108,8 @@
+         let passphrase=Zeroizing::new(std::str::from_utf8(&payload[length+3..])
+             .map_err(|_|anyhow::anyhow!("invalid mnemonic passphrase encoding"))?.to_owned());
+         Ok(UnlockedMnemonic {material,passphrase})
+-    }
+ }
++
+ fn check(bytes:&[u8],network:LightNetwork,wallet:Uuid)->Result<()> {
+     ensure!(!wallet.is_nil() && bytes.len()>=HEADER+19+16 && bytes.len()<=HEADER+MAX_PAYLOAD+16
+         && &bytes[..8]==MAGIC && &bytes[8..72]==network.storage_identity().as_bytes()
+@@ -173,3 +177,5 @@
+         Ok(())
+     }
+ }
++
++pub mod backup;
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup.rs
+@@ -0,0 +1,87 @@
++//! Encrypted mnemonic vault plus address allocations. Excludes trade journals.
++//! Retained files are never overwritten; exact restore retries are idempotent.
++use super::*;
++use crate::litecoin_light::account::allocation::AddressBook;
++use bitcoin::hashes::{Hash,sha256};
++const BUNDLE_MAGIC:&[u8;8]=b"MZMNBK01";
++const FILE:&str="litecoin-wallet.backup";
++const MAX_BUNDLE:usize=2_000_000;
++
++pub struct BackupInfo {digest:sha256::Hash,account:PublicAccount,wallet:Uuid,allocated:[u32;2]}
++impl BackupInfo {
++    pub fn digest(&self)->sha256::Hash {self.digest}
++    pub fn account(&self)->&PublicAccount {&self.account}
++    pub fn wallet_id(&self)->Uuid {self.wallet}
++    pub fn allocated(&self)->[u32;2] {self.allocated}
++}
++struct Decoded {vault:Vec<u8>,book:Vec<u8>,account:PublicAccount,allocated:[u32;2]}
++
++pub fn export(vault:&MnemonicVault,book:&AddressBook,password:&[u8])->Result<Vec<u8>> {
++    let (descriptor,record)=book.backup_parts()?;
++    let account=PublicAccount::from_descriptor(&descriptor,vault.network)?;
++    drop(vault.unlock_for_account(password,&descriptor)?);
++    let mut payload=Zeroizing::new(Vec::with_capacity(12+vault.bytes.len()+record.len()));
++    payload.extend_from_slice(&(vault.bytes.len() as u32).to_be_bytes());payload.extend_from_slice(&vault.bytes);
++    payload.extend_from_slice(&account.account_index().to_be_bytes());
++    payload.extend_from_slice(&(record.len() as u32).to_be_bytes());payload.extend_from_slice(&record);
++    ensure!(HEADER+payload.len()+16<=MAX_BUNDLE,"mnemonic backup exceeds record limit");
++    let mut salt=[0u8;16];let mut nonce=[0u8;24];
++    OsRng.try_fill_bytes(&mut salt).context("backup entropy unavailable")?;
++    OsRng.try_fill_bytes(&mut nonce).context("backup entropy unavailable")?;
++    let mut result=Vec::with_capacity(HEADER+payload.len()+16);
++    result.extend_from_slice(BUNDLE_MAGIC);result.extend_from_slice(vault.network.storage_identity().as_bytes());
++    result.extend_from_slice(vault.wallet.as_bytes());result.extend_from_slice(&salt);result.extend_from_slice(&nonce);
++    let key=super::super::super::key(password,&salt)?;
++    let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid backup key"))?;
++    cipher.encrypt_in_place(XNonce::from_slice(&nonce),&result,&mut *payload)
++        .map_err(|_|anyhow::anyhow!("mnemonic backup encryption failed"))?;
++    result.extend_from_slice(&payload);Ok(result)
++}
++fn decode(bundle:&[u8],password:&[u8],network:LightNetwork,wallet:Uuid)->Result<Decoded> {
++    ensure!(!wallet.is_nil() && bundle.len()>HEADER+16+12 && bundle.len()<=MAX_BUNDLE
++        && &bundle[..8]==BUNDLE_MAGIC && &bundle[8..72]==network.storage_identity().as_bytes()
++        && &bundle[72..88]==wallet.as_bytes(),"invalid mnemonic backup context");
++    let key=super::super::super::key(password,&bundle[88..104])?;
++    let cipher=XChaCha20Poly1305::new_from_slice(&*key).map_err(|_|anyhow::anyhow!("invalid backup key"))?;
++    let mut payload=Zeroizing::new(bundle[HEADER..].to_vec());
++    cipher.decrypt_in_place(XNonce::from_slice(&bundle[104..128]),&bundle[..HEADER],&mut *payload)
++        .map_err(|_|anyhow::anyhow!("mnemonic backup authentication failed"))?;
++    ensure!(payload.len()>=12,"truncated mnemonic backup payload");
++    let length=u32::from_be_bytes(payload[..4].try_into()?) as usize;
++    ensure!(length<=HEADER+MAX_PAYLOAD+16 && payload.len()>=length+12,"invalid mnemonic vault length");
++    let vault=payload[4..length+4].to_vec();
++    let unlocked=decode_record(&vault,password,network,wallet)?;
++    let index=u32::from_be_bytes(payload[length+4..length+8].try_into()?);
++    let count=u32::from_be_bytes(payload[length+8..length+12].try_into()?) as usize;
++    ensure!(count>0 && count==payload.len()-length-12,"invalid mnemonic address record length");
++    let account=unlocked.public_account(network,index)?;
++    let book=payload[length+12..].to_vec();
++    let allocated=AddressBook::backup_counts(&account,&book)?;
++    Ok(Decoded {vault,book,account,allocated})
++}
++pub fn inspect(bundle:&[u8],password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<BackupInfo> {
++    let decoded=decode(bundle,password,network.into(),wallet)?;
++    Ok(BackupInfo {digest:sha256::Hash::hash(bundle),account:decoded.account,wallet,allocated:decoded.allocated})
++}
++pub fn save_verified(directory:&Path,bundle:&[u8],password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<BackupInfo> {
++    let info=inspect(bundle,password,network,wallet)?;let journal=Journal::open(directory)?;
++    journal.retain(FILE,bundle)?;ensure!(journal.read(FILE)?==bundle,"mnemonic backup read-back mismatch");Ok(info)
++}
++pub fn load_verified(directory:&Path,password:&[u8],network:impl Into<LightNetwork>,wallet:Uuid)->Result<(Vec<u8>,BackupInfo)> {
++    let journal=Journal::open(directory)?;let bundle=journal.read(FILE)?;
++    let info=inspect(&bundle,password,network,wallet)?;Ok((bundle,info))
++}
++/// Preflight both destinations before publishing either. An interruption may
++/// leave the vault alone retained; retry the identical bundle to finish safely.
++pub fn restore(vault_directory:&Path,book_directory:&Path,network:impl Into<LightNetwork>,wallet:Uuid,
++    password:&[u8],bundle:&[u8])->Result<(MnemonicVault,AddressBook)> {
++    let network=network.into();let decoded=decode(bundle,password,network,wallet)?;
++    let vault_journal=Journal::open(vault_directory)?;let book_journal=Journal::open(book_directory)?;
++    vault_journal.compatible(RECORD,&decoded.vault)?;
++    AddressBook::restore_preflight(&book_journal,&decoded.account,&decoded.book)?;
++    vault_journal.retain(RECORD,&decoded.vault)?;
++    let book=AddressBook::restore_record(book_journal,decoded.account,decoded.book)?;
++    Ok((MnemonicVault {journal:vault_journal,network,wallet,bytes:decoded.vault},book))
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup/tests.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage/backup/tests.rs
+@@ -0,0 +1,70 @@
++use super::*;
++use crate::litecoin_light::{account::Branch,network::{BtcNetwork,BchNetwork,DogeNetwork}};
++use std::{fs,path::PathBuf,os::unix::fs::DirBuilderExt};
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("mnemonic-backup-{}",Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++const PASSWORD:&[u8]=b"disposable mnemonic backup password";
++
++#[test]
++fn four_chain_backup_restores_mnemonic_passphrase_and_allocations()->Result<()> {
++    for network in [LightNetwork::Litecoin(LtcNetwork::Regtest),LightNetwork::Bitcoin(BtcNetwork::Regtest),
++        LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
++        let source=Directory::new()?;let allocations=Directory::new()?;let saved=Directory::new()?;
++        let material=MnemonicMaterial::from_entropy(&[7;32])?;let wallet=Uuid::new_v4();
++        let vault=MnemonicVault::create(&source.0,network,wallet,PASSWORD,&material,"recovery passphrase")?;
++        let account=material.public_account(network,3,"recovery passphrase")?;
++        let mut book=AddressBook::create(&allocations.0,material.public_account(network,3,"recovery passphrase")?)?;
++        let receive=Uuid::new_v4();book.reserve(receive,Branch::Receive)?;book.reserve(Uuid::new_v4(),Branch::Change)?;
++        book.reserve(Uuid::new_v4(),Branch::Receive)?;
++        let bundle=export(&vault,&book,PASSWORD)?;
++        assert_eq!(save_verified(&saved.0,&bundle,PASSWORD,network,wallet)?.allocated(),[2,1]);
++        assert_eq!(load_verified(&saved.0,PASSWORD,network,wallet)?.0,bundle);
++        assert!(inspect(&bundle,b"wrong",network,wallet).is_err());
++        assert!(inspect(&bundle,PASSWORD,network,Uuid::new_v4()).is_err());
++        let other=if network==LightNetwork::Bitcoin(BtcNetwork::Regtest) {LightNetwork::BitcoinCash(BchNetwork::Regtest)} else {LightNetwork::Bitcoin(BtcNetwork::Regtest)};
++        assert!(inspect(&bundle,PASSWORD,other,wallet).is_err());
++        let mut corrupt=bundle.clone();let last=corrupt.len()-1;corrupt[last]^=1;
++        assert!(inspect(&corrupt,PASSWORD,network,wallet).is_err());
++        let destination=Directory::new()?;let target_book=Directory::new()?;
++        assert!(restore(&destination.0,&target_book.0,network,wallet,b"wrong",&bundle).is_err());
++        assert_eq!(fs::read_dir(&destination.0)?.count(),0);assert_eq!(fs::read_dir(&target_book.0)?.count(),0);
++        // Simulate a crash after the first of the two publication steps.
++        let decoded=decode(&bundle,PASSWORD,network,wallet)?;
++        Journal::open(&destination.0)?.retain(RECORD,&decoded.vault)?;
++        let (restored,mut restored_book)=restore(&destination.0,&target_book.0,network,wallet,PASSWORD,&bundle)?;
++        let unlocked=restored.unlock_for_account(PASSWORD,&account.descriptor())?;
++        assert_eq!(&*unlocked.material().reveal(),&*material.reveal());assert_eq!(unlocked.passphrase(),"recovery passphrase");
++        assert_eq!(restored_book.allocated_count(Branch::Receive)?,2);assert_eq!(restored_book.allocated_count(Branch::Change)?,1);
++        // Reusing the original request must return the original address.
++        assert_eq!(restored_book.reserve(receive,Branch::Receive)?.address(),account.derive(Branch::Receive,0)?.address());
++        let vault_bytes=fs::read(destination.0.join(RECORD))?;
++        let book_bytes=fs::read(target_book.0.join("litecoin-address-book.json"))?;
++        drop(restored);drop(restored_book);
++        let (restored,mut restored_book)=restore(&destination.0,&target_book.0,network,wallet,PASSWORD,&bundle)?;
++        assert_eq!(fs::read(destination.0.join(RECORD))?,vault_bytes);
++        assert_eq!(fs::read(target_book.0.join("litecoin-address-book.json"))?,book_bytes);
++        assert_eq!(restored_book.reserve(Uuid::new_v4(),Branch::Receive)?.address(),account.derive(Branch::Receive,2)?.address());
++        drop(restored);drop(restored_book);
++        // An older backup cannot reset allocations that have advanced.
++        assert!(restore(&destination.0,&target_book.0,network,wallet,PASSWORD,&bundle).is_err());
++        assert_eq!(fs::read(destination.0.join(RECORD))?,vault_bytes);
++    }
++    Ok(())
++}
++
++#[test]
++fn conflicting_address_record_refuses_vault_publication()->Result<()> {
++    let network=LightNetwork::Litecoin(LtcNetwork::Regtest);let wallet=Uuid::new_v4();
++    let source=Directory::new()?;let addresses=Directory::new()?;let destination=Directory::new()?;let target=Directory::new()?;
++    let material=MnemonicMaterial::from_entropy(&[8;16])?;
++    let vault=MnemonicVault::create(&source.0,network,wallet,PASSWORD,&material,"")?;
++    let book=AddressBook::create(&addresses.0,material.public_account(network,0,"")?)?;
++    let bundle=export(&vault,&book,PASSWORD)?;
++    let mut other=AddressBook::create(&target.0,material.public_account(network,0,"")?)?;
++    other.reserve(Uuid::new_v4(),Branch::Receive)?;drop(other);
++    let before=fs::read(target.0.join("litecoin-address-book.json"))?;
++    assert!(restore(&destination.0,&target.0,network,wallet,PASSWORD,&bundle).is_err());
++    assert!(!destination.0.join(RECORD).exists());assert_eq!(fs::read(target.0.join("litecoin-address-book.json"))?,before);
++    Ok(())
++}

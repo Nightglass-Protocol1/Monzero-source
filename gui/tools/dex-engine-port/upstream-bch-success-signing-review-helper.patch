@@ -1,0 +1,182 @@
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -550,10 +550,11 @@
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct SuccessReleaseReviewRequest {schema: String,request_id: uuid::Uuid}
+-    fn success_release_review_request(bytes: &[u8]) -> Result<uuid::Uuid> {
++    fn success_release_review_request(bytes: &[u8],action: &str) -> Result<uuid::Uuid> {
+         ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid success review request size");
+         let request: SuccessReleaseReviewRequest=serde_json::from_slice(bytes)?;
+-        ensure!(request.schema=="monzero-bch-success-release-review-request-v1" && !request.request_id.is_nil(),
++        ensure!(matches!(action,"release"|"signature"|"signed-release")
++            && request.schema==format!("monzero-bch-success-{action}-review-request-v1") && !request.request_id.is_nil(),
+             "invalid success review request");Ok(request.request_id)
+     }
+     fn success_release_review_config(bytes: &[u8]) -> Result<SuccessReleaseReviewConfig> {
+@@ -563,8 +564,8 @@
+             "invalid success review configuration");
+         parse_digest(&config.deployment_commitment)?;Ok(config)
+     }
+-    fn success_release_review_operation(path: &Path,bytes: &[u8]) -> Result<serde_json::Value> {
+-        let request_id=success_release_review_request(bytes)?;
++    fn success_release_review_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
++        let request_id=success_release_review_request(bytes,action)?;
+         let (_wrapper_lease,bytes)=private_bytes(path)?;
+         let wrapper=success_release_review_config(&bytes)?;
+         let (_admission_lease,config)=load(&wrapper.admission_config_file)?;
+@@ -578,8 +579,14 @@
+         execution.saved_admission_review(&config.negotiation_pins)?;
+         let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+         // This offline path cannot construct or export spend-enabling bytes.
+-        let review=execution.review_bch_success_release(&parse_digest(&wrapper.deployment_commitment)?,wrapper.safety_blocks,now)?;
+-        Ok(serde_json::json!({"schema":"monzero-bch-success-release-review-response-v1",
++        let deployment=parse_digest(&wrapper.deployment_commitment)?;
++        let review=match action {
++            "release"=>execution.review_bch_success_release(&deployment,wrapper.safety_blocks,now)?,
++            "signature"=>execution.review_bch_success_signature_retention(&deployment,wrapper.safety_blocks,now)?,
++            "signed-release"=>execution.review_signed_bch_success_release(&deployment,wrapper.safety_blocks,now)?,
++            _=>anyhow::bail!("unsupported success review"),
++        };
++        Ok(serde_json::json!({"schema":format!("monzero-bch-success-{action}-review-response-v1"),
+             "requestId":request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
+             "review":{"details":review.details,
+                 "commitment":review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()}}))
+@@ -1322,7 +1329,11 @@
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(success_preparation_operation(Path::new(&args[2]),&bytes))?
+         } else if action=="--success-release-review-stdio-v1" {
+-            success_release_review_operation(Path::new(&args[2]),&bytes)?
++            success_release_review_operation(Path::new(&args[2]),&bytes,"release")?
++        } else if action=="--success-signature-review-stdio-v1" {
++            success_release_review_operation(Path::new(&args[2]),&bytes,"signature")?
++        } else if action=="--success-signed-release-review-stdio-v1" {
++            success_release_review_operation(Path::new(&args[2]),&bytes,"signed-release")?
+         } else if action=="--native-observation-stdio-v1" {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(native_observation_operation(Path::new(&args[2]),&bytes))?
+@@ -1375,6 +1386,22 @@
+     #[cfg(test)]
+     mod tests {
+         #[test]
++        fn signing_reviews_require_their_own_request_schema() -> anyhow::Result<()> {
++            for action in ["release","signature","signed-release"] {
++                let request=serde_json::json!({"schema":format!("monzero-bch-success-{action}-review-request-v1"),
++                    "requestId":uuid::Uuid::new_v4()});
++                let bytes=serde_json::to_vec(&request)?;
++                for expected in ["release","signature","signed-release","unknown"] {
++                    assert_eq!(super::success_release_review_request(&bytes,expected).is_ok(),action==expected);
++                }
++                for field in ["frame","signature","commitment","outputFile"] {
++                    let mut invalid=request.clone();invalid[field]=serde_json::Value::Null;
++                    assert!(super::success_release_review_request(&serde_json::to_vec(&invalid)?,action).is_err());
++                }
++            }
++            Ok(())
++        }
++        #[test]
+         fn success_preparation_status_accepts_no_consent_or_private_fields() -> anyhow::Result<()> {
+             let request=serde_json::json!({"schema":"monzero-bch-success-preparation-status-request-v1","requestId":uuid::Uuid::new_v4()});
+             assert!(super::success_preparation_status_request(&serde_json::to_vec(&request)?).is_ok());
+@@ -1419,14 +1446,14 @@
+         #[test]
+         fn success_review_cannot_accept_release_or_private_output_fields() -> anyhow::Result<()> {
+             let request=serde_json::json!({"schema":"monzero-bch-success-release-review-request-v1","requestId":uuid::Uuid::new_v4()});
+-            assert!(super::success_release_review_request(&serde_json::to_vec(&request)?).is_ok());
++            assert!(super::success_release_review_request(&serde_json::to_vec(&request)?,"release").is_ok());
+             for field in ["commitment","frame","signature","outputFile"] {
+                 let mut invalid=request.clone();invalid[field]=serde_json::Value::Null;
+-                assert!(super::success_release_review_request(&serde_json::to_vec(&invalid)?).is_err());
++                assert!(super::success_release_review_request(&serde_json::to_vec(&invalid)?,"release").is_err());
+             }
+             let mut invalid=request.clone();invalid["requestId"]=serde_json::json!(uuid::Uuid::nil());
+-            assert!(super::success_release_review_request(&serde_json::to_vec(&invalid)?).is_err());
+-            assert!(super::success_release_review_request(&vec![b' ';513]).is_err());
++            assert!(super::success_release_review_request(&serde_json::to_vec(&invalid)?,"release").is_err());
++            assert!(super::success_release_review_request(&vec![b' ';513],"release").is_err());
+             let wrapper=serde_json::json!({"schema":"monzero-private-bch-success-release-review-v1",
+                 "admissionConfigFile":"/private/admission.json","deploymentCommitment":"ab".repeat(32),"safetyBlocks":5});
+             assert!(super::success_release_review_config(&serde_json::to_vec(&wrapper)?).is_ok());
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+@@ -84,6 +84,7 @@
+     assert!(sender.prepare_reviewed_bch_success_release(&observer,bch,5,release_time,&[0;32]).await.is_err());
+     assert_eq!(contents(&sender_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     success_release_helper::exercise(setup,sender_metadata,snapshots,pins,base,&deployment,&release.details,&release.commitment)?;
++    success_identity_fixture::reviews(setup,sender_metadata,snapshots,pins,base,&deployment,None,None)?;
+     let adaptor=sender.prepare_reviewed_bch_success_release(&observer,bch,5,release_time,&release.commitment).await?;
+     assert!(!adaptor.is_empty());
+     let signature=success_identity_fixture::sign(&adaptor)?;
+@@ -92,6 +93,8 @@
+     let signing=sender.review_bch_success_signature_retention(&deployment,5,signing_time)?;
+     assert_eq!(signing.details["action"],"retain-bch-success-signature");
+     assert_ne!(signing.commitment,release.commitment);
++    let signing_public=json!({"details":signing.details,"commitment":hex(&signing.commitment)});
++    success_identity_fixture::reviews(setup,sender_metadata,snapshots,pins,base,&deployment,Some(&signing_public),None)?;
+     assert!(sender.review_signed_bch_success_release(&deployment,5,signing_time).is_err());
+     // Preparation approval cannot authorize identity retention, even with a valid signature.
+     for wrong in [[0;32],release.commitment] {
+@@ -105,6 +108,8 @@
+     let outgoing=sender.review_signed_bch_success_release(&deployment,5,signing_time)?;
+     assert_eq!(outgoing.details["action"],"release-signed-bch-success");
+     assert_ne!(outgoing.commitment,release.commitment);assert_ne!(outgoing.commitment,signing.commitment);
++    let release_public=json!({"details":outgoing.details,"commitment":hex(&outgoing.commitment)});
++    success_identity_fixture::reviews(setup,sender_metadata,snapshots,pins,base,&deployment,Some(&signing_public),Some(&release_public))?;
+     let before=contents(&sender_metadata.0)?;let secrets=contents(&snapshots.0)?;
+     for wrong in [[0;32],release.commitment,signing.commitment] {
+         assert!(sender.recover_reviewed_bch_success_release(&observer,bch,5,signing_time,&wrong).await.is_err());
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_identity_fixture.rs
+@@ -22,3 +22,49 @@
+     ensure!(signature.len()==128 && signature.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid identity signature");
+     Ok((0..64).map(|i|u8::from_str_radix(&signature[i*2..i*2+2],16)).collect::<std::result::Result<Vec<_>,_>>()?)
+ }
++
++/// Public review modes use private retained state but never export its frames.
++pub(super) fn reviews(setup: &Setup,original: &PrivateStore,snapshots: &PrivateStore,
++    pins: &NegotiationPins,base: u64,deployment: &[u8;32],signing: Option<&Value>,release: Option<&Value>) -> Result<()> {
++    let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
++    let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper
++        && hex(&Sha256::digest(std::fs::read(&helper)?))==digest,"review helper changed");
++    let metadata=PrivateStore::new()?;let private=PrivateStore::new()?;let config=PrivateStore::new()?;
++    for (name,bytes) in contents(&original.0)? {save(&metadata.0.join(name),&bytes)?;}
++    for (name,bytes) in contents(&snapshots.0)? {save(&private.0.join(name),&bytes)?;}
++    let quote=config.0.join("quote.json");save(&quote,&setup.quote.record()?)?;
++    let admission=config.0.join("admission.json");
++    save(&admission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-admission-v1",
++        "helper":helper,"helperDigest":digest,"quoteFile":quote,
++        "quoteCommitment":hex(setup.quote.commitment()),"admittedAt":base,
++        "tradeId":setup.quote.terms()["swapId"],"identityPins":[
++            SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++            SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++        "policy":setup.policy,"role":"bch-funder","metadataDirectory":metadata.0,
++        "snapshotDirectory":private.0,"negotiationPins":pins}))?)?;
++    let wrapper=config.0.join("review.json");
++    save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-success-release-review-v1",
++        "admissionConfigFile":admission,"deploymentCommitment":hex(deployment),"safetyBlocks":5}))?)?;
++    let before=contents(&metadata.0)?;let secrets=contents(&private.0)?;
++    for (action,expected) in [("signature",signing),("signed-release",release)] {
++        let id=uuid::Uuid::new_v4();
++        let request=json!({"schema":format!("monzero-bch-success-{action}-review-request-v1"),"requestId":id});
++        let mut child=Command::new(&helper).arg(format!("--success-{action}-review-stdio-v1")).arg(&wrapper)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("signing review stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),expected.is_some(),"signing review outcome");
++        if let Some(expected)=expected {
++            assert!(output.stderr.is_empty() && output.stdout.len()<=16384);
++            let value: Value=serde_json::from_slice(&output.stdout)?;
++            assert_eq!(value.as_object().unwrap().len(),6);
++            assert_eq!(value["schema"],format!("monzero-bch-success-{action}-review-response-v1"));
++            assert_eq!(value["requestId"],id.to_string());assert_eq!(value["tradeId"],setup.quote.terms()["swapId"]);
++            assert_eq!(value["executable"],false);assert_eq!(value["chainObserved"],false);
++            assert_eq!(&value["review"],expected);
++        } else {assert!(output.stdout.is_empty());}
++        assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&private.0)?,secrets);
++    }
++    Ok(())
++}

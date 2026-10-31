@@ -1,0 +1,24 @@
+{
+  "mode": "swap (did not complete: claimer endpoint refused log queries)",
+  "contract": "0xf7c19f735C3494b356091eFBeFf3ab53617190b7",
+  "accounts": "test phrase #0 (owner) and #1 (claimer)",
+  "owner": {
+    "bnbTxs": {
+      "new_swap": ["0x44ecdc9c867bd2308c785eb2a0b184614d896dd6e2fcf3e34ec0d7a97a1c95cd"],
+      "refund": ["0x10fa015e9d4af8dfc403e082d2b6ff9631448b6033a7f8469e51b3d242e86d6a"]
+    },
+    "final": "Done(Refunded)"
+  },
+  "claimer": { "final": "WaitingForEvmLock (never locked XMZ)" },
+  "timeline": [
+    "11:12:13 UTC owner locked 0.02 tBNB (timeout1 13:12:13)",
+    "11:12-11:13 claimer's endpoint (BNB Chain testnet seed) answered every eth_getLogs with 'limit exceeded'",
+    "The runner held the offer only in memory, so the process was paused (SIGSTOP) before its error limit and resumed at 12:43",
+    "12:43:20 owner refunded early (no XMZ lock 30 min before timeout1), confirmed 12:43:36; account #0 back to 0.1699 tBNB"
+  ],
+  "lessons": [
+    "HTTPS support was missing in the engine (fixed: rustls)",
+    "Endpoints must be checked for history log queries before trading (fixed: check_logs)",
+    "The agreed offer must be persisted before any lock (fixed in the runner: run.json + resume; required in the app)"
+  ]
+}

@@ -1,0 +1,186 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
+@@ -50,15 +50,35 @@
+     invoke(helper,path,"signing-submit",Some(approved),false)?;
+     assert_eq!(contents(&metadata.0)?,before);
+     assert_eq!(server.state.lock().unwrap().sign_calls,1);
+-    // Recover the exact bytes produced by the lost reply through the existing
+-    // explicit controller. Helper reconciliation will be integrated separately.
+     let raw=server.state.lock().unwrap().signed_candidate.clone();
+-    let mut execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+-    let recovered=execution.review_bch_signing_reconciliation(&raw)?;
+-    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+-    let signed=execution.reconcile_bch_signing(&raw,&recovered.commitment,now)?;
+-    let expected=json!({"txid":signed.lock_outpoint().txid.to_string(),"contractVout":signed.lock_outpoint().vout});
+-    drop(execution);
++    let recovered_tx: Transaction=bitcoin::consensus::deserialize(&raw)?;
++    let expected=json!({"txid":recovered_tx.compute_txid().to_string(),"contractVout":0});
++    let recovery_files=PrivateStore::new()?;
++    let candidate=recovery_files.0.join("candidate.bin");save(&candidate,&raw)?;
++    let recovery_path=recovery_files.0.join("recovery.json");
++    save(&recovery_path,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-signing-recovery-v1",
++        "preparationConfigFile":path,"recoveredTransactionFile":candidate}))?)?;
++    // Neither review nor import may open the unavailable RPC descriptor.
++    std::fs::remove_file(rpc_path)?;
++    let recovered=invoke(helper,&recovery_path,"signing-recovery-review",None,true)?;
++    assert_eq!(recovered["review"]["details"]["action"],"retain-recovered-signature-only");
++    assert_eq!(recovered["review"]["details"]["fundingTxid"],expected["txid"]);
++    assert!(recovered["signedFunding"].is_null());
++    assert_eq!(recovered["signingIntent"],uncertain["signingIntent"]);
++    let recovery_approval=recovered["review"]["commitment"].as_str().context("missing recovery review")?;
++    invoke(helper,&recovery_path,"signing-recovery-submit",None,false)?;
++    invoke(helper,&recovery_path,"signing-recovery-submit",Some(approved),false)?;
++    let mut altered=raw.clone();let last=altered.len()-1;altered[last]^=1;save(&candidate,&altered)?;
++    invoke(helper,&recovery_path,"signing-recovery-submit",Some(recovery_approval),false)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    save(&candidate,&raw)?;
++    let retained=invoke(helper,&recovery_path,"signing-recovery-submit",Some(recovery_approval),true)?;
++    assert_eq!(retained["signedFunding"],expected);
++    assert_eq!(retained["review"],recovered["review"]);
++    let retained_records=contents(&metadata.0)?;
++    invoke(helper,&recovery_path,"signing-recovery-submit",Some(recovery_approval),true)?;
++    assert_eq!(contents(&metadata.0)?,retained_records);
++    save(rpc_path,&serde_json::to_vec(descriptor)?)?;
+     let restored=invoke(helper,path,"signing-status",None,true)?;
+     assert_eq!(restored["signingIntent"],uncertain["signingIntent"]);
+     assert_eq!(restored["signedFunding"],expected);
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -66,6 +66,10 @@
+         private_file(path,false)
+     }
+     fn private_file(path: &Path, credential: bool) -> Result<(File,zeroize::Zeroizing<Vec<u8>>)> {
++        private_file_limit(path,credential,if credential {1024} else {16384})
++    }
++    fn private_file_limit(path: &Path,credential: bool,limit: u64)
++        -> Result<(File,zeroize::Zeroizing<Vec<u8>>)> {
+         ensure!(path.is_absolute() && path.canonicalize()? == path,"invalid private admission path");
+         let file = OpenOptions::new().read(true)
+             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)?;
+@@ -74,11 +78,11 @@
+         let uid = unsafe {libc::geteuid()};
+         ensure!(before.is_file() && before.uid() == uid && before.nlink() == 1
+             && (before.mode() & 0o7777 == 0o600 || (credential && before.mode() & 0o7777 == 0o400))
+-            && before.len() > 0 && before.len() <= if credential {1024} else {16384},
++            && before.len() > 0 && before.len() <= limit,
+             "unsafe private admission file");
+         if !credential {file.try_lock()?;}
+         let mut bytes = zeroize::Zeroizing::new(Vec::new());
+-        (&file).take(16385).read_to_end(&mut bytes)?;
++        (&file).take(limit+1).read_to_end(&mut bytes)?;
+         let after = file.metadata()?;
+         let named = std::fs::symlink_metadata(path)?;
+         ensure!(named.is_file() && (named.dev(),named.ino()) == (before.dev(),before.ino())
+@@ -143,10 +147,10 @@
+     fn funding_request(bytes: &[u8], action: &str) -> Result<Request> {
+         ensure!(!bytes.is_empty() && bytes.len() <= 512,"invalid BCH funding request size");
+         let request: Request = serde_json::from_slice(bytes)?;
+-        ensure!(matches!(action,"review"|"submit"|"status"|"observe"|"prepare"|"preparation-status"|"lock-review"|"lock-submit"|"lock-status"|"signing-review"|"signing-submit"|"signing-status")
++        ensure!(matches!(action,"review"|"submit"|"status"|"observe"|"prepare"|"preparation-status"|"lock-review"|"lock-submit"|"lock-status"|"signing-review"|"signing-submit"|"signing-status"|"signing-recovery-review"|"signing-recovery-submit")
+             && request.schema == format!("monzero-bch-funding-{action}-request-v1")
+             && !request.request_id.is_nil(),"invalid BCH funding request");
+-        if matches!(action,"submit"|"lock-submit"|"signing-submit") {
++        if matches!(action,"submit"|"lock-submit"|"signing-submit"|"signing-recovery-submit") {
+             parse_digest(request.commitment.as_deref().context("missing BCH funding approval")?)?;
+         } else {ensure!(request.commitment.is_none(),"unexpected BCH funding approval");}
+         Ok(request)
+@@ -289,9 +293,26 @@
+             "invalid BCH preparation policy");
+         Ok(config)
+     }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct SigningRecoveryConfig {
++        schema: String,preparation_config_file: PathBuf,recovered_transaction_file: PathBuf,
++    }
++    fn signing_recovery_config(bytes: &[u8]) -> Result<SigningRecoveryConfig> {
++        let config: SigningRecoveryConfig=serde_json::from_slice(bytes)?;
++        ensure!(config.schema=="monzero-private-bch-signing-recovery-v1"
++            && config.preparation_config_file.is_absolute() && config.recovered_transaction_file.is_absolute(),
++            "invalid BCH signing recovery configuration");
++        Ok(config)
++    }
+     async fn preparation_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
+-        ensure!(matches!(action,"prepare"|"preparation-status"|"lock-review"|"lock-submit"|"lock-status"|"signing-review"|"signing-submit"|"signing-status"),"invalid preparation action");
++        ensure!(matches!(action,"prepare"|"preparation-status"|"lock-review"|"lock-submit"|"lock-status"|"signing-review"|"signing-submit"|"signing-status"|"signing-recovery-review"|"signing-recovery-submit"),"invalid preparation action");
+         let request=funding_request(bytes,action)?;
++        let recovery=if matches!(action,"signing-recovery-review"|"signing-recovery-submit") {
++            let (lease,bytes)=private_bytes(path)?;
++            Some((lease,signing_recovery_config(&bytes)?))
++        } else {None};
++        let path=recovery.as_ref().map_or(path,|(_,config)|config.preparation_config_file.as_path());
+         let (_preparation_lease,bytes)=private_bytes(path)?;
+         let preparation=preparation_config(&bytes)?;
+         let (_funding_lease,bytes)=private_bytes(&preparation.funding_config_file)?;
+@@ -307,6 +328,25 @@
+         let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
+             &quote,&config.policy,config.role)?;
+         execution.saved_admission_review(&config.negotiation_pins)?;
++        if let Some((_,recovery))=&recovery {
++            execution.saved_bch_wallet_preparation_review(&deployment,&preparation.policy)?;
++            execution.saved_bch_signing(&deployment)?;
++            let (_raw_lease,raw)=private_file_limit(&recovery.recovered_transaction_file,false,1_000_000)?;
++            let review=execution.review_bch_signing_reconciliation(&raw)?;
++            if action=="signing-recovery-submit" {
++                let approved=parse_digest(request.commitment.as_deref().context("missing recovery approval")?)?;
++                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                execution.reconcile_bch_signing(&raw,&approved,now)?;
++            }
++            // Reuse the offline status serializer, replacing its review with
++            // this exact recovered candidate's separate retention-only review.
++            let mut response=signing_operation(&mut execution,&preparation,&deployment,&request,
++                config.trade_id,"signing-status").await?;
++            response["schema"]=serde_json::json!(format!("monzero-bch-funding-{action}-response-v1"));
++            response["review"]=serde_json::json!({"details":review.details,
++                "commitment":review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
++            return Ok(response)
++        }
+         if matches!(action,"signing-review"|"signing-submit"|"signing-status") {
+             return signing_operation(&mut execution,&preparation,&deployment,&request,config.trade_id,action).await;
+         }
+@@ -407,6 +447,8 @@
+         std::io::stdin().take(513).read_to_end(&mut bytes)?;
+         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+         let preparation_action=match action {
++            "--funding-signing-recovery-review-stdio-v1"=>Some("signing-recovery-review"),
++            "--funding-signing-recovery-submit-stdio-v1"=>Some("signing-recovery-submit"),
+             "--funding-signing-review-stdio-v1"=>Some("signing-review"),
+             "--funding-signing-submit-stdio-v1"=>Some("signing-submit"),
+             "--funding-signing-status-stdio-v1"=>Some("signing-status"),
+@@ -445,6 +487,34 @@
+ 
+     #[cfg(test)]
+     mod tests {
++        #[test]
++        fn signing_recovery_requires_exact_approval_and_private_bounded_candidate() -> Result<()> {
++            for action in ["signing-recovery-review","signing-recovery-submit"] {
++                let mut request=serde_json::json!({"schema":format!("monzero-bch-funding-{action}-request-v1"),
++                    "requestId":uuid::Uuid::new_v4()});
++                assert_eq!(funding_request(&serde_json::to_vec(&request)?,action).is_ok(),action.ends_with("review"));
++                request["commitment"]=serde_json::json!("11".repeat(32));
++                assert_eq!(funding_request(&serde_json::to_vec(&request)?,action).is_ok(),action.ends_with("submit"));
++            }
++            let valid=serde_json::json!({"schema":"monzero-private-bch-signing-recovery-v1",
++                "preparationConfigFile":"/private/preparation.json","recoveredTransactionFile":"/private/candidate"});
++            signing_recovery_config(&serde_json::to_vec(&valid)?)?;
++            for field in ["preparationConfigFile","recoveredTransactionFile","schema"] {
++                let mut bad=valid.clone();bad[field]=serde_json::json!("invalid");
++                assert!(signing_recovery_config(&serde_json::to_vec(&bad)?).is_err());
++            }
++            let mut bad=valid;bad["broadcast"]=serde_json::json!(true);
++            assert!(signing_recovery_config(&serde_json::to_vec(&bad)?).is_err());
++            let directory=Directory::new()?;
++            let candidate=directory.file("candidate",&vec![7;20_000])?;
++            assert!(private_bytes(&candidate).is_err());
++            let (lease,bytes)=private_file_limit(&candidate,false,1_000_000)?;
++            assert_eq!(bytes.len(),20_000);drop(lease);
++            assert!(private_file_limit(&candidate,false,19_999).is_err());
++            std::fs::set_permissions(&candidate,std::fs::Permissions::from_mode(0o644))?;
++            assert!(private_file_limit(&candidate,false,1_000_000).is_err());
++            Ok(())
++        }
+         #[test]
+         fn signing_protocol_requires_separate_submit_approval() -> Result<()> {
+             for action in ["signing-review","signing-status","signing-submit"] {

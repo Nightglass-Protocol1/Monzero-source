@@ -1,0 +1,161 @@
+diff --git a/swap-machine/tests/alice_peer/mod.rs b/swap-machine/tests/alice_peer/mod.rs
+index 2077de9cf..84e19d732 100644
+--- a/swap-machine/tests/alice_peer/mod.rs
++++ b/swap-machine/tests/alice_peer/mod.rs
+@@ -54,6 +54,47 @@ impl Drop for OwnedProcess {
+     }
+ }
+ impl AlicePeer {
++    /// Fixture-only crash after a synced negotiated-state checkpoint.
++    /// The parent never reads the checkpoint or obtains Alice's private state.
++    pub fn restart_from_checkpoint(&mut self)->Result<()> {
++        let acknowledged: bool=self.wire.borrow_mut().call("checkpoint",())?;
++        ensure!(acknowledged,"Alice checkpoint was not acknowledged");
++        self.owner.child.kill()?;
++        self.owner.child.wait()?;
++        let path=self.owner.directory.join("peer");
++        std::fs::remove_file(&path)?;
++        let listener=UnixListener::bind(&path)?;
++        listener.set_nonblocking(true)?;
++        let id=self.wire.borrow().id;
++        let sequence=self.wire.borrow().sequence;
++        self.owner.child=Command::new(std::env::current_exe()?)
++            .args(["--exact","alice_peer_process","--ignored"])
++            .env("MONZERO_TEST_ALICE_SOCKET",&path)
++            .env("MONZERO_TEST_ALICE_ID",id.to_string())
++            .env("MONZERO_TEST_ALICE_RESUME","1")
++            .env("MONZERO_TEST_ALICE_SEQUENCE",sequence.to_string())
++            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
++        let deadline=Instant::now()+Duration::from_secs(15);
++        let socket=loop {
++            match listener.accept() {
++                Ok((socket,_))=>break socket,
++                Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{
++                    ensure!(Instant::now()<deadline && self.owner.child.try_wait()?.is_none(),
++                        "Alice fixture did not resume");
++                    std::thread::sleep(Duration::from_millis(10));
++                }
++                Err(error)=>return Err(error.into()),
++            }
++        };
++        socket.set_read_timeout(Some(Duration::from_secs(30)))?;
++        socket.set_write_timeout(Some(Duration::from_secs(30)))?;
++        let mut wire=Wire {socket,id,sequence};
++        let funding: (monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey)=wire.receive("resume")?;
++        ensure!(funding==self.funding,"Alice resumed with different funding keys");
++        wire.sequence+=1;
++        self.wire=RefCell::new(wire);
++        Ok(())
++    }
+     pub async fn negotiate(id: Uuid, bob0: bob::State0, wallet: &bitcoin_wallet::Wallet,
+         redeem: bitcoin::Address, punish: bitcoin::Address) -> Result<(Self,bob::State2)> {
+         let directory=std::env::temp_dir().join(format!("xmz-alice-{}",Uuid::new_v4()));
+@@ -146,11 +187,27 @@ fn fixture_frame_context_boundaries()->Result<()> {
+ }
+ 
+ pub fn serve()->Result<()> {
+-    let socket=UnixStream::connect(std::env::var_os("MONZERO_TEST_ALICE_SOCKET").context("missing socket")?)?;
++    let path=PathBuf::from(std::env::var_os("MONZERO_TEST_ALICE_SOCKET").context("missing socket")?);
++    let checkpoint_directory=path.parent().context("missing fixture directory")?;
++    let socket=UnixStream::connect(&path)?;
+     socket.set_read_timeout(Some(Duration::from_secs(600)))?;
+     socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+     let id=std::env::var("MONZERO_TEST_ALICE_ID")?.parse()?;
+     let mut wire=Wire {socket,id,sequence:0};
++    let state=if std::env::var("MONZERO_TEST_ALICE_RESUME").as_deref()==Ok("1") {
++        let expected_sequence: u64=std::env::var("MONZERO_TEST_ALICE_SEQUENCE")?.parse()?;
++        let checkpoint=checkpoint_directory.join(format!("checkpoint-{expected_sequence}.json"));
++        let mut bytes=Vec::new();
++        std::fs::File::open(&checkpoint)?.take(1_048_577).read_to_end(&mut bytes)?;
++        ensure!(bytes.len()<=1_048_576,"oversized Alice fixture checkpoint");
++        let (saved_id,sequence,state): (Uuid,u64,alice::State3)=serde_json::from_slice(&bytes)?;
++        ensure!(saved_id==id && sequence==expected_sequence,"Alice checkpoint context mismatch");
++        wire.sequence=sequence;
++        let funding=state.lock_xmr_transfer_request();
++        wire.send("resume",(funding.public_spend_key,funding.public_view_key.0))?;
++        wire.sequence+=1;
++        state
++    } else {
+     let init: Value=wire.receive("init")?;
+     let redeem=init["redeem"].as_str().context("missing redeem")?.parse::<bitcoin::Address<_>>()?.require_network(bitcoin::Network::Regtest)?;
+     let punish=init["punish"].as_str().context("missing punish")?.parse::<bitcoin::Address<_>>()?.require_network(bitcoin::Network::Regtest)?;
+@@ -167,6 +224,8 @@ pub fn serve()->Result<()> {
+     let state=state.receive(wire.receive("message4")?)?;
+     let funding=state.lock_xmr_transfer_request();
+     wire.send("message4",(funding.public_spend_key,funding.public_view_key.0))?; wire.sequence+=1;
++    state
++    };
+     // Post-negotiation operations remain fixture-only and retain Alice's keys here.
+     loop {
+         // Peek the framed command once, then dispatch through the same bound decoder.
+@@ -180,6 +239,18 @@ pub fn serve()->Result<()> {
+             && value["swapId"]==id.to_string() && value["sequence"]==wire.sequence,"invalid fixture command context");
+         let kind=value["kind"].as_str().context("missing command")?;
+         match kind {
++            "checkpoint"=>{
++                use std::os::unix::fs::OpenOptionsExt;
++                let bytes=serde_json::to_vec(&(id,wire.sequence+1,&state))?;
++                ensure!(bytes.len()<=1_048_576,"oversized Alice fixture checkpoint");
++                let checkpoint=checkpoint_directory.join(format!("checkpoint-{}.json",wire.sequence+1));
++                let mut file=std::fs::OpenOptions::new().write(true).create_new(true)
++                    .mode(0o600).open(&checkpoint)?;
++                file.write_all(&bytes)?;
++                file.sync_all()?;
++                std::fs::File::open(checkpoint.parent().context("missing checkpoint parent")?)?.sync_all()?;
++                wire.send(kind,true)?;
++            }
+             "cancel"=>wire.send(kind,state.signed_cancel_transaction()?)?,
+             "redeem"=>wire.send(kind,state.signed_redeem_transaction(serde_json::from_value(value["payload"].clone())?)?)?,
+             "refund-key"=>{
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 7c29f64d9..532defc29 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -441,8 +441,21 @@ async fn settlement(refund: bool) -> Result<()> {
+             funding_proof.into(), None), // Bitcoin-only fixture, no native chain.
+     };
+ 
++    #[cfg(unix)]
++    alice3.restart_from_checkpoint()?;
++    #[cfg(unix)]
++    alice3.restart_from_checkpoint()?;
++
+     if refund {
+         let cancel = alice3.signed_cancel_transaction()?;
++        #[cfg(unix)]
++        let cancel = {
++            alice3.restart_from_checkpoint()?;
++            let resumed = alice3.signed_cancel_transaction()?;
++            anyhow::ensure!(resumed.compute_txid() == cancel.compute_txid(),
++                "resumed cancellation changed transaction identity");
++            resumed
++        };
+         let error = env.bitcoind.sendrawtransaction(cancel.clone().into()).await
+             .expect_err("cancel must fail before relative timelock");
+         anyhow::ensure!(error.to_string().contains("non-BIP68-final"), "unexpected early-cancel rejection: {error}");
+@@ -466,6 +479,8 @@ async fn settlement(refund: bool) -> Result<()> {
+         balance(&alice_wallet, Amount::ZERO).await?;
+         let observed = bob_wallet.get_raw_transaction(refund_id).await?
+             .context("confirmed refund missing from Electrum")?;
++        #[cfg(unix)]
++        alice3.restart_from_checkpoint()?;
+         let recovered = alice3.extract_monero_private_key_from_refund(observed)?;
+         assert_eq!(monero_oxide_ext::PublicKey::from_private_key(&recovered),
+             alice3.lock_xmr_transfer_request().public_spend_key);
+@@ -481,7 +496,15 @@ async fn settlement(refund: bool) -> Result<()> {
+         } else { bob4.tx_redeem_encsig() };
+         #[cfg(not(unix))]
+         let signature = bob4.tx_redeem_encsig();
+-        let redeem = alice3.signed_redeem_transaction(signature)?;
++        let redeem = alice3.signed_redeem_transaction(signature.clone())?;
++        #[cfg(unix)]
++        let redeem = {
++            alice3.restart_from_checkpoint()?;
++            let resumed = alice3.signed_redeem_transaction(signature)?;
++            anyhow::ensure!(resumed.compute_txid() == redeem.compute_txid(),
++                "resumed redemption changed transaction identity");
++            resumed
++        };
+         broadcast_confirm(&env, redeem).await?;
+         balance(&alice_wallet, amount - fee).await?;
+         balance(&bob_wallet, funding - amount - fee).await?;

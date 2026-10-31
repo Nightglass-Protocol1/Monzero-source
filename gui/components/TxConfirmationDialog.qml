@@ -65,6 +65,8 @@ Rectangle {
     property var transactionPriority: ""
     property bool sweepUnmixable: false
     property bool assetIssuance: false
+    property bool assetTransfer: false
+    property bool assetBurn: false
     property string assetId: ""
     property string assetSummary: ""
     property alias errorText: errorText
@@ -142,6 +144,8 @@ Rectangle {
         root.transactionPriority = "";
         root.sweepUnmixable = false;
         root.assetIssuance = false;
+        root.assetTransfer = false;
+        root.assetBurn = false;
         root.assetId = "";
         root.assetSummary = "";
     }
@@ -176,6 +180,10 @@ Rectangle {
                         return qsTr("Sweep unmixable outputs") + translationManager.emptyString;
                     } else if (root.assetIssuance) {
                         return qsTr("Confirm asset issuance") + translationManager.emptyString;
+                    } else if (root.assetBurn) {
+                        return qsTr("Confirm asset burn") + translationManager.emptyString;
+                    } else if (root.assetTransfer) {
+                        return qsTr("Confirm asset transfer") + translationManager.emptyString;
                     } else {
                         return qsTr("Confirm send") + translationManager.emptyString;
                     }
@@ -231,7 +239,7 @@ Rectangle {
 
         Text {
             Layout.fillWidth: true
-            visible: root.assetIssuance
+            visible: root.assetIssuance || root.assetTransfer || root.assetBurn
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.Wrap
             color: MonzeroComponents.Style.defaultFontColor

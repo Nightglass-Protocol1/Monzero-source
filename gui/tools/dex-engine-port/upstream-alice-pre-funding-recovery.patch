@@ -1,0 +1,96 @@
+diff --git a/swap-machine/src/alice/mod.rs b/swap-machine/src/alice/mod.rs
+index 2b4b7da6c..2ae7c0c00 100644
+--- a/swap-machine/src/alice/mod.rs
++++ b/swap-machine/src/alice/mod.rs
+@@ -798,12 +798,24 @@ impl State3 {
+         policy: &crate::native_trade_quote::DeploymentPolicy, now: u64,
+     ) -> Result<()> {
+         quote.check_deployment(policy, now)?;
+-        let number = |field: &str| -> Result<u64> { Ok(quote.terms()[field].parse()?) };
++        self.check_native_economics(quote.terms(),quote.destinations())
++    }
++
++    /// Validate restored economics against authenticated historical terms.
++    /// No freshness requirement and no authority to fund or broadcast: storage
++    /// integrity, transcript binding and chain reconciliation remain mandatory.
++    pub fn check_recorded_quote(&self, quote: &crate::native_trade_quote::RecordedQuote) -> Result<()> {
++        self.check_native_economics(quote.terms(),quote.destinations())
++    }
++
++    fn check_native_economics(&self, terms: &std::collections::BTreeMap<String,String>,
++        destinations: &crate::native_quote_destinations::QuoteDestinations) -> Result<()> {
++        let number = |field: &str| -> Result<u64> { Ok(terms[field].parse()?) };
+         anyhow::ensure!(self.btc.to_sat() == number("btcSatoshis")?
+             && self.tx_lock.lock_amount() == self.btc && self.xmr.as_pico() == number("xmzAtoms")?,
+             "negotiated principal differs from quote");
+-        anyhow::ensure!(self.refund_address == quote.destinations().btc_refund
+-            && self.redeem_address == quote.destinations().btc_payout,
++        anyhow::ensure!(self.refund_address == destinations.btc_refund
++            && self.redeem_address == destinations.btc_payout,
+             "negotiated destination differs from quote");
+         anyhow::ensure!(u64::from(u32::from(self.cancel_timelock)) == number("cancelBlocks")?
+             && u64::from(u32::from(self.punish_timelock)) == number("punishBlocks")?,
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index bd7a2ac3a..c2d61d3a7 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -885,15 +885,29 @@ mod tests {
+         bob2.check_native_quote(&bob_quote, &policy, 1000)?;
+         alice3.check_native_quote(&alice_quote, &policy, 1000)?;
+         assert!(alice3.check_native_quote(&alice_quote, &policy, 1100).is_err());
++        let historical_alice=verify(&proposed,1000)?.into_recorded();
++        alice3.check_recorded_quote(&historical_alice)?;
+         let mut changed_alice = alice3.clone();
+         changed_alice.btc = bitcoin::Amount::from_sat(450001);
++        assert!(changed_alice.check_recorded_quote(&historical_alice).is_err());
+         assert!(changed_alice.check_native_quote(&alice_quote, &policy, 1000).is_err());
+         changed_alice = alice3.clone();
+         changed_alice.xmr = swap_core::monero::primitives::Amount::from_pico(150000000001);
++        assert!(changed_alice.check_recorded_quote(&historical_alice).is_err());
+         assert!(changed_alice.check_native_quote(&alice_quote, &policy, 1000).is_err());
+         changed_alice = alice3.clone();
+         changed_alice.btc_amnesty_amount = Some(bitcoin::Amount::from_sat(1));
++        assert!(changed_alice.check_recorded_quote(&historical_alice).is_err());
+         assert!(changed_alice.check_native_quote(&alice_quote, &policy, 1000).is_err());
++        changed_alice=alice3.clone();
++        changed_alice.tx_cancel_fee=bitcoin::Amount::from_sat(u64::MAX);
++        assert!(changed_alice.check_recorded_quote(&historical_alice).is_err());
++        changed_alice=alice3.clone();
++        changed_alice.cancel_timelock=CancelTimelock::new(policy.cancel_blocks+1);
++        assert!(changed_alice.check_recorded_quote(&historical_alice).is_err());
++        changed_alice=alice3.clone();
++        changed_alice.should_publish_tx_withhold=Some(true);
++        assert!(changed_alice.check_recorded_quote(&historical_alice).is_err());
+         assert!(bob2.check_native_quote(&bob_quote, &policy, 1100).is_err());
+         let mut changed_state = bob2.clone();
+         changed_state.tx_cancel_fee = bitcoin::Amount::from_sat(u64::MAX);
+diff --git a/swap-machine/tests/alice_peer/mod.rs b/swap-machine/tests/alice_peer/mod.rs
+index d82457611..706734dab 100644
+--- a/swap-machine/tests/alice_peer/mod.rs
++++ b/swap-machine/tests/alice_peer/mod.rs
+@@ -223,6 +223,7 @@ pub fn serve()->Result<()> {
+         if let Some(association)=&association {
+             let terms=association.verify_record(crate::quote_fixture::now()?)?;
+             ensure!(terms.terms()["swapId"]==id.to_string(),"checkpoint quote belongs to another swap");
++            state.check_recorded_quote(&terms)?;
+         }
+         wire.sequence=sequence;
+         let funding=state.lock_xmr_transfer_request();
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 877eba048..1dfbaa3f7 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -443,6 +443,13 @@ async fn settlement(refund: bool) -> Result<()> {
+     let mut _recovery_owner = None;
+     #[cfg(unix)]
+     let mut checkpoint_pin = None;
++    #[cfg(unix)]
++    {
++        // Preserve and actually reload Alice's negotiated state before either
++        // swap asset is funded. The parent retains only public association data.
++        alice3.restart_from_checkpoint()?;
++        if let Some(owner)=&quote_owner { alice3.check_quote(owner.context())?; }
++    }
+     let (bob3, lock) = bob2.lock_btc().await?;
+     let lock_id = lock.txid();
+     #[cfg(unix)]

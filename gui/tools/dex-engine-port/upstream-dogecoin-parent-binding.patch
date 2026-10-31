@@ -1,0 +1,66 @@
+--- a/swap-core/src/dogecoin.rs
++++ b/swap-core/src/dogecoin.rs
+@@ -175,6 +175,63 @@
+         terms.outpoint.txid=funding.compute_txid();
+         terms.fee_atoms=0;assert!(lock.prepare_refund(&funding,&terms,&key).is_err());terms.fee_atoms=1_000_000;
+         terms.recipient.network=DogeNetwork::Mainnet;assert!(lock.prepare_refund(&funding,&terms,&key).is_err());
++        Ok(())
++    }
++    #[test]
++    fn alternate_parent_signature_invalidates_presigned_refund()->Result<()> {
++        // A funding signer can produce two valid low-S signatures for the same
++        // legacy spend. This is not a claim of third-party or node acceptance.
++        let secp=Secp256k1::new();let funding_key=key(3);let refund_key=key(4);
++        let funding_public=PublicKey::from_secret_key(&secp,&funding_key);
++        let refund_public=PublicKey::from_secret_key(&secp,&refund_key);
++        let lock=TimelockedRefund::new(DogeNetwork::Regtest,refund_public,1410)?;
++        let previous_script=ScriptBuf::new_p2pkh(&PubkeyHash::hash(&funding_public.serialize()));
++        let unsigned=Transaction {version:Version::ONE,lock_time:absolute::LockTime::ZERO,
++            input:vec![TxIn {previous_output:OutPoint {txid:bitcoin::Txid::from_byte_array([9;32]),vout:0},
++                script_sig:ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
++            output:vec![TxOut {value:Amount::from_sat(1_000_000_000),script_pubkey:lock.address().script_pubkey()}]};
++        let digest=SighashCache::new(&unsigned).legacy_signature_hash(0,&previous_script,EcdsaSighashType::All.to_u32())?;
++        let message=Message::from_digest(digest.to_byte_array());
++        let signed_parent=|entropy:[u8;32]|->Result<Transaction> {
++            let signature=secp.sign_ecdsa_with_noncedata(&message,&funding_key,&entropy);
++            secp.verify_ecdsa(&message,&signature,&funding_public)?;
++            let mut normalized=signature;normalized.normalize_s();assert_eq!(normalized,signature);
++            let mut bytes=signature.serialize_der().to_vec();bytes.push(EcdsaSighashType::All.to_u32() as u8);
++            let mut parent=unsigned.clone();
++            parent.input[0].script_sig=Builder::new().push_slice(PushBytesBuf::try_from(bytes)?)
++                .push_slice(funding_public.serialize()).into_script();
++            assert_eq!(SighashCache::new(&parent).legacy_signature_hash(0,&previous_script,EcdsaSighashType::All.to_u32())?,digest);
++            Ok(parent)
++        };
++        let first=signed_parent([1;32])?;let alternate=signed_parent([2;32])?;
++        assert_eq!(first.output,alternate.output);
++        assert_ne!(first.compute_txid(),alternate.compute_txid());
++        let mut terms=RefundTerms {outpoint:OutPoint {txid:first.compute_txid(),vout:0},
++            locked_atoms:1_000_000_000,recipient:DogeAddress {network:DogeNetwork::Regtest,kind:Kind::P2pkh,payload:[2;20]},
++            fee_atoms:1_000_000,maximum_fee_atoms:1_000_000,minimum_output_atoms:100_000_000};
++        let prepared=lock.prepare_refund(&first,&terms,&refund_key)?;
++        assert!(lock.prepare_refund(&alternate,&terms,&refund_key).is_err());
++        let tx=prepared.transaction();
++        let signature=match tx.input[0].script_sig.instructions().next().context("missing refund signature")?? {
++            bitcoin::script::Instruction::PushBytes(bytes)=> {
++                let bytes=bytes.as_bytes();assert_eq!(bytes.last(),Some(&1));
++                bitcoin::secp256k1::ecdsa::Signature::from_der(&bytes[..bytes.len()-1])?
++            }
++            _=>anyhow::bail!("refund signature is not a push"),
++        };
++        let refund_message=|transaction:&Transaction|->Result<Message> {
++            let digest=SighashCache::new(transaction).legacy_signature_hash(0,lock.redeem_script(),EcdsaSighashType::All.to_u32())?;
++            Ok(Message::from_digest(digest.to_byte_array()))
++        };
++        secp.verify_ecdsa(&refund_message(tx)?,&signature,&refund_public)?;
++        let mut rebound=tx.clone();rebound.input[0].previous_output.txid=alternate.compute_txid();
++        assert!(secp.verify_ecdsa(&refund_message(&rebound)?,&signature,&refund_public).is_err());
++        // The one-key primitive can sign again. A future multi-party protocol
++        // must not assume a disappeared peer will provide replacement signatures.
++        terms.outpoint.txid=alternate.compute_txid();
++        let replacement=lock.prepare_refund(&alternate,&terms,&refund_key)?;
++        assert_eq!(replacement.transaction().input[0].previous_output,terms.outpoint);
++        assert_eq!(replacement.transaction().output,tx.output);
+         Ok(())
+     }
+     #[test]

@@ -1,0 +1,423 @@
+diff --git a/swap-machine/src/bch_key_recovery.rs b/swap-machine/src/bch_key_recovery.rs
+--- a/swap-machine/src/bch_key_recovery.rs
++++ b/swap-machine/src/bch_key_recovery.rs
+@@ -8,6 +8,19 @@
+ use swap_core::{bch::DataMessage, monero};
+ use zeroize::Zeroizing;
+ use crate::common::CROSS_CURVE_PROOF_SYSTEM;
++use sha2::{Digest,Sha256};
++use std::{collections::VecDeque,sync::Mutex};
++
++// Process-local positive cryptographic results only. No quote, identity, journal,
++// time or chain authorization is cached. All of those are checked by callers.
++// Bound memory even when a peer supplies many different valid public proofs.
++const VERIFIED_PROOF_LIMIT: usize = 64;
++static VERIFIED_PROOFS: Mutex<VecDeque<[u8;32]>> = Mutex::new(VecDeque::new());
++fn proof_digest(adaptor: &Point,native: &[u8;32],proof: &CrossCurveDLEQProof) -> Result<[u8;32]> {
++    let mut hash=Sha256::new();hash.update(b"monzero-bch-cross-curve-verification-cache-v1\0");
++    hash.update(adaptor.to_bytes());hash.update(native);hash.update(serde_json::to_vec(proof)?);
++    Ok(hash.finalize().into())
++}
+ 
+ pub mod authenticated;
+ 
+@@ -24,8 +37,19 @@
+         ensure!(point.compress().to_bytes() == native && point.is_torsion_free()
+             && point != curve25519_dalek_ng::edwards::EdwardsPoint::identity(),
+             "noncanonical or degenerate BCH/XMZ native public key");
+-        ensure!(CROSS_CURVE_PROOF_SYSTEM.verify(proof, (adaptor, point)),
+-            "BCH/XMZ cross-curve proof does not verify");
++        // Match the proof system's fixed commitment count before serialization.
++        ensure!(proof.commitments.len()==252,"invalid BCH cross-curve commitment count");
++        let digest=proof_digest(&adaptor,&native,proof)?;
++        let cached=VERIFIED_PROOFS.lock().map_err(|_|anyhow::anyhow!("BCH proof cache poisoned"))?.contains(&digest);
++        if !cached {
++            ensure!(CROSS_CURVE_PROOF_SYSTEM.verify(proof, (adaptor, point)),
++                "BCH/XMZ cross-curve proof does not verify");
++            let mut verified=VERIFIED_PROOFS.lock().map_err(|_|anyhow::anyhow!("BCH proof cache poisoned"))?;
++            if !verified.contains(&digest) {
++                if verified.len()==VERIFIED_PROOF_LIMIT {verified.pop_front();}
++                verified.push_back(digest);
++            }
++        }
+         Ok(Self { adaptor, native })
+     }
+ 
+@@ -59,6 +83,16 @@
+         let (proof, (adaptor, edwards)) = CROSS_CURVE_PROOF_SYSTEM.prove(&native.into_dalek_ng(), &mut rng);
+         let native_public = edwards.compress().to_bytes();
+         let binding = ProvenNativeAdaptor::verify(adaptor, native_public, &proof)?;
++        // A warm result must still bind both public keys and every proof field.
++        let digest=proof_digest(&adaptor,&native_public,&proof)?;
++        assert!(VERIFIED_PROOFS.lock().unwrap().contains(&digest));
++        ProvenNativeAdaptor::verify(adaptor,native_public,&proof)?;
++        let mut changed_proof=proof.clone();changed_proof.commitments.swap(0,1);
++        assert_ne!(proof_digest(&adaptor,&native_public,&changed_proof)?,digest);
++        assert!(ProvenNativeAdaptor::verify(adaptor,native_public,&changed_proof).is_err());
++        assert!(!VERIFIED_PROOFS.lock().unwrap().contains(&proof_digest(&adaptor,&native_public,&changed_proof)?));
++        let mut truncated_proof=proof.clone();truncated_proof.commitments.pop();
++        assert!(ProvenNativeAdaptor::verify(adaptor,native_public,&truncated_proof).is_err());
+         let mut bytes = Zeroizing::new(original.as_bytes()); bytes.reverse();
+         let decrypt = Scalar::from_bytes(*bytes).unwrap().non_zero().unwrap();
+         let signer = Scalar::random(&mut rng);
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -501,6 +501,91 @@
+             "commitment":saved.receipt.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+             "receivedAt":saved.received_at.to_string()}));
+         Ok(serde_json::json!({"schema":format!("monzero-bch-refund-protection-{action}-response-v1"),
++            "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
++            "review":review,"receipt":receipt}))
++    }
++
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct NativeProofConfig {
++        schema: String, admission_config_file: PathBuf, peer_message_file: PathBuf,
++    }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct NativeProofMessage { schema: String, frame: Vec<u8>, signature: Vec<u8> }
++    impl Drop for NativeProofMessage {
++        fn drop(&mut self) {use zeroize::Zeroize;self.frame.zeroize();}
++    }
++    fn native_proof_message(bytes: &[u8]) -> Result<NativeProofMessage> {
++        ensure!(!bytes.is_empty() && bytes.len()<=65536,"invalid native proof envelope size");
++        let message: NativeProofMessage=serde_json::from_slice(bytes)?;
++        ensure!(message.schema=="monzero-bch-peer-native-proof-v1"
++            && !message.frame.is_empty() && message.frame.len()<=8192 && message.signature.len()==64,
++            "invalid peer native proof message");
++        Ok(message)
++    }
++    fn native_proof_request(bytes: &[u8],action: &str) -> Result<Request> {
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid native proof request size");
++        let request: Request=serde_json::from_slice(bytes)?;
++        ensure!(matches!(action,"review"|"submit"|"status"|"context") && !request.request_id.is_nil()
++            && request.schema==format!("monzero-bch-native-proof-{action}-request-v1"),
++            "invalid native proof request");
++        if action=="submit" {
++            parse_digest(request.commitment.as_deref().context("missing native proof approval")?)?;
++        } else {ensure!(request.commitment.is_none(),"unexpected native proof approval");}
++        Ok(request)
++    }
++    fn native_proof_config(bytes: &[u8]) -> Result<NativeProofConfig> {
++        let config: NativeProofConfig=serde_json::from_slice(bytes)?;
++        ensure!(config.schema=="monzero-private-bch-native-proof-v1"
++            && config.admission_config_file.is_absolute() && config.peer_message_file.is_absolute(),
++            "invalid native proof configuration");
++        Ok(config)
++    }
++    fn native_proof_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
++        let request=native_proof_request(bytes,action)?;
++        let (_wrapper_lease,bytes)=private_bytes(path)?;
++        let wrapper=native_proof_config(&bytes)?;
++        let (_admission_lease,config)=load(&wrapper.admission_config_file)?;
++        ensure!(matches!(config.role,Role::BchFunder),"native proof requires BCH funder");
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"native proof trade changed");
++        let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        if action=="context" {
++            return Ok(serde_json::json!({"schema":"monzero-bch-native-proof-context-response-v1",
++                "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
++                "context":execution.bch_native_proof_public_context()?}));
++        }
++        let mut review=serde_json::Value::Null;
++        if action!="status" {
++            // Keep the private message lease through acceptance. The decoded
++            // frame is zeroized on drop; no transaction key enters public output.
++            let (_message_lease,bytes)=private_file_limit(&wrapper.peer_message_file,false,65536)?;
++            let message=native_proof_message(&bytes)?;
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            if action=="submit" {
++                let approved=parse_digest(request.commitment.as_deref().context("missing native proof approval")?)?;
++                // Acceptance independently authenticates and reviews the proof
++                // before comparing exact consent and retaining it. Do not repeat
++                // that expensive restore merely to reconstruct public output.
++                execution.accept_reviewed_bch_native_proof(now,&message.frame,&message.signature,&approved)?;
++            } else {
++                let checked=execution.review_bch_native_proof(now,&message.frame,&message.signature)?;
++                review=serde_json::json!({"details":checked.details,
++                    "commitment":checked.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
++            }
++        }
++        let receipt=execution.saved_bch_native_proof_review()?.map(|saved| {
++            let saved_review=serde_json::json!({"details":saved.review.details,
++                "commitment":saved.review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
++            if action!="review" {review=saved_review;}
++            serde_json::json!({"state":"retained","receivedAt":saved.received_at.to_string()})
++        });
++        Ok(serde_json::json!({"schema":format!("monzero-bch-native-proof-{action}-response-v1"),
+             "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
+             "review":review,"receipt":receipt}))
+     }
+@@ -1020,7 +1105,16 @@
+             "--native-relay-status-stdio-v1"=>Some("status"),
+             _=>None,
+         };
+-        let result = if let Some(operation)=native_relay_action {
++        let native_proof_action=match action {
++            "--native-proof-review-stdio-v1"=>Some("review"),
++            "--native-proof-submit-stdio-v1"=>Some("submit"),
++            "--native-proof-status-stdio-v1"=>Some("status"),
++            "--native-proof-context-stdio-v1"=>Some("context"),
++            _=>None,
++        };
++        let result = if let Some(operation)=native_proof_action {
++            native_proof_operation(Path::new(&args[2]),&bytes,operation)?
++        } else if let Some(operation)=native_relay_action {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(native_relay_operation(Path::new(&args[2]),&bytes,operation))?
+         } else if let Some(operation)=native_preparation_action {
+@@ -1078,6 +1172,47 @@
+                 assert!(super::native_preparation_request(&serde_json::to_vec(&value)?,action).is_err());
+             }
+             assert!(super::native_preparation_request(&vec![b' ';513],"status").is_err());
++            Ok(())
++        }
++        #[test]
++        fn native_proof_requests_require_exact_consent() -> anyhow::Result<()> {
++            for action in ["review","submit","status","context"] {
++                let mut value=serde_json::json!({"schema":format!("monzero-bch-native-proof-{action}-request-v1"),
++                    "requestId":uuid::Uuid::new_v4()});
++                assert_eq!(super::native_proof_request(&serde_json::to_vec(&value)?,action).is_ok(),action!="submit");
++                value["commitment"]=serde_json::json!("11".repeat(32));
++                assert_eq!(super::native_proof_request(&serde_json::to_vec(&value)?,action).is_ok(),action=="submit");
++                value["tx_key"]=serde_json::json!("private");
++                assert!(super::native_proof_request(&serde_json::to_vec(&value)?,action).is_err());
++            }
++            assert!(super::native_proof_request(&vec![b' ';513],"status").is_err());
++            Ok(())
++        }
++        #[test]
++        fn native_proof_envelope_is_bounded_and_exact() -> anyhow::Result<()> {
++            let mut value=serde_json::json!({"schema":"monzero-bch-peer-native-proof-v1",
++                "frame":vec![1u8;8192],"signature":vec![2u8;64]});
++            assert!(super::native_proof_message(&serde_json::to_vec(&value)?).is_ok());
++            value["frame"]=serde_json::json!(vec![1u8;8193]);
++            assert!(super::native_proof_message(&serde_json::to_vec(&value)?).is_err());
++            value["frame"]=serde_json::json!([]);
++            assert!(super::native_proof_message(&serde_json::to_vec(&value)?).is_err());
++            value["frame"]=serde_json::json!([1]);value["signature"]=serde_json::json!(vec![2u8;63]);
++            assert!(super::native_proof_message(&serde_json::to_vec(&value)?).is_err());
++            value["signature"]=serde_json::json!(vec![2u8;64]);value["extra"]=serde_json::json!(true);
++            assert!(super::native_proof_message(&serde_json::to_vec(&value)?).is_err());
++            assert!(super::native_proof_message(&vec![b' ';65537]).is_err());
++            Ok(())
++        }
++        #[test]
++        fn native_proof_wrapper_rejects_rpc_and_relative_paths() -> anyhow::Result<()> {
++            let mut value=serde_json::json!({"schema":"monzero-private-bch-native-proof-v1",
++                "admissionConfigFile":"/private/admission.json","peerMessageFile":"/private/message.json"});
++            assert!(super::native_proof_config(&serde_json::to_vec(&value)?).is_ok());
++            value["peerMessageFile"]=serde_json::json!("relative.json");
++            assert!(super::native_proof_config(&serde_json::to_vec(&value)?).is_err());
++            value["peerMessageFile"]=serde_json::json!("/private/message.json");value["rpcFile"]=serde_json::json!("/private/rpc.json");
++            assert!(super::native_proof_config(&serde_json::to_vec(&value)?).is_err());
+             Ok(())
+         }
+         #[test]
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -147,7 +147,7 @@
+                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()
+             } else {base+19};
+             native_payment(&config["native"],&setup,&native_metadata,&snapshots,&rpc,&mut native,&mut restored,
+-                &event,&gate,txid,payment_time).await?;
++                &event,&gate,txid,payment_time,&metadata,&pins,base).await?;
+         } else {
+         phase(&event,&gate,"observed","aged",txid).await?;
+         assert_eq!(native.observe_received_bch_funding(&rpc).await?.status(),FundingStatus::ConfirmedUnspent {confirmations:15});
+@@ -193,3 +193,5 @@
+ mod receipt_helper;
+ 
+ mod preparation_helper;
++
++mod proof_helper;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+@@ -4,7 +4,8 @@
+ use agreement::execution::funding::{native::{NativeFundingSource,relay::NativeRelayState,proof}};
+ pub(super) async fn exercise(config: &Value,setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
+     bch: &BchRpc,native: &mut AdmittedExecution<'_>,sender: &mut AdmittedExecution<'_>,
+-    event: &std::path::Path,gate: &std::path::Path,bch_txid: Txid,now: u64) -> Result<()> {
++    event: &std::path::Path,gate: &std::path::Path,bch_txid: Txid,now: u64,
++    sender_metadata: &PrivateStore,pins: &NegotiationPins,base: u64) -> Result<()> {
+     let field=|name: &str| -> Result<&str> {config[name].as_str().context("missing native fixture field")};
+     let backend=||NativeFundingRpc::new(u16::try_from(config["daemonPort"].as_u64().context("daemon port")?)?,
+         u16::try_from(config["walletPort"].as_u64().context("wallet port")?)?,field("username")?.into(),field("password")?.into());
+@@ -26,17 +27,28 @@
+     let before=contents(&metadata.0)?;
+     assert_eq!(native.relay_bch_native_funding(&mut relay,bch,&review.commitment,now+3).await?.txid,sent.txid);
+     assert_eq!(contents(&metadata.0)?,before);
++    let context=sender.bch_native_proof_public_context()?;
++    assert_eq!(context.as_object().unwrap().len(),4);
++    assert!(native.bch_native_proof_public_context().is_err());
+     let frame=native.prepare_bch_native_proof(now+4)?;
+     let signature=SigningKey::from_bytes(&[2;32]).sign(&proof::signing_bytes(&frame)?).to_bytes();
+     native.retain_outgoing_bch_native_proof(now+5,&signature)?;
+     let review=sender.review_bch_native_proof(now+6,&frame,&signature)?;
+     assert_eq!(review.details.as_object().unwrap().len(),13);
++    assert_eq!(context["bchFundingOutpoint"],review.details["bchFundingOutpoint"]);
++    assert_eq!(context["destination"],review.details["destination"]);
++    for name in ["agreement","admission"] {
++        let bytes: [u8;32]=serde_json::from_value(review.details[name].clone())?;
++        assert_eq!(context[name],hex(&bytes));
++    }
++
+     assert_eq!(review.details["txid"],sent.txid);assert_eq!(review.details["amountAtoms"],"200000000000");
+     assert!(native.review_bch_native_proof(now+6,&frame,&signature).is_err());
+     assert!(sender.review_bch_native_proof(now+6,&frame,&[0;64]).is_err());
+     assert!(sender.received_bch_native_proof()?.is_none());
+     assert!(sender.accept_reviewed_bch_native_proof(now+6,&frame,&signature,&[0;32]).is_err());
+     assert!(sender.received_bch_native_proof()?.is_none());
++    proof_helper::exercise(setup,snapshots,&contents(&sender_metadata.0)?,pins,base,&frame,&signature,&review.commitment,&context)?;
+     sender.accept_reviewed_bch_native_proof(now+6,&frame,&signature,&review.commitment)?;
+     let saved=sender.saved_bch_native_proof_review()?.context("missing public proof review")?;
+     assert_eq!(saved.review.commitment,review.commitment);assert_eq!(saved.received_at,now+6);
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/proof_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/proof_helper.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/proof_helper.rs
+@@ -0,0 +1,110 @@
++//! Production helper approval and restart over an isolated copy of pre-receipt state.
++use super::*;
++
++pub(super) fn exercise(setup: &Setup,snapshots: &PrivateStore,
++    original: &std::collections::BTreeMap<std::ffi::OsString,Vec<u8>>,pins: &NegotiationPins,
++    base: u64,frame: &[u8],signature: &[u8],expected: &[u8;32],context: &Value) -> Result<()> {
++    let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
++    let helper_digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper
++        && hex(&Sha256::digest(std::fs::read(&helper)?))==helper_digest,"proof helper changed");
++    let program=match (std::env::var_os("MONZERO_BCH_QT_NATIVE_PROOF_PROBE"),
++        std::env::var_os("MONZERO_BCH_QT_NATIVE_PROOF_PROBE_SHA256")) {
++        (None,None)=>helper.clone(),
++        (Some(path),Some(digest))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && digest.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),"Qt proof probe changed");
++            path
++        },
++        _=>anyhow::bail!("incomplete Qt proof probe pin"),
++    };
++    let through_qt=program!=helper;
++    // Clone both stores: proof retention creates a private snapshot record and
++    // must not mutate the still-live controller's funding context.
++    let private_copy=PrivateStore::new()?;
++    for (name,bytes) in contents(&snapshots.0)? {save(&private_copy.0.join(name),&bytes)?;}
++    let snapshots=&private_copy;
++    let metadata=PrivateStore::new()?;let config=PrivateStore::new()?;
++    for (name,bytes) in original {save(&metadata.0.join(name),bytes)?;}
++    let quote_path=config.0.join("quote.json");save(&quote_path,&setup.quote.record()?)?;
++    let admission=config.0.join("admission.json");
++    save(&admission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-admission-v1",
++        "helper":helper,"helperDigest":helper_digest,"quoteFile":quote_path,
++        "quoteCommitment":hex(setup.quote.commitment()),"admittedAt":base,
++        "tradeId":setup.quote.terms()["swapId"],"identityPins":[
++            SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++            SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++        "policy":setup.policy,"role":"bch-funder","metadataDirectory":metadata.0,
++        "snapshotDirectory":snapshots.0,"negotiationPins":pins}))?)?;
++    let peer=config.0.join("peer.json");
++    let message=json!({"schema":"monzero-bch-peer-native-proof-v1","frame":frame,"signature":signature});
++    let message_bytes=serde_json::to_vec(&message)?;save(&peer,&message_bytes)?;
++    let wrapper=config.0.join("receipt.json");
++    save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-proof-v1",
++        "admissionConfigFile":admission,"peerMessageFile":peer}))?)?;
++    // Independently restored before any peer proof was read.
++    save(&PathBuf::from(format!("{}.public-context.json",wrapper.display())),&serde_json::to_vec(context)?)?;
++    let invoke=|action: &str,approval: Option<&str>,success: bool| -> Result<Value> {
++        let id=uuid::Uuid::new_v4();
++        let mut request=json!({"schema":format!("monzero-bch-native-proof-{action}-request-v1"),"requestId":id});
++        if let Some(approval)=approval {request["commitment"]=approval.into();}
++        let mut child=Command::new(&program).arg(format!("--native-proof-{action}-stdio-v1")).arg(&wrapper)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("helper stdin missing")?.write_all(&serde_json::to_vec(&request)?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++        if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++        assert!(output.stderr.is_empty() && output.stdout.len()<=16384);
++        let result:Value=serde_json::from_slice(&output.stdout)?;
++        assert_eq!(result.as_object().unwrap().len(),7);
++        assert_eq!(result["schema"],format!("monzero-bch-native-proof-{action}-response-v1"));
++        assert_eq!(result["requestId"],id.to_string());assert_eq!(result["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(result["executable"],false);assert_eq!(result["chainObserved"],false);
++        Ok(result)
++    };
++    let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    // The context command must work before the private peer file is available.
++    std::fs::remove_file(&peer)?;
++    let id=uuid::Uuid::new_v4();
++    let request=json!({"schema":"monzero-bch-native-proof-context-request-v1","requestId":id});
++    let mut child=Command::new(&helper).arg("--native-proof-context-stdio-v1").arg(&wrapper)
++        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++    child.stdin.take().context("context helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++    let output=child.wait_with_output()?;
++    assert!(output.status.success() && output.stderr.is_empty() && output.stdout.len()<=16384);
++    let restored: Value=serde_json::from_slice(&output.stdout)?;
++    assert_eq!(restored.as_object().unwrap().len(),6);
++    assert_eq!(restored["schema"],"monzero-bch-native-proof-context-response-v1");
++    assert_eq!(restored["requestId"],id.to_string());assert_eq!(restored["tradeId"],setup.quote.terms()["swapId"]);
++    assert_eq!(restored["executable"],false);assert_eq!(restored["chainObserved"],false);
++    assert_eq!(&restored["context"],context);
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    save(&peer,&message_bytes)?;
++
++    let initial=invoke("status",None,true)?;assert!(initial["receipt"].is_null() && initial["review"].is_null());
++    let reviewed=invoke("review",None,true)?;assert_eq!(reviewed["review"]["commitment"],hex(expected));
++    assert!(reviewed["receipt"].is_null());
++    invoke("submit",Some(&"00".repeat(32)),false)?;
++    let mut wrong=message.clone();wrong["signature"][0]=json!(signature[0]^1);save(&peer,&serde_json::to_vec(&wrong)?)?;
++    invoke("review",None,false)?;save(&peer,&message_bytes)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    let accepted=invoke("submit",Some(&hex(expected)),true)?;
++    assert_eq!(accepted["receipt"]["state"],"retained");
++    assert_eq!(accepted["review"]["details"].as_object().unwrap().len(),13);
++    assert_eq!(accepted["review"],reviewed["review"]);
++    assert!(accepted["receipt"]["receivedAt"].as_str().context("receipt time")?.parse::<u64>()?>=base);
++
++    let retained=contents(&metadata.0)?;let retained_secrets=contents(&snapshots.0)?;
++    let again=if through_qt {
++        invoke("submit",Some(&hex(expected)),false)?;invoke("status",None,true)?
++    } else {invoke("submit",Some(&hex(expected)),true)?};
++    assert_eq!(again["receipt"],accepted["receipt"]);assert_eq!(again["review"],accepted["review"]);
++    assert_eq!(contents(&metadata.0)?,retained);
++    std::fs::remove_file(&peer)?;
++    let status=invoke("status",None,true)?;
++    assert_eq!(status["receipt"],accepted["receipt"]);assert_eq!(status["review"],accepted["review"]);
++    invoke("review",None,false)?;
++    assert_eq!(contents(&metadata.0)?,retained);assert_eq!(contents(&snapshots.0)?,retained_secrets);
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof/approval.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof/approval.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native/proof/approval.rs
+@@ -5,10 +5,19 @@
+ pub struct NativeProofReview {pub details: serde_json::Value,pub commitment: [u8;32]}
+ pub struct SavedNativeProof {pub review: NativeProofReview,pub received_at: u64}
+ impl AdmittedExecution<'_> {
++    /// Restore public funding context before reading any peer proof. This is
++    /// historical journal evidence, never a payment confirmation or approval.
++    pub fn bch_native_proof_public_context(&self) -> Result<serde_json::Value> {
++        ensure!(self.role==Role::BchFunder,"wrong native proof context role");
++        let (agreed,outpoint,_)=self.native_proof_context()?;
++        let hex=|bytes: &[u8]|bytes.iter().map(|b|format!("{b:02x}")).collect::<String>();
++        Ok(json!({"bchFundingOutpoint":outpoint.to_string(),
++            "destination":agreed.owned().wallet().address().to_string(),
++            "admission":hex(&self.admission_digest()?),"agreement":hex(agreed.commitment())}))
++    }
+     fn native_proof_review(&self,bytes: &[u8],signature: &[u8]) -> Result<NativeProofReview> {
+         ensure!(self.role==Role::BchFunder,"wrong native proof review role");
+-        self.authenticate_native_proof(bytes,signature)?;
+-        let frame=self.check_native_proof(bytes)?;
++        let frame=self.authenticate_native_proof(bytes,signature)?;
+         let details=json!({"schema":REVIEW,"action":"retain-native-payment-proof",
+             "swapId":frame.swap,"quote":frame.quote,"agreement":frame.agreement,
+             "admission":self.admission_digest()?,"bchFundingOutpoint":format!("{}:{}",frame.bch_txid,frame.bch_vout),

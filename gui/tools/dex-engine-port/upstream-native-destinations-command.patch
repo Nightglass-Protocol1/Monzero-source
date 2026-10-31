@@ -1,0 +1,110 @@
+diff --git a/swap-machine/src/bin/native-fee-preview.rs b/swap-machine/src/bin/native-fee-preview.rs
+index a75d84e01..03d63fa75 100644
+--- a/swap-machine/src/bin/native-fee-preview.rs
++++ b/swap-machine/src/bin/native-fee-preview.rs
+@@ -40,6 +40,35 @@ mod linux {
+ 
+     pub async fn run() -> Result<()> {
+         let args: Vec<_> = std::env::args_os().collect();
++        if args.get(1).is_some_and(|arg| arg == "--quote-destinations-stdio-v1") {
++            use tokio::io::{AsyncReadExt, AsyncWriteExt};
++            ensure!(args.len() == 6 && args[2] == "--bitcoin-network" && args[4] == "--xmz-network",
++                "invalid destination arguments");
++            let btc = match args[3].to_str() {
++                Some("mainnet") => bitcoin::Network::Bitcoin,
++                Some("testnet") => bitcoin::Network::Testnet,
++                Some("regtest") => bitcoin::Network::Regtest,
++                _ => anyhow::bail!("unsupported Bitcoin deployment"),
++            };
++            let xmz = match args[5].to_str() {
++                Some("mainnet") => XmzNetwork::Mainnet,
++                Some("testnet") => XmzNetwork::Testnet,
++                Some("stagenet") => XmzNetwork::Stagenet,
++                _ => anyhow::bail!("unsupported XMZ deployment"),
++            };
++            let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)?;
++            let mut writer = tokio::net::unix::pipe::Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)?;
++            return tokio::time::timeout(std::time::Duration::from_secs(10), async {
++                let mut bytes = Vec::new();
++                reader.take(2049).read_to_end(&mut bytes).await?;
++                let reply = swap_machine::native_quote_destinations::validate_command(&bytes, btc, xmz)?;
++                let output = serde_json::to_vec(&reply)?;
++                ensure!(output.len() <= 2048, "oversized destination reply");
++                writer.write_all(&output).await?;
++                writer.flush().await?;
++                Ok(())
++            }).await?;
++        }
+         let recovery = args.get(1).is_some_and(|arg| arg == "--recovery-stdio-v1");
+         ensure!((args.len() == 4 && (args[1] == "--fee-preview-stdio-v1" || args[1] == "--wallet-control-stdio-v1")
+             || args.len() == 6 && recovery && args[4] == "--journal-directory") && args[2] == "--session-file",
+@@ -108,6 +137,8 @@ fn main() {
+             eprintln!("Native wallet control failed");
+         } else if std::env::args_os().nth(1).is_some_and(|arg| arg == "--recovery-stdio-v1") {
+             eprintln!("Native recovery check failed");
++        } else if std::env::args_os().nth(1).is_some_and(|arg| arg == "--quote-destinations-stdio-v1") {
++            eprintln!("Native destination check failed");
+         } else {
+             eprintln!("Native fee preview failed");
+         }
+diff --git a/swap-machine/src/native_quote_destinations.rs b/swap-machine/src/native_quote_destinations.rs
+index af6ae054f..39cbf49c2 100644
+--- a/swap-machine/src/native_quote_destinations.rs
++++ b/swap-machine/src/native_quote_destinations.rs
+@@ -10,6 +10,34 @@ pub struct QuoteDestinations {
+     pub xmz_refund: XmzAddress,
+ }
+ 
++/// Echoes caller correlation only; commitment is not independent quote evidence.
++pub fn validate_command(bytes: &[u8], btc: Network, xmz: XmzNetwork) -> Result<serde_json::Value> {
++    #[derive(serde::Deserialize)]
++    #[serde(deny_unknown_fields, rename_all = "camelCase")]
++    struct Request {
++        schema: String, request_id: String, quote_commitment: String,
++        btc_payout: String, btc_refund: String, xmz_payout: String, xmz_refund: String,
++    }
++    ensure!(bytes.len() <= 2048, "oversized destination command");
++    let value: serde_json::Value = serde_json::from_slice(bytes)?;
++    ensure!(serde_json::to_vec(&value)? == bytes, "noncanonical destination command");
++    let request: Request = serde_json::from_value(value)?;
++    let id: uuid::Uuid = request.request_id.parse()?;
++    ensure!(request.schema == "monzero-native-destinations-request-v1"
++        && !id.is_nil() && id.to_string() == request.request_id, "invalid destination context");
++    ensure!(request.quote_commitment.len() == 64 && request.quote_commitment.bytes()
++        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "invalid quote commitment");
++    let destinations = QuoteDestinations::parse(btc, xmz, &request.btc_payout,
++        &request.btc_refund, &request.xmz_payout, &request.xmz_refund)?;
++    Ok(serde_json::json!({
++        "schema": "monzero-native-destinations-v1", "requestId": request.request_id,
++        "quoteCommitment": request.quote_commitment,
++        "btcPayout": destinations.btc_payout.to_string(), "btcRefund": destinations.btc_refund.to_string(),
++        "xmzPayout": destinations.xmz_payout.to_string(), "xmzRefund": destinations.xmz_refund.to_string(),
++        "valid": true, "executable": false
++    }))
++}
++
+ impl QuoteDestinations {
+     /// Networks must come from trusted deployment configuration, not the quote.
+     /// Some Bitcoin networks share legacy prefixes; genesis is checked separately.
+@@ -44,6 +72,21 @@ mod tests {
+         let btc = Address::p2wsh(&bitcoin::ScriptBuf::new(), Network::Regtest).to_string();
+         let vectors: Vec<_> = include_str!("../../swap-core/src/xmz_address_vectors.txt").lines().collect();
+         let xmz = vectors[0];
++        let command = serde_json::json!({"schema":"monzero-native-destinations-request-v1",
++            "requestId":uuid::Uuid::new_v4().to_string(), "quoteCommitment":"a".repeat(64),
++            "btcPayout":btc,"btcRefund":btc,"xmzPayout":xmz,"xmzRefund":xmz});
++        let encoded = serde_json::to_vec(&command).unwrap();
++        let reply = validate_command(&encoded, Network::Regtest, XmzNetwork::Mainnet).unwrap();
++        assert_eq!(reply["requestId"], command["requestId"]);
++        assert_eq!(reply["quoteCommitment"], command["quoteCommitment"]);
++        assert_eq!(reply["executable"], false);
++        assert!(validate_command(&encoded, Network::Bitcoin, XmzNetwork::Mainnet).is_err());
++        let mut duplicate = encoded.clone();
++        duplicate.splice(1..1, b"\"schema\":\"ignored\",".iter().copied());
++        assert!(validate_command(&duplicate, Network::Regtest, XmzNetwork::Mainnet).is_err());
++        let mut extra = command.clone();
++        extra["unexpected"] = serde_json::json!(true);
++        assert!(validate_command(&serde_json::to_vec(&extra).unwrap(), Network::Regtest, XmzNetwork::Mainnet).is_err());
+         let decoded = QuoteDestinations::parse(Network::Regtest, XmzNetwork::Mainnet,
+             &btc, &btc, xmz, xmz).unwrap();
+         assert_eq!(decoded.btc_payout.to_string(), btc);

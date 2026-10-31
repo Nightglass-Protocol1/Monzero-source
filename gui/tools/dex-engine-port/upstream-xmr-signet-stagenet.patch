@@ -1,0 +1,422 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 5c46a86d1..c81a2ce9e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -9970,8 +9970,6 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+ [[package]]
+ name = "simple-request"
+ version = "0.2.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5c2b7792ed2409a25b01606121e65579dcacbc574e90f275a8cb6a4d78006986"
+ dependencies = [
+  "futures-util",
+  "http-body-util",
+diff --git a/Cargo.toml b/Cargo.toml
+index c76225722..141b32914 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -115,6 +115,10 @@ vergen = { version = "8.3", default-features = false, features = ["build", "git"
+ vergen-git2 = { version = "1", features = ["build"] }
+ 
+ [patch.crates-io]
++# Monzero: send title-case header names and a Host header with its port, so public
++# Monero nodes that reset lowercase-header requests accept the daemon RPC client
++simple-request = { path = "vendor/simple-request" }
++
+ # patch until new release https://github.com/thomaseizinger/rust-jsonrpc-client/pull/51
+ jsonrpc_client = { git = "https://github.com/delta1/rust-jsonrpc-client.git", rev = "3b6081697cd616c952acb9c2f02d546357d35506" }
+ 
+diff --git a/bitcoin-wallet/src/core.rs b/bitcoin-wallet/src/core.rs
+index 7164ac6a0..398891691 100644
+--- a/bitcoin-wallet/src/core.rs
++++ b/bitcoin-wallet/src/core.rs
+@@ -90,7 +90,7 @@ pub mod bitcoin_address {
+     /// Parse the address and validate the network.
+     pub fn parse_and_validate(address: &str, is_testnet: bool) -> Result<bitcoin::Address> {
+         let expected_network = if is_testnet {
+-            bitcoin::Network::Testnet
++            bitcoin::Network::Signet
+         } else {
+             bitcoin::Network::Bitcoin
+         };
+@@ -103,7 +103,7 @@ pub mod bitcoin_address {
+         is_testnet: bool,
+     ) -> Result<Address<NetworkChecked>> {
+         let expected_network = if is_testnet {
+-            bitcoin::Network::Testnet
++            bitcoin::Network::Signet
+         } else {
+             bitcoin::Network::Bitcoin
+         };
+@@ -137,7 +137,7 @@ pub mod bitcoin_address {
+         revalidate_network(
+             address,
+             if is_testnet {
+-                bitcoin::Network::Testnet
++                bitcoin::Network::Signet
+             } else {
+                 bitcoin::Network::Bitcoin
+             },
+diff --git a/monero-rpc-pool/src/proxy.rs b/monero-rpc-pool/src/proxy.rs
+index f3e2e7f2e..5635c0310 100644
+--- a/monero-rpc-pool/src/proxy.rs
++++ b/monero-rpc-pool/src/proxy.rs
+@@ -510,8 +510,11 @@ async fn proxy_to_single_node(
+ 
+         let maybe_tls_stream = TokioIo::new(maybe_tls_stream);
+ 
+-        // Build an HTTP/1 connection over the stream.
+-        let (sender, conn) = hyper::client::conn::http1::handshake(maybe_tls_stream)
++        // Build an HTTP/1 connection over the stream. Title-case header names: some Monero
++        // nodes (or proxies in front of them) reset requests with lowercase header names.
++        let (sender, conn) = hyper::client::conn::http1::Builder::new()
++            .title_case_headers(true)
++            .handshake(maybe_tls_stream)
+             .await
+             .map_err(|e| SingleRequestError::ConnectionError(e.to_string()))?;
+ 
+diff --git a/monero-sys/build.rs b/monero-sys/build.rs
+index 3938883e8..b54337bd8 100644
+--- a/monero-sys/build.rs
++++ b/monero-sys/build.rs
+@@ -113,6 +113,15 @@ fn find_workspace_target_dir() -> std::path::PathBuf {
+ fn main() {
+     let is_github_actions: bool = std::env::var("GITHUB_ACTIONS").is_ok();
+     let is_docker_build: bool = std::env::var("DOCKER_BUILD").is_ok();
++    let native_jobs = if is_github_actions || is_docker_build {
++        1
++    } else {
++        std::env::var("NUM_JOBS")
++            .expect("Cargo to provide NUM_JOBS")
++            .parse::<std::num::NonZeroUsize>()
++            .expect("NUM_JOBS to be a positive integer")
++            .get()
++    };
+ 
+     // Rerun this when the bridge.rs or static_bridge.h file changes.
+     println!("cargo:rerun-if-changed=src/bridge.rs");
+@@ -143,7 +152,7 @@ fn main() {
+         .join(std::env::var("TARGET").expect("TARGET env var to be present"));
+ 
+     let (contrib_depends_dir, target) =
+-        compile_dependencies(contrib_depends_dir, stable_depends_dir);
++        compile_dependencies(contrib_depends_dir, stable_depends_dir, native_jobs);
+ 
+     // Build with the monero library all dependencies required
+     let mut config = Config::new(MONERO_CPP_DIR);
+@@ -196,14 +205,7 @@ fn main() {
+                 .to_string(),
+         ) // This is needed for libsodium.a to be found on mingw-w64
+         .build_arg("-Wno-dev") // Disable warnings we can't fix anyway
+-        .build_arg(format!(
+-            "-j{}",
+-            if is_github_actions || is_docker_build {
+-                1
+-            } else {
+-                num_cpus::get()
+-            }
+-        ))
++        .build_arg(format!("-j{native_jobs}"))
+         .build_arg("-I.")
+         .build();
+ 
+@@ -434,10 +436,35 @@ fn main() {
+     build.compile("monero-sys");
+ }
+ 
++/// Keep pinned pre-C23 depends packages (libiconv, readline) buildable on newer GCC.
++/// Patch the copied recipe, so its content hash selects a new dependency cache
++/// entry without deleting or changing previously built artifacts.
++fn patch_depends_recipe(
++    source: &Path,
++    destination: &Path,
++    relative: &str,
++    patch: &str,
++) -> Result<(), Box<dyn std::error::Error>> {
++    let original = fs::read_to_string(source.join(relative))?;
++    let patch = diffy::Patch::from_str(patch)?;
++    let expected = diffy::apply(&original, &patch)?;
++    let target = destination.join(relative);
++    let current = fs::read_to_string(&target)?;
++    if current == expected {
++        return Ok(());
++    }
++    if current != original {
++        return Err("Copied libiconv recipe differs from the pinned source and expected patch".into());
++    }
++    fs::write(target, expected)?;
++    Ok(())
++}
++
+ /// Compile the dependencies
+ fn compile_dependencies(
+     contrib_depends: std::path::PathBuf,
+     out_dir: std::path::PathBuf,
++    native_jobs: usize,
+ ) -> (std::path::PathBuf, String) {
+     let mut target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+     target = match target.as_str() {
+@@ -479,6 +506,14 @@ fn compile_dependencies(
+         }
+     }
+ 
++    for (recipe, patch) in [
++        ("packages/libiconv.mk", include_str!("patches/depends-libiconv-c17.patch")),
++        ("packages/readline.mk", include_str!("patches/depends-readline-c17.patch")),
++    ] {
++        patch_depends_recipe(&contrib_depends, &out_dir, recipe, patch)
++            .expect("the pinned depends compatibility patch to apply");
++    }
++
+     let mut cmd = std::process::Command::new("env");
+     if target.contains("-apple-") {
+         cmd.arg("-i");
+@@ -490,6 +525,7 @@ fn compile_dependencies(
+     }
+     cmd.arg("make")
+         .arg(format!("HOST={target}"))
++        .arg(format!("NUM_CORES={native_jobs}"))
+         .arg("DEBUG=")
+         .current_dir(&out_dir)
+         .stdout(std::process::Stdio::piped())
+diff --git a/monero-sys/patches/depends-libiconv-c17.patch b/monero-sys/patches/depends-libiconv-c17.patch
+new file mode 100644
+index 000000000..0baa2fe02
+--- /dev/null
++++ b/monero-sys/patches/depends-libiconv-c17.patch
+@@ -0,0 +1,10 @@
++--- a/packages/libiconv.mk
+++++ b/packages/libiconv.mk
++@@ -9,6 +9,7 @@
++   $(package)_config_opts=--enable-static
++   $(package)_config_opts=--disable-shared
++   $(package)_config_opts_linux=--with-pic
+++  $(package)_cflags_linux=-std=gnu17
++   $(package)_config_opts_freebsd=--with-pic
++   $(package)_ar_ios=$($(package)_ar)
++   $(package)_ar_iossimulator=$($(package)_ar)
+diff --git a/monero-sys/patches/depends-readline-c17.patch b/monero-sys/patches/depends-readline-c17.patch
+new file mode 100644
+index 000000000..865e476c4
+--- /dev/null
++++ b/monero-sys/patches/depends-readline-c17.patch
+@@ -0,0 +1,11 @@
++--- a/packages/readline.mk
+++++ b/packages/readline.mk
++@@ -12,6 +12,7 @@
++   $(package)_config_opts+=--host=$(HOST)
++   $(package)_config_opts+=--disable-shared --with-curses
++   $(package)_config_opts_release=--disable-debug-mode
++-  $(package)_build_opts=CFLAGS="$($(package)_cflags) $($(package)_cppflags) -fPIC"
+++  $(package)_cflags+=-std=gnu17
+++  $(package)_build_opts=CFLAGS="$($(package)_cflags) $($(package)_cppflags) -fPIC -std=gnu17"
++ endef
++ 
+diff --git a/swap-env/src/config.rs b/swap-env/src/config.rs
+index ac7253883..ce177f641 100644
+--- a/swap-env/src/config.rs
++++ b/swap-env/src/config.rs
+@@ -415,7 +415,7 @@ pub fn query_user_for_initial_config_with_network(
+ ) -> Result<Config> {
+     let defaults = match bitcoin_network {
+         bitcoin::Network::Bitcoin => Mainnet::get_config_file_defaults()?,
+-        bitcoin::Network::Testnet => Testnet::get_config_file_defaults()?,
++        bitcoin::Network::Signet => Testnet::get_config_file_defaults()?,
+         _ => bail!("Unsupported bitcoin network"),
+     };
+ 
+@@ -485,7 +485,7 @@ pub fn query_user_for_initial_config_with_network(
+ 
+ pub fn query_user_for_initial_config(testnet: bool) -> Result<Config> {
+     let (bitcoin_network, monero_network) = if testnet {
+-        let bitcoin_network = bitcoin::Network::Testnet;
++        let bitcoin_network = bitcoin::Network::Signet;
+         let monero_network = monero_address::Network::Stagenet;
+         (bitcoin_network, monero_network)
+     } else {
+diff --git a/swap-env/src/defaults.rs b/swap-env/src/defaults.rs
+index 0e5edb3c9..a20d9565c 100644
+--- a/swap-env/src/defaults.rs
++++ b/swap-env/src/defaults.rs
+@@ -83,13 +83,10 @@ pub fn default_electrum_servers_mainnet() -> Vec<Url> {
+ }
+ 
+ pub fn default_electrum_servers_testnet() -> Vec<Url> {
++    // Monzero test: Bitcoin signet servers (checked 29 Oct 2026)
+     vec![
+-        Url::parse("ssl://blackie.c3-soft.com:57006")
+-            .expect("default electrum server url to be valid"),
+-        Url::parse("ssl://electrum.blockstream.info:60002")
+-            .expect("default electrum server url to be valid"),
+-        Url::parse("ssl://blockstream.info:993").expect("default electrum server url to be valid"),
+-        Url::parse("tcp://testnet.aranguren.org:51001")
++        Url::parse("ssl://mempool.space:60602").expect("default electrum server url to be valid"),
++        Url::parse("ssl://signet-electrumx.wakiyamap.dev:50002")
+             .expect("default electrum server url to be valid"),
+     ]
+ }
+diff --git a/swap-env/src/env.rs b/swap-env/src/env.rs
+index 9cbcbe0ba..b2f2a530f 100644
+--- a/swap-env/src/env.rs
++++ b/swap-env/src/env.rs
+@@ -86,7 +86,7 @@ impl GetConfig for Testnet {
+             bitcoin_cancel_timelock: 12 * 3,
+             bitcoin_punish_timelock: 24 * 3,
+             bitcoin_remaining_refund_timelock: 2,
+-            bitcoin_network: bitcoin::Network::Testnet,
++            bitcoin_network: bitcoin::Network::Signet, // Monzero test: signet + stagenet
+             monero_avg_block_time: 2.std_minutes(),
+             monero_lock_retry_timeout: 10.std_minutes(),
+             monero_finality_confirmations: 10,
+diff --git a/swap/examples/headless_buy_xmr.rs b/swap/examples/headless_buy_xmr.rs
+new file mode 100644
+index 000000000..04a80d0e8
+--- /dev/null
++++ b/swap/examples/headless_buy_xmr.rs
+@@ -0,0 +1,120 @@
++//! Monzero test driver (not upstream): buy stagenet XMR with signet BTC from one known
++//! maker, without the GUI. Runs the same `buy_xmr` request the desktop app uses.
++//!
++//!   headless_buy_xmr --data-dir D (--monero-node URL | --monero-pool) --electrum URL... address
++//!       print the internal Bitcoin wallet balance and a deposit address, then exit
++//!   MONZERO_TEST_AUTO_SELECT_MAKER=1 headless_buy_xmr --data-dir D --monero-node URL \
++//!       --electrum URL... buy --seller /ip4/.../p2p/<peer> --xmr-address 5...
++//!       swap the whole wallet balance (up to the maker's maximum) and wait until it ends
++use anyhow::{bail, Context as _, Result};
++use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
++use rust_decimal::Decimal;
++use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
++use swap::cli::api::request::{BuyXmrArgs, Request};
++use swap::cli::api::tauri_bindings::MoneroNodeConfig;
++use swap::cli::api::{Context, ContextBuilder};
++use swap::cli::command::Bitcoin;
++use swap::monero::{LabeledMoneroAddress, MoneroAddressPool};
++
++fn value(args: &[String], flag: &str) -> Result<String> {
++    let at = args.iter().position(|a| a == flag).with_context(|| format!("{flag} is required"))?;
++    args.get(at + 1).cloned().with_context(|| format!("{flag} needs a value"))
++}
++
++fn values(args: &[String], flag: &str) -> Vec<String> {
++    args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].clone()).collect()
++}
++
++#[tokio::main]
++async fn main() -> Result<()> {
++    // As swap's own binary: rustls needs one process-wide crypto provider
++    rustls::crypto::ring::default_provider()
++        .install_default()
++        .expect("failed to install default rustls provider");
++
++    let args: Vec<String> = std::env::args().collect();
++    let command = args.last().context("missing command")?.clone();
++    let command = if args.iter().any(|a| a == "buy") { "buy".to_string() } else { command };
++
++    let context = Arc::new(Context::new_without_tauri_handle());
++    ContextBuilder::new(true)
++        .with_bitcoin(Bitcoin {
++            bitcoin_electrum_rpc_urls: values(&args, "--electrum"),
++            bitcoin_target_block: None,
++        })
++        // --monero-pool: upstream's rotating node pool instead of one fixed node
++        .with_monero(if args.iter().any(|a| a == "--monero-pool") {
++            MoneroNodeConfig::Pool
++        } else {
++            MoneroNodeConfig::SingleNode { url: value(&args, "--monero-node")? }
++        })
++        .with_data_dir(PathBuf::from(value(&args, "--data-dir")?))
++        .with_json(false)
++        .with_tor(false)
++        .with_enable_monero_tor(false)
++        .build(context.clone())
++        .await
++        .context("Failed to build the swap context")?;
++
++    let wallet = context.try_get_bitcoin_wallet().await?;
++    wallet.sync().await.context("Failed to sync the Bitcoin wallet")?;
++    println!("bitcoin balance: {}", wallet.balance().await?);
++
++    match command.as_str() {
++        "address" => {
++            println!("deposit address: {}", wallet.new_address().await?);
++            let monero = context.try_get_monero_manager().await?;
++            println!("internal monero address: {}", monero.main_wallet().await.main_address().await?);
++            Ok(())
++        }
++        "rpc-check" => {
++            // The same daemon RPC health check the swap runs before locking any funds
++            let monero = context.try_get_monero_manager().await?;
++            monero.rpc_health_check().await?;
++            println!("monero daemon rpc: ok, height {}", monero.direct_rpc_block_height().await?);
++            Ok(())
++        }
++        "buy" => buy(&args, context).await,
++        other => bail!("unknown command {other}: use address or buy"),
++    }
++}
++
++async fn buy(args: &[String], context: Arc<Context>) -> Result<()> {
++    if std::env::var_os("MONZERO_TEST_AUTO_SELECT_MAKER").is_none() {
++        bail!("set MONZERO_TEST_AUTO_SELECT_MAKER=1: it approves the first matching maker quote");
++    }
++    let seller = Multiaddr::from_str(&value(args, "--seller")?).context("Invalid --seller")?;
++    let Some(Protocol::P2p(peer_id)) = seller.iter().last() else {
++        bail!("--seller must end in /p2p/<peer id>");
++    };
++    let peer_id: PeerId = peer_id;
++    let address = swap::monero::Address::from_str(
++        swap::monero::Network::Stagenet,
++        &value(args, "--xmr-address")?,
++    )
++    .context("Invalid --xmr-address (must be a stagenet address)")?;
++
++    let mut event_loop = context.try_get_event_loop_handle().await?;
++    event_loop.queue_peer_address(peer_id, seller.clone()).await?;
++
++    let receive = LabeledMoneroAddress::with_address(address, Decimal::ONE, "test receive".into())?;
++    BuyXmrArgs {
++        bitcoin_change_address: None,
++        monero_receive_pool: MoneroAddressPool::new(vec![receive]),
++    }
++    .request(context.clone())
++    .await?;
++
++    // buy_xmr hands the running swap to a background task; wait until it releases the lock.
++    loop {
++        tokio::time::sleep(Duration::from_secs(15)).await;
++        if context.swap_lock.get_current_swap_id().await.is_none() {
++            break;
++        }
++    }
++    let db = context.try_get_db().await?;
++    for (peer, swap_id, state) in db.all().await? {
++        println!("swap {swap_id} with {peer}: {state:?}");
++    }
++    Ok(())
++}
+diff --git a/swap/src/cli/api/tauri_bindings.rs b/swap/src/cli/api/tauri_bindings.rs
+index c72f9d2b9..20cbb2f5f 100644
+--- a/swap/src/cli/api/tauri_bindings.rs
++++ b/swap/src/cli/api/tauri_bindings.rs
+@@ -794,6 +794,8 @@ impl TauriEmitter for Option<TauriHandle> {
+     ) -> Result<bool> {
+         match self {
+             Some(tauri) => tauri.request_maker_selection(details, timeout_secs).await,
++            // Monzero headless test driver (examples/headless_buy_xmr.rs) only
++            None if std::env::var_os("MONZERO_TEST_AUTO_SELECT_MAKER").is_some() => Ok(true),
+             None => bail!("No Tauri handle available"),
+         }
+     }
+diff --git a/swap/src/cli/command.rs b/swap/src/cli/command.rs
+index 37b338aac..1fc75edb6 100644
+--- a/swap/src/cli/command.rs
++++ b/swap/src/cli/command.rs
+@@ -20,7 +20,7 @@ use super::api::request::GetLogsArgs;
+ // See: https://1209k.com/bitcoin-eye/ele.php?chain=btc
+ const DEFAULT_ELECTRUM_RPC_URL: &str = "ssl://blockstream.info:700";
+ // See: https://1209k.com/bitcoin-eye/ele.php?chain=tbtc
+-pub const DEFAULT_ELECTRUM_RPC_URL_TESTNET: &str = "tcp://electrum.blockstream.info:60001";
++pub const DEFAULT_ELECTRUM_RPC_URL_TESTNET: &str = "ssl://mempool.space:60602";
+ 
+ const DEFAULT_BITCOIN_CONFIRMATION_TARGET: u16 = 1;
+ pub const DEFAULT_BITCOIN_CONFIRMATION_TARGET_TESTNET: u16 = 1;

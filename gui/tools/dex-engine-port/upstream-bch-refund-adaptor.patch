@@ -1,0 +1,296 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement.rs
+@@ -86,3 +86,5 @@
+         Ok(())
+     }
+ }
++
++pub mod refund;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
+@@ -115,3 +115,5 @@
+         Ok(admission)
+     }
+ }
++
++pub mod refund;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -815,3 +815,6 @@
+ 
+ #[cfg(target_os="linux")]
+ mod wallet_locks;
++
++#[cfg(target_os="linux")]
++mod refund;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/refund.rs
+@@ -0,0 +1,47 @@
++//! Native-funder encrypted refund protection, before BCH funding publication.
++//! This frame contains no success signature, private key or signed funding bytes.
++use super::*;
++const DOMAIN: &str = "monzero-bch-refund-adaptor-v1";
++const MAX: usize = 8192;
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Frame {
++    schema: String, quote: [u8;32], agreement: [u8;32], swap: String,
++    encrypted: EncryptedSignature,
++}
++pub fn signing_bytes(frame: &[u8]) -> Result<Vec<u8>> {
++    ensure!(!frame.is_empty() && frame.len() <= MAX,"invalid BCH refund frame size");
++    let mut message = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:",DOMAIN.len(),DOMAIN,frame.len()).into_bytes();
++    message.extend_from_slice(frame); Ok(message)
++}
++impl AgreedNativeWallet {
++    pub(super) fn refund_frame(&self, quote: &VerifiedBchQuote) -> Result<Vec<u8>> {
++        ensure!(self.owned.role == Role::NativeFunder,"only native funder prepares BCH refund protection");
++        let frame = Frame {schema:DOMAIN.into(),quote:*quote.commitment(),agreement:self.commitment,
++            swap:quote.terms()["swapId"].clone(),encrypted:self.owned.prepare_encrypted_signature(quote)?};
++        let bytes = serde_json::to_vec(&serde_json::to_value(frame)?)?;
++        self.check_refund_frame(quote,&bytes)?;
++        Ok(bytes)
++    }
++    pub(super) fn check_refund_frame(&self, quote: &VerifiedBchQuote, bytes: &[u8]) -> Result<EncryptedSignature> {
++        ensure!(!bytes.is_empty() && bytes.len() <= MAX,"invalid BCH refund frame size");
++        let frame: Frame = serde_json::from_slice(bytes)?;
++        ensure!(frame.schema == DOMAIN && frame.quote == *quote.commitment()
++            && self.owned.wallet.pair.bch.quote_commitment == *quote.commitment()
++            && frame.agreement == self.commitment && frame.swap == quote.terms()["swapId"]
++            && serde_json::to_vec(&serde_json::to_value(&frame)?)? == bytes,"BCH refund frame context mismatch");
++        let covenant = quote.recovery_plan().recovery();
++        let signer = Point::from_bytes(covenant.terms().signing_key.serialize()).context("invalid BCH refund signing key")?;
++        covenant.data_message().verify_encrypted(&signer,&self.owned.wallet.pair.bch.binding.adaptor,&frame.encrypted)?;
++        Ok(frame.encrypted)
++    }
++    pub(super) fn check_signed_refund(&self, quote: &VerifiedBchQuote, bytes: &[u8], signature: &[u8])
++        -> Result<EncryptedSignature> {
++        let encrypted = self.check_refund_frame(quote,bytes)?;
++        let identity = &quote.terms()[Role::NativeFunder.identity()];
++        let mut pin = [0;32];
++        for (i,byte) in pin.iter_mut().enumerate() { *byte = u8::from_str_radix(&identity[i*2..i*2+2],16)?; }
++        VerifyingKey::from_bytes(&pin)?.verify_strict(&signing_bytes(bytes)?,&Signature::from_slice(signature)?)?;
++        Ok(encrypted)
++    }
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/refund.rs
+@@ -0,0 +1,127 @@
++//! Write-once refund adaptor preparation, outgoing signature and peer receipt.
++//! No funding publication, success-signature release, decryption or relay.
++use super::*;
++use crate::bch_key_recovery::authenticated::SignedFrame;
++use ecdsa_fun::adaptor::EncryptedSignature;
++
++const PREPARED: &str = "monzero-bch-refund-preparation-v1";
++const SIGNED: &str = "monzero-bch-refund-authenticated-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Preparation { schema: String, admission: [u8;32], prepared_at: u64, frame: Vec<u8> }
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Receipt { schema: String, admission: [u8;32], signed: SignedFrame }
++
++pub struct OutgoingRefund { frame: Vec<u8>, signature: Vec<u8> }
++impl OutgoingRefund {
++    pub fn frame(&self) -> &[u8] { &self.frame }
++    pub fn signature(&self) -> &[u8] { &self.signature }
++}
++fn name(quote: &VerifiedBchQuote,role: Role,stage: &str) -> String {
++    format!("{}.bch-refund-{}-{stage}",quote.terms()["swapId"],role.domain())
++}
++fn optional(journal: &Journal,name: &str) -> Result<Option<Vec<u8>>> {
++    match journal.read(name) {
++        Ok(bytes) => Ok(Some(bytes)),
++        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound) => Ok(None),
++        Err(e) => Err(e),
++    }
++}
++impl AdmittedExecution<'_> {
++    fn refund_context(&self, now: u64) -> Result<([u8;32],AgreedNativeWallet)> {
++        let admission = self.read_admission()?;
++        self.quote.check_policy(self.policy,now)?;
++        ensure!(now >= admission.admitted_at,"BCH refund stage predates execution admission");
++        let mut hash = Sha256::new(); hash.update(b"monzero-bch-refund-admission-v1\0");
++        hash.update(serde_json::to_vec(&admission)?);
++        Ok((hash.finalize().into(),self.restore_agreement()?))
++    }
++    fn refund_preparation(&self,bytes: &[u8]) -> Result<Preparation> {
++        ensure!(self.role == Role::NativeFunder && bytes.len() <= 16384,"invalid BCH refund preparation owner or size");
++        let state: Preparation = serde_json::from_slice(bytes)?;
++        let (admission,agreed) = self.refund_context(state.prepared_at)?;
++        ensure!(state.schema == PREPARED && state.admission == admission
++            && serde_json::to_vec(&state)? == bytes,"BCH refund preparation changed");
++        agreed.check_refund_frame(self.quote,&state.frame)?;
++        Ok(state)
++    }
++    fn refund_receipt(&self,bytes: &[u8]) -> Result<(Receipt,EncryptedSignature)> {
++        ensure!(bytes.len() <= 16384,"oversized BCH refund receipt");
++        let state: Receipt = serde_json::from_slice(bytes)?;
++        let (admission,agreed) = self.refund_context(state.signed.admitted_at)?;
++        ensure!(state.schema == SIGNED && state.admission == admission
++            && serde_json::to_vec(&state)? == bytes,"BCH refund receipt changed");
++        let encrypted = agreed.check_signed_refund(self.quote,&state.signed.bytes,&state.signed.signature)?;
++        if self.role == Role::NativeFunder {
++            let prepared = self.refund_preparation(&self.metadata.read(&name(self.quote,self.role,"prepared"))?)?;
++            ensure!(state.signed.admitted_at >= prepared.prepared_at && state.signed.bytes == prepared.frame,
++                "BCH outgoing refund differs from retained preparation");
++        }
++        Ok((state,encrypted))
++    }
++
++    /// Retain the encrypted refund frame before exposing bytes for identity
++    /// signing. This does not produce a BCH success signature or funding offer.
++    pub fn prepare_bch_refund_adaptor(&mut self,now: u64) -> Result<Vec<u8>> {
++        ensure!(self.role == Role::NativeFunder,"only native funder prepares BCH refund protection");
++        let (admission,agreed) = self.refund_context(now)?;
++        let slot = name(self.quote,self.role,"prepared");
++        if let Some(bytes) = optional(&self.metadata,&slot)? {
++            let state = self.refund_preparation(&bytes)?;
++            ensure!(now >= state.prepared_at,"BCH refund preparation time moved backwards");
++            return Ok(state.frame)
++        }
++        let frame = agreed.refund_frame(self.quote)?;
++        let state = Preparation {schema:PREPARED.into(),admission,prepared_at:now,frame:frame.clone()};
++        self.metadata.retain(&slot,&serde_json::to_vec(&state)?)?;
++        Ok(frame)
++    }
++
++    /// Retain the identity signature before exposing an outgoing refund frame.
++    /// Repeated calls return the original message only, never a replacement.
++    pub fn retain_outgoing_bch_refund(&mut self,now: u64,signature: &[u8]) -> Result<OutgoingRefund> {
++        ensure!(self.role == Role::NativeFunder,"only native funder sends BCH refund protection");
++        let (admission,agreed) = self.refund_context(now)?;
++        let prepared = self.refund_preparation(&self.metadata.read(&name(self.quote,self.role,"prepared"))?)?;
++        ensure!(now >= prepared.prepared_at,"BCH refund signature predates preparation");
++        agreed.check_signed_refund(self.quote,&prepared.frame,signature)?;
++        let slot = name(self.quote,self.role,"authenticated");
++        if let Some(bytes) = optional(&self.metadata,&slot)? {
++            let (old,_) = self.refund_receipt(&bytes)?;
++            ensure!(now >= old.signed.admitted_at && old.signed.signature == signature,"BCH outgoing refund already retained differently");
++            return Ok(OutgoingRefund {frame:old.signed.bytes.clone(),signature:old.signed.signature.clone()})
++        }
++        let state = Receipt {schema:SIGNED.into(),admission,
++            signed:SignedFrame {bytes:prepared.frame.clone(),signature:signature.to_vec(),admitted_at:now}};
++        self.metadata.retain(&slot,&serde_json::to_vec(&state)?)?;
++        Ok(OutgoingRefund {frame:prepared.frame,signature:signature.to_vec()})
++    }
++
++    /// Accept only the native funder's authenticated refund adaptor for this
++    /// exact agreement. Persist before returning protection to funding logic.
++    pub fn accept_bch_refund_adaptor(&mut self,now: u64,frame: &[u8],signature: &[u8]) -> Result<EncryptedSignature> {
++        ensure!(self.role == Role::BchFunder,"only BCH funder accepts peer refund protection");
++        let (admission,agreed) = self.refund_context(now)?;
++        let encrypted = agreed.check_signed_refund(self.quote,frame,signature)?;
++        let slot = name(self.quote,self.role,"authenticated");
++        if let Some(bytes) = optional(&self.metadata,&slot)? {
++            let (old,encrypted) = self.refund_receipt(&bytes)?;
++            ensure!(now >= old.signed.admitted_at && old.signed.bytes == frame && old.signed.signature == signature,
++                "BCH received refund already retained differently");
++            return Ok(encrypted)
++        }
++        let state = Receipt {schema:SIGNED.into(),admission,
++            signed:SignedFrame {bytes:frame.to_vec(),signature:signature.to_vec(),admitted_at:now}};
++        self.metadata.retain(&slot,&serde_json::to_vec(&state)?)?;
++        Ok(encrypted)
++    }
++
++    /// Historical restoration revalidates the original admission time, never
++    /// renews quote expiry and never publishes a signature or funding bytes.
++    pub fn received_bch_refund_adaptor(&self) -> Result<Option<EncryptedSignature>> {
++        ensure!(self.role == Role::BchFunder,"wrong BCH refund receipt owner");
++        optional(&self.metadata,&name(self.quote,self.role,"authenticated"))?
++            .map(|bytes|self.refund_receipt(&bytes).map(|(_,encrypted)|encrypted)).transpose()
++    }
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/refund.rs
+@@ -0,0 +1,88 @@
++use super::*;
++use agreement::execution::{AdmittedExecution,NegotiationPins};
++
++fn identity_signature(frame: &[u8],role: Role) -> Vec<u8> {
++    let key = SigningKey::from_bytes(&[if role == Role::NativeFunder {2} else {1};32]);
++    key.sign(&agreement::refund::signing_bytes(frame).unwrap()).to_bytes().to_vec()
++}
++fn admit_pair<'a>(setup: &'a Setup,snapshots: &std::path::Path,bmeta: &std::path::Path,nmeta: &std::path::Path)
++    -> Result<(AdmittedExecution<'a>,AdmittedExecution<'a>)> {
++    let (b,bv,bpin) = selected_with_outgoing(setup,snapshots,0)?;
++    let (n,nv,npin) = selected_with_outgoing(setup,snapshots,1)?;
++    let mut admitted = Vec::new();
++    for (role,selected,own,peer,initial,metadata) in [
++        (Role::BchFunder,&b,&bv,&nv,bpin,bmeta),(Role::NativeFunder,&n,&nv,&bv,npin,nmeta)] {
++        let (wallet,received) = selected.retain_received_view(snapshots,&setup.quote,&setup.policy,
++            1003,own.commitment(),peer.frame(),peer.signature())?;
++        let ack = wallet.acknowledgement(&setup.quote)?;
++        let agreed = wallet.accept_agreement(&setup.quote,&setup.policy,1004,&ack,
++            &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++        let agreement = agreement::storage::persist(snapshots,&setup.quote,&setup.policy,role,&agreed)?;
++        let pins = NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
++        admitted.push(AdmittedExecution::admit(metadata,snapshots,&setup.quote,&setup.policy,
++            role,setup.quote.commitment(),pins,1005)?);
++    }
++    let native = admitted.pop().unwrap(); let bch = admitted.pop().unwrap(); Ok((bch,native))
++}
++
++#[test]
++fn refund_adaptor_exchange_is_authenticated_retained_and_restored_without_success_release() -> Result<()> {
++    let setup = Setup::new()?; let snapshots = PrivateStore::new()?;
++    let bmeta = PrivateStore::new()?; let nmeta = PrivateStore::new()?;
++    let (mut b,mut n) = admit_pair(&setup,&snapshots.0,&bmeta.0,&nmeta.0)?;
++    assert!(b.received_bch_refund_adaptor()?.is_none());
++    assert!(b.prepare_bch_refund_adaptor(1006).is_err());
++    assert!(n.received_bch_refund_adaptor().is_err());
++    assert!(n.prepare_bch_refund_adaptor(1004).is_err());
++    assert!(n.prepare_bch_refund_adaptor(2000).is_err());
++    let frame = n.prepare_bch_refund_adaptor(1006)?;
++    let value: serde_json::Value = serde_json::from_slice(&frame)?;
++    assert_eq!(value.as_object().unwrap().len(),5); // Only public context and encrypted refund.
++    assert!(value.get("funding").is_none()); assert!(value.get("success").is_none());
++    assert_eq!(n.prepare_bch_refund_adaptor(1007)?,frame);
++    let signature = identity_signature(&frame,Role::NativeFunder);
++    let wrong = identity_signature(&frame,Role::BchFunder);
++    assert!(n.retain_outgoing_bch_refund(1007,&wrong).is_err());
++    assert!(n.retain_outgoing_bch_refund(1005,&signature).is_err());
++    assert!(b.accept_bch_refund_adaptor(1007,&frame,&wrong).is_err());
++    assert!(n.accept_bch_refund_adaptor(1007,&frame,&signature).is_err());
++    for field in ["quote","agreement","swap","schema"] {
++        let mut changed = value.clone();
++        changed[field] = if field=="quote" || field=="agreement" {serde_json::to_value([0u8;32])?} else {serde_json::json!("other")};
++        let changed = serde_json::to_vec(&changed)?;
++        assert!(b.accept_bch_refund_adaptor(1007,&changed,&identity_signature(&changed,Role::NativeFunder)).is_err());
++    }
++    let mut success = value.clone();
++    success["encrypted"] = serde_json::to_value(b.restore_agreement()?.owned().prepare_encrypted_signature(&setup.quote)?)?;
++    let success = serde_json::to_vec(&success)?;
++    assert!(b.accept_bch_refund_adaptor(1007,&success,&identity_signature(&success,Role::NativeFunder)).is_err());
++    let mut noncanonical = frame.clone(); noncanonical.push(b' ');
++    assert!(b.accept_bch_refund_adaptor(1007,&noncanonical,&identity_signature(&noncanonical,Role::NativeFunder)).is_err());
++    assert!(b.received_bch_refund_adaptor()?.is_none());
++    let outgoing = n.retain_outgoing_bch_refund(1007,&signature)?;
++    assert_eq!(outgoing.frame(),frame); assert_eq!(outgoing.signature(),signature);
++    let encrypted = b.accept_bch_refund_adaptor(1008,outgoing.frame(),outgoing.signature())?;
++    let expected = serde_json::to_vec(&encrypted)?;
++    assert_eq!(serde_json::to_vec(&b.accept_bch_refund_adaptor(1009,&frame,&signature)?)?,expected);
++    assert!(b.accept_bch_refund_adaptor(1007,&frame,&signature).is_err());
++    assert!(b.accept_bch_refund_adaptor(2000,&frame,&signature).is_err());
++    assert!(n.retain_outgoing_bch_refund(2000,&signature).is_err());
++    drop(b); drop(n);
++    let b = AdmittedExecution::resume(&bmeta.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    let mut n = AdmittedExecution::resume(&nmeta.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++    assert_eq!(serde_json::to_vec(&b.received_bch_refund_adaptor()?.unwrap())?,expected);
++    assert_eq!(n.prepare_bch_refund_adaptor(1010)?,frame);
++    assert_eq!(n.retain_outgoing_bch_refund(1010,&signature)?.frame(),frame);
++    let receipt = bmeta.0.join(format!("{}.bch-refund-bch-funder-authenticated",setup.quote.terms()["swapId"]));
++    let original = std::fs::read(&receipt)?;
++    std::fs::write(&receipt,b"{}")?; assert!(b.received_bch_refund_adaptor().is_err());
++    std::fs::write(&receipt,&original)?;
++    let prepared = nmeta.0.join(format!("{}.bch-refund-xmz-funder-prepared",setup.quote.terms()["swapId"]));
++    let original = std::fs::read(&prepared)?;
++    std::fs::write(&prepared,b"{}")?;
++    assert!(n.prepare_bch_refund_adaptor(1010).is_err());
++    assert!(n.retain_outgoing_bch_refund(1010,&signature).is_err());
++    std::fs::write(&prepared,&original)?;
++    assert_eq!(n.prepare_bch_refund_adaptor(1010)?,frame);
++    Ok(())
++}

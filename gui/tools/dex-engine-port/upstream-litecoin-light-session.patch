@@ -1,0 +1,259 @@
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -109,3 +109,5 @@
+ 
+ #[cfg(test)]
+ mod tests;
++
++pub mod session;
+diff --git a/swap-machine/src/litecoin_light/tests.rs b/swap-machine/src/litecoin_light/tests.rs
+--- a/swap-machine/src/litecoin_light/tests.rs
++++ b/swap-machine/src/litecoin_light/tests.rs
+@@ -6,7 +6,7 @@
+ fn bytes(hex: &str) -> Vec<u8> {
+     (0..hex.len()).step_by(2).map(|i|u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect()
+ }
+-fn fixture() -> (InclusionRequest, Vec<u8>, Vec<u8>, Value) {
++pub(super) fn fixture() -> (InclusionRequest, Vec<u8>, Vec<u8>, Value) {
+     let request = InclusionRequest { id: 7, height: 123,
+         block_hash: "fb6f54079ea63c4c7cf866ea10086c9bf31b34b681fcdf261f7b8e77f53e8260".parse().unwrap(),
+         txid: "c7446fb712e90d850729417cc8004058d45d479dd3b12a571d7d00fb3c04cf36".parse().unwrap() };
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -0,0 +1,116 @@
++//! Read-only Electrum 1.4 requests over a caller-supplied stream.
++//! Production callers must supply an authenticated TLS stream. This module
++//! does not create connections, authenticate servers or validate chain work.
++//! Matching reported genesis prevents accidental wrong-network use, not lies.
++use super::*;
++use serde::de::DeserializeOwned;
++use serde_json::{Value, json, value::RawValue};
++use std::time::Duration;
++use swap_core::litecoin_address::LtcNetwork;
++use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
++
++pub struct ReadSession<S> {
++    stream: BufReader<S>,
++    next_id: u64,
++    usable: bool,
++    timeout: Duration,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Reply {
++    jsonrpc: String,
++    id: u64,
++    result: Box<RawValue>,
++    error: Option<Value>,
++}
++#[derive(Deserialize)]
++struct Features { genesis_hash: String, hash_function: String }
++
++impl<S: AsyncRead + AsyncWrite + Unpin> ReadSession<S> {
++    /// Negotiates only protocol 1.4. No addresses or wallet data are queried
++    /// before the server's claimed genesis and script-hash function match.
++    pub async fn negotiate(stream: S, network: LtcNetwork) -> Result<Self> {
++        Self::negotiate_with_timeout(stream, network, Duration::from_secs(15)).await
++    }
++    async fn negotiate_with_timeout(stream: S, network: LtcNetwork, timeout: Duration) -> Result<Self> {
++        let mut session = Self { stream: BufReader::new(stream), next_id: 1, usable: true, timeout };
++        let (_, bytes) = session.exchange("server.version", json!(["Monzero", "1.4"]), MAX_RESPONSE).await?;
++        let version: [String; 2] = result(&bytes)?;
++        ensure!(!version[0].is_empty() && version[0].len() <= 256 && version[1] == "1.4",
++            "unsupported Electrum protocol");
++        let (_, bytes) = session.exchange("server.features", json!([]), MAX_RESPONSE).await?;
++        let features: Features = result(&bytes)?;
++        ensure!(features.genesis_hash == network.genesis() && features.hash_function == "sha256",
++            "wrong Electrum network or script hashing");
++        Ok(session)
++    }
++
++    /// Fetch a header, raw transparent transaction and inclusion branch.
++    /// The expected block hash and height must come from independent chain
++    /// validation, not from this server. Returns no confirmation/unspent claim.
++    pub async fn inclusion(&mut self, height: u32, block_hash: BlockHash, txid: Txid) -> Result<MerkleMatch> {
++        let matched = self.inclusion_inner(height, block_hash, txid).await;
++        if matched.is_err() { self.usable = false; }
++        matched
++    }
++    async fn inclusion_inner(&mut self, height: u32, block_hash: BlockHash, txid: Txid) -> Result<MerkleMatch> {
++        let (_, bytes) = self.exchange("blockchain.block.header", json!([height]), 1024).await?;
++        let header = decode_hex(&result::<String>(&bytes)?, 80)?;
++        ensure!(header.len() == 80, "invalid Electrum header length");
++        let parsed: Header = deserialize(&header)?;
++        ensure!(parsed.block_hash() == block_hash, "Electrum header differs from requested chain anchor");
++        let (_, bytes) = self.exchange("blockchain.transaction.get", json!([txid.to_string(), false]),
++            MAX_TRANSACTION * 2 + 1024).await?;
++        let raw = decode_hex(&result::<String>(&bytes)?, MAX_TRANSACTION)?;
++        let transaction: Transaction = deserialize(&raw)?;
++        ensure!(transaction.compute_txid() == txid, "Electrum returned another transaction");
++        let (id, proof) = self.exchange("blockchain.transaction.get_merkle", json!([txid.to_string(), height]),
++            MAX_RESPONSE).await?;
++        match_merkle_proof(&InclusionRequest { id, height, block_hash, txid }, &header, &raw, &proof)
++    }
++
++    async fn exchange(&mut self, method: &str, params: Value, limit: usize) -> Result<(u64, Vec<u8>)> {
++        ensure!(self.usable, "Electrum session requires a new connection");
++        // Set before the first await so dropping a pending future also poisons
++        // this stream. A late reply must never be consumed by another request.
++        self.usable = false;
++        let id = self.next_id;
++        self.next_id = id.checked_add(1).context("Electrum request identity exhausted")?;
++        let mut request = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
++        request.push(b'\n');
++        let bytes = tokio::time::timeout(self.timeout, async {
++            self.stream.get_mut().write_all(&request).await?;
++            self.stream.get_mut().flush().await?;
++            let mut bytes = Vec::new();
++            loop {
++                let buffer = self.stream.fill_buf().await?;
++                ensure!(!buffer.is_empty(), "Electrum disconnected before completing response");
++                let end = buffer.iter().position(|b| *b == b'\n');
++                let consumed = end.map_or(buffer.len(), |end| end + 1);
++                ensure!(bytes.len() + consumed <= limit, "oversized Electrum response");
++                bytes.extend_from_slice(&buffer[..consumed]);
++                self.stream.consume(consumed);
++                if end.is_some() { break; }
++            }
++            Ok::<_, anyhow::Error>(bytes)
++        }).await.context("Electrum request deadline exceeded")??;
++        let reply: Reply = serde_json::from_slice(&bytes).context("malformed Electrum response")?;
++        ensure!(reply.jsonrpc == "2.0" && reply.id == id && reply.error.is_none(),
++            "Electrum response identity mismatch or server error");
++        self.usable = true;
++        Ok((id, bytes))
++    }
++}
++fn result<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
++    let reply: Reply = serde_json::from_slice(bytes)?;
++    serde_json::from_str(reply.result.get()).context("invalid Electrum result")
++}
++fn decode_hex(value: &str, maximum: usize) -> Result<Vec<u8>> {
++    ensure!(!value.is_empty() && value.len() <= maximum * 2 && value.len() % 2 == 0
++        && value.bytes().all(|b| b.is_ascii_hexdigit()), "invalid Electrum hexadecimal data");
++    (0..value.len()).step_by(2).map(|i|u8::from_str_radix(&value[i..i+2],16)
++        .context("invalid Electrum hexadecimal data")).collect()
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session/tests.rs b/swap-machine/src/litecoin_light/session/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/tests.rs
+@@ -0,0 +1,112 @@
++use super::*;
++use tokio::io::{AsyncReadExt, DuplexStream};
++use tokio::task::JoinHandle;
++
++fn reply(id: u64, result: Value) -> Vec<u8> {
++    let mut bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
++    bytes.push(b'\n'); bytes
++}
++fn handshake() -> Vec<Vec<u8>> {
++    vec![reply(1,json!(["fixture","1.4"])),reply(2,json!({
++        "genesis_hash":LtcNetwork::Mainnet.genesis(),"hash_function":"sha256",
++        "server_version":"fixture","protocol_min":"1.4","protocol_max":"1.4.3","hosts":{}}))]
++}
++fn server(responses: Vec<Vec<u8>>) -> (DuplexStream, JoinHandle<Vec<Value>>) {
++    let (client, stream) = tokio::io::duplex(256);
++    let task = tokio::spawn(async move {
++        let mut stream = BufReader::new(stream);
++        let mut requests = Vec::new();
++        for response in responses {
++            let mut line = String::new();
++            assert!(stream.read_line(&mut line).await.unwrap() > 0);
++            requests.push(serde_json::from_str(&line).unwrap());
++            // Fragment replies across reads, including their trailing newline.
++            for part in response.chunks(17) {
++                if stream.get_mut().write_all(part).await.is_err() { return requests; }
++            }
++        }
++        let mut extra = Vec::new(); stream.read_to_end(&mut extra).await.unwrap();
++        assert!(extra.is_empty(), "unexpected request after failure or completion");
++        requests
++    });
++    (client, task)
++}
++fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b|format!("{b:02x}")).collect() }
++
++#[tokio::test]
++async fn session_fetches_fragmented_proof_only_after_network_handshake() -> Result<()> {
++    let (request, header, raw, mut proof) = super::super::tests::fixture();
++    let mut responses = handshake();
++    responses.push(reply(3,json!(hex(&header)))); responses.push(reply(4,json!(hex(&raw))));
++    proof["id"] = json!(5); responses.push(serde_json::to_vec(&proof)?); responses.last_mut().unwrap().push(b'\n');
++    let (stream, task) = server(responses);
++    let mut session = ReadSession::negotiate(stream,LtcNetwork::Mainnet).await?;
++    let matched = session.inclusion(request.height,request.block_hash,request.txid).await?;
++    assert_eq!(matched.txid(),request.txid); drop(session);
++    let requests = task.await?;
++    assert_eq!(requests.iter().map(|r|r["method"].as_str().unwrap()).collect::<Vec<_>>(),
++        ["server.version","server.features","blockchain.block.header","blockchain.transaction.get","blockchain.transaction.get_merkle"]);
++    assert_eq!(requests[0]["params"],json!(["Monzero","1.4"]));
++    assert_eq!(requests[2]["params"],json!([request.height]));
++    assert_eq!(requests[3]["params"],json!([request.txid.to_string(),false]));
++    assert_eq!(requests[4]["params"],json!([request.txid.to_string(),request.height]));
++    Ok(())
++}
++#[tokio::test]
++async fn session_rejects_wrong_network_or_hash_function_before_wallet_queries() -> Result<()> {
++    for (genesis, hash) in [(LtcNetwork::Testnet.genesis(),"sha256"),
++        (LtcNetwork::Regtest.genesis(),"sha256"),(LtcNetwork::Mainnet.genesis(),"scrypt")] {
++        let mut responses = handshake(); responses[1] = reply(2,json!({"genesis_hash":genesis,"hash_function":hash}));
++        let (stream, task) = server(responses);
++        assert!(ReadSession::negotiate(stream,LtcNetwork::Mainnet).await.is_err());
++        assert_eq!(task.await?.len(),2);
++    }
++    Ok(())
++}
++#[tokio::test]
++async fn session_refuses_unnegotiated_versions_wrong_ids_and_errors() -> Result<()> {
++    for response in [reply(1,json!(["fixture","1.4.3"])),reply(1,json!(["fixture","1.3"])),
++        reply(8,json!(["fixture","1.4"])),b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null,\"error\":{\"code\":-1}}\n".to_vec(),
++        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"id\":1,\"result\":[\"fixture\",\"1.4\"]}\n".to_vec()] {
++        let (stream,task) = server(vec![response]);
++        assert!(ReadSession::negotiate(stream,LtcNetwork::Mainnet).await.is_err());
++        assert_eq!(task.await?.len(),1);
++    }
++    Ok(())
++}
++#[tokio::test]
++async fn session_wrong_header_permanently_stops_further_requests() -> Result<()> {
++    let (request,mut header,_,_) = super::super::tests::fixture(); header[76] ^= 1;
++    let mut responses = handshake(); responses.push(reply(3,json!(hex(&header))));
++    let (stream,task) = server(responses);
++    let mut session = ReadSession::negotiate(stream,LtcNetwork::Mainnet).await?;
++    assert!(session.inclusion(request.height,request.block_hash,request.txid).await.is_err());
++    assert!(session.inclusion(request.height,request.block_hash,request.txid).await.is_err());
++    drop(session); assert_eq!(task.await?.len(),3);
++    Ok(())
++}
++#[tokio::test]
++async fn session_rejects_unterminated_and_oversized_lines() -> Result<()> {
++    let (stream,mut peer) = tokio::io::duplex(32768);
++    let task = tokio::spawn(async move {
++        let mut buf = [0;512]; let _ = peer.read(&mut buf).await?;
++        peer.write_all(b"{\"jsonrpc\":\"2.0\"").await?;
++        Ok::<_,std::io::Error>(())
++    });
++    assert!(ReadSession::negotiate(stream,LtcNetwork::Mainnet).await.is_err()); task.await??;
++    let (stream,task) = server(vec![vec![b' ';MAX_RESPONSE+1]]);
++    assert!(ReadSession::negotiate(stream,LtcNetwork::Mainnet).await.is_err()); task.await?;
++    Ok(())
++}
++#[tokio::test]
++async fn session_timeout_and_cancelled_future_cannot_reuse_stream() -> Result<()> {
++    // A caller-owned stream with no reply proves the whole-request deadline.
++    let (stream,_peer) = tokio::io::duplex(4096);
++    assert!(ReadSession::negotiate_with_timeout(stream,LtcNetwork::Mainnet,Duration::from_millis(20)).await.is_err());
++    let (stream,_peer) = tokio::io::duplex(4096);
++    let mut session = ReadSession {stream:BufReader::new(stream),next_id:1,usable:true,timeout:Duration::from_secs(1)};
++    let timed = tokio::time::timeout(Duration::from_millis(20),session.exchange("server.features",json!([]),MAX_RESPONSE)).await;
++    assert!(timed.is_err()); assert!(!session.usable);
++    assert!(session.exchange("server.features",json!([]),MAX_RESPONSE).await.is_err());
++    Ok(())
++}

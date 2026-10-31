@@ -1,0 +1,200 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ ## [Unreleased]
++
++- Private BCH/XMZ prototype: expose read-only funding observation against the pinned BCH regtest backend, including after quote expiry.
++  Point-in-time chain evidence never resets a relay attempt or authorizes retransmission.
+ 
+ - Private BCH/XMZ prototype: add explicitly reviewed BCH regtest funding relay and offline retained relay status.
+   A durable attempt prevents retransmission after an uncertain result; historical status remains available after quote expiry.
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/submit.rs
+@@ -23,7 +23,7 @@
+     let response:Value=serde_json::from_slice(&output.stdout)?;
+     assert_eq!(response["schema"],format!("monzero-bch-funding-{action}-response-v1"));
+     assert_eq!(response["requestId"],id.to_string());
+-    assert_eq!(response["executable"],false);assert_eq!(response["chainObserved"],false);
++    assert_eq!(response["executable"],false);assert_eq!(response["chainObserved"],action=="observe");
+     Ok(response)
+ }
+ 
+@@ -78,6 +78,7 @@
+         drop(historical);
+         invoke(helper,&submit_path,"submit",Some(&approved),false)?;
+         assert_eq!(server.state.lock().unwrap().relay_calls,1);
++        if !via_qt {observe(helper,&submit_path,&server,metadata,snapshots,&txid,"acknowledged",&[0,2])?;}
+         drop(server);status("acknowledged")?;
+         return Ok(())
+     }
+@@ -94,6 +95,15 @@
+     std::fs::set_permissions(&cookie,std::fs::Permissions::from_mode(0o400))?;
+     assert_eq!(contents(&metadata.0)?,before);assert!(!intent.exists());assert!(!ack.exists());
+     assert_eq!(server.state.lock().unwrap().relay_calls,0);
++    if !via_qt {
++        let before=contents(&metadata.0)?;
++        invoke(helper,&submit_path,"observe",Some(&approved),false)?;
++        let mut wrong=descriptor.clone();wrong["wallet"]=json!("other");
++        save(&rpc_path,&serde_json::to_vec(&wrong)?)?;
++        invoke(helper,&submit_path,"observe",None,false)?;
++        save(&rpc_path,&serde_json::to_vec(&descriptor)?)?;
++        assert_eq!(contents(&metadata.0)?,before);
++    }
+     let acknowledged=case==Case::Acknowledged;
+     let response=invoke(helper,&submit_path,"submit",Some(&approved),acknowledged)?;
+     let state=if acknowledged {"acknowledged"} else {"attempted"};
+@@ -109,6 +119,12 @@
+     invoke(helper,&submit_path,"submit",Some(&approved),acknowledged && !via_qt)?;
+     assert_eq!(server.state.lock().unwrap().relay_calls,1);
+     assert_eq!(contents(&metadata.0)?,retained);assert_eq!(contents(&snapshots.0)?,secrets);
++    if !via_qt {
++        let modes: &[u8]=if acknowledged {&[0,1,3,4,8,11,2]} else {&[0,2]};
++        observe(helper,&submit_path,&server,metadata,snapshots,&txid,state,modes)?;
++        invoke(helper,&submit_path,"submit",Some(&approved),acknowledged)?;
++        assert_eq!(server.state.lock().unwrap().relay_calls,1);
++    }
+     // Status cannot contact the node: even its descriptor and cookie are gone.
+     drop(server);std::fs::remove_file(&rpc_path)?;std::fs::remove_file(&cookie)?;
+     status(state)?;
+@@ -117,3 +133,35 @@
+     save(&intent,&saved)?;status(state)?;
+     Ok(())
+ }
++
++// Observe the retained transaction without altering relay intent or private records.
++fn observe(helper: &std::path::Path,path: &std::path::Path,server: &Server,
++    metadata: &PrivateStore,snapshots: &PrivateStore,txid: &str,relay: &str,modes: &[u8]) -> Result<()> {
++    let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    let calls=server.state.lock().unwrap().relay_calls;
++    for &mode in modes {
++        {let mut state=server.state.lock().unwrap();state.observation_mode=mode.into();state.observation_chain_calls=0;}
++        let success=matches!(mode,0|1|2|3);
++        let response=invoke(helper,path,"observe",None,success)?;
++        if success {
++            assert_eq!(response["relay"]["state"],relay);
++            assert_eq!(response["relay"]["confirmed"],false);
++            let value=&response["observation"];
++            assert_eq!(value.as_object().unwrap().len(),6);
++            assert_eq!(value["txid"],txid);assert_eq!(value["tip"],"08".repeat(32));
++            assert!(value["observedAt"].as_str().context("missing observation time")?.parse::<u64>()?>0);
++            let (state,confirmations,unspent)=match mode {
++                0 => ("confirmed-unspent",json!("3"),json!(true)),
++                1 => ("mempool",Value::Null,json!(true)),
++                3 => ("mempool",Value::Null,json!(false)),
++                2 => ("unobserved",Value::Null,Value::Null),
++                _ => unreachable!(),
++            };
++            assert_eq!(value["state"],state);assert_eq!(value["confirmations"],confirmations);
++            assert_eq!(value["lockOutputUnspent"],unspent);
++        }
++        assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++        assert_eq!(server.state.lock().unwrap().relay_calls,calls);
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -143,7 +143,7 @@
+     fn funding_request(bytes: &[u8], action: &str) -> Result<Request> {
+         ensure!(!bytes.is_empty() && bytes.len() <= 512,"invalid BCH funding request size");
+         let request: Request = serde_json::from_slice(bytes)?;
+-        ensure!(matches!(action,"review"|"submit"|"status")
++        ensure!(matches!(action,"review"|"submit"|"status"|"observe")
+             && request.schema == format!("monzero-bch-funding-{action}-request-v1")
+             && !request.request_id.is_nil(),"invalid BCH funding request");
+         if action == "submit" {
+@@ -160,7 +160,7 @@
+     }
+     async fn funding_operation(path: &Path, bytes: &[u8], now: u64, action: &str) -> Result<serde_json::Value> {
+         let request = funding_request(bytes,action)?;
+-        let submission = if action == "submit" {
++        let submission = if matches!(action,"submit"|"observe") {
+             let (lease,bytes) = private_bytes(path)?;
+             let config: FundingSubmission = serde_json::from_slice(&bytes)?;
+             ensure!(config.schema == "monzero-private-bch-funding-submit-v1"
+@@ -182,20 +182,39 @@
+             &config.snapshot_directory,&quote,&config.policy,config.role)?;
+         execution.saved_admission_review(&config.negotiation_pins)?;
+         let deployment = parse_digest(&funding.deployment_commitment)?;
+-        let review = if action == "status" {execution.saved_bch_funding_relay_review(&deployment)?}
++        let review = if matches!(action,"status"|"observe") {execution.saved_bch_funding_relay_review(&deployment)?}
+             else {execution.review_bch_funding_relay_for_deployment(&deployment,now)?};
+         let commitment: String = review.commitment.iter().map(|b|format!("{b:02x}")).collect();
++        let mut observation = None;
+         if let Some((_,submission)) = &submission {
+-            let approved = parse_digest(request.commitment.as_deref().context("missing funding approval")?)?;
+-            ensure!(approved == review.commitment,"BCH funding approval changed");
+             let (_rpc_lease,bytes) = private_bytes(&submission.rpc_file)?;
+             let rpc: FundingRpc = serde_json::from_slice(&bytes)?;
+             let (_cookie_lease,bytes) = private_file(&rpc.cookie_file,true)?;
+             let backend = rpc.backend(&bytes)?;
+-            // Restoring cryptographic records can take time. Anchor the relay's
+-            // deadline to the actual dispatch entry, not helper startup time.
+-            let dispatch_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+-            execution.relay_bch_funding(&backend,&approved,dispatch_now).await?;
++            if action == "observe" {
++                // Validate historical relay records before querying the backend.
++                execution.bch_funding_relay_state()?;
++                let observed = execution.observe_signed_bch_funding(&backend).await?;
++                use swap_machine::bch_rpc::observation::FundingStatus;
++                let (state,confirmations,unspent) = match observed.status() {
++                    FundingStatus::ConfirmedUnspent {confirmations} =>
++                        ("confirmed-unspent",Some(confirmations.to_string()),Some(true)),
++                    FundingStatus::Mempool {lock_output_unspent} =>
++                        ("mempool",None,Some(lock_output_unspent)),
++                    FundingStatus::Unobserved => ("unobserved",None,None),
++                };
++                let observed_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                observation = Some(serde_json::json!({"state":state,"txid":observed.txid().to_string(),
++                    "tip":observed.tip().to_string(),"confirmations":confirmations,
++                    "lockOutputUnspent":unspent,"observedAt":observed_at.to_string()}));
++            } else {
++                let approved = parse_digest(request.commitment.as_deref().context("missing funding approval")?)?;
++                ensure!(approved == review.commitment,"BCH funding approval changed");
++                // Restoring cryptographic records can take time. Anchor the relay's
++                // deadline to the actual dispatch entry, not helper startup time.
++                let dispatch_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                execution.relay_bch_funding(&backend,&approved,dispatch_now).await?;
++            }
+         }
+         let mut response = serde_json::json!({"schema":format!("monzero-bch-funding-{action}-response-v1"),
+             "requestId":request.request_id,"tradeId":config.trade_id,
+@@ -210,6 +229,10 @@
+                 Some(FundingRelayState::Acknowledged {txid}) => ("acknowledged",txid.to_string()),
+             };
+             response["relay"] = serde_json::json!({"state":state,"txid":txid,"confirmed":false});
++        }
++        if let Some(observation) = observation {
++            response["chainObserved"] = serde_json::json!(true);
++            response["observation"] = observation;
+         }
+         Ok(response)
+     }
+@@ -256,6 +279,7 @@
+             "--funding-review-stdio-v1" => Some("review"),
+             "--funding-submit-stdio-v1" => Some("submit"),
+             "--funding-status-stdio-v1" => Some("status"),
++            "--funding-observe-stdio-v1" => Some("observe"),
+             _ => None,
+         } {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+@@ -275,6 +299,14 @@
+     #[cfg(test)]
+     mod tests {
+ use super::*;
++#[test]
++fn funding_observation_requires_read_only_request() {
++    let mut value=serde_json::json!({"schema":"monzero-bch-funding-observe-request-v1",
++        "requestId":uuid::Uuid::new_v4()});
++    assert!(funding_request(&serde_json::to_vec(&value).unwrap(),"observe").is_ok());
++    value["commitment"]=serde_json::json!("11".repeat(32));
++    assert!(funding_request(&serde_json::to_vec(&value).unwrap(),"observe").is_err());
++}
+ #[test]
+ fn funding_review_protocol_rejects_approval_and_unpinned_deployment() {
+     let valid = serde_json::json!({"schema":"monzero-bch-funding-review-request-v1",

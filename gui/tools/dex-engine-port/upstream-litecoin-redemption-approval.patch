@@ -1,0 +1,228 @@
+diff --git a/swap-machine/src/litecoin_negotiation/execution.rs b/swap-machine/src/litecoin_negotiation/execution.rs
+index cbfbc6d3c..0dfb3fd2a 100644
+--- a/swap-machine/src/litecoin_negotiation/execution.rs
++++ b/swap-machine/src/litecoin_negotiation/execution.rs
+@@ -412,3 +412,5 @@ pub mod funding_approval;
+ pub mod start_approval;
+ 
+ pub mod lock_approval;
++
++pub mod redeem_approval;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/redeem_approval.rs b/swap-machine/src/litecoin_negotiation/execution/redeem_approval.rs
+new file mode 100644
+index 000000000..b3493a2b5
+--- /dev/null
++++ b/swap-machine/src/litecoin_negotiation/execution/redeem_approval.rs
+@@ -0,0 +1,134 @@
++//! Explicit consent for the retained completed Litecoin redemption.
++use super::*;
++use crate::{litecoin_rpc::LitecoinRpc, native_funding_rpc::relay::NativeTransferRelay};
++use bitcoin::Txid;
++
++pub struct RedeemSpendReview {
++    pub details: serde_json::Value,
++    pub commitment: [u8; 32],
++}
++#[derive(Serialize)]
++#[serde(tag = "state", rename_all = "camelCase")]
++pub enum ReviewedRedeemOutcome {
++    Acknowledged { txid: Txid },
++    Uncertain { txid: Txid },
++    Mempool { txid: Txid },
++}
++fn review_commitment(details: &serde_json::Value) -> Result<[u8; 32]> {
++    let mut hash = Sha256::new();
++    hash.update(b"MONZERO-LTC-REDEMPTION-APPROVAL-V1\0");
++    hash.update(serde_json::to_vec(details)?);
++    Ok(hash.finalize().into())
++}
++impl Execution {
++    /// No RPC or broadcast. Recover interrupted publication of an already saved
++    /// dispatch/receipt before binding consent to the exact send/retry state.
++    pub fn review_completed_redeem(&mut self) -> Result<RedeemSpendReview> {
++        use swap_core::litecoin_address::LtcSegwitAddress;
++        let transaction = self.recover_completed_redeem()?;
++        ensure!(transaction.input.len() == 1 && transaction.output.len() == 1,
++            "invalid redemption transaction shape");
++        let (mut head,previous,quote,_,_)=self.load()?;
++        let expected=super::redeem_relay::dispatch_bytes(&head,&transaction)?;
++        let dispatch=match self.metadata.read(&super::redeem_relay::dispatch_name(self.claim.trade)) {
++            Ok(saved)=>{
++                ensure!(saved==expected,"redemption dispatch differs from reviewed bytes");
++                let hash:[u8;32]=Sha256::digest(&saved).into();
++                if let Some(pin)=head.redeem_dispatch.as_ref() {ensure!(*pin==hash,"redemption dispatch differs from head");}
++                head.redeem_dispatch=Some(hash);Some(hash)
++            },
++            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
++                ensure!(head.redeem_dispatch.is_none(),"missing committed redemption dispatch");None
++            },
++            Err(e)=>return Err(e),
++        };
++        match self.metadata.read(&super::redeem_relay::receipt_name(self.claim.trade)) {
++            Ok(saved)=>{
++                let expected=serde_json::to_vec(&super::redeem_relay::Receipt {schema:"monzero-ltc-redeem-receipt-v1".into(),
++                    dispatch:dispatch.context("receipt without redemption dispatch")?,txid:transaction.compute_txid()})?;
++                ensure!(saved==expected,"redemption receipt differs from reviewed bytes");
++                let hash:[u8;32]=Sha256::digest(&saved).into();
++                if let Some(pin)=head.redeem_receipt.as_ref() {ensure!(*pin==hash,"redemption receipt differs from head");}
++                head.redeem_receipt=Some(hash);
++            },
++            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
++                ensure!(head.redeem_receipt.is_none(),"missing committed redemption receipt");
++            },
++            Err(e)=>return Err(e),
++        }
++        let current=serde_json::to_vec(&head)?;
++        if current!=previous {self.metadata.replace_execution_head(self.claim.trade,&previous,&current)?;}
++
++        let input = quote.terms()["ltcAtoms"].parse::<u64>()?;
++        let amount = transaction.output[0].value.to_sat();
++        let fee = input.checked_sub(amount).context("redemption output exceeds lock")?;
++        ensure!(fee == quote.terms()["ltcRedeemFeeAtoms"].parse::<u64>()?, "redemption fee differs from quote");
++        let destination = LtcSegwitAddress::from_script(self.policy.ltc_network, &transaction.output[0].script_pubkey)?.to_string();
++        ensure!(destination == quote.terms()["ltcPayout"], "redemption destination differs from quote");
++        let details = serde_json::json!({"schema":"monzero-ltc-redemption-review-v1","tradeId":head.trade,
++            "quoteCommitment":hex(&head.quote),"journalCommitment":hex(&Sha256::digest(&current)),
++            "completedCommitment":hex(&head.redeem_completed.context("missing completed redemption")?),
++            "transactionCommitment":hex(&Sha256::digest(bitcoin::consensus::serialize(&transaction))),
++            "dispatchCommitment":dispatch.map(|h|hex(&h)),"action":if dispatch.is_some(){"retransmit"}else{"send"},
++            "txid":transaction.compute_txid(),"wtxid":transaction.compute_wtxid(),
++            "inputTxid":transaction.input[0].previous_output.txid,"inputVout":transaction.input[0].previous_output.vout.to_string(),
++            "sequence":transaction.input[0].sequence.0.to_string(),"destination":destination,
++            "inputAtoms":input.to_string(),"amountAtoms":amount.to_string(),"feeAtoms":fee.to_string(),"chainObserved":false});
++        Ok(RedeemSpendReview {commitment:review_commitment(&details)?,details})
++    }
++    /// Consent is checked before RPC. A retry may reconcile the exact pooled
++    /// transaction, but still requires fresh evidence of our native funding.
++    pub async fn submit_reviewed_completed_redeem(&mut self, native:&NativeTransferRelay,
++        ltc:&LitecoinRpc, approved:[u8;32]) -> Result<ReviewedRedeemOutcome> {
++        let review=self.review_completed_redeem()?;
++        ensure!(review.commitment==approved,"redemption approval differs from retained transaction or action");
++        ensure!(ltc.network()==self.policy.ltc_network,"wrong redemption network");
++        let retry=review.details["action"]=="retransmit";
++        if retry {
++            self.reconcile_native_lock(native).await?;
++            let transaction=self.recover_completed_redeem()?;
++            if ltc.contract_spend_in_mempool(&transaction).await? {
++                return Ok(ReviewedRedeemOutcome::Mempool {txid:transaction.compute_txid()});
++            }
++        }
++        let outcome=if retry {self.retransmit_completed_redeem(native,ltc).await?}
++            else {self.relay_completed_redeem(native,ltc).await?};
++        Ok(match outcome {
++            super::redeem_relay::RedeemRelayOutcome::Acknowledged {txid}=>ReviewedRedeemOutcome::Acknowledged {txid},
++            super::redeem_relay::RedeemRelayOutcome::Uncertain {txid}=>ReviewedRedeemOutcome::Uncertain {txid},
++        })
++    }
++    /// Indexed active-chain evidence for the retained transaction effect. Saved
++    /// acknowledgements never stand in for fresh confirmation, including retries.
++    pub async fn check_completed_redeem(&mut self,ltc:&LitecoinRpc)->Result<serde_json::Value> {
++        let transaction=self.recover_completed_redeem()?;
++        let (head,_,quote,_,_)=self.load()?;
++        ensure!(ltc.network()==self.policy.ltc_network,"wrong redemption observation network");
++        let minimum=quote.terms()["ltcConfirmations"].parse::<u64>()?.max(u64::from(self.policy.ltc_confirmations));
++        let observed=ltc.indexed_confirmed_transaction(transaction.compute_txid(),minimum).await?;
++        ensure!(super::redeem::same_redemption_effect(&transaction,observed.transaction()),"observed redemption differs from agreement");
++        Ok(serde_json::json!({"schema":"monzero-ltc-redemption-confirmation-v1","tradeId":head.trade,
++            "quoteCommitment":hex(&head.quote),"txid":transaction.compute_txid(),"wtxid":observed.transaction().compute_wtxid(),
++            "block":observed.block(),"tip":observed.tip(),"confirmations":observed.confirmations().to_string(),
++            "requiredConfirmations":minimum.to_string(),"chainObserved":true}))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn redemption_consent_binds_every_field_and_domain()->Result<()> {
++        let review=serde_json::json!({"schema":"monzero-ltc-redemption-review-v1","action":"send","txid":"a","wtxid":"b",
++            "destination":"payout","amountAtoms":"99","feeAtoms":"1","inputAtoms":"100",
++            "tradeId":"trade","quoteCommitment":"quote","journalCommitment":"journal","completedCommitment":"completed",
++            "transactionCommitment":"transaction","dispatchCommitment":null,"sequence":"0","inputTxid":"parent","inputVout":"0","chainObserved":false});
++        let approved=review_commitment(&review)?;
++        for key in review.as_object().unwrap().keys() {
++            let mut changed=review.clone();changed[key]=serde_json::json!("changed");
++            assert_ne!(approved,review_commitment(&changed)?,"unbound field {key}");
++        }
++        let mut hash=Sha256::new();hash.update(b"MONZERO-LTC-RECOVERY-SPEND-APPROVAL-V1\0");hash.update(serde_json::to_vec(&review)?);
++        assert_ne!(approved,<[u8;32]>::from(hash.finalize()));Ok(())
++    }
++}
+diff --git a/swap-machine/src/litecoin_negotiation/execution/redeem_relay.rs b/swap-machine/src/litecoin_negotiation/execution/redeem_relay.rs
+index f4db186a1..5ae2bd594 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/redeem_relay.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/redeem_relay.rs
+@@ -10,10 +10,10 @@ pub enum RedeemRelayOutcome { Acknowledged {txid:Txid}, Uncertain {txid:Txid} }
+ struct Dispatch {schema:String,trade:uuid::Uuid,quote:[u8;32],checkpoint:[u8;32],completed:[u8;32],txid:Txid,wtxid:Wtxid}
+ #[derive(Serialize,Deserialize)]
+ #[serde(deny_unknown_fields)]
+-struct Receipt {schema:String,dispatch:[u8;32],txid:Txid}
++pub(super) struct Receipt {pub(super) schema:String,pub(super) dispatch:[u8;32],pub(super) txid:Txid}
+ pub(super) fn dispatch_name(trade:uuid::Uuid)->String {format!("{trade}.ltc-redeem-dispatch")}
+ pub(super) fn receipt_name(trade:uuid::Uuid)->String {format!("{trade}.ltc-redeem-receipt")}
+-fn dispatch_bytes(head:&Head,transaction:&Transaction)->Result<Vec<u8>> {
++pub(super) fn dispatch_bytes(head:&Head,transaction:&Transaction)->Result<Vec<u8>> {
+     serde_json::to_vec(&Dispatch {schema:"monzero-ltc-redeem-dispatch-v1".into(),trade:head.trade,quote:head.quote,
+         checkpoint:head.checkpoint,completed:head.redeem_completed.context("missing committed redemption")?,
+         txid:transaction.compute_txid(),wtxid:transaction.compute_wtxid()}).map_err(Into::into)
+diff --git a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+index f4a6ccb48..74b4828aa 100644
+--- a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
++++ b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+@@ -190,8 +190,23 @@ async fn actual_paired_chain_execution()->Result<()> {
+             let rpc=litecoin(&root,&request)?;
+             let relay=NativeTransferRelay::new(native(&root,&request,request.wallet_port)?);
+             let completed=alice.recover_completed_redeem()?;
+-            let outcome=alice.relay_completed_redeem(&relay,&rpc).await?;
+-            ensure!(matches!(outcome,execution::redeem_relay::RedeemRelayOutcome::Acknowledged {..}),"fixture redemption acknowledgement missing");
++            use execution::redeem_approval::ReviewedRedeemOutcome;
++            ensure!(bob.review_completed_redeem().is_err(),"wrong role reviewed redemption");
++            let review=alice.review_completed_redeem()?;
++            ensure!(review.details["action"]=="send" && review.details["chainObserved"]==false,"invalid first redemption review");
++            let mut changed=review.commitment;changed[0]^=1;
++            let error=alice.submit_reviewed_completed_redeem(&relay,&rpc,changed).await
++                .err().context("altered redemption approval accepted")?;
++            ensure!(error.to_string()=="redemption approval differs from retained transaction or action","wrong approval rejection");
++            let outcome=alice.submit_reviewed_completed_redeem(&relay,&rpc,review.commitment).await?;
++            ensure!(matches!(outcome,ReviewedRedeemOutcome::Acknowledged {..}),"fixture redemption acknowledgement missing");
++            ensure!(alice.submit_reviewed_completed_redeem(&relay,&rpc,review.commitment).await.is_err(),"stale send approval accepted");
++            let retry=alice.review_completed_redeem()?;
++            ensure!(retry.details["action"]=="retransmit" && retry.commitment!=review.commitment,"retry lacks distinct consent");
++            let outcome=alice.submit_reviewed_completed_redeem(&relay,&rpc,retry.commitment).await?;
++            ensure!(matches!(outcome,ReviewedRedeemOutcome::Mempool {..}),"exact redemption retry not reconciled");
++            ensure!(alice.review_completed_redeem()?.commitment==retry.commitment,"pooled retry changed journal");
++            result["redemptionApprovalBound"]=serde_json::json!(true);
+             result["txid"]=serde_json::json!(completed.compute_txid());
+         },
+         "redeem"=>{
+@@ -202,10 +217,28 @@ async fn actual_paired_chain_execution()->Result<()> {
+             bob.admit_native_funding(&observer,proof,now).await?;
+             let release=bob.release_redeem(&observer,&rpc,2,&bob_identity).await?;
+             let completed=alice.complete_redeem(release.bytes(),release.signature())?;
+-            let outcome=alice.relay_completed_redeem(&relay,&rpc).await?;
+-            ensure!(matches!(outcome,execution::redeem_relay::RedeemRelayOutcome::Acknowledged {..}),"fixture redemption acknowledgement missing");
++            use execution::redeem_approval::ReviewedRedeemOutcome;
++            ensure!(bob.review_completed_redeem().is_err(),"wrong role reviewed redemption");
++            let review=alice.review_completed_redeem()?;
++            ensure!(review.details["action"]=="send" && review.details["chainObserved"]==false,"invalid first redemption review");
++            let mut changed=review.commitment;changed[0]^=1;
++            let error=alice.submit_reviewed_completed_redeem(&relay,&rpc,changed).await
++                .err().context("altered redemption approval accepted")?;
++            ensure!(error.to_string()=="redemption approval differs from retained transaction or action","wrong approval rejection");
++            let outcome=alice.submit_reviewed_completed_redeem(&relay,&rpc,review.commitment).await?;
++            ensure!(matches!(outcome,ReviewedRedeemOutcome::Acknowledged {..}),"fixture redemption acknowledgement missing");
++            ensure!(alice.submit_reviewed_completed_redeem(&relay,&rpc,review.commitment).await.is_err(),"stale send approval accepted");
++            let retry=alice.review_completed_redeem()?;
++            ensure!(retry.details["action"]=="retransmit" && retry.commitment!=review.commitment,"retry lacks distinct consent");
++            let outcome=alice.submit_reviewed_completed_redeem(&relay,&rpc,retry.commitment).await?;
++            ensure!(matches!(outcome,ReviewedRedeemOutcome::Mempool {..}),"exact redemption retry not reconciled");
++            ensure!(alice.review_completed_redeem()?.commitment==retry.commitment,"pooled retry changed journal");
++            result["redemptionApprovalBound"]=serde_json::json!(true);
+             result["txid"]=serde_json::json!(completed.compute_txid());
+         },
++        "check_redeem" | "check_redeem_unconfirmed" | "check_redeem_reorg"=>{
++            result["observation"]=alice.check_completed_redeem(&litecoin(&root,&request)?).await?;
++        },
+         "claim_restore"=>{
+             let rpc=litecoin(&root,&request)?;let observer=native(&root,&request,request.observer_wallet_port)?;
+             let block=request.block.context("missing redemption block")?;

@@ -1,0 +1,229 @@
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -123,3 +123,5 @@
+ pub mod tls;
+ 
+ pub mod headers;
++
++pub mod state;
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -155,6 +155,6 @@
+ }
+ 
+ #[cfg(test)]
+-mod tests;
++pub(super) mod tests;
+ 
+ pub mod sync;
+diff --git a/swap-machine/src/litecoin_light/session/tests.rs b/swap-machine/src/litecoin_light/session/tests.rs
+--- a/swap-machine/src/litecoin_light/session/tests.rs
++++ b/swap-machine/src/litecoin_light/session/tests.rs
+@@ -2,7 +2,7 @@
+ use tokio::io::{AsyncReadExt, DuplexStream};
+ use tokio::task::JoinHandle;
+ 
+-pub(super) fn reply(id: u64, result: Value) -> Vec<u8> {
++pub(in crate::litecoin_light) fn reply(id: u64, result: Value) -> Vec<u8> {
+     let mut bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
+     bytes.push(b'\n'); bytes
+ }
+@@ -11,7 +11,7 @@
+         "genesis_hash":LtcNetwork::Mainnet.genesis(),"hash_function":"sha256",
+         "server_version":"fixture","protocol_min":"1.4","protocol_max":"1.4.3","hosts":{}}))]
+ }
+-pub(super) fn server(responses: Vec<Vec<u8>>) -> (DuplexStream, JoinHandle<Vec<Value>>) {
++pub(in crate::litecoin_light) fn server(responses: Vec<Vec<u8>>) -> (DuplexStream, JoinHandle<Vec<Value>>) {
+     let (client, stream) = tokio::io::duplex(256);
+     let task = tokio::spawn(async move {
+         let mut stream = BufReader::new(stream);
+@@ -31,7 +31,7 @@
+     });
+     (client, task)
+ }
+-pub(super) fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b|format!("{b:02x}")).collect() }
++pub(in crate::litecoin_light) fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b|format!("{b:02x}")).collect() }
+ 
+ #[tokio::test]
+ async fn session_fetches_fragmented_proof_only_after_network_handshake() -> Result<()> {
+@@ -111,7 +111,7 @@
+     Ok(())
+ }
+ 
+-pub(super) fn regtest_handshake() -> Vec<Vec<u8>> {
++pub(in crate::litecoin_light) fn regtest_handshake() -> Vec<Vec<u8>> {
+     let mut responses=handshake();
+     responses[1]=reply(2,json!({"genesis_hash":LtcNetwork::Regtest.genesis(),"hash_function":"sha256"}));
+     responses
+diff --git a/swap-machine/src/litecoin_light/state.rs b/swap-machine/src/litecoin_light/state.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/state.rs
+@@ -0,0 +1,54 @@
++//! Coordinates selected headers, validated candidates and durable publication.
++//! Blocking cache replay and publication belong on an application worker.
++//! This is not a wallet, a freshness decision or signing authority.
++use super::{headers::{HeaderSequence,ChainChange,cache::HeaderCache},session::sync::SyncCandidate};
++use anyhow::{Result,ensure};
++use std::path::Path;
++use swap_core::litecoin_address::LtcNetwork;
++
++/// Owns the cache lease throughout synchronization. No mutable chain reference
++/// escapes, so updates through this API cannot bypass durable publication.
++pub struct ChainState {
++    cache: HeaderCache,
++    selected: HeaderSequence,
++    maximum_height: u32,
++    usable: bool,
++}
++impl ChainState {
++    /// Only an absent cache starts at genesis; a damaged cache is an error.
++    /// A restored chain still requires current network/freshness assessment.
++    pub fn open(directory: &Path,network: LtcNetwork,maximum_height: u32,now: u64) -> Result<Self> {
++        let cache=HeaderCache::open(directory,network)?;
++        let selected=match cache.load(maximum_height,now)? {
++            Some(chain)=>chain,
++            None=>HeaderSequence::new(network)?,
++        };
++        Ok(Self {cache,selected,maximum_height,usable:true})
++    }
++    pub fn chain(&self) -> Result<&HeaderSequence> {
++        ensure!(self.usable,"Litecoin chain state requires reopen after publication failure");
++        Ok(&self.selected)
++    }
++    /// Publish only a complete, stronger candidate within the resource policy.
++    /// Persistence precedes visibility; any persistence error invalidates this
++    /// handle, including when rename succeeded but directory sync failed.
++    /// Drop and reopen to reconcile the durable record before further use.
++    pub fn publish(&mut self,candidate: SyncCandidate) -> Result<Option<ChainChange>> {
++        self.publish_with(candidate,|cache,chain|cache.save(chain))
++    }
++    fn publish_with(&mut self,candidate: SyncCandidate,
++        save: impl FnOnce(&HeaderCache,&HeaderSequence)->Result<()>) -> Result<Option<ChainChange>> {
++        ensure!(candidate.target_height()<=self.maximum_height,"Litecoin candidate exceeds cache height policy");
++        let chain=self.chain()?;
++        let mut staged=chain.fork(chain.height())?;
++        let Some(change)=candidate.finish(&mut staged)? else {return Ok(None)};
++        self.usable=false;
++        save(&self.cache,&staged)?;
++        self.selected=staged;
++        self.usable=true;
++        Ok(Some(change))
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/state/tests.rs b/swap-machine/src/litecoin_light/state/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/state/tests.rs
+@@ -0,0 +1,106 @@
++use super::*;
++use crate::litecoin_light::{headers::tests::child,session::{ReadSession,
++    tests::{server,reply,hex,regtest_handshake}}};
++use bitcoin::{block::Header,consensus::{serialize,deserialize}};
++use serde_json::json;
++use std::{fs,os::unix::fs::PermissionsExt,path::PathBuf};
++struct Directory(PathBuf);
++impl Directory {
++    fn new() -> Result<Self> {
++        let path=std::env::temp_dir().join(format!("monzero-chain-state-{}",uuid::Uuid::new_v4()));
++        fs::create_dir(&path)?;fs::set_permissions(&path,fs::Permissions::from_mode(0o700))?;
++        Ok(Self(path.canonicalize()?))
++    }
++}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++fn descendant() -> Header {
++    let raw="000000209d08f789f2afaf053878d9b21add2f847fff4a9c32fb58b8c5c79ca166f94a9d111111111111111111111111111111111111111111111111111111111111111106e7494dffff7f2000000000";
++    let bytes: Vec<u8>=(0..raw.len()).step_by(2).map(|i|u8::from_str_radix(&raw[i..i+2],16).unwrap()).collect();
++    deserialize(&bytes).unwrap()
++}
++/// Exercise production tip parsing, fork discovery and download over two mock
++/// connections, not a fabricated SyncCandidate or a real network/node.
++async fn candidate(selected: &HeaderSequence,branch: &[Header],download: bool) -> Result<SyncCandidate> {
++    let last=branch.last().unwrap();
++    let mut responses=regtest_handshake();responses.push(reply(3,json!({"height":branch.len(),"hex":hex(&serialize(last))})));
++    let (stream,task)=server(responses);
++    let tip=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?.reported_tip().await?;
++    assert_eq!(task.await?.len(),3);
++    // These fixed cases have a genesis or height-one selected chain.
++    assert!(selected.height()<=1);
++    let mut responses=regtest_handshake();let mut id=3;
++    let start=if selected.height()==1 {
++        responses.push(reply(id,json!(hex(&serialize(&branch[0])))));id+=1;
++        if selected.contains(1,branch[0].block_hash()) {1} else {0}
++    } else {0};
++    if download && start<branch.len() {
++        responses.push(reply(id,json!({"count":branch.len()-start,"max":2016,
++            "hex":hex(&branch[start..].iter().flat_map(serialize).collect::<Vec<_>>())})));
++    }
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let mut candidate=session.begin_sync(selected,tip).await?;
++    if download && !candidate.complete() {candidate.advance(&mut session,2016,1296688902).await?;}
++    drop(session);task.await?;Ok(candidate)
++}
++#[tokio::test]
++async fn state_sync_publication_and_reorg_survive_reopen() -> Result<()> {
++    let dir=Directory::new()?;let mut state=ChainState::open(&dir.0,LtcNetwork::Regtest,2,1296688902)?;
++    assert_eq!(state.chain()?.height(),0);assert!(!dir.0.join("headers.bin").exists());
++    let first=candidate(state.chain()?,&[child()],true).await?;
++    assert_eq!(state.publish(first)?.unwrap().new_tip,(1,child().block_hash()));
++    assert!(ChainState::open(&dir.0,LtcNetwork::Regtest,2,1296688902).is_err());drop(state);
++    let mut state=ChainState::open(&dir.0,LtcNetwork::Regtest,2,1296688902)?;
++    assert!(state.chain()?.contains(1,child().block_hash()));
++    let mut alternate=child();alternate.nonce=0;
++    let fork=candidate(state.chain()?,&[alternate,descendant()],true).await?;
++    assert_eq!(state.publish(fork)?.unwrap().common_ancestor,0);
++    assert!(!state.chain()?.contains(1,child().block_hash()));drop(state);
++    let state=ChainState::open(&dir.0,LtcNetwork::Regtest,2,1296688902)?;
++    assert!(state.chain()?.contains(1,alternate.block_hash()));assert!(state.chain()?.contains(2,descendant().block_hash()));
++    Ok(())
++}
++#[tokio::test]
++async fn state_incomplete_equal_work_and_policy_refusal_do_not_write() -> Result<()> {
++    let dir=Directory::new()?;let mut state=ChainState::open(&dir.0,LtcNetwork::Regtest,1,1296688902)?;
++    let pending=candidate(state.chain()?,&[child()],false).await?;
++    assert!(state.publish(pending).is_err());assert_eq!(state.chain()?.height(),0);assert!(!dir.0.join("headers.bin").exists());
++    let first=candidate(state.chain()?,&[child()],true).await?;state.publish(first)?;
++    let before=fs::read(dir.0.join("headers.bin"))?;
++    let equal=candidate(state.chain()?,&[child()],true).await?;assert!(state.publish(equal)?.is_none());
++    assert_eq!(fs::read(dir.0.join("headers.bin"))?,before);
++    let mut alternate=child();alternate.nonce=0;
++    let over=candidate(state.chain()?,&[alternate,descendant()],true).await?;
++    assert!(state.publish(over).is_err());assert!(state.chain()?.contains(1,child().block_hash()));
++    assert_eq!(fs::read(dir.0.join("headers.bin"))?,before);Ok(())
++}
++#[tokio::test]
++async fn state_publication_failure_requires_reopen_and_preserves_prior_record() -> Result<()> {
++    let dir=Directory::new()?;let mut state=ChainState::open(&dir.0,LtcNetwork::Regtest,2,1296688902)?;
++    let first=candidate(state.chain()?,&[child()],true).await?;state.publish(first)?;
++    let mut alternate=child();alternate.nonce=0;
++    let next=candidate(state.chain()?,&[alternate,descendant()],true).await?;
++    let path=dir.0.join("headers.bin");let before=fs::read(&path)?;
++    // Deterministic storage refusal works even when tests run with broad privileges.
++    fs::set_permissions(&path,fs::Permissions::from_mode(0o644))?;
++    assert!(state.publish(next).is_err());assert!(state.chain().is_err());assert_eq!(fs::read(&path)?,before);
++    fs::set_permissions(&path,fs::Permissions::from_mode(0o600))?;assert!(state.chain().is_err());drop(state);
++    let state=ChainState::open(&dir.0,LtcNetwork::Regtest,2,1296688902)?;
++    assert!(state.chain()?.contains(1,child().block_hash()));assert_eq!(state.chain()?.height(),1);drop(state);
++    let mut damaged=fs::read(&path)?;damaged[48]^=1;fs::write(&path,damaged)?;
++    assert!(ChainState::open(&dir.0,LtcNetwork::Regtest,2,1296688902).is_err());Ok(())
++}
++
++#[tokio::test]
++async fn state_ambiguous_publication_reopens_actual_durable_tip() -> Result<()> {
++    let dir=Directory::new()?;let mut state=ChainState::open(&dir.0,LtcNetwork::Regtest,1,1296688902)?;
++    let first=candidate(state.chain()?,&[child()],true).await?;
++    // Inject an error after actual publication. This exercises uncertainty at
++    // the cache API boundary; it does not claim to force an OS fsync failure.
++    assert!(state.publish_with(first,|cache,chain| {
++        cache.save(chain)?;anyhow::bail!("simulated error after cache publication")
++    }).is_err());
++    assert!(state.chain().is_err());drop(state);
++    let state=ChainState::open(&dir.0,LtcNetwork::Regtest,1,1296688902)?;
++    assert_eq!(state.chain()?.height(),1);assert!(state.chain()?.contains(1,child().block_hash()));
++    Ok(())
++}

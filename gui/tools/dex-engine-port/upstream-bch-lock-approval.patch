@@ -1,0 +1,104 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ ## [Unreleased]
++
++- Private BCH/XMZ prototype: require a separate exact-preparation review for app-facing wallet lock approval.
++  Historical lock intent is distinct from current advisory wallet locks; reconciliation never reselects inputs.
+ 
+ - Private BCH/XMZ prototype: add preparation and offline saved-preparation helper commands.
+   Both bind original admission, policy and deployment; neither signs nor broadcasts.
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation.rs
+@@ -138,3 +138,5 @@
+         Ok(())
+     }
+ }
++
++pub mod locking;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation/locking.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation/locking.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/preparation/locking.rs
+@@ -0,0 +1,44 @@
++//! Separate approval for advisory wallet locking of the exact saved candidate.
++//! Saved intent is historical; it never asserts that wallet locks still exist.
++use super::*;
++use crate::bch_rpc::FundingInputsObservation;
++
++const REVIEW: &str="monzero-bch-wallet-lock-review-v1";
++pub struct WalletLockReview {pub details: serde_json::Value,pub commitment: [u8;32]}
++pub struct SavedWalletLockIntent {pub commitment: [u8;32],pub recorded_at: u64}
++impl AdmittedExecution<'_> {
++    /// Offline, current-quote review. Approval applies only to the exact retained
++    /// candidate and configured wallet policy, not signing or broadcasting.
++    pub fn review_bch_wallet_lock(&self,deployment: &[u8;32],policy: &WalletPreparationPolicy,
++        now: u64) -> Result<WalletLockReview> {
++        self.quote.check_policy(self.policy,now)?;
++        let candidate=self.wallet_preparation_candidate()?.context("BCH wallet candidate is absent")?;
++        ensure!(now>=candidate.prepared_at,"BCH lock review predates preparation");
++        let preparation=self.saved_bch_wallet_preparation_review(deployment,policy)?;
++        let details=serde_json::json!({"schema":REVIEW,"action":"lock-retained-wallet-inputs",
++            "preparationReview":preparation.details,"preparationReviewCommitment":hex(&preparation.commitment)});
++        Ok(WalletLockReview {commitment:hash(REVIEW,&serde_json::to_vec(&details)?),details})
++    }
++
++    /// This reports a validated historical intent, including after expiry.
++    /// Missing intent does not prove that the wallet has no advisory locks.
++    pub fn saved_bch_wallet_lock_intent(&self,deployment: &[u8;32],policy: &WalletPreparationPolicy)
++        -> Result<Option<SavedWalletLockIntent>> {
++        self.saved_bch_wallet_preparation_review(deployment,policy)?;
++        if optional(&self.metadata,&record_name(self.quote,"wallet-lock-intent"))?.is_none() {return Ok(None)}
++        let prepared=self.prepared_bch_funding()?.context("BCH preparation is absent")?;
++        let (intent,commitment)=self.funding_lock_intent(&prepared)?;
++        ensure!(&intent.deployment==deployment && intent.change_address==policy.change_address
++            && intent.minimum_confirmations==policy.minimum_confirmations,"saved BCH lock policy changed");
++        Ok(Some(SavedWalletLockIntent {commitment,recorded_at:intent.admitted_at}))
++    }
++
++    /// Explicit approval or reconciliation of original inputs only. Existing
++    /// wallet intent is retained before mutation; no unlock or reselection.
++    pub async fn lock_bch_wallet_preparation(&mut self,backend: &BchRpc,policy: &WalletPreparationPolicy,
++        approved: &[u8;32],now: u64) -> Result<FundingInputsObservation> {
++        let review=self.review_bch_wallet_lock(&backend.deployment_commitment()?,policy,now)?;
++        ensure!(&review.commitment==approved,"BCH wallet lock approval differs from exact preparation");
++        self.lock_bch_funding_inputs(backend,now,&policy.change_address,policy.minimum_confirmations).await
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/preparation.rs
+@@ -54,6 +54,29 @@
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     {let state=server.state.lock().unwrap();assert_eq!(state.preparation_calls,1);assert_eq!(state.calls,0);
+         assert_eq!(state.sign_calls,0);assert_eq!(state.relay_calls,0);assert!(!state.locked);}
++    let lock_review=execution.review_bch_wallet_lock(&deployment,&policy,now+1)?;
++    assert_ne!(lock_review.commitment,review.commitment);
++    assert_eq!(lock_review.details["preparationReview"],review.details);
++    assert!(execution.saved_bch_wallet_lock_intent(&deployment,&policy)?.is_none());
++    let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    assert!(execution.lock_bch_wallet_preparation(rpc,&policy,&review.commitment,now+1).await.is_err());
++    assert!(execution.lock_bch_wallet_preparation(wrong,&policy,&lock_review.commitment,now+1).await.is_err());
++    assert!(execution.review_bch_wallet_lock(&deployment,&policy,now-1).is_err());
++    assert!(execution.review_bch_wallet_lock(&deployment,&policy,expiry).is_err());
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    assert_eq!(server.state.lock().unwrap().calls,0);
++    execution.lock_bch_wallet_preparation(rpc,&policy,&lock_review.commitment,now+1).await?;
++    let intent=execution.saved_bch_wallet_lock_intent(&deployment,&policy)?.context("missing approved wallet lock intent")?;
++    assert_eq!(intent.recorded_at,now+1);assert_eq!(server.state.lock().unwrap().calls,1);
++    let records=contents(&metadata.0)?;
++    // A node restart can remove advisory locks without changing historical intent.
++    server.state.lock().unwrap().locked=false;
++    assert_eq!(execution.saved_bch_wallet_lock_intent(&deployment,&policy)?.unwrap().commitment,intent.commitment);
++    assert!(!server.state.lock().unwrap().locked);
++    execution.lock_bch_wallet_preparation(rpc,&policy,&lock_review.commitment,now+1).await?;
++    assert_eq!(contents(&metadata.0)?,records);assert_eq!(contents(&snapshots.0)?,secrets);
++    {let state=server.state.lock().unwrap();assert_eq!(state.calls,2);assert!(state.locked);
++        assert_eq!(state.preparation_calls,1);assert_eq!(state.sign_calls,0);assert_eq!(state.relay_calls,0);}
+     Ok(execution)
+ }
+ 

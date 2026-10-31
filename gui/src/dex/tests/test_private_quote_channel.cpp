@@ -52,6 +52,11 @@ class PrivateQuoteChannelTest : public QObject {
     Q_OBJECT
 private slots:
     void writeAdmissionCountsBothTlsQueues() {
+        using Profile=PrivateQuoteChannel::Profile;
+        QVERIFY(PrivateQuoteChannel::hasWriteCapacity(0,0,410000,Profile::LitecoinNegotiation));
+        QVERIFY(!PrivateQuoteChannel::hasWriteCapacity(0,0,410001,Profile::LitecoinNegotiation));
+        QVERIFY(!PrivateQuoteChannel::hasWriteCapacity(0,0,410000,Profile::Quotes));
+        QVERIFY(!PrivateQuoteChannel::hasWriteCapacity(0,0,1,static_cast<Profile>(999)));
         constexpr int message = 98304;
         constexpr qint64 available = 2 * message - message - 4;
         QVERIFY(PrivateQuoteChannel::hasWriteCapacity(0, 0, message));

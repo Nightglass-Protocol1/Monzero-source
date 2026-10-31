@@ -1,0 +1,164 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet.rs
+@@ -5,6 +5,8 @@
+ use curve25519_dalek_ng::{edwards::{CompressedEdwardsY,EdwardsPoint},traits::Identity};
+ use sha2::{Digest,Sha256};
+ use swap_core::xmz_address::XmzAddress;
++
++pub mod agreement;
+ 
+ const VIEW_DOMAIN: &str = "monzero-bch-xmz-private-view-v1";
+ const MAX_VIEW_FRAME: usize = 2048;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -147,3 +147,69 @@
+     }
+     Ok(())
+ }
++
++fn owned(setup: &Setup, role: Role) -> Result<OwnedNativeWallet> {
++    let (index,tag) = if role == Role::BchFunder {(0,3)} else {(1,4)};
++    setup.wallet()?.bind_local(&setup.quote,role,bitcoin::secp256k1::SecretKey::from_slice(&[tag;32])?,
++        setup.spend[index],setup.view[index])
++}
++fn ack_sign(bytes: &[u8], role: Role) -> Vec<u8> {
++    SigningKey::from_bytes(&[if role==Role::BchFunder {1} else {2};32])
++        .sign(&agreement::signing_bytes(bytes,role).unwrap()).to_bytes().to_vec()
++}
++
++#[test]
++fn both_peers_acknowledge_identical_context_and_only_their_funding_intent() -> Result<()> {
++    let setup = Setup::new()?;
++    let bch = owned(&setup,Role::BchFunder)?; let native = owned(&setup,Role::NativeFunder)?;
++    let frame = bch.acknowledgement(&setup.quote)?;
++    assert_eq!(frame,native.acknowledgement(&setup.quote)?);
++    let bs = ack_sign(&frame,Role::BchFunder); let ns = ack_sign(&frame,Role::NativeFunder);
++    let bch = bch.accept_agreement(&setup.quote,&setup.policy,1000,&frame,&bs,&ns)?;
++    let native = native.accept_agreement(&setup.quote,&setup.policy,1000,&frame,&bs,&ns)?;
++    assert_eq!(bch.commitment(),native.commitment());
++    let lock = setup.quote.recovery_plan().lock().script_pubkey();
++    let address = native.owned().wallet().address();
++    bch.check_bch_funding(&setup.quote,&setup.policy,1001,&lock,100_000,5000)?;
++    native.check_native_funding(&setup.quote,&setup.policy,1001,address,101_000,1000)?;
++    assert!(native.check_bch_funding(&setup.quote,&setup.policy,1001,&lock,100_000,5000).is_err());
++    assert!(bch.check_native_funding(&setup.quote,&setup.policy,1001,address,101_000,1000).is_err());
++    for time in [999,2000] {
++        assert!(bch.check_bch_funding(&setup.quote,&setup.policy,time,&lock,100_000,5000).is_err());
++        assert!(native.check_native_funding(&setup.quote,&setup.policy,time,address,101_000,1000).is_err());
++    }
++    for (amount,fee) in [(99_999,5000),(100_000,0),(100_000,5001)] {
++        assert!(bch.check_bch_funding(&setup.quote,&setup.policy,1001,&lock,amount,fee).is_err());
++    }
++    for (amount,fee) in [(100_000,1000),(101_000,0),(101_000,1001)] {
++        assert!(native.check_native_funding(&setup.quote,&setup.policy,1001,address,amount,fee).is_err());
++    }
++    assert!(bch.check_bch_funding(&setup.quote,&setup.policy,1001,
++        setup.quote.recovery_plan().recovery().script_pubkey().as_script(),100_000,5000).is_err());
++    assert!(native.check_native_funding(&setup.quote,&setup.policy,1001,setup.quote.xmz_payout(),101_000,1000).is_err());
++    Ok(())
++}
++
++#[test]
++fn jointly_signed_acknowledgements_cannot_replace_derived_transcript() -> Result<()> {
++    let setup = Setup::new()?; let frame = owned(&setup,Role::BchFunder)?.acknowledgement(&setup.quote)?;
++    let bs = ack_sign(&frame,Role::BchFunder); let ns = ack_sign(&frame,Role::NativeFunder);
++    assert!(owned(&setup,Role::BchFunder)?.accept_agreement(&setup.quote,&setup.policy,1000,&frame,&ns,&bs).is_err());
++    assert!(owned(&setup,Role::NativeFunder)?.accept_agreement(&setup.quote,&setup.policy,1000,&frame,&bs,&[]).is_err());
++    assert!(owned(&setup,Role::BchFunder)?.accept_agreement(&setup.quote,&setup.policy,2000,&frame,&bs,&ns).is_err());
++    let value: serde_json::Value = serde_json::from_slice(&frame)?;
++    let mut variants = vec![serde_json::to_vec_pretty(&value)?];
++    for field in ["quoteCommitment","swapId","transcript","xmzAddress","bchLockScript","bchRecoveryScript","schema"] {
++        let mut changed = value.clone(); changed[field] = "wrong".into(); variants.push(serde_json::to_vec(&changed)?);
++    }
++    for changed in variants {
++        let bs = ack_sign(&changed,Role::BchFunder); let ns = ack_sign(&changed,Role::NativeFunder);
++        assert!(owned(&setup,Role::BchFunder)?.accept_agreement(&setup.quote,&setup.policy,1000,&changed,&bs,&ns).is_err());
++    }
++    // Valid alternative signed view shares under the same quote create another
++    // wallet/transcript; the old acknowledgement must not approve it.
++    let mut other = setup;
++    other.view[1] = monero::PrivateViewKey::new_random(&mut rand::thread_rng());
++    assert!(owned(&other,Role::NativeFunder)?.accept_agreement(&other.quote,&other.policy,1000,&frame,&bs,&ns).is_err());
++    Ok(())
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement.rs
+@@ -0,0 +1,78 @@
++//! Both peers acknowledge the exact derived wallet and contracts. This is a
++//! protocol precondition, not user approval, chain evidence or relay authority.
++use super::*;
++const DOMAIN: &str = "monzero-bch-xmz-key-agreement-v1";
++const MAX_ACK: usize = 4096;
++
++pub struct AgreedNativeWallet {
++    owned: OwnedNativeWallet, commitment: [u8;32], agreed_at: u64,
++}
++
++pub fn signing_bytes(frame: &[u8], role: Role) -> Result<Vec<u8>> {
++    ensure!(!frame.is_empty() && frame.len() <= MAX_ACK,"invalid BCH key acknowledgement size");
++    let domain = format!("{DOMAIN}-{}",role.domain());
++    let mut message = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:",domain.len(),domain,frame.len()).into_bytes();
++    message.extend_from_slice(frame); Ok(message)
++}
++
++impl OwnedNativeWallet {
++    /// Public acknowledgement: contains commitments and destinations, never
++    /// private view shares, native spend shares or contract signing secrets.
++    pub fn acknowledgement(&self, quote: &VerifiedBchQuote) -> Result<Vec<u8>> {
++        ensure!(self.wallet.pair.bch.quote_commitment == *quote.commitment(),"BCH acknowledgement quote mismatch");
++        Ok(serde_json::to_vec(&serde_json::json!({"schema":DOMAIN,
++            "quoteCommitment":hex(quote.commitment()),"swapId":quote.terms()["swapId"],
++            "transcript":hex(self.wallet.transcript_commitment()),"xmzAddress":self.wallet.address().to_string(),
++            "bchLockScript":hex(quote.recovery_plan().lock().script_pubkey().as_bytes()),
++            "bchRecoveryScript":hex(quote.recovery_plan().recovery().script_pubkey().as_bytes())}))?)
++    }
++
++    pub fn accept_agreement(self, quote: &VerifiedBchQuote, policy: &Policy, now: u64,
++        frame: &[u8], bch_signature: &[u8], native_signature: &[u8]) -> Result<AgreedNativeWallet> {
++        quote.check_policy(policy,now)?;
++        ensure!(frame.len() <= MAX_ACK && self.acknowledgement(quote)? == frame,
++            "BCH acknowledgement differs from locally derived exchange");
++        for (role,signature) in [(Role::BchFunder,bch_signature),(Role::NativeFunder,native_signature)] {
++            let identity = &quote.terms()[role.identity()]; let mut pin = [0;32];
++            for (i,byte) in pin.iter_mut().enumerate() { *byte = u8::from_str_radix(&identity[i*2..i*2+2],16)?; }
++            VerifyingKey::from_bytes(&pin)?.verify_strict(&signing_bytes(frame,role)?,&Signature::from_slice(signature)?)?;
++        }
++        let mut hash = Sha256::new(); hash.update(DOMAIN); hash.update([0]);
++        hash.update(frame); hash.update(bch_signature); hash.update(native_signature);
++        Ok(AgreedNativeWallet {owned:self,commitment:hash.finalize().into(),agreed_at:now})
++    }
++}
++
++impl AgreedNativeWallet {
++    pub fn owned(&self) -> &OwnedNativeWallet { &self.owned }
++    pub fn commitment(&self) -> &[u8;32] { &self.commitment }
++
++    fn check(&self, quote: &VerifiedBchQuote, policy: &Policy, now: u64,
++        role: Role, atoms: u64, fee_cap: u64) -> Result<()> {
++        ensure!(self.owned.role == role && self.owned.wallet.pair.bch.quote_commitment == *quote.commitment()
++            && now >= self.agreed_at,"BCH agreed funding context mismatch");
++        quote.check_policy(policy,now)?;
++        let (amount,fee) = match role { Role::BchFunder => ("bchAtoms","bchFundingFeeMaxAtoms"),
++            Role::NativeFunder => ("xmzAtoms","xmzFundingFeeMaxAtoms") };
++        ensure!(atoms == quote.terms()[amount].parse::<u64>()? && fee_cap > 0
++            && fee_cap <= quote.terms()[fee].parse::<u64>()?, "funding differs from signed BCH quote");
++        Ok(())
++    }
++
++    /// Check a prepared funding intent before the separate approval/chain flow.
++    pub fn check_bch_funding(&self, quote: &VerifiedBchQuote, policy: &Policy, now: u64,
++        output_script: &bitcoin::Script, atoms: u64, fee_cap: u64) -> Result<()> {
++        self.check(quote,policy,now,Role::BchFunder,atoms,fee_cap)?;
++        ensure!(output_script == quote.recovery_plan().lock().script_pubkey().as_script(),
++            "BCH funding destination differs from acknowledged contract");
++        Ok(())
++    }
++
++    /// The native lock includes the signed payout and its settlement fee reserve.
++    pub fn check_native_funding(&self, quote: &VerifiedBchQuote, policy: &Policy, now: u64,
++        address: &XmzAddress, atoms: u64, fee_cap: u64) -> Result<()> {
++        self.check(quote,policy,now,Role::NativeFunder,atoms,fee_cap)?;
++        ensure!(address == self.owned.wallet.address(),"XMZ funding destination differs from acknowledged wallet");
++        Ok(())
++    }
++}

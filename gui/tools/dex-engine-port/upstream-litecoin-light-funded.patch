@@ -1,0 +1,107 @@
+diff --git a/swap-machine/src/litecoin_light/session/wallet/tests.rs b/swap-machine/src/litecoin_light/session/wallet/tests.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/tests.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/tests.rs
+@@ -50,3 +50,5 @@
+     assert!(session.refresh_wallet(&HeaderSequence::new(LtcNetwork::Regtest)?,&account(),[0,0],&limits()).await.is_err());
+     drop(session);assert_eq!(task.await?.len(),5);Ok(())
+ }
++
++mod funded;
+diff --git a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+@@ -0,0 +1,66 @@
++use super::*;
++#[derive(Deserialize)]
++struct Fixture {seed:String,blocks:Vec<Block>}
++#[derive(Deserialize)]
++#[serde(rename_all="camelCase")]
++struct Block {height:u32,header:String,transaction:String,txid:Txid,block_hash:BlockHash}
++fn fixture()->Result<(Fixture,PublicAccount,HeaderSequence)> {
++    let fixture:Fixture=serde_json::from_str(include_str!("../fixture.json"))?;
++    let master=Xpriv::new_master(NetworkKind::Test,&decode_hex(&fixture.seed,32)?)?;
++    let account=PublicAccount::from_master(&master,LtcNetwork::Regtest,0)?;
++    let mut chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    for block in &fixture.blocks {
++        assert_eq!(chain.append(&decode_hex(&block.header,80)?,1296689052)?,block.block_hash);
++    }
++    Ok((fixture,account,chain))
++}
++async fn run(short:bool,unrelated:bool,corrupt:bool)->Result<()> {
++    let (fixture,account,chain)=fixture()?;
++    let chain=if short {chain.fork(1)?} else {chain};
++    let credit=&fixture.blocks[0];let spend=&fixture.blocks[1];
++    let credit_report=json!({"tx_hash":credit.txid.to_string(),"height":1});
++    let spend_report=json!({"tx_hash":spend.txid.to_string(),"height":2});
++    let mut responses=regtest_handshake();
++    responses.push(reply(3,if short {json!([credit_report])} else {json!([credit_report,spend_report])}));
++    responses.push(reply(4,json!([])));
++    responses.push(reply(5,if short {json!([])} else if unrelated {json!([credit_report,spend_report])} else {json!([spend_report])}));
++    if !short {responses.push(reply(6,json!([])));}
++    let selected=fixture.blocks.iter().take(if short {1}else{2}).map(|block|(block.txid,block)).collect::<BTreeMap<_,_>>();
++    let first_id=responses.len() as u64+1;
++    for (offset,block) in selected.values().enumerate() {
++        let id=first_id+offset as u64*2;
++        responses.push(reply(id,json!(block.transaction)));
++        let pos=if corrupt && offset+1==selected.len() {1}else{0};
++        responses.push(reply(id+1,json!({"block_height":block.height,"pos":pos,"merkle":[]})));
++    }
++    let expected=responses.len();
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let result=session.refresh_wallet(&chain,&account,[1,if short {0}else{1}],&limits()).await;
++    if unrelated || corrupt {
++        assert!(result.is_err());assert!(!session.usable);
++    } else {
++        let result=result?;let accounting=result.accounting();
++        assert_eq!(accounting.observed_mature().to_sat(),if short {100000}else{60000});
++        assert_eq!(accounting.observed_immature().to_sat(),0);assert_eq!(result.pending_reports(),0);
++        assert_eq!(accounting.coins().len(),1);
++        assert_eq!(accounting.coins()[0].outpoint().txid,if short {credit.txid}else{spend.txid});
++        assert_eq!(accounting.coins()[0].confirmations(),1);
++    }
++    drop(session);let requests=task.await?;assert_eq!(requests.len(),expected);
++    for (offset,block) in selected.values().enumerate() {
++        let index=first_id as usize-1+offset*2;
++        assert_eq!(requests[index]["method"],"blockchain.transaction.get");
++        assert_eq!(requests[index]["params"],json!([block.txid.to_string(),false]));
++        assert_eq!(requests[index+1]["method"],"blockchain.transaction.get_merkle");
++        assert_eq!(requests[index+1]["params"],json!([block.txid.to_string(),block.height]));
++    }
++    Ok(())
++}
++#[tokio::test]
++async fn funded_refresh_verifies_receipt_spend_and_change()->Result<()> {run(false,false,false).await}
++#[tokio::test]
++async fn funded_refresh_recomputes_on_branch_without_spend()->Result<()> {run(true,false,false).await}
++#[tokio::test]
++async fn funded_refresh_rejects_proven_but_unrelated_history_claim()->Result<()> {run(false,true,false).await}
++#[tokio::test]
++async fn funded_refresh_rejects_invalid_inclusion_without_snapshot()->Result<()> {run(false,false,true).await}
+diff --git a/swap-machine/src/litecoin_light/session/wallet/fixture.json b/swap-machine/src/litecoin_light/session/wallet/fixture.json
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet/fixture.json
+@@ -0,0 +1,22 @@
++{
++  "warning": "PUBLIC TEST SEED; synthetic inclusion, not consensus-valid transactions",
++  "seed": "000102030405060708090a0b0c0d0e0f",
++  "blocks": [
++    {
++      "height": 1,
++      "header": "00000020f916c456fc51df627885d7d674ed02dc88a225adb3f02ad13eb4938ff3270853680f8fce5a996ddb4b15a37731d2b1fb2d4adc110f428037d714065ba860eb8070e6494dffff7f2001000000",
++      "transaction": "020000000109090909090909090909090909090909090909090909090909090909090909090000000000feffffff01a086010000000000160014f25e193af88c84263dd5e707ba1cb47e91f629a800000000",
++      "txid": "80eb60a85b0614d73780420f11dc4a2dfbb1d23177a3154bdb6d995ace8f0f68",
++      "blockHash": "50c4fa21807cc48ea3540ac77832a0e37869d6593c09fdcb9877ae116e380e21",
++      "workHash": "1e99166f1f49a64aa8f2fdb44bb62d7180c80a68105af193f399cfece9cfd4af"
++    },
++    {
++      "height": 2,
++      "header": "00000020210e386e11ae7798cbfd093c59d66978e3a03278c70a54a38ec47c8021fac450b7c6a10ef13c0b5d13bae94a85519baf377f2e0228920a1b46af1306ce06415c06e7494dffff7f2000000000",
++      "transaction": "0200000001680f8fce5a996ddb4b15a37731d2b1fb2d4adc110f428037d714065ba860eb800000000000feffffff0160ea000000000000160014aef3890b85e63ceeb2f6d59522aa73e358b3fc3c00000000",
++      "txid": "5c4106ce0613af461b0a9228022e7f37af9b51854ae9ba135d0b3cf10ea1c6b7",
++      "blockHash": "1279f4dc17e156bcfce991e6ff8ce482f95b62fa0a8e94be8160d8444a136d61",
++      "workHash": "2fbee15a10b657908957473db37d0e93721028a956e80b4f59b5e34550f8c335"
++    }
++  ]
++}

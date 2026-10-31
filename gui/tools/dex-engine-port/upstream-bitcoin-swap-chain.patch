@@ -1,0 +1,2643 @@
+diff --git a/swap-core/src/litecoin_address.rs b/swap-core/src/litecoin_address.rs
+index a65fd420c..4ee9a2fb0 100644
+--- a/swap-core/src/litecoin_address.rs
++++ b/swap-core/src/litecoin_address.rs
+@@ -1,20 +1,39 @@
+-//! Transparent native-SegWit Litecoin destinations. No Bitcoin address wrapper.
+-//! Network parameters: litecoin-project/litecoin v0.21.5.8 src/chainparams.cpp.
++//! Transparent native-SegWit destinations for the swap's UTXO chain: Litecoin or
++//! Bitcoin. Both share the same script and witness rules, so one contract
++//! construction serves either chain; the network value binds chain and deployment.
++//! Network parameters: litecoin-project/litecoin v0.21.5.8 src/chainparams.cpp and
++//! bitcoin/bitcoin v31 src/kernel/chainparams.cpp. No Bitcoin address wrapper.
+ use anyhow::{Context, Result, ensure};
+ use bitcoin::{ScriptBuf, WitnessProgram, WitnessVersion};
+ use bitcoin::bech32::{Hrp, segwit};
+ use std::fmt;
+ 
++/// Historical name: the first variants are Litecoin deployments. The `Bitcoin*`
++/// variants reuse every Litecoin contract path unchanged. Bitcoin's public test
++/// deployments are testnet4 (BIP94) and signet; testnet3 is not accepted for swaps.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-pub enum LtcNetwork { Mainnet, Testnet, Regtest }
++pub enum LtcNetwork { Mainnet, Testnet, Regtest, BitcoinMainnet, BitcoinTestnet4, BitcoinRegtest, BitcoinSignet }
+ 
+ impl LtcNetwork {
++    pub const ALL: [Self; 7] = [Self::Mainnet, Self::Testnet, Self::Regtest,
++        Self::BitcoinMainnet, Self::BitcoinTestnet4, Self::BitcoinRegtest, Self::BitcoinSignet];
++
++    /// Deployment name as reported by Core's `getblockchaininfo.chain`.
+     pub fn name(self) -> &'static str {
+-        match self { Self::Mainnet => "main", Self::Testnet => "test", Self::Regtest => "regtest" }
++        match self {
++            Self::Mainnet | Self::BitcoinMainnet => "main",
++            Self::Testnet => "test",
++            Self::BitcoinTestnet4 => "testnet4",
++            Self::BitcoinSignet => "signet",
++            Self::Regtest | Self::BitcoinRegtest => "regtest",
++        }
+     }
+ 
+     pub fn hrp(self) -> &'static str {
+-        match self { Self::Mainnet => "ltc", Self::Testnet => "tltc", Self::Regtest => "rltc" }
++        match self {
++            Self::Mainnet => "ltc", Self::Testnet => "tltc", Self::Regtest => "rltc",
++            Self::BitcoinMainnet => "bc", Self::BitcoinTestnet4 | Self::BitcoinSignet => "tb", Self::BitcoinRegtest => "bcrt",
++        }
+     }
+ 
+     pub fn genesis(self) -> &'static str {
+@@ -22,13 +41,51 @@ impl LtcNetwork {
+             Self::Mainnet => "12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2",
+             Self::Testnet => "4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0",
+             Self::Regtest => "530827f38f93b43ed12af0b3ad25a288dc02ed74d6d7857862df51fc56c416f9",
++            Self::BitcoinMainnet => "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
++            Self::BitcoinTestnet4 => "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
++            Self::BitcoinRegtest => "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
++            Self::BitcoinSignet => "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
++        }
++    }
++
++    pub fn is_bitcoin(self) -> bool {
++        matches!(self, Self::BitcoinMainnet | Self::BitcoinTestnet4 | Self::BitcoinRegtest | Self::BitcoinSignet)
++    }
++    pub fn is_regtest(self) -> bool { matches!(self, Self::Regtest | Self::BitcoinRegtest) }
++    pub fn is_mainnet(self) -> bool { matches!(self, Self::Mainnet | Self::BitcoinMainnet) }
++    /// Human chain name, for messages only.
++    pub fn coin(self) -> &'static str { if self.is_bitcoin() { "Bitcoin" } else { "Litecoin" } }
++    /// Short chain tag used in light-wallet schema names (`monzero-private-btc-light-v1`).
++    pub fn tag(self) -> &'static str { if self.is_bitcoin() { "btc" } else { "ltc" } }
++    /// Identifier in signed quotes and journals, e.g. "ltc-testnet" or "btc-testnet4".
++    pub fn quote_name(self) -> &'static str {
++        match self {
++            Self::Mainnet => "ltc-mainnet", Self::Testnet => "ltc-testnet", Self::Regtest => "ltc-regtest",
++            Self::BitcoinMainnet => "btc-mainnet", Self::BitcoinTestnet4 => "btc-testnet4", Self::BitcoinRegtest => "btc-regtest",
++            Self::BitcoinSignet => "btc-signet",
+         }
+     }
++    pub fn from_quote_name(name: &str) -> Option<Self> {
++        Self::ALL.into_iter().find(|network| network.quote_name() == name)
++    }
++    /// Total supply bound for amount sanity checks, in atoms.
++    pub fn max_atoms(self) -> u64 {
++        if self.is_bitcoin() { 21_000_000 * 100_000_000 } else { 84_000_000 * 100_000_000 }
++    }
++
++    /// Test deployments the DEX helpers accept: an owned regtest chain with the
++    /// offline XMZ fakechain (whose quotes name "xmz-mainnet"), or the public test
++    /// chain (Litecoin testnet, Bitcoin testnet4 or signet) with XMZ testnet. Never mainnet.
++    pub fn is_staged_test_pair(self, xmz: crate::xmz_address::XmzNetwork) -> bool {
++        use crate::xmz_address::XmzNetwork;
++        matches!((self, xmz), (Self::Regtest | Self::BitcoinRegtest, XmzNetwork::Mainnet)
++            | (Self::Testnet | Self::BitcoinTestnet4 | Self::BitcoinSignet, XmzNetwork::Testnet))
++    }
+ 
+     /// Compare independently obtained node identity with the configured deployment.
+     /// This does not authenticate the node or attest its consensus validation.
+     pub fn verify_chain(self, chain: &str, genesis: &str) -> Result<()> {
+-        ensure!(chain == self.name() && genesis == self.genesis(), "wrong Litecoin chain identity");
++        ensure!(chain == self.name() && genesis == self.genesis(), "wrong {} chain identity", self.coin());
+         Ok(())
+     }
+ }
+@@ -44,23 +101,24 @@ pub struct LtcSegwitAddress {
+ 
+ impl LtcSegwitAddress {
+     pub fn parse(network: LtcNetwork, value: &str) -> Result<Self> {
+-        ensure!(value.len() <= 90, "Litecoin address too long");
+-        let (hrp, version, program) = segwit::decode(value).context("invalid Litecoin SegWit address")?;
+-        ensure!(hrp == Hrp::parse(network.hrp())?, "wrong Litecoin address network");
++        ensure!(value.len() <= 90, "{} address too long", network.coin());
++        let (hrp, version, program) = segwit::decode(value)
++            .with_context(|| format!("invalid {} SegWit address", network.coin()))?;
++        ensure!(hrp == Hrp::parse(network.hrp())?, "wrong {} address network", network.coin());
+         let version = match version.to_u8() {
+             0 => WitnessVersion::V0,
+             1 if program.len() == 32 => WitnessVersion::V1,
+-            _ => anyhow::bail!("unsupported Litecoin witness program"),
++            _ => anyhow::bail!("unsupported {} witness program", network.coin()),
+         };
+         let script = ScriptBuf::new_witness_program(&WitnessProgram::new(version, &program)?);
+         let address = Self::from_script(network, &script)?;
+-        ensure!(address.encoded == value, "noncanonical Litecoin address");
++        ensure!(address.encoded == value, "noncanonical {} address", network.coin());
+         Ok(address)
+     }
+ 
+     pub fn from_script(network: LtcNetwork, script: &ScriptBuf) -> Result<Self> {
+         ensure!(script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr(),
+-            "unsupported Litecoin destination script");
++            "unsupported {} destination script", network.coin());
+         let hrp = Hrp::parse(network.hrp())?;
+         let program = &script.as_bytes()[2..];
+         let encoded = if script.is_p2tr() { segwit::encode_v1(hrp, program)? }
+@@ -82,7 +140,7 @@ mod tests {
+ 
+     #[test]
+     fn binds_every_supported_script_to_each_network() {
+-        let networks = [LtcNetwork::Mainnet, LtcNetwork::Testnet, LtcNetwork::Regtest];
++        let networks = LtcNetwork::ALL;
+         for network in networks {
+             for (version, size) in [(WitnessVersion::V0, 20), (WitnessVersion::V0, 32), (WitnessVersion::V1, 32)] {
+                 let script = ScriptBuf::new_witness_program(&WitnessProgram::new(version, &vec![42; size]).unwrap());
+@@ -91,17 +149,45 @@ mod tests {
+                 assert_eq!(address.network(), network);
+                 assert_eq!(LtcSegwitAddress::parse(network, &address.to_string()).unwrap(), address);
+                 for other in networks {
+-                    assert_eq!(LtcSegwitAddress::parse(other, &address.to_string()).is_ok(), network == other);
++                    // Bitcoin's public test deployments share "tb", as in Bitcoin itself;
++                    // the chain identity check below still separates them.
++                    assert_eq!(LtcSegwitAddress::parse(other, &address.to_string()).is_ok(), network.hrp() == other.hrp());
+                     assert_eq!(network.verify_chain(other.name(), other.genesis()).is_ok(), network == other);
+                     if network != other {
+                         assert!(network.verify_chain(network.name(), other.genesis()).is_err());
+-                        assert!(network.verify_chain(other.name(), network.genesis()).is_err());
++                        // Litecoin and Bitcoin share deployment names; genesis separates them.
++                        assert_eq!(network.verify_chain(other.name(), network.genesis()).is_ok(), network.name() == other.name());
+                     }
+                 }
+             }
+         }
+     }
+ 
++    #[test]
++    fn bitcoin_deployments_use_bitcoin_identities() {
++        let regtest = LtcNetwork::BitcoinRegtest;
++        let script = ScriptBuf::new_witness_program(&WitnessProgram::new(WitnessVersion::V0, &[7; 32]).unwrap());
++        let address = LtcSegwitAddress::from_script(regtest, &script).unwrap();
++        assert!(address.to_string().starts_with("bcrt1q"));
++        assert!(LtcSegwitAddress::from_script(LtcNetwork::BitcoinTestnet4, &script).unwrap().to_string().starts_with("tb1q"));
++        assert!(LtcSegwitAddress::from_script(LtcNetwork::BitcoinSignet, &script).unwrap().to_string().starts_with("tb1q"));
++        assert!(LtcSegwitAddress::from_script(LtcNetwork::BitcoinMainnet, &script).unwrap().to_string().starts_with("bc1q"));
++        assert!(LtcSegwitAddress::parse(LtcNetwork::Regtest, &address.to_string()).is_err());
++        for network in LtcNetwork::ALL {
++            assert_eq!(LtcNetwork::from_quote_name(network.quote_name()), Some(network));
++            assert_eq!(network.is_bitcoin(), network.tag() == "btc");
++        }
++        assert!(LtcNetwork::from_quote_name("btc-testnet").is_none());
++        assert!(regtest.verify_chain("regtest", LtcNetwork::Regtest.genesis()).is_err());
++        regtest.verify_chain("regtest", "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206").unwrap();
++        LtcNetwork::BitcoinTestnet4.verify_chain("testnet4", "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043").unwrap();
++        LtcNetwork::BitcoinSignet.verify_chain("signet", "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6").unwrap();
++        assert!(LtcNetwork::BitcoinSignet.verify_chain("testnet4", LtcNetwork::BitcoinSignet.genesis()).is_err());
++        assert!(LtcNetwork::BitcoinSignet.verify_chain("signet", LtcNetwork::BitcoinTestnet4.genesis()).is_err());
++        assert!(LtcNetwork::BitcoinSignet.is_staged_test_pair(crate::xmz_address::XmzNetwork::Testnet));
++        assert!(!LtcNetwork::BitcoinSignet.is_staged_test_pair(crate::xmz_address::XmzNetwork::Mainnet));
++    }
++
+     #[test]
+     fn rejects_bad_checksum_wrong_chain_noncanonical_and_unsupported_programs() {
+         let network = LtcNetwork::Regtest;
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 19e61b9d6..35e99a544 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -434,11 +434,11 @@ mod linux {
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct PreparationObserver {wallet_port:u16,login_file:PathBuf}
+     fn preparation_config_valid(schema:&str,prefix:&str,observer:Option<&PreparationObserver>,
+-        ltc:u16,daemon:u16,wallet:u16)->bool {
++        ltc:Option<u16>,daemon:u16,wallet:u16)->bool {
+         let version=if schema==format!("{prefix}-v1") {observer.is_none()}
+             else if schema==format!("{prefix}-v2") || schema==format!("{prefix}-v3") || schema==format!("{prefix}-v4") {observer.is_some_and(|o|
+-                o.wallet_port!=0 && ![ltc,daemon,wallet].contains(&o.wallet_port))} else {false};
+-        version && ltc!=0 && daemon!=0 && wallet!=0 && ltc!=daemon && ltc!=wallet && daemon!=wallet
++                o.wallet_port!=0 && Some(o.wallet_port)!=ltc && ![daemon,wallet].contains(&o.wallet_port))} else {false};
++        version && ltc.is_none_or(|ltc|ltc!=0 && ltc!=daemon && ltc!=wallet) && daemon!=0 && wallet!=0 && daemon!=wallet
+     }
+     fn payment_location_valid(schema:&str,prefix:&str,block:Option<bitcoin::BlockHash>,password:bool)->bool {
+         match schema.strip_prefix(prefix) {
+@@ -451,7 +451,8 @@ mod linux {
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct RefundRpc {
+-        schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
++        schema:String,#[serde(default)] ltc_port:Option<u16>,#[serde(default)] ltc_wallet:Option<String>,#[serde(default)] ltc_anchor:Option<String>,
++        #[serde(default)] ltc_cookie_file:Option<PathBuf>,#[serde(default)] ltc_light:Option<LightChainConfig>,
+         native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,#[serde(default)] ltc_refund_block:Option<bitcoin::BlockHash>,
+         #[serde(default)] preparation_observer:Option<PreparationObserver>,
+         #[serde(default)] wallet_password_file:Option<PathBuf>,
+@@ -467,7 +468,8 @@ mod linux {
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct FundingRpc {
+-        schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
++        schema:String,#[serde(default)] ltc_port:Option<u16>,#[serde(default)] ltc_wallet:Option<String>,#[serde(default)] ltc_anchor:Option<String>,
++        #[serde(default)] ltc_cookie_file:Option<PathBuf>,#[serde(default)] ltc_light:Option<LightChainConfig>,
+         native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,
+         #[serde(default)] source:Option<FundingSource>,
+     }
+@@ -482,9 +484,9 @@ mod linux {
+                     !s.wallet.is_empty() && (1..=4).contains(&s.priority)),
+                 _=>false,
+             };
+-            source && self.ltc_port!=0 && self.native_daemon_port!=0 && self.native_wallet_port!=0
+-                && self.ltc_port!=self.native_daemon_port && self.ltc_port!=self.native_wallet_port
+-                && self.native_daemon_port!=self.native_wallet_port
++            source && self.native_daemon_port!=0 && self.native_wallet_port!=0 && self.native_daemon_port!=self.native_wallet_port
++                && ltc_access_valid(self.ltc_port,self.ltc_wallet.as_ref(),self.ltc_anchor.as_ref(),self.ltc_cookie_file.as_ref(),
++                    self.ltc_light.as_ref(),&[self.native_daemon_port,self.native_wallet_port])
+         }
+         fn matches_source(&self,review:&serde_json::Value)->bool {
+             self.source.as_ref().is_none_or(|s|review["wallet"]==s.wallet
+@@ -494,6 +496,46 @@ mod linux {
+     }
+     enum FundingOperation {Prepare,Submit,Check,Proof}
+ 
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields)]
++    struct LightServerConfig {host:String,port:u16}
++    /// The XMZ seller's Bitcoin/Litecoin access through independent Electrum
++    /// servers instead of its own node (SELLER_LIGHT_REDEEM.md).
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct LightChainConfig {servers:Vec<LightServerConfig>,maximum_tip_age:u64}
++    /// Exactly one of a complete node configuration or a light configuration.
++    fn ltc_access_valid(port:Option<u16>,wallet:Option<&String>,anchor:Option<&String>,cookie:Option<&PathBuf>,
++        light:Option<&LightChainConfig>,native_ports:&[u16])->bool {
++        let Some(light)=light else {
++            return port.is_some_and(|port|port!=0 && !native_ports.contains(&port))
++                && wallet.is_some() && anchor.is_some() && cookie.is_some();
++        };
++        let distinct=light.servers.iter().enumerate().all(|(i,a)|light.servers[..i].iter().all(|b|(&a.host,a.port)!=(&b.host,b.port)));
++        port.is_none() && wallet.is_none() && anchor.is_none() && cookie.is_none()
++            && (2..=8).contains(&light.servers.len()) && distinct
++            && light.servers.iter().all(|s|!s.host.is_empty() && s.host.len()<=253 && s.port!=0)
++            && (600..=3*3600).contains(&light.maximum_tip_age)
++    }
++    /// Build the configured chain access. The returned file is the node cookie
++    /// lease, held for the operation as before; light access needs none.
++    fn seller_chain(network:swap_core::litecoin_address::LtcNetwork,port:Option<u16>,wallet:Option<String>,anchor:Option<String>,
++        cookie:Option<&Path>,light:Option<&LightChainConfig>)->Result<(Option<File>,swap_machine::litecoin_rpc::redeem_chain::light::SellerChain)> {
++        use swap_machine::{litecoin_light::{headers::HeaderSequence,tls::TlsEndpoint},litecoin_rpc::{LitecoinRpc,
++            redeem_chain::{light::{LightRedeemChain,SellerChain,system_clock},light_rules::LightLockPolicy}}};
++        if let Some(light)=light {
++            let servers=light.servers.iter().map(|s|TlsEndpoint::new(s.host.clone(),s.port,network)).collect::<Result<Vec<_>>>()?;
++            let policy=LightLockPolicy {minimum_servers:servers.len(),maximum_tip_age:light.maximum_tip_age};
++            let chain=LightRedeemChain::new(network,servers,HeaderSequence::new(network)?,policy,system_clock)?;
++            return Ok((None,SellerChain::Light(chain)));
++        }
++        let (lease,user,password)=credentials(cookie.context("missing Litecoin node cookie")?)?;
++        let anchor=swap_core::litecoin_address::LtcSegwitAddress::parse(network,&anchor.context("missing Litecoin anchor")?)?;
++        let node=LitecoinRpc::new(port.context("missing Litecoin node port")?,user,password,network,
++            wallet.context("missing Litecoin wallet")?,anchor)?;
++        Ok((Some(lease),SellerChain::Node(node)))
++    }
++
+     fn credentials(path:&Path)->Result<(File,String,String)> {
+         let (lease,bytes)=private_bytes(path,true)?;
+         ensure!(bytes.len()<=1024,"oversized RPC credentials");
+@@ -507,13 +549,11 @@ mod linux {
+         for (i,byte) in result.iter_mut().enumerate() {*byte=u8::from_str_radix(&text[2*i..2*i+2],16)?;}
+         Ok(result)
+     }
+-    /// Accepted deployments: owned Litecoin regtest with an offline XMZ fakechain
+-    /// (lab quotes name "xmz-mainnet"), or public Litecoin testnet with an XMZ
+-    /// testnet daemon. Litecoin mainnet is never accepted by this helper.
++    /// Accepted deployments: owned Litecoin or Bitcoin regtest with an offline XMZ
++    /// fakechain (lab quotes name "xmz-mainnet"), or public Litecoin testnet /
++    /// Bitcoin testnet4 with an XMZ testnet daemon. Mainnet is never accepted here.
+     fn staged(policy:&Policy)->bool {
+-        use swap_core::{litecoin_address::LtcNetwork,xmz_address::XmzNetwork};
+-        matches!((policy.ltc_network,policy.xmz_network),
+-            (LtcNetwork::Regtest,XmzNetwork::Mainnet)|(LtcNetwork::Testnet,XmzNetwork::Testnet))
++        policy.ltc_network.is_staged_test_pair(policy.xmz_network)
+     }
+     async fn isolated_native(port:u16,policy:&Policy)->Result<()> {
+         ensure!(staged(policy),"native settlement outside an accepted test deployment");
+@@ -527,7 +567,7 @@ mod linux {
+         let envelope:serde_json::Value=serde_json::from_slice(&bytes)?;
+         ensure!(envelope["id"]=="isolated-refund-check" && envelope.get("error").is_none(),"invalid isolation response");
+         let info=&envelope["result"];
+-        if policy.ltc_network==swap_core::litecoin_address::LtcNetwork::Regtest {
++        if policy.ltc_network.is_regtest() {
+             ensure!(info["nettype"]=="fakechain" && info["offline"]==true
+                 && info["incoming_connections_count"].as_u64()==Some(0)
+                 && info["outgoing_connections_count"].as_u64()==Some(0),"refund GUI requires offline native fakechain");
+@@ -545,29 +585,29 @@ mod linux {
+         Ok(())
+     }
+     async fn recovered_wallet(config:&Config,execution:&mut Execution,request:&Request,payout:bool,operation:&str)->Result<serde_json::Value> {
+-        use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,
++        use swap_machine::{native_funding_rpc::{NativeFundingRpc,
+             relay::NativeTransferRelay,wallet_session::NativeWalletSession}};
+-        use swap_core::litecoin_address::LtcSegwitAddress;
+         ensure!(config.role==if payout {"litecoin-funder"} else {"native-funder"}
+             && staged(&config.policy),"invalid recovered wallet role or deployment");
+         ensure!(matches!(operation,"restore"|"open"|"check"),"invalid recovered wallet operation");
+         let rpc_path=if payout {config.payout_rpc_file.as_deref()} else {config.refund_rpc_file.as_deref()}
+             .context("recovered wallet configuration missing")?;
+         let (_rpc_lease,bytes)=private_bytes(rpc_path,false)?;
+-        let (schema,port,wallet,anchor,cookie,daemon,wallet_port,login,block,observer,password_file)=if payout {
++        let (schema,port,wallet,anchor,cookie,light,daemon,wallet_port,login,block,observer,password_file)=if payout {
+             let r:PayoutRpc=serde_json::from_slice(&bytes)?;
+-            (r.schema,r.ltc_port,r.ltc_wallet,r.ltc_anchor,r.ltc_cookie_file,r.native_daemon_port,r.native_wallet_port,
++            (r.schema,Some(r.ltc_port),Some(r.ltc_wallet),Some(r.ltc_anchor),Some(r.ltc_cookie_file),None,r.native_daemon_port,r.native_wallet_port,
+                 r.native_login_file,r.ltc_redeem_block,r.preparation_observer,r.wallet_password_file)
+         } else {
+             let r:RefundRpc=serde_json::from_slice(&bytes)?;
+-            (r.schema,r.ltc_port,r.ltc_wallet,r.ltc_anchor,r.ltc_cookie_file,r.native_daemon_port,r.native_wallet_port,
++            (r.schema,r.ltc_port,r.ltc_wallet,r.ltc_anchor,r.ltc_cookie_file,r.ltc_light,r.native_daemon_port,r.native_wallet_port,
+                 r.native_login_file,r.ltc_refund_block,r.preparation_observer,r.wallet_password_file)
+         };
+         let purpose=if payout {"payout"} else {"refund"};
+         let prefix=format!("monzero-private-ltc-{purpose}-rpc");
+         ensure!((schema==format!("{prefix}-v3") || schema==format!("{prefix}-v4"))
+             && payment_location_valid(&schema,&prefix,block,password_file.is_some())
+-            && preparation_config_valid(&schema,&prefix,observer.as_ref(),port,daemon,wallet_port),
++            && preparation_config_valid(&schema,&prefix,observer.as_ref(),port,daemon,wallet_port)
++            && ltc_access_valid(port,wallet.as_ref(),anchor.as_ref(),cookie.as_ref(),light.as_ref(),&[daemon,wallet_port,observer.as_ref().map_or(0,|o|o.wallet_port)]),
+             "wallet recovery requires explicit observer and password configuration");
+         let password_file=password_file.context("missing recovered wallet password file")?;
+         let observer=observer.context("missing recovered wallet observer")?;
+@@ -579,8 +619,7 @@ mod linux {
+             Some(zeroize::Zeroizing::new(std::str::from_utf8(&bytes)?.to_owned()))
+         };
+         isolated_native(daemon,&config.policy).await?;
+-        let (_ltc_lease,user,secret)=credentials(&cookie)?;
+-        let ltc=LitecoinRpc::new(port,user,secret,config.policy.ltc_network,wallet,LtcSegwitAddress::parse(config.policy.ltc_network,&anchor)?)?;
++        let (_ltc_lease,ltc)=seller_chain(config.policy.ltc_network,port,wallet,anchor,cookie.as_deref(),light.as_ref())?;
+         let block=match block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
+         let (_observer_lease,user,secret)=credentials(&observer.login_file)?;
+         let observer=NativeFundingRpc::new(daemon,observer.wallet_port,user,secret)?;
+@@ -613,9 +652,8 @@ mod linux {
+     async fn refund_rpc(config:&Config,execution:&mut Execution,request:&Request,operation:PaymentOperation)->Result<serde_json::Value> {
+         let checking=matches!(operation,PaymentOperation::Check);
+         let preparing=matches!(operation,PaymentOperation::Prepare);
+-        use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
++        use swap_machine::{native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             litecoin_negotiation::execution::refund_approval::RefundAction};
+-        use swap_core::litecoin_address::LtcSegwitAddress;
+         ensure!(config.role=="native-funder" && staged(&config.policy),
+             "refund GUI submission is limited to isolated-chain development");
+         let approval=if preparing {
+@@ -632,11 +670,12 @@ mod linux {
+         let rpc:RefundRpc=serde_json::from_slice(&bytes)?;
+         ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-refund-rpc",rpc.preparation_observer.as_ref(),
+             rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
++            && ltc_access_valid(rpc.ltc_port,rpc.ltc_wallet.as_ref(),rpc.ltc_anchor.as_ref(),rpc.ltc_cookie_file.as_ref(),
++                rpc.ltc_light.as_ref(),&[rpc.native_daemon_port,rpc.native_wallet_port])
+             && payment_location_valid(&rpc.schema,"monzero-private-ltc-refund-rpc",rpc.ltc_refund_block,rpc.wallet_password_file.is_some()),"invalid refund RPC configuration");
+         isolated_native(rpc.native_daemon_port,&config.policy).await?;
+-        let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet,
+-            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
++        let (_ltc_file,ltc)=seller_chain(config.policy.ltc_network,rpc.ltc_port,rpc.ltc_wallet,rpc.ltc_anchor,
++            rpc.ltc_cookie_file.as_deref(),rpc.ltc_light.as_ref())?;
+         let block=match rpc.ltc_refund_block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
+         let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
+         if preparing {
+@@ -691,7 +730,7 @@ mod linux {
+         let (_rpc_lease,bytes)=private_bytes(config.payout_rpc_file.as_deref().context("payout execution not configured")?,false)?;
+         let rpc:PayoutRpc=serde_json::from_slice(&bytes)?;
+         ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-payout-rpc",rpc.preparation_observer.as_ref(),
+-            rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
++            Some(rpc.ltc_port),rpc.native_daemon_port,rpc.native_wallet_port)
+             && payment_location_valid(&rpc.schema,"monzero-private-ltc-payout-rpc",rpc.ltc_redeem_block,rpc.wallet_password_file.is_some()),"invalid payout RPC configuration");
+         isolated_native(rpc.native_daemon_port,&config.policy).await?;
+         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+@@ -734,9 +773,8 @@ mod linux {
+         let exporting=matches!(operation,FundingOperation::Proof);
+         let checking=matches!(operation,FundingOperation::Check|FundingOperation::Proof);
+         let preparing=matches!(operation,FundingOperation::Prepare);
+-        use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
++        use swap_machine::{native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             litecoin_negotiation::execution::{funding_approval::FundingAction,lock_funding::NativeFundingSource}};
+-        use swap_core::litecoin_address::LtcSegwitAddress;
+         ensure!(config.role=="native-funder" && staged(&config.policy),
+             "funding GUI submission is limited to isolated-chain development");
+         let safety=request.safety_blocks.context("missing funding safety blocks")?;
+@@ -791,9 +829,8 @@ mod linux {
+                     "confirmations":depth.to_string(),"chainObserved":true,"executable":false},
+                 "review":{"details":review.details,"commitment":commitment}}));
+         }
+-        let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet.clone(),
+-            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
++        let (_ltc_file,ltc)=seller_chain(config.policy.ltc_network,rpc.ltc_port,rpc.ltc_wallet.clone(),rpc.ltc_anchor.clone(),
++            rpc.ltc_cookie_file.as_deref(),rpc.ltc_light.as_ref())?;
+         if preparing {
+             let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+             let payment=execution.prepare_native_lock(&mut native,&ltc,source.context("missing preparation source")?,safety,now).await?;
+@@ -810,9 +847,8 @@ mod linux {
+                 "feeAtoms":payment.fee.atom_string(),"chainObserved":false,"executable":false}}))
+     }
+     async fn redemption_rpc(config:&Config,execution:&mut Execution,request:&Request,mode:&str)->Result<serde_json::Value> {
+-        use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
++        use swap_machine::{native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             litecoin_negotiation::execution::funding_approval::FundingAction};
+-        use swap_core::litecoin_address::LtcSegwitAddress;
+         ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder"
+             && staged(&config.policy),"redemption requires isolated native funder funding configuration");
+         if mode=="--redemption-review-stdio-v1" {
+@@ -829,9 +865,8 @@ mod linux {
+         };
+         let (_rpc,bytes)=private_bytes(config.funding_rpc_file.as_deref().context("missing redemption RPC configuration")?,false)?;
+         let rpc:FundingRpc=serde_json::from_slice(&bytes)?;ensure!(rpc.valid(),"invalid redemption RPC configuration");
+-        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet.clone(),
+-            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
++        let (_ltc_file,ltc)=seller_chain(config.policy.ltc_network,rpc.ltc_port,rpc.ltc_wallet.clone(),rpc.ltc_anchor.clone(),
++            rpc.ltc_cookie_file.as_deref(),rpc.ltc_light.as_ref())?;
+         if checking {
+             let observation=execution.check_completed_redeem(&ltc).await?;
+             return Ok(serde_json::json!({"schema":"monzero-ltc-redemption-check-response-v1","requestId":request.request_id,
+@@ -864,8 +899,6 @@ mod linux {
+     // An unavailable native wallet or expired commercial quote must not prevent
+     // cancellation or the agreed punishment path. No new funding is authorized.
+     async fn native_recovery_rpc(config:&Config,execution:&mut Execution,request:&Request,mode:&str)->Result<serde_json::Value> {
+-        use swap_machine::litecoin_rpc::LitecoinRpc;
+-        use swap_core::litecoin_address::LtcSegwitAddress;
+         ensure!(valid_request(request,mode),"invalid native-funder recovery request");
+         let (kind,name,operation)=native_recovery_mode(mode).context("invalid native-funder recovery mode")?;
+         ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder"
+@@ -885,9 +918,8 @@ mod linux {
+         let (_rpc,bytes)=private_bytes(config.funding_rpc_file.as_deref().context("missing recovery RPC configuration")?,false)?;
+         let rpc:FundingRpc=serde_json::from_slice(&bytes)?;
+         ensure!(rpc.valid(),"invalid native-funder recovery RPC configuration");
+-        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet,
+-            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
++        let (_cookie,ltc)=seller_chain(config.policy.ltc_network,rpc.ltc_port,rpc.ltc_wallet,rpc.ltc_anchor,
++            rpc.ltc_cookie_file.as_deref(),rpc.ltc_light.as_ref())?;
+         if operation=="check" {
+             let observation=execution.check_recovery_spend(&ltc,kind).await?;
+             return Ok(serde_json::json!({"schema":schema,"requestId":request.request_id,
+@@ -914,8 +946,33 @@ mod linux {
+                         match version {1|2=>located && !password,3=>located && password,4=>!located && password,_=>false});
+                 }}}
+                 let observer=PreparationObserver {wallet_port:4,login_file:PathBuf::from("/observer")};
+-                assert!(preparation_config_valid(&format!("{prefix}-v4"),&prefix,Some(&observer),1,2,3));
+-                assert!(!preparation_config_valid(&format!("{prefix}-v4"),&prefix,None,1,2,3));
++                assert!(preparation_config_valid(&format!("{prefix}-v4"),&prefix,Some(&observer),Some(1),2,3));
++                assert!(!preparation_config_valid(&format!("{prefix}-v4"),&prefix,None,Some(1),2,3));
++            }
++            Ok(())
++        }
++        #[test]
++        fn seller_chain_is_exactly_one_of_node_or_light()->Result<()> {
++            let node=serde_json::json!({"schema":"monzero-private-ltc-funding-rpc-v1","ltcPort":1,"ltcWallet":"w","ltcAnchor":"a",
++                "ltcCookieFile":"/cookie","nativeDaemonPort":2,"nativeWalletPort":3,"nativeLoginFile":"/login"});
++            let servers=serde_json::json!([{"host":"one.example","port":50002},{"host":"two.example","port":50002}]);
++            let mut light=node.clone();
++            for key in ["ltcPort","ltcWallet","ltcAnchor","ltcCookieFile"] {light.as_object_mut().unwrap().remove(key);}
++            light["ltcLight"]=serde_json::json!({"servers":servers,"maximumTipAge":5400});
++            let valid=|value:&serde_json::Value|serde_json::from_value::<FundingRpc>(value.clone()).map(|r|r.valid()).unwrap_or(false);
++            assert!(valid(&node) && valid(&light));
++            let mut both=node.clone();both["ltcLight"]=light["ltcLight"].clone();
++            let mut neither=light.clone();neither.as_object_mut().unwrap().remove("ltcLight");
++            let mut partial=light.clone();partial["ltcPort"]=serde_json::json!(1);
++            let mut one=light.clone();one["ltcLight"]["servers"]=serde_json::json!([servers[0]]);
++            let mut same=light.clone();same["ltcLight"]["servers"]=serde_json::json!([servers[0],servers[0]]);
++            let mut stale=light.clone();stale["ltcLight"]["maximumTipAge"]=serde_json::json!(4*3600);
++            let mut eager=light.clone();eager["ltcLight"]["maximumTipAge"]=serde_json::json!(60);
++            let mut clash=node.clone();clash["ltcPort"]=serde_json::json!(2);
++            let mut unknown=light.clone();unknown["ltcLight"]["trust"]=serde_json::json!(true);
++            for (case,value) in [("both",both),("neither",neither),("partial node",partial),("one server",one),
++                ("duplicate server",same),("unbounded tip age",stale),("tip age too short",eager),("port clash",clash),("unknown field",unknown)] {
++                assert!(!valid(&value),"{case} accepted");
+             }
+             Ok(())
+         }
+@@ -1086,10 +1143,10 @@ mod linux {
+                 let observer=PreparationObserver {wallet_port:port,login_file:"/owned/login".into()};
+                 for name in ["refund","payout"] {
+                     let prefix=format!("monzero-private-ltc-{name}-rpc");
+-                    assert!(preparation_config_valid(&format!("{prefix}-v1"),&prefix,None,1,2,3));
+-                    assert!(!preparation_config_valid(&format!("{prefix}-v1"),&prefix,Some(&observer),1,2,3));
+-                    assert!(!preparation_config_valid(&format!("{prefix}-v2"),&prefix,None,1,2,3));
+-                    assert_eq!(preparation_config_valid(&format!("{prefix}-v2"),&prefix,Some(&observer),1,2,3),port==4);
++                    assert!(preparation_config_valid(&format!("{prefix}-v1"),&prefix,None,Some(1),2,3));
++                    assert!(!preparation_config_valid(&format!("{prefix}-v1"),&prefix,Some(&observer),Some(1),2,3));
++                    assert!(!preparation_config_valid(&format!("{prefix}-v2"),&prefix,None,Some(1),2,3));
++                    assert_eq!(preparation_config_valid(&format!("{prefix}-v2"),&prefix,Some(&observer),Some(1),2,3),port==4);
+                 }
+             }
+         }
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+index 306e0c040..de7bb06b2 100644
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -106,7 +106,7 @@ mod linux {
+     fn network_for(tag:&str,name:&str)->Result<LightNetwork> {
+         Ok(match (tag,name) {
+             ("ltc","main")=>LtcNetwork::Mainnet.into(),("ltc","test")=>LtcNetwork::Testnet.into(),("ltc","regtest")=>LtcNetwork::Regtest.into(),
+-            ("btc","main")=>BtcNetwork::Mainnet.into(),("btc","test")=>BtcNetwork::Testnet.into(),("btc","regtest")=>BtcNetwork::Regtest.into(),
++            ("btc","main")=>BtcNetwork::Mainnet.into(),("btc","test")=>BtcNetwork::Testnet.into(),("btc","regtest")=>BtcNetwork::Regtest.into(),("btc","testnet4")=>BtcNetwork::Testnet4.into(),("btc","signet")=>BtcNetwork::Signet.into(),
+             ("bch","main")=>BchNetwork::Mainnet.into(),("bch","test")=>BchNetwork::Testnet.into(),("bch","regtest")=>BchNetwork::Regtest.into(),
+             ("doge","main")=>DogeNetwork::Mainnet.into(),("doge","test")=>DogeNetwork::Testnet.into(),("doge","regtest")=>DogeNetwork::Regtest.into(),
+             _=>anyhow::bail!("unsupported light-chain network"),
+diff --git a/swap-machine/src/bin/native-ltc-light/dex.rs b/swap-machine/src/bin/native-ltc-light/dex.rs
+index 08f9bb357..2930f5f79 100644
+--- a/swap-machine/src/bin/native-ltc-light/dex.rs
++++ b/swap-machine/src/bin/native-ltc-light/dex.rs
+@@ -48,14 +48,12 @@ fn public_review(review:swap_machine::litecoin_negotiation::execution::lock_appr
+     json!({"details":review.details,"commitment":sha256::Hash::from_byte_array(review.commitment).to_string()})
+ }
+ /// The only deployments light DEX funding accepts: isolated regtest paired with
+-/// the XMZ fakechain, or Litecoin testnet paired with XMZ testnet. Never mainnet.
++/// the XMZ fakechain, or Litecoin testnet / Bitcoin testnet4 paired with XMZ
++/// testnet. Never mainnet. The wallet's chain tag must match the swap chain.
+ fn staged_network(policy:&Policy)->Result<LtcNetwork> {
+-    use swap_core::xmz_address::XmzNetwork;
+-    match (policy.ltc_network,policy.xmz_network) {
+-        (LtcNetwork::Regtest,XmzNetwork::Mainnet) => Ok(LtcNetwork::Regtest),
+-        (LtcNetwork::Testnet,XmzNetwork::Testnet) => Ok(LtcNetwork::Testnet),
+-        _ => anyhow::bail!("light DEX funding is limited to Litecoin regtest or testnet test deployments"),
+-    }
++    ensure!(policy.ltc_network.is_staged_test_pair(policy.xmz_network),
++        "light DEX funding is limited to regtest or public test-network deployments");
++    Ok(policy.ltc_network)
+ }
+ pub(super) fn run(path:&Path,mode:&str)->Result<()> {
+     let mut input=Zeroizing::new(Vec::new());std::io::stdin().take(8193).read_to_end(&mut input)?;
+@@ -68,8 +66,8 @@ pub(super) fn run(path:&Path,mode:&str)->Result<()> {
+     let (_wallet_lease,wallet_bytes)=private_config(&dex.wallet_config_file)?;
+     let expected=context_digest(&bytes,&wallet_bytes)?;
+     ensure!(expected==digest(&request.approved_config_digest)?,"light DEX configuration changed");
+-    let wallet_config=parse_config(&wallet_bytes,"ltc")?;
+-    let network=network_for("ltc",&wallet_config.network)?;
++    let wallet_config=parse_config(&wallet_bytes,staged.tag())?;
++    let network=network_for(staged.tag(),&wallet_config.network)?;
+     ensure!(network==LightNetwork::from(staged),"wrong light DEX wallet network");
+     let mut execution=Execution::resume(&dex.metadata_directory,&dex.snapshot_directory,dex.trade_id,
+         &dex.policy,LocalRole::LitecoinFunder,dex.pins)?;
+@@ -103,8 +101,8 @@ fn terms(path:&Path,input:&[u8])->Result<()> {
+     let (_wallet_lease,wallet_bytes)=private_config(&dex.wallet_config_file)?;
+     let expected=context_digest(&bytes,&wallet_bytes)?;
+     ensure!(expected==digest(&request.approved_config_digest)?,"light DEX configuration changed");
+-    let config=parse_config(&wallet_bytes,"ltc")?;
+-    ensure!(network_for("ltc",&config.network)?==LightNetwork::from(staged),"wrong funding terms wallet network");
++    let config=parse_config(&wallet_bytes,staged.tag())?;
++    ensure!(network_for(staged.tag(),&config.network)?==LightNetwork::from(staged),"wrong funding terms wallet network");
+     let execution=Execution::resume(&dex.metadata_directory,&dex.snapshot_directory,dex.trade_id,
+         &dex.policy,LocalRole::LitecoinFunder,dex.pins)?;
+     let terms=execution.light_funding_terms(now()?)?;
+diff --git a/swap-machine/src/litecoin_light/headers.rs b/swap-machine/src/litecoin_light/headers.rs
+index c3accda37..c48be5243 100644
+--- a/swap-machine/src/litecoin_light/headers.rs
++++ b/swap-machine/src/litecoin_light/headers.rs
+@@ -143,6 +143,9 @@ impl HeaderSequence {
+         let mut times: Vec<_> = self.headers.iter().rev().take(11).map(|h|h.time).collect();
+         times.sort_unstable();
+         ensure!(header.time>times[times.len()/2], "{coin} timestamp does not exceed median past time");
++        // BIP94 timewarp bound: a period's first block may not predate its parent by over 600 s.
++        ensure!(!self.network.enforces_bip94() || height%2016!=0
++            || i64::from(header.time)>=i64::from(previous.time)-600, "{coin} timewarp header rejected");
+         ensure!(u64::from(header.time)<=now.checked_add(7200).context("invalid local header clock")?,
+             "{coin} header timestamp too far in future");
+         self.network.check_version(height,header.version.to_consensus())?;
+diff --git a/swap-machine/src/litecoin_light/headers/tests.rs b/swap-machine/src/litecoin_light/headers/tests.rs
+index 6195dd4ff..706d4ea37 100644
+--- a/swap-machine/src/litecoin_light/headers/tests.rs
++++ b/swap-machine/src/litecoin_light/headers/tests.rs
+@@ -268,3 +268,6 @@ fn testnet_starts_at_its_checkpoint_and_validates_real_headers_on_top() -> Resul
+     assert_eq!(HeaderSequence::new(LtcNetwork::Regtest)?.root_height(),0);
+     Ok(())
+ }
++mod testnet4;
++mod signet;
++mod mainnet;
+diff --git a/swap-machine/src/litecoin_light/headers/tests/mainnet.rs b/swap-machine/src/litecoin_light/headers/tests/mainnet.rs
+new file mode 100644
+index 000000000..df06bc894
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/headers/tests/mainnet.rs
+@@ -0,0 +1,64 @@
++//! Bitcoin mainnet header rules from a pinned checkpoint, and an ignored full-chain check
++//! against headers exported from a Bitcoin Core node.
++use super::*;
++use crate::litecoin_light::network::BtcNetwork;
++
++const MAINNET: LightNetwork = LightNetwork::Bitcoin(BtcNetwork::Mainnet);
++
++/// Mainnet blocks 971,713–971,715, the first three after the pinned checkpoint.
++const AFTER_CHECKPOINT: [&str; 3] = [
++    "0000ef2567e4170256d588a8822684fed6628da0906690f085c100000000000000000000d6e633674f15bec73fdcfde3988851ccfb27d0179554262223b661a04c251e97d81ad26a9300021742b69e2c",
++    "00a07c2e276b669a42ef2e5f0aef7241f7b8f9f21bb53cb824110000000000000000000002ea23e0d23ac2050c5b1b2b8e68f8f224a880496dabdcd0cf628b663e772d45b220d26a93000217e5a12c44",
++    "00a000205b090090043163711ee9fc29529691a251e3625e4838010000000000000000009db18e48ba18ba6bd4f8933cbd616091629c78adaf5863d7b40d90e5665ad1701728d26a93000217f1788f0a",
++];
++
++#[test]
++fn mainnet_starts_at_its_checkpoint_and_validates_real_headers_on_top() -> Result<()> {
++    let mut chain = HeaderSequence::new(MAINNET)?;
++    assert_eq!((chain.height(), chain.root_height()), (971712, 971712));
++    assert_eq!(chain.header(971712).unwrap().block_hash().to_string(),
++        "00000000000000000000c185f0906690a08d62d6fe842682a888d5560217e467");
++    let raw = |hex: &str| -> Vec<u8> { (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2], 16).unwrap()).collect() };
++    let now = 1792158319u64;
++    for (offset, header) in AFTER_CHECKPOINT.iter().enumerate() {
++        chain.append(&raw(header), now)?;
++        assert_eq!(chain.height(), 971713 + offset as u32);
++    }
++    // Real SHA256d work is required on top of the checkpoint.
++    let mut forged = HeaderSequence::new(MAINNET)?;
++    let mut bytes = raw(AFTER_CHECKPOINT[0]); bytes[76] ^= 1;
++    assert!(forged.append(&bytes, now).is_err());
++    assert!(chain.adopt(HeaderSequence::from_genesis(MAINNET)?).is_err());
++    Ok(())
++}
++
++/// `MONZERO_BTC_MAINNET_HEADERS`: flat 80-byte headers from height 0, exported from a Bitcoin
++/// Core node (any node whose best header chain is mainnet).
++#[test]
++#[ignore = "requires exported Bitcoin mainnet headers"]
++fn mainnet_real_headers_validate_from_genesis() -> Result<()> {
++    let path = std::env::var_os("MONZERO_BTC_MAINNET_HEADERS").context("missing MONZERO_BTC_MAINNET_HEADERS")?;
++    let bytes = std::fs::read(path)?;
++    ensure!(bytes.len() % 80 == 0 && bytes.len() >= 80 * 971716, "need headers past the checkpoint");
++    let mut chain = HeaderSequence::from_genesis(MAINNET)?;
++    assert_eq!(bytes[..80], serialize(&chain.header(0).unwrap())[..]);
++    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    for batch in bytes[80..].chunks(2016 * 80) { chain.append_batch(batch, now)?; }
++    assert_eq!(chain.height() as usize, bytes.len() / 80 - 1);
++    // Real SHA256d work is required: a header with one changed nonce bit is refused.
++    let tip = chain.height();
++    let mut prefix = HeaderSequence::from_genesis(MAINNET)?;
++    for batch in bytes[80..80 * tip as usize].chunks(2016 * 80) { prefix.append_batch(batch, now)?; }
++    let mut forged = serialize(&chain.header(tip).unwrap()); forged[76] ^= 1;
++    assert!(prefix.append(&forged, now).is_err());
++    // The pinned checkpoint lies on this chain with the same cumulative work, and syncs to the same tip.
++    let root = MAINNET.checkpoint().context("mainnet checkpoint")?.height;
++    let mut rooted = HeaderSequence::new(MAINNET)?;
++    assert_eq!(rooted.header(root).unwrap().block_hash(), chain.header(root).unwrap().block_hash());
++    let mut upto = HeaderSequence::from_genesis(MAINNET)?;
++    for batch in bytes[80..80 * (root as usize + 1)].chunks(2016 * 80) { upto.append_batch(batch, now)?; }
++    assert_eq!(rooted.chain_work(), upto.chain_work());
++    for batch in bytes[80 * (root as usize + 1)..].chunks(2016 * 80) { rooted.append_batch(batch, now)?; }
++    assert_eq!(rooted.height(), chain.height());
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/headers/tests/signet.rs b/swap-machine/src/litecoin_light/headers/tests/signet.rs
+new file mode 100644
+index 000000000..872c2cdc5
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/headers/tests/signet.rs
+@@ -0,0 +1,114 @@
++//! Bitcoin signet header rules: identity, the non-power-of-two proof-of-work
++//! limit, no minimum-difficulty exception, and an ignored full-chain check
++//! against headers exported from a synced Bitcoin Core.
++use super::*;
++use crate::litecoin_light::network::BtcNetwork;
++
++const SIGNET: LightNetwork = LightNetwork::Bitcoin(BtcNetwork::Signet);
++
++fn header(bits: u32, time: u32) -> Header {
++    Header { version: Version::from_consensus(0x20000000), prev_blockhash: BlockHash::all_zeros(),
++        merkle_root: bitcoin::TxMerkleNode::all_zeros(), time, bits: CompactTarget::from_consensus(bits), nonce: 0 }
++}
++
++#[test]
++fn signet_genesis_and_identity() -> Result<()> {
++    let chain = HeaderSequence::from_genesis(SIGNET)?;
++    assert_eq!(chain.header(0).unwrap().block_hash().to_string(), SIGNET.genesis());
++    assert_eq!((SIGNET.name(), SIGNET.hrp(), SIGNET.coin_type()), ("signet", "tb", 1));
++    assert_eq!(LightNetwork::from(LtcNetwork::BitcoinSignet), SIGNET);
++    assert_ne!(SIGNET, LightNetwork::Bitcoin(BtcNetwork::Testnet4));
++    assert!(LightNetwork::Litecoin(LtcNetwork::BitcoinSignet).ensure_header_rules().is_err());
++    Ok(())
++}
++
++#[test]
++fn signet_limit_is_its_genesis_target() -> Result<()> {
++    // Bitcoin Core: consensus.powLimit = 00000377ae000000…00, genesis nBits 0x1e0377ae.
++    assert_eq!(compact(&SIGNET.limit()), 0x1e0377ae);
++    assert_eq!(SIGNET.target(0x1e0377ae)?, SIGNET.limit());
++    assert!(SIGNET.target(0x1e0377af).is_err());
++    assert!(SIGNET.target(0x1d00ffff).is_ok());
++    // A slow period cannot ease past the limit.
++    assert_eq!(SIGNET.retarget(0x1e0377ae, 1_209_600 * 4, 1_209_600)?, 0x1e0377ae);
++    Ok(())
++}
++
++#[test]
++fn signet_has_no_minimum_difficulty_exception() -> Result<()> {
++    let bits = 0x1e012345u32;
++    let headers: Vec<Header> = (0..2000u32).map(|i| header(bits, 1_000_000 + i * 600)).collect();
++    // An hour after its parent, testnet would allow the easiest target; signet keeps the period's.
++    let late = headers[1999].time + 3600;
++    assert_eq!(SIGNET.next_bits(&headers, 0, late)?, bits);
++    assert_eq!(LightNetwork::Bitcoin(BtcNetwork::Testnet).next_bits(&headers, 0, late)?, 0x1d00ffff);
++    // At a boundary it retargets like mainnet: a period twice as slow halves the difficulty.
++    let period: Vec<Header> = (0..2016u32).map(|i| header(bits, 1_000_000 + i * 1200)).collect();
++    let expected = SIGNET.retarget(bits, i64::from(period[2015].time - period[0].time), 1_209_600)?;
++    assert_eq!(SIGNET.next_bits(&period, 0, period[2015].time + 600)?, expected);
++    assert!(SIGNET.target(expected)? > SIGNET.target(bits)?);
++    Ok(())
++}
++
++/// Signet blocks 326,593–326,595, the first three after the pinned checkpoint.
++const AFTER_CHECKPOINT: [&str; 3] = [
++    "00000020b453909904d5436e31ecb2a041b2ebf6ca41ec687dec16e596061c7d06000000c2da66d9da33dcbdc61418491d5544e7c748bef1a70f3126bea1f51d98327e4e7dfad16a9b4f151debfdbf01",
++    "000000203d17630835cb40f2512c496eeb37a157d5df6618ce9cef75c512e6a811000000d73fc6317b043dd9d76d4d5409ac9064d295d78284971387ddd645fb216dfb0992fad16a9b4f151db366af06",
++    "00000020ed1b76b748328d6c760276f41d7bfbc67f244b7b34936cc18b5a4748040000005a9aa9f7c675c2a18a4ed1f8e069805d4f99160b86b6e886c12023e448bc45cbb1fdd16a9b4f151d6da48809",
++];
++
++#[test]
++fn signet_starts_at_its_checkpoint_and_validates_real_headers_on_top() -> Result<()> {
++    let mut chain = HeaderSequence::new(SIGNET)?;
++    assert_eq!((chain.height(), chain.root_height()), (326592, 326592));
++    assert_eq!(chain.header(326592).unwrap().block_hash().to_string(),
++        "000000067d1c0696e516ec7d68ec41caf6ebb241a0b2ec316e43d504999053b4");
++    let raw = |hex: &str| -> Vec<u8> { (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2], 16).unwrap()).collect() };
++    let now = 1792146865u64;
++    for (offset, header) in AFTER_CHECKPOINT.iter().enumerate() {
++        chain.append(&raw(header), now)?;
++        assert_eq!(chain.height(), 326593 + offset as u32);
++    }
++    // Real SHA256d work is required on top of the checkpoint.
++    let mut forged = HeaderSequence::new(SIGNET)?;
++    let mut bytes = raw(AFTER_CHECKPOINT[0]); bytes[76] ^= 1;
++    assert!(forged.append(&bytes, now).is_err());
++    assert!(chain.adopt(HeaderSequence::from_genesis(SIGNET)?).is_err());
++    Ok(())
++}
++
++/// `MONZERO_BTC_SIGNET_HEADERS`: flat 80-byte headers from height 0, as written by
++/// `tools/dex-engine-port/fetch_ltc_headers.py` against a synced signet node.
++#[test]
++#[ignore = "requires exported Bitcoin signet headers"]
++fn signet_real_headers_validate_from_genesis() -> Result<()> {
++    let path = std::env::var_os("MONZERO_BTC_SIGNET_HEADERS").context("missing MONZERO_BTC_SIGNET_HEADERS")?;
++    let bytes = std::fs::read(path)?;
++    ensure!(bytes.len() % 80 == 0 && bytes.len() >= 80 * 4033, "need at least two difficulty periods");
++    let mut chain = HeaderSequence::from_genesis(SIGNET)?;
++    assert_eq!(bytes[..80], serialize(&chain.header(0).unwrap())[..]);
++    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    for batch in bytes[80..].chunks(2016 * 80) { chain.append_batch(batch, now)?; }
++    assert_eq!(chain.height() as usize, bytes.len() / 80 - 1);
++    // The real chain has retargeted, so boundary rules were exercised.
++    let changes = (2016..=chain.height()).step_by(2016)
++        .filter(|height| chain.header(*height).unwrap().bits != chain.header(height - 1).unwrap().bits).count();
++    assert!(changes > 0, "no signet retarget in the exported headers");
++    // Real SHA256d work is required: a header with one changed nonce bit is refused.
++    let tip = chain.height();
++    let mut prefix = HeaderSequence::from_genesis(SIGNET)?;
++    for batch in bytes[80..80 * tip as usize].chunks(2016 * 80) { prefix.append_batch(batch, now)?; }
++    let mut forged = serialize(&chain.header(tip).unwrap()); forged[76] ^= 1;
++    assert!(prefix.append(&forged, now).is_err());
++    // The pinned checkpoint, when present, lies on this chain with the same cumulative work.
++    if let Some(root) = SIGNET.checkpoint().map(|checkpoint| checkpoint.height) {
++        let mut rooted = HeaderSequence::new(SIGNET)?;
++        assert_eq!(rooted.header(root).unwrap().block_hash(), chain.header(root).unwrap().block_hash());
++        let mut upto = HeaderSequence::from_genesis(SIGNET)?;
++        for batch in bytes[80..80 * (root as usize + 1)].chunks(2016 * 80) { upto.append_batch(batch, now)?; }
++        assert_eq!(rooted.chain_work(), upto.chain_work());
++        for batch in bytes[80 * (root as usize + 1)..].chunks(2016 * 80) { rooted.append_batch(batch, now)?; }
++        assert_eq!(rooted.height(), chain.height());
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/headers/tests/testnet4.rs b/swap-machine/src/litecoin_light/headers/tests/testnet4.rs
+new file mode 100644
+index 000000000..f446fd159
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/headers/tests/testnet4.rs
+@@ -0,0 +1,121 @@
++//! Bitcoin testnet4 (BIP94) header rules: synthetic difficulty vectors, and an
++//! ignored full-chain check against headers exported from a synced Bitcoin Core.
++use super::*;
++use crate::litecoin_light::network::BtcNetwork;
++
++fn header(bits: u32, time: u32) -> Header {
++    Header { version: Version::from_consensus(0x20000000), prev_blockhash: BlockHash::all_zeros(),
++        merkle_root: bitcoin::TxMerkleNode::all_zeros(), time, bits: CompactTarget::from_consensus(bits), nonce: 0 }
++}
++
++#[test]
++fn testnet4_genesis_and_identity() -> Result<()> {
++    let network = LightNetwork::Bitcoin(BtcNetwork::Testnet4);
++    let chain = HeaderSequence::from_genesis(network)?;
++    assert_eq!(chain.header(0).unwrap().block_hash().to_string(), network.genesis());
++    assert_eq!((network.name(), network.hrp(), network.coin_type()), ("testnet4", "tb", 1));
++    assert_eq!(LightNetwork::from(LtcNetwork::BitcoinTestnet4), network);
++    assert!(LightNetwork::Litecoin(LtcNetwork::BitcoinTestnet4).ensure_header_rules().is_err());
++    Ok(())
++}
++
++#[test]
++fn testnet4_retargets_from_first_block_of_the_period() -> Result<()> {
++    // A full period on schedule whose last block used the minimum-difficulty
++    // exception. BIP94 keeps the period's real difficulty; testnet3 resets it.
++    let (hard, easiest) = (0x1c7fffffu32, 0x1d00ffffu32);
++    let mut headers = vec![header(hard, 1_000_000)];
++    for i in 1..2015u32 { headers.push(header(hard, 1_000_000 + i * 600)); }
++    headers.push(header(easiest, 1_000_000 + 1_209_600));
++    assert_eq!(headers.len(), 2016);
++    let time = 1_000_000 + 1_209_600 + 600;
++    assert_eq!(LightNetwork::Bitcoin(BtcNetwork::Testnet4).next_bits(&headers, 0, time)?, hard);
++    assert_eq!(LightNetwork::Bitcoin(BtcNetwork::Testnet).next_bits(&headers, 0, time)?, easiest);
++    // Inside a period the 20-minute minimum-difficulty exception still applies.
++    let inner = &headers[..2000];
++    assert_eq!(LightNetwork::Bitcoin(BtcNetwork::Testnet4).next_bits(inner, 0, inner[1999].time + 1201)?, easiest);
++    assert_eq!(LightNetwork::Bitcoin(BtcNetwork::Testnet4).next_bits(inner, 0, inner[1999].time + 1200)?, hard);
++    Ok(())
++}
++
++/// Real testnet4 headers 155,233–155,244, exported from the project's node.
++const AFTER_CHECKPOINT: [&str; 12] = [
++    "00e0af205b34402d570eb429969799fe0dc8d2228b407501b9c54d31020000000000000011ca71278ff660f87af4e7bdbfe5e36e747bfcfe30328ef12a278f157afa37e0949cc36affff001d16018045",
++    "0020f420a5ad8947dc8d8a4b631ea62016a58e1b9bcb61b1a6ea2de74c43dc0000000000a0e4df998b9b92f2de359d37067bbf719c56dfb6cb2dfa29e8b3132a6706328745a1c36affff001da91b0c56",
++    "000000204ce06de9e2797d0bee5108b2bd9c50ec3b04bc5d2a40b679ca643000000000001413ed66ff200631fe6b8842db0c6942a2f198affc7e3469af54e46179e1c518f6a5c36affff001dd65c938e",
++    "00000020a17ea191f77a93b34bd5ee6d60efb87158cc3f7fc883fb190abc12e4000000003c476203233e372c37d13c437ff4368a2437dbf960c343a458d0675b113a0032a7aac36affff001d2c6841bf",
++    "00000020a0484e90ed4df24514c96afe34b1c724aaa868aa2c34c90d37edc6eb000000001ad6bc252390365aa2f3dbe13a30f9ad0d4c4dbba0393225d602b4e8bd939b5c58afc36affff001d1ed26e87",
++    "00a08929a72cb2a8d1718da7e6b108dba4133d4f02272357013265721a05d37a00000000d8b9d4f8aba34cd5556a8611be6a0b6f64e4c3385469997669a0d2631eca269f3c9ac36a437e0319166e197f",
++    "00804f21c63b24c62501ff6eb6296514ccc2ffe2ab8ec6386caf46180000000000000000b00a50b6039a9cfcda74f384cd0aba570283964b2b9e1246fbcdd7c342eee6b0ed9ec36affff001dd7c10d50",
++    "00006b2094bd5069d97c53e833b752eff9505b72666aee09973d3bf0b73666000000000055065576afd2120800b67a018c984853d260e8da6fe0037ca33c5cef603e25969ea3c36affff001d48e0945c",
++    "0080db21d77901d82e80276a7fd89f3da921caff35661637edb6329440a6550000000000251a23e6d0592407f704354024b615108deffb8433559d16c3a4518c923b2d1d4fa8c36affff001d80aa9aeb",
++    "00005525437f6e246d12d36e0220ee19c438ece2d39872f1ece812bd08e14d00000000009c36b1ac6a879e9c71deb0c3db280483d2b7c08b96880779de5a27630912e3db00adc36affff001dd0706929",
++    "00602127431af9829d83bb46ee24b313bf9e82a8ae577b40946642d809a94400000000001c0319d4b5713c1bcbab363ce519cfad5558e2c2e2a9c996307b3bdc780f6d94b1b1c36affff001d2a393389",
++    "00c0ac31c2fd166fe6fde505139b2859baba9773a41a733db13fa13442f36d0000000000eec99d2c7ae7487ef1d75d2c1f1062a2d0d35e96a928b952e087638484fcf6deaba6c36a437e03197e1c6487",
++];
++
++#[test]
++fn testnet4_starts_at_its_checkpoint_and_validates_real_headers_on_top() -> Result<()> {
++    let network = LightNetwork::Bitcoin(BtcNetwork::Testnet4);
++    let mut chain = HeaderSequence::new(network)?;
++    assert_eq!((chain.height(), chain.root_height()), (155232, 155232));
++    assert_eq!(chain.header(155232).unwrap().block_hash().to_string(),
++        "0000000000000002314dc5b90175408b22d2c80dfe99979629b40e572d40345b");
++    let raw = |hex: &str| -> Vec<u8> { (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2], 16).unwrap()).collect() };
++    let now = 1791207083u64;
++    for (offset, header) in AFTER_CHECKPOINT.iter().enumerate() {
++        chain.append(&raw(header), now)?;
++        assert_eq!(chain.height(), 155233 + offset as u32);
++    }
++    // Real SHA256d work is required on top of the checkpoint.
++    let mut forged = HeaderSequence::new(network)?;
++    let mut bytes = raw(AFTER_CHECKPOINT[0]); bytes[76] ^= 1;
++    assert!(forged.append(&bytes, now).is_err());
++    assert!(chain.adopt(HeaderSequence::from_genesis(network)?).is_err());
++    // Regtest still starts at genesis.
++    assert_eq!(HeaderSequence::new(LightNetwork::Bitcoin(BtcNetwork::Regtest))?.root_height(), 0);
++    Ok(())
++}
++
++/// `MONZERO_BTC_TESTNET4_HEADERS`: flat 80-byte headers from height 0, as written by
++/// `tools/dex-engine-port/fetch_ltc_headers.py` against a synced testnet4 node.
++#[test]
++#[ignore = "requires exported Bitcoin testnet4 headers"]
++fn testnet4_real_headers_validate_from_genesis() -> Result<()> {
++    let path = std::env::var_os("MONZERO_BTC_TESTNET4_HEADERS").context("missing MONZERO_BTC_TESTNET4_HEADERS")?;
++    let bytes = std::fs::read(path)?;
++    ensure!(bytes.len() % 80 == 0 && bytes.len() >= 80 * 4033, "need at least two difficulty periods");
++    let network = LightNetwork::Bitcoin(BtcNetwork::Testnet4);
++    let mut chain = HeaderSequence::from_genesis(network)?;
++    assert_eq!(bytes[..80], serialize(&chain.header(0).unwrap())[..]);
++    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    for batch in bytes[80..].chunks(2016 * 80) { chain.append_batch(batch, now)?; }
++    assert_eq!(chain.height() as usize, bytes.len() / 80 - 1);
++    // BIP94 must matter on the real chain: at some boundary the last block of the
++    // period was minimum difficulty while the real difficulty was retained.
++    let boundaries = (2016..=chain.height()).step_by(2016).filter(|height| {
++        let last = chain.header(height - 1).unwrap().bits; let first = chain.header(height - 2016).unwrap().bits;
++        last != first
++    }).count();
++    assert!(boundaries > 0, "no boundary distinguishes BIP94 from testnet3 rules");
++    // A boundary header may not predate its parent by more than 600 seconds;
++    // the timewarp rule rejects it before proof of work is examined.
++    let boundary = (chain.height() / 2016) * 2016;
++    let mut prefix = HeaderSequence::from_genesis(network)?;
++    for batch in bytes[80..80 * boundary as usize].chunks(2016 * 80) { prefix.append_batch(batch, now)?; }
++    let mut warped = chain.header(boundary).unwrap();
++    warped.time = prefix.header(boundary - 1).unwrap().time - 601;
++    let error = prefix.append(&serialize(&warped), now).unwrap_err().to_string();
++    assert!(error.contains("timewarp") || error.contains("median past"), "{error}");
++    let real = serialize(&chain.header(boundary).unwrap());
++    assert_eq!(prefix.append(&real, now)?, chain.header(boundary).unwrap().block_hash());
++    // The pinned checkpoint lies on this chain and the remaining tail validates on top of it.
++    let mut rooted = HeaderSequence::new(network)?;
++    let root = rooted.root_height();
++    assert_eq!(rooted.header(root).unwrap().block_hash(), chain.header(root).unwrap().block_hash());
++    assert_eq!(rooted.chain_work(), &{ let mut c = HeaderSequence::from_genesis(network)?;
++        for batch in bytes[80..80 * (root as usize + 1)].chunks(2016 * 80) { c.append_batch(batch, now)?; } c.chain_work().clone() });
++    for batch in bytes[80 * (root as usize + 1)..].chunks(2016 * 80) { rooted.append_batch(batch, now)?; }
++    assert_eq!(rooted.height(), chain.height());
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/network.rs b/swap-machine/src/litecoin_light/network.rs
+index 664285697..fb680f4b6 100644
+--- a/swap-machine/src/litecoin_light/network.rs
++++ b/swap-machine/src/litecoin_light/network.rs
+@@ -11,9 +11,14 @@ use num_bigint::BigUint;
+ use std::fmt;
+ use swap_core::litecoin_address::LtcNetwork;
+ 
+-/// Bitcoin deployments. Testnet is testnet3 (testnet4 uses BIP94 rules not implemented here).
++/// Bitcoin deployments. Testnet is testnet3; Testnet4 adds the BIP94 header rules
++/// (first-block retarget base and the timewarp bound). Signet is the default
++/// public signet: mainnet difficulty rules under its own proof-of-work limit.
++/// Its block signatures sit in the coinbase, which headers do not carry, so a
++/// light wallet checks signet proof of work only: test coins on a trusted
++/// Electrum view, never a model for value-bearing chains.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub enum BtcNetwork { Mainnet, Testnet, Regtest }
++pub enum BtcNetwork { Mainnet, Testnet, Regtest, Testnet4, Signet }
+ /// Bitcoin Cash deployments. Only regtest header rules are implemented: mainnet
+ /// and testnet need a post-fork checkpoint and ASERT, and are refused.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -37,12 +42,23 @@ pub enum ScriptKind {
+     P2pkhForkId,
+ }
+ 
+-impl From<LtcNetwork> for LightNetwork { fn from(network: LtcNetwork) -> Self { Self::Litecoin(network) } }
++/// Swap networks name Litecoin or Bitcoin deployments (see `LtcNetwork`).
++impl From<LtcNetwork> for LightNetwork {
++    fn from(network: LtcNetwork) -> Self {
++        match network {
++            LtcNetwork::BitcoinMainnet => Self::Bitcoin(BtcNetwork::Mainnet),
++            LtcNetwork::BitcoinTestnet4 => Self::Bitcoin(BtcNetwork::Testnet4),
++            LtcNetwork::BitcoinRegtest => Self::Bitcoin(BtcNetwork::Regtest),
++            LtcNetwork::BitcoinSignet => Self::Bitcoin(BtcNetwork::Signet),
++            litecoin => Self::Litecoin(litecoin),
++        }
++    }
++}
+ impl From<BtcNetwork> for LightNetwork { fn from(network: BtcNetwork) -> Self { Self::Bitcoin(network) } }
+ impl From<BchNetwork> for LightNetwork { fn from(network: BchNetwork) -> Self { Self::BitcoinCash(network) } }
+ impl From<DogeNetwork> for LightNetwork { fn from(network: DogeNetwork) -> Self { Self::Dogecoin(network) } }
+ impl PartialEq<LtcNetwork> for LightNetwork {
+-    fn eq(&self, other: &LtcNetwork) -> bool { *self == Self::Litecoin(*other) }
++    fn eq(&self, other: &LtcNetwork) -> bool { *self == Self::from(*other) }
+ }
+ 
+ impl LightNetwork {
+@@ -61,6 +77,8 @@ impl LightNetwork {
+             Self::Litecoin(network) => network.name(),
+             Self::Bitcoin(BtcNetwork::Mainnet) | Self::BitcoinCash(BchNetwork::Mainnet) | Self::Dogecoin(DogeNetwork::Mainnet) => "main",
+             Self::Bitcoin(BtcNetwork::Testnet) | Self::BitcoinCash(BchNetwork::Testnet) | Self::Dogecoin(DogeNetwork::Testnet) => "test",
++            Self::Bitcoin(BtcNetwork::Testnet4) => "testnet4",
++            Self::Bitcoin(BtcNetwork::Signet) => "signet",
+             Self::Bitcoin(BtcNetwork::Regtest) | Self::BitcoinCash(BchNetwork::Regtest) | Self::Dogecoin(DogeNetwork::Regtest) => "regtest",
+         }
+     }
+@@ -69,7 +87,7 @@ impl LightNetwork {
+         match self {
+             Self::Litecoin(network) => network.hrp(),
+             Self::Bitcoin(BtcNetwork::Mainnet) => "bc",
+-            Self::Bitcoin(BtcNetwork::Testnet) => "tb",
++            Self::Bitcoin(BtcNetwork::Testnet | BtcNetwork::Testnet4 | BtcNetwork::Signet) => "tb",
+             Self::Bitcoin(BtcNetwork::Regtest) => "bcrt",
+             Self::BitcoinCash(_) | Self::Dogecoin(_) => "",
+         }
+@@ -81,6 +99,8 @@ impl LightNetwork {
+             Self::Bitcoin(BtcNetwork::Mainnet) | Self::BitcoinCash(BchNetwork::Mainnet) => "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+             Self::Bitcoin(BtcNetwork::Testnet) | Self::BitcoinCash(BchNetwork::Testnet) => "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
+             Self::Bitcoin(BtcNetwork::Regtest) | Self::BitcoinCash(BchNetwork::Regtest) => "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
++            Self::Bitcoin(BtcNetwork::Testnet4) => "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
++            Self::Bitcoin(BtcNetwork::Signet) => "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+             Self::Dogecoin(DogeNetwork::Mainnet) => "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691",
+             Self::Dogecoin(DogeNetwork::Testnet) => "bb0a78264637406b6360aad926284d544d7049f45189db5664f3c4d07350559e",
+             Self::Dogecoin(DogeNetwork::Regtest) => "3d2160a3b5dc4a9d62e7e66a295f70313ac808440ef7400d6c0772171ce973a5",
+@@ -130,6 +150,8 @@ impl LightNetwork {
+     /// Header consensus rules implemented for this deployment. Refusing is
+     /// safer than accepting headers under rules that were never checked.
+     pub(super) fn ensure_header_rules(self) -> Result<()> {
++        // Bitcoin deployments of the swap network map to `Bitcoin`, never `Litecoin`.
++        ensure!(!matches!(self, Self::Litecoin(network) if network.is_bitcoin()), "invalid Litecoin light network");
+         ensure!(!matches!(self, Self::BitcoinCash(BchNetwork::Mainnet | BchNetwork::Testnet)),
+             "Bitcoin Cash {} header validation needs a post-fork checkpoint and ASERT, which are not implemented", self.name());
+         ensure!(!matches!(self, Self::Dogecoin(DogeNetwork::Mainnet | DogeNetwork::Testnet)),
+@@ -165,6 +187,69 @@ impl LightNetwork {
+         "000000209357147c559a9d399ec876f83532f6ee826386483a09fb6a614ebaae1eb45ab12a4f07767cfdcbfea144f4013e0477e6e1a31d33f7039045e1c4ac9148a06aefe50bd16affe9001ddc34b8f5",
+                 ],
+             }),
++            // Bitcoin testnet4 block 155,232 (00000000…345b), taken 2026-10-20 from the
++            // project's synced Bitcoin Core v31.1 node after every header from genesis passed
++            // these BIP94 rules; cumulative work independently summed and equal to the node's.
++            Self::Bitcoin(BtcNetwork::Testnet4) => Some(Checkpoint {
++                height: 155232,
++                hash: "0000000000000002314dc5b90175408b22d2c80dfe99979629b40e572d40345b",
++                chain_work: "eb0000bf067f0cac0f9",
++                window: &[
++        "0000002041ae6a0e6fe359b11225bae36bf2c210a02e56c5ea26e76ba0b88d0000000000d3669166e10d36c7e658abce1cc92b28f1560d5b2dafcdf34cf1160567e48454278cc36affff001d521685b1",
++        "00000020e4a00ad2bb9c5b9f35f6c7b5e65b5ea1f762845b2abc0b42a9b389ae0000000030589a3a2c971f7a60ab872b1be254358d68e4df6d429be7930b156d4eec9c7bd890c36affff001d121abfab",
++        "000000200f3846f43fc05f736ef711f077a84e0904e9efd1a5c747619d07dc0c00000000fa4993dca019ec9e1cfe6640d035886085b3bbe459643416b4dc806eafe530638995c36affff001d5e0ddf82",
++        "0000002042f469d300162601f3b66b19c9915ad375fd061812c3799ebc9d5c0000000000e7a35434b8bf5a818f5c481005ac912d772d0dcfa97dd0a7fe66a8372d8cd0133a9ac36affff001dabb8bc2f",
++        "000000209a801d1145f0d940659d1b9508a2bf5efb77a5f61876c697fde2d7520000000023f24e1b201f144cb51a1d4f2f71df7e82849440501d7ca42667ea46190a135feb9ec36affff001d119a4cab",
++        "00c0fd29be213abfa1ac7bdcdb675bb814f6851fccd4e500fe9adbdf3e771e80000000008649813182029ed592553819b46a475d769640f537239a90aed932daca8c29247787c36a6e3f031938fb3930",
++        "000056209e1c2b12ed97d68554b079472eecc622ed2418fa257d5b35000000000000000043b4ff5885eefeabaaaa4f6bad4749cd2db4b9ab6e0c1ec220f542fe6f1d4391288cc36affff001db8004c4c",
++        "0040bf21aa63f10433621af301e2040935c393ad6429ca1fafea8076b854d800000000007646430c9d1d20eb71e253b454ecdca1bfb8ff3f20e5ac0412c9e21d23ca4ae6d990c36affff001d4b18987f",
++        "00205622c641616194c97c09763dec871693c7e668f8f5889bfbb0907fbdaa0000000000e6aff20aa01019f5f19c1f39cb548eb5ef270885017e0e427ea995e9bcdaf74b8a95c36affff001d6c391966",
++        "0040dd21c2f8139c10fec685a51b67b3c5b85a798c5a161234776e042ac28b00000000005514adc04431860a2c882aaf0decd5ea573999052e193077c495028162439fe03b9ac36affff001d6e00c924",
++        "00c01133a4b225a064922585bd9db58ad1cb7127031c8ba15252c0db7a31cc00000000007f6bf7535d4eb0882eb99466ccacdc6f6848c61d4936aec2e67c75e233f7c363e397c36a437e0319e11e4279",
++                ],
++            }),
++            // Bitcoin signet block 326,592 (00000006…53b4), taken 2026-10-25 from the project's
++            // Bitcoin Core v31.1 node after every header from genesis passed these rules;
++            // cumulative work independently summed and equal to the node's.
++            Self::Bitcoin(BtcNetwork::Signet) => Some(Checkpoint {
++                height: 326592,
++                hash: "000000067d1c0696e516ec7d68ec41caf6ebb241a0b2ec316e43d504999053b4",
++                chain_work: "1192fad994cd",
++                window: &[
++        "0000002072a9db399964f26987a7c1f4c5c92c9229c4952a47aa2537e2eabe5a03000000d3bc2ec8d2c11ed675db50f49912653d68bd320f7b8a5f36a606ace2206619bb98e4d16ab2cb141da38fbd14",
++        "00000020e7f5162778cc2508cce2b18cd892536750e13b4761d1a10991fdfd0502000000b9ad782d34cd0656ad29d9bd74ee843ae819ffc7a417635f65f66c0c21fa5f1203e5d16ab2cb141de733550f",
++        "0000002056d402028ccbcac17f79c839df45504906140e3a2bc2b9571b991c8809000000025d30dd9a19cd3049da7297f73af0d07dd14c9f2933b1e32d13f62d35e2080508e5d16ab2cb141d1fbbd403",
++        "000000200ea125b1e0521695297b0ce960fdf5f230d61a12eb5471bf11294c430a000000ec2eb5839f8a2d15628fbe7c07ea3e4e6e1ab67f1d83e66e110edaeca6f5fea005e8d16ab2cb141d58b63609",
++        "000000206680f0d076143024fa726b240cf7ec1ba43f1c391ab7ebe138fb903c0400000091defc09ce3ca32a2d3fd508273cd2aade44d1d67585a9376e9d6be0ad91830651ecd16ab2cb141d1bc3c60c",
++        "000000209d369d57e474d3ebe2c5e0fb1cf48fbd7a6c596a9f5391ba88d98d8e00000000d46e411f12aa06ab7661f4f3df741eac520151b1d421dfc6122a83f8185e905161edd16ab2cb141dfcd2f809",
++        "00000020ea61bc3de880f047f01741b0e7b95a06a95a1b6a2b5f3f71f4f6027f02000000bac39e35a373e2c8ff8ef392b7d7ab8f58b011a1449565a88859f98d359d816614eed16ab2cb141d71b7d610",
++        "000000204973edec5a7029fdb3d3067ff04150519d0993a253fea982cd6e00940f000000bb41d6ef8a178554340e4bdfaf00feffb1839796a03d6cdc1a3a02b37e2cdf44acf4d16ab2cb141d7c233b03",
++        "000000203c8c567531ccaecd1137bca0c5e804b1736db861f8301c3dce4b17bf10000000d0fe1d0e419befae5275c1ef274cf8aedce507c55e909d3d91f1208035662feb3af6d16ab2cb141d5f3bf407",
++        "00000020e720d06571c7b4928b9cc61a15ff194bf02035c1126161fb24b1b9dc0e000000ce4ec340377a1ae03f906ca655195f81bdf0f2893f0ed31df111d00417c247d283f7d16ab2cb141d7a29a104",
++        "00000020c355a73e00339b294d06eee097a050c69235b4ad4044cfff2b7c30b00c00000050aa5f3cd70ca6d298ca9d54a074a756ae01f4154e84034a9104ecd4865d274939f8d16a9b4f151d221ca412",
++                ],
++            }),
++            // Bitcoin mainnet block 971,712 (00000000…e467), taken 2026-10-25 from a Bitcoin Core v31.1
++            // node run for this (headers only); every header from genesis passed these rules and the
++            // cumulative work, summed independently, equals the node's.
++            Self::Bitcoin(BtcNetwork::Mainnet) => Some(Checkpoint {
++                height: 971712,
++                hash: "00000000000000000000c185f0906690a08d62d6fe842682a888d5560217e467",
++                chain_work: "150116ff7cb6c4aecb7256b7a",
++                window: &[
++        "0000f5286086cc5f9069730c473e256d810942e22394976607b40000000000000000000033d243fbec11fda25a255ca29e4885c1f4a7aa1f1d467c61ee465b0560cceb523909d26af01e021750a77f53",
++        "0000ff3fe4d2b1b9ed36e217ed95e24088fe0f72019645186e6e01000000000000000000713514defed855848b3cb8504911ebd3b82e29a7a83160fe7830c4a969afd8fcaa0ad26af01e02179eadd47d",
++        "00206122bd3cefe8883e8a0f6c38c49e053b96d8dd67ba69d1f20000000000000000000054e8aa85edfdb9923c191e00fa4d535a9bef549788fcc05c9145361bb426fc7b1b0ad26af01e0217b532a828",
++        "0000ff3f1f79279962088009441c570ab356ec04211c5fb378e1010000000000000000008c32318bcb1a6c98ad3d0005df7efb8c990e31528ce340e5adeb4c9679f0ddcf3f0fd26af01e0217b01dab56",
++        "006000203fa931984e93c9a75aa702c5683315cea8f42ad2d49c00000000000000000000b0dd3aa6a10a08a49f19823e7933fd6826860c369beb2d6c5209690b2ff4c3715911d26af01e0217ef81be1a",
++        "0020052027c570f9cf51cd864f5c4a666688096001203dc1b40f0000000000000000000074bbcd62099096f1ab3338f6bf365246b0308b0fe00e485324977e104f66b4823e13d26af01e0217148eca0d",
++        "00200120e85f555e34e4fdf1aa55677a7d72dc6c3aebe4ecc42c00000000000000000000e821e6cc9a7742365bb4b9c7206bb08352fa2fe4aaa6cca2e325d27ba77554348e13d26af01e02170837b022",
++        "0000ff3feb0066976f7288acac7f178272e1e1e41b18a0ac2fd8010000000000000000003b6bbb7d507bffb4a94e44c30b2cdf5de6bc93e02e9286c1b3bbd1a7f6f8913ae114d26af01e0217e1851993",
++        "006098207892459fde06761a76c9521b23d9d7637b6edd75ee2f010000000000000000004a02510d9960cac920fe057215978e205211ae4dffc63d00279a7f55888fb5a7da17d26af01e02174f9430cc",
++        "008000209818aca2f44b68ac8382c3849cbf224c9cedd66b51d9010000000000000000007ed241313648e28d9143a78f2065402e3222a2de61c480061edadb3c75a14ee79e18d26af01e0217883f947a",
++        "006005202e5ea9d74cd63c1fb65514e47c38f2a4767ad8d6ae51000000000000000000003d63f20e90eb3b43e72ea91858f41d1d92103442acfa6106400e04e08f4d94df8b1ad26a930002176d7224e8",
++                ],
++            }),
+             _ => None,
+         }
+     }
+@@ -177,14 +262,20 @@ impl LightNetwork {
+                     LtcNetwork::Mainnet => (1317972665, 2084524493, 0x1e0ffff0),
+                     LtcNetwork::Testnet => (1486949366, 293345, 0x1e0ffff0),
+                     LtcNetwork::Regtest => (1296688602, 0, 0x207fffff),
++                    _ => anyhow::bail!("invalid Litecoin light network"),
+                 };
+                 ("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9", time, nonce, bits)
+             }
++            // Testnet4's genesis coinbase carries a different message, hence its own merkle root.
++            Self::Bitcoin(BtcNetwork::Testnet4) =>
++                ("7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e", 1714777860, 393743547, 0x1d00ffff),
+             Self::Bitcoin(network) => {
+                 let (time, nonce, bits) = match network {
+                     BtcNetwork::Mainnet => (1231006505, 2083236893, 0x1d00ffff),
+                     BtcNetwork::Testnet => (1296688602, 414098458, 0x1d00ffff),
+                     BtcNetwork::Regtest => (1296688602, 2, 0x207fffff),
++                    BtcNetwork::Signet => (1598918400, 52613770, 0x1e0377ae),
++                    BtcNetwork::Testnet4 => unreachable!(),
+                 };
+                 ("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b", time, nonce, bits)
+             }
+@@ -223,6 +314,8 @@ impl LightNetwork {
+     }
+ 
+     pub(super) fn limit(self) -> BigUint {
++        // Signet's limit is not of the 2^n - 1 form: 0x00000377ae00…00.
++        if self == Self::Bitcoin(BtcNetwork::Signet) { return BigUint::from(0x0377aeu32) << 216usize }
+         let bits = match self {
+             Self::Litecoin(LtcNetwork::Regtest) | Self::Bitcoin(BtcNetwork::Regtest)
+                 | Self::BitcoinCash(BchNetwork::Regtest) | Self::Dogecoin(DogeNetwork::Regtest) => 255,
+@@ -260,7 +353,7 @@ impl LightNetwork {
+             _ => (1200, 1209600),
+         };
+         if height % 2016 != 0 {
+-            if !self.is_mainnet() {
++            if self.allows_min_difficulty() {
+                 if u64::from(time) > u64::from(previous.time) + min_difficulty_gap { return Ok(easiest) }
+                 let mut index = height - 1;
+                 while index > 0 && index % 2016 != 0 && at(index)?.bits.to_consensus() == easiest { index -= 1; }
+@@ -277,9 +370,20 @@ impl LightNetwork {
+             _ => height - 2016,
+         };
+         let elapsed = i64::from(previous.time) - i64::from(at(first)?.time);
+-        self.retarget(previous.bits.to_consensus(), elapsed, timespan)
++        // BIP94: retarget from the period's first block, which can never use the
++        // minimum-difficulty exception, instead of the possibly-easiest last block.
++        let base_bits = if self.enforces_bip94() { at(height - 2016)?.bits } else { previous.bits };
++        self.retarget(base_bits.to_consensus(), elapsed, timespan)
+     }
+ 
++    /// Test networks with the twenty-minute minimum-difficulty exception. Signet has none.
++    pub(super) fn allows_min_difficulty(self) -> bool {
++        !self.is_mainnet() && self != Self::Bitcoin(BtcNetwork::Signet)
++    }
++
++    /// BIP94 header rules (Bitcoin testnet4 only).
++    pub(super) fn enforces_bip94(self) -> bool { self == Self::Bitcoin(BtcNetwork::Testnet4) }
++
+     pub(super) fn retarget(self, bits: u32, elapsed: i64, timespan: u64) -> Result<u32> {
+         let mut value = self.target(bits)?;
+         let limit = self.limit();
+@@ -317,9 +421,12 @@ impl LightNetwork {
+             Self::Litecoin(LtcNetwork::Mainnet) => (710000, 811879, 918684, Some(1201536)),
+             Self::Litecoin(LtcNetwork::Testnet) => (76, 76, 76, Some(6048)),
+             Self::Litecoin(LtcNetwork::Regtest) => (500, 1251, 1351, Some(0)),
++            // Unreachable through `ensure_header_rules`; strictest rules if ever reached.
++            Self::Litecoin(_) => (0, 0, 0, Some(0)),
+             Self::Bitcoin(BtcNetwork::Mainnet) => (227931, 363725, 388381, None),
+             Self::Bitcoin(BtcNetwork::Testnet) => (21111, 330776, 581885, None),
+             Self::Bitcoin(BtcNetwork::Regtest) => (1, 1, 1, None),
++            Self::Bitcoin(BtcNetwork::Testnet4 | BtcNetwork::Signet) => (1, 1, 1, None),
+             Self::BitcoinCash(_) | Self::Dogecoin(_) => (u32::MAX, u32::MAX, u32::MAX, None),
+         }
+     }
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+index be63f1864..fab3df78f 100644
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -131,8 +131,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ReadSession<S> {
+     }
+ 
+     // Raw transaction identity is checked, but mempool membership and witness
+-    // validity remain peer claims. Used only by provisional wallet refresh.
+-    async fn reported_transaction(&mut self,txid:Txid)->Result<Transaction> {
++    // validity remain peer claims. Used by provisional wallet refresh and by the
++    // light redeem chain, which requires every server to return identical bytes.
++    pub(crate) async fn reported_transaction(&mut self,txid:Txid)->Result<Transaction> {
+         let (_,bytes)=self.exchange("blockchain.transaction.get",json!([txid.to_string(),false]),
+             MAX_TRANSACTION*2+1024).await?;
+         let raw=decode_hex(&result::<String>(&bytes)?,MAX_TRANSACTION)?;
+diff --git a/swap-machine/src/litecoin_light/session/broadcast.rs b/swap-machine/src/litecoin_light/session/broadcast.rs
+index 923e8090e..a68d704f6 100644
+--- a/swap-machine/src/litecoin_light/session/broadcast.rs
++++ b/swap-machine/src/litecoin_light/session/broadcast.rs
+@@ -16,4 +16,15 @@ impl<S:AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
+         record.acknowledge()?;
+         Ok(txid)
+     }
++    /// Exact contract-spend bytes the swap engine has durably committed to send
++    /// (redeem or cancel). Consumes the session for the same reasons as above.
++    /// The acknowledgement is a relay claim only, never inclusion evidence.
++    pub(crate) async fn broadcast_contract_spend(mut self,transaction:&Transaction)->Result<Txid> {
++        let raw=serialize(transaction).iter().map(|byte|format!("{byte:02x}")).collect::<String>();
++        let (_,bytes)=self.exchange("blockchain.transaction.broadcast",json!([raw]),1024).await?;
++        let reported:String=result(&bytes)?;
++        let txid=transaction.compute_txid();
++        ensure!(reported==txid.to_string(),"contract spend acknowledgement identity mismatch");
++        Ok(txid)
++    }
+ }
+diff --git a/swap-machine/src/litecoin_negotiation/execution/funding_approval.rs b/swap-machine/src/litecoin_negotiation/execution/funding_approval.rs
+index 5a62e9676..02fe83563 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/funding_approval.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/funding_approval.rs
+@@ -1,6 +1,6 @@
+ //! Deliberate consent for the exact retained native funding transaction.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::relay::{NativeTransferRelay,RelayedTransfer}};
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::relay::{NativeTransferRelay,RelayedTransfer}};
+ 
+ #[derive(Clone,Copy,Debug,PartialEq,Eq)]
+ pub enum FundingAction {Send,Retransmit}
+@@ -55,7 +55,7 @@ impl Execution {
+     /// Consent is checked before RPC. The existing relay then independently
+     /// enforces quote expiry, wallet identity and a fresh live Litecoin lock.
+     pub async fn relay_reviewed_native_lock(&mut self,action:FundingAction,approved:[u8;32],
+-        native:&mut NativeTransferRelay,ltc:&LitecoinRpc,safety_blocks:u32)->Result<RelayedTransfer> {
++        native:&mut NativeTransferRelay,ltc:&impl RedeemChain,safety_blocks:u32)->Result<RelayedTransfer> {
+         let current=self.review_native_lock_payment(action,safety_blocks)?;
+         ensure!(current.commitment==approved,"funding approval is stale or differs from the retained payment/action");
+         match action {
+diff --git a/swap-machine/src/litecoin_negotiation/execution/lock_funding.rs b/swap-machine/src/litecoin_negotiation/execution/lock_funding.rs
+index ab443a6cf..dc11bfad3 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/lock_funding.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/lock_funding.rs
+@@ -2,7 +2,7 @@
+ //! Wallet ownership is caller supplied. Construction may retry under the same
+ //! intent until exact prepared bytes exist; preparation never broadcasts.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::relay::{NativeTransferRelay,RelayRequest,RelayedTransfer,
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::relay::{NativeTransferRelay,RelayRequest,RelayedTransfer,
+     lock_checkpoint::PreparedNativeLock}};
+ use swap_core::xmz::XmzAmount;
+ use zeroize::Zeroizing;
+@@ -28,7 +28,7 @@ fn missing(error:&anyhow::Error)->bool {
+ impl Execution {
+     /// Prepare once, with broadcast disabled. The intent is pinned before asking
+     /// the wallet to construct anything. Retained preparations are never replaced.
+-    pub async fn prepare_native_lock(&mut self,relay:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn prepare_native_lock(&mut self,relay:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         source:NativeFundingSource,safety_blocks:u32,now:u64)->Result<RelayedTransfer> {
+         ensure!(matches!(self.role,LocalRole::NativeFunder),"wrong native funding role");
+         let (mut head,previous,quote,_,exchange)=self.load()?;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/native_payout.rs b/swap-machine/src/litecoin_negotiation/execution/native_payout.rs
+index 6988eadf8..26bbb64ff 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/native_payout.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/native_payout.rs
+@@ -1,7 +1,7 @@
+ //! Non-relaying payout preparation owned by the durable execution journal.
+ use super::*;
+ use super::native_claim_wallet::BoundPayout;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::{NativeFundingRpc,
+     full_proceeds::lock_payout::{self,PreparedLockPayout}},xmz_funding::FundingObserver};
+ use zeroize::Zeroizing;
+ 
+@@ -32,7 +32,7 @@ impl Intent {
+ impl Execution {
+     /// Persist intent before construction and exact private bytes before returning
+     /// accounting. Existing preparations recover offline; never construct a replacement.
+-    pub async fn prepare_native_payout(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++    pub async fn prepare_native_payout(&mut self,native:&impl FundingObserver,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash,client:&NativeFundingRpc,priority:u32)->Result<serde_json::Value> {
+         ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong native payout role");
+         ensure!((1..=4).contains(&priority),"invalid native payout priority");
+@@ -56,7 +56,7 @@ impl Execution {
+             Err(e)=>Err(e),
+         }
+     }
+-    async fn construct_native_payout(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++    async fn construct_native_payout(&mut self,native:&impl FundingObserver,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash,client:&NativeFundingRpc,priority:u32)->Result<serde_json::Value> {
+         // Reobserve both chains before every construction attempt. No expiry check:
+         // this spends an existing claim, not admission of a new funded trade.
+diff --git a/swap-machine/src/litecoin_negotiation/execution/native_refund.rs b/swap-machine/src/litecoin_negotiation/execution/native_refund.rs
+index d6995146d..f60450277 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/native_refund.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/native_refund.rs
+@@ -1,6 +1,6 @@
+ //! Alice's native wallet recovery after a confirmed agreed Litecoin refund.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{relay::NativeTransferRelay,
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::{relay::NativeTransferRelay,
+     wallet_session::{NativeWalletSession,SwapWalletId}}};
+ use crate::litecoin_negotiation::recovery::native_claim::NativeClaimKeys;
+ use zeroize::Zeroizing;
+@@ -75,7 +75,7 @@ impl Execution {
+     }
+     /// Fresh observations on both chains precede key release. Commercial expiry
+     /// never disables recovery of an existing funded agreement.
+-    pub async fn prepare_native_refund(&mut self,native:&NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn prepare_native_refund(&mut self,native:&NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash)->Result<PreparedNativeRefund> {
+         ensure!(matches!(self.role,LocalRole::NativeFunder),"wrong native refund role");
+         self.reconcile_native_lock(native).await?;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/native_refund_payout.rs b/swap-machine/src/litecoin_negotiation/execution/native_refund_payout.rs
+index afc292951..8aa76ce6b 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/native_refund_payout.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/native_refund_payout.rs
+@@ -1,7 +1,7 @@
+ //! Non-relaying refund payment preparation owned by the durable execution journal.
+ use super::*;
+ use super::native_refund::BoundRefund;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::{NativeFundingRpc,
+     full_proceeds::lock_payout::{self,PreparedLockPayout}},native_funding_rpc::relay::NativeTransferRelay};
+ use zeroize::Zeroizing;
+ 
+@@ -32,7 +32,7 @@ impl Intent {
+ impl Execution {
+     /// Persist intent before construction and exact private bytes before returning
+     /// accounting. Existing preparations recover offline; never construct a replacement.
+-    pub async fn prepare_native_refund_payout(&mut self,native:&NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn prepare_native_refund_payout(&mut self,native:&NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash,client:&NativeFundingRpc,priority:u32)->Result<serde_json::Value> {
+         ensure!(matches!(self.role,LocalRole::NativeFunder),"wrong native payout role");
+         ensure!((1..=4).contains(&priority),"invalid native payout priority");
+@@ -56,7 +56,7 @@ impl Execution {
+             Err(e)=>Err(e),
+         }
+     }
+-    async fn construct_native_refund_payout(&mut self,native:&NativeTransferRelay,ltc:&LitecoinRpc,
++    async fn construct_native_refund_payout(&mut self,native:&NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash,client:&NativeFundingRpc,priority:u32)->Result<serde_json::Value> {
+         // Reobserve both chains before every construction attempt. No expiry check:
+         // this spends an existing claim, not admission of a new funded trade.
+diff --git a/swap-machine/src/litecoin_negotiation/execution/native_relay.rs b/swap-machine/src/litecoin_negotiation/execution/native_relay.rs
+index 4d0e1d7ca..02beb15a6 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/native_relay.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/native_relay.rs
+@@ -1,6 +1,6 @@
+ //! Native funding dispatch under the execution lease. No payment reconstruction.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::relay::{NativeTransferRelay,RelayedTransfer,
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::relay::{NativeTransferRelay,RelayedTransfer,
+     lock_checkpoint::PreparedNativeLock}};
+ use swap_core::monero::TransferProof;
+ 
+@@ -28,19 +28,19 @@ impl Execution {
+ 
+     /// Send the exact retained native transaction once. An uncertain result
+     /// leaves dispatch occupied; calling this initial operation again is refused.
+-    pub async fn relay_native_lock(&mut self,native:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn relay_native_lock(&mut self,native:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         safety_blocks:u32)->Result<RelayedTransfer> {
+         self.dispatch_native_lock(native,ltc,safety_blocks,false).await
+     }
+ 
+     /// Explicit retransmission only, under fresh quote/live-lock checks. The
+     /// caller supplies a fresh RPC relay instance; no replacement is constructed.
+-    pub async fn retransmit_native_lock(&mut self,native:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn retransmit_native_lock(&mut self,native:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         safety_blocks:u32)->Result<RelayedTransfer> {
+         self.dispatch_native_lock(native,ltc,safety_blocks,true).await
+     }
+ 
+-    async fn dispatch_native_lock(&mut self,native:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    async fn dispatch_native_lock(&mut self,native:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         safety_blocks:u32,retry:bool)->Result<RelayedTransfer> {
+         let prepared=self.load_prepared_native_lock()?;
+         let (mut head,previous,quote,_,exchange)=self.load()?;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/payout_approval.rs b/swap-machine/src/litecoin_negotiation/execution/payout_approval.rs
+index 30f63f65a..d96b6afbe 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/payout_approval.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/payout_approval.rs
+@@ -1,6 +1,6 @@
+ //! Explicit native-UI consent bound to one retained payout payment and action.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::relay::{NativeTransferRelay,RelayedTransfer}};
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::relay::{NativeTransferRelay,RelayedTransfer}};
+ 
+ #[derive(Clone,Copy,Debug,PartialEq,Eq)]
+ pub enum PayoutAction { Send, Retransmit }
+@@ -50,7 +50,7 @@ impl Execution {
+     /// Native GUI bridge entry point. The caller supplies the exact displayed
+     /// commitment after consent; fresh two-chain preflight still happens below.
+     pub async fn relay_reviewed_native_payout(&mut self,action:PayoutAction,approved:[u8;32],
+-        native:&mut NativeTransferRelay,ltc:&LitecoinRpc,block:bitcoin::BlockHash)->Result<RelayedTransfer> {
++        native:&mut NativeTransferRelay,ltc:&impl RedeemChain,block:bitcoin::BlockHash)->Result<RelayedTransfer> {
+         let current=self.review_native_payout_payment(action)?;
+         ensure!(current.commitment==approved,"payout approval is stale or differs from the retained payment/action");
+         match action {
+diff --git a/swap-machine/src/litecoin_negotiation/execution/payout_relay.rs b/swap-machine/src/litecoin_negotiation/execution/payout_relay.rs
+index bfbd5f571..20981087f 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/payout_relay.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/payout_relay.rs
+@@ -1,6 +1,6 @@
+ //! Durable native payout dispatch. Saved bytes are never reconstructed here.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{relay::{NativeTransferRelay,RelayedTransfer},
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::{relay::{NativeTransferRelay,RelayedTransfer},
+     full_proceeds::lock_payout::PreparedLockPayout}};
+ 
+ #[derive(Serialize)]
+@@ -29,17 +29,17 @@ impl Execution {
+     }
+     /// First explicit send. Any retained attempt requires reconciliation or the
+     /// separate retransmit API, even after an interrupted head publication.
+-    pub async fn relay_native_payout(&mut self,native:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn relay_native_payout(&mut self,native:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash)->Result<RelayedTransfer> {
+         self.dispatch_native_payout(native,ltc,block,false).await
+     }
+     /// Explicit retry of the identical saved transaction using a fresh backend.
+     /// A prior acknowledgement is not confirmation and does not forbid retry.
+-    pub async fn retransmit_native_payout(&mut self,native:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn retransmit_native_payout(&mut self,native:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash)->Result<RelayedTransfer> {
+         self.dispatch_native_payout(native,ltc,block,true).await
+     }
+-    async fn dispatch_native_payout(&mut self,native:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    async fn dispatch_native_payout(&mut self,native:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash,retry:bool)->Result<RelayedTransfer> {
+         let prepared=self.load_prepared_native_payout()?;
+         let redemption=self.retained_native_redemption()?;
+@@ -90,7 +90,7 @@ impl Execution {
+     }
+     /// Observe current LTC redemption and the exact native payout. The returned
+     /// native depth is an observation at this call, never a cached completion flag.
+-    pub async fn reconcile_native_payout(&mut self,native:&NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn reconcile_native_payout(&mut self,native:&NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash)->Result<u64> {
+         let prepared=self.load_prepared_native_payout()?;
+         let redemption=self.retained_native_redemption()?;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/recovery.rs b/swap-machine/src/litecoin_negotiation/execution/recovery.rs
+index c3f14fff6..b76490381 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/recovery.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/recovery.rs
+@@ -179,7 +179,7 @@ impl Execution {
+ 
+     /// Reobserve the exact recovered lock, including pending spends, before
+     /// considering redeem-signature release. Native funding must also be checked.
+-    pub async fn observe_live_lock(&mut self,rpc:&crate::litecoin_rpc::LitecoinRpc,
++    pub async fn observe_live_lock(&mut self,rpc:&impl crate::litecoin_rpc::RedeemChain,
+         safety_blocks:u32)->Result<crate::litecoin_rpc::VerifiedLiveLock> {
+         let (_,_,quote,_,exchange)=self.load()?;
+         let keys=exchange.finish()?;
+@@ -224,7 +224,7 @@ impl Execution {
+     /// Find a current confirmed block for the role's already-agreed settlement
+     /// transaction. This returns a search hint, not native-payment authority:
+     /// claim/refund preparation and reconciliation still verify both chains.
+-    pub async fn locate_native_settlement_block(&mut self,ltc:&crate::litecoin_rpc::LitecoinRpc)->Result<bitcoin::BlockHash> {
++    pub async fn locate_native_settlement_block(&mut self,ltc:&impl crate::litecoin_rpc::RedeemChain)->Result<bitcoin::BlockHash> {
+         ensure!(ltc.network()==self.policy.ltc_network,"wrong settlement lookup network");
+         let (plan,_)=self.recovery_plan()?;
+         let (_,_,quote,_,_)=self.load()?;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs b/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs
+index 458e05bea..82665e710 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs
+@@ -1,6 +1,6 @@
+ //! Explicit submission of the retained Litecoin cancellation/recovery transactions.
+ use super::*;
+-use crate::litecoin_rpc::LitecoinRpc;
++use crate::litecoin_rpc::RedeemChain;
+ use bitcoin::{Transaction,Txid,Wtxid,BlockHash};
+ 
+ #[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord,Serialize,Deserialize)]
+@@ -101,7 +101,7 @@ impl Execution {
+             "inputAtoms":input.to_string(),"amountAtoms":amount.to_string(),"feeAtoms":fee.to_string(),"chainObserved":false});
+         Ok(RecoverySpendReview {commitment:review_commitment(&details)?,details})
+     }
+-    pub async fn submit_reviewed_recovery_spend(&mut self,ltc:&LitecoinRpc,kind:RecoverySpend,approved:[u8;32])->Result<ReviewedRecoveryOutcome> {
++    pub async fn submit_reviewed_recovery_spend(&mut self,ltc:&impl RedeemChain,kind:RecoverySpend,approved:[u8;32])->Result<ReviewedRecoveryOutcome> {
+         let review=self.review_recovery_spend(kind)?;
+         ensure!(review.commitment==approved,"recovery approval differs from retained transaction or action");
+         ensure!(ltc.network()==self.policy.ltc_network,"wrong recovery network");
+@@ -120,14 +120,14 @@ impl Execution {
+     /// No native-funding or commercial-expiry gate: these are already-agreed
+     /// recovery obligations. The Litecoin node enforces current spendability and
+     /// relative timelocks before the owner records its first broadcast attempt.
+-    pub async fn relay_recovery_spend(&mut self,ltc:&LitecoinRpc,kind:RecoverySpend)->Result<RecoveryRelayOutcome> {
++    pub async fn relay_recovery_spend(&mut self,ltc:&impl RedeemChain,kind:RecoverySpend)->Result<RecoveryRelayOutcome> {
+         self.submit_recovery_spend(ltc,kind,false).await
+     }
+     /// An explicit retry never changes the signed bytes or creates new keys.
+-    pub async fn retransmit_recovery_spend(&mut self,ltc:&LitecoinRpc,kind:RecoverySpend)->Result<RecoveryRelayOutcome> {
++    pub async fn retransmit_recovery_spend(&mut self,ltc:&impl RedeemChain,kind:RecoverySpend)->Result<RecoveryRelayOutcome> {
+         self.submit_recovery_spend(ltc,kind,true).await
+     }
+-    async fn submit_recovery_spend(&mut self,ltc:&LitecoinRpc,kind:RecoverySpend,retry:bool)->Result<RecoveryRelayOutcome> {
++    async fn submit_recovery_spend(&mut self,ltc:&impl RedeemChain,kind:RecoverySpend,retry:bool)->Result<RecoveryRelayOutcome> {
+         let transaction=self.recovery_transaction(kind)?;
+         let (mut head,previous,_,_,_)=self.load()?;
+         ensure!(ltc.network()==self.policy.ltc_network,"wrong recovery Litecoin network");
+@@ -156,7 +156,7 @@ impl Execution {
+     }
+     /// Fresh indexed observation of the agreed recovery effect. A peer may
+     /// have published the shared cancellation; a local dispatch is not required.
+-    pub async fn check_recovery_spend(&mut self,ltc:&LitecoinRpc,kind:RecoverySpend)->Result<serde_json::Value> {
++    pub async fn check_recovery_spend(&mut self,ltc:&impl RedeemChain,kind:RecoverySpend)->Result<serde_json::Value> {
+         let transaction=self.recovery_transaction(kind)?;
+         let (head,_,quote,_,_)=self.load()?;
+         ensure!(ltc.network()==self.policy.ltc_network,"wrong recovery observation network");
+@@ -170,7 +170,7 @@ impl Execution {
+     }
+     /// Fresh chain evidence, including when the peer broadcast the shared
+     /// cancellation first. An acknowledgement or saved depth never suffices.
+-    pub async fn observe_recovery_spend(&mut self,ltc:&LitecoinRpc,kind:RecoverySpend,block:BlockHash)->Result<u64> {
++    pub async fn observe_recovery_spend(&mut self,ltc:&impl RedeemChain,kind:RecoverySpend,block:BlockHash)->Result<u64> {
+         let transaction=self.recovery_transaction(kind)?;
+         let (_,_,quote,_,_)=self.load()?;
+         ensure!(ltc.network()==self.policy.ltc_network,"wrong recovery observation network");
+diff --git a/swap-machine/src/litecoin_negotiation/execution/redeem.rs b/swap-machine/src/litecoin_negotiation/execution/redeem.rs
+index 9f1f2c050..67c7313fa 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/redeem.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/redeem.rs
+@@ -1,6 +1,6 @@
+ //! Durable Bob redeem release, gated by current evidence from both chains.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,xmz_funding::FundingObserver};
++use crate::{litecoin_rpc::RedeemChain,xmz_funding::FundingObserver};
+ use crate::litecoin_negotiation::recovery::redeem::SignedRedeem;
+ 
+ #[derive(Serialize,Deserialize)]
+@@ -20,7 +20,7 @@ const RELEASE_OBSERVATION_ATTEMPTS:usize=4;
+ const RELEASE_RETRY_DELAY:std::time::Duration=std::time::Duration::from_millis(if cfg!(test) {1} else {2000});
+ 
+ impl Execution {
+-    pub async fn release_redeem(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++    pub async fn release_redeem(&mut self,native:&impl FundingObserver,ltc:&impl RedeemChain,
+         safety_blocks:u32,identity:&ed25519_dalek::SigningKey)->Result<SignedRedeem> {
+         ensure!(identity.verifying_key().to_bytes()==self.claim.pins[0],"wrong redeem identity");
+         self.checked_release(native,ltc,safety_blocks,ReleaseAction::Sign(identity)).await?.signed()
+@@ -28,7 +28,7 @@ impl Execution {
+ 
+     /// An identity-free retry still checks current funding, the live lock and
+     /// cancellation margin. A saved frame never bypasses either chain check.
+-    pub async fn recover_redeem_release(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++    pub async fn recover_redeem_release(&mut self,native:&impl FundingObserver,ltc:&impl RedeemChain,
+         safety_blocks:u32)->Result<SignedRedeem> {
+         self.checked_release(native,ltc,safety_blocks,ReleaseAction::Recover).await?.signed()
+     }
+@@ -36,16 +36,16 @@ impl Execution {
+     /// Retain one exact adaptor frame for the external identity signer. The
+     /// frame itself is sensitive release material: both chains are checked even
+     /// on review and retry, before any frame is returned.
+-    pub async fn redeem_signing_frame(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++    pub async fn redeem_signing_frame(&mut self,native:&impl FundingObserver,ltc:&impl RedeemChain,
+         safety_blocks:u32)->Result<Vec<u8>> {
+         Ok(self.checked_release(native,ltc,safety_blocks,ReleaseAction::Review).await?.bytes)
+     }
+-    pub async fn submit_redeem_signature(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++    pub async fn submit_redeem_signature(&mut self,native:&impl FundingObserver,ltc:&impl RedeemChain,
+         safety_blocks:u32,bytes:&[u8],signature:&[u8])->Result<SignedRedeem> {
+         self.checked_release(native,ltc,safety_blocks,ReleaseAction::Submit(bytes,signature)).await?.signed()
+     }
+ 
+-    async fn checked_release(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++    async fn checked_release(&mut self,native:&impl FundingObserver,ltc:&impl RedeemChain,
+         safety_blocks:u32,action:ReleaseAction<'_>)->Result<Release> {
+         ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong redeem release role");
+         let filename=release_name(self.claim.trade);
+@@ -160,7 +160,7 @@ impl Execution {
+     /// redemption and native funding. Retain the redemption witness before keys
+     /// leave this operation. This prepares a claim; it does not relay a payment.
+     /// Retries reobserve both chains rather than trusting retained confirmations.
+-    pub async fn prepare_native_claim(&mut self,native:&impl FundingObserver,ltc:&LitecoinRpc,
++    pub async fn prepare_native_claim(&mut self,native:&impl FundingObserver,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash)->Result<super::native_claim_wallet::PreparedNativeClaim> {
+         ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong native claim role");
+         let (plan,local)=self.recovery_plan()?;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/redeem_approval.rs b/swap-machine/src/litecoin_negotiation/execution/redeem_approval.rs
+index b3493a2b5..f11abf42e 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/redeem_approval.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/redeem_approval.rs
+@@ -1,6 +1,6 @@
+ //! Explicit consent for the retained completed Litecoin redemption.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc, native_funding_rpc::relay::NativeTransferRelay};
++use crate::{litecoin_rpc::RedeemChain, native_funding_rpc::relay::NativeTransferRelay};
+ use bitcoin::Txid;
+ 
+ pub struct RedeemSpendReview {
+@@ -79,7 +79,7 @@ impl Execution {
+     /// Consent is checked before RPC. A retry may reconcile the exact pooled
+     /// transaction, but still requires fresh evidence of our native funding.
+     pub async fn submit_reviewed_completed_redeem(&mut self, native:&NativeTransferRelay,
+-        ltc:&LitecoinRpc, approved:[u8;32]) -> Result<ReviewedRedeemOutcome> {
++        ltc:&impl RedeemChain, approved:[u8;32]) -> Result<ReviewedRedeemOutcome> {
+         let review=self.review_completed_redeem()?;
+         ensure!(review.commitment==approved,"redemption approval differs from retained transaction or action");
+         ensure!(ltc.network()==self.policy.ltc_network,"wrong redemption network");
+@@ -100,7 +100,7 @@ impl Execution {
+     }
+     /// Indexed active-chain evidence for the retained transaction effect. Saved
+     /// acknowledgements never stand in for fresh confirmation, including retries.
+-    pub async fn check_completed_redeem(&mut self,ltc:&LitecoinRpc)->Result<serde_json::Value> {
++    pub async fn check_completed_redeem(&mut self,ltc:&impl RedeemChain)->Result<serde_json::Value> {
+         let transaction=self.recover_completed_redeem()?;
+         let (head,_,quote,_,_)=self.load()?;
+         ensure!(ltc.network()==self.policy.ltc_network,"wrong redemption observation network");
+diff --git a/swap-machine/src/litecoin_negotiation/execution/redeem_relay.rs b/swap-machine/src/litecoin_negotiation/execution/redeem_relay.rs
+index 5ae2bd594..19c4a6c05 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/redeem_relay.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/redeem_relay.rs
+@@ -1,6 +1,6 @@
+ //! Alice's durable completed-redemption submission and fresh reconciliation.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::relay::NativeTransferRelay};
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::relay::NativeTransferRelay};
+ use bitcoin::{Transaction,Txid,Wtxid,BlockHash};
+ 
+ #[derive(Debug,PartialEq,Eq)]
+@@ -21,15 +21,15 @@ pub(super) fn dispatch_bytes(head:&Head,transaction:&Transaction)->Result<Vec<u8
+ impl Execution {
+     /// First submission requires currently confirmed native funding. The saved
+     /// peer release and completed transaction are revalidated before any RPC.
+-    pub async fn relay_completed_redeem(&mut self,native:&NativeTransferRelay,ltc:&LitecoinRpc)->Result<RedeemRelayOutcome> {
++    pub async fn relay_completed_redeem(&mut self,native:&NativeTransferRelay,ltc:&impl RedeemChain)->Result<RedeemRelayOutcome> {
+         self.submit_completed_redeem(native,ltc,false).await
+     }
+     /// Explicit retry submits only the retained bytes. Already-mined or pooled
+     /// transactions should be reconciled, not replaced or re-signed.
+-    pub async fn retransmit_completed_redeem(&mut self,native:&NativeTransferRelay,ltc:&LitecoinRpc)->Result<RedeemRelayOutcome> {
++    pub async fn retransmit_completed_redeem(&mut self,native:&NativeTransferRelay,ltc:&impl RedeemChain)->Result<RedeemRelayOutcome> {
+         self.submit_completed_redeem(native,ltc,true).await
+     }
+-    async fn submit_completed_redeem(&mut self,native:&NativeTransferRelay,ltc:&LitecoinRpc,retry:bool)->Result<RedeemRelayOutcome> {
++    async fn submit_completed_redeem(&mut self,native:&NativeTransferRelay,ltc:&impl RedeemChain,retry:bool)->Result<RedeemRelayOutcome> {
+         let transaction=self.recover_completed_redeem()?;
+         self.reconcile_native_lock(native).await?;
+         let (mut head,previous,_,_,_)=self.load()?;
+@@ -62,7 +62,7 @@ impl Execution {
+     }
+     /// A receipt never substitutes for fresh chain evidence. A reorg may change
+     /// the witness while retaining the exact redemption's transaction effects.
+-    pub async fn reconcile_completed_redeem(&mut self,ltc:&LitecoinRpc,block:BlockHash)->Result<u64> {
++    pub async fn reconcile_completed_redeem(&mut self,ltc:&impl RedeemChain,block:BlockHash)->Result<u64> {
+         let transaction=self.recover_completed_redeem()?;
+         let (head,_,quote,_,_)=self.load()?;
+         let bytes=dispatch_bytes(&head,&transaction)?;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/refund_approval.rs b/swap-machine/src/litecoin_negotiation/execution/refund_approval.rs
+index f42f813b6..390c26733 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/refund_approval.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/refund_approval.rs
+@@ -1,6 +1,6 @@
+ //! Explicit native-UI consent bound to one retained refund payment and action.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::relay::{NativeTransferRelay,RelayedTransfer}};
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::relay::{NativeTransferRelay,RelayedTransfer}};
+ 
+ #[derive(Clone,Copy,Debug,PartialEq,Eq)]
+ pub enum RefundAction { Send, Retransmit }
+@@ -50,7 +50,7 @@ impl Execution {
+     /// Native GUI bridge entry point. The caller supplies the exact displayed
+     /// commitment after consent; fresh two-chain preflight still happens below.
+     pub async fn relay_reviewed_native_refund(&mut self,action:RefundAction,approved:[u8;32],
+-        native:&mut NativeTransferRelay,ltc:&LitecoinRpc,block:bitcoin::BlockHash)->Result<RelayedTransfer> {
++        native:&mut NativeTransferRelay,ltc:&impl RedeemChain,block:bitcoin::BlockHash)->Result<RelayedTransfer> {
+         let current=self.review_native_refund_payment(action)?;
+         ensure!(current.commitment==approved,"refund approval is stale or differs from the retained payment/action");
+         match action {
+diff --git a/swap-machine/src/litecoin_negotiation/execution/refund_payout_relay.rs b/swap-machine/src/litecoin_negotiation/execution/refund_payout_relay.rs
+index 8d81490c7..a02a97faa 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/refund_payout_relay.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/refund_payout_relay.rs
+@@ -1,6 +1,6 @@
+ //! Durable native payout dispatch. Saved bytes are never reconstructed here.
+ use super::*;
+-use crate::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{relay::{NativeTransferRelay,RelayedTransfer},
++use crate::{litecoin_rpc::RedeemChain,native_funding_rpc::{relay::{NativeTransferRelay,RelayedTransfer},
+     full_proceeds::lock_payout::PreparedLockPayout}};
+ 
+ #[derive(Serialize)]
+@@ -29,17 +29,17 @@ impl Execution {
+     }
+     /// First explicit send. Any retained attempt requires reconciliation or the
+     /// separate retransmit API, even after an interrupted head publication.
+-    pub async fn relay_native_refund_payout(&mut self,native:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn relay_native_refund_payout(&mut self,native:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash)->Result<RelayedTransfer> {
+         self.dispatch_native_refund_payout(native,ltc,block,false).await
+     }
+     /// Explicit retry of the identical saved transaction using a fresh backend.
+     /// A prior acknowledgement is not confirmation and does not forbid retry.
+-    pub async fn retransmit_native_refund_payout(&mut self,native:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn retransmit_native_refund_payout(&mut self,native:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash)->Result<RelayedTransfer> {
+         self.dispatch_native_refund_payout(native,ltc,block,true).await
+     }
+-    async fn dispatch_native_refund_payout(&mut self,native:&mut NativeTransferRelay,ltc:&LitecoinRpc,
++    async fn dispatch_native_refund_payout(&mut self,native:&mut NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash,retry:bool)->Result<RelayedTransfer> {
+         let prepared=self.load_prepared_native_refund_payout()?;
+         let redemption=self.retained_native_refund()?;
+@@ -90,7 +90,7 @@ impl Execution {
+     }
+     /// Observe current LTC redemption and the exact native payout. The returned
+     /// native depth is an observation at this call, never a cached completion flag.
+-    pub async fn reconcile_native_refund_payout(&mut self,native:&NativeTransferRelay,ltc:&LitecoinRpc,
++    pub async fn reconcile_native_refund_payout(&mut self,native:&NativeTransferRelay,ltc:&impl RedeemChain,
+         block:bitcoin::BlockHash)->Result<u64> {
+         let prepared=self.load_prepared_native_refund_payout()?;
+         let redemption=self.retained_native_refund()?;
+diff --git a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+index 7e7cd80e4..4f606f3e1 100644
+--- a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
++++ b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+@@ -42,11 +42,9 @@ async fn actual_paired_chain_execution()->Result<()> {
+     ensure!(bytes.len()<=32768,"oversized paired fixture request");
+     let mut request:Request=serde_json::from_slice(&bytes)?;
+     {
+-        use swap_core::{litecoin_address::LtcNetwork,xmz_address::XmzNetwork};
+-        ensure!(matches!((request.policy.ltc_network,request.policy.xmz_network),
+-            (LtcNetwork::Regtest,XmzNetwork::Mainnet)|(LtcNetwork::Testnet,XmzNetwork::Testnet)),
+-            "paired fixture requires Litecoin regtest or the testnet pair");
+-        ensure!(request.ltc_cookie.is_none()==(request.policy.ltc_network==LtcNetwork::Regtest),
++        ensure!(request.policy.ltc_network.is_staged_test_pair(request.policy.xmz_network),
++            "paired fixture requires a regtest or public test-network pair");
++        ensure!(request.ltc_cookie.is_none()==request.policy.ltc_network.is_regtest(),
+             "testnet fixture requires an explicit node cookie");
+     }
+     let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+diff --git a/swap-machine/src/litecoin_quote.rs b/swap-machine/src/litecoin_quote.rs
+index 3c77bfb87..44d1f7990 100644
+--- a/swap-machine/src/litecoin_quote.rs
++++ b/swap-machine/src/litecoin_quote.rs
+@@ -108,7 +108,7 @@ impl VerifiedLtcQuote {
+     }
+ 
+     pub fn check_policy(&self, policy: &Policy, now: u64) -> Result<()> {
+-        let ltc = match policy.ltc_network { LtcNetwork::Mainnet => "ltc-mainnet", LtcNetwork::Testnet => "ltc-testnet", LtcNetwork::Regtest => "ltc-regtest" };
++        let ltc = policy.ltc_network.quote_name();
+         let xmz = match policy.xmz_network { XmzNetwork::Mainnet => "xmz-mainnet", XmzNetwork::Testnet => "xmz-testnet", XmzNetwork::Stagenet => "xmz-stagenet" };
+         ensure!(hash(&policy.xmz_genesis) && self.terms["ltcGenesis"] == policy.ltc_network.genesis()
+             && self.terms["xmzGenesis"] == policy.xmz_genesis && self.terms["ltcGenesis"] != self.terms["xmzGenesis"]
+@@ -122,7 +122,7 @@ impl VerifiedLtcQuote {
+                 && payout.refund_fee_max_atoms()<=policy.maximum_xmz_fee,"native settlement fee exceeds policy");
+         }
+         let principal = n("ltcAtoms")?;
+-        ensure!(principal <= 84_000_000 * 100_000_000 && principal <= policy.maximum_ltc_atoms
++        ensure!(principal <= policy.ltc_network.max_atoms() && principal <= policy.maximum_ltc_atoms
+             && n("xmzAtoms")? <= policy.maximum_xmz_atoms, "Litecoin quote principal exceeds policy");
+         ensure!(n("ltcFundingFeeMaxAtoms")? <= policy.maximum_ltc_funding_fee
+             && n("ltcFundingFeeMaxAtoms")? < principal && n("xmzNativeFeeMaxAtoms")? <= policy.maximum_xmz_fee,
+@@ -212,13 +212,11 @@ mod policy_ltc_network {
+     use super::LtcNetwork;
+     use serde::{Deserialize,Serializer,Deserializer};
+     pub fn serialize<S: Serializer>(value: &LtcNetwork,s: S)->Result<S::Ok,S::Error> {
+-        s.serialize_str(match value { LtcNetwork::Mainnet=>"ltc-mainnet",LtcNetwork::Testnet=>"ltc-testnet",LtcNetwork::Regtest=>"ltc-regtest" })
++        s.serialize_str(value.quote_name())
+     }
+     pub fn deserialize<'de,D: Deserializer<'de>>(d: D)->Result<LtcNetwork,D::Error> {
+-        match String::deserialize(d)?.as_str() {
+-            "ltc-mainnet"=>Ok(LtcNetwork::Mainnet),"ltc-testnet"=>Ok(LtcNetwork::Testnet),"ltc-regtest"=>Ok(LtcNetwork::Regtest),
+-            _=>Err(serde::de::Error::custom("invalid Litecoin deployment")),
+-        }
++        LtcNetwork::from_quote_name(&String::deserialize(d)?)
++            .ok_or_else(||serde::de::Error::custom("invalid Litecoin or Bitcoin deployment"))
+     }
+ }
+ mod policy_xmz_network {
+diff --git a/swap-machine/src/litecoin_rpc.rs b/swap-machine/src/litecoin_rpc.rs
+index 1d6c36a4b..349683f77 100644
+--- a/swap-machine/src/litecoin_rpc.rs
++++ b/swap-machine/src/litecoin_rpc.rs
+@@ -62,6 +62,8 @@ struct ChainInfo {
+     chain: String,
+     bestblockhash: BlockHash,
+     initialblockdownload: bool,
++    /// Litecoin Core 0.21 only; Bitcoin Core moved deployments to `getdeploymentinfo`.
++    #[serde(default)]
+     softforks: Value,
+ }
+ #[derive(Deserialize)]
+@@ -122,8 +124,15 @@ impl LitecoinRpc {
+         let info: ChainInfo = serde_json::from_str(self.rpc(false, "getblockchaininfo", json!([])).await?.get())?;
+         let genesis: String = serde_json::from_str(self.rpc(false, "getblockhash", json!([0])).await?.get())?;
+         self.network.verify_chain(&info.chain, &genesis)?;
+-        ensure!(!info.initialblockdownload && info.softforks["csv"]["active"] == true
+-            && info.softforks["segwit"]["active"] == true, "Litecoin chain not ready for contract settlement");
++        let deployments = if self.network.is_bitcoin() {
++            let raw = self.rpc(false, "getdeploymentinfo", json!([info.bestblockhash.to_string()])).await?;
++            let value: Value = serde_json::from_str(raw.get())?;
++            ensure!(value["hash"].as_str() == Some(info.bestblockhash.to_string().as_str()),
++                "Bitcoin deployment information is for another tip");
++            value["deployments"].clone()
++        } else { info.softforks };
++        ensure!(!info.initialblockdownload && deployments["csv"]["active"] == true
++            && deployments["segwit"]["active"] == true, "{} chain not ready for contract settlement", self.network.coin());
+         Ok(info.bestblockhash)
+     }
+ 
+@@ -152,7 +161,7 @@ impl LitecoinRpc {
+         fee_rate_atoms_per_kb: u64, maximum_fee: Amount) -> Result<LockPreview> {
+         ensure!(contract.network() == self.network && contract.script_pubkey().is_p2wsh(),
+             "wrong Litecoin contract network or script");
+-        ensure!(amount.to_sat() > 0 && amount.to_sat() <= 84_000_000 * 100_000_000
++        ensure!(amount.to_sat() > 0 && amount.to_sat() <= self.network.max_atoms()
+             && maximum_fee > Amount::ZERO && maximum_fee < amount && fee_rate_atoms_per_kb > 0,
+             "invalid Litecoin amount or fee policy");
+         self.wallet_ready().await?;
+@@ -287,3 +296,6 @@ pub mod reservation;
+ pub mod confirmed;
+ 
+ mod redeem_submission;
++
++pub mod redeem_chain;
++pub use redeem_chain::RedeemChain;
+diff --git a/swap-machine/src/litecoin_rpc/confirmed.rs b/swap-machine/src/litecoin_rpc/confirmed.rs
+index 16bde3bd6..d8ccc5ce3 100644
+--- a/swap-machine/src/litecoin_rpc/confirmed.rs
++++ b/swap-machine/src/litecoin_rpc/confirmed.rs
+@@ -13,6 +13,11 @@ impl ConfirmedTransaction {
+     pub fn block(&self)->BlockHash { self.block }
+     pub fn confirmations(&self)->u64 { self.confirmations }
+     pub fn transaction(&self)->&Transaction { &self.transaction }
++    /// Evidence assembled by the light redeem chain from headers it validated.
++    pub(in crate::litecoin_rpc) fn from_light(network:LtcNetwork,tip:BlockHash,block:BlockHash,
++        confirmations:u64,transaction:Transaction)->Self {
++        Self {network,tip,block,confirmations,transaction}
++    }
+ }
+ #[derive(Deserialize)]
+ struct RawTransaction { in_active_chain:bool,hex:String,txid:Txid,hash:Wtxid,blockhash:BlockHash,confirmations:u64 }
+diff --git a/swap-machine/src/litecoin_rpc/redeem_chain.rs b/swap-machine/src/litecoin_rpc/redeem_chain.rs
+new file mode 100644
+index 000000000..a984fd8e2
+--- /dev/null
++++ b/swap-machine/src/litecoin_rpc/redeem_chain.rs
+@@ -0,0 +1,55 @@
++//! Chain observations and transport the XMZ seller needs to redeem a lock.
++//! `LitecoinRpc` (a caller-owned full node) is the only implementation today;
++//! a light-wallet implementation must meet the same contracts
++//! (see tools/dex-engine-port/SELLER_LIGHT_REDEEM.md).
++use super::{LitecoinRpc,VerifiedLiveLock,confirmed::ConfirmedTransaction};
++use anyhow::Result;
++use bitcoin::{Amount,BlockHash,OutPoint,ScriptBuf,Transaction,Txid};
++use std::future::Future;
++use swap_core::litecoin_address::LtcNetwork;
++
++pub trait RedeemChain: Sync {
++    fn network(&self)->LtcNetwork;
++    /// Lock unspent (pending spends included), agreed script and amount, deep
++    /// enough, and at least `safety_blocks` before cancellation is possible.
++    fn verify_live_lock(&self,outpoint:OutPoint,script:&ScriptBuf,amount:Amount,
++        confirmations:u64,cancel_blocks:u32,safety_blocks:u32)->impl Future<Output=Result<VerifiedLiveLock>>+Send;
++    /// The completed redemption would be accepted now; nothing is sent.
++    fn preflight_contract_spend(&self,transaction:&Transaction)->impl Future<Output=Result<()>>+Send;
++    /// Send the exact bytes. False means the outcome is uncertain, never refused.
++    fn dispatch_contract_spend(&self,transaction:&Transaction)->impl Future<Output=bool>+Send;
++    /// Read-only reconciliation; absence grants no send authority.
++    fn contract_spend_in_mempool(&self,transaction:&Transaction)->impl Future<Output=Result<bool>>+Send;
++    fn confirmed_transaction(&self,txid:Txid,block:BlockHash,minimum:u64)
++        ->impl Future<Output=Result<ConfirmedTransaction>>+Send;
++    fn indexed_confirmed_transaction(&self,txid:Txid,minimum:u64)
++        ->impl Future<Output=Result<ConfirmedTransaction>>+Send;
++}
++
++impl RedeemChain for LitecoinRpc {
++    fn network(&self)->LtcNetwork {LitecoinRpc::network(self)}
++    fn verify_live_lock(&self,outpoint:OutPoint,script:&ScriptBuf,amount:Amount,
++        confirmations:u64,cancel_blocks:u32,safety_blocks:u32)->impl Future<Output=Result<VerifiedLiveLock>>+Send {
++        LitecoinRpc::verify_live_lock(self,outpoint,script,amount,confirmations,cancel_blocks,safety_blocks)
++    }
++    fn preflight_contract_spend(&self,transaction:&Transaction)->impl Future<Output=Result<()>>+Send {
++        LitecoinRpc::preflight_contract_spend(self,transaction)
++    }
++    fn dispatch_contract_spend(&self,transaction:&Transaction)->impl Future<Output=bool>+Send {
++        LitecoinRpc::dispatch_contract_spend(self,transaction)
++    }
++    fn contract_spend_in_mempool(&self,transaction:&Transaction)->impl Future<Output=Result<bool>>+Send {
++        LitecoinRpc::contract_spend_in_mempool(self,transaction)
++    }
++    fn confirmed_transaction(&self,txid:Txid,block:BlockHash,minimum:u64)
++        ->impl Future<Output=Result<ConfirmedTransaction>>+Send {
++        LitecoinRpc::confirmed_transaction(self,txid,block,minimum)
++    }
++    fn indexed_confirmed_transaction(&self,txid:Txid,minimum:u64)
++        ->impl Future<Output=Result<ConfirmedTransaction>>+Send {
++        LitecoinRpc::indexed_confirmed_transaction(self,txid,minimum)
++    }
++}
++
++pub mod light_rules;
++pub mod light;
+diff --git a/swap-machine/src/litecoin_rpc/redeem_chain/light.rs b/swap-machine/src/litecoin_rpc/redeem_chain/light.rs
+new file mode 100644
+index 000000000..79d35c9e7
+--- /dev/null
++++ b/swap-machine/src/litecoin_rpc/redeem_chain/light.rs
+@@ -0,0 +1,312 @@
++//! Light-wallet `RedeemChain` for the XMZ seller (SELLER_LIGHT_REDEEM.md).
++//! Inclusion and depth are proven against headers this process validated.
++//! Unspentness, mempool state and witness bytes are server claims: every
++//! configured server must agree with each other and with the local tip, the
++//! tip must be recent, and any doubt fails closed. A server that lies can stall
++//! a trade; it cannot make the seller release before the cancel margin.
++use super::{RedeemChain,light_rules::{LightLockPolicy,ServerLockReport,light_live_lock}};
++use super::super::{VerifiedLiveLock,confirmed::ConfirmedTransaction};
++use crate::litecoin_light::{headers::HeaderSequence,tls::TlsEndpoint,
++    session::{ReadSession,history::ReportedPosition}};
++use anyhow::{Context,Result,bail,ensure};
++use bitcoin::{Amount,BlockHash,OutPoint,ScriptBuf,Transaction,Txid,absolute,relative,consensus::encode::serialize};
++use std::future::Future;
++use swap_core::litecoin_address::LtcNetwork;
++use tokio::{io::{AsyncRead,AsyncWrite},sync::Mutex};
++
++/// One independently operated Electrum server. Each call opens a new session.
++pub trait LightServer: Sync {
++    type Stream: AsyncRead+AsyncWrite+Unpin+Send;
++    fn connect(&self)->impl Future<Output=Result<ReadSession<Self::Stream>>>+Send;
++}
++impl LightServer for TlsEndpoint {
++    type Stream=tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
++    fn connect(&self)->impl Future<Output=Result<ReadSession<Self::Stream>>>+Send {TlsEndpoint::connect(self)}
++}
++
++/// Contract scripts receive one lock and are spent once, so short histories suffice.
++const CONTRACT_HISTORY:usize=16;
++/// Payout and refund addresses are fresh per trade; a little room for reuse.
++const OUTPUT_HISTORY:usize=64;
++/// Headers one call may download (about a year of Bitcoin blocks).
++const MAXIMUM_DOWNLOAD:u32=60_000;
++/// Smallest output any supported chain relays as standard.
++const DUST:Amount=Amount::from_sat(546);
++
++pub struct LightRedeemChain<S> {
++    network:LtcNetwork,
++    servers:Vec<S>,
++    chain:Mutex<HeaderSequence>,
++    policy:LightLockPolicy,
++    clock:fn()->Result<u64>,
++}
++
++/// What every server reported about one contract output, with the lock proven.
++struct ContractObservation {
++    height:u32,
++    block:BlockHash,
++    outputs:Vec<(OutPoint,Amount)>,
++    reports:Vec<ServerLockReport>,
++}
++
++pub fn system_clock()->Result<u64> {
++    Ok(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())
++}
++
++impl<S:LightServer> LightRedeemChain<S> {
++    /// `chain` is the caller's validated header cache (from a checkpoint or
++    /// genesis). It is extended in memory; callers persist it separately.
++    pub fn new(network:LtcNetwork,servers:Vec<S>,chain:HeaderSequence,policy:LightLockPolicy,
++        clock:fn()->Result<u64>)->Result<Self> {
++        ensure!(chain.network()==network,"light redeem chain is for another network");
++        ensure!(policy.minimum_servers>=2 && servers.len()>=policy.minimum_servers,
++            "light redemption needs at least two independent servers");
++        Ok(Self {network,servers,chain:Mutex::new(chain),policy,clock})
++    }
++
++    pub async fn height(&self)->u32 {self.chain.lock().await.height()}
++
++    /// Extend the local chain with every server's headers. The heaviest valid
++    /// branch wins; servers that report a lighter branch are caught later by the
++    /// tip agreement check, never adopted.
++    async fn synchronize(&self,chain:&mut HeaderSequence)->Result<()> {
++        let now=(self.clock)()?;
++        for server in &self.servers {
++            let tip=server.connect().await?.reported_tip().await?;
++            let mut session=server.connect().await?;
++            let mut candidate=session.begin_sync(chain,tip).await?;
++            ensure!(candidate.target_height().saturating_sub(candidate.height())<=MAXIMUM_DOWNLOAD,
++                "light chain is too far behind; synchronise the wallet first");
++            while !candidate.complete() {candidate.advance(&mut session,2016,now).await?;}
++            candidate.finish(chain)?;
++        }
++        Ok(())
++    }
++
++    fn fresh_tip(&self,chain:&HeaderSequence)->Result<()> {
++        let tip=chain.header(chain.height()).context("light chain has no tip")?;
++        ensure!(u64::from(tip.time).saturating_add(self.policy.maximum_tip_age)>=(self.clock)()?,
++            "best header is too old; newer blocks may be withheld");
++        Ok(())
++    }
++
++    /// Ask every server about one contract output, then prove the funding
++    /// transaction's inclusion. Reports carry each server's tip taken after
++    /// its answers, so a block found mid-query shows up as disagreement.
++    async fn observe_contract(&self,chain:&HeaderSequence,outpoint:OutPoint,script:&ScriptBuf)
++        ->Result<ContractObservation> {
++        let mut reports=Vec::with_capacity(self.servers.len());
++        let mut height=None;
++        for server in &self.servers {
++            let mut session=server.connect().await?;
++            let history=session.reported_history(script,CONTRACT_HISTORY).await?;
++            let unspent=session.reported_unspent(script,CONTRACT_HISTORY).await?;
++            // A cancel pays the lock's own script, so other history entries
++            // are spends only if one consumes this outpoint. Inputs are
++            // committed by the txid, which the session checks.
++            let mut untouched=true;
++            for entry in history.iter().filter(|entry|entry.txid()!=outpoint.txid) {
++                let other=session.reported_transaction(entry.txid()).await?;
++                if other.input.iter().any(|input|input.previous_output==outpoint) {untouched=false;break;}
++            }
++            drop(session);
++            let tip=server.connect().await?.reported_tip().await?;
++            let funded=history.iter().find(|entry|entry.txid()==outpoint.txid).and_then(|entry|match entry.position() {
++                ReportedPosition::Block(height)=>Some(height),_=>None});
++            let funded=funded.context("a server does not report the contract funding as confirmed")?;
++            ensure!(*height.get_or_insert(funded)==funded,"servers disagree on the contract funding block");
++            let listed=unspent.iter().any(|output|output.outpoint()==outpoint && output.height()==funded);
++            reports.push(ServerLockReport {tip_height:tip.height(),tip:tip.hash(),lock_unspent:untouched && listed});
++        }
++        let height=height.context("no servers configured")?;
++        ensure!(height<=chain.height(),"contract funding is above the validated chain");
++        let block=chain.header(height).context("contract funding block is outside the validated chain")?.block_hash();
++        let included=self.servers[0].connect().await?.transaction_on(chain,height,outpoint.txid).await?;
++        let outputs=included.outputs_to(script).collect();
++        Ok(ContractObservation {height,block,outputs,reports})
++    }
++
++    /// Every server must return the same bytes: a txid commits to everything
++    /// except the witness, and callers recover keys from witnesses.
++    async fn agreed_transaction(&self,txid:Txid)->Result<Transaction> {
++        let mut agreed:Option<Transaction>=None;
++        for server in &self.servers {
++            let transaction=server.connect().await?.reported_transaction(txid).await?;
++            match &agreed {
++                Some(first)=>ensure!(serialize(first)==serialize(&transaction),"servers return different transaction bytes"),
++                None=>agreed=Some(transaction),
++            }
++        }
++        agreed.context("no servers configured")
++    }
++
++    /// Confirmed height of a transaction, found through its first output's
++    /// script history on every server, then proven against local headers.
++    async fn confirmed_location(&self,chain:&HeaderSequence,transaction:&Transaction)->Result<u32> {
++        let txid=transaction.compute_txid();
++        let script=&transaction.output.first().context("transaction has no outputs")?.script_pubkey;
++        let mut height=None;
++        for server in &self.servers {
++            let history=server.connect().await?.reported_history(script,OUTPUT_HISTORY).await?;
++            let found=history.iter().find(|entry|entry.txid()==txid).and_then(|entry|match entry.position() {
++                ReportedPosition::Block(height)=>Some(height),_=>None}).context("transaction is not confirmed")?;
++            ensure!(*height.get_or_insert(found)==found,"servers disagree on the transaction block");
++        }
++        let height=height.context("no servers configured")?;
++        let included=self.servers[0].connect().await?.transaction_on(chain,height,txid).await?;
++        ensure!(included.txid()==txid,"proof is for another transaction");
++        Ok(height)
++    }
++
++    async fn confirmed(&self,txid:Txid,block:Option<BlockHash>,minimum:u64)->Result<ConfirmedTransaction> {
++        ensure!(minimum>0,"zero transaction confirmation requirement");
++        let mut chain=self.chain.lock().await;
++        self.synchronize(&mut chain).await?;
++        let transaction=self.agreed_transaction(txid).await?;
++        let height=self.confirmed_location(&chain,&transaction).await?;
++        let found=chain.header(height).context("transaction block outside the validated chain")?.block_hash();
++        if let Some(block)=block {
++            ensure!(found==block,"transaction is not confirmed in the requested active block");
++        }
++        let confirmations=u64::from(chain.height()-height)+1;
++        ensure!(confirmations>=minimum,"transaction is not confirmed in the requested active block");
++        let tip=chain.header(chain.height()).context("light chain has no tip")?.block_hash();
++        Ok(ConfirmedTransaction::from_light(self.network,tip,found,confirmations,transaction))
++    }
++}
++
++/// The P2WSH script a completed contract spend draws from.
++fn spent_contract(transaction:&Transaction)->Result<(OutPoint,ScriptBuf)> {
++    ensure!(transaction.input.len()==1 && transaction.output.len()==1
++        && transaction.input[0].script_sig.is_empty(),"invalid completed redemption shape");
++    let input=&transaction.input[0];
++    let witness_script=ScriptBuf::from_bytes(input.witness.last().context("invalid completed redemption shape")?.to_vec());
++    Ok((input.previous_output,ScriptBuf::new_p2wsh(&witness_script.wscript_hash())))
++}
++
++impl<S:LightServer> RedeemChain for LightRedeemChain<S> {
++    fn network(&self)->LtcNetwork {self.network}
++
++    async fn verify_live_lock(&self,outpoint:OutPoint,script:&ScriptBuf,amount:Amount,
++        confirmations:u64,cancel_blocks:u32,safety_blocks:u32)->Result<VerifiedLiveLock> {
++        ensure!(!outpoint.is_null() && script.is_p2wsh() && amount>Amount::ZERO,"invalid lock expectation");
++        let mut chain=self.chain.lock().await;
++        self.synchronize(&mut chain).await?;
++        let observed=self.observe_contract(&chain,outpoint,script).await?;
++        light_live_lock(&chain,self.network,observed.height,observed.block,&observed.outputs,outpoint,script,amount,
++            confirmations,cancel_blocks,safety_blocks,&observed.reports,&self.policy,(self.clock)()?)
++    }
++
++    /// No mempool acceptance test exists over Electrum; check what a node would:
++    /// the input is the proven, unspent contract output, timelocks are met now,
++    /// and the fee is positive with a standard output. Broadcast refusal leaves
++    /// the retained bytes untouched for a later retry, as with a node.
++    async fn preflight_contract_spend(&self,transaction:&Transaction)->Result<()> {
++        let (outpoint,contract)=spent_contract(transaction)?;
++        let mut chain=self.chain.lock().await;
++        self.synchronize(&mut chain).await?;
++        self.fresh_tip(&chain)?;
++        let observed=self.observe_contract(&chain,outpoint,&contract).await?;
++        let tip=chain.header(chain.height()).context("light chain has no tip")?.block_hash();
++        ensure!(observed.reports.iter().all(|r|r.tip_height==chain.height() && r.tip==tip),
++            "servers disagree with the local tip; resynchronise and check again");
++        ensure!(observed.reports.iter().all(|r|r.lock_unspent),"contract output is spent or unknown to a server");
++        let mut matching=observed.outputs.iter().filter(|(o,_)|*o==outpoint);
++        let (_,value)=matching.next().context("spent output does not pay the contract")?;
++        ensure!(matching.next().is_none(),"duplicate contract outpoint");
++        let output=transaction.output[0].value;
++        ensure!(output>=DUST && output<*value,"contract spend pays dust or has no fee");
++        let depth=chain.height()-observed.height+1;
++        if let Some(lock)=transaction.input[0].sequence.to_relative_lock_time() {
++            ensure!(transaction.version.0>=2,"relative timelock needs version 2");
++            match lock {
++                relative::LockTime::Blocks(blocks)=>ensure!(depth>=u32::from(blocks.value()),
++                    "contract spend timelock is not yet satisfied"),
++                relative::LockTime::Time(_)=>bail!("time-based contract timelocks are not supported"),
++            }
++        }
++        match transaction.lock_time {
++            absolute::LockTime::Blocks(height)=>ensure!(height.to_consensus_u32()<=chain.height(),
++                "contract spend lock time is not yet satisfied"),
++            absolute::LockTime::Seconds(_)=>bail!("time-based contract lock times are not supported"),
++        }
++        Ok(())
++    }
++
++    /// Send to every server; any matching acknowledgement counts as sent.
++    async fn dispatch_contract_spend(&self,transaction:&Transaction)->bool {
++        let mut acknowledged=false;
++        for server in &self.servers {
++            if let Ok(session)=server.connect().await {
++                acknowledged|=session.broadcast_contract_spend(transaction).await.ok()==Some(transaction.compute_txid());
++            }
++        }
++        acknowledged
++    }
++
++    async fn contract_spend_in_mempool(&self,transaction:&Transaction)->Result<bool> {
++        let (_,contract)=spent_contract(transaction)?;
++        let txid=transaction.compute_txid();
++        let mut found=false;
++        for server in &self.servers {
++            let mut session=server.connect().await?;
++            let pending=session.reported_history(&contract,CONTRACT_HISTORY).await?.iter().any(|entry|entry.txid()==txid
++                && matches!(entry.position(),ReportedPosition::Mempool|ReportedPosition::MempoolWithUnconfirmedParents));
++            if pending {
++                let reported=session.reported_transaction(txid).await?;
++                ensure!(serialize(&reported)==serialize(transaction),"mempool recovery differs from retained signed bytes");
++                found=true;
++            }
++        }
++        Ok(found)
++    }
++
++    async fn confirmed_transaction(&self,txid:Txid,block:BlockHash,minimum:u64)->Result<ConfirmedTransaction> {
++        self.confirmed(txid,Some(block),minimum).await
++    }
++
++    async fn indexed_confirmed_transaction(&self,txid:Txid,minimum:u64)->Result<ConfirmedTransaction> {
++        self.confirmed(txid,None,minimum).await
++    }
++}
++
++/// The seller's chain access, chosen per trade: its own node, or light servers.
++pub enum SellerChain {
++    Node(super::super::LitecoinRpc),
++    Light(LightRedeemChain<TlsEndpoint>),
++}
++impl RedeemChain for SellerChain {
++    fn network(&self)->LtcNetwork {
++        match self {Self::Node(chain)=>RedeemChain::network(chain),Self::Light(chain)=>chain.network}
++    }
++    async fn verify_live_lock(&self,outpoint:OutPoint,script:&ScriptBuf,amount:Amount,
++        confirmations:u64,cancel_blocks:u32,safety_blocks:u32)->Result<VerifiedLiveLock> {
++        match self {
++            Self::Node(chain)=>chain.verify_live_lock(outpoint,script,amount,confirmations,cancel_blocks,safety_blocks).await,
++            Self::Light(chain)=>chain.verify_live_lock(outpoint,script,amount,confirmations,cancel_blocks,safety_blocks).await,
++        }
++    }
++    async fn preflight_contract_spend(&self,transaction:&Transaction)->Result<()> {
++        match self {Self::Node(chain)=>chain.preflight_contract_spend(transaction).await,
++            Self::Light(chain)=>chain.preflight_contract_spend(transaction).await}
++    }
++    async fn dispatch_contract_spend(&self,transaction:&Transaction)->bool {
++        match self {Self::Node(chain)=>chain.dispatch_contract_spend(transaction).await,
++            Self::Light(chain)=>chain.dispatch_contract_spend(transaction).await}
++    }
++    async fn contract_spend_in_mempool(&self,transaction:&Transaction)->Result<bool> {
++        match self {Self::Node(chain)=>chain.contract_spend_in_mempool(transaction).await,
++            Self::Light(chain)=>chain.contract_spend_in_mempool(transaction).await}
++    }
++    async fn confirmed_transaction(&self,txid:Txid,block:BlockHash,minimum:u64)->Result<ConfirmedTransaction> {
++        match self {Self::Node(chain)=>chain.confirmed_transaction(txid,block,minimum).await,
++            Self::Light(chain)=>chain.confirmed_transaction(txid,block,minimum).await}
++    }
++    async fn indexed_confirmed_transaction(&self,txid:Txid,minimum:u64)->Result<ConfirmedTransaction> {
++        match self {Self::Node(chain)=>chain.indexed_confirmed_transaction(txid,minimum).await,
++            Self::Light(chain)=>chain.indexed_confirmed_transaction(txid,minimum).await}
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_rpc/redeem_chain/light/tests.rs b/swap-machine/src/litecoin_rpc/redeem_chain/light/tests.rs
+new file mode 100644
+index 000000000..388967d7f
+--- /dev/null
++++ b/swap-machine/src/litecoin_rpc/redeem_chain/light/tests.rs
+@@ -0,0 +1,333 @@
++//! A semantic Electrum fake: real headers and merkle proofs over a small regtest
++//! chain, with history and unspent reports derived from the transactions.
++//! Faults model the servers SELLER_LIGHT_REDEEM.md worries about.
++use super::*;
++use crate::litecoin_light::network::LightNetwork;
++use bitcoin::{Sequence,TxIn,TxOut,Witness,block::{Header,Version},consensus::encode::deserialize,
++    hashes::{Hash,sha256d},transaction};
++use serde_json::{Value,json};
++use std::{cell::Cell,sync::{Arc,Mutex as Shared}};
++use tokio::io::{AsyncBufReadExt,AsyncWriteExt,BufReader};
++
++const NETWORK:LtcNetwork=LtcNetwork::BitcoinRegtest;
++const LOCK:Amount=Amount::from_sat(200_000);
++
++thread_local!(static NOW:Cell<u64>=const {Cell::new(0)});
++fn clock()->Result<u64> {Ok(NOW.with(Cell::get))}
++
++struct World {headers:Vec<Header>,blocks:Vec<Vec<Transaction>>,mempool:Vec<Transaction>}
++impl World {
++    fn new()->Self {
++        let genesis=HeaderSequence::from_genesis(NETWORK).unwrap().header(0).unwrap();
++        Self {headers:vec![genesis],blocks:vec![vec![]],mempool:vec![]}
++    }
++    fn height(&self)->u32 {(self.headers.len()-1) as u32}
++    /// Mine the mempool plus `extra` into one block and move the clock to it.
++    fn mine(&mut self,extra:Vec<Transaction>) {
++        let height=self.headers.len() as u32;
++        let coinbase=Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
++            input:vec![TxIn {script_sig:ScriptBuf::from_bytes([&height.to_le_bytes()[..],&[0;8]].concat()),..TxIn::default()}],
++            output:vec![TxOut {value:Amount::from_sat(50),script_pubkey:ScriptBuf::new_op_return([7;20])}]};
++        let mut txs=vec![coinbase];txs.append(&mut self.mempool);txs.extend(extra);
++        let previous=*self.headers.last().unwrap();
++        let root=merkle(&txs.iter().map(|t|t.compute_txid().to_byte_array()).collect::<Vec<_>>(),0).0;
++        let header=(0u32..).map(|nonce|Header {version:Version::from_consensus(0x2000_0000),prev_blockhash:previous.block_hash(),
++            merkle_root:bitcoin::TxMerkleNode::from_byte_array(root),time:previous.time+600,bits:previous.bits,nonce})
++            .find(|h|h.validate_pow(h.target()).is_ok()).unwrap();
++        self.headers.push(header);self.blocks.push(txs);
++        NOW.with(|now|now.set(u64::from(header.time)+60));
++    }
++    fn mine_empty(&mut self,count:u32) {for _ in 0..count {self.mine(vec![]);}}
++    fn located(&self,txid:Txid)->Option<(u32,usize,&Transaction)> {
++        self.blocks.iter().enumerate().find_map(|(h,txs)|txs.iter().position(|t|t.compute_txid()==txid)
++            .map(|i|(h as u32,i,&txs[i])))
++    }
++}
++
++/// Merkle root of `leaves` and the branch for `index`.
++fn merkle(leaves:&[[u8;32]],mut index:usize)->([u8;32],Vec<[u8;32]>) {
++    let mut level=leaves.to_vec();let mut branch=vec![];
++    while level.len()>1 {
++        if level.len()%2==1 {level.push(*level.last().unwrap());}
++        branch.push(level[index^1]);
++        level=level.chunks(2).map(|pair|sha256d::Hash::hash(&[pair[0],pair[1]].concat()).to_byte_array()).collect();
++        index/=2;
++    }
++    (level[0],branch)
++}
++
++#[derive(Clone,Copy,Default)]
++struct Faults {
++    /// Serve a chain this many blocks short of the real tip.
++    withhold:u32,
++    /// Omit spends: history drops spending transactions, spent outputs stay listed.
++    hide_spends:bool,
++    /// Return transactions with an altered witness.
++    tamper_witness:bool,
++}
++struct FakeServer {world:Arc<Shared<World>>,faults:Faults}
++
++fn hex(bytes:&[u8])->String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
++fn raw(bytes:&str)->Vec<u8> {(0..bytes.len()).step_by(2).map(|i|u8::from_str_radix(&bytes[i..i+2],16).unwrap()).collect()}
++
++impl FakeServer {
++    fn answer(&self,method:&str,params:&Value)->Value {
++        let mut world=self.world.lock().unwrap();
++        let visible=world.height()-self.faults.withhold;
++        let hidden:Vec<Transaction>=world.blocks[visible as usize+1..].iter().flat_map(|b|b[1..].to_vec()).collect();
++        let pool:Vec<Transaction>=hidden.into_iter().chain(world.mempool.iter().cloned()).collect();
++        let confirmed=|world:&World|world.blocks[..=visible as usize].iter().enumerate()
++            .flat_map(|(h,b)|b.iter().map(move |t|(h as u32,t.clone()))).collect::<Vec<_>>();
++        let header=|h:u64|json!(hex(&serialize(&world.headers[h as usize])));
++        let txid=|v:&Value|v.as_str().unwrap().parse::<Txid>().unwrap();
++        match method {
++            "server.version"=>json!(["fake","1.4"]),
++            "server.features"=>json!({"genesis_hash":LightNetwork::from(NETWORK).genesis(),"hash_function":"sha256"}),
++            "blockchain.headers.subscribe"=>json!({"height":visible,"hex":header(u64::from(visible))}),
++            "blockchain.block.header"=>header(params[0].as_u64().unwrap()),
++            "blockchain.block.headers"=>{
++                let start=params[0].as_u64().unwrap() as u32;
++                let end=(start+params[1].as_u64().unwrap() as u32).min(visible+1);
++                let hex=(start..end).map(|h|hex(&serialize(&world.headers[h as usize]))).collect::<String>();
++                json!({"count":end.saturating_sub(start),"hex":hex,"max":2016})
++            }
++            "blockchain.transaction.get"=>{
++                let id=txid(&params[0]);
++                let mut tx=world.located(id).map(|(_,_,t)|t.clone())
++                    .or_else(|| world.mempool.iter().find(|t|t.compute_txid()==id).cloned()).unwrap();
++                if self.faults.tamper_witness && !tx.input[0].witness.is_empty() {
++                    let mut items:Vec<Vec<u8>>=tx.input[0].witness.iter().map(<[u8]>::to_vec).collect();
++                    items[0][0]^=1;tx.input[0].witness=Witness::from_slice(&items);
++                }
++                json!(hex(&serialize(&tx)))
++            }
++            "blockchain.transaction.get_merkle"=>{
++                let (height,index,_)=world.located(txid(&params[0])).unwrap();
++                let leaves:Vec<_>=world.blocks[height as usize].iter().map(|t|t.compute_txid().to_byte_array()).collect();
++                let branch=merkle(&leaves,index).1.into_iter().map(|h|Txid::from_byte_array(h).to_string()).collect::<Vec<_>>();
++                json!({"block_height":height,"merkle":branch,"pos":index})
++            }
++            "blockchain.scripthash.get_history"|"blockchain.scripthash.listunspent"=>{
++                let wanted=params[0].as_str().unwrap();
++                let all:Vec<(u32,Transaction)>=confirmed(&world).into_iter().chain(pool.iter().map(|t|(0,t.clone()))).collect();
++                let pays=|t:&Transaction|t.output.iter().any(|o|crate::litecoin_light::script_hash(&o.script_pubkey)==wanted);
++                let spends=|t:&Transaction|t.input.iter().any(|i|all.iter().any(|(_,p)|p.compute_txid()==i.previous_output.txid
++                    && p.output.get(i.previous_output.vout as usize).is_some_and(|o|crate::litecoin_light::script_hash(&o.script_pubkey)==wanted)));
++                if method.ends_with("get_history") {
++                    json!(all.iter().filter(|(_,t)|pays(t) || (!self.faults.hide_spends && spends(t)))
++                        .map(|(h,t)|json!({"tx_hash":t.compute_txid().to_string(),"height":h})).collect::<Vec<_>>())
++                } else {
++                    json!(all.iter().flat_map(|(h,t)|t.output.iter().enumerate()
++                        .filter(|(_,o)|crate::litecoin_light::script_hash(&o.script_pubkey)==wanted)
++                        .map(move |(vout,o)|(*h,OutPoint {txid:t.compute_txid(),vout:vout as u32},o.value)))
++                        .filter(|(_,outpoint,_)|self.faults.hide_spends
++                            || !all.iter().any(|(_,t)|t.input.iter().any(|i|i.previous_output==*outpoint)))
++                        .map(|(h,outpoint,value)|json!({"tx_hash":outpoint.txid.to_string(),"tx_pos":outpoint.vout,"height":h,"value":value.to_sat()}))
++                        .collect::<Vec<_>>())
++                }
++            }
++            "blockchain.transaction.broadcast"=>{
++                let tx:Transaction=deserialize(&raw(params[0].as_str().unwrap())).unwrap();
++                let id=tx.compute_txid();
++                if world.located(id).is_none() && !world.mempool.iter().any(|t|t.compute_txid()==id) {world.mempool.push(tx);}
++                json!(id.to_string())
++            }
++            other=>panic!("unexpected Electrum method {other}"),
++        }
++    }
++}
++
++impl LightServer for Arc<FakeServer> {
++    type Stream=tokio::io::DuplexStream;
++    async fn connect(&self)->Result<ReadSession<Self::Stream>> {
++        let (client,stream)=tokio::io::duplex(1<<20);
++        let server=self.clone();
++        tokio::spawn(async move {
++            let mut stream=BufReader::new(stream);
++            let mut line=String::new();
++            while stream.read_line(&mut line).await.unwrap_or(0)>0 {
++                let request:Value=serde_json::from_str(&line).unwrap();line.clear();
++                let result=server.answer(request["method"].as_str().unwrap(),&request["params"]);
++                let mut reply=serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"result":result})).unwrap();
++                reply.push(b'\n');
++                if stream.get_mut().write_all(&reply).await.is_err() {return;}
++            }
++        });
++        ReadSession::negotiate(client,NETWORK).await
++    }
++}
++
++struct Trade {
++    world:Arc<Shared<World>>,
++    lock:OutPoint,
++    contract:ScriptBuf,
++    redeem:Transaction,
++    /// Spends the lock after a three-block relative timelock.
++    cancel:Transaction,
++}
++fn spend(lock:OutPoint,sequence:Sequence,witness_script:&ScriptBuf,payout:u8)->Transaction {
++    Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:lock,sequence,witness:Witness::from_slice(&[vec![payout;72],witness_script.to_bytes()]),
++            ..TxIn::default()}],
++        output:vec![TxOut {value:Amount::from_sat(199_000),script_pubkey:ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([payout;32]))}]}
++}
++/// Ten blocks, the lock at height 11, then `after` more blocks.
++fn trade(after:u32)->Trade {
++    let mut world=World::new();
++    world.mine_empty(10);
++    let witness_script=ScriptBuf::from_bytes(vec![0x51]);
++    let contract=ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
++    let funding=Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},..TxIn::default()}],
++        output:vec![TxOut {value:LOCK,script_pubkey:contract.clone()}]};
++    let lock=OutPoint {txid:funding.compute_txid(),vout:0};
++    world.mine(vec![funding]);
++    world.mine_empty(after);
++    Trade {redeem:spend(lock,Sequence::MAX,&witness_script,1),cancel:spend(lock,Sequence::from_height(3),&witness_script,2),
++        world:Arc::new(Shared::new(world)),lock,contract}
++}
++fn policy()->LightLockPolicy {LightLockPolicy {minimum_servers:2,maximum_tip_age:5400}}
++impl Trade {
++    fn chain(&self,faults:[Faults;2])->LightRedeemChain<Arc<FakeServer>> {
++        let servers=faults.map(|faults|Arc::new(FakeServer {world:self.world.clone(),faults})).to_vec();
++        LightRedeemChain::new(NETWORK,servers,HeaderSequence::from_genesis(NETWORK).unwrap(),policy(),clock).unwrap()
++    }
++    async fn verify(&self,chain:&LightRedeemChain<Arc<FakeServer>>)->Result<VerifiedLiveLock> {
++        chain.verify_live_lock(self.lock,&self.contract,LOCK,1,36,4).await
++    }
++}
++/// The refusal message; panics if the call was accepted.
++fn refusal<T>(result:Result<T>)->String {
++    match result {Ok(_)=>panic!("accepted"),Err(error)=>format!("{error:#}")}
++}
++const HONEST:[Faults;2]=[Faults {withhold:0,hide_spends:false,tamper_witness:false};2];
++
++#[tokio::test]
++async fn honest_servers_carry_a_redemption_from_lock_check_to_confirmation()->Result<()> {
++    let trade=trade(2);
++    let chain=trade.chain(HONEST);
++    let live=trade.verify(&chain).await?;
++    assert_eq!(live.observation().confirmations,3);
++    assert_eq!(chain.height().await,13);
++
++    chain.preflight_contract_spend(&trade.redeem).await?;
++    assert!(!chain.contract_spend_in_mempool(&trade.redeem).await?);
++    assert!(chain.dispatch_contract_spend(&trade.redeem).await);
++    assert!(chain.contract_spend_in_mempool(&trade.redeem).await?);
++    assert!(trade.verify(&chain).await.is_err(),"a pending spend must end the lock check");
++    assert!(chain.preflight_contract_spend(&trade.redeem).await.is_err(),"already sent");
++
++    trade.world.lock().unwrap().mine(vec![]);
++    let block=trade.world.lock().unwrap().headers[14].block_hash();
++    let txid=trade.redeem.compute_txid();
++    assert!(!chain.contract_spend_in_mempool(&trade.redeem).await?);
++    let confirmed=chain.confirmed_transaction(txid,block,1).await?;
++    assert_eq!((confirmed.block(),confirmed.confirmations(),confirmed.network()),(block,1,NETWORK));
++    assert_eq!(serialize(confirmed.transaction()),serialize(&trade.redeem));
++    assert!(chain.confirmed_transaction(txid,block,2).await.is_err(),"too shallow");
++    let earlier=trade.world.lock().unwrap().headers[13].block_hash();
++    assert!(chain.confirmed_transaction(txid,earlier,1).await.is_err(),"wrong block");
++    trade.world.lock().unwrap().mine_empty(2);
++    assert_eq!(chain.indexed_confirmed_transaction(txid,3).await?.confirmations(),3);
++    Ok(())
++}
++
++#[tokio::test]
++async fn one_honest_server_exposes_a_spend_another_hides()->Result<()> {
++    let trade=trade(4);
++    let hiding=Faults {hide_spends:true,..Faults::default()};
++    trade.world.lock().unwrap().mempool.push(trade.cancel.clone());
++    assert!(trade.verify(&trade.chain([hiding,Faults::default()])).await.is_err());
++    assert!(trade.verify(&trade.chain([Faults::default(),hiding])).await.is_err());
++    // Two colluding servers can hide a spend: the documented residual risk,
++    // bounded by releasing only before the cancel timelock.
++    assert!(trade.verify(&trade.chain([hiding,hiding])).await.is_ok());
++    Ok(())
++}
++
++#[tokio::test]
++async fn withheld_blocks_fail_closed()->Result<()> {
++    let trade=trade(20);
++    // Every server hides the last twelve blocks: two hours of Bitcoin time.
++    let stale=Faults {withhold:12,..Faults::default()};
++    let error=refusal(trade.verify(&trade.chain([stale,stale])).await);
++    assert!(error.contains("too old"),"{error}");
++    assert!(trade.chain([stale,stale]).preflight_contract_spend(&trade.redeem).await.is_err());
++    // One server one block behind: disagreement, not a silently shorter chain.
++    let lagging=Faults {withhold:1,..Faults::default()};
++    let error=refusal(trade.verify(&trade.chain([Faults::default(),lagging])).await);
++    assert!(error.contains("disagree"),"{error}");
++    assert!(trade.verify(&trade.chain(HONEST)).await.is_ok());
++    Ok(())
++}
++
++#[tokio::test]
++async fn timelocks_dust_and_unconfirmed_locks_are_refused_before_sending()->Result<()> {
++    let trade=trade(1);
++    let chain=trade.chain(HONEST);
++    // Lock depth 2: the three-block cancel path is not yet open.
++    assert!(refusal(chain.preflight_contract_spend(&trade.cancel).await).contains("timelock"));
++    trade.world.lock().unwrap().mine(vec![]);
++    chain.preflight_contract_spend(&trade.cancel).await?;
++
++    let mut dust=trade.redeem.clone();dust.output[0].value=Amount::from_sat(545);
++    assert!(chain.preflight_contract_spend(&dust).await.is_err());
++    let mut free=trade.redeem.clone();free.output[0].value=LOCK;
++    assert!(chain.preflight_contract_spend(&free).await.is_err());
++    let mut future=trade.redeem.clone();future.lock_time=absolute::LockTime::from_height(100).unwrap();
++    assert!(chain.preflight_contract_spend(&future).await.is_err());
++    let mut other=trade.redeem.clone();other.input[0].previous_output.vout=1;
++    assert!(chain.preflight_contract_spend(&other).await.is_err());
++
++    let pending=self::trade(0);
++    let funding=pending.world.lock().unwrap().blocks.pop().unwrap().remove(1);
++    {let mut world=pending.world.lock().unwrap();world.headers.pop();world.mempool.push(funding);}
++    assert!(pending.verify(&pending.chain(HONEST)).await.is_err(),"unconfirmed lock");
++    Ok(())
++}
++
++#[tokio::test]
++async fn transactions_must_be_byte_identical_on_every_server()->Result<()> {
++    let trade=trade(2);
++    trade.world.lock().unwrap().mine(vec![trade.redeem.clone()]);
++    let txid=trade.redeem.compute_txid();
++    let tampering=Faults {tamper_witness:true,..Faults::default()};
++    let error=refusal(trade.chain([Faults::default(),tampering]).indexed_confirmed_transaction(txid,1).await);
++    assert!(error.contains("different transaction bytes"),"{error}");
++    assert!(trade.chain(HONEST).indexed_confirmed_transaction(txid,1).await.is_ok());
++    Ok(())
++}
++
++#[test]
++fn needs_two_servers_on_the_same_network() {
++    let trade=trade(0);
++    let one=vec![Arc::new(FakeServer {world:trade.world.clone(),faults:Faults::default()})];
++    assert!(LightRedeemChain::new(NETWORK,one,HeaderSequence::from_genesis(NETWORK).unwrap(),policy(),clock).is_err());
++    let two=(0..2).map(|_|Arc::new(FakeServer {world:trade.world.clone(),faults:Faults::default()})).collect();
++    assert!(LightRedeemChain::new(LtcNetwork::BitcoinSignet,two,HeaderSequence::from_genesis(NETWORK).unwrap(),policy(),clock).is_err());
++}
++
++#[tokio::test]
++async fn a_cancel_paying_the_lock_script_leaves_its_output_spendable()->Result<()> {
++    // As in the swap, the cancel pays the lock's own 2-of-2 script, so that
++    // script's history holds both the lock and the cancel.
++    let trade=trade(3);
++    let witness_script=ScriptBuf::from_bytes(vec![0x51]);
++    let mut cancel=trade.cancel.clone();cancel.output[0].script_pubkey=trade.contract.clone();
++    trade.world.lock().unwrap().mine(vec![cancel.clone()]);
++    let chain=trade.chain(HONEST);
++    assert!(trade.verify(&chain).await.is_err(),"the lock is spent by the cancel");
++    let mut punish=spend(OutPoint {txid:cancel.compute_txid(),vout:0},Sequence::from_height(2),&witness_script,3);
++    punish.output[0].value=Amount::from_sat(198_000);
++    assert!(refusal(chain.preflight_contract_spend(&punish).await).contains("timelock"));
++    trade.world.lock().unwrap().mine(vec![]);
++    chain.preflight_contract_spend(&punish).await?;
++    // A real spend of the cancel output is still seen, by either server.
++    let refund=spend(OutPoint {txid:cancel.compute_txid(),vout:0},Sequence::MAX,&witness_script,4);
++    trade.world.lock().unwrap().mine(vec![refund]);
++    let error=refusal(chain.preflight_contract_spend(&punish).await);
++    assert!(error.contains("spent"),"{error}");
++    let hiding=Faults {hide_spends:true,..Faults::default()};
++    assert!(trade.chain([Faults::default(),hiding]).preflight_contract_spend(&punish).await.is_err());
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_rpc/redeem_chain/light_rules.rs b/swap-machine/src/litecoin_rpc/redeem_chain/light_rules.rs
+new file mode 100644
+index 000000000..2a5f2971e
+--- /dev/null
++++ b/swap-machine/src/litecoin_rpc/redeem_chain/light_rules.rs
+@@ -0,0 +1,110 @@
++//! Light-wallet rules for the XMZ seller's lock check (SELLER_LIGHT_REDEEM.md).
++//! Proven locally: the lock's inclusion and depth on validated headers.
++//! Not provable from headers: that the lock is unspent and that no newer
++//! headers are being withheld. Both are cross-checked across independent
++//! servers, and the best header must be recent; every doubt fails closed.
++use super::super::{ObservedOutput,VerifiedLiveLock,validate_live_lock};
++use crate::litecoin_light::headers::HeaderSequence;
++use anyhow::{Context,Result,ensure};
++use bitcoin::{Amount,BlockHash,OutPoint,ScriptBuf};
++use swap_core::litecoin_address::LtcNetwork;
++
++/// One server's report, taken while the caller's chain was at this tip.
++pub struct ServerLockReport { pub tip_height:u32, pub tip:BlockHash, pub lock_unspent:bool }
++
++pub struct LightLockPolicy {
++    /// Independently operated servers that must agree; at least two.
++    pub minimum_servers:usize,
++    /// Oldest acceptable best-header time, in seconds behind `now`.
++    pub maximum_tip_age:u64,
++}
++
++/// `lock_outputs` are the lock transaction's outputs paying `script`, taken
++/// from a transaction proven included at `lock_height`/`lock_block`.
++#[allow(clippy::too_many_arguments)]
++pub fn light_live_lock(chain:&HeaderSequence,network:LtcNetwork,lock_height:u32,lock_block:BlockHash,
++    lock_outputs:&[(OutPoint,Amount)],outpoint:OutPoint,script:&ScriptBuf,amount:Amount,confirmations:u64,
++    cancel_blocks:u32,safety_blocks:u32,reports:&[ServerLockReport],policy:&LightLockPolicy,now:u64)
++    ->Result<VerifiedLiveLock> {
++    ensure!(chain.network()==network,"light lock chain is for another network");
++    ensure!(!outpoint.is_null() && script.is_p2wsh() && amount>Amount::ZERO,"invalid lock expectation");
++    ensure!(policy.minimum_servers>=2 && (1..=3*3600).contains(&policy.maximum_tip_age),
++        "light lock policy needs two servers and a tip age of at most three hours");
++    let height=chain.height();
++    let tip=chain.header(height).context("light chain has no tip")?;
++    ensure!(u64::from(tip.time).saturating_add(policy.maximum_tip_age)>=now,
++        "best header is too old; newer blocks may be withheld");
++    ensure!(reports.len()>=policy.minimum_servers,"too few servers reported on the lock");
++    ensure!(reports.iter().all(|r|r.tip_height==height && r.tip==tip.block_hash()),
++        "servers disagree with the local tip; resynchronise and check again");
++    ensure!(reports.iter().all(|r|r.lock_unspent),"a server reports the lock as spent");
++    ensure!(chain.contains(lock_height,lock_block),"lock block is not on the validated chain");
++    let mut matching=lock_outputs.iter().filter(|(o,_)|*o==outpoint);
++    let (_,observed_amount)=matching.next().context("lock transaction does not pay the contract at this outpoint")?;
++    ensure!(matching.next().is_none(),"duplicate lock outpoint");
++    let observed=ObservedOutput {tip:tip.block_hash(),confirmations:u64::from(height-lock_height)+1,
++        amount:*observed_amount,script:script.clone()};
++    validate_live_lock(&observed,script,amount,confirmations,cancel_blocks,safety_blocks)?;
++    Ok(VerifiedLiveLock {network,outpoint,observed})
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bitcoin::{block::Header,consensus::serialize,hashes::Hash};
++
++    const NETWORK:LtcNetwork=LtcNetwork::BitcoinRegtest;
++    fn chain(length:u32)->Result<HeaderSequence> {
++        let mut chain=HeaderSequence::from_genesis(NETWORK)?;
++        while chain.height()<length {
++            let previous=chain.header(chain.height()).unwrap();
++            let header=(0u32..).map(|nonce|Header {version:bitcoin::block::Version::from_consensus(0x2000_0000),prev_blockhash:previous.block_hash(),
++                merkle_root:previous.merkle_root,time:previous.time+600,bits:previous.bits,nonce})
++                .find(|h|h.validate_pow(h.target()).is_ok()).unwrap();
++            chain.append(&serialize(&header),u64::from(header.time))?;
++        }
++        Ok(chain)
++    }
++
++    #[test]
++    fn light_lock_needs_proof_fresh_tip_and_agreeing_servers()->Result<()> {
++        let chain=chain(12)?;
++        let tip=chain.header(12).unwrap();let now=u64::from(tip.time)+60;
++        let script=ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([3;32]));
++        let outpoint=OutPoint {txid:bitcoin::Txid::from_byte_array([5;32]),vout:1};
++        let amount=Amount::from_sat(200_000);
++        let lock_block=chain.header(10).unwrap().block_hash();
++        let report=|unspent|ServerLockReport {tip_height:12,tip:tip.block_hash(),lock_unspent:unspent};
++        let policy=LightLockPolicy {minimum_servers:2,maximum_tip_age:5400};
++        let check=|height,block,outputs:&[(OutPoint,Amount)],reports:&[ServerLockReport],policy:&LightLockPolicy,now,conf,cancel|
++            light_live_lock(&chain,NETWORK,height,block,outputs,outpoint,&script,amount,conf,cancel,4,reports,policy,now);
++        let good=[(outpoint,amount)];
++
++        // Lock at height 10 on a 12-block chain: three confirmations.
++        let live=check(10,lock_block,&good,&[report(true),report(true)],&policy,now,1,36)?;
++        assert_eq!(live.observation().confirmations,3);
++        assert_eq!(live.outpoint(),outpoint);assert_eq!(live.network(),NETWORK);
++
++        let refused=[
++            ("one server",check(10,lock_block,&good,&[report(true)],&policy,now,1,36)),
++            ("one-server policy",check(10,lock_block,&good,&[report(true),report(true)],
++                &LightLockPolicy {minimum_servers:1,maximum_tip_age:5400},now,1,36)),
++            ("stale tip",check(10,lock_block,&good,&[report(true),report(true)],&policy,now+5400,1,36)),
++            ("unbounded tip age",check(10,lock_block,&good,&[report(true),report(true)],
++                &LightLockPolicy {minimum_servers:2,maximum_tip_age:u64::MAX},now,1,36)),
++            ("spent on one server",check(10,lock_block,&good,&[report(true),report(false)],&policy,now,1,36)),
++            ("server on another tip",check(10,lock_block,&good,&[report(true),
++                ServerLockReport {tip_height:13,tip:BlockHash::from_byte_array([9;32]),lock_unspent:true}],&policy,now,1,36)),
++            ("block off chain",check(10,BlockHash::from_byte_array([1;32]),&good,&[report(true),report(true)],&policy,now,1,36)),
++            ("wrong amount",check(10,lock_block,&[(outpoint,Amount::from_sat(199_999))],&[report(true),report(true)],&policy,now,1,36)),
++            ("other outpoint",check(10,lock_block,&[(OutPoint {vout:0,..outpoint},amount)],&[report(true),report(true)],&policy,now,1,36)),
++            ("duplicate outpoint",check(10,lock_block,&[(outpoint,amount),(outpoint,amount)],&[report(true),report(true)],&policy,now,1,36)),
++            ("shallow",check(10,lock_block,&good,&[report(true),report(true)],&policy,now,4,36)),
++            ("near cancellation",check(10,lock_block,&good,&[report(true),report(true)],&policy,now,1,7)),
++        ];
++        for (case,result) in refused {assert!(result.is_err(),"{case} was accepted");}
++        assert!(light_live_lock(&chain,LtcNetwork::BitcoinSignet,10,lock_block,&good,outpoint,&script,amount,1,36,4,
++            &[report(true),report(true)],&policy,now).is_err());
++        Ok(())
++    }
++}
+diff --git a/swap-machine/src/litecoin_rpc/reservation.rs b/swap-machine/src/litecoin_rpc/reservation.rs
+index 1ed50c547..1234f5d42 100644
+--- a/swap-machine/src/litecoin_rpc/reservation.rs
++++ b/swap-machine/src/litecoin_rpc/reservation.rs
+@@ -295,7 +295,7 @@ impl LitecoinRpc {
+     fn validate_intent(&self, intent: &Intent) -> Result<LockPreview> {
+         ensure!(intent.schema == "monzero-ltc-reservation-v1" && intent.genesis == self.network.genesis()
+             && intent.wallet == self.wallet && intent.anchor == self.anchor.to_string()
+-            && intent.amount > 0 && intent.amount <= 84_000_000 * 100_000_000
++            && intent.amount > 0 && intent.amount <= self.network.max_atoms()
+             && intent.maximum_fee > 0 && intent.maximum_fee < intent.amount,
+             "Litecoin reservation deployment or policy mismatch");
+         let contract = LtcSegwitAddress::parse(self.network, &intent.contract)?;

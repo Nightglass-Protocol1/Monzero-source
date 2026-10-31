@@ -1,0 +1,227 @@
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -421,6 +421,7 @@
+     mod import { include!("native-ltc-light/import.rs"); }
+     mod discovery { include!("native-ltc-light/discovery.rs"); }
+     mod import_recovery { include!("native-ltc-light/import_recovery.rs"); }
++    mod import_activation { include!("native-ltc-light/import_activation.rs"); }
+     fn output(response:&Value)->Result<()> {
+         let bytes=serde_json::to_vec(response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
+         std::io::stdout().write_all(&bytes)?;Ok(())
+@@ -428,6 +429,7 @@
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
++        if args[1]=="--wallet-import-activate-stdio-v1" {return import_activation::run(Path::new(&args[2]));}
+         if args[1]=="--wallet-import-recover-stdio-v1" {return import_recovery::run(Path::new(&args[2]));}
+         if args[1]=="--wallet-import-discover-stdio-v1" {return discovery::run(Path::new(&args[2]));}
+         if args[1]=="--wallet-import-preview-stdio-v1" {return import::run(Path::new(&args[2]),false);}
+diff --git a/swap-machine/src/bin/native-ltc-light/import_activation.rs b/swap-machine/src/bin/native-ltc-light/import_activation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/import_activation.rs
+@@ -0,0 +1,31 @@
++// Explicit activation, authenticated against the pending wallet and reviewed
++// recovery receipt. The active configuration is separate; no live market opens.
++use super::*;
++use swap_machine::litecoin_light::{vault::setup::configuration::activation::{activate,ActivationApproval},
++    session::wallet::recovery::retention::mnemonic::Destinations};
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct ActivationRequest {schema:String,request_id:uuid::Uuid,approved_config_digest:String,
++    approved_coverage:String,approved_recovery_digest:String,activation_approved:bool,
++    journal_directory:PathBuf,backup_directory:PathBuf,password:Password}
++pub(super) fn run(path:&Path)->Result<()> {
++    let mut input=Zeroizing::new(Vec::with_capacity(8193));std::io::stdin().take(8193).read_to_end(&mut input)?;
++    ensure!(!input.is_empty() && input.len()<=8192,"invalid wallet activation request size");
++    let request:ActivationRequest=serde_json::from_slice(&input)?;
++    let tag=["ltc","btc","bch","doge"].into_iter()
++        .find(|tag|request.schema==format!("monzero-{tag}-light-wallet-import-activate-request-v1"))
++        .context("invalid import activation schema")?;
++    ensure!(!request.request_id.is_nil() && request.activation_approved,"missing wallet activation approval");
++    let (_lease,config,configuration)=discovery::pending_config(path,tag,&request.approved_config_digest)?;
++    let setup=path.parent().context("missing wallet configuration parent")?;
++    ensure!(path.file_name()==Some(std::ffi::OsStr::new("litecoin-wallet.json")),"unexpected pending configuration name");
++    let coverage:sha256::Hash=request.approved_coverage.parse()?;
++    let recovery:sha256::Hash=request.approved_recovery_digest.parse()?;
++    ensure!(coverage.to_string()==request.approved_coverage && recovery.to_string()==request.approved_recovery_digest,
++        "noncanonical activation commitments");
++    let receipt=activate(setup,network_for(tag,&config.network)?,
++        &Destinations {journal:&request.journal_directory,backup:&request.backup_directory},request.password.0.as_bytes(),
++        &ActivationApproval {configuration,coverage,recovery,approved:true},now()?)?;
++    output(&json!({"schema":format!("monzero-{tag}-light-wallet-import-activate-response-v1"),
++        "requestId":request.request_id,"activation":receipt,"tradingEnabled":false}))
++}
+diff --git a/swap-machine/src/litecoin_light/vault/setup/configuration.rs b/swap-machine/src/litecoin_light/vault/setup/configuration.rs
+--- a/swap-machine/src/litecoin_light/vault/setup/configuration.rs
++++ b/swap-machine/src/litecoin_light/vault/setup/configuration.rs
+@@ -98,3 +98,6 @@
+     ensure!(journal.read(CONFIGURATION)?==bytes,"Litecoin configuration read-back mismatch");
+     Ok(ConfiguredWallet {wallet:created,path:setup.join(CONFIGURATION),digest:sha256::Hash::hash(&bytes)})
+ }
++
++/// Explicit activation of a recovered mnemonic wallet.
++pub mod activation;
+diff --git a/swap-machine/src/litecoin_light/vault/setup/configuration/activation.rs b/swap-machine/src/litecoin_light/vault/setup/configuration/activation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/setup/configuration/activation.rs
+@@ -0,0 +1,84 @@
++//! Explicit local-wallet activation. No market or active-trade authority.
++use super::*;
++use crate::litecoin_light::{state::ChainState,account::descriptor::PublicAccountDescriptor,
++    session::wallet::recovery::retention::mnemonic::{Approval,Destinations,resume_mnemonic_recovery}};
++const INTENT:&str="litecoin-wallet-activation.json";
++const ACTIVE:&str="litecoin-wallet-active.json";
++const COMPLETE:&str="litecoin-wallet-activated.json";
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct Pending {schema:String,network:String,cache_directory:PathBuf,maximum_height:u32,
++    endpoint:Option<Endpoint>,wallet:Wallet,recovery:Value}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Endpoint {host:String,port:u16}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct Wallet {account:PublicAccountDescriptor,address_book_directory:PathBuf,spend_directory:PathBuf,vault:Vault}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct Vault {directory:PathBuf,wallet_id:Uuid,seed_encoding:String}
++pub struct ActivationApproval {
++    pub configuration:sha256::Hash,
++    pub coverage:sha256::Hash,
++    pub recovery:sha256::Hash,
++    pub approved:bool,
++}
++/// Reauthenticate the exact recovered wallet and backup before publishing a
++/// separate operational configuration. No original record is overwritten.
++/// Consumers must require the completion receipt before automatically opening
++/// this configuration after restart. Later address changes require newer backup
++/// policy; an old activation receipt is not fresh backup verification.
++pub fn activate(setup:&Path,network:LightNetwork,destinations:&Destinations<'_>,password:&[u8],
++    approval:&ActivationApproval,now:u64)->Result<Value> {
++    activate_with(setup,network,destinations,password,approval,now,|_|Ok(()))
++}
++#[derive(Clone,Copy,PartialEq)]
++enum Stage {Intent,Configuration,Complete}
++fn activate_with(setup:&Path,network:LightNetwork,destinations:&Destinations<'_>,password:&[u8],
++    approval:&ActivationApproval,now:u64,checkpoint:impl Fn(Stage)->Result<()>)->Result<Value> {
++    ensure!(approval.approved,"missing explicit wallet activation approval");
++    let journal=Journal::open(setup)?;
++    let raw=journal.read(CONFIGURATION)?;
++    ensure!(raw.len()<=4096 && sha256::Hash::hash(&raw)==approval.configuration,"activation configuration differs from approval");
++    let pending:Pending=serde_json::from_slice(&raw)?;
++    let mut value:Value=serde_json::from_slice(&raw)?;
++    ensure!(serde_json::to_vec(&value)?==raw && pending.schema==format!("monzero-private-{}-light-recovery-pending-v1",network.tag())
++        && pending.network==network.name() && pending.maximum_height<=10_000_000
++        && pending.recovery==json!({"status":"discovery-required","addressRecordsRestored":false,"activeSwapRecovery":false})
++        && pending.wallet.vault.seed_encoding==MnemonicMaterial::ENCODING && !pending.wallet.vault.wallet_id.is_nil(),
++        "invalid pending wallet activation context");
++    if let Some(endpoint)=&pending.endpoint {TlsEndpoint::new(endpoint.host.clone(),endpoint.port,network)?;}
++    // Read the separately approved receipt before any recovery reconciliation.
++    let expected={let recovery=Journal::open(destinations.journal)?;recovery.read("light-recovery-backup-complete.json")?};
++    ensure!(sha256::Hash::hash(&expected)==approval.recovery,"recovery receipt differs from activation approval");
++    let vault=MnemonicVault::open(&pending.wallet.vault.directory,network,pending.wallet.vault.wallet_id)?;
++    drop(vault.unlock_for_account(password,&pending.wallet.account)?);
++    let mut book=AddressBook::open(&pending.wallet.address_book_directory,
++        PublicAccount::from_descriptor(&pending.wallet.account,network)?)?;
++    let state=ChainState::open(&pending.cache_directory,network,pending.maximum_height,now)?;
++    let _spends=Journal::open(&pending.wallet.spend_directory)?;
++    let recovery=resume_mnemonic_recovery(destinations,state.chain()?,&mut book,&vault,password,
++        &Approval {coverage:approval.coverage,configuration:approval.configuration})?;
++    ensure!(serde_json::to_vec(&recovery)?==expected,"recovery changed before activation");
++    value.as_object_mut().context("invalid pending wallet object")?.remove("recovery");
++    value["schema"]=json!(format!("monzero-private-{}-light-v1",network.tag()));
++    let active=serde_json::to_vec(&value)?;
++    let intent=json!({"schema":"monzero-light-wallet-activation-intent-v1",
++        "pendingConfigurationDigest":approval.configuration,"coverageCommitment":approval.coverage,
++        "recoveryDigest":approval.recovery,"recoveryDirectory":destinations.journal,
++        "backupDigest":recovery["backupDigest"],"backupDirectory":destinations.backup,
++        "configurationFile":setup.join(ACTIVE),"configurationDigest":sha256::Hash::hash(&active),
++        "walletId":pending.wallet.vault.wallet_id,"network":network.name(),"coin":network.tag(),
++        "walletActivated":true,"tradingEnabled":false,"historyCompleteness":"unproven","activeSwapRecovery":false});
++    let mut completed=intent.clone();completed["schema"]=json!("monzero-light-wallet-activation-complete-v1");
++    let intent=serde_json::to_vec(&intent)?;let completed_bytes=serde_json::to_vec(&completed)?;
++    journal.compatible(INTENT,&intent)?;journal.compatible(ACTIVE,&active)?;journal.compatible(COMPLETE,&completed_bytes)?;
++    journal.retain(INTENT,&intent)?;checkpoint(Stage::Intent)?;
++    journal.retain(ACTIVE,&active)?;checkpoint(Stage::Configuration)?;
++    journal.retain(COMPLETE,&completed_bytes)?;checkpoint(Stage::Complete)?;
++    ensure!(journal.read(ACTIVE)?==active && journal.read(COMPLETE)?==completed_bytes,"activation read-back mismatch");
++    Ok(completed)
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/setup/configuration/activation/tests.rs b/swap-machine/src/litecoin_light/vault/setup/configuration/activation/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/setup/configuration/activation/tests.rs
+@@ -0,0 +1,68 @@
++use super::*;
++use crate::litecoin_light::{network::{BtcNetwork,BchNetwork,DogeNetwork},
++    session::{ReadSession,wallet::RefreshLimits,tests::{reply,server}}};
++use std::{fs,os::unix::fs::PermissionsExt};
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().join(format!("wallet-activation-{}",Uuid::new_v4()));
++    fs::create_dir(&path)?;fs::set_permissions(&path,fs::Permissions::from_mode(0o700))?;Ok(Self(path.canonicalize()?))}}
++impl Drop for Directory {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
++const PASSWORD:&[u8]=b"disposable explicit activation password";
++#[tokio::test]
++async fn activation_reauthenticates_preserves_pending_and_resumes_publication()->Result<()> {
++    for (network,stop) in [(LightNetwork::Litecoin(LtcNetwork::Regtest),Some(Stage::Intent)),
++        (LightNetwork::Bitcoin(BtcNetwork::Regtest),Some(Stage::Configuration)),
++        (LightNetwork::BitcoinCash(BchNetwork::Regtest),Some(Stage::Complete)),
++        (LightNetwork::Dogecoin(DogeNetwork::Regtest),None)] {
++        let setup=Directory::new()?;let keys=Directory::new()?;let addresses=Directory::new()?;
++        let initial=Directory::new()?;let cache=Directory::new()?;let spends=Directory::new()?;
++        let recovered=Directory::new()?;let recovery_journal=Directory::new()?;
++        let paths=SetupDirectories {vault:keys.0.clone(),addresses:addresses.0.clone(),backup:initial.0.clone()};
++        let options=ConfigurationOptions {cache:cache.0.clone(),spends:spends.0.clone(),maximum_height:1000,endpoint:None};
++        let material=MnemonicMaterial::from_entropy(&[61;32])?;let wallet=Uuid::new_v4();
++        let configured=initialize_configured_imported_mnemonic(&setup.0,&paths,network,wallet,0,PASSWORD,&options,&material,"")?;
++        let pending=fs::read(configured.configuration_path())?;
++        let vault=MnemonicVault::open(&keys.0,network,wallet)?;
++        let mut book=AddressBook::open(&addresses.0,material.public_account(network,0,"")?)?;
++        let identity=Uuid::new_v4();book.reserve(identity,Branch::Receive)?;
++        let mut responses=vec![reply(1,json!(["fixture","1.4"])),reply(2,json!({"genesis_hash":network.genesis(),
++            "hash_function":"sha256","server_version":"fixture","protocol_min":"1.4","protocol_max":"1.4.3","hosts":{}}))];
++        for id in 3..10 {responses.push(reply(id,json!([])));}
++        let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,network).await?;
++        let state=ChainState::open(&cache.0,network,1000,2_000_000_000)?;
++        let observed=session.refresh_wallet(state.chain()?,&material.public_account(network,0,"")?,[2,1],
++            &RefreshLimits {gap:2,addresses_per_branch:10,history_entries_per_branch:10}).await?;
++        drop(session);task.await?;
++        let coverage=observed.review_recovery_coverage(state.chain()?,&book,[2,1])?;
++        let destinations=Destinations {journal:&recovery_journal.0,backup:&recovered.0};
++        let receipt=coverage.retain_mnemonic_recovery(&destinations,state.chain()?,&mut book,&vault,PASSWORD,
++            &Approval {coverage:coverage.commitment(),configuration:configured.configuration_digest()})?;
++        let approval=ActivationApproval {configuration:configured.configuration_digest(),coverage:coverage.commitment(),
++            recovery:sha256::Hash::hash(&serde_json::to_vec(&receipt)?),approved:true};
++        drop(state);drop(book);drop(vault);
++        let before=fs::read(addresses.0.join("litecoin-address-book.json"))?;
++        assert!(activate(&setup.0,network,&destinations,PASSWORD,&ActivationApproval {approved:false,..approval},2_000_000_000).is_err());
++        assert!(activate(&setup.0,network,&destinations,PASSWORD,&ActivationApproval {recovery:sha256::Hash::hash(b"wrong"),..approval},2_000_000_000).is_err());
++        assert!(activate(&setup.0,network,&destinations,b"wrong password",&approval,2_000_000_000).is_err());
++        assert!(!setup.0.join(INTENT).exists());assert!(!setup.0.join(ACTIVE).exists());assert!(!setup.0.join(COMPLETE).exists());
++        if let Some(stop)=stop {
++            assert!(activate_with(&setup.0,network,&destinations,PASSWORD,&approval,2_000_000_000,
++                |stage|{ensure!(stage!=stop,"injected activation interruption");Ok(())}).is_err());
++        }
++        let activated=activate(&setup.0,network,&destinations,PASSWORD,&approval,2_000_000_000)?;
++        assert_eq!(activated["walletActivated"],true);assert_eq!(activated["tradingEnabled"],false);
++        assert_eq!(activated["activeSwapRecovery"],false);assert_eq!(activated["historyCompleteness"],"unproven");
++        let active=fs::read(setup.0.join(ACTIVE))?;let saved=fs::read(setup.0.join(COMPLETE))?;
++        let mut expected:Value=serde_json::from_slice(&pending)?;expected.as_object_mut().unwrap().remove("recovery");
++        expected["schema"]=json!(format!("monzero-private-{}-light-v1",network.tag()));
++        assert_eq!(active,serde_json::to_vec(&expected)?);
++        assert_eq!(activate(&setup.0,network,&destinations,PASSWORD,&approval,2_000_000_000)?,activated);
++        assert_eq!(fs::read(setup.0.join(ACTIVE))?,active);assert_eq!(fs::read(setup.0.join(COMPLETE))?,saved);
++        assert_eq!(fs::read(configured.configuration_path())?,pending);
++        assert_eq!(fs::read(addresses.0.join("litecoin-address-book.json"))?,before);
++        // A historical activation cannot turn a damaged backup into fresh proof.
++        let path=recovered.0.join("litecoin-wallet.backup");let mut damaged=fs::read(&path)?;let end=damaged.len()-1;damaged[end]^=1;fs::write(&path,damaged)?;
++        assert!(activate(&setup.0,network,&destinations,PASSWORD,&approval,2_000_000_000).is_err());
++        assert_eq!(fs::read(setup.0.join(ACTIVE))?,active);assert_eq!(fs::read(setup.0.join(COMPLETE))?,saved);
++    }
++    Ok(())
++}

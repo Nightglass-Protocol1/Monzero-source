@@ -1,0 +1,116 @@
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -12,6 +12,7 @@
+ pub mod native_execution_claim;
+ pub mod route_approval;
+ pub mod bch_key_recovery;
++pub mod bch_quote_signatures;
+ 
+ #[cfg(test)]
+ mod tests {
+--- /dev/null
++++ b/swap-machine/src/bch_quote_signatures.rs
+@@ -0,0 +1,103 @@
++//! BCH/XMZ signature boundary only: no term semantics, freshness, deployment or funding authority.
++//! Callers must validate the complete trade schema before using any signed field.
++use anyhow::{Result, ensure};
++use ed25519_dalek::{Signature, VerifyingKey};
++use sha2::{Digest, Sha256};
++
++const DOMAIN: &str = "monzero-native-bch-xmz-quote-v1";
++
++fn message(payload: &[u8], role: &str) -> Vec<u8> {
++    let domain = format!("{DOMAIN}-{role}");
++    let mut bytes = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:", domain.len(), domain, payload.len()).into_bytes();
++    bytes.extend_from_slice(payload);
++    bytes
++}
++
++fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
++}
++
++/// Expected keys are native caller pins, not identities chosen from the payload.
++/// Returned commitment binds signed bytes but is never an executable quote token.
++pub fn verify(
++    payload: &[u8], bch_key: &[u8; 32], xmz_key: &[u8; 32],
++    bch_signature: &[u8], xmz_signature: &[u8],
++) -> Result<[u8; 32]> {
++    ensure!(!payload.is_empty() && payload.len() <= 8192 && bch_key != xmz_key,
++        "invalid native quote signature input");
++    let value: serde_json::Value = serde_json::from_slice(payload)?;
++    ensure!(value.is_object() && serde_json::to_vec(&value)? == payload,
++        "noncanonical signed quote");
++    ensure!(value["schema"] == DOMAIN && value["bchFunder"] == hex(bch_key)
++        && value["xmzFunder"] == hex(xmz_key), "wrong quote signing context");
++    VerifyingKey::from_bytes(bch_key)?.verify_strict(&message(payload, "bch-funder"), &Signature::from_slice(bch_signature)?)?;
++    VerifyingKey::from_bytes(xmz_key)?.verify_strict(&message(payload, "xmz-funder"), &Signature::from_slice(xmz_signature)?)?;
++    let mut hash = Sha256::new();
++    hash.update(DOMAIN.as_bytes()); hash.update([0]); hash.update(payload);
++    Ok(hash.finalize().into())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use ed25519_dalek::{Signer, SigningKey};
++    #[test]
++    fn strict_role_and_identity_binding() {
++        // Disposable fixed test keys; never wallet keys.
++        let bch = SigningKey::from_bytes(&[1; 32]);
++        let xmz = SigningKey::from_bytes(&[2; 32]);
++        let b = bch.verifying_key().to_bytes(); let x = xmz.verifying_key().to_bytes();
++        let payload = serde_json::to_vec(&serde_json::json!({"schema": DOMAIN,
++            "bchFunder": hex(&b), "xmzFunder": hex(&x), "amount": "test-only"})).unwrap();
++        let bs = bch.sign(&message(&payload, "bch-funder")).to_bytes();
++        let xs = xmz.sign(&message(&payload, "xmz-funder")).to_bytes();
++        // Independently generated PyNaCl/libsodium vectors with Qt's framing.
++        assert_eq!(hex(&bs), "a53aabcebd2f8f1e79e9ec671e4f7380b503730ea518f96a1b82239b7cfd2b4495416455db1d48e6d7b526e7e78068bdec902a436feb404ba31006260b2aaa0c");
++        assert_eq!(hex(&xs), "6d279e373262439bfde738635217d368d26598dac5d5a3d7b70b20ec8b92fb1679c36790388a2c41ca68c43c144ea5582117d642844442810a91e83d58499b04");
++        assert_eq!(hex(&verify(&payload, &b, &x, &bs, &xs).unwrap()),
++            "4a24552ef26156477f6b507d4b4417aaa1034eeaf544d0b7c1e3efd36af46edf");
++        assert!(verify(&payload, &b, &x, &bs, &xs).is_ok());
++        assert!(verify(&payload, &b, &x, &xs, &bs).is_err());
++        assert!(verify(&payload, &x, &b, &bs, &xs).is_err());
++        assert!(verify(&payload, &b, &b, &bs, &bs).is_err());
++        assert!(verify(&payload, &b, &x, &[], &xs).is_err());
++        let wrong = bch.sign(&message(&payload, "xmz-funder")).to_bytes();
++        assert!(verify(&payload, &b, &x, &wrong, &xs).is_err());
++        let mut ambiguous = payload.clone();
++        ambiguous.splice(1..1, b"\"amount\":\"ignored\",".iter().copied());
++        assert!(verify(&ambiguous, &b, &x, &bs, &xs).is_err());
++    }
++
++    #[test]
++    fn signed_noncanonical_and_wrong_market_payloads_are_rejected() {
++        let bch = SigningKey::from_bytes(&[1; 32]);
++        let xmz = SigningKey::from_bytes(&[2; 32]);
++        let b = bch.verifying_key().to_bytes();
++        let x = xmz.verifying_key().to_bytes();
++        let value = serde_json::json!({"schema": DOMAIN,
++            "bchFunder": hex(&b), "xmzFunder": hex(&x)});
++        let payload = serde_json::to_vec(&value).unwrap();
++        let mut duplicate = payload.clone();
++        duplicate.splice(1..1, b"\"schema\":\"ignored\",".iter().copied());
++        let mut oversized = value.clone();
++        oversized["padding"] = "x".repeat(8192).into();
++        let mut other_market = value.clone();
++        other_market["schema"] = "monzero-native-btc-xmz-quote-v1".into();
++        // Sign each invalid encoding itself: failure must not depend on an
++        // accidentally invalid signature after mutating the original bytes.
++        for invalid in [Vec::new(), b"[]".to_vec(), duplicate,
++            serde_json::to_vec_pretty(&value).unwrap(),
++            serde_json::to_vec(&oversized).unwrap(),
++            serde_json::to_vec(&other_market).unwrap()] {
++            let bs = bch.sign(&message(&invalid, "bch-funder")).to_bytes();
++            let xs = xmz.sign(&message(&invalid, "xmz-funder")).to_bytes();
++            assert!(verify(&invalid, &b, &x, &bs, &xs).is_err());
++        }
++        let mut wrong_domain = message(&payload, "bch-funder");
++        let offset = wrong_domain.windows(3).position(|part| part == b"bch").unwrap();
++        wrong_domain[offset..offset + 3].copy_from_slice(b"btc");
++        let bs = bch.sign(&wrong_domain).to_bytes();
++        let xs = xmz.sign(&message(&payload, "xmz-funder")).to_bytes();
++        assert!(verify(&payload, &b, &x, &bs, &xs).is_err());
++    }
++}

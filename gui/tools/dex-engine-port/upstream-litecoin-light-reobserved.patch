@@ -1,0 +1,143 @@
+diff --git a/swap-machine/src/litecoin_light/session/wallet/payment.rs b/swap-machine/src/litecoin_light/session/wallet/payment.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/payment.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/payment.rs
+@@ -21,6 +21,24 @@
+         }
+         Ok(inputs)
+     }
++    /// Reopen the exact retained payment using externally retained review terms
++    /// and commitment, then revalidate only its inputs against this scan. No
++    /// selection, allocation, new claims, signing or broadcast occurs here.
++    pub fn reopen_payment(&self,chain:&HeaderSequence,payment:&TxOut,change_index:Option<u32>,
++        maximum_fee:bitcoin::Amount,minimum_confirmations:u64,directory:&Path,operation:Uuid,
++        expected:bitcoin::hashes::sha256::Hash)->Result<ObservedClaimedSpend> {
++        use crate::litecoin_light::vault::signing::review::claims::ClaimedSpend;
++        let claimed=ClaimedSpend::open(directory,operation,&self.account,payment,change_index,maximum_fee,expected)?;
++        let candidates=self.payment_inputs()?;
++        let by_outpoint=candidates.iter().map(|input|(bitcoin::OutPoint {txid:input.transaction.txid(),vout:input.vout},input)).collect::<BTreeMap<_,_>>();
++        let mut inputs=Vec::with_capacity(claimed.transaction().input.len());
++        for input in &claimed.transaction().input {
++            let found=by_outpoint.get(&input.previous_output).context("Litecoin retained input is absent or observed spent")?;
++            inputs.push(IncludedInput {transaction:found.transaction,vout:found.vout,branch:found.branch,index:found.index});
++        }
++        ObservedClaimedSpend::revalidate(claimed,chain,&self.accounting,&inputs,minimum_confirmations)
++    }
++
+     /// Pure fee-aware review from retained scan evidence. No address allocations
+     /// or input claims are made; recheck and retain before signing approval.
+     pub fn estimate_payment(&self,chain:&HeaderSequence,payment:&TxOut,
+diff --git a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/tests/funded.rs
+@@ -130,5 +130,14 @@
+     let commitment=prepared.signing_commitment();drop(prepared);drop(book);
+     let mut book=AddressBook::open(&addresses.0,PublicAccount::from_descriptor(&account.descriptor(),account.network())?)?;
+     let resumed=observation.prepare_payment(chain,&payment,&policy,&mut book,&claims.0,operation)?;
+-    assert_eq!(resumed.signing_commitment(),commitment);assert_eq!(book.allocated_count(Branch::Change)?,discovered_change+1);Ok(())
++    assert_eq!(resumed.signing_commitment(),commitment);assert_eq!(book.allocated_count(Branch::Change)?,discovered_change+1);
++    let transaction=resumed.transaction().clone();drop(resumed);drop(book);
++    let address_bytes=fs::read(addresses.0.join("litecoin-address-book.json"))?;
++    let reopened=observation.reopen_payment(chain,&payment,Some(discovered_change),policy.fee,1,&claims.0,operation,commitment)?;
++    assert_eq!(reopened.transaction(),&transaction);assert_eq!(reopened.signing_commitment(),commitment);drop(reopened);
++    assert_eq!(fs::read(addresses.0.join("litecoin-address-book.json"))?,address_bytes);
++    assert!(observation.reopen_payment(&genesis,&payment,Some(discovered_change),policy.fee,1,&claims.0,operation,commitment).is_err());
++    assert!(observation.reopen_payment(chain,&payment,Some(discovered_change),policy.fee,100,&claims.0,operation,commitment).is_err());
++    assert!(observation.reopen_payment(chain,&payment,Some(discovered_change+1),policy.fee,1,&claims.0,operation,commitment).is_err());
++    assert!(observation.reopen_payment(chain,&payment,Some(discovered_change),Amount::from_sat(999),1,&claims.0,operation,commitment).is_err());Ok(())
+ }
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/reopen.rs
+@@ -44,6 +44,26 @@
+         }
+         Ok(Self {journal,review,records})
+     }
++    /// Authenticate every retained prevout/path against fresh inclusion evidence.
++    /// The retained transaction is never rebuilt by coin selection. This checks
++    /// chain membership/depth; the caller must separately check observed spends.
++    pub(in crate::litecoin_light::vault::signing::review) fn revalidate_inclusions(&self,
++        chain:&crate::litecoin_light::headers::HeaderSequence,
++        inputs:&[super::super::confirmed::IncludedInput<'_>],minimum_confirmations:u64)
++        ->Result<()> {
++        ensure!(inputs.len()==self.review.inputs.len(),"Litecoin recovered input evidence count mismatch");
++        for (included,retained) in inputs.iter().zip(&self.review.inputs) {
++            ensure!(included.transaction.txid()==retained.outpoint.txid && included.vout==retained.outpoint.vout
++                && included.transaction.outputs().get(included.vout as usize)==Some(&retained.prevout)
++                && included.branch==retained.branch && included.index==retained.index,
++                "Litecoin recovered input evidence mismatch");
++            let depth=included.transaction.confirmations_on(chain).context("Litecoin recovered input is orphaned")?;
++            ensure!(minimum_confirmations>0 && depth>=minimum_confirmations
++                && (!included.transaction.is_coinbase() || depth>=100),"Litecoin recovered input is immature");
++        }
++        ensure!(chain.network()==self.review.account.network(),"Litecoin recovered chain network mismatch");
++        Ok(())
++    }
+     /// Verify a retained signed transaction without unlocking the seed. Missing
+     /// intent/bytes is an error, never permission to replace or release inputs.
+     /// Verification proves signatures against retained prevouts, not unspentness.
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+@@ -56,3 +56,39 @@
+     let error=retained.approve_and_sign_on(&chain,&observed,&wrong_seed,retained.signing_commitment()).unwrap_err();
+     assert!(error.to_string().contains("chain changed"));Ok(())
+ }
++
++#[test]
++fn reopened_claim_reanchors_exact_transaction_after_chain_extension()->Result<()> {
++    // Public seed and injected genesis inclusion test policy, not consensus history.
++    let (seed,account,mut spend,prevout)=super::super::super::super::tests::fixture()?;
++    let mut chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut credit=spend.clone();credit.output=vec![prevout.clone()];
++    let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),
++        block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},&credit)?;
++    spend.input[0].previous_output=OutPoint {txid:included.txid(),vout:0};
++    let payment=spend.output[0].clone();let fee=Amount::from_sat(1000);
++    let inputs=[IncludedInput {transaction:&included,vout:0,branch:Branch::Receive,index:3}];
++    let old=ObservedWallet::reconcile(&chain,&[prevout.script_pubkey.clone()],std::slice::from_ref(&included))?;
++    let directory=Directory::new()?;let operation=Uuid::new_v4();
++    let prepared=ConfirmedSpendReview::new(&chain,&account,spend.clone(),&inputs,&payment,None,fee,1)?
++        .retain_observed(&chain,&old,&directory.0,operation)?;
++    let commitment=prepared.signing_commitment();drop(prepared);
++    let fixture:serde_json::Value=serde_json::from_str(include_str!("../../../../../session/wallet/fixture.json"))?;
++    chain.append(&Vec::from_hex(fixture["blocks"][0]["header"].as_str().unwrap())?,u64::MAX-7200)?;
++    let observed=ObservedWallet::reconcile(&chain,&[prevout.script_pubkey.clone()],std::slice::from_ref(&included))?;
++    let open=||ClaimedSpend::open(&directory.0,operation,&account,&payment,None,fee,commitment);
++    let count=fs::read_dir(&directory.0)?.count();
++    assert!(ObservedClaimedSpend::revalidate(open()?,&chain,&old,&inputs,1).is_err());
++    assert!(ObservedClaimedSpend::revalidate(open()?,&chain,&observed,&inputs,3).is_err());
++    let wrong=[IncludedInput {transaction:&included,vout:0,branch:Branch::Change,index:3}];
++    assert!(ObservedClaimedSpend::revalidate(open()?,&chain,&observed,&wrong,1).is_err());
++    assert!(ObservedClaimedSpend::revalidate(open()?,&chain,&observed,&[],1).is_err());
++    let spent=ObservedWallet::reconcile_with_pending(&chain,&[prevout.script_pubkey],std::slice::from_ref(&included),&[spend.clone()])?;
++    assert!(ObservedClaimedSpend::revalidate(open()?,&chain,&spent,&inputs,1).is_err());
++    assert_eq!(fs::read_dir(&directory.0)?.count(),count);
++    let reopened=ObservedClaimedSpend::revalidate(open()?,&chain,&observed,&inputs,2)?;
++    assert_eq!(reopened.transaction(),&spend);assert_eq!(reopened.signing_commitment(),commitment);
++    let signed=reopened.approve_and_sign_on(&chain,&observed,&seed,commitment)?;
++    assert_eq!(signed.compute_txid(),spend.compute_txid());drop(reopened);
++    assert_eq!(open()?.load_signed()?,signed);Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+@@ -36,6 +36,19 @@
+     }
+ }
+ impl ObservedClaimedSpend {
++    /// Re-anchor an existing claimed transaction after a refresh/restart, without
++    /// selecting replacement inputs, changing records or granting signing consent.
++    pub fn revalidate(claimed:ClaimedSpend,chain:&HeaderSequence,observed:&ObservedWallet,
++        inputs:&[IncludedInput<'_>],minimum_confirmations:u64)->Result<Self> {
++        claimed.revalidate_inclusions(chain,inputs,minimum_confirmations)?;
++        let inputs=inputs.iter().map(|input|Ok((OutPoint {txid:input.transaction.txid(),vout:input.vout},
++            input.transaction.outputs().get(input.vout as usize).context("missing Litecoin recovered output")?.value)))
++            .collect::<Result<Vec<_>>>()?;
++        let network=chain.network();let height=chain.height();
++        let tip=chain.header(height).context("missing Litecoin selected tip")?.block_hash();
++        require_observed(chain,observed,network,height,tip,&inputs)?;
++        Ok(Self {claimed,network,height,tip,inputs})
++    }
+     pub fn transaction(&self)->&Transaction {self.claimed.transaction()}
+     pub fn fee(&self)->Amount {self.claimed.fee()}
+     pub fn signing_commitment(&self)->sha256::Hash {self.claimed.signing_commitment()}

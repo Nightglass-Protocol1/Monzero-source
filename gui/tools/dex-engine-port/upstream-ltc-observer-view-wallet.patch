@@ -1,0 +1,47 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 9a5555d6d..19e61b9d6 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -341,6 +341,32 @@ mod linux {
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct FundingProofRequest {schema:String,request_id:uuid::Uuid,proof_hex:String}
+     impl Drop for FundingProofRequest {fn drop(&mut self) {use zeroize::Zeroize;self.proof_hex.zeroize();}}
++    /// The Litecoin funder checks the XMZ lock through a view-only wallet of the
++    /// shared address on its observer wallet service. Open it, or create it from
++    /// the negotiated view key the first time. Its password is derived from that
++    /// view key: the file protects nothing the trade's secrets folder lacks.
++    async fn open_observer_view(execution:&Execution,login:&Path,daemon_port:u16,wallet_port:u16,trade:uuid::Uuid,
++        network:swap_core::xmz_address::XmzNetwork)->Result<()> {
++        use sha2::{Digest,Sha256};
++        use swap_machine::native_funding_rpc::{NativeFundingRpc,wallet_session::{NativeWalletSession,SwapWalletId}};
++        let keys=execution.completed_keys()?;
++        let address=keys.native_address().clone();
++        let observer=||->Result<NativeFundingRpc> {
++            let (_login,user,password)=credentials(login)?;
++            NativeFundingRpc::new(daemon_port,wallet_port,user,password)
++        };
++        let opened=observer()?.opened_wallet(network).await?;
++        if opened.as_ref()==Some(&address) {return Ok(());}
++        ensure!(opened.is_none(),"the observer wallet service has another wallet open");
++        let view=zeroize::Zeroizing::new(keys.private_view_key().iter().map(|b|format!("{b:02x}")).collect::<String>());
++        let secret=zeroize::Zeroizing::new(Sha256::new().chain_update(b"monzero-ltc-observer-view-v1\0").chain_update(view.as_bytes()).finalize()
++            .iter().map(|b|format!("{b:02x}")).collect::<String>());
++        let id=SwapWalletId::new(trade)?;
++        // An existing view wallet opens; otherwise (first time) restore it. A fresh
++        // session for the restore, since a failed open marks a session uncertain.
++        if NativeWalletSession::new(observer()?,network).open_view(&id,secret.to_string(),&address).await.is_ok() {return Ok(());}
++        NativeWalletSession::new(observer()?,network).restore_view(&id,view.to_string(),0,secret.to_string(),&address).await
++    }
+     async fn release_litecoin(path:&Path,input:&[u8],mode:&str)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::NativeFundingRpc};
+         use swap_core::litecoin_address::LtcSegwitAddress;
+@@ -386,6 +412,9 @@ mod linux {
+         if let Some(proof)=proof {
+             let txid=proof.tx_hash.0.clone();
+             let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            open_observer_view(&execution,&rpc.observer_login_file,rpc.native_daemon_port,rpc.observer_wallet_port,
++                config.trade_id,config.policy.xmz_network).await
++                .context("Failed to open the trade's view-only XMZ wallet")?;
+             execution.admit_native_funding(&native,proof,now).await?;
+             return Ok(serde_json::json!({"schema":"monzero-ltc-funding-proof-accept-response-v1","requestId":request_id,
+                 "fundingTxid":txid,"snapshot":execution.saved_status()?}));

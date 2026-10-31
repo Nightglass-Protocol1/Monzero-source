@@ -1,0 +1,13 @@
+{
+  "commit": "89a591f7c5b1fd110c0819377ad8f2647d656800",
+  "sha256": {
+    "src/script/interpreter.cpp": "aa6b6f2d98d0227da543d0217debc0b7e17fba3338f0c63dfe9e08eface90776",
+    "src/script/sighashtype.h": "8bf738fff1c87883527602c3360f45241118f164a442cd1d309b2854cd4b21d4",
+    "src/test/data/sighash.json": "f48615ba2c609fbd8a291c2ba9d781e3a60a672712bec56cd3fcb1bea9381510",
+    "src/test/sighash_tests.cpp": "033571bdf7b6a37eef7b81d5fc1d24627cbc952e77e3d6d061417538768b614f"
+  },
+  "repository": "https://github.com/bitcoin-cash-node/bitcoin-cash-node",
+  "tag": "v29.0.0",
+  "license": "MIT; COPYING retained in bchn-source-review-89a591f7c5b1",
+  "vectors": "Four rows of src/test/data/sighash.json whose hashType low byte is 0x41; BCHN tests use zero input amount."
+}

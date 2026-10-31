@@ -1,0 +1,97 @@
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -11,6 +11,7 @@
+ pub mod native_quote_reservation;
+ pub mod native_execution_claim;
+ pub mod route_approval;
++pub mod bch_key_recovery;
+ 
+ #[cfg(test)]
+ mod tests {
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery.rs
+@@ -0,0 +1,84 @@
++//! Cryptographic BCH-adaptor to XMZ-share binding only. Peers and trade terms
++//! must be authenticated separately. A valid proof is neither chain evidence
++//! nor permission to release a signature or spend native funds.
++use anyhow::{Context, Result, ensure};
++use curve25519_dalek_ng::{edwards::CompressedEdwardsY, traits::Identity};
++use ecdsa_fun::{adaptor::EncryptedSignature, fun::Point};
++use sigma_fun::ext::dl_secp256k1_ed25519_eq::CrossCurveDLEQProof;
++use swap_core::{bch::DataMessage, monero};
++use zeroize::Zeroizing;
++use crate::common::CROSS_CURVE_PROOF_SYSTEM;
++
++/// Non-deserializable proof-checked public binding. This does not establish
++/// participant identity, quote ownership or uniqueness across trades.
++pub struct ProvenNativeAdaptor {
++    adaptor: Point,
++    native: [u8;32],
++}
++
++impl ProvenNativeAdaptor {
++    pub fn verify(adaptor: Point, native: [u8;32], proof: &CrossCurveDLEQProof) -> Result<Self> {
++        let point = CompressedEdwardsY(native).decompress().context("invalid BCH/XMZ native public key")?;
++        ensure!(point.compress().to_bytes() == native && point.is_torsion_free()
++            && point != curve25519_dalek_ng::edwards::EdwardsPoint::identity(),
++            "noncanonical or degenerate BCH/XMZ native public key");
++        ensure!(CROSS_CURVE_PROOF_SYSTEM.verify(proof, (adaptor, point)),
++            "BCH/XMZ cross-curve proof does not verify");
++        Ok(Self { adaptor, native })
++    }
++
++    /// The caller must extract this signature from the exact agreed covenant
++    /// spend, and separately enforce confirmation/reorg and local-role policy.
++    pub fn recover_share(&self, message: &DataMessage, signing_key: &Point,
++        encrypted: &EncryptedSignature, der: &[u8]) -> Result<monero::PrivateKey> {
++        let recovered = message.recover(signing_key, &self.adaptor, encrypted, der)?;
++        let mut bytes = Zeroizing::new(recovered.to_bytes());
++        bytes.reverse(); // secp256k1 big endian -> native scalar little endian.
++        let share = monero::PrivateKey::from_slice(bytes.as_ref())
++            .map_err(|_| anyhow::anyhow!("recovered BCH/XMZ native share is not canonical"))?;
++        ensure!(share.as_bytes() == *bytes, "recovered BCH/XMZ native share was reduced");
++        ensure!(monero::PublicKey::from_private_key(&share).decompress().compress().to_bytes() == self.native,
++            "recovered BCH/XMZ share differs from proven native key");
++        Ok(share)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use swap_core::compat::IntoDalekNg;
++    use ecdsa_fun::{ECDSA, fun::Scalar};
++
++    #[test]
++    fn bch_adaptor_recovers_the_proven_native_scalar_without_reduction() -> Result<()> {
++        let mut rng = rand::thread_rng();
++        let native = monero::Scalar::random(&mut rng);
++        let original = monero::PrivateKey::from_scalar(native);
++        let (proof, (adaptor, edwards)) = CROSS_CURVE_PROOF_SYSTEM.prove(&native.into_dalek_ng(), &mut rng);
++        let native_public = edwards.compress().to_bytes();
++        let binding = ProvenNativeAdaptor::verify(adaptor, native_public, &proof)?;
++        let mut bytes = Zeroizing::new(original.as_bytes()); bytes.reverse();
++        let decrypt = Scalar::from_bytes(*bytes).unwrap().non_zero().unwrap();
++        let signer = Scalar::random(&mut rng);
++        let public = ECDSA::verify_only().verification_key_for(&signer);
++        let message = DataMessage::new(b"BCH covenant destination for native recovery test");
++        let encrypted = message.encrypted_sign(&signer, &adaptor);
++        let der = message.decrypt(&public, &decrypt, encrypted.clone())?;
++        let recovered = binding.recover_share(&message, &public, &encrypted, &der)?;
++        assert_eq!(recovered.as_bytes(), original.as_bytes());
++        let local = monero::PrivateKey::from_scalar(monero::Scalar::random(&mut rng));
++        assert_eq!((recovered+local).as_bytes(), (original+local).as_bytes());
++        let changed = DataMessage::new(b"different covenant destination");
++        assert!(binding.recover_share(&changed, &public, &encrypted, &der).is_err());
++        let other = Scalar::random(&mut rng);
++        assert!(binding.recover_share(&message, &ECDSA::verify_only().verification_key_for(&other), &encrypted, &der).is_err());
++        assert!(ProvenNativeAdaptor::verify(ECDSA::verify_only().verification_key_for(&other), native_public, &proof).is_err());
++        assert!(ProvenNativeAdaptor::verify(adaptor, [0;32], &proof).is_err());
++        let mut identity = [0;32]; identity[0] = 1;
++        assert!(ProvenNativeAdaptor::verify(adaptor, identity, &proof).is_err());
++        let unrelated = monero::PrivateKey::from_scalar(monero::Scalar::random(&mut rng));
++        let unrelated_public = monero::PublicKey::from_private_key(&unrelated).decompress().compress().to_bytes();
++        assert!(ProvenNativeAdaptor::verify(adaptor, unrelated_public, &proof).is_err());
++        Ok(())
++    }
++}

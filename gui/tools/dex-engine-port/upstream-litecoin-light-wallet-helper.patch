@@ -1,0 +1,112 @@
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -1,5 +1,5 @@
+ //! Read-only light-chain helper for an app-owned worker process. No wallet keys,
+-//! balance claims, signing, broadcast or live-market activation.
++//! authoritative balances, signing, broadcast or live-market activation.
+ #[cfg(target_os="linux")]
+ mod linux {
+     use anyhow::{Context,Result,ensure};
+@@ -8,16 +8,24 @@
+     use std::{fs::{File,OpenOptions},io::{Read,Write},os::unix::fs::{MetadataExt,OpenOptionsExt},
+         path::{Path,PathBuf},time::{SystemTime,UNIX_EPOCH}};
+     use swap_core::litecoin_address::LtcNetwork;
+-    use swap_machine::litecoin_light::{state::ChainState,tls::TlsEndpoint};
++    use swap_machine::litecoin_light::{state::ChainState,tls::TlsEndpoint,
++        account::{PublicAccount,Branch,descriptor::PublicAccountDescriptor,allocation::AddressBook},
++        session::wallet::RefreshLimits};
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+-    struct Config {schema:String,network:String,cache_directory:PathBuf,maximum_height:u32,endpoint:Option<Endpoint>}
++    struct Config {schema:String,network:String,cache_directory:PathBuf,maximum_height:u32,endpoint:Option<Endpoint>,wallet:Option<WalletConfig>}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields)]
+     struct Endpoint {host:String,port:u16}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+-    struct Request {schema:String,request_id:uuid::Uuid,maximum_download_headers:Option<u32>}
++    struct Request {schema:String,request_id:uuid::Uuid,maximum_download_headers:Option<u32>,wallet_scan:Option<WalletScan>}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct WalletConfig {account:PublicAccountDescriptor,address_book_directory:PathBuf}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct WalletScan {gap:u32,addresses_per_branch:u32,history_entries_per_branch:usize}
+     fn now() -> Result<u64> {Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())}
+     fn config(path: &Path) -> Result<(File,Config)> {
+         ensure!(path.is_absolute() && path.canonicalize()?==path,"noncanonical light-chain configuration");
+@@ -65,18 +73,50 @@
+             "downloadedHeaders":downloaded,"change":changed,
+             "reportedTipOnSelectedChain":state.chain()?.contains(reported_height,reported_tip)}))
+     }
++    fn initialize_wallet(config:&Config,network:LtcNetwork)->Result<Value> {
++        let wallet=config.wallet.as_ref().context("missing watch-only wallet configuration")?;
++        let account=PublicAccount::from_descriptor(&wallet.account,network)?;
++        let book=AddressBook::create(&wallet.address_book_directory,account)?;
++        Ok(json!({"watchOnly":true,"initialized":true,"receivingAllocated":book.allocated_count(Branch::Receive)?,
++            "changeAllocated":book.allocated_count(Branch::Change)?,"spendable":false}))
++    }
++    async fn refresh_wallet(config:&Config,network:LtcNetwork,state:&ChainState,scan:&WalletScan)->Result<Value> {
++        let wallet=config.wallet.as_ref().context("missing watch-only wallet configuration")?;
++        let account=PublicAccount::from_descriptor(&wallet.account,network)?;
++        let book=AddressBook::open(&wallet.address_book_directory,PublicAccount::from_descriptor(&wallet.account,network)?)?;
++        let allocated=[book.allocated_count(Branch::Receive)?,book.allocated_count(Branch::Change)?];
++        let endpoint=config.endpoint.as_ref().context("missing explicit TLS endpoint")?;
++        let mut session=TlsEndpoint::new(endpoint.host.clone(),endpoint.port,network)?.connect().await?;
++        let observation=session.refresh_wallet(state.chain()?,&account,allocated,&RefreshLimits {
++            gap:scan.gap,addresses_per_branch:scan.addresses_per_branch,history_entries_per_branch:scan.history_entries_per_branch}).await?;
++        let amounts=observation.accounting();
++        Ok(json!({"watchOnly":true,"spendable":false,"balanceStatus":"provisional",
++            "observedConfirmedAtomic":amounts.observed_mature().to_sat().to_string(),
++            "immatureAtomic":amounts.observed_immature().to_sat().to_string(),
++            "pendingSpentAtomic":amounts.reported_pending_spent().to_sat().to_string(),
++            "pendingReceivedAtomic":amounts.reported_pending_received().to_sat().to_string(),
++            "pendingTransactions":observation.pending_reports(),"confirmedCoinCount":amounts.coins().len(),
++            "receiveScanned":observation.receive().scanned(),"changeScanned":observation.change().scanned(),
++            "scanStop":"reported-gap"}))
++    }
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
+-        let sync=match args[1].to_str() {Some("--status-stdio-v1")=>false,Some("--sync-stdio-v1")=>true,
++        let mode=match args[1].to_str() {Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
++            Some("--wallet-init-stdio-v1")=>"wallet-init",Some("--wallet-refresh-stdio-v1")=>"wallet-refresh",
+             _=>anyhow::bail!("unsupported light-chain operation")};
+         let mut bytes=Vec::new();std::io::stdin().take(513).read_to_end(&mut bytes)?;
+         ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid light-chain request size");
+         let request: Request=serde_json::from_slice(&bytes)?;
+-        let schema=if sync {"monzero-ltc-light-sync-request-v1"} else {"monzero-ltc-light-status-request-v1"};
++        let schema=format!("monzero-ltc-light-{mode}-request-v1");
++        let sync=mode=="sync";
+         ensure!(request.schema==schema && !request.request_id.is_nil(),"invalid light-chain request identity");
+         ensure!(if sync {request.maximum_download_headers.is_some_and(|n|(1..=10_000_000).contains(&n))}
+             else {request.maximum_download_headers.is_none()},"invalid light-chain request budget");
++        ensure!(if mode=="wallet-refresh" {request.wallet_scan.as_ref().is_some_and(|scan|
++            (1..=500).contains(&scan.gap) && (1..=500).contains(&scan.addresses_per_branch)
++                && (1..=1000).contains(&scan.history_entries_per_branch))}
++            else {request.wallet_scan.is_none()},"invalid wallet refresh budget");
+         let (_lease,config)=config(Path::new(&args[2]))?;
+         let network=match config.network.as_str() {"main"=>LtcNetwork::Mainnet,"test"=>LtcNetwork::Testnet,
+             "regtest"=>LtcNetwork::Regtest,_=>anyhow::bail!("unsupported Litecoin network")};
+@@ -86,8 +126,19 @@
+             Some(tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(synchronize(&config,network,&mut state,budget))?)
+         } else {None};
+-        let response=json!({"schema":if sync {"monzero-ltc-light-sync-response-v1"} else {"monzero-ltc-light-status-response-v1"},
++        let mut response=json!({"schema":format!("monzero-ltc-light-{mode}-response-v1"),
+             "requestId":request.request_id,"executable":false,"chain":snapshot(&state)?,"synchronization":synchronization});
++        if mode=="wallet-init" || mode=="wallet-refresh" {
++            let wallet=if mode=="wallet-init" {initialize_wallet(&config,network)?} else {
++                let scan=request.wallet_scan.as_ref().context("missing wallet scan budget")?;
++                tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
++                    tokio::time::timeout(std::time::Duration::from_secs(3600),refresh_wallet(&config,network,&state,scan)).await
++                        .context("wallet refresh deadline exceeded")?
++                })?
++            };
++            response.as_object_mut().context("invalid response object")?.remove("synchronization");
++            response["wallet"]=wallet;
++        }
+         let bytes=serde_json::to_vec(&response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
+         std::io::stdout().write_all(&bytes)?;Ok(())
+     }

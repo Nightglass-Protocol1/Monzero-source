@@ -1,0 +1,161 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
+@@ -0,0 +1,91 @@
++//! Dedicated wallet lifecycle for recovered native keys. No transaction
++//! construction or payout authority. Restore attempt is durable before RPC.
++use super::*;
++use crate::native_funding_rpc::wallet_session::{NativeWalletSession,SwapWalletId};
++
++const INTENT: &str = "monzero-bch-native-claim-wallet-intent-v1";
++const READY: &str = "monzero-bch-native-claim-wallet-ready-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Intent {schema: String,binding: [u8;32],at: u64}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Ready {schema: String,intent: [u8;32]}
++fn name(quote: &VerifiedBchQuote,suffix: &str) -> String {
++    format!("{}.bch-native-claim-wallet-{suffix}",quote.terms()["swapId"])
++}
++fn key_hex(bytes: &[u8;32]) -> String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
++impl NativeClaim {
++    async fn check_wallet(&self,session: &mut NativeWalletSession) -> Result<()> {
++        session.verify_spend_key(&self.spend,&self.address).await?;
++        session.import_transaction(&self.native_txid,&self.address).await
++    }
++}
++impl AdmittedExecution<'_> {
++    fn claim_wallet_binding(&self,claim: &NativeClaim,id: &SwapWalletId) -> Result<[u8;32]> {
++        // Stable across a reorganization that reconfirms the same exact spend
++        // in another block. Fresh chain evidence is required separately below.
++        Ok(hash(INTENT,&serde_json::to_vec(&json!({"quote":self.quote.commitment(),
++            "admission":self.admission_digest()?,"wallet":id.filename(),"address":claim.address.to_string(),
++            "nativePayment":claim.native_txid,"redemption":claim.redemption}))?))
++    }
++    fn claim_wallet_intent(&self,binding: &[u8;32],now: u64) -> Result<Option<[u8;32]>> {
++        let Some(bytes)=optional(&self.metadata,&name(self.quote,"intent"))? else {
++            ensure!(optional(&self.metadata,&name(self.quote,"ready"))?.is_none(),
++                "BCH claim wallet readiness lacks original intent");return Ok(None)
++        };
++        ensure!(bytes.len()<=4096,"oversized BCH claim wallet intent");
++        let intent: Intent=serde_json::from_slice(&bytes)?;
++        ensure!(intent.schema==INTENT && intent.binding==*binding && now>=intent.at
++            && serde_json::to_vec(&intent)?==bytes,"BCH claim wallet intent changed or time moved backwards");
++        let digest=hash(INTENT,&bytes);
++        if let Some(bytes)=optional(&self.metadata,&name(self.quote,"ready"))? {
++            ensure!(bytes.len()<=4096,"oversized BCH claim wallet readiness");
++            let ready: Ready=serde_json::from_slice(&bytes)?;
++            ensure!(ready.schema==READY && ready.intent==digest && serde_json::to_vec(&ready)?==bytes,
++                "BCH claim wallet readiness changed");
++        }
++        Ok(Some(digest))
++    }
++    fn retain_claim_wallet_ready(&self,intent: [u8;32]) -> Result<()> {
++        self.metadata.retain(&name(self.quote,"ready"),&serde_json::to_vec(&Ready {schema:READY.into(),intent})?)
++    }
++    /// One restore attempt only. Errors may have created/opened the wallet.
++    /// Reconcile through explicit open/check; never fall back to restoration.
++    pub async fn restore_bch_claim_wallet(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++        redemption: Txid,block: Option<BlockHash>,now: u64,session: &mut NativeWalletSession,password: String) -> Result<()> {
++        let password=Zeroizing::new(password);
++        let claim=self.recover_bch_native_claim(native,bch,redemption,block,now).await?;
++        let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
++        let binding=self.claim_wallet_binding(&claim,&id)?;
++        ensure!(self.claim_wallet_intent(&binding,now)?.is_none(),"BCH claim wallet restore was already attempted; open/check explicitly");
++        session.preflight_restore(&password,&claim.address).await?;
++        let bytes=serde_json::to_vec(&Intent {schema:INTENT.into(),binding,at:now})?;
++        self.metadata.retain(&name(self.quote,"intent"),&bytes)?;
++        session.restore(&id,key_hex(&claim.spend),key_hex(&claim.view),0,password.to_string(),&claim.address).await?;
++        claim.check_wallet(session).await?;
++        self.retain_claim_wallet_ready(hash(INTENT,&bytes))
++    }
++    /// Caller supplies an exclusively owned empty session. A failed open is not
++    /// permission to generate a replacement wallet or change recovered keys.
++    pub async fn open_bch_claim_wallet(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++        redemption: Txid,block: Option<BlockHash>,now: u64,session: &mut NativeWalletSession,password: String) -> Result<()> {
++        let password=Zeroizing::new(password);
++        let claim=self.recover_bch_native_claim(native,bch,redemption,block,now).await?;
++        let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
++        let binding=self.claim_wallet_binding(&claim,&id)?;
++        let intent=self.claim_wallet_intent(&binding,now)?.context("missing original BCH claim wallet intent")?;
++        session.open(&id,password.to_string(),&claim.address).await?;
++        claim.check_wallet(session).await?;self.retain_claim_wallet_ready(intent)
++    }
++    /// Reconcile an already-open wallet using an explicitly re-established
++    /// exclusive session. Same-session uncertainty remains an error in adapter.
++    pub async fn check_bch_claim_wallet(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++        redemption: Txid,block: Option<BlockHash>,now: u64,session: &mut NativeWalletSession) -> Result<()> {
++        let claim=self.recover_bch_native_claim(native,bch,redemption,block,now).await?;
++        let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
++        let binding=self.claim_wallet_binding(&claim,&id)?;
++        let intent=self.claim_wallet_intent(&binding,now)?.context("missing original BCH claim wallet intent")?;
++        claim.check_wallet(session).await?;self.retain_claim_wallet_ready(intent)
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+@@ -64,3 +64,5 @@
+             redemption,block:confirmed.block(),commitment})
+     }
+ }
++
++pub mod wallet;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim.rs
+@@ -27,6 +27,11 @@
+     server.state.lock().unwrap().redemption_confirmation_mode=0;
+     // A prepared adaptor was already exposed before external identity signing.
+     // Restore a separate metadata history where the signed envelope was never saved.
++    let client=crate::native_funding_rpc::NativeFundingRpc::new(1,2,"fixture".into(),"fixture".into())?;
++    let mut session=crate::native_funding_rpc::wallet_session::NativeWalletSession::new(client,setup.policy.xmz_network);
++    let intent=bch_metadata.join(format!("{}.bch-native-claim-wallet-intent",setup.quote.terms()["swapId"]));
++    let error=bch.restore_bch_claim_wallet(&observer,rpc,txid,block,2042,&mut session,String::new()).await.unwrap_err();
++    assert_eq!(error.to_string(),"invalid wallet password");assert!(!intent.exists());
+     let copied=PrivateStore::new()?;
+     for entry in std::fs::read_dir(bch_metadata)? {
+         let entry=entry?;if entry.file_type()?.is_file() {std::fs::copy(entry.path(),copied.0.join(entry.file_name()))?;}
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session.rs b/swap-machine/src/native_funding_rpc/wallet_session.rs
+--- a/swap-machine/src/native_funding_rpc/wallet_session.rs
++++ b/swap-machine/src/native_funding_rpc/wallet_session.rs
+@@ -53,6 +53,14 @@
+         }).await.context("wallet command timed out")?
+     }
+ 
++    /// Read-only preflight before a caller persists its restore attempt.
++    /// This reserves nothing; restore repeats the checks before dispatch.
++    pub(crate) async fn preflight_restore(&self,password: &str,expected: &XmzAddress) -> Result<()> {
++        checked_password(password.to_owned())?;
++        ensure!(expected.network()==self.network,"wallet network mismatch");
++        self.require_empty().await
++    }
++
+     async fn require_empty(&self) -> Result<()> {
+         ensure!(!self.uncertain, "wallet session requires reconciliation");
+         ensure!(self.client.opened_wallet(self.network).await?.is_none(), "wallet already open");
+@@ -256,6 +264,22 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[tokio::test]
++    async fn restore_preflight_rejects_input_and_uncertainty_before_rpc() -> Result<()> {
++        let address=XmzAddress::parse(XmzNetwork::Mainnet,
++            "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H")?;
++        let client=NativeFundingRpc::new(1,2,"fixture".into(),"fixture".into())?;
++        let mut session=NativeWalletSession::new(client,XmzNetwork::Mainnet);
++        for password in [String::new(),"x".repeat(1025),"x\0y".into()] {
++            assert_eq!(session.preflight_restore(&password,&address).await.unwrap_err().to_string(),"invalid wallet password");
++        }
++        session.network=XmzNetwork::Testnet;
++        assert_eq!(session.preflight_restore("fixture",&address).await.unwrap_err().to_string(),"wallet network mismatch");
++        session.network=XmzNetwork::Mainnet;session.uncertain=true;
++        assert_eq!(session.preflight_restore("fixture",&address).await.unwrap_err().to_string(),"wallet session requires reconciliation");
++        Ok(())
++    }
++
+     #[test]
+     fn malformed_control_diagnostics_do_not_echo_private_input() {
+         let marker = "private-password-marker";

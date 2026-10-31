@@ -1,0 +1,329 @@
+diff --git a/swap-machine/src/litecoin_light/tls.rs b/swap-machine/src/litecoin_light/tls.rs
+--- a/swap-machine/src/litecoin_light/tls.rs
++++ b/swap-machine/src/litecoin_light/tls.rs
+@@ -18,9 +18,9 @@
+     network: LightNetwork,
+ }
+ impl TlsEndpoint {
+-    pub(in crate::litecoin_light) fn host(&self)->&str {&self.host}
+-    pub(in crate::litecoin_light) fn port(&self)->u16 {self.port}
+-    pub(in crate::litecoin_light) fn network(&self)->LightNetwork {self.network}
++    pub fn host(&self)->&str {&self.host}
++    pub fn port(&self)->u16 {self.port}
++    pub fn network(&self)->LightNetwork {self.network}
+ 
+     /// Explicitly submit the exact retained signed transaction. The caller must
+     /// obtain separate send consent and assess chain/fee policy beforehand.
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -35,7 +35,14 @@
+     /// Exact unsigned funding proposal only; never a signing/relay permit.
+     /// Kept behind the observed-spend API so callers must recheck the chain.
+     pub(in crate::litecoin_light::vault::signing::review) fn recovery_psbt(&self,operation:Uuid,expected:sha256::Hash)->Result<bitcoin::psbt::Psbt> {
+-        self.check_signing_review(expected)?;self.ensure_not_submitted()?;
++        self.ensure_not_submitted()?;
++        self.retained_funding_psbt(self.review.account.network(),operation,expected)
++    }
++    /// Read-only reconstruction for negotiated recovery, including after relay.
++    /// This does not establish unspentness or authorize signing or submission.
++    pub fn retained_funding_psbt(&self,network:LightNetwork,operation:Uuid,expected:sha256::Hash)->Result<bitcoin::psbt::Psbt> {
++        self.check_signing_review(expected)?;
++        ensure!(network==self.review.account.network(),"wrong retained funding network");
+         ensure!(!operation.is_nil() && self.records[0].0==format!("ltc-spend-{operation}.json"),"funding claim belongs to another operation");
+         ensure!(self.review.account.network().script_kind()==crate::litecoin_light::network::ScriptKind::WitnessV0,
+             "pre-signed recovery requires stable SegWit funding inputs");
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+@@ -36,6 +36,8 @@
+     }
+ }
+ impl ObservedClaimedSpend {
++    /// Internal readback under the same wallet lease; no freshness authority.
++    pub(crate) fn retained_claim(&self)->&ClaimedSpend {&self.claimed}
+     /// Re-anchor an existing claimed transaction after a refresh/restart, without
+     /// selecting replacement inputs, changing records or granting signing consent.
+     pub fn revalidate(claimed:ClaimedSpend,chain:&HeaderSequence,observed:&ObservedWallet,
+diff --git a/swap-machine/src/litecoin_negotiation/execution/light_funding.rs b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+--- a/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+@@ -1,5 +1,5 @@
+ //! Light-wallet input claims enter the existing negotiated recovery protocol.
+-//! Recovery preparation and separately approved local funding signatures. No relay.
++//! Recovery preparation, local signatures and separately approved funding relay.
+ use super::*;
+ use crate::litecoin_light::{accounting::ObservedWallet,headers::HeaderSequence,
+     network::LightNetwork,vault::signing::review::confirmed::claimed::ObservedClaimedSpend};
+@@ -37,3 +37,5 @@
+     }
+ }
+ pub mod approval;
++
++pub mod relay;
+diff --git a/swap-machine/src/litecoin_light/funding_tests.rs b/swap-machine/src/litecoin_light/funding_tests.rs
+--- a/swap-machine/src/litecoin_light/funding_tests.rs
++++ b/swap-machine/src/litecoin_light/funding_tests.rs
+@@ -18,11 +18,11 @@
+     fn child(&self,name:&str)->Result<PathBuf> {let path=self.0.join(name);fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(path)}
+ }
+ impl Drop for Root {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
+-#[test]
+-fn seed_funding_requires_approved_peer_recovery_and_resumes_exactly()->Result<()> { funding_approval(false) }
+-#[test]
+-fn mnemonic_funding_requires_approved_peer_recovery_and_resumes_exactly()->Result<()> { funding_approval(true) }
+-fn funding_approval(mnemonic:bool)->Result<()> {
++#[tokio::test]
++async fn seed_funding_requires_approved_peer_recovery_and_resumes_exactly()->Result<()> { funding_approval(false).await }
++#[tokio::test]
++async fn mnemonic_funding_requires_approved_peer_recovery_and_resumes_exactly()->Result<()> { funding_approval(true).await }
++async fn funding_approval(mnemonic:bool)->Result<()> {
+     let root=Root::new()?;let bm=root.child("bob-meta")?;let bs=root.child("bob-secrets")?;
+     let am=root.child("alice-meta")?;let als=root.child("alice-secrets")?;
+     let (policy,terms)=crate::litecoin_quote::tests::fixture();
+@@ -131,7 +131,16 @@
+     // A changed input claim must fail before producing further recovery output.
+     let entry=fs::read_dir(&claims)?.collect::<std::io::Result<Vec<_>>>()?.into_iter()
+         .find(|entry|entry.path().extension().is_some_and(|e|e=="claim")).unwrap();
+-    fs::write(entry.path(),b"altered")?;
++    let record=fs::read(entry.path())?;fs::write(entry.path(),b"altered")?;
+     assert!(bob.light_recovery_signing_frame(&spend,&chain,&observed,commitment,1003).is_err());
++    fs::write(entry.path(),record)?;
++    if !mnemonic {
++        let endpoint=relay::first_attempt(&mut bob,&spend,&chain,&observed,commitment).await?;
++        drop(bob);drop(spend);
++        let mut bob=Execution::resume(&bm,&bs,trade,&policy,LocalRole::LitecoinFunder,pins)?;
++        let claim=ClaimedSpend::open(&claims,trade,&account,&payment,None,Amount::from_sat(1000),commitment)?;
++        relay::cold_retry(&mut bob,&claim,&chain,commitment,&endpoint,&signed).await?;
++    }
+     Ok(())
+ }
++mod relay;
+diff --git a/swap-machine/src/litecoin_negotiation/execution/light_funding/relay.rs b/swap-machine/src/litecoin_negotiation/execution/light_funding/relay.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_negotiation/execution/light_funding/relay.rs
+@@ -0,0 +1,113 @@
++//! Exact-byte funding send, observation and approved retry. No key unlocking.
++use super::*;
++use super::super::lock_approval::LockFundingReview;
++use crate::litecoin_light::{tls::TlsEndpoint,session::{ReadSession,reconciliation::{PaymentObservation,PaymentPosition}},
++    vault::signing::review::claims::{ClaimedSpend,broadcast::BroadcastStatus}};
++use bitcoin::{Transaction,Txid,consensus::serialize};
++use tokio::io::{AsyncRead,AsyncWrite};
++
++fn approval(details:serde_json::Value)->Result<LockFundingReview> {
++    let mut hash=Sha256::new();hash.update(b"MONZERO-LTC-LIGHT-RELAY-APPROVAL-V1\0");
++    hash.update(serde_json::to_vec(&details)?);
++    Ok(LockFundingReview {details,commitment:hash.finalize().into()})
++}
++fn endpoint_details(endpoint:&TlsEndpoint)->serde_json::Value {
++    serde_json::json!({"network":endpoint.network().storage_identity(),"host":endpoint.host(),"port":endpoint.port()})
++}
++impl Execution {
++    /// First send requires fresh quote admission, same-tip input observation,
++    /// retained peer recovery and the exact already-signed wallet transaction.
++    pub fn review_light_funding_send(&mut self,spend:&ObservedClaimedSpend,
++        chain:&HeaderSequence,observed:&ObservedWallet,claim:sha256::Hash,endpoint:&TlsEndpoint,now:u64)->Result<LockFundingReview> {
++        ensure!(endpoint.network()==chain.network(),"wrong light funding endpoint network");
++        let funding=self.review_light_funding(spend,chain,observed,claim,now)?;
++        let signed=spend.retained_signed()?;
++        ensure!(spend.retained_claim().broadcast_status(endpoint,claim)?==BroadcastStatus::NoLocalAttempt,
++            "light funding was already attempted; reconcile first");
++        approval(serde_json::json!({"schema":"monzero-ltc-light-relay-review-v1","action":"send",
++            "funding":funding.details,"endpoint":endpoint_details(endpoint),
++            "txid":signed.compute_txid(),"signedDigest":sha256::Hash::hash(&serialize(&signed))}))
++    }
++
++    /// Consent for signatures never implies consent for broadcast. Publication
++    /// precedes connecting; errors and cancellation retain an uncertain attempt.
++    pub async fn send_light_funding(&mut self,spend:&ObservedClaimedSpend,
++        chain:&HeaderSequence,observed:&ObservedWallet,claim:sha256::Hash,endpoint:&TlsEndpoint,
++        approved:&[u8;32],now:u64)->Result<Txid> {
++        let review=self.review_light_funding_send(spend,chain,observed,claim,endpoint,now)?;
++        ensure!(review.commitment==*approved,"light funding send approval is stale or changed");
++        spend.broadcast_on(chain,observed,endpoint,claim).await
++    }
++
++    /// Validate a signed claim against the original admitted agreement, including
++    /// after quote expiry or input spend. This is readback, never fresh admission.
++    fn retained_light_funding(&mut self,claim:&ClaimedSpend,chain:&HeaderSequence,
++        expected:sha256::Hash)->Result<Transaction> {
++        ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong light funding role");
++        ensure!(chain.network()==LightNetwork::from(self.policy.ltc_network),"wrong light funding network");
++        let (head,_,quote,_,exchange)=self.load()?;
++        let psbt=claim.retained_funding_psbt(chain.network(),self.claim.trade,expected)?;
++        let binding=self.light_funding_binding(&head,&psbt,chain,expected)?;
++        ensure!(self.metadata.read(&format!("{}.ltc-light-funding",self.claim.trade))?==binding,
++            "retained light funding differs from proposal");
++        let (policy,admitted)=self.recovery_admission(&head)?;
++        let plan=RecoveryPlan::new(&quote,&policy,admitted,&exchange.finish()?,psbt)?;
++        let outgoing=self.recover_recovery_outgoing()?;
++        plan.verify_local_message(outgoing.bytes(),outgoing.signature())?;
++        let recovery=self.recover_recovery()?;
++        let refund=recovery.refund.context("missing retained light-funder refund")?;
++        ensure!(recovery.punish.is_none()
++            && recovery.cancel.input.first().is_some_and(|i|i.previous_output==plan.lock_outpoint())
++            && refund.compute_txid()==plan.refund_txid(),"retained light funding recovery mismatch");
++        let signed=claim.load_signed()?;
++        ensure!(signed.compute_txid()==plan.lock_outpoint().txid,"retained light funding identity mismatch");
++        Ok(signed)
++    }
++
++    /// Observe only the exact signed funding transaction. The session is a read
++    /// transport; no vault, send intent, input release or replacement is involved.
++    /// Pending/absent reports are not proof of complete network knowledge.
++    pub async fn observe_light_funding_on<S:AsyncRead+AsyncWrite+Unpin>(&mut self,
++        claim:&ClaimedSpend,chain:&HeaderSequence,expected:sha256::Hash,
++        session:&mut ReadSession<S>,maximum_history:usize)->Result<PaymentObservation> {
++        let signed=self.retained_light_funding(claim,chain,expected)?;
++        let observation=claim.observe_payment_on(session,chain,maximum_history).await?;
++        ensure!(self.retained_light_funding(claim,chain,expected)?==signed,"light funding changed during observation");
++        Ok(observation)
++    }
++
++    /// Retry only an endpoint with retained submission evidence. A current
++    /// selected-chain observation must refer to these exact signed bytes. This
++    /// never treats a missing report as permission to create another payment.
++    pub fn review_light_funding_retry(&mut self,claim:&ClaimedSpend,chain:&HeaderSequence,
++        expected:sha256::Hash,endpoint:&TlsEndpoint,observation:&PaymentObservation)->Result<LockFundingReview> {
++        ensure!(endpoint.network()==chain.network(),"wrong light funding retry network");
++        let signed=self.retained_light_funding(claim,chain,expected)?;
++        let status=match claim.broadcast_status(endpoint,expected)? {
++            BroadcastStatus::NoLocalAttempt=>anyhow::bail!("no retained light funding attempt at this endpoint"),
++            BroadcastStatus::OutcomeUnknown=>"outcome-unknown",
++            BroadcastStatus::ServerAcknowledged=>"server-acknowledged",
++        };
++        ensure!(observation.txid()==signed.compute_txid(),"light funding observation belongs to another transaction");
++        let position=match observation.position_on(chain)? {
++            PaymentPosition::NotReported=>"not-reported",
++            PaymentPosition::ReportedPending=>"reported-pending",
++            PaymentPosition::Included {..}=>anyhow::bail!("light funding already included; reconcile settlement"),
++        };
++        approval(serde_json::json!({"schema":"monzero-ltc-light-relay-review-v1","action":"retry",
++            "trade":self.claim.trade,"quote":self.claim.quote,"claimCommitment":expected,
++            "txid":signed.compute_txid(),"signedDigest":sha256::Hash::hash(&serialize(&signed)),
++            "endpoint":endpoint_details(endpoint),"localStatus":status,"reportedPosition":position,
++            "observedHeight":observation.selected_height(),"observedTip":observation.selected_tip()}))
++    }
++
++    /// Explicit retry submits the original retained bytes only. It can initiate
++    /// inclusion when an earlier attempt was lost; require a separate review.
++    pub async fn retry_light_funding(&mut self,claim:&ClaimedSpend,chain:&HeaderSequence,
++        expected:sha256::Hash,endpoint:&TlsEndpoint,observation:&PaymentObservation,
++        approved:&[u8;32])->Result<Txid> {
++        let review=self.review_light_funding_retry(claim,chain,expected,endpoint,observation)?;
++        ensure!(review.commitment==*approved,"light funding retry approval is stale or changed");
++        endpoint.broadcast_retained(claim,expected).await
++    }
++}
+diff --git a/swap-machine/src/litecoin_light/funding_tests/relay.rs b/swap-machine/src/litecoin_light/funding_tests/relay.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/funding_tests/relay.rs
+@@ -0,0 +1,105 @@
++use super::*;
++use crate::litecoin_light::{tls::TlsEndpoint,session::{ReadSession,tests::{server,reply,regtest_handshake},reconciliation::PaymentObservation},
++    vault::signing::review::claims::broadcast::{BroadcastStatus,BroadcastRecord}};
++use bitcoin::consensus::encode::serialize_hex;
++use serde_json::json;
++
++pub(super) async fn first_attempt(bob:&mut Execution,spend:&ObservedClaimedSpend,
++    chain:&HeaderSequence,observed:&ObservedWallet,expected:sha256::Hash)->Result<TlsEndpoint> {
++    // Owned local peer closes TLS immediately. The production send path must
++    // retain an uncertain attempt, with no plaintext transaction or fallback.
++    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++    let endpoint=TlsEndpoint::new("127.0.0.1".into(),listener.local_addr()?.port(),chain.network())?;
++    let other=TlsEndpoint::new("localhost".into(),endpoint.port(),chain.network())?;
++    let review=bob.review_light_funding_send(spend,chain,observed,expected,&endpoint,1004)?;
++    assert_eq!(review.details["action"],"send");
++    assert!(bob.send_light_funding(spend,chain,observed,expected,&endpoint,&[0;32],1004).await.is_err());
++    assert!(bob.send_light_funding(spend,chain,observed,expected,&other,&review.commitment,1004).await.is_err());
++    assert!(bob.send_light_funding(spend,chain,observed,expected,&endpoint,&review.commitment,2001).await.is_err());
++    assert_eq!(spend.retained_claim().broadcast_status(&endpoint,expected)?,BroadcastStatus::NoLocalAttempt);
++    let task=tokio::spawn(async move {let (socket,_)=listener.accept().await?;drop(socket);Ok::<_,std::io::Error>(())});
++    assert!(bob.send_light_funding(spend,chain,observed,expected,&endpoint,&review.commitment,1004).await.is_err());
++    // On systems lacking trust roots, connect can fail before accept. Cancel
++    // the owned listener then; the durable uncertainty rule is the same.
++    if !task.is_finished() {task.abort();}
++    match task.await {Ok(result)=>result?,Err(error) if error.is_cancelled()=>(),Err(error)=>return Err(error.into())}
++    assert_eq!(spend.retained_claim().broadcast_status(&endpoint,expected)?,BroadcastStatus::OutcomeUnknown);
++    assert!(bob.review_light_funding_send(spend,chain,observed,expected,&endpoint,1004).is_err());
++    let operation=review.details["funding"]["trade"].as_str().unwrap().parse()?;
++    assert!(spend.funding_psbt_on(chain,observed,operation,expected).is_err());
++    Ok(endpoint)
++}
++async fn observation(bob:&mut Execution,claim:&ClaimedSpend,chain:&HeaderSequence,
++    expected:sha256::Hash,signed:&Transaction,pending:bool)->Result<PaymentObservation> {
++    let mut responses=regtest_handshake();
++    responses.push(reply(3,if pending {json!([{"tx_hash":signed.compute_txid(),"height":0}])} else {json!([])}));
++    if pending {responses.push(reply(4,json!(serialize_hex(signed))));}
++    let count=responses.len();let (stream,task)=server(responses);
++    let mut session=ReadSession::negotiate(stream,chain.network()).await?;
++    let result=bob.observe_light_funding_on(claim,chain,expected,&mut session,10).await?;
++    drop(session);let requests=task.await?;assert_eq!(requests.len(),count);
++    assert!(requests.iter().all(|r|r["method"]!="blockchain.transaction.broadcast"));
++    Ok(result)
++}
++pub(super) async fn cold_retry(bob:&mut Execution,claim:&ClaimedSpend,chain:&HeaderSequence,
++    expected:sha256::Hash,endpoint:&TlsEndpoint,signed:&Transaction)->Result<()> {
++    let pending=observation(bob,claim,chain,expected,signed,true).await?;
++    let review=bob.review_light_funding_retry(claim,chain,expected,endpoint,&pending)?;
++    assert_eq!(review.details["action"],"retry");assert_eq!(review.details["localStatus"],"outcome-unknown");
++    let other=TlsEndpoint::new("localhost".into(),endpoint.port(),chain.network())?;
++    assert!(bob.review_light_funding_retry(claim,chain,expected,&other,&pending).is_err());
++    let absent=observation(bob,claim,chain,expected,signed,false).await?;
++    let absent_review=bob.review_light_funding_retry(claim,chain,expected,endpoint,&absent)?;
++    assert_ne!(absent_review.commitment,review.commitment);
++    assert!(bob.retry_light_funding(claim,chain,expected,endpoint,&absent,&review.commitment).await.is_err());
++    assert!(bob.retry_light_funding(claim,chain,expected,endpoint,&absent,&[0;32]).await.is_err());
++    // No listening server remains. Exact retry must fail without releasing the
++    // existing signed transaction or requiring vault/password access.
++    assert!(bob.retry_light_funding(claim,chain,expected,endpoint,&absent,&absent_review.commitment).await.is_err());
++    assert_eq!(claim.load_signed()?,*signed);
++    // Exercise the same retained broadcast record through the real protocol
++    // encoder with a matching acknowledgement; no TLS bypass is exposed by DEX.
++    let record=BroadcastRecord::new(claim,endpoint,expected)?;record.retain_intent()?;
++    let mut responses=regtest_handshake();responses.push(reply(3,json!(signed.compute_txid())));
++    let (stream,task)=server(responses);
++    let session=ReadSession::negotiate(stream,chain.network()).await?;
++    assert_eq!(session.submit_retained(&record).await?,signed.compute_txid());
++    let requests=task.await?;assert_eq!(requests.len(),3);
++    assert_eq!(requests[2]["params"],json!([serialize_hex(signed)]));
++    let acknowledged=bob.review_light_funding_retry(claim,chain,expected,endpoint,&absent)?;
++    assert_eq!(acknowledged.details["localStatus"],"server-acknowledged");
++    assert_ne!(acknowledged.commitment,absent_review.commitment);
++    assert!(bob.retry_light_funding(claim,chain,expected,endpoint,&absent,&absent_review.commitment).await.is_err());
++    // An old observation cannot approve a retry against an extended chain.
++    use bitcoin::hex::FromHex;
++    let fixture:serde_json::Value=serde_json::from_str(include_str!("../session/wallet/fixture.json"))?;
++    let mut extended=HeaderSequence::new(chain.network())?;
++    extended.append(&Vec::from_hex(fixture["blocks"][0]["header"].as_str().unwrap())?,u64::MAX-7200)?;
++    assert!(bob.review_light_funding_retry(claim,&extended,expected,endpoint,&absent).is_err());
++    // Synthetic SPV inclusion for this exact transaction, not full-block
++    // consensus evidence. A bounded regtest header search supplies real PoW.
++    let mut included_chain=HeaderSequence::new(chain.network())?;
++    let mut header=included_chain.header(0).unwrap();header.prev_blockhash=header.block_hash();
++    header.merkle_root=bitcoin::TxMerkleNode::from_raw_hash(signed.compute_txid().to_raw_hash());
++    header.time+=1;header.version=bitcoin::block::Version::from_consensus(0x20000000);
++    for nonce in 0..512 {
++        header.nonce=nonce;
++        match included_chain.append(&bitcoin::consensus::serialize(&header),u64::MAX-7200) {
++            Ok(_)=>break,
++            Err(error) if error.to_string()=="insufficient Litecoin Scrypt work"=>(),
++            Err(error)=>return Err(error),
++        }
++    }
++    anyhow::ensure!(included_chain.height()==1,"test header search exhausted");
++    let mut responses=regtest_handshake();
++    responses.push(reply(3,json!([{"tx_hash":signed.compute_txid(),"height":1}])));
++    responses.push(reply(4,json!(serialize_hex(signed))));
++    responses.push(reply(5,json!({"block_height":1,"pos":0,"merkle":[]})));
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,chain.network()).await?;
++    let included=bob.observe_light_funding_on(claim,&included_chain,expected,&mut session,10).await?;
++    drop(session);assert_eq!(task.await?.len(),5);
++    assert!(matches!(included.position_on(&included_chain)?,crate::litecoin_light::session::reconciliation::PaymentPosition::Included {confirmations:1,..}));
++    assert!(bob.review_light_funding_retry(claim,&included_chain,expected,endpoint,&included).is_err());
++    assert_eq!(claim.load_signed()?,*signed);
++    Ok(())
++}

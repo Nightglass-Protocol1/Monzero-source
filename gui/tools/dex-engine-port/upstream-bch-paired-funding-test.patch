@@ -1,0 +1,153 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -22,12 +22,25 @@
+         Self::with_network_at(network,1000,2000)
+     }
+     fn with_network_at(network: Option<crate::bch_rpc::BchNetwork>, now: u64, expires: u64) -> Result<Self> {
++        Self::with_native_context(network,now,expires,None)
++    }
++    fn with_native_context(network: Option<crate::bch_rpc::BchNetwork>, now: u64, expires: u64, native: Option<&serde_json::Value>) -> Result<Self> {
+         let (mut policy,mut terms) = fixture();
+         terms.insert("expiresAt".into(),expires.to_string());
+         if let Some(network) = network {
+             policy.bch_network = network.quote_name().into(); policy.bch_genesis = network.genesis().into();
+             terms.insert("bchNetwork".into(),policy.bch_network.clone());
+             terms.insert("bchGenesis".into(),policy.bch_genesis.clone());
++        }
++        if let Some(native)=native {
++            policy.xmz_genesis=native["genesis"].as_str().context("missing native genesis")?.into();
++            policy.maximum_xmz_atoms=200_000_000_000;policy.maximum_xmz_fee=10_000_000_000;
++            for (name,value) in [("xmzGenesis",policy.xmz_genesis.as_str()),("xmzPayout",native["payout"].as_str().context("missing native payout")?),
++                ("xmzRefund",native["refund"].as_str().context("missing native refund")?),("xmzAtoms","200000000000"),
++                ("xmzPayoutAtoms","100000000000"),("xmzFundingFeeMaxAtoms","10000000000"),
++                ("xmzClaimFeeMaxAtoms","10000000000"),("xmzRefundFeeMaxAtoms","10000000000")] {
++                terms.insert(name.into(),value.into());
++            }
+         }
+         let quote = signed(&terms,&policy,now)?;
+         let mut setup = Self {policy,quote,spend:vec![],view:vec![],frames:vec![],signatures:vec![]};
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -6,14 +6,17 @@
+ #[tokio::test]
+ #[ignore = "requires a disposable owned BCHN regtest wallet and digest-pinned context"]
+ async fn bch_owned_node_executes_funding_controller() -> Result<()> {
+-    exercise(false).await
++    exercise(false,false).await
+ }
+ #[tokio::test]
+ #[ignore = "requires a disposable owned BCHN wallet and phase-coordinated driver"]
+ async fn bch_owned_node_validates_authenticated_funding_window() -> Result<()> {
+-    exercise(true).await
++    exercise(true,false).await
+ }
+-async fn exercise(handoff: bool) -> Result<()> {
++#[tokio::test]
++#[ignore = "requires owned BCHN and XMZ fakechain services"]
++async fn bch_paired_nodes_fund_native_contract() -> Result<()> {exercise(true,true).await}
++async fn exercise(handoff: bool,paired: bool) -> Result<()> {
+     let path=PathBuf::from(std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG")?);
+     let bytes=std::fs::read(&path)?;
+     ensure!(bytes.len()<16384 && hex(&Sha256::digest(&bytes))==std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG_SHA256")?,"node fixture context changed");
+@@ -23,7 +26,7 @@
+     let clock=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+     let base=clock.checked_sub(60).context("invalid fixture clock")?;
+     let network = BchNetwork::Regtest {checkpoint_height:1,checkpoint:BlockHash::from_str(field("checkpoint")?)?};
+-    let setup = Setup::with_network_at(Some(network),base,base+3500)?;
++    let setup = Setup::with_native_context(Some(network),base,base+3500,if paired {Some(&config["native"])} else {None})?;
+     let snapshots = PrivateStore::new()?; let metadata = PrivateStore::new()?;
+     let (selected,own,initial) = selected_with_outgoing_at(&setup,&snapshots.0,0,base)?;
+     let (native_selected,peer,native_initial) = selected_with_outgoing_at(&setup,&snapshots.0,1,base)?;
+@@ -97,7 +100,7 @@
+         assert_eq!(contents(&native_metadata.0)?,before);
+         let received=native.accept_bch_funding_message(base+16,&frame,&signature)?;
+         assert_eq!(received.signed().lock_outpoint(),signed.lock_outpoint());drop(native);
+-        let native=AdmittedExecution::resume(&native_metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        let mut native=AdmittedExecution::resume(&native_metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
+         assert_eq!(native.received_bch_funding_message()?.unwrap().frame(),frame);
+         assert_eq!(native.observe_received_bch_funding(&rpc).await?.status(),FundingStatus::Mempool {lock_output_unspent:true});
+         assert!(native.check_bch_lock_for_native_funding(&rpc,base+17,5).await.is_err());
+@@ -111,15 +114,20 @@
+         assert_eq!(checked.amount_atoms(),setup.quote.terms()["xmzAtoms"].parse::<u64>()?);
+         assert_eq!(checked.maximum_fee_atoms(),setup.quote.terms()["xmzFundingFeeMaxAtoms"].parse::<u64>()?);
+         assert_eq!(checked.destination(),native.restore_agreement()?.owned().wallet().address());
++        if paired {
++            native_payment(&config["native"],&setup,&native_metadata,&snapshots,&rpc,&mut native,&mut restored,
++                &event,&gate,txid,base+19).await?;
++        } else {
+         phase(&event,&gate,"observed","aged",txid).await?;
+         assert_eq!(native.observe_received_bch_funding(&rpc).await?.status(),FundingStatus::ConfirmedUnspent {confirmations:15});
+         assert!(native.check_bch_lock_for_native_funding(&rpc,base+19,5).await.is_err());
+         assert_eq!(contents(&native_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++        }
+     }
+     let report=PathBuf::from(field("report")?);ensure!(!report.exists(),"fixture report exists");
+     save(&report,&serde_json::to_vec(&json!({"schema":"monzero-bch-node-executor-result-v1","executable":false,
+         "txid":txid.to_string(),"lockVout":signed.lock_outpoint().vout,"lockScript":setup.quote.recovery_plan().lock().script_pubkey().to_hex_string(),
+-        "authenticatedHandoff":handoff,"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff,
++        "authenticatedHandoff":handoff,"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff && !paired,"pairedNativeFunding":paired,
+         "principalAtoms":100000,"feeAtoms":fee,"productionWalletLockSignRelay":true,"restartSavedBytes":true,
+         "inputs":inputs.iter().map(|p|json!({"txid":p.txid.to_string(),"vout":p.vout})).collect::<Vec<_>>() }))?)?;
+     Ok(())
+@@ -140,3 +148,6 @@
+         }
+     }).await.context("node fixture phase timed out")?
+ }
++
++mod native_payment;
++use native_payment::exercise as native_payment;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+@@ -0,0 +1,52 @@
++//! Actual native wallet preparation and approved retained relay after BCH handoff.
++use super::*;
++use crate::native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay};
++use agreement::execution::funding::{native::{NativeFundingSource,relay::NativeRelayState,proof}};
++pub(super) async fn exercise(config: &Value,setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
++    bch: &BchRpc,native: &mut AdmittedExecution<'_>,sender: &mut AdmittedExecution<'_>,
++    event: &std::path::Path,gate: &std::path::Path,bch_txid: Txid,now: u64) -> Result<()> {
++    let field=|name: &str| -> Result<&str> {config[name].as_str().context("missing native fixture field")};
++    let backend=||NativeFundingRpc::new(u16::try_from(config["daemonPort"].as_u64().context("daemon port")?)?,
++        u16::try_from(config["walletPort"].as_u64().context("wallet port")?)?,field("username")?.into(),field("password")?.into());
++    let observer_backend=||NativeFundingRpc::new(u16::try_from(config["daemonPort"].as_u64().context("daemon port")?)?,
++        u16::try_from(config["observerPort"].as_u64().context("observer port")?)?,field("observerUsername")?.into(),field("observerPassword")?.into());
++    let agreement=native.restore_agreement()?;let keys=agreement.owned().wallet();
++    let mut session=crate::native_funding_rpc::wallet_session::NativeWalletSession::new(observer_backend()?,setup.policy.xmz_network);
++    session.restore_view(&crate::native_funding_rpc::wallet_session::SwapWalletId::new(setup.quote.terms()["swapId"].parse()?)?,
++        hex(&keys.private_view_key().0.as_bytes()),0,"owned-fixture-watch-wallet".into(),keys.address()).await?;
++    drop(session);drop(agreement);
++    let mut relay=NativeTransferRelay::new(backend()?);
++    let source=NativeFundingSource {wallet:XmzAddress::parse(setup.policy.xmz_network,field("source")?)?,account:0,priority:1};
++    let prepared=native.prepare_bch_native_funding(&mut relay,bch,source,5,now).await?;
++    ensure!(prepared.fee.atoms()>0 && prepared.fee.atoms()<=10_000_000_000,"native fee exceeds quote");
++    let review=native.review_bch_native_relay(bch,now+1)?;
++    assert!(native.relay_bch_native_funding(&mut relay,bch,&[0;32],now+2).await.is_err());
++    let sent=native.relay_bch_native_funding(&mut relay,bch,&review.commitment,now+2).await?;
++    assert_eq!(sent.txid,prepared.txid);assert_eq!(sent.fee,prepared.fee);
++    let before=contents(&metadata.0)?;
++    assert_eq!(native.relay_bch_native_funding(&mut relay,bch,&review.commitment,now+3).await?.txid,sent.txid);
++    assert_eq!(contents(&metadata.0)?,before);
++    let frame=native.prepare_bch_native_proof(now+4)?;
++    let signature=SigningKey::from_bytes(&[2;32]).sign(&proof::signing_bytes(&frame)?).to_bytes();
++    native.retain_outgoing_bch_native_proof(now+5,&signature)?;
++    sender.accept_bch_native_proof(now+6,&frame,&signature)?;
++    let observer=observer_backend()?;
++    assert!(sender.observe_bch_native_payment(&observer).await.is_err());
++    let pending=event.with_extension("pending");
++    save(&pending,&serde_json::to_vec(&json!({"phase":"native-funded","txid":bch_txid.to_string(),
++        "nativeTxid":sent.txid,"nativeFeeAtoms":sent.fee.atoms(),"nativeAmountAtoms":200_000_000_000u64}))?)?;
++    std::fs::rename(&pending,event)?;
++    tokio::time::timeout(std::time::Duration::from_secs(120),async {
++        loop {
++            if std::fs::read(gate).is_ok_and(|v|v==b"native-confirmed") {return;}
++            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
++        }
++    }).await.context("native confirmation fixture timed out")?;
++    let confirmed=sender.observe_bch_native_payment(&observer).await?;
++    assert_eq!(confirmed.quote(),setup.quote.commitment());
++    assert!(matches!(native.bch_native_relay_state()?,Some(NativeRelayState::Acknowledged {..})));
++    assert!(native.recover_bch_native_funding()?.txid==prepared.txid);
++    // Keep the private snapshot directory live through the final observation.
++    assert!(!contents(&snapshots.0)?.is_empty());
++    Ok(())
++}

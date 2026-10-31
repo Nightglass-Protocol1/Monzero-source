@@ -1,0 +1,131 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing.rs b/swap-machine/src/litecoin_light/vault/signing.rs
+--- a/swap-machine/src/litecoin_light/vault/signing.rs
++++ b/swap-machine/src/litecoin_light/vault/signing.rs
+@@ -41,3 +41,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++pub mod review;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/tests.rs b/swap-machine/src/litecoin_light/vault/signing/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/tests.rs
+@@ -1,6 +1,6 @@
+ use super::*;
+ use bitcoin::{absolute,transaction,TxIn,OutPoint,ScriptBuf,Sequence,Amount,Txid,hashes::Hash};
+-fn fixture()->Result<(SecretSeed,PublicAccount,Transaction,TxOut)> {
++pub(super) fn fixture()->Result<(SecretSeed,PublicAccount,Transaction,TxOut)> {
+     let seed=SecretSeed::from_bytes(Zeroizing::new([42;32]));
+     let account=seed.public_account(LtcNetwork::Regtest,2)?;
+     let prevout=TxOut {value:Amount::from_sat(100000),script_pubkey:account.derive(Branch::Receive,3)?.address().script_pubkey().clone()};
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review.rs b/swap-machine/src/litecoin_light/vault/signing/review.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review.rs
+@@ -0,0 +1,63 @@
++//! Immutable transaction-content review. Inputs are caller-supplied evidence,
++//! not an unspentness proof; consent and durable reservations remain external.
++use super::*;
++use bitcoin::{Amount,OutPoint};
++
++pub struct OwnedInput {
++    pub outpoint:OutPoint,
++    pub prevout:TxOut,
++    pub branch:Branch,
++    pub index:u32,
++}
++pub struct SpendReview {
++    account:PublicAccount,
++    transaction:Transaction,
++    inputs:Vec<OwnedInput>,
++    fee:Amount,
++}
++impl SpendReview {
++    /// Exactly one payment followed by optional wallet change. Output order and
++    /// values are retained, not reconstructed after approval. The caller must
++    /// separately authenticate prevouts and establish spending authorization.
++    pub fn new(account:&PublicAccount,transaction:Transaction,inputs:Vec<OwnedInput>,
++        payment:&TxOut,change_index:Option<u32>,maximum_fee:Amount)->Result<Self> {
++        ensure!(!inputs.is_empty() && inputs.len()<=1000 && transaction.input.len()==inputs.len(),
++            "invalid Litecoin spend input count");
++        ensure!(payment.value.to_sat()>0 && !payment.script_pubkey.is_empty() && payment.script_pubkey.len()<=10000,
++            "invalid Litecoin payment");
++        ensure!(transaction.output.len()==if change_index.is_some() {2}else{1}
++            && transaction.output.first()==Some(payment),"Litecoin payment outputs changed");
++        if let Some(index)=change_index {
++            let change=&transaction.output[1];
++            ensure!(change.value.to_sat()>0 && &change.script_pubkey==account.derive(Branch::Change,index)?.address().script_pubkey(),
++                "Litecoin change does not match wallet");
++        }
++        let mut seen=std::collections::HashSet::new();let mut total=0u64;
++        for (input,owned) in transaction.input.iter().zip(&inputs) {
++            ensure!(input.previous_output==owned.outpoint && !owned.outpoint.is_null() && seen.insert(owned.outpoint)
++                && input.script_sig.is_empty() && input.witness.is_empty(),"invalid Litecoin unsigned input");
++            ensure!(owned.prevout.value.to_sat()>0 && account.matches_script(owned.branch,owned.index,&owned.prevout.script_pubkey)?,
++                "Litecoin input ownership mismatch");
++            total=total.checked_add(owned.prevout.value.to_sat()).context("Litecoin input amount overflow")?;
++        }
++        let output=transaction.output.iter().try_fold(0u64,|sum,out|sum.checked_add(out.value.to_sat()).context("Litecoin output amount overflow"))?;
++        let fee=Amount::from_sat(total.checked_sub(output).context("Litecoin outputs exceed inputs")?);
++        ensure!(fee<=maximum_fee,"Litecoin fee exceeds approved maximum");
++        Ok(Self {account:PublicAccount::from_descriptor(&account.descriptor(),account.network())?,transaction,inputs,fee})
++    }
++    pub fn transaction(&self)->&Transaction {&self.transaction}
++    pub fn fee(&self)->Amount {self.fee}
++    /// Signs only the retained transaction; does not submit it or establish
++    /// freshness, unspentness, relay policy or user approval.
++    pub fn sign(&self,seed:&SecretSeed)->Result<Transaction> {
++        let mut signed=self.transaction.clone();
++        for (index,input) in self.inputs.iter().enumerate() {
++            signed.input[index].witness=seed.sign_p2wpkh_input(&self.account,input.branch,input.index,
++                &self.transaction,index,&input.prevout)?;
++        }
++        ensure!(signed.compute_txid()==self.transaction.compute_txid(),"Litecoin signing changed transaction identity");
++        Ok(signed)
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/tests.rs
+@@ -0,0 +1,38 @@
++use super::*;
++fn fixture()->Result<(SecretSeed,PublicAccount,Transaction,Vec<OwnedInput>)> {
++    let (seed,account,tx,prevout)=super::super::tests::fixture()?;
++    let input=OwnedInput {outpoint:tx.input[0].previous_output,prevout,branch:Branch::Receive,index:3};
++    Ok((seed,account,tx,vec![input]))
++}
++#[test]
++fn reviewed_payment_signs_exact_transaction_and_fee()->Result<()> {
++    let (seed,account,mut tx,inputs)=fixture()?;
++    tx.output[0].value=Amount::from_sat(60000);
++    tx.output.push(TxOut {value:Amount::from_sat(39000),script_pubkey:account.derive(Branch::Change,1)?.address().script_pubkey().clone()});
++    let payment=tx.output[0].clone();
++    let review=SpendReview::new(&account,tx.clone(),inputs,&payment,Some(1),Amount::from_sat(1000))?;
++    assert_eq!(review.fee(),Amount::from_sat(1000));assert_eq!(review.transaction(),&tx);
++    let signed=review.sign(&seed)?;assert_eq!(signed.output,tx.output);assert_eq!(signed.input[0].witness.len(),2);
++    assert!(review.transaction().input[0].witness.is_empty());
++    let other=SecretSeed::from_bytes(Zeroizing::new([43;32]));assert!(review.sign(&other).is_err());Ok(())
++}
++#[test]
++fn review_rejects_output_substitution_fees_and_input_mismatch()->Result<()> {
++    for mode in 0..7 {
++        let (_,account,mut tx,mut inputs)=fixture()?;let payment=tx.output[0].clone();
++        let mut limit=Amount::from_sat(1000);
++        match mode {
++            0=>limit=Amount::from_sat(999),
++            1=>tx.output[0].value=Amount::from_sat(100001),
++            2=>tx.output.push(payment.clone()),
++            3=>inputs[0].outpoint.vout=1,
++            4=>inputs[0].index=4,
++            5=>tx.input[0].witness.push([1]),
++            _=>tx.output[0].script_pubkey=account.derive(Branch::Change,1)?.address().script_pubkey().clone(),
++        }
++        assert!(SpendReview::new(&account,tx,inputs,&payment,None,limit).is_err());
++    }
++    let (_,account,mut tx,inputs)=fixture()?;let payment=tx.output[0].clone();
++    tx.output.push(TxOut {value:Amount::from_sat(1),script_pubkey:account.derive(Branch::Receive,0)?.address().script_pubkey().clone()});
++    assert!(SpendReview::new(&account,tx,inputs,&payment,Some(0),Amount::from_sat(1000)).is_err());Ok(())
++}

@@ -1,0 +1,111 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/observation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/observation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/observation.rs
+@@ -0,0 +1,35 @@
++//! Fresh confirmation of this native funder's exact retained BCH redemption.
++//! Observation does not rewrite relay history or authorize native payout.
++use super::*;
++use crate::bch_rpc::{BchRpc,confirmed::ConfirmedTransaction};
++use bitcoin::BlockHash;
++
++pub struct ConfirmedRedemption {
++    quote: [u8;32],admission: [u8;32],redemption: [u8;32],confirmation: ConfirmedTransaction,
++}
++impl ConfirmedRedemption {
++    pub fn quote(&self) -> &[u8;32] {&self.quote}
++    pub fn admission(&self) -> &[u8;32] {&self.admission}
++    pub fn redemption(&self) -> &[u8;32] {&self.redemption}
++    pub fn confirmation(&self) -> &ConfirmedTransaction {&self.confirmation}
++}
++impl AdmittedExecution<'_> {
++    /// The block is only a search hint. None requires the owned node's index.
++    /// Every call obtains fresh evidence, including after an uncertain relay.
++    pub async fn observe_bch_redemption(&self,bch: &BchRpc,block: Option<BlockHash>) -> Result<ConfirmedRedemption> {
++        let record=self.load_private_redemption()?.context("missing private BCH redemption")?;
++        let retained=summary(&record)?;
++        let (deployment,_)=self.native_bch_observation_policy()?;
++        ensure!(bch.deployment_commitment()?==deployment,"BCH redemption confirmation observer changed");
++        let minimum=u64::from(self.policy.bch_confirmations);
++        let confirmation=match block {
++            Some(block)=>bch.confirmed_transaction(retained.txid(),block,minimum).await?,
++            None=>bch.indexed_confirmed_transaction(retained.txid(),minimum).await?,
++        };
++        ensure!(confirmation.deployment()==&deployment
++            && serialize(confirmation.transaction())==record.transaction,
++            "confirmed BCH spend differs from retained redemption");
++        Ok(ConfirmedRedemption {quote:*self.quote.commitment(),admission:record.admission,
++            redemption:*retained.commitment(),confirmation})
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs
+@@ -89,3 +89,5 @@
+ }
+ 
+ pub mod relay;
++
++pub mod observation;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay.rs
+@@ -40,6 +40,22 @@
+         drop(execution);
+         let mut restored = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
+         assert_eq!(restored.bch_redemption_relay_state()?,Some(expected));
++        let observed=restored.observe_bch_redemption(rpc,Some(BlockHash::from_byte_array([6;32]))).await?;
++        assert_eq!(observed.confirmation().transaction().compute_txid(),txid);
++        assert_eq!(observed.confirmation().confirmations(),3);
++        assert_eq!(observed.quote(),setup.quote.commitment());
++        assert_eq!(observed.redemption(),restored.retained_bch_redemption()?.unwrap().commitment());
++        // Confirmed observation is read-only, including after a lost reply.
++        assert_eq!(restored.bch_redemption_relay_state()?,Some(expected));
++        if mode==0 {
++            assert_eq!(restored.observe_bch_redemption(rpc,None).await?.confirmation().transaction().compute_txid(),txid);
++            for unsafe_mode in [1,2,3] {
++                server.state.lock().unwrap().redemption_confirmation_mode=unsafe_mode;
++                assert!(restored.observe_bch_redemption(rpc,None).await.is_err());
++            }
++            server.state.lock().unwrap().redemption_confirmation_mode=0;
++        }
++
+         let again = restored.relay_bch_redemption(&observer,rpc,&review.commitment,2039).await;
+         if mode==0 {assert_eq!(again?,txid);} else {assert!(again.is_err());}
+         assert_eq!(server.state.lock().unwrap().redemption_relay_calls,before+1);
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+@@ -7,7 +7,7 @@
+     sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
+ 
+ #[derive(Default)]
+-struct State { redemption: Option<Transaction>, redemption_relay_calls: usize, locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8,
++struct State { redemption_confirmation_mode: u8, redemption: Option<Transaction>, redemption_relay_calls: usize, locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8,
+     sign_calls: usize, sign_mode: u8, signed_candidate: Vec<u8>, sign_intent: Option<std::path::PathBuf>, observed: Option<Transaction>, observed_vout: u32,
+     observation_mode: u8, observation_chain_calls: usize, relay_mode: u8, relay_calls: usize, relay_intent: Option<std::path::PathBuf> }
+ struct Server {
+@@ -68,6 +68,23 @@
+                             } else {"08".repeat(32)}})
+                     },
+                     "getblockhash" => json!(if request["params"][0] == 0 {network.genesis().into()} else {"07".repeat(32)}),
++                    "getrawtransaction" => {
++                        use bitcoin::consensus::encode::serialize_hex;
++                        let expected=state.redemption.as_ref().context("missing redemption observation fixture")?;
++                        let block="06".repeat(32);
++                        ensure!(request["params"]==json!([expected.compute_txid(),true])
++                            || request["params"]==json!([expected.compute_txid(),true,block]),"wrong redemption observation lookup");
++                        let mut tx=expected.clone();
++                        if state.redemption_confirmation_mode==3 {tx.output[0].value=Amount::from_sat(1);}
++                        json!({"txid":expected.compute_txid(),"hex":serialize_hex(&tx),"blockhash":block,
++                            "in_active_chain":state.redemption_confirmation_mode!=1,
++                            "confirmations":if state.redemption_confirmation_mode==2 {1} else {3}})
++                    },
++                    "getblockheader" => {
++                        ensure!(request["params"]==json!(["06".repeat(32),true]),"wrong redemption block header");
++                        json!({"hash":"06".repeat(32),"height":if state.redemption_confirmation_mode==2 {200} else {198},
++                            "confirmations":if state.redemption_confirmation_mode==2 {1} else {3}})
++                    },
+                     "getwalletinfo" => json!({"walletname":"test","private_keys_enabled":true}),
+                     "getaddressinfo" => json!({"ismine":true,"iswatchonly":false,"scriptPubKey":script.to_hex_string()}),
+                     "gettxout" if state.observed.as_ref().is_some_and(|tx| request["params"][0]==tx.compute_txid().to_string()) => {

@@ -1,0 +1,168 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution.rs
+@@ -5,6 +5,8 @@
+ use crate::bch_key_recovery::authenticated::local_keys::{RetainedLocalKeys,peer::RetainedPeer};
+ use crate::litecoin_rpc::reservation::Journal;
+ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt};
++
++pub mod funding;
+ 
+ const SCHEMA: &str = "monzero-bch-execution-admission-v2";
+ 
+@@ -79,7 +81,9 @@
+         let admission = Admission {schema:SCHEMA.into(),trade:quote.terms()["swapId"].clone(),
+             quote:*reviewed_quote,role,admitted_at:now,pins};
+         metadata.retain(&name(quote,role),&serde_json::to_vec(&admission)?)?;
+-        Ok(Self {metadata,snapshots:snapshots.into(),quote,policy,role})
++        let execution = Self {metadata,snapshots:snapshots.into(),quote,policy,role};
++        execution.prepared_bch_funding()?;
++        Ok(execution)
+     }
+ 
+     /// Cold recovery uses the original externally verified quote/policy/role.
+@@ -88,6 +92,7 @@
+         policy: &'a Policy, role: Role) -> Result<Self> {
+         let execution = Self {metadata:open(metadata,snapshots)?,snapshots:snapshots.into(),quote,policy,role};
+         execution.restore_agreement()?;
++        execution.prepared_bch_funding()?;
+         Ok(execution)
+     }
+ 
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -728,7 +728,7 @@
+         assert!(AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role).is_err());
+         assert_eq!(*execution.restore_agreement()?.secret_checkpoint(&setup.quote)?,*agreed.secret_checkpoint(&setup.quote)?);
+         drop(execution);
+-        let execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role)?;
++        let mut execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role)?;
+         assert_eq!(execution.restore_agreement()?.commitment(),agreed.commitment());
+         let change = setup.quote.recovery_plan().recovery().terms().redeem_destination.clone();
+         let amount = setup.quote.recovery_plan().terms().locked_atoms;
+@@ -748,10 +748,44 @@
+         assert!(execution.validate_bch_funding_preview(2000,&raw,&[&parent],&change,1000,546).is_err());
+         assert!(execution.validate_bch_funding_preview(1006,&raw,&[&parent],&change,5001,546).is_err());
+         assert!(execution.validate_bch_funding_preview(1006,&raw,&[&parent],&change,999,546).is_err());
++        assert!(execution.prepared_bch_funding()?.is_none());
++        if role == Role::BchFunder {
++            let prepared = execution.retain_bch_funding_preparation(1006,&raw,&[&parent],&change,1000,546)?;
++            let digest = *prepared.commitment();
++            assert_eq!(prepared.prepared_at(),1006);
++            assert_eq!(execution.prepared_bch_funding()?.unwrap().commitment(),&digest);
++            assert!(execution.retain_bch_funding_preparation(2000,&raw,&[&parent],&change,1000,546).is_err());
++            let pin_path = std::fs::read_dir(&metadata.0)?.map(|e|e.unwrap().path())
++                .find(|p|p.file_name().unwrap().to_string_lossy().ends_with("bch-funding-pin")).unwrap();
++            // Simulate the snapshot-written/metadata-not-published boundary.
++            std::fs::remove_file(pin_path)?;
++            assert!(execution.prepared_bch_funding()?.is_none());
++            let mut changed = funding.clone(); changed.output[1].value=Amount::from_sat(9999);
++            assert!(execution.retain_bch_funding_preparation(1006,&serialize(&changed),&[&parent],&change,1001,546).is_err());
++            assert_eq!(execution.retain_bch_funding_preparation(1006,&raw,&[&parent],&change,1000,546)?.commitment(),&digest);
++            drop(execution);
++            execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role)?;
++            let reopened = execution.prepared_bch_funding()?.unwrap();
++            assert_eq!(reopened.commitment(),&digest);
++            assert_eq!(serialize(reopened.preview().transaction()),raw);
++            assert_eq!(reopened.preview().fee().to_sat(),1000);
++            let template_path = std::fs::read_dir(&snapshots.0)?.map(|e|e.unwrap().path())
++                .find(|p|p.file_name().unwrap().to_string_lossy().ends_with("bch-funding-template")).unwrap();
++            let original = std::fs::read(&template_path)?;
++            std::fs::write(&template_path,b"{")?;
++            assert!(execution.prepared_bch_funding().is_err());
++            drop(execution);
++            assert!(AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role).is_err());
++            std::fs::write(template_path,original)?;
++            execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role)?;
++        } else {
++            assert!(execution.retain_bch_funding_preparation(1006,&raw,&[&parent],&change,1000,546).is_err());
++        }
+         drop(execution);
+         // An identical admission is an idempotent retry, not a replacement.
+         drop(admit(&metadata.0,setup.quote.commitment(),pins,1005)?);
+-        let record = std::fs::read_dir(&metadata.0)?.next().unwrap()?.path();
++        let record = std::fs::read_dir(&metadata.0)?.map(|e|e.unwrap().path())
++            .find(|p|p.file_name().unwrap().to_string_lossy().contains("execution-admission")).unwrap();
+         std::fs::write(&record,b"{")?;
+         assert!(AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,role).is_err());
+     }
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
+@@ -0,0 +1,78 @@
++//! Retained unsigned funding preparation, not input reservation, approval,
++//! signing permission or relay state. Snapshot publication precedes metadata.
++use super::*;
++use swap_core::bch::funding::FundingPreview;
++
++const TEMPLATE: &str = "monzero-bch-funding-template-v1";
++const PIN: &str = "monzero-bch-funding-pin-v1";
++
++pub struct PreparedBchFunding { preview: FundingPreview, commitment: [u8;32], prepared_at: u64 }
++impl PreparedBchFunding {
++    pub fn preview(&self) -> &FundingPreview { &self.preview }
++    pub fn commitment(&self) -> &[u8;32] { &self.commitment }
++    pub fn prepared_at(&self) -> u64 { self.prepared_at }
++}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Template {
++    schema: String, admission: [u8;32], prepared_at: u64, unsigned: Vec<u8>,
++    sources: Vec<Vec<u8>>, change: Vec<u8>, maximum_fee: u64, minimum_change: u64,
++}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Pin { schema: String, admission: [u8;32], template: [u8;32] }
++fn hash(domain: &str, bytes: &[u8]) -> [u8;32] {
++    let mut h = Sha256::new(); h.update(domain); h.update([0]); h.update(bytes); h.finalize().into()
++}
++fn record_name(quote: &VerifiedBchQuote, suffix: &str) -> String {
++    format!("{}.bch-funding-{suffix}",quote.terms()["swapId"])
++}
++impl AdmittedExecution<'_> {
++    fn admission_digest(&self) -> Result<[u8;32]> {
++        Ok(hash(SCHEMA,&serde_json::to_vec(&self.read_admission()?)?))
++    }
++    /// Retain the exact validated preparation before publishing its trusted pin.
++    /// A retry must supply the original bytes, policy and preparation time.
++    /// Failure leaves any written records in place; never delete them to reprice.
++    pub fn retain_bch_funding_preparation(&mut self, now: u64, unsigned: &[u8], sources: &[&[u8]],
++        change: &bitcoin::Script, maximum_fee: u64, minimum_change: u64) -> Result<PreparedBchFunding> {
++        let preview = self.validate_bch_funding_preview(now,unsigned,sources,change,maximum_fee,minimum_change)?;
++        let admission = self.admission_digest()?;
++        let template = Template {schema:TEMPLATE.into(),admission,prepared_at:now,unsigned:unsigned.to_vec(),
++            sources:sources.iter().map(|s|s.to_vec()).collect(),change:change.as_bytes().to_vec(),maximum_fee,minimum_change};
++        let bytes = serde_json::to_vec(&template)?;
++        // A bounded journal record is stricter than the in-memory preview limit.
++        ensure!(bytes.len() <= 2_000_000,"BCH funding preparation exceeds durable record limit");
++        let commitment = hash(TEMPLATE,&bytes);
++        Journal::open(&self.snapshots)?.retain(&record_name(self.quote,"template"),&bytes)?;
++        let pin = Pin {schema:PIN.into(),admission,template:commitment};
++        self.metadata.retain(&record_name(self.quote,"pin"),&serde_json::to_vec(&pin)?)?;
++        Ok(PreparedBchFunding {preview,commitment,prepared_at:now})
++    }
++
++    /// Restore the exact historically validated preparation. None means there
++    /// is no trusted pin, not that inputs may be reselected or funds relayed.
++    /// An orphan template still blocks any different preparation at its slot.
++    /// Signing must separately check current expiry, chain state and approval.
++    pub fn prepared_bch_funding(&self) -> Result<Option<PreparedBchFunding>> {
++        let pin_bytes = match self.metadata.read(&record_name(self.quote,"pin")) {
++            Ok(bytes)=>bytes,
++            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>return Ok(None),
++            Err(error)=>return Err(error),
++        };
++        ensure!(self.role == Role::BchFunder && pin_bytes.len() <= 4096,"invalid BCH funding preparation owner");
++        let pin: Pin = serde_json::from_slice(&pin_bytes)?;
++        let admission = self.admission_digest()?;
++        ensure!(pin.schema == PIN && pin.admission == admission && serde_json::to_vec(&pin)? == pin_bytes,
++            "BCH funding pin admission mismatch");
++        let bytes = Journal::open(&self.snapshots)?.read(&record_name(self.quote,"template"))?;
++        ensure!(hash(TEMPLATE,&bytes) == pin.template,"BCH funding template digest mismatch");
++        let template: Template = serde_json::from_slice(&bytes)?;
++        ensure!(template.schema == TEMPLATE && template.admission == admission
++            && serde_json::to_vec(&template)? == bytes,"BCH funding template admission mismatch");
++        let sources: Vec<&[u8]> = template.sources.iter().map(Vec::as_slice).collect();
++        let preview = self.validate_bch_funding_preview(template.prepared_at,&template.unsigned,&sources,
++            bitcoin::Script::from_bytes(&template.change),template.maximum_fee,template.minimum_change)?;
++        Ok(Some(PreparedBchFunding {preview,commitment:pin.template,prepared_at:template.prepared_at}))
++    }
++}

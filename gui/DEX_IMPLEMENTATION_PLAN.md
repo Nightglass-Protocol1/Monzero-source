@@ -2,6 +2,169 @@
 
 Status: local prototype. Funding previews cannot sign or broadcast transactions.
 
+Scope update: [the approved first-release plan](DEX_FIRST_RELEASE_SCOPE.md) permits
+zero mandatory app trading fee for initial BTC/XMZ swaps. Fee-bearing V6 material
+below remains historical research, not the activation prerequisite for that scope.
+
+## Native-funder Litecoin recovery app controls — 6 October 2026
+
+Shared app setup now connects the native-funder's cancellation and punishment
+controls to the role-bound helper commands. The Litecoin funder retains
+cancellation/refund and its own funding controls. Reviews bind the signed fee and
+destination; submission requires explicit consent, and failed checks clear old
+confirmation evidence. The wallet rebuild, ten-scenario transport regression and
+32 QML checks passed. All four targeted DEX suites passed and the production
+helper rebuilt successfully. Real-node recovery acceptance remains pending while
+node fixtures are stopped. The earlier helper checkpoint below records its own scope;
+the detailed app checkpoint is in `DEX_MULTICOIN_PROGRESS.md`.
+
+## Native-funder Litecoin recovery transport — 6 October 2026
+
+The helper now exposes separate review, explicitly approved submission and
+confirmation commands for the native-funder's retained cancellation and
+punishment transactions. It reuses the existing engine recovery implementation
+and private native-funding configuration. Thirteen helper tests, release
+all-features/all-targets compilation and patch reconstruction passed. Qt/QML
+integration and helper-to-node acceptance are still required; node fixtures
+remain stopped. See the detailed checkpoint in `DEX_MULTICOIN_PROGRESS.md`.
+
+## Dogecoin funding-output observation — 6 October 2026
+
+The engine now checks an expected Dogecoin output against confirmed transaction
+bytes and the mempool-aware UTXO view, rejecting altered amounts/scripts, spent
+outputs and inconsistent chain observations. Mock RPC coverage passed; the
+extended real-node fixture remains unrun while node tests are stopped. This is a
+funding-validation prerequisite, not a complete DOGE/XMZ settlement protocol.
+
+Rust regression: 148 library tests and 12 helper tests passed, seven node fixtures
+ignored. Release all-features/all-targets compilation and ordered patch
+reconstruction passed. Logs: `build/dogecoin-unspent-regression-20261006.log`,
+`build/dogecoin-unspent-check-20261006.log` and
+`build/dogecoin-unspent-patch-audit-20261006.log`.
+
+## Market isolation update — 6 October 2026
+
+Litecoin trade controls are now grouped under the selected LTC market, and the
+Bitcoin commercial-terms panel is restricted to BTC. Changing markets clears
+checked approvals without discarding saved backend reviews or submitting an
+operation. Returning to a market requires a fresh checkbox acknowledgement.
+
+The wallet rebuild passed (`build/market-isolation-wallet-20261006.log`). The
+short QML suite reports 31 passed, zero failures
+(`build/market-isolation-qml-20261006.log`), including market switching across all
+seven supported pairs and retained-review/no-submission assertions. The standalone
+runner still emits its existing `ImageMask.qml` missing `isOpenGL` context warning.
+Long-running node tests were not restarted; continuous full settlement remains
+unverified. The 5 October table below retains the earlier engine and node evidence.
+
+## Current build and verification — 5 October 2026
+
+The wallet builds successfully. The current changes extend the isolated Litecoin
+integration tests; at that checkpoint, production wallet, QML and Rust sources had not changed since
+the successful shared-setup build. This is a private prototype, not a live-trading
+release. The active worktree contains uncommitted development changes.
+
+| Area | Current verified status | Evidence |
+| --- | --- | --- |
+| Full wallet | Built successfully | [Wallet build log](build/litecoin-app-setup-build-tests-20261005.log) |
+| Latest DEX test binary | Built with the continuous-settlement driver | [Test build log](build/litecoin-continuous-settlement-build-20261005.log) |
+| Targeted CTest suites | 4/4 passed: engine, settlement, private quote channel and settlement journal | [CTest log](build/litecoin-continuous-settlement-ctest-20261005.log) |
+| QML controls | 29 tests passed at the latest UI change | [QML log](build/litecoin-app-setup-qml-20261005.log) |
+| Rust engine/helper | 148 library tests and 12 helper tests passed; 7 fixture tests ignored by the ordinary runner | [Rust test log](build/litecoin-indexed-settlement-rust-tests-20261005.log) |
+| Rust build coverage | All-features/all-targets check passed; warnings remain | [Rust check log](build/litecoin-indexed-settlement-rust-check-20261005.log) |
+| Engine patch provenance | Ordered patches reproduce all indexed engine sources | [Patch audit](build/litecoin-indexed-settlement-patch-audit-20261005.log) |
+| Litecoin continuous funding | Success and refund runs passed with the same engines from startup through confirmed funding; later settlement and fresh-engine restart also passed | [Success report](build/litecoin-resident-funding-success-20261005-results.json), [refund report](build/litecoin-resident-funding-refund-20261005-results.json) |
+| Litecoin continuous full settlement | Implemented; full verification incomplete. Reruns stopped at the user’s request. Initial runs reached settlement but hit QtTest's 300-second function watchdog. Resident-only limit raised to 1,800 seconds; operation deadlines retained | [Success rerun](build/litecoin-continuous-settlement-success-recheck-20261005.log), [refund rerun](build/litecoin-continuous-settlement-refund-recheck-20261005.log) |
+
+The continuous full-settlement reruns were stopped at the user’s request and are
+not counted as passing. No test runs remain active. The next gate
+is confirming both paths through redemption/cancellation, recovered-wallet
+operations, final payments, reorganisations and subsequent restart. Remaining
+Litecoin recovery-path acceptance and the other currencies' settlement work still
+block live activation. Current node reports retain `executable: false` and
+`recoveryPathsVerified: false`.
+
+## Multi-asset roadmap update — 5 October 2026
+
+The active scope includes LTC, DOGE, ETH, XMR and native THORChain RUNE while
+preserving the BTC/XMZ foundation. Coin selectors and exact-precision previews
+are implemented; all new markets remain unavailable for live trading.
+
+Litecoin has recorded isolated paired-chain success and refund fixtures,
+including native payout proofs and cache-rebuild recovery. The September 27
+success report covers GUI-bound funding and payout review, submission,
+confirmation and reorganisation rejection. These results supersede the older
+notes saying paired-chain settlement had not passed; they do not establish
+complete release or recovery-path acceptance.
+
+A private shared app manifest now attaches startup, funding, recovery and payment
+controls to the same saved Litecoin trade, with separate phase state and approvals.
+Initial creation, approval-gated peer startup and restart are now exercised through
+the shared setup. A resident Qt fixture also keeps both engines alive through
+reservation, recovery agreement, lock approval and confirmed native funding.
+The next app-flow work is extending that continuous sequence through redemption
+and final payments, followed by remaining recovery paths. Payout/refund RPC configuration can now omit future
+block hashes: the helper resolves the agreed transaction's active block locally,
+and both isolated paired-chain paths pass after mining that transaction into a
+different block without changing configuration. The private Qt session transports and locally verifies
+the native funding proof, waits for Litecoin-side release approval, signs the
+exact retained redemption frame and exchanges durable acknowledgements.
+That message exchange does not broadcast either payment. A separate app control
+now reviews and approves the completed Litecoin transaction, submits or explicitly
+retries its exact saved bytes, and checks indexed confirmation. The isolated
+paired-chain success fixture passes these controls, including unconfirmed and
+reorganised-block rejection with stale UI evidence cleared.
+Cancellation/refund confirmation
+now has a separate read-only app check using the local node transaction index,
+active-block membership, saved transaction effect and required confirmation depth.
+A new check clears previous evidence immediately; failure leaves an unknown result.
+Litecoin cancellation/refund now have separate Qt review and submission controls,
+with approval bound to the exact retained bytes and first-send/retry action.
+Retries reconcile exact signed bytes already in the node mempool; node timelock
+preflight remains required before sending. These controls remain regtest-only. Claim/refund
+wallet restoration, explicit reopen and checking an already-open wallet now run
+through native helper and Qt controls. Recovered XMZ payout/refund preparation
+uses explicit observer/spending-wallet connections and separate payment approval. Litecoin lock funding now has a separate
+app review and explicit approval bound to its retained transaction and send/retry
+action. First submission signs only that reservation; retry reconciles the exact
+persisted transaction. XMZ funding preparation is now exposed through
+the native helper and Qt controls, with an explicit source wallet/account/priority,
+no broadcast, and separate approval of the retained payment.
+The native journal helper now has separate startup review and approval operations
+bound to a mutually signed v2 quote, role, policy and pinned counterparties.
+It is restricted to Litecoin regtest and does not send funds. Its request and
+configuration tests pass; helper-started paired-chain success and refund
+acceptance passed on disposable chains. Qt/QML now displays the full startup
+review and requires explicit consent bound to its commitment. Both paired-chain
+paths passed with both roles created and resumed through the Qt bridge. Lost
+startup replies block automatic retries and replacement keys. Peer negotiation
+can now use engine-produced messages signed by the Qt encrypted identity store.
+The native helper retains those external signatures and accepts authenticated
+incoming messages into the saved trade, with idempotent redelivery. A native Qt
+coordinator now owns this workflow over mutually authenticated, pinned TLS; both
+paired-chain paths pass with fresh-session redelivery leaving retained state
+unchanged. Wallet startup now provisions it through a private `--dex-ltc-peer`
+configuration and starts loopback TLS only after matching trade creation or
+saved-journal validation. A funding source configuration enables XMZ preparation
+after recovery agreement and confirmed Litecoin funding. Recovery messages can now
+be prepared and admitted through the helper, with exact retained frames signed
+by the Qt encrypted identity store. The native session now exchanges those
+messages and durable acknowledgements over pinned mutual TLS, with restart
+redelivery. The app now has an owned reservation helper/job and an explicit
+control that reserves Litecoin inputs and starts recovery exchange. It restores
+the same reservation on reconnect. Signing/broadcasting the Litecoin lock now
+requires its separate app approval; a changed review clears consent. Existing saved-trade funding,
+payout and refund controls continue to require their own approvals.
+
+Dogecoin has engine-signed P2SH/CLTV refund primitives and a chain-specific
+confirmation adapter tested against an actual disposable node, including node
+restart and reorganisation. These are not a DOGE/XMZ two-party swap protocol.
+ETH settlement remains unimplemented; explicit sequential routes are approved
+for XMR/RUNE but are not executable. BCH also requires its own settlement work.
+See [current evidence and remaining work](DEX_MULTICOIN_PROGRESS.md).
+The detailed material below includes earlier research and does not override
+per-market activation gates.
+
 ## Current verification boundary
 
 The funding planner is implemented and covered by regression tests for acquisition,

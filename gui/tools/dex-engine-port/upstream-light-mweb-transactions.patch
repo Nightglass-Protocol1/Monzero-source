@@ -1,0 +1,166 @@
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+index 843456559..b3101f49f 100644
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -72,6 +72,65 @@ pub fn script_hash(script: &Script) -> String {
+     digest.iter().map(|b| format!("{b:02x}")).collect()
+ }
+ 
++/// Litecoin MWEB serialization (flag bit 0x08) carries extension-block data
++/// between the outputs (or witnesses) and the lock time: the HogEx transaction
++/// that pays MWEB peg-outs, and canonical transactions that peg in. The txid
++/// excludes that data, as it excludes witnesses. Returns the bytes without it,
++/// in the plain or segwit form, so the standard decoder reads them; callers
++/// still require the decoded txid to be the one they asked for. Other bytes
++/// are returned unchanged.
++pub fn canonical_transaction(raw: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
++    use std::borrow::Cow;
++    if raw.len() < 6 || raw[4] != 0 || raw[5] & 0x08 == 0 { return Ok(Cow::Borrowed(raw)); }
++    let flags = raw[5];
++    ensure!(flags & !0x09 == 0, "unsupported Litecoin transaction flags");
++    struct Reader<'a> { bytes: &'a [u8], at: usize }
++    impl Reader<'_> {
++        fn take(&mut self, count: usize) -> Result<std::ops::Range<usize>> {
++            let end = self.at.checked_add(count).filter(|end| *end <= self.bytes.len())
++                .context("truncated Litecoin MWEB transaction")?;
++            let range = self.at..end; self.at = end; Ok(range)
++        }
++        fn count(&mut self) -> Result<usize> {
++            let first = self.bytes[self.take(1)?.start];
++            let value = match first {
++                0xfd => u64::from(u16::from_le_bytes(self.bytes[self.take(2)?].try_into()?)),
++                0xfe => u64::from(u32::from_le_bytes(self.bytes[self.take(4)?].try_into()?)),
++                0xff => u64::from_le_bytes(self.bytes[self.take(8)?].try_into()?),
++                small => u64::from(small),
++            };
++            ensure!(value <= MAX_TRANSACTION as u64, "oversized Litecoin MWEB transaction field");
++            Ok(value as usize)
++        }
++        fn item(&mut self) -> Result<()> { let length = self.count()?; self.take(length)?; Ok(()) }
++    }
++    let mut reader = Reader { bytes: raw, at: 6 };
++    let body = reader.at;
++    let inputs = reader.count()?;
++    for _ in 0..inputs { reader.take(36)?; reader.item()?; reader.take(4)?; }
++    let outputs = reader.count()?;
++    for _ in 0..outputs { reader.take(8)?; reader.item()?; }
++    let witness_start = reader.at;
++    let mut witnessed = false;
++    if flags & 0x01 != 0 {
++        for _ in 0..inputs {
++            let items = reader.count()?;
++            witnessed |= items != 0;
++            for _ in 0..items { reader.item()?; }
++        }
++    }
++    // The extension data itself is not decoded: it is whatever lies between
++    // here and the four lock-time bytes, and must not be empty.
++    ensure!(raw.len() >= reader.at + 5, "truncated Litecoin MWEB transaction");
++    let mut canonical = Vec::with_capacity(raw.len());
++    canonical.extend_from_slice(&raw[..4]);
++    if witnessed { canonical.extend_from_slice(&[0, 1]); }
++    canonical.extend_from_slice(&raw[body..witness_start]);
++    if witnessed { canonical.extend_from_slice(&raw[witness_start..reader.at]); }
++    canonical.extend_from_slice(&raw[raw.len() - 4..]);
++    Ok(Cow::Owned(canonical))
++}
++
+ /// Match exact requested non-witness transaction identity and header identity.
+ /// All payloads are bounded before deserialization. The supplied block hash is
+ /// SHA256d header identity, NOT Litecoin's Scrypt proof-of-work hash.
+@@ -84,8 +143,9 @@ pub fn match_merkle_proof(request: &InclusionRequest, header_bytes: &[u8],
+         "invalid Electrum proof response size");
+     let header: Header = deserialize(header_bytes).context("invalid Litecoin header")?;
+     ensure!(header.block_hash() == request.block_hash, "Litecoin proof header changed");
+-    let transaction: Transaction = deserialize(transaction_bytes).context("unsupported or invalid Litecoin transaction")?;
+-    ensure!(serialize(&transaction) == transaction_bytes && transaction.compute_txid() == request.txid,
++    let canonical = canonical_transaction(transaction_bytes)?;
++    let transaction: Transaction = deserialize(&canonical).context("unsupported or invalid Litecoin transaction")?;
++    ensure!(serialize(&transaction) == *canonical && transaction.compute_txid() == request.txid,
+         "Litecoin proof transaction changed");
+     // A 64-byte non-witness transaction can be confused with a Merkle internal
+     // node. Reject it even if a server supplies an otherwise matching branch.
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+index cb00f49f8..be63f1864 100644
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -122,7 +122,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ReadSession<S> {
+         let (_, bytes) = self.exchange("blockchain.transaction.get", json!([txid.to_string(), false]),
+             MAX_TRANSACTION * 2 + 1024).await?;
+         let raw = decode_hex(&result::<String>(&bytes)?, MAX_TRANSACTION)?;
+-        let transaction: Transaction = deserialize(&raw)?;
++        let transaction: Transaction = deserialize(&super::canonical_transaction(&raw)?)?;
+         ensure!(transaction.compute_txid() == txid, "Electrum returned another transaction");
+         let (id, proof) = self.exchange("blockchain.transaction.get_merkle", json!([txid.to_string(), height]),
+             MAX_RESPONSE).await?;
+@@ -136,8 +136,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ReadSession<S> {
+         let (_,bytes)=self.exchange("blockchain.transaction.get",json!([txid.to_string(),false]),
+             MAX_TRANSACTION*2+1024).await?;
+         let raw=decode_hex(&result::<String>(&bytes)?,MAX_TRANSACTION)?;
+-        let transaction:Transaction=deserialize(&raw)?;
+-        ensure!(serialize(&transaction)==raw && transaction.compute_txid()==txid,
++        let canonical=super::canonical_transaction(&raw)?;
++        let transaction:Transaction=deserialize(&canonical)?;
++        ensure!(serialize(&transaction)==*canonical && transaction.compute_txid()==txid,
+             "Litecoin pending transaction identity changed");
+         Ok(transaction)
+     }
+diff --git a/swap-machine/src/litecoin_light/tests.rs b/swap-machine/src/litecoin_light/tests.rs
+index acd7a5406..7766e8076 100644
+--- a/swap-machine/src/litecoin_light/tests.rs
++++ b/swap-machine/src/litecoin_light/tests.rs
+@@ -123,3 +123,54 @@ fn light_proof_does_not_claim_to_authenticate_witness() -> Result<()> {
+     check(&request,&header,&serialize(&tx),&response)?;
+     Ok(())
+ }
++
++// HogEx transaction 9fca4fed… from Litecoin testnet block 4,926,156, as
++// litecoind's getrawtransaction returns it (MWEB flag 0x08).
++const TESTNET_HOGEX: &str = "02000000000801e8524178f45afa866ef46199e9d547cf6d8557871dd948301fed84cc79b01fb50000000000ffffffff01d4511a2f11a300002258205b8365f5e750603d21f800a1cb2146bc5e5ae0bc8137a4ee99e01bae900bd0ef0000000000";
++
++#[test]
++fn mweb_hogex_is_read_without_its_extension_data() -> Result<()> {
++    let raw = bytes(TESTNET_HOGEX);
++    assert!(deserialize::<Transaction>(&raw).is_err(), "the plain decoder cannot read MWEB bytes");
++    let canonical = canonical_transaction(&raw)?;
++    let tx: Transaction = deserialize(&canonical)?;
++    assert_eq!(tx.compute_txid().to_string(), "9fca4fedfd27be931530b168845a4896aee81065dcd552a6b432d314895a46ff");
++    assert_eq!(tx.input.len(), 1);
++    assert_eq!(tx.output.len(), 1);
++    assert_eq!(serialize(&tx), *canonical);
++    Ok(())
++}
++
++#[test]
++fn mweb_segwit_transaction_keeps_its_witnesses() -> Result<()> {
++    let (_, _, raw, _) = fixture();
++    let mut tx: Transaction = deserialize(&raw)?;
++    tx.input[0].witness.push([7; 72]); tx.input[0].witness.push([2; 33]);
++    let segwit = serialize(&tx);
++    // Same transaction with the MWEB bit and three bytes of extension data.
++    let mut mweb = segwit.clone();
++    mweb[5] = 0x09;
++    let at = mweb.len() - 4;
++    mweb.splice(at..at, [1, 0xab, 0xcd]);
++    let canonical = canonical_transaction(&mweb)?;
++    assert_eq!(*canonical, segwit[..]);
++    let decoded: Transaction = deserialize(&canonical)?;
++    assert_eq!(decoded.compute_txid(), tx.compute_txid());
++    assert_eq!(decoded.input[0].witness, tx.input[0].witness);
++    Ok(())
++}
++
++#[test]
++fn mweb_bytes_that_do_not_parse_are_refused() {
++    let raw = bytes(TESTNET_HOGEX);
++    let mut unknown_flag = raw.clone(); unknown_flag[5] = 0x0c;
++    assert!(canonical_transaction(&unknown_flag).is_err());
++    // No extension data left before the lock time.
++    assert!(canonical_transaction(&raw[..raw.len() - 1]).is_err());
++    assert!(canonical_transaction(&raw[..20]).is_err());
++    let mut huge_count = raw.clone(); huge_count[6] = 0xff;
++    assert!(canonical_transaction(&huge_count).is_err());
++    // Ordinary transactions pass through untouched.
++    let (_, _, plain, _) = fixture();
++    assert!(matches!(canonical_transaction(&plain), Ok(std::borrow::Cow::Borrowed(_))));
++}

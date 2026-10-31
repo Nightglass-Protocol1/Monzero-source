@@ -117,6 +117,17 @@ void registerXdgMime(){
     // - Windows handled in the installer by rbrunner7
     // - Linux written to `QStandardPaths::ApplicationsLocation`
     // - Tails written to persistent dotfiles
+    // Install the same transparent artwork used inside the wallet so a Linux
+    // desktop does not keep showing a missing or older orange application icon.
+    const QString iconPath = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+        + "/icons/hicolor/256x256/apps/monzero.png";
+    QFile iconSource(":/images/monzero-xmz-coin.png");
+    QSaveFile iconFile(iconPath);
+    if (QDir().mkpath(QFileInfo(iconPath).path()) && iconSource.open(QIODevice::ReadOnly)
+        && iconFile.open(QIODevice::WriteOnly)) {
+        const QByteArray icon = iconSource.readAll();
+        if (iconFile.write(icon) == icon.size()) iconFile.commit();
+    }
     QString mime = xdgMime();
     QString appPath = QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation);
     QString filePath = QString("%1/monzero-gui.desktop").arg(appPath);

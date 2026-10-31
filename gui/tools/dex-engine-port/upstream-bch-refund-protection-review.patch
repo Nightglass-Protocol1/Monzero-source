@@ -1,0 +1,91 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/refund.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/refund.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/refund.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/refund.rs
+@@ -13,6 +13,13 @@
+ #[serde(deny_unknown_fields)]
+ struct Receipt { schema: String, admission: [u8;32], signed: SignedFrame }
+ 
++const PROTECTION_REVIEW: &str = "monzero-bch-refund-protection-review-v1";
++pub struct RefundProtectionReview { pub details: serde_json::Value, pub commitment: [u8;32] }
++pub struct SavedRefundProtection { pub receipt: [u8;32], pub received_at: u64 }
++fn digest(domain: &str,bytes: &[u8]) -> [u8;32] {
++    let mut hash=Sha256::new();hash.update(domain.as_bytes());hash.update([0]);hash.update(bytes);hash.finalize().into()
++}
++fn hex(bytes: &[u8]) -> String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
+ pub struct OutgoingRefund { frame: Vec<u8>, signature: Vec<u8> }
+ impl OutgoingRefund {
+     pub fn frame(&self) -> &[u8] { &self.frame }
+@@ -98,6 +105,43 @@
+         Ok(OutgoingRefund {frame:prepared.frame,signature:signature.to_vec()})
+     }
+ 
++    /// Offline review of the authenticated peer's exact refund protection.
++    /// This approves receiving one adaptor only, never funding or refund release.
++    pub fn review_bch_refund_protection(&self,now: u64,frame: &[u8],signature: &[u8])
++        -> Result<RefundProtectionReview> {
++        ensure!(self.role==Role::BchFunder,"only BCH funder reviews received refund protection");
++        let (admission,agreed)=self.refund_context(now)?;
++        agreed.check_signed_refund(self.quote,frame,signature)?;
++        if let Some(bytes)=optional(&self.metadata,&name(self.quote,self.role,"authenticated"))? {
++            let (old,_)=self.refund_receipt(&bytes)?;
++            ensure!(now>=old.signed.admitted_at && old.signed.bytes==frame && old.signed.signature==signature,
++                "BCH refund protection already retained differently");
++        }
++        let parsed: serde_json::Value=serde_json::from_slice(frame)?;
++        let details=serde_json::json!({"schema":PROTECTION_REVIEW,"action":"accept-peer-refund-protection-only",
++            "swapId":self.quote.terms()["swapId"],"quote":hex(self.quote.commitment()),"admission":hex(&admission),
++            "agreement":parsed["agreement"],"peerIdentity":self.quote.terms()[Role::NativeFunder.identity()],
++            "frame":hex(&digest("monzero-bch-refund-frame-v1",frame)),
++            "signature":hex(&digest("monzero-bch-refund-identity-signature-v1",signature))});
++        Ok(RefundProtectionReview {commitment:digest(PROTECTION_REVIEW,&serde_json::to_vec(&details)?),details})
++    }
++
++    /// Explicit acceptance of the displayed, separately authenticated message.
++    /// Wrong or expired approval is refused before any durable write.
++    pub fn accept_reviewed_bch_refund_protection(&mut self,now: u64,frame: &[u8],signature: &[u8],
++        approved: &[u8;32]) -> Result<()> {
++        let review=self.review_bch_refund_protection(now,frame,signature)?;
++        ensure!(&review.commitment==approved,"BCH refund protection approval changed");
++        self.accept_bch_refund_adaptor(now,frame,signature)?;
++        Ok(())
++    }
++
++    /// Historical receipt validation, including after quote expiry. This does
++    /// not assert that a private recovery bundle is retained or funding is safe.
++    pub fn saved_bch_refund_protection(&self) -> Result<Option<SavedRefundProtection>> {
++        Ok(self.received_bch_refund_record()?.map(|(_,receipt,received_at)|SavedRefundProtection {receipt,received_at}))
++    }
++
+     /// Accept only the native funder's authenticated refund adaptor for this
+     /// exact agreement. Persist before returning protection to funding logic.
+     pub fn accept_bch_refund_adaptor(&mut self,now: u64,frame: &[u8],signature: &[u8]) -> Result<EncryptedSignature> {
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -152,7 +152,25 @@
+     let frame=native.prepare_bch_refund_adaptor(base+6)?;
+     let signature=SigningKey::from_bytes(&[2;32]).sign(&agreement::refund::signing_bytes(&frame)?).to_bytes();
+     let refund=native.retain_outgoing_bch_refund(base+7,&signature)?;
+-    execution.accept_bch_refund_adaptor(base+10,refund.frame(),refund.signature())?;
++    let before=contents(&metadata.0)?;let secret_records=contents(&snapshots.0)?;
++    assert!(execution.saved_bch_refund_protection()?.is_none());
++    let protection=execution.review_bch_refund_protection(base+10,refund.frame(),refund.signature())?;
++    assert_eq!(protection.details["action"],"accept-peer-refund-protection-only");
++    assert_eq!(protection.details["swapId"],setup.quote.terms()["swapId"]);
++    assert!(native.review_bch_refund_protection(base+10,refund.frame(),refund.signature()).is_err());
++    assert!(execution.review_bch_refund_protection(base+4,refund.frame(),refund.signature()).is_err());
++    assert!(execution.review_bch_refund_protection(base+3500,refund.frame(),refund.signature()).is_err());
++    let mut wrong_signature=refund.signature().to_vec();wrong_signature[0]^=1;
++    assert!(execution.review_bch_refund_protection(base+10,refund.frame(),&wrong_signature).is_err());
++    assert!(execution.accept_reviewed_bch_refund_protection(base+10,refund.frame(),refund.signature(),&signing.commitment).is_err());
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secret_records);
++    execution.accept_reviewed_bch_refund_protection(base+10,refund.frame(),refund.signature(),&protection.commitment)?;
++    let accepted=execution.saved_bch_refund_protection()?.context("missing refund protection receipt")?;
++    assert_eq!(accepted.received_at,base+10);assert_ne!(accepted.receipt,[0;32]);
++    let before=contents(&metadata.0)?;
++    execution.accept_reviewed_bch_refund_protection(base+11,refund.frame(),refund.signature(),&protection.commitment)?;
++    assert_eq!(execution.saved_bch_refund_protection()?.unwrap().receipt,accepted.receipt);
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secret_records);
+     execution.retain_bch_recovery(base+11)?;
+     let reviewed_at=if submit_case==Some(submit::Case::Expired) {base+12} else {clock};
+     let expected=execution.review_bch_funding_relay(&rpc,reviewed_at)?;

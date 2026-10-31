@@ -1,0 +1,207 @@
+diff --git a/swap-machine/src/litecoin_light/account.rs b/swap-machine/src/litecoin_light/account.rs
+--- a/swap-machine/src/litecoin_light/account.rs
++++ b/swap-machine/src/litecoin_light/account.rs
+@@ -70,3 +70,6 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++#[cfg(target_os="linux")]
++pub mod allocation;
+diff --git a/swap-machine/src/litecoin_rpc/reservation.rs b/swap-machine/src/litecoin_rpc/reservation.rs
+--- a/swap-machine/src/litecoin_rpc/reservation.rs
++++ b/swap-machine/src/litecoin_rpc/reservation.rs
+@@ -104,6 +104,28 @@
+         }
+         self.directory.sync_all()?;
+         Ok(())
++    }
++
++    /// Compare and replace one bounded mutable record under the directory lease.
++    /// Callers invalidate in-memory state on any error: rename may have succeeded
++    /// even when the final directory sync failed.
++    #[cfg(target_os="linux")]
++    pub(crate) fn replace_record(&self,name: &str,expected: &[u8],replacement: &[u8]) -> Result<()> {
++        ensure!(replacement.len()<=2_000_000,"oversized Litecoin journal replacement");
++        ensure!(self.read(name)?==expected,"Litecoin journal record changed");
++        let temporary=std::ffi::CString::new(format!("{}.tmp",uuid::Uuid::new_v4()))?;
++        let target=std::ffi::CString::new(name)?;
++        let mut file=self.file(temporary.to_str()?,libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL)?;
++        if let Err(error)=file.write_all(replacement).and_then(|_|file.sync_all()) {
++            unsafe {libc::unlinkat(self.directory.as_raw_fd(),temporary.as_ptr(),0);}
++            return Err(error.into());
++        }
++        if unsafe {libc::renameat2(self.directory.as_raw_fd(),temporary.as_ptr(),self.directory.as_raw_fd(),target.as_ptr(),0)}!=0 {
++            let error=std::io::Error::last_os_error();
++            unsafe {libc::unlinkat(self.directory.as_raw_fd(),temporary.as_ptr(),0);}
++            return Err(error.into());
++        }
++        self.directory.sync_all()?;Ok(())
+     }
+ 
+     #[cfg(target_os="linux")]
+diff --git a/swap-machine/src/litecoin_light/account/allocation.rs b/swap-machine/src/litecoin_light/account/allocation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/account/allocation.rs
+@@ -0,0 +1,86 @@
++//! Explicit, durable public address allocation. No secret material is stored.
++//! Requires separate wallet backup/discovery/gap policy before user exposure.
++//! The journal is not authenticated against rollback of an older valid backup.
++use super::*;
++use crate::litecoin_rpc::reservation::Journal;
++use bitcoin::hashes::{Hash,sha256};
++use serde::{Deserialize,Serialize};
++use std::{collections::BTreeSet,path::Path};
++use uuid::Uuid;
++const NAME:&str="litecoin-address-book.json";
++const MAX_ENTRIES:usize=10_000;
++#[derive(Clone,Deserialize,Serialize)]
++#[serde(deny_unknown_fields)]
++struct Record {schema:String,account:String,entries:Vec<Entry>}
++#[derive(Clone,Deserialize,Serialize)]
++#[serde(deny_unknown_fields)]
++struct Entry {request:Uuid,branch:u8,index:u32}
++
++pub struct AddressBook {
++    journal:Journal,
++    account:PublicAccount,
++    record:Record,
++    bytes:Vec<u8>,
++    usable:bool,
++}
++impl AddressBook {
++    /// Explicit initialization only. Existing allocations cannot be reset.
++    pub fn create(directory:&Path,account:PublicAccount)->Result<Self> {
++        let journal=Journal::open(directory)?;
++        let record=Record {schema:"monzero-ltc-address-book-v1".into(),account:identity(&account),entries:vec![]};
++        let bytes=serde_json::to_vec(&record)?;journal.retain(NAME,&bytes)?;
++        Ok(Self {journal,account,record,bytes,usable:true})
++    }
++    /// Missing or invalid state is an error, never implicit initialization.
++    pub fn open(directory:&Path,account:PublicAccount)->Result<Self> {
++        let journal=Journal::open(directory)?;let bytes=journal.read(NAME)?;
++        let record:Record=serde_json::from_slice(&bytes)?;
++        ensure!(record.schema=="monzero-ltc-address-book-v1" && record.account==identity(&account)
++            && record.entries.len()<=MAX_ENTRIES,"Litecoin address book identity or limit mismatch");
++        let mut next=[0u32;2];let mut requests=BTreeSet::new();
++        for entry in &record.entries {
++            ensure!(entry.branch<=1 && !entry.request.is_nil() && requests.insert(entry.request),"invalid Litecoin address allocation identity");
++            ensure!(entry.index==next[entry.branch as usize],"nonsequential Litecoin address allocation");
++            next[entry.branch as usize]+=1;
++        }
++        // Reconcile a rename whose directory sync may previously have failed.
++        // The identical-record path syncs both the existing file and directory.
++        journal.retain(NAME,&bytes)?;
++        Ok(Self {journal,account,record,bytes,usable:true})
++    }
++    /// Request IDs are retry identities and must be retained by the caller.
++    /// Same ID/branch returns the original address without allocating another.
++    pub fn reserve(&mut self,request:Uuid,branch:Branch)->Result<DerivedAddress> {
++        self.reserve_with(request,branch,|journal,before,after|journal.replace_record(NAME,before,after))
++    }
++    fn reserve_with(&mut self,request:Uuid,branch:Branch,
++        publish:impl FnOnce(&Journal,&[u8],&[u8])->Result<()>)->Result<DerivedAddress> {
++        ensure!(self.usable,"Litecoin address book requires reopen after publication failure");
++        ensure!(!request.is_nil(),"missing Litecoin address request identity");
++        if self.journal.read(NAME)?!=self.bytes {
++            self.usable=false;anyhow::bail!("Litecoin address book changed outside its lease")
++        }
++        let branch_number=branch.index() as u8;
++        if let Some(entry)=self.record.entries.iter().find(|entry|entry.request==request) {
++            ensure!(entry.branch==branch_number,"Litecoin address request reused for another branch");
++            return self.account.derive(branch,entry.index)
++        }
++        ensure!(self.record.entries.len()<MAX_ENTRIES,"Litecoin address journal capacity reached");
++        let index=self.record.entries.iter().filter(|entry|entry.branch==branch_number).count() as u32;
++        let address=self.account.derive(branch,index)?;
++        let mut record=self.record.clone();record.entries.push(Entry {request,branch:branch_number,index});
++        let bytes=serde_json::to_vec(&record)?;
++        self.usable=false;publish(&self.journal,&self.bytes,&bytes)?;
++        self.record=record;self.bytes=bytes;self.usable=true;Ok(address)
++    }
++}
++fn identity(account:&PublicAccount)->String {
++    let mut bytes=b"monzero-ltc-public-account-v1\0".to_vec();
++    bytes.extend_from_slice(account.network.genesis().as_bytes());
++    bytes.extend_from_slice(&account.account.to_be_bytes());
++    bytes.extend_from_slice(account.fingerprint.as_bytes());
++    bytes.extend_from_slice(&account.public.encode());
++    sha256::Hash::hash(&bytes).to_string()
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/account/allocation/tests.rs b/swap-machine/src/litecoin_light/account/allocation/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/account/allocation/tests.rs
+@@ -0,0 +1,69 @@
++use super::*;
++use std::{fs,os::unix::fs::PermissionsExt,path::PathBuf};
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {
++    let path=std::env::temp_dir().join(format!("monzero-address-book-{}",Uuid::new_v4()));
++    fs::create_dir(&path)?;fs::set_permissions(&path,fs::Permissions::from_mode(0o700))?;Ok(Self(path.canonicalize()?))
++}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++fn account(network:LtcNetwork,index:u32,seed:u8)->PublicAccount {
++    let master=Xpriv::new_master(if network==LtcNetwork::Mainnet {NetworkKind::Main} else {NetworkKind::Test},&[seed;32]).unwrap();
++    PublicAccount::from_master(&master,network,index).unwrap()
++}
++fn standard()->PublicAccount {account(LtcNetwork::Regtest,0,1)}
++#[test]
++fn allocation_persists_retries_and_separate_branch_indices()->Result<()> {
++    let dir=Directory::new()?;assert!(AddressBook::open(&dir.0,standard()).is_err());
++    let mut book=AddressBook::create(&dir.0,standard())?;let receive=Uuid::new_v4();let change=Uuid::new_v4();
++    let first=book.reserve(receive,Branch::Receive)?;let before=fs::read(dir.0.join(NAME))?;
++    assert_eq!(book.reserve(receive,Branch::Receive)?.address().to_string(),first.address().to_string());
++    assert_eq!(fs::read(dir.0.join(NAME))?,before);
++    assert!(book.reserve(receive,Branch::Change).is_err());assert!(book.reserve(Uuid::nil(),Branch::Receive).is_err());
++    assert_eq!(book.reserve(change,Branch::Change)?.path().to_string(),"84'/1'/0'/1/0");
++    assert!(AddressBook::open(&dir.0,standard()).is_err());drop(book);
++    assert!(AddressBook::create(&dir.0,standard()).is_err());
++    let mut book=AddressBook::open(&dir.0,standard())?;
++    assert_eq!(book.reserve(receive,Branch::Receive)?.address().to_string(),first.address().to_string());
++    assert_eq!(book.reserve(Uuid::new_v4(),Branch::Receive)?.path().to_string(),"84'/1'/0'/0/1");
++    assert_eq!(book.reserve(Uuid::new_v4(),Branch::Change)?.path().to_string(),"84'/1'/0'/1/1");Ok(())
++}
++#[test]
++fn allocation_rejects_other_accounts_networks_and_malformed_state()->Result<()> {
++    let dir=Directory::new()?;let mut book=AddressBook::create(&dir.0,standard())?;
++    book.reserve(Uuid::new_v4(),Branch::Receive)?;drop(book);
++    for other in [account(LtcNetwork::Testnet,0,1),account(LtcNetwork::Regtest,1,1),account(LtcNetwork::Regtest,0,2)] {
++        assert!(AddressBook::open(&dir.0,other).is_err());
++    }
++    let path=dir.0.join(NAME);let original=fs::read(&path)?;
++    for case in 0..5 {
++        let mut value:serde_json::Value=serde_json::from_slice(&original)?;
++        match case {0=>value["entries"][0]["index"]=serde_json::json!(1),
++            1=>value["entries"][0]["branch"]=serde_json::json!(2),
++            2=>{let entry=value["entries"][0].clone();value["entries"].as_array_mut().unwrap().push(entry);},
++            3=>value["extra"]=serde_json::json!(true),
++            4=>value["entries"][0]["request"]=serde_json::json!(Uuid::nil()),_=>unreachable!()}
++        fs::write(&path,serde_json::to_vec(&value)?)?;assert!(AddressBook::open(&dir.0,standard()).is_err());
++    }
++    fs::write(&path,b"{")?;assert!(AddressBook::open(&dir.0,standard()).is_err());Ok(())
++}
++#[test]
++fn allocation_ambiguous_publication_reopens_same_request_without_reuse()->Result<()> {
++    let dir=Directory::new()?;let mut book=AddressBook::create(&dir.0,standard())?;let request=Uuid::new_v4();
++    assert!(book.reserve_with(request,Branch::Receive,|journal,before,after| {
++        journal.replace_record(NAME,before,after)?;anyhow::bail!("simulated lost result after durable publication")
++    }).is_err());
++    assert!(book.reserve(request,Branch::Receive).is_err());drop(book);
++    let mut book=AddressBook::open(&dir.0,standard())?;
++    assert_eq!(book.reserve(request,Branch::Receive)?.path().to_string(),"84'/1'/0'/0/0");
++    assert_eq!(book.reserve(Uuid::new_v4(),Branch::Receive)?.path().to_string(),"84'/1'/0'/0/1");Ok(())
++}
++#[test]
++fn allocation_failed_publication_and_changed_record_cannot_return_an_address()->Result<()> {
++    let dir=Directory::new()?;let mut book=AddressBook::create(&dir.0,standard())?;
++    let before=fs::read(dir.0.join(NAME))?;
++    assert!(book.reserve_with(Uuid::new_v4(),Branch::Change,|_,_,_|anyhow::bail!("injected write failure")).is_err());
++    assert_eq!(fs::read(dir.0.join(NAME))?,before);assert!(book.reserve(Uuid::new_v4(),Branch::Change).is_err());drop(book);
++    let mut book=AddressBook::open(&dir.0,standard())?;
++    fs::write(dir.0.join(NAME),b"changed")?;assert!(book.reserve(Uuid::new_v4(),Branch::Receive).is_err());
++    fs::write(dir.0.join(NAME),&before)?;assert!(book.reserve(Uuid::new_v4(),Branch::Receive).is_err());Ok(())
++}

@@ -1,3 +1,4 @@
+#include "WalletAssetTransfer.h"
 // Copyright (c) 2014-2024, The Monero Project
 //
 // All rights reserved.
@@ -54,6 +55,8 @@
 #include <QDebug>
 #include <QUrl>
 #include <QTimer>
+#include "qt/network.h"
+#include <QJsonDocument>
 #include <QtConcurrent/QtConcurrent>
 #include <QList>
 #include <QMap>
@@ -367,6 +370,49 @@ quint64 Wallet::balance() const
 quint64 Wallet::balance(quint32 accountIndex) const
 {
     return m_walletImpl->balance(accountIndex);
+}
+
+bool Wallet::requestPublicProfile(const QString &action, const QVariantMap &payload, const QJSValue &callback)
+{
+    const QByteArray body = QJsonDocument::fromVariant(payload).toJson(QJsonDocument::Compact);
+    if (nettype() != NetworkType::MAINNET || (action != "challenge" && action != "update")
+        || body.size() > 4096 || !callback.isCallable()) return false;
+    const QString proxy = getProxyAddress();
+    return m_scheduler.run([action, body, proxy] {
+        class BoundedClient : public net::http::client {
+            size_t received = 0;
+            bool on_header(const epee::net_utils::http::http_response_info &headers) override {
+                size_t length = 0;
+                if (!headers.m_header_info.m_content_length.empty()
+                    && (!epee::string_tools::get_xtype_from_string(length, headers.m_header_info.m_content_length)
+                        || length > 65536)) return false;
+                return headers.m_response_code == 200 && net::http::client::on_header(headers);
+            }
+            bool handle_target_data(std::string &piece) override {
+                if (piece.size() > 65536 - received) return false;
+                received += piece.size();
+                return net::http::client::handle_target_data(piece);
+            }
+        } client;
+        const QJSValueList failure{QJSValue(0), QJSValue(QString())};
+        if (!client.set_proxy(proxy.toStdString())) return failure;
+        client.set_server("monzero.org", "443", {}, epee::net_utils::ssl_options_t{
+            epee::net_utils::ssl_support_t::e_ssl_support_enabled});
+        const epee::net_utils::http::http_response_info *response = nullptr;
+        const epee::net_utils::http::fields_list headers{{"Content-Type", "application/json"}};
+        const bool ok = client.invoke("/wallets/api.php?action=" + action.toStdString(), "POST",
+            body.toStdString(), std::chrono::seconds(15), &response, headers);
+        if (!ok || !response || response->m_response_code != 200 || response->m_body.size() > 65536) return failure;
+        return QJSValueList{QJSValue(200), QJSValue(QString::fromStdString(response->m_body))};
+    }, callback).first;
+}
+
+QVariantMap Wallet::publicProfileSnapshot() const
+{
+    return {{"address", address(0, 0)}, {"balance", QString::number(balanceAll())},
+            {"height", QString::number(blockChainHeight())},
+            {"synchronized", m_connectionStatus == ConnectionStatus_Connected && synchronized()
+                && blockChainHeight() > 0 && blockChainHeight() >= daemonBlockChainHeight()}};
 }
 
 quint64 Wallet::balanceAll() const
@@ -767,6 +813,53 @@ void Wallet::createAssetIssuanceAsync(
                 currentSubaddressAccount(), {}, assetId);
         PendingTransaction *transaction = new PendingTransaction(implementation, this);
         emit assetIssuanceCreated(transaction, QString::fromStdString(assetId));
+    });
+}
+
+bool Wallet::assetTransfersAvailable() const {
+    return WalletAssetTransfer::available<Monero::Wallet>(0);
+}
+
+void Wallet::createAssetTransferAsync(
+    const QString &assetId,
+    const QString &recipientAddress,
+    const QString &transferAmount,
+    const QString &burnAmount,
+    quint32 mixinCount,
+    PendingTransaction::Priority priority)
+{
+    if (!assetTransfersAvailable()) {
+        emit assetTransferFailed(tr("Asset transfers and burns are unavailable in this wallet version."));
+        return;
+    }
+    m_scheduler.run([this, assetId, recipientAddress, transferAmount, burnAmount,
+                     mixinCount, priority] {
+        bool transferOk = true;
+        const quint64 transfer = transferAmount.isEmpty() ? 0 : transferAmount.toULongLong(&transferOk, 10);
+        bool burnOk = true;
+        const quint64 burn = burnAmount.isEmpty() ? 0 : burnAmount.toULongLong(&burnOk, 10);
+        if ((!transferAmount.isEmpty() && !transferOk) || (!burnAmount.isEmpty() && !burnOk)) {
+            emit assetTransferFailed(tr("Amount must be an unsigned 64-bit integer"));
+            return;
+        }
+        if ((transfer == 0) == (burn == 0)) {
+            emit assetTransferFailed(tr("Enter exactly one of a transfer amount or a burn amount"));
+            return;
+        }
+
+        Monero::PendingTransaction *implementation =
+            WalletAssetTransfer::create(0,m_walletImpl,
+                assetId.trimmed().toStdString(),
+                recipientAddress.trimmed().toStdString(),
+                transfer, burn, mixinCount,
+                static_cast<Monero::PendingTransaction::Priority>(priority),
+                currentSubaddressAccount(), std::set<uint32_t>{});
+        if (!implementation) {
+            emit assetTransferFailed(tr("The wallet could not prepare this asset transaction."));
+            return;
+        }
+        PendingTransaction *transaction = new PendingTransaction(implementation, this);
+        emit assetTransferCreated(transaction);
     });
 }
 

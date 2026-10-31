@@ -1,0 +1,189 @@
+diff --git a/swap-machine/src/litecoin_light/vault.rs b/swap-machine/src/litecoin_light/vault.rs
+--- a/swap-machine/src/litecoin_light/vault.rs
++++ b/swap-machine/src/litecoin_light/vault.rs
+@@ -137,3 +137,6 @@
+ pub mod signing;
+ 
+ pub mod setup;
++
++/// Explicit local raw-seed recovery; existing wallet derivation remains unchanged.
++pub mod recovery;
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -420,6 +420,7 @@
+             "receivingAllocated":0,"changeAllocated":0,"scope":"seed-and-address-allocations",
+             "allocationFreshness":"unassessed","activeSwapRecovery":false}))
+     }
++    mod recovery { include!("native-ltc-light/recovery.rs"); }
+     fn output(response:&Value)->Result<()> {
+         let bytes=serde_json::to_vec(response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
+         std::io::stdout().write_all(&bytes)?;Ok(())
+@@ -427,6 +428,7 @@
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
++        if args[1]=="--wallet-recovery-stdio-v1" {return recovery::reveal(Path::new(&args[2]));}
+         let mode=match args[1].to_str() {Some("--wallet-create-stdio-v1")=>"wallet-create",Some("--wallet-restore-stdio-v1")=>"wallet-restore",Some("--wallet-backup-save-stdio-v1")=>"wallet-backup-save",Some("--wallet-backup-verify-stdio-v1")=>"wallet-backup-verify",Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
+             Some("--wallet-reconcile-stdio-v1")=>"wallet-reconcile",Some("--wallet-broadcast-stdio-v1")=>"wallet-broadcast",Some("--wallet-broadcast-status-stdio-v1")=>"wallet-broadcast-status",
+             Some("--wallet-signed-stdio-v1")=>"wallet-signed",Some("--wallet-sign-stdio-v1")=>"wallet-sign",Some("--wallet-reopen-stdio-v1")=>"wallet-reopen",Some("--wallet-receive-stdio-v1")=>"wallet-receive",Some("--wallet-prepare-stdio-v1")=>"wallet-prepare",Some("--wallet-estimate-stdio-v1")=>"wallet-estimate",
+diff --git a/swap-machine/src/litecoin_light/vault/recovery.rs b/swap-machine/src/litecoin_light/vault/recovery.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/recovery.rs
+@@ -0,0 +1,79 @@
++//! Explicit, password-authenticated recovery of existing raw BIP32 seed wallets.
++//! Existing vaults were not generated from BIP39; never relabel their seed as a
++//! BIP39 mnemonic. Callers must use a private reveal channel, not public status,
++//! logs, clipboard automation or a network transport. Not an active-trade backup.
++use super::*;
++
++/// Neither Clone, Debug nor Serialize. Callers explicitly expose bytes only
++/// inside a consented local recovery view and erase owned buffers afterwards.
++pub struct RecoverySeed(Zeroizing<[u8;32]>);
++impl RecoverySeed {
++    pub const ENCODING:&'static str="raw-bip32-seed-hex-v1";
++    pub fn expose_bytes(&self)->&[u8;32] {&self.0}
++    /// Strict 32-byte lowercase hex. This is raw BIP32 seed material, NOT a
++    /// private spending key or BIP39 entropy. Never guess a recovery format.
++    pub fn from_hex(value:&str)->Result<Self> {
++        ensure!(value.len()==64,"invalid recovery seed length");
++        let mut bytes=Zeroizing::new([0u8;32]);
++        for (i,pair) in value.as_bytes().chunks_exact(2).enumerate() {
++            let digit=|c:u8|->Result<u8> {match c {b'0'..=b'9'=>Ok(c-b'0'),b'a'..=b'f'=>Ok(c-b'a'+10),_=>anyhow::bail!("invalid recovery seed encoding")}};
++            bytes[i]=(digit(pair[0])?<<4)|digit(pair[1])?;
++        }
++        Ok(Self(bytes))
++    }
++    /// Recover the same public account before publishing any restored wallet.
++    /// The caller separately restores address allocations and trade journals.
++    pub fn public_account(&self,network:impl Into<LightNetwork>,index:u32)->Result<PublicAccount> {
++        SecretSeed::from_bytes(Zeroizing::new(*self.0)).public_account(network,index)
++    }
++    pub fn into_seed(self)->SecretSeed {SecretSeed::from_bytes(Zeroizing::new(*self.0))}
++}
++
++/// Authenticate the password and expected public account before exposing seed
++/// bytes. This never writes plaintext, contacts a server or changes the vault.
++pub fn reveal(vault:&SeedVault,password:&[u8],expected:&PublicAccountDescriptor)->Result<RecoverySeed> {
++    let seed=vault.unlock_for_account(password,expected)?;
++    Ok(RecoverySeed(Zeroizing::new(*seed.0)))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::litecoin_light::network::{BtcNetwork,BchNetwork,DogeNetwork};
++    use crate::litecoin_light::account::Branch;
++
++    struct Directory(std::path::PathBuf);
++    impl Drop for Directory {fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);}}
++
++    #[test]
++    fn raw_recovery_round_trip_is_chain_bound_and_read_only()->Result<()> {
++        for network in [LightNetwork::Litecoin(LtcNetwork::Regtest),LightNetwork::Bitcoin(BtcNetwork::Regtest),
++            LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
++            let temporary=Directory(std::env::temp_dir().join(format!("monzero-local-recovery-{}",Uuid::new_v4())));
++            let directory=temporary.0.clone();std::fs::create_dir(&directory)?;
++            #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(&directory,std::fs::Permissions::from_mode(0o700))?;}
++            let seed=SecretSeed::from_bytes(Zeroizing::new([7;32]));
++            let account=seed.public_account(network,3)?;
++            let wallet=Uuid::new_v4();let password=b"disposable recovery test password";
++            let vault=SeedVault::create(&directory,network,wallet,password,&seed)?;
++            let before=std::fs::read(directory.join(NAME))?;
++            let recovered=reveal(&vault,password,&account.descriptor())?;
++            assert_eq!(recovered.expose_bytes(),&[7;32]);
++            let from_text=RecoverySeed::from_hex(&"07".repeat(32))?;
++            let restored=from_text.public_account(network,3)?;
++            assert_eq!(serde_json::to_vec(&restored.descriptor())?,serde_json::to_vec(&account.descriptor())?);
++            assert_eq!(restored.derive(Branch::Receive,17)?.address(),account.derive(Branch::Receive,17)?.address());
++            assert!(reveal(&vault,b"wrong password",&account.descriptor()).is_err());
++            let other=SecretSeed::from_bytes(Zeroizing::new([8;32])).public_account(network,3)?;
++            assert!(reveal(&vault,password,&other.descriptor()).is_err());
++            assert_eq!(std::fs::read(directory.join(NAME))?,before);
++        }
++        Ok(())
++    }
++    #[test]
++    fn recovery_rejects_ambiguous_encoding() {
++        for text in [String::new(),"0".repeat(63),"0".repeat(65),"AA".repeat(32),"gg".repeat(32),
++            " 07".repeat(32),"abandon ".repeat(24)] {assert!(RecoverySeed::from_hex(&text).is_err());}
++        assert!(RecoverySeed::from_hex(&"00".repeat(32)).is_ok());
++    }
++}
+diff --git a/swap-machine/src/bin/native-ltc-light/recovery.rs b/swap-machine/src/bin/native-ltc-light/recovery.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/recovery.rs
+@@ -0,0 +1,71 @@
++// Private recovery output. Never pass this response to public wallet status or
++// QML diagnostics. The desktop caller must explicitly reveal and then clear it.
++use super::*;
++use serde::Serialize;
++use swap_machine::litecoin_light::vault::recovery::{self as material,RecoverySeed};
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct RevealRequest {
++    schema:String,
++    request_id:uuid::Uuid,
++    approved_config_digest:String,
++    reveal_approved:bool,
++    password:Password,
++}
++struct SeedHex<'a>(&'a RecoverySeed);
++impl std::fmt::Display for SeedHex<'_> {
++    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
++        for byte in self.0.expose_bytes() {write!(f,"{byte:02x}")?;} Ok(())
++    }
++}
++impl Serialize for SeedHex<'_> {
++    fn serialize<S:serde::Serializer>(&self,serializer:S)->std::result::Result<S::Ok,S::Error> {
++        serializer.collect_str(self)
++    }
++}
++#[derive(Serialize)]
++#[serde(rename_all="camelCase")]
++struct RevealResponse<'a> {
++    schema:String,
++    request_id:uuid::Uuid,
++    coin:&'a str,
++    network:&'a str,
++    wallet_id:uuid::Uuid,
++    account:u32,
++    seed_encoding:&'static str,
++    seed_hex:SeedHex<'a>,
++    active_swap_recovery:bool,
++}
++
++pub(super) fn reveal(path:&Path)->Result<()> {
++    let mut input=Zeroizing::new(Vec::with_capacity(8193));
++    std::io::stdin().take(8193).read_to_end(&mut input)?;
++    ensure!(!input.is_empty() && input.len()<=8192,"invalid recovery request size");
++    let request:RevealRequest=serde_json::from_slice(&input)?;
++    let tag=["ltc","btc","bch","doge"].into_iter()
++        .find(|tag|request.schema==format!("monzero-{tag}-light-wallet-recovery-request-v1"))
++        .context("invalid recovery schema")?;
++    ensure!(!request.request_id.is_nil() && request.reveal_approved,"missing recovery reveal approval");
++    let (_lease,raw)=private_config(path)?;
++    let approved:sha256::Hash=request.approved_config_digest.parse()?;
++    ensure!(approved.to_string()==request.approved_config_digest && sha256::Hash::hash(&raw)==approved,
++        "recovery configuration differs from approval");
++    let config:Config=serde_json::from_slice(&raw)?;
++    ensure!(config.schema==format!("monzero-private-{tag}-light-v1"),"wrong recovery chain");
++    let network=network_for(tag,&config.network)?;
++    let wallet=config.wallet.as_ref().context("missing recovery wallet")?;
++    let public=PublicAccount::from_descriptor(&wallet.account,network)?;
++    let vault_config=wallet.vault.as_ref().context("missing recovery vault")?;
++    let vault=SeedVault::open(&vault_config.directory,network,vault_config.wallet_id)?;
++    let seed=material::reveal(&vault,request.password.0.as_bytes(),&wallet.account)?;
++    let response=RevealResponse {schema:format!("monzero-{tag}-light-wallet-recovery-response-v1"),
++        request_id:request.request_id,coin:tag,network:&config.network,wallet_id:vault_config.wallet_id,
++        account:public.account_index(),seed_encoding:RecoverySeed::ENCODING,seed_hex:SeedHex(&seed),active_swap_recovery:false};
++    // Fixed capacity exceeds the bounded response; avoid reallocating secrets.
++    let mut output=Zeroizing::new(Vec::with_capacity(4096));
++    serde_json::to_writer(&mut *output,&response)?;
++    ensure!(output.len()<=4096,"oversized private recovery response");
++    std::io::stdout().write_all(&output)?;
++    Ok(())
++}

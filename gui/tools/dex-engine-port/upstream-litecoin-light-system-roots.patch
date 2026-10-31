@@ -1,0 +1,78 @@
+diff --git a/swap-machine/src/litecoin_light/tls/tests.rs b/swap-machine/src/litecoin_light/tls/tests.rs
+--- a/swap-machine/src/litecoin_light/tls/tests.rs
++++ b/swap-machine/src/litecoin_light/tls/tests.rs
+@@ -109,3 +109,74 @@
+     }
+     Ok(())
+ }
++
++
++async fn public_child(port: u16, root: &str, outcome: &str) -> Result<()> {
++    let directory = PathBuf::from(std::env::var("MONZERO_LTC_TLS_FIXTURE")?);
++    let mut command = std::process::Command::new(std::env::current_exe()?);
++    command.args(["litecoin_light::tls::tests::system_store_child", "--exact", "--ignored", "--test-threads=1"])
++        .env_clear().env("LANG","C")
++        .env("MONZERO_LTC_TLS_FIXTURE",&directory)
++        .env("MONZERO_TLS_CHILD_PORT",port.to_string())
++        .env("MONZERO_TLS_CHILD_OUTCOME",outcome)
++        .env("SSL_CERT_FILE",directory.join(root));
++    if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") { command.env("LD_LIBRARY_PATH",path); }
++    let output = tokio::task::spawn_blocking(move || command.output()).await??;
++    ensure!(output.status.success(),"public TLS child failed: {} {}",
++        String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
++    ensure!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
++        "public TLS child did not execute the fixture");
++    Ok(())
++}
++
++#[tokio::test]
++#[ignore = "child fixture; invoke only through the public-root parent tests"]
++async fn system_store_child() -> Result<()> {
++    let port: u16 = std::env::var("MONZERO_TLS_CHILD_PORT")?.parse()?;
++    let outcome = std::env::var("MONZERO_TLS_CHILD_OUTCOME")?;
++    let endpoint = TlsEndpoint::new("localhost".into(),port,LtcNetwork::Mainnet)?;
++    let result = endpoint.connect().await;
++    match outcome.as_str() {
++        "accept" => {
++            let mut session = result?;
++            let (request,_,_,_) = super::super::tests::fixture();
++            let matched = session.inclusion(request.height,request.block_hash,request.txid).await?;
++            ensure!(matched.txid()==request.txid && matched.block_hash()==request.block_hash,
++                "public TLS proof mismatch");
++        }
++        "tls-reject" | "roots-reject" => {
++            let error = match result { Ok(_) => anyhow::bail!("unexpected public TLS connection"), Err(error) => error };
++            let expected = if outcome=="tls-reject" {"Electrum TLS authentication failed"}
++                else {"unable to load complete system TLS trust store"};
++            ensure!(error.to_string()==expected,"wrong public TLS rejection: {error}");
++        }
++        _ => anyhow::bail!("invalid public TLS child fixture mode"),
++    }
++    Ok(())
++}
++
++#[tokio::test]
++#[ignore = "requires disposable local TLS fixture certificates"]
++async fn tls_public_system_store_connects_and_rejects_untrusted_server() -> Result<()> {
++    let (_,header,raw,proof) = super::super::tests::fixture();
++    let mut responses = handshake(LtcNetwork::Mainnet);
++    responses.extend([json!(hex(&header)),json!(hex(&raw)),proof["result"].clone()]);
++    let (port,task) = server("server.der",responses).await?;
++    public_child(port,"root.pem","accept").await?;
++    assert_eq!(task.await??,5);
++    let (port,task) = server("server.der",vec![]).await?;
++    public_child(port,"other-root.pem","tls-reject").await?;
++    assert_eq!(task.await??,0);
++    Ok(())
++}
++
++#[tokio::test]
++#[ignore = "requires disposable local TLS fixture certificates"]
++async fn tls_public_missing_and_empty_store_fail_before_tcp() -> Result<()> {
++    for root in ["does-not-exist.pem","empty.pem"] {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        public_child(listener.local_addr()?.port(),root,"roots-reject").await?;
++        assert!(tokio::time::timeout(Duration::from_millis(30),listener.accept()).await.is_err());
++    }
++    Ok(())
++}

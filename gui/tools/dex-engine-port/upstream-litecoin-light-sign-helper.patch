@@ -1,0 +1,152 @@
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -1,9 +1,11 @@
+-//! Read-only light-chain helper for an app-owned worker process. No wallet keys,
+-//! authoritative balances, signing, broadcast or live-market activation.
++//! App-owned Litecoin helper: observation, retained review and explicit vault-backed
++//! signing. No authoritative balance, automatic approval, broadcast or live markets.
+ #[cfg(target_os="linux")]
+ mod linux {
+     use anyhow::{Context,Result,ensure};
+     use serde::Deserialize;
++    use zeroize::Zeroizing;
++    use swap_machine::litecoin_light::vault::SeedVault;
+     use serde_json::{Value,json};
+     use std::{fs::{File,OpenOptions},io::{Read,Write},os::unix::fs::{MetadataExt,OpenOptionsExt},
+         path::{Path,PathBuf},time::{SystemTime,UNIX_EPOCH}};
+@@ -21,10 +23,10 @@
+     struct Endpoint {host:String,port:u16}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+-    struct Request {schema:String,request_id:uuid::Uuid,maximum_download_headers:Option<u32>,wallet_scan:Option<WalletScan>,payment:Option<Payment>,fee_quote:Option<FeeQuote>,retained_review:Option<RetainedReview>}
+-    #[derive(Deserialize)]
+-    #[serde(deny_unknown_fields,rename_all="camelCase")]
+-    struct WalletConfig {account:PublicAccountDescriptor,address_book_directory:PathBuf,spend_directory:Option<PathBuf>}
++    struct Request {schema:String,request_id:uuid::Uuid,maximum_download_headers:Option<u32>,wallet_scan:Option<WalletScan>,payment:Option<Payment>,fee_quote:Option<FeeQuote>,retained_review:Option<RetainedReview>,signing_approval:Option<SigningApproval>}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct WalletConfig {account:PublicAccountDescriptor,address_book_directory:PathBuf,spend_directory:Option<PathBuf>,vault:Option<VaultConfig>}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct Payment {address:String,amount_atomic:String,fee_atomic:String,minimum_change_atomic:String,minimum_confirmations:u64}
+@@ -35,6 +37,22 @@
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct RetainedReview {signing_commitment:String,change_address:Option<String>}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct VaultConfig {directory:PathBuf,wallet_id:uuid::Uuid}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct SigningApproval {approved_commitment:String,password:Password}
++    // Neither Debug nor Serialize. Own and erase the decoded credential; input
++    // bytes are separately erased. Parser/dependency internals may retain copies.
++    struct Password(Zeroizing<String>);
++    impl<'de> Deserialize<'de> for Password {
++        fn deserialize<D:serde::Deserializer<'de>>(deserializer:D)->std::result::Result<Self,D::Error> {
++            let value=Zeroizing::new(String::deserialize(deserializer)?);
++            if value.is_empty() || value.len()>1024 {return Err(serde::de::Error::custom("invalid wallet password length"));}
++            Ok(Self(value))
++        }
++    }
+     fn atomic(value:&str)->Result<Amount> {
+         ensure!(!value.is_empty() && value.len()<=20 && value.bytes().all(|b|b.is_ascii_digit())
+             && (value=="0" || !value.starts_with('0')),"invalid atomic Litecoin amount");
+@@ -127,7 +145,7 @@
+             "scanStop":"reported-gap"}))
+     }
+     async fn prepare_wallet(config:&Config,network:LtcNetwork,state:&ChainState,scan:&WalletScan,
+-        payment:&Payment,operation:uuid::Uuid,retained:Option<&RetainedReview>)->Result<Value> {
++        payment:&Payment,operation:uuid::Uuid,retained:Option<&RetainedReview>,approval:Option<&SigningApproval>)->Result<Value> {
+         let address=LtcSegwitAddress::parse(network,&payment.address)?;
+         let output=TxOut {value:atomic(&payment.amount_atomic)?,script_pubkey:address.script_pubkey().clone()};
+         let policy=PreparationPolicy {fee:atomic(&payment.fee_atomic)?,minimum_change:atomic(&payment.minimum_change_atomic)?,
+@@ -135,6 +153,12 @@
+         ensure!(output.value.to_sat()>0 && policy.minimum_change.to_sat()>0 && policy.minimum_confirmations>0,
+             "invalid Litecoin preparation policy");
+         let wallet=config.wallet.as_ref().context("missing watch-only wallet configuration")?;
++        if let Some(approval)=approval {
++            ensure!(retained.is_some_and(|review|review.signing_commitment==approval.approved_commitment),
++                "Litecoin signing approval does not match retained review");
++            let vault=wallet.vault.as_ref().context("missing explicit Litecoin vault configuration")?;
++            ensure!(!vault.wallet_id.is_nil() && vault.directory.is_absolute(),"invalid Litecoin vault configuration");
++        }
+         let directory=wallet.spend_directory.as_ref().context("missing explicit Litecoin spend directory")?;
+         let account=PublicAccount::from_descriptor(&wallet.account,network)?;
+         let mut book=AddressBook::open(&wallet.address_book_directory,PublicAccount::from_descriptor(&wallet.account,network)?)?;
+@@ -164,12 +188,21 @@
+         ensure!(prepared.fee()==policy.fee && change.is_none_or(|out|out.value>=policy.minimum_change),
+             "retained Litecoin payment policy mismatch");
+         let change_address=change.map(|out|LtcSegwitAddress::from_script(network,&out.script_pubkey).map(|a|a.to_string())).transpose()?;
+-        Ok(json!({"watchOnly":true,"spendable":false,"prepared":true,"signed":false,
++        let mut response=json!({"watchOnly":true,"spendable":false,"prepared":true,"signed":false,
+             "paymentAddress":address.to_string(),"paymentAtomic":output.value.to_sat().to_string(),
+             "feeAtomic":prepared.fee().to_sat().to_string(),"changeAddress":change_address,
+             "changeAtomic":change.map(|out|out.value.to_sat()).unwrap_or(0).to_string(),
+             "inputCount":tx.input.len(),"txid":tx.compute_txid().to_string(),
+-            "signingCommitment":prepared.signing_commitment().to_string()}))
++            "signingCommitment":prepared.signing_commitment().to_string()});
++        if let Some(approval)=approval {
++            let config=wallet.vault.as_ref().context("missing Litecoin vault configuration")?;
++            let vault=SeedVault::open(&config.directory,network,config.wallet_id)?;
++            let signed=prepared.approve_with_vault_on(state.chain()?,observation.accounting(),&vault,
++                approval.password.0.as_bytes(),approval.approved_commitment.parse()?)?;
++            ensure!(signed.compute_txid()==tx.compute_txid(),"Litecoin signed payment identity changed");
++            response["watchOnly"]=json!(false);response["signed"]=json!(true);response["broadcast"]=json!(false);
++        }
++        Ok(response)
+     }
+     async fn estimate_wallet(config:&Config,network:LtcNetwork,state:&ChainState,scan:&WalletScan,quote:&FeeQuote)->Result<Value> {
+         let address=LtcSegwitAddress::parse(network,&quote.address)?;
+@@ -201,24 +234,25 @@
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
+         let mode=match args[1].to_str() {Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
+-            Some("--wallet-reopen-stdio-v1")=>"wallet-reopen",Some("--wallet-receive-stdio-v1")=>"wallet-receive",Some("--wallet-prepare-stdio-v1")=>"wallet-prepare",Some("--wallet-estimate-stdio-v1")=>"wallet-estimate",
++            Some("--wallet-sign-stdio-v1")=>"wallet-sign",Some("--wallet-reopen-stdio-v1")=>"wallet-reopen",Some("--wallet-receive-stdio-v1")=>"wallet-receive",Some("--wallet-prepare-stdio-v1")=>"wallet-prepare",Some("--wallet-estimate-stdio-v1")=>"wallet-estimate",
+             Some("--wallet-init-stdio-v1")=>"wallet-init",Some("--wallet-refresh-stdio-v1")=>"wallet-refresh",
+             _=>anyhow::bail!("unsupported light-chain operation")};
+-        let mut bytes=Vec::new();std::io::stdin().take(2049).read_to_end(&mut bytes)?;
+-        ensure!(!bytes.is_empty() && bytes.len()<=if mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-estimate" {2048}else{512},"invalid light-chain request size");
+-        let request: Request=serde_json::from_slice(&bytes)?;
++        let mut bytes=Zeroizing::new(Vec::new());std::io::stdin().take(8193).read_to_end(&mut bytes)?;
++        ensure!(!bytes.is_empty() && bytes.len()<=if mode=="wallet-sign" {8192}else if mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" || mode=="wallet-estimate" {2048}else{512},"invalid light-chain request size");
++        let request: Request=serde_json::from_slice(&bytes)?;drop(bytes);
+         let schema=format!("monzero-ltc-light-{mode}-request-v1");
+         let sync=mode=="sync";
+         ensure!(request.schema==schema && !request.request_id.is_nil(),"invalid light-chain request identity");
+         ensure!(if sync {request.maximum_download_headers.is_some_and(|n|(1..=10_000_000).contains(&n))}
+             else {request.maximum_download_headers.is_none()},"invalid light-chain request budget");
+-        ensure!(if mode=="wallet-refresh" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-estimate" {request.wallet_scan.as_ref().is_some_and(|scan|
++        ensure!(if mode=="wallet-refresh" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" || mode=="wallet-estimate" {request.wallet_scan.as_ref().is_some_and(|scan|
+             (1..=500).contains(&scan.gap) && (1..=500).contains(&scan.addresses_per_branch)
+                 && (1..=1000).contains(&scan.history_entries_per_branch))}
+             else {request.wallet_scan.is_none()},"invalid wallet refresh budget");
+-        ensure!((mode=="wallet-prepare" || mode=="wallet-reopen")==request.payment.is_some(),"invalid Litecoin payment request");
++        ensure!((mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign")==request.payment.is_some(),"invalid Litecoin payment request");
+         ensure!((mode=="wallet-estimate")==request.fee_quote.is_some(),"invalid Litecoin fee quote request");
+-        ensure!((mode=="wallet-reopen")==request.retained_review.is_some(),"invalid retained Litecoin review request");
++        ensure!((mode=="wallet-reopen" || mode=="wallet-sign")==request.retained_review.is_some(),"invalid retained Litecoin review request");
++        ensure!((mode=="wallet-sign")==request.signing_approval.is_some(),"invalid Litecoin signing approval request");
+         let (_lease,config)=config(Path::new(&args[2]))?;
+         let network=match config.network.as_str() {"main"=>LtcNetwork::Mainnet,"test"=>LtcNetwork::Testnet,
+             "regtest"=>LtcNetwork::Regtest,_=>anyhow::bail!("unsupported Litecoin network")};
+@@ -230,14 +264,14 @@
+         } else {None};
+         let mut response=json!({"schema":format!("monzero-ltc-light-{mode}-response-v1"),
+             "requestId":request.request_id,"executable":false,"chain":snapshot(&state)?,"synchronization":synchronization});
+-        if mode=="wallet-init" || mode=="wallet-refresh" || mode=="wallet-receive" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-estimate" {
++        if mode=="wallet-init" || mode=="wallet-refresh" || mode=="wallet-receive" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" || mode=="wallet-estimate" {
+             let wallet=if mode=="wallet-init" {initialize_wallet(&config,network)?}
+             else if mode=="wallet-receive" {receive_address(&config,network,request.request_id)?} else {
+                 let scan=request.wallet_scan.as_ref().context("missing wallet scan budget")?;
+                 tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+                     tokio::time::timeout(std::time::Duration::from_secs(3600),async {
+-                        if mode=="wallet-prepare" || mode=="wallet-reopen" {
+-                            prepare_wallet(&config,network,&state,scan,request.payment.as_ref().context("missing payment")?,request.request_id,request.retained_review.as_ref()).await
++                        if mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" {
++                            prepare_wallet(&config,network,&state,scan,request.payment.as_ref().context("missing payment")?,request.request_id,request.retained_review.as_ref(),request.signing_approval.as_ref()).await
+                         } else if mode=="wallet-estimate" {
+                             estimate_wallet(&config,network,&state,scan,request.fee_quote.as_ref().context("missing fee quote")?).await
+                         } else {refresh_wallet(&config,network,&state,scan).await}

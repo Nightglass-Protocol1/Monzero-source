@@ -1,0 +1,203 @@
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -13,7 +13,7 @@
+     use std::{fs::{File,OpenOptions},io::{Read,Write},os::unix::fs::{MetadataExt,OpenOptionsExt},
+         path::{Path,PathBuf},time::{SystemTime,UNIX_EPOCH}};
+     use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
+-    use bitcoin::{Amount,Transaction,TxOut,bip32::ChildNumber,hashes::sha256};
++    use bitcoin::{Amount,Transaction,TxOut,bip32::ChildNumber,hashes::{Hash,sha256}};
+     use swap_machine::litecoin_light::vault::signing::review::confirmed::selection::{preparation::PreparationPolicy,estimated::EstimatedPaymentPolicy};
+     use swap_machine::litecoin_light::{state::ChainState,tls::TlsEndpoint,
+         account::{PublicAccount,Branch,descriptor::PublicAccountDescriptor,allocation::AddressBook},
+@@ -26,7 +26,7 @@
+     struct Endpoint {host:String,port:u16}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+-    struct Request {schema:String,request_id:uuid::Uuid,maximum_download_headers:Option<u32>,maximum_history_entries:Option<usize>,wallet_scan:Option<WalletScan>,payment:Option<Payment>,fee_quote:Option<FeeQuote>,retained_review:Option<RetainedReview>,signing_approval:Option<SigningApproval>,broadcast_approval:Option<BroadcastApproval>,backup_approval:Option<BackupApproval>,restore_approval:Option<RestoreApproval>}
++    struct Request {schema:String,request_id:uuid::Uuid,maximum_download_headers:Option<u32>,maximum_history_entries:Option<usize>,wallet_scan:Option<WalletScan>,payment:Option<Payment>,fee_quote:Option<FeeQuote>,retained_review:Option<RetainedReview>,signing_approval:Option<SigningApproval>,broadcast_approval:Option<BroadcastApproval>,backup_approval:Option<BackupApproval>,restore_approval:Option<RestoreApproval>,create_approval:Option<CreateApproval>}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct WalletConfig {account:PublicAccountDescriptor,address_book_directory:PathBuf,spend_directory:Option<PathBuf>,vault:Option<VaultConfig>}
+@@ -55,6 +55,14 @@
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct RestoreApproval {directory:PathBuf,password:Password,approved_digest:String}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct CreateApproval {approved_config_digest:String,password:Password}
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct SetupConfig {schema:String,network:String,setup_directory:PathBuf,vault_directory:PathBuf,
++        address_book_directory:PathBuf,backup_directory:PathBuf,spend_directory:PathBuf,cache_directory:PathBuf,
++        wallet_id:uuid::Uuid,account_index:u32,maximum_height:u32,endpoint:Option<Endpoint>}
+     // Neither Debug nor Serialize. Own and erase the decoded credential; input
+     // bytes are separately erased. Parser/dependency internals may retain copies.
+     struct Password(Zeroizing<String>);
+@@ -74,7 +82,7 @@
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct WalletScan {gap:u32,addresses_per_branch:u32,history_entries_per_branch:usize}
+     fn now() -> Result<u64> {Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())}
+-    fn config(path: &Path) -> Result<(File,Config)> {
++    fn private_config(path: &Path) -> Result<(File,Vec<u8>)> {
+         ensure!(path.is_absolute() && path.canonicalize()?==path,"noncanonical light-chain configuration");
+         let file=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC|libc::O_NONBLOCK).open(path)?;
+         let before=file.metadata()?;
+@@ -87,6 +95,10 @@
+             && bytes.len() as u64==before.len() && after.len()==before.len()
+             && (before.mtime(),before.mtime_nsec(),before.ctime(),before.ctime_nsec())
+                 ==(after.mtime(),after.mtime_nsec(),after.ctime(),after.ctime_nsec()),"light-chain configuration changed");
++        Ok((file,bytes))
++    }
++    fn config(path:&Path)->Result<(File,Config)> {
++        let (file,bytes)=private_config(path)?;
+         let config: Config=serde_json::from_slice(&bytes)?;
+         ensure!(config.schema=="monzero-private-ltc-light-v1" && config.maximum_height<=10_000_000,
+             "invalid light-chain configuration");
+@@ -370,6 +382,29 @@
+             "walletId":info.wallet_id(),"receivingAllocated":allocated[0],"changeAllocated":allocated[1],
+             "scope":"seed-and-address-allocations","allocationFreshness":"unassessed","activeSwapRecovery":false}))
+     }
++    fn create_wallet(path:&Path,approval:&CreateApproval)->Result<Value> {
++        use swap_machine::litecoin_light::vault::setup::{SetupDirectories,
++            configuration::{ConfigurationOptions,initialize_configured}};
++        let (_lease,bytes)=private_config(path)?;
++        let approved:sha256::Hash=approval.approved_config_digest.parse()?;
++        ensure!(approved.to_string()==approval.approved_config_digest && sha256::Hash::hash(&bytes)==approved,
++            "wallet creation settings differ from approval");
++        let config:SetupConfig=serde_json::from_slice(&bytes)?;
++        ensure!(config.schema=="monzero-private-ltc-setup-v1","invalid Litecoin setup schema");
++        let network=match config.network.as_str() {"main"=>LtcNetwork::Mainnet,"test"=>LtcNetwork::Testnet,
++            "regtest"=>LtcNetwork::Regtest,_=>anyhow::bail!("unsupported creation network")};
++        let endpoint=config.endpoint.map(|e|TlsEndpoint::new(e.host,e.port,network)).transpose()?;
++        let directories=SetupDirectories {vault:config.vault_directory,addresses:config.address_book_directory,backup:config.backup_directory};
++        let options=ConfigurationOptions {cache:config.cache_directory,spends:config.spend_directory,
++            maximum_height:config.maximum_height,endpoint};
++        let created=initialize_configured(&config.setup_directory,&directories,network,config.wallet_id,
++            config.account_index,approval.password.0.as_bytes(),&options)?;
++        Ok(json!({"watchOnly":true,"spendable":false,"created":true,"backupVerified":true,
++            "configurationFile":created.configuration_path(),"configurationDigest":created.configuration_digest().to_string(),
++            "backupDigest":created.wallet().backup().digest().to_string(),"walletId":config.wallet_id,
++            "receivingAllocated":0,"changeAllocated":0,"scope":"seed-and-address-allocations",
++            "allocationFreshness":"unassessed","activeSwapRecovery":false}))
++    }
+     fn output(response:&Value)->Result<()> {
+         let bytes=serde_json::to_vec(response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
+         std::io::stdout().write_all(&bytes)?;Ok(())
+@@ -377,14 +412,14 @@
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
+-        let mode=match args[1].to_str() {Some("--wallet-restore-stdio-v1")=>"wallet-restore",Some("--wallet-backup-save-stdio-v1")=>"wallet-backup-save",Some("--wallet-backup-verify-stdio-v1")=>"wallet-backup-verify",Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
++        let mode=match args[1].to_str() {Some("--wallet-create-stdio-v1")=>"wallet-create",Some("--wallet-restore-stdio-v1")=>"wallet-restore",Some("--wallet-backup-save-stdio-v1")=>"wallet-backup-save",Some("--wallet-backup-verify-stdio-v1")=>"wallet-backup-verify",Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
+             Some("--wallet-reconcile-stdio-v1")=>"wallet-reconcile",Some("--wallet-broadcast-stdio-v1")=>"wallet-broadcast",Some("--wallet-broadcast-status-stdio-v1")=>"wallet-broadcast-status",
+             Some("--wallet-signed-stdio-v1")=>"wallet-signed",Some("--wallet-sign-stdio-v1")=>"wallet-sign",Some("--wallet-reopen-stdio-v1")=>"wallet-reopen",Some("--wallet-receive-stdio-v1")=>"wallet-receive",Some("--wallet-prepare-stdio-v1")=>"wallet-prepare",Some("--wallet-estimate-stdio-v1")=>"wallet-estimate",
+             Some("--wallet-init-stdio-v1")=>"wallet-init",Some("--wallet-refresh-stdio-v1")=>"wallet-refresh",
+             _=>anyhow::bail!("unsupported light-chain operation")};
+         let backup_mode=mode=="wallet-backup-save" || mode=="wallet-backup-verify";
+         let mut bytes=Zeroizing::new(Vec::new());std::io::stdin().take(8193).read_to_end(&mut bytes)?;
+-        ensure!(!bytes.is_empty() && bytes.len()<=if mode=="wallet-sign" || backup_mode || mode=="wallet-restore" {8192}else if mode=="wallet-reconcile" || mode=="wallet-broadcast" || mode=="wallet-broadcast-status" || mode=="wallet-signed" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" || mode=="wallet-estimate" {2048}else{512},"invalid light-chain request size");
++        ensure!(!bytes.is_empty() && bytes.len()<=if mode=="wallet-sign" || backup_mode || mode=="wallet-restore" || mode=="wallet-create" {8192}else if mode=="wallet-reconcile" || mode=="wallet-broadcast" || mode=="wallet-broadcast-status" || mode=="wallet-signed" || mode=="wallet-prepare" || mode=="wallet-reopen" || mode=="wallet-sign" || mode=="wallet-estimate" {2048}else{512},"invalid light-chain request size");
+         let request: Request=serde_json::from_slice(&bytes)?;drop(bytes);
+         let schema=format!("monzero-ltc-light-{mode}-request-v1");
+         let sync=mode=="sync";
+@@ -404,6 +439,12 @@
+             else {request.maximum_history_entries.is_none()},"invalid Litecoin payment history budget");
+         ensure!(backup_mode==request.backup_approval.is_some(),"invalid Litecoin backup approval request");
+         ensure!((mode=="wallet-restore")==request.restore_approval.is_some(),"invalid Litecoin restore approval request");
++        ensure!((mode=="wallet-create")==request.create_approval.is_some(),"invalid Litecoin creation approval request");
++        if mode=="wallet-create" {
++            let wallet=create_wallet(Path::new(&args[2]),request.create_approval.as_ref().context("missing creation approval")?)?;
++            return output(&json!({"schema":format!("monzero-ltc-light-{mode}-response-v1"),
++                "requestId":request.request_id,"executable":false,"wallet":wallet}));
++        }
+         let (_lease,config)=config(Path::new(&args[2]))?;
+         let network=match config.network.as_str() {"main"=>LtcNetwork::Mainnet,"test"=>LtcNetwork::Testnet,
+             "regtest"=>LtcNetwork::Regtest,_=>anyhow::bail!("unsupported Litecoin network")};
+--- a/swap-machine/src/litecoin_light/vault/setup.rs
++++ b/swap-machine/src/litecoin_light/vault/setup.rs
+@@ -111,3 +111,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++pub mod configuration;
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/setup/configuration.rs
+@@ -0,0 +1,77 @@
++//! Bind setup options and publish the standard private helper configuration.
++//! Publication does not activate the account or contact the configured server.
++use super::*;
++use bitcoin::hashes::{Hash,sha256};
++use crate::litecoin_light::tls::TlsEndpoint;
++use serde_json::{Value,json};
++const SETTINGS:&str="litecoin-wallet-settings.json";
++const CONFIGURATION:&str="litecoin-wallet.json";
++pub struct ConfigurationOptions {
++    pub cache:PathBuf,
++    pub spends:PathBuf,
++    pub maximum_height:u32,
++    pub endpoint:Option<TlsEndpoint>,
++}
++pub struct ConfiguredWallet {
++    wallet:CreatedWallet,
++    path:PathBuf,
++    digest:sha256::Hash,
++}
++impl ConfiguredWallet {
++    pub fn wallet(&self)->&CreatedWallet {&self.wallet}
++    pub fn configuration_path(&self)->&Path {&self.path}
++    pub fn configuration_digest(&self)->sha256::Hash {self.digest}
++}
++impl ConfigurationOptions {
++    fn endpoint_value(&self)->Value {
++        self.endpoint.as_ref().map(|e|json!({"host":e.host(),"port":e.port()})).unwrap_or(Value::Null)
++    }
++    fn validate(&self,setup:&Path,paths:&SetupDirectories,network:LtcNetwork)->Result<()> {
++        ensure!(self.maximum_height<=10_000_000 && self.endpoint.as_ref().is_none_or(|e|e.network()==network),
++            "invalid Litecoin creation chain settings");
++        let directories=[setup,paths.vault.as_path(),paths.addresses.as_path(),paths.backup.as_path(),
++            self.cache.as_path(),self.spends.as_path()];
++        for (i,directory) in directories.iter().enumerate() {
++            ensure!(directories[..i].iter().all(|other|other!=directory),"creation directories must be distinct");
++            drop(Journal::open(directory)?);
++        }
++        Ok(())
++    }
++}
++/// The caller explicitly approves these settings before passing a password.
++/// Identical retries reuse both keys and configuration; changed settings fail.
++/// Configuration contains only public account data and local storage paths.
++pub fn initialize_configured(setup:&Path,paths:&SetupDirectories,network:LtcNetwork,wallet:Uuid,
++    index:u32,password:&[u8],options:&ConfigurationOptions)->Result<ConfiguredWallet> {
++    ensure!(!wallet.is_nil() && !password.is_empty() && password.len()<=1024,"invalid wallet creation identity or password");
++    bitcoin::bip32::ChildNumber::from_hardened_idx(index)?;
++    options.validate(setup,paths,network)?;
++    let settings=serde_json::to_vec(&json!({"schema":"monzero-ltc-wallet-settings-v1","network":network.name(),
++        "wallet":wallet,"account":index,"directories":paths,"cache":options.cache,"spends":options.spends,
++        "maximumHeight":options.maximum_height,"endpoint":options.endpoint_value()}))?;
++    {
++        let journal=Journal::open(setup)?;
++        // A standalone setup/configuration cannot silently adopt new settings.
++        match journal.read(SETTINGS) {
++            Err(error) if missing(&error)=>{
++                require_absent(&journal,INTENT)?;require_absent(&journal,COMPLETE)?;require_absent(&journal,CONFIGURATION)?;
++            },
++            Err(error)=>return Err(error),
++            Ok(existing)=>ensure!(existing==settings,"Litecoin creation settings changed"),
++        }
++        journal.retain(SETTINGS,&settings)?;
++    }
++    let created=initialize(setup,paths,network,wallet,index,password)?;
++    let mut configuration=json!({"schema":"monzero-private-ltc-light-v1","network":network.name(),
++        "cacheDirectory":options.cache,"maximumHeight":options.maximum_height,
++        "wallet":{"account":created.account().descriptor(),"addressBookDirectory":paths.addresses,
++            "spendDirectory":options.spends,"vault":{"directory":paths.vault,"walletId":wallet}}});
++    if options.endpoint.is_some() {configuration["endpoint"]=options.endpoint_value();}
++    let bytes=serde_json::to_vec(&configuration)?;
++    ensure!(bytes.len()<=4096,"oversized generated Litecoin configuration");
++    let journal=Journal::open(setup)?;
++    ensure!(journal.read(SETTINGS)?==settings,"Litecoin creation settings changed before publication");
++    journal.retain(CONFIGURATION,&bytes)?;
++    ensure!(journal.read(CONFIGURATION)?==bytes,"Litecoin configuration read-back mismatch");
++    Ok(ConfiguredWallet {wallet:created,path:setup.join(CONFIGURATION),digest:sha256::Hash::hash(&bytes)})
++}

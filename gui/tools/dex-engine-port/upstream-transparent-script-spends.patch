@@ -1,0 +1,250 @@
+--- a/swap-core/src/bitcoin/lock.rs
++++ b/swap-core/src/bitcoin/lock.rs
+@@ -144,6 +144,17 @@
+         sequence: Option<u32>,
+         spending_fee: Amount,
+     ) -> Transaction {
++        self.build_spend_transaction_to_script(&spend_address.script_pubkey(), sequence, spending_fee)
++    }
++
++    /// Build a transparent Bitcoin-family spend to an already validated script.
++    /// The caller must validate chain identity, destination and fee policy.
++    pub fn build_spend_transaction_to_script(
++        &self,
++        spend_script: &ScriptBuf,
++        sequence: Option<u32>,
++        spending_fee: Amount,
++    ) -> Transaction {
+         let previous_output = self.as_outpoint();
+ 
+         let sequence = Sequence(sequence.unwrap_or(0xFFFF_FFFF));
+@@ -159,7 +170,7 @@
+                 [self.lock_output_vout()]
+             .value
+                 - spending_fee,
+-            script_pubkey: spend_address.script_pubkey(),
++            script_pubkey: spend_script.clone(),
+         };
+ 
+         tracing::debug!(fee=%spending_fee.to_sat(), "Constructed Bitcoin spending transaction");
+--- a/swap-core/src/bitcoin/cancel.rs
++++ b/swap-core/src/bitcoin/cancel.rs
+@@ -170,6 +170,17 @@
+         sequence: Option<PunishTimelock>,
+         spending_fee: Amount,
+     ) -> Transaction {
++        self.build_spend_transaction_to_script(&spend_address.script_pubkey(), sequence, spending_fee)
++    }
++
++    /// Build a transparent Bitcoin-family spend to an already validated script.
++    /// The caller must validate chain identity, destination and fee policy.
++    pub fn build_spend_transaction_to_script(
++        &self,
++        spend_script: &ScriptBuf,
++        sequence: Option<PunishTimelock>,
++        spending_fee: Amount,
++    ) -> Transaction {
+         let previous_output = self.as_outpoint();
+ 
+         let sequence = Sequence(sequence.map(|seq| seq.0).unwrap_or(0xFFFF_FFFF));
+@@ -182,7 +193,7 @@
+ 
+         let tx_out = TxOut {
+             value: self.amount() - spending_fee,
+-            script_pubkey: spend_address.script_pubkey(),
++            script_pubkey: spend_script.clone(),
+         };
+ 
+         Transaction {
+--- a/swap-core/src/bitcoin/redeem.rs
++++ b/swap-core/src/bitcoin/redeem.rs
+@@ -31,9 +31,15 @@
+ 
+ impl TxRedeem {
+     pub fn new(tx_lock: &TxLock, redeem_address: &Address, spending_fee: Amount) -> Self {
++        Self::new_to_script(tx_lock, &redeem_address.script_pubkey(), spending_fee)
++    }
++
++    /// Construct a transparent Bitcoin-family spend without address encoding.
++    /// Chain identity, destination script and fee policy must be validated by the caller.
++    pub fn new_to_script(tx_lock: &TxLock, redeem_script: &ScriptBuf, spending_fee: Amount) -> Self {
+         // lock_input is the shared output that is now being used as an input for the
+         // redeem transaction
+-        let tx_redeem = tx_lock.build_spend_transaction(redeem_address, None, spending_fee);
++        let tx_redeem = tx_lock.build_spend_transaction_to_script(redeem_script, None, spending_fee);
+ 
+         let digest = SighashCache::new(&tx_redeem)
+             .p2wsh_signature_hash(
+@@ -48,7 +54,7 @@
+             inner: tx_redeem,
+             digest,
+             lock_output_descriptor: tx_lock.output_descriptor.clone(),
+-            watch_script: redeem_address.script_pubkey(),
++            watch_script: redeem_script.clone(),
+         }
+     }
+ 
+--- a/swap-core/src/bitcoin/full_refund.rs
++++ b/swap-core/src/bitcoin/full_refund.rs
+@@ -36,7 +36,13 @@
+ 
+ impl TxFullRefund {
+     pub fn new(tx_cancel: &TxCancel, refund_address: &Address, spending_fee: Amount) -> Self {
+-        let tx_refund = tx_cancel.build_spend_transaction(refund_address, None, spending_fee);
++        Self::new_to_script(tx_cancel, &refund_address.script_pubkey(), spending_fee)
++    }
++
++    /// Construct a transparent Bitcoin-family spend without address encoding.
++    /// Chain identity, destination script and fee policy must be validated by the caller.
++    pub fn new_to_script(tx_cancel: &TxCancel, refund_script: &ScriptBuf, spending_fee: Amount) -> Self {
++        let tx_refund = tx_cancel.build_spend_transaction_to_script(refund_script, None, spending_fee);
+ 
+         let digest = SighashCache::new(&tx_refund)
+             .p2wsh_signature_hash(
+@@ -54,7 +60,7 @@
+             inner: tx_refund,
+             digest,
+             cancel_output_descriptor: tx_cancel.output_descriptor.clone(),
+-            watch_script: refund_address.script_pubkey(),
++            watch_script: refund_script.clone(),
+         }
+     }
+ 
+--- a/swap-core/tests/litecoin_settlement.rs
++++ b/swap-core/tests/litecoin_settlement.rs
+@@ -8,7 +8,7 @@
+ use anyhow::{Context, Result, ensure};
+ use bitcoin::consensus::encode::serialize_hex;
+ use bitcoin::psbt::Psbt;
+-use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction};
++use bitcoin::{Amount, ScriptBuf, Transaction};
+ use ecdsa_fun::adaptor::{Adaptor, HashTranscript};
+ use ecdsa_fun::nonce::Deterministic;
+ use swap_core::monero::{ScalarExt, private_key_from_secp256k1_scalar};
+@@ -101,14 +101,14 @@
+         (1..=MAX_CANCEL_BLOCKS).contains(&request.cancel_blocks),
+         "cancelBlocks must be between 1 and {MAX_CANCEL_BLOCKS}"
+     );
+-    let redeem_address = script_carrier(&request.redeem_script).context("invalid redeemScript")?;
+-    let refund_address = script_carrier(&request.refund_script).context("invalid refundScript")?;
++    let redeem_script = destination_script(&request.redeem_script).context("invalid redeemScript")?;
++    let refund_script = destination_script(&request.refund_script).context("invalid refundScript")?;
+ 
+     let (A, B, S_a) = (keys.a.public(), keys.b.public(), keys.s_a.public());
+     let shared_script = build_shared_output_descriptor(A.into(), B.into())?.script_pubkey();
+     ensure!(
+-        redeem_address.script_pubkey() != shared_script
+-            && refund_address.script_pubkey() != shared_script,
++        redeem_script != shared_script
++            && refund_script != shared_script,
+         "redeemScript and refundScript must not pay the shared output"
+     );
+ 
+@@ -119,7 +119,7 @@
+     let lock_fee = tx_lock.fee()?;
+     let fee = Amount::from_sat(fee);
+ 
+-    let tx_redeem = TxRedeem::new(&tx_lock, &redeem_address, fee);
++    let tx_redeem = TxRedeem::new_to_script(&tx_lock, &redeem_script, fee);
+     let redeem_encsig = keys.b.encsign(S_a, tx_redeem.digest());
+     let redeem = tx_redeem.clone().complete(
+         redeem_encsig.clone(),
+@@ -141,7 +141,7 @@
+         B,
+         fee,
+     )?;
+-    let tx_refund = TxFullRefund::new(&tx_cancel, &refund_address, fee);
++    let tx_refund = TxFullRefund::new_to_script(&tx_cancel, &refund_script, fee);
+     let refund_encsig = keys.a.encsign(keys.s_b.public(), tx_refund.digest());
+     let adaptor = Adaptor::<HashTranscript<Sha256>, Deterministic<Sha256>>::default();
+     let refund_sig_a = adaptor.decrypt_signature(&keys.s_b.clone().into(), refund_encsig);
+@@ -176,8 +176,8 @@
+         redeem.output[0].value.to_sat() == amount - fee.to_sat()
+             && cancel.output[0].value.to_sat() == amount - fee.to_sat()
+             && refund.output[0].value.to_sat() == refund_value
+-            && redeem.output[0].script_pubkey == redeem_address.script_pubkey()
+-            && refund.output[0].script_pubkey == refund_address.script_pubkey()
++            && redeem.output[0].script_pubkey == redeem_script
++            && refund.output[0].script_pubkey == refund_script
+             && cancel.output[0].script_pubkey == shared_script,
+         "settlement accounting does not match the request"
+     );
+@@ -285,18 +285,12 @@
+     Ok(())
+ }
+ 
+-/// Litecoin and Bitcoin share scriptPubKey encodings. The regtest `Address`
+-/// only carries the script into the shared transaction builders and is never
+-/// rendered or exported.
+-fn script_carrier(script_hex: &str) -> Result<Address> {
++/// Parse only transparent destination scripts; chain address validation is the
++/// responsibility of the owned Litecoin node in the harness.
++fn destination_script(script_hex: &str) -> Result<ScriptBuf> {
+     let script = ScriptBuf::from_hex(script_hex)?;
+     ensure!(is_native_segwit(&script), "unsupported output script shape");
+-    let address = Address::from_script(&script, Network::Regtest)?;
+-    ensure!(
+-        address.script_pubkey() == script,
+-        "script carrier changed the output script"
+-    );
+-    Ok(address)
++    Ok(script)
+ }
+ 
+ fn is_native_segwit(script: &ScriptBuf) -> bool {
+@@ -450,6 +444,55 @@
+             response["cancel"]["txid"].as_str().unwrap()
+         );
+         assert_eq!(refund.input[0].witness.len(), 3);
++    }
++
++    #[test]
++    fn bitcoin_address_and_script_constructors_preserve_wire_transactions() {
++        use bitcoin::{Address, Network};
++        use bitcoin_wallet::primitives::Watchable;
++
++        let keys = FixtureKeys::new();
++        let lock = TxLock::from_psbt(
++            funded_psbt(vec![lock_output(AMOUNT), change_output()]),
++            keys.a.public(), keys.b.public(), Amount::from_sat(AMOUNT),
++        ).unwrap();
++        let fee = Amount::from_sat(2000);
++        let cancel = TxCancel::new(&lock, CancelTimelock::new(12),
++            keys.a.public(), keys.b.public(), fee).unwrap();
++        // Different witness versions and script sizes must preserve the signed
++        // transaction, sighash and observer destination on the legacy BTC path.
++        for script in [p2wpkh(3), shared_script(), ScriptBuf::from_hex(
++            "512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
++        ).unwrap()] {
++            let address = Address::from_script(&script, Network::Regtest).unwrap();
++            for sequence in [None, Some(0), Some(12), Some(u32::MAX)] {
++                assert_eq!(lock.build_spend_transaction(&address, sequence, fee),
++                    lock.build_spend_transaction_to_script(&script, sequence, fee));
++            }
++            assert_eq!(cancel.build_spend_transaction(&address, None, fee),
++                cancel.build_spend_transaction_to_script(&script, None, fee));
++            let legacy = TxRedeem::new(&lock, &address, fee);
++            let direct = TxRedeem::new_to_script(&lock, &script, fee);
++            assert_eq!(legacy.txid(), direct.txid());
++            assert_eq!(legacy.digest(), direct.digest());
++            assert_eq!(legacy.script(), direct.script());
++            let encrypted = keys.b.encsign(keys.s_a.public(), direct.digest());
++            assert_eq!(legacy.complete(encrypted.clone(), keys.a.clone(),
++                keys.s_a.clone().into(), keys.b.public()).unwrap(),
++                direct.complete(encrypted, keys.a.clone(),
++                keys.s_a.clone().into(), keys.b.public()).unwrap());
++            let legacy = TxFullRefund::new(&cancel, &address, fee);
++            let direct = TxFullRefund::new_to_script(&cancel, &script, fee);
++            assert_eq!(legacy.txid(), direct.txid());
++            assert_eq!(legacy.digest(), direct.digest());
++            assert_eq!(legacy.script(), direct.script());
++            let sign = |tx: TxFullRefund| {
++                let a = keys.a.sign(tx.digest());
++                let b = keys.b.sign(tx.digest());
++                tx.add_signatures((keys.a.public(), a), (keys.b.public(), b)).unwrap()
++            };
++            assert_eq!(sign(legacy), sign(direct));
++        }
+     }
+ 
+     #[test]

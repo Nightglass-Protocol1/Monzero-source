@@ -1,0 +1,135 @@
+diff --git a/swap-machine/src/native_funding_rpc/full_proceeds.rs b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+index 72696093d..9e5b09a05 100644
+--- a/swap-machine/src/native_funding_rpc/full_proceeds.rs
++++ b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+@@ -30,6 +30,79 @@ pub struct FullProceedsPreview {
+     pub weight: u64,
+ }
+ 
++/// Experimental exact-net accounting, not authority to fund or settle a quote.
++/// The caller supplies the approved reserve owner; this module never chooses it.
++pub struct ExactNetRequest {
++    pub source: FullProceedsRequest,
++    pub principal: XmzAmount,
++    pub reserve_return: XmzAddress,
++}
++
++pub struct ExactNetPreview {
++    pub recipient: XmzAmount,
++    pub reserve_return: XmzAmount,
++    pub network_fee: XmzAmount,
++}
++
++/// Constructs but never exports or broadcasts a transaction. Fees are deducted
++/// exclusively from the reserve-return output, never the exact-net payout.
++pub async fn preview_exact_net(client: &NativeFundingRpc, request: &ExactNetRequest,
++    genesis: &str) -> Result<ExactNetPreview> {
++    let source = &request.source;
++    let params = exact_net_params(request)?;
++    ensure!(hash(genesis) && hash(&source.lock_txid), "invalid exact-net chain or lock");
++    let before = client.snapshot().await?;
++    ensure!(before.genesis == genesis && hash(&before.tip_hash), "unexpected exact-net chain");
++    ensure!(client.opened_wallet(source.wallet.network()).await?.as_ref() == Some(&source.wallet),
++        "unexpected exact-net wallet");
++    let incoming = client.rpc(client.wallet, "incoming_transfers",
++        json!({"transfer_type":"available", "account_index":source.account})).await?;
++    let inputs = lock_inputs(&incoming, source)?;
++    let response = client.rpc(client.wallet, "transfer", params).await?;
++    let preview = check_exact_net(&response, request, &inputs)?;
++    ensure!(client.opened_wallet(source.wallet.network()).await?.as_ref() == Some(&source.wallet),
++        "exact-net wallet changed");
++    ensure!(client.snapshot().await? == before, "exact-net chain changed");
++    Ok(preview)
++}
++
++fn exact_net_params(request: &ExactNetRequest) -> Result<Value> {
++    let source = &request.source;
++    let reserve = source.locked.atoms().checked_sub(request.principal.atoms())
++        .context("exact-net principal exceeds lock")?;
++    ensure!(request.principal.atoms() > 0 && source.maximum_fee.atoms() > 0
++        && reserve > source.maximum_fee.atoms() && (1..=4).contains(&source.priority),
++        "invalid exact-net principal or reserve");
++    ensure!(source.wallet.network() == source.destination.network()
++        && source.wallet.network() == request.reserve_return.network()
++        && source.wallet != source.destination && source.wallet != request.reserve_return
++        && source.destination != request.reserve_return, "invalid exact-net destinations");
++    Ok(json!({"destinations":[
++        {"address":source.destination.to_string(),"amount":request.principal.atoms()},
++        {"address":request.reserve_return.to_string(),"amount":reserve}],
++        "account_index":source.account,"priority":source.priority,"unlock_time":0,
++        "subtract_fee_from_outputs":[1],"do_not_relay":true,
++        "get_tx_key":false,"get_tx_hex":false,"get_tx_metadata":false}))
++}
++
++fn check_exact_net(response: &Value, request: &ExactNetRequest,
++    inputs: &BTreeSet<String>) -> Result<ExactNetPreview> {
++    let amounts = response["amounts_by_dest"]["amounts"].as_array()
++        .context("missing exact-net destinations")?;
++    ensure!(amounts.len() == 2 && amounts[0].as_u64() == Some(request.principal.atoms()),
++        "exact-net payout differs from principal");
++    let returned = amounts[1].as_u64().context("invalid exact-net reserve return")?;
++    ensure!(returned > 0 && request.principal.atoms().checked_add(returned)
++        == Some(number(response, "amount")?), "invalid exact-net destination total");
++    // Reuse full-lock input, fee and artifact checks after validating the
++    // distinct output amounts. This copy contains no permitted signing data.
++    let mut accounting = response.clone();
++    accounting["amounts_by_dest"]["amounts"] = json!([number(response, "amount")?]);
++    let checked = check_response(&accounting, &request.source, inputs)?;
++    Ok(ExactNetPreview { recipient: request.principal,
++        reserve_return: XmzAmount::from_atoms(returned), network_fee: checked.network_fee })
++}
++
+ /// Fail closed if a single transaction cannot consume exactly the intended
+ /// lock. No automatic split, sweep-all, output freezing or relay fallback.
+ pub async fn preview(client: &NativeFundingRpc, request: &FullProceedsRequest,
+@@ -136,6 +209,25 @@ mod tests {
+             "tx_key":"","tx_blob":"","tx_metadata":"","multisig_txset":"","unsigned_txset":""})
+     }
+     #[test]
++    fn exact_net_accounting_preserves_principal_and_returns_reserve() -> Result<()> {
++        let request = ExactNetRequest { source: request(), principal: XmzAmount::from_atoms(90),
++            reserve_return: request().wallet };
++        let expected = lock_inputs(&incoming(), &request.source)?;
++        let mut value = response();
++        value["amounts_by_dest"]["amounts"] = json!([90,10]);
++        let checked = check_exact_net(&value, &request, &expected)?;
++        assert_eq!(checked.recipient.atoms(),90);
++        assert_eq!(checked.reserve_return.atoms(),10);
++        assert_eq!(checked.network_fee.atoms(),2);
++        for amounts in [json!([89,11]),json!([90,9]),json!([90,0]),json!([100]),json!([90,9,1])] {
++            let mut changed = value.clone(); changed["amounts_by_dest"]["amounts"] = amounts;
++            assert!(check_exact_net(&changed,&request,&expected).is_err());
++        }
++        // Identical source/destination fixtures cannot construct a transaction.
++        assert!(exact_net_params(&request).is_err());
++        Ok(())
++    }
++    #[test]
+     fn full_proceeds_requests_never_relay_or_export_metadata() {
+         let value = params(&request());
+         assert_eq!(value["do_not_relay"], true);
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index e14950d4d..5d4f40b06 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -190,6 +190,20 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+         .await.err().context("incorrect lock principal accepted")?.to_string()
+         == "available lock total differs from approved full-proceeds principal", "wrong principal rejection");
+     full.locked = locked;
++    let exact = swap_machine::native_funding_rpc::full_proceeds::ExactNetRequest {
++        source: full,
++        principal: amount,
++        // Public fixture-only destination; no transaction is exported or relayed.
++        reserve_return: XmzAddress::parse(XmzNetwork::Mainnet,
++            "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H")?,
++    };
++    let exact_preview = swap_machine::native_funding_rpc::full_proceeds::preview_exact_net(
++        &client, &exact, genesis).await?;
++    anyhow::ensure!(exact_preview.recipient == amount
++        && exact_preview.recipient.checked_add(exact_preview.reserve_return)
++            .and_then(|total| total.checked_add(exact_preview.network_fee)) == Some(locked),
++        "exact-net preview changed principal or lost reserve");
++    let mut full = exact.source;
+     full.maximum_fee = XmzAmount::from_atoms(1);
+     anyhow::ensure!(swap_machine::native_funding_rpc::full_proceeds::preview(&client,&full,genesis)
+         .await.err().context("excess fee accepted")?.to_string()

@@ -1,0 +1,125 @@
+diff --git a/swap-machine/tests/alice_peer/mod.rs b/swap-machine/tests/alice_peer/mod.rs
+index 84e19d732..d95644e4c 100644
+--- a/swap-machine/tests/alice_peer/mod.rs
++++ b/swap-machine/tests/alice_peer/mod.rs
+@@ -43,7 +43,7 @@ impl Wire {
+ 
+ pub struct AlicePeer {
+     wire: RefCell<Wire>, owner: OwnedProcess,
+-    funding: (monero_oxide_ext::PublicKey, monero_oxide_ext::PublicKey),
++    funding: (monero_oxide_ext::PublicKey, monero_oxide_ext::PublicKey, u64),
+ }
+ struct OwnedProcess { child: Child, directory: PathBuf }
+ impl Drop for OwnedProcess {
+@@ -89,14 +89,15 @@ impl AlicePeer {
+         socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+         socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+         let mut wire=Wire {socket,id,sequence};
+-        let funding: (monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey)=wire.receive("resume")?;
++        let funding: (monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey,u64)=wire.receive("resume")?;
+         ensure!(funding==self.funding,"Alice resumed with different funding keys");
+         wire.sequence+=1;
+         self.wire=RefCell::new(wire);
+         Ok(())
+     }
+     pub async fn negotiate(id: Uuid, bob0: bob::State0, wallet: &bitcoin_wallet::Wallet,
+-        redeem: bitcoin::Address, punish: bitcoin::Address) -> Result<(Self,bob::State2)> {
++        redeem: bitcoin::Address, punish: bitcoin::Address,
++        btc_amount: bitcoin::Amount, xmz_atoms: u64) -> Result<(Self,bob::State2)> {
+         let directory=std::env::temp_dir().join(format!("xmz-alice-{}",Uuid::new_v4()));
+         std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+         let path=directory.join("peer");
+@@ -123,18 +124,21 @@ impl AlicePeer {
+         socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+         socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+         let mut wire=Wire {socket,id,sequence:0};
+-        let _: bool=wire.call("init",json!({"redeem":redeem.to_string(),"punish":punish.to_string()}))?;
++        let _: bool=wire.call("init",json!({"redeem":redeem.to_string(),"punish":punish.to_string(),
++            "btcSatoshis":btc_amount.to_sat().to_string(),"xmzAtoms":xmz_atoms.to_string()}))?;
+         let message=wire.call("message0",bob0.next_message()?)?;
+         let bob1=bob0.receive(wallet,message).await?;
+         let message=wire.call("message2",bob1.next_message())?;
+         let bob2=bob1.receive(message)?;
+-        let funding=wire.call("message4",bob2.next_message()?)?;
++        let funding: (monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey,u64)=wire.call("message4",bob2.next_message()?)?;
++        ensure!(funding.2==xmz_atoms && bob2.xmr.as_pico()==xmz_atoms
++            && bob2.tx_lock.lock_amount()==btc_amount,"negotiated fixture amounts differ from request");
+         Ok((Self {wire:RefCell::new(wire),owner,funding},bob2))
+     }
+     pub fn lock_xmr_transfer_request(&self)->swap_core::monero::TransferRequest {
+         swap_core::monero::TransferRequest {public_spend_key:self.funding.0,
+             public_view_key:swap_core::monero::PublicViewKey(self.funding.1),
+-            amount:swap_core::monero::primitives::Amount::from_pico(200_000_000_000).into()}
++            amount:swap_core::monero::primitives::Amount::from_pico(self.funding.2).into()}
+     }
+     pub fn signed_cancel_transaction(&self)->Result<bitcoin::Transaction> { self.wire.borrow_mut().call("cancel",()) }
+     pub fn signed_redeem_transaction(&self, signature: swap_core::bitcoin::EncryptedSignature)->Result<bitcoin::Transaction> {
+@@ -204,16 +208,24 @@ pub fn serve()->Result<()> {
+         ensure!(saved_id==id && sequence==expected_sequence,"Alice checkpoint context mismatch");
+         wire.sequence=sequence;
+         let funding=state.lock_xmr_transfer_request();
+-        wire.send("resume",(funding.public_spend_key,funding.public_view_key.0))?;
++        wire.send("resume",(funding.public_spend_key,funding.public_view_key.0,funding.amount.as_pico()))?;
+         wire.sequence+=1;
+         state
+     } else {
+     let init: Value=wire.receive("init")?;
+     let redeem=init["redeem"].as_str().context("missing redeem")?.parse::<bitcoin::Address<_>>()?.require_network(bitcoin::Network::Regtest)?;
+     let punish=init["punish"].as_str().context("missing punish")?.parse::<bitcoin::Address<_>>()?.require_network(bitcoin::Network::Regtest)?;
++    let number = |field: &str| -> Result<u64> {
++        let text=init[field].as_str().context("missing fixture principal")?;
++        let value: u64=text.parse()?;
++        ensure!(value>0 && value.to_string()==text,"invalid fixture principal");
++        Ok(value)
++    };
++    let btc_amount=bitcoin::Amount::from_sat(number("btcSatoshis")?);
++    let xmz_atoms=number("xmzAtoms")?;
+     let fee=bitcoin::Amount::from_sat(1000);
+-    let state=alice::State0::new(bitcoin::Amount::from_sat(500000),
+-        swap_core::monero::primitives::Amount::from_pico(200_000_000_000),bitcoin::Amount::ZERO,
++    let state=alice::State0::new(btc_amount,
++        swap_core::monero::primitives::Amount::from_pico(xmz_atoms),bitcoin::Amount::ZERO,
+         Regtest::get_config(),redeem,punish,fee,fee,fee,false,&mut rand::rngs::OsRng);
+     wire.send("init",true)?; wire.sequence+=1;
+     let (received,state)=state.receive(wire.receive("message0")?)?;
+@@ -222,8 +234,10 @@ pub fn serve()->Result<()> {
+     let state=state.receive(wire.receive("message2")?)?;
+     wire.send("message2",state.next_message()?)?; wire.sequence+=1;
+     let state=state.receive(wire.receive("message4")?)?;
++    ensure!(state.btc==btc_amount && state.tx_lock.lock_amount()==btc_amount
++        && state.xmr.as_pico()==xmz_atoms,"Alice negotiated different fixture amounts");
+     let funding=state.lock_xmr_transfer_request();
+-    wire.send("message4",(funding.public_spend_key,funding.public_view_key.0))?; wire.sequence+=1;
++    wire.send("message4",(funding.public_spend_key,funding.public_view_key.0,funding.amount.as_pico()))?; wire.sequence+=1;
+     state
+     };
+     // Post-negotiation operations remain fixture-only and retain Alice's keys here.
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 532defc29..eb04625bf 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -317,11 +317,13 @@ async fn settlement(refund: bool) -> Result<()> {
+     harness::fund_and_mine(&env.bitcoind, bob_wallet.new_address().await?, funding).await?;
+     balance(&bob_wallet, funding).await?;
+ 
+-    let amount = Amount::from_sat(500_000);
++    // Non-default amounts catch duplicated constants in the separate peer and
++    // its checkpoint/recovery path before quotes can supply these values.
++    let amount = Amount::from_sat(450_000);
+     let fee = Amount::from_sat(1_000);
+     let config = Regtest::get_config();
+     // This does not validate native XMZ funding, network identity, or transfer proof.
+-    let atoms: swap_core::xmz::XmzAmount = "2".parse().expect("constant fixture amount");
++    let atoms: swap_core::xmz::XmzAmount = "1.5".parse().expect("constant fixture amount");
+     let legacy_amount = swap_core::monero::primitives::Amount::from_pico(atoms.atoms());
+     #[cfg(not(unix))]
+     let alice0 = alice::State0::new(amount, legacy_amount, Amount::ZERO, config,
+@@ -336,7 +338,7 @@ async fn settlement(refund: bool) -> Result<()> {
+         fee, fee, fee, fee, fee, fee);
+     #[cfg(unix)]
+     let (mut alice3,bob2)=alice_peer::AlicePeer::negotiate(swap_id,bob0,&bob_wallet,
+-        alice_wallet.new_address().await?,alice_wallet.new_address().await?).await?;
++        alice_wallet.new_address().await?,alice_wallet.new_address().await?,amount,atoms.atoms()).await?;
+     #[cfg(not(unix))]
+     let (alice3,bob2)={
+     let (_, alice1) = alice0.receive(bob0.next_message()?)?;

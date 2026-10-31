@@ -1,0 +1,207 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 5dc41f95d..b6d746bcf 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -230,12 +230,21 @@ mod linux {
+     async fn reserve_litecoin(path:&Path,input:&[u8],mode:&str)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_quote::VerifiedLtcQuote,litecoin_rpc::LitecoinRpc};
+         use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        use swap_machine::litecoin_negotiation::execution::recovery_relay::RecoverySpend;
+         let request:Request=serde_json::from_slice(input)?;
++        let recovery=match mode {
++            "--recovery-cancel-review-stdio-v1"=>Some((RecoverySpend::Cancel,false,"cancel")),
++            "--recovery-cancel-submit-stdio-v1"=>Some((RecoverySpend::Cancel,true,"cancel")),
++            "--recovery-refund-review-stdio-v1"=>Some((RecoverySpend::Refund,false,"refund")),
++            "--recovery-refund-submit-stdio-v1"=>Some((RecoverySpend::Refund,true,"refund")),
++            _=>None,
++        };
+         let review=mode=="--lock-funding-review-stdio-v1";let submit=mode=="--lock-funding-submit-stdio-v1";
+-        ensure!(request.schema==if review {"monzero-ltc-lock-funding-review-request-v1"}
++        let recovery_schema=recovery.map(|(_,sending,name)|format!("monzero-ltc-recovery-{name}-{}-request-v1",if sending {"submit"} else {"review"}));
++        ensure!(request.schema==if let Some(schema)=recovery_schema.as_deref() {schema} else if review {"monzero-ltc-lock-funding-review-request-v1"}
+             else if submit {"monzero-ltc-lock-funding-submit-request-v1"} else {"monzero-ltc-reservation-prepare-request-v1"}
+             && !request.request_id.is_nil() && request.action.is_none() && request.safety_blocks.is_none()
+-            && request.commitment.is_some()==submit && request.priority.is_none(),"invalid reservation/funding request");
++            && request.commitment.is_some()==(submit || recovery.is_some_and(|(_,s,_)|s)) && request.priority.is_none(),"invalid reservation/funding request");
+         let (_wrapper,bytes)=private_bytes(path,false)?;
+         let wrapper:ReservationConfig=serde_json::from_slice(&bytes)?;
+         ensure!(wrapper.schema=="monzero-private-ltc-reservation-v1","invalid reservation configuration");
+@@ -252,6 +261,18 @@ mod linux {
+         let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+         let adapter=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
+             LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        if let Some((kind,sending,name))=recovery {
++            if sending {
++                let approved=parse_commitment(request.commitment.as_deref().context("missing recovery approval")?)?;
++                let outcome=execution.submit_reviewed_recovery_spend(&adapter,kind,approved).await?;
++                return Ok(serde_json::json!({"schema":format!("monzero-ltc-recovery-{name}-submit-response-v1"),
++                    "requestId":request.request_id,"snapshot":execution.saved_status()?,"outcome":outcome}));
++            }
++            let review=execution.review_recovery_spend(kind)?;
++            return Ok(serde_json::json!({"schema":format!("monzero-ltc-recovery-{name}-review-response-v1"),
++                "requestId":request.request_id,"snapshot":execution.saved_status()?,"review":{"details":review.details,
++                    "commitment":review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()}}));
++        }
+         if review {
+             let review=execution.review_litecoin_funding(&adapter,&rpc.reservation_directory)?;
+             return Ok(serde_json::json!({"schema":"monzero-ltc-lock-funding-review-response-v1","requestId":request.request_id,
+@@ -795,7 +816,7 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
+-        if args.len()==4 && ["--reservation-prepare-stdio-v1","--lock-funding-review-stdio-v1","--lock-funding-submit-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
++        if args.len()==4 && ["--reservation-prepare-stdio-v1","--lock-funding-review-stdio-v1","--lock-funding-submit-stdio-v1","--recovery-cancel-review-stdio-v1","--recovery-cancel-submit-stdio-v1","--recovery-refund-review-stdio-v1","--recovery-refund-submit-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
+             let mut input=Vec::new();std::io::stdin().take(513).read_to_end(&mut input)?;
+             ensure!(input.len()<=512,"oversized reservation request");
+             let response=tokio::runtime::Builder::new_current_thread().enable_all().build()?
+diff --git a/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs b/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs
+index 7bfe66c49..0d42c89af 100644
+--- a/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/recovery_relay.rs
+@@ -26,6 +26,14 @@ fn dispatch_bytes(head:&Head,kind:RecoverySpend,tx:&Transaction)->Result<Vec<u8>
+         checkpoint:head.checkpoint,recovery:head.recovery_intent.context("missing recovery agreement")?,kind,
+         txid:tx.compute_txid(),wtxid:tx.compute_wtxid()}).map_err(Into::into)
+ }
++pub struct RecoverySpendReview {pub details:serde_json::Value,pub commitment:[u8;32]}
++#[derive(Serialize)]
++#[serde(tag="state",rename_all="camelCase")]
++pub enum ReviewedRecoveryOutcome {Acknowledged {txid:Txid},Uncertain {txid:Txid},Mempool {txid:Txid}}
++fn review_commitment(details:&serde_json::Value)->Result<[u8;32]> {
++    let mut hash=Sha256::new();hash.update(b"MONZERO-LTC-RECOVERY-SPEND-APPROVAL-V1\0");
++    hash.update(serde_json::to_vec(details)?);Ok(hash.finalize().into())
++}
+ impl Execution {
+     fn recovery_transaction(&mut self,kind:RecoverySpend)->Result<Transaction> {
+         ensure!(kind.allowed(self.claim.role),"wrong Litecoin recovery spend role");
+@@ -36,6 +44,79 @@ impl Execution {
+             RecoverySpend::Punish=>retained.punish.context("missing agreed punishment"),
+         }
+     }
++    /// Review retained bytes only; no chain lookup, signing or broadcast. May
++    /// finish publishing an already-written dispatch/receipt after a crash.
++    pub fn review_recovery_spend(&mut self,kind:RecoverySpend)->Result<RecoverySpendReview> {
++        use swap_core::litecoin_address::LtcSegwitAddress;
++        let transaction=self.recovery_transaction(kind)?;
++        ensure!(transaction.input.len()==1 && transaction.output.len()==1,"invalid recovery transaction shape");
++        let (mut head,previous,quote,_,_)=self.load()?;
++        let expected=dispatch_bytes(&head,kind,&transaction)?;
++        let dispatch=match self.metadata.read(&dispatch_name(self.claim.trade,kind)) {
++            Ok(saved)=>{
++                ensure!(saved==expected,"recovery dispatch differs from reviewed bytes");
++                let hash:[u8;32]=Sha256::digest(&saved).into();
++                if let Some(pin)=head.recovery_dispatch.get(&kind) {ensure!(*pin==hash,"recovery dispatch differs from head");}
++                head.recovery_dispatch.insert(kind,hash);Some(hash)
++            },
++            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
++                ensure!(!head.recovery_dispatch.contains_key(&kind),"missing committed recovery dispatch");None
++            },
++            Err(e)=>return Err(e),
++        };
++        match self.metadata.read(&receipt_name(self.claim.trade,kind)) {
++            Ok(saved)=>{
++                let expected=serde_json::to_vec(&Receipt {schema:"monzero-ltc-recovery-receipt-v1".into(),
++                    dispatch:dispatch.context("receipt without recovery dispatch")?,txid:transaction.compute_txid()})?;
++                ensure!(saved==expected,"recovery receipt differs from reviewed bytes");
++                let hash:[u8;32]=Sha256::digest(&saved).into();
++                if let Some(pin)=head.recovery_receipts.get(&kind) {ensure!(*pin==hash,"recovery receipt differs from head");}
++                head.recovery_receipts.insert(kind,hash);
++            },
++            Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
++                ensure!(!head.recovery_receipts.contains_key(&kind),"missing committed recovery receipt");
++            },
++            Err(e)=>return Err(e),
++        }
++        let current=serde_json::to_vec(&head)?;
++        if current!=previous {self.metadata.replace_execution_head(self.claim.trade,&previous,&current)?;}
++        let locked=quote.terms()["ltcAtoms"].parse::<u64>()?;
++        let input=if kind==RecoverySpend::Cancel {locked} else {
++            locked.checked_sub(quote.terms()["ltcCancelFeeAtoms"].parse()?).context("cancel fee exceeds lock")?
++        };
++        let amount=transaction.output[0].value.to_sat();
++        let fee=input.checked_sub(amount).context("recovery output exceeds input")?;
++        let fee_key=match kind {RecoverySpend::Cancel=>"ltcCancelFeeAtoms",RecoverySpend::Refund=>"ltcRefundFeeAtoms",RecoverySpend::Punish=>"ltcPunishFeeAtoms"};
++        ensure!(fee==quote.terms()[fee_key].parse::<u64>()?,"recovery fee differs from quote");
++        let destination=LtcSegwitAddress::from_script(self.policy.ltc_network,&transaction.output[0].script_pubkey)?.to_string();
++        if kind==RecoverySpend::Refund {ensure!(destination==quote.terms()["ltcRefund"],"refund destination differs from quote");}
++        let details=serde_json::json!({"schema":"monzero-ltc-recovery-spend-review-v1","tradeId":head.trade,
++            "quoteCommitment":hex(&head.quote),"journalCommitment":hex(&Sha256::digest(&current)),
++            "recoveryCommitment":hex(&head.recovery_intent.context("missing recovery agreement")?),
++            "transactionCommitment":hex(&Sha256::digest(bitcoin::consensus::serialize(&transaction))),
++            "dispatchCommitment":dispatch.map(|h|hex(&h)),"operation":kind.label(),
++            "action":if dispatch.is_some(){"retransmit"}else{"send"},"txid":transaction.compute_txid(),"wtxid":transaction.compute_wtxid(),
++            "inputTxid":transaction.input[0].previous_output.txid,"inputVout":transaction.input[0].previous_output.vout.to_string(),
++            "sequence":transaction.input[0].sequence.0.to_string(),"destination":destination,
++            "inputAtoms":input.to_string(),"amountAtoms":amount.to_string(),"feeAtoms":fee.to_string(),"chainObserved":false});
++        Ok(RecoverySpendReview {commitment:review_commitment(&details)?,details})
++    }
++    pub async fn submit_reviewed_recovery_spend(&mut self,ltc:&LitecoinRpc,kind:RecoverySpend,approved:[u8;32])->Result<ReviewedRecoveryOutcome> {
++        let review=self.review_recovery_spend(kind)?;
++        ensure!(review.commitment==approved,"recovery approval differs from retained transaction or action");
++        ensure!(ltc.network()==self.policy.ltc_network,"wrong recovery network");
++        let retry=review.details["action"]=="retransmit";
++        if retry {
++            let transaction=self.recovery_transaction(kind)?;
++            if ltc.contract_spend_in_mempool(&transaction).await? {
++                return Ok(ReviewedRecoveryOutcome::Mempool {txid:transaction.compute_txid()});
++            }
++        }
++        match self.submit_recovery_spend(ltc,kind,retry).await? {
++            RecoveryRelayOutcome::Acknowledged {txid}=>Ok(ReviewedRecoveryOutcome::Acknowledged {txid}),
++            RecoveryRelayOutcome::Uncertain {txid}=>Ok(ReviewedRecoveryOutcome::Uncertain {txid}),
++        }
++    }
+     /// No native-funding or commercial-expiry gate: these are already-agreed
+     /// recovery obligations. The Litecoin node enforces current spendability and
+     /// relative timelocks before the owner records its first broadcast attempt.
+@@ -85,3 +166,22 @@ impl Execution {
+         Ok(observed.confirmations())
+     }
+ }
++
++#[cfg(test)]
++mod approval_tests {
++    use super::*;
++    #[test]
++    fn recovery_consent_binds_every_reviewed_field_and_domain()->Result<()> {
++        let review=serde_json::json!({"operation":"cancel","action":"send","txid":"a","wtxid":"b",
++            "destination":"contract","amountAtoms":"99","feeAtoms":"1","inputAtoms":"100",
++            "tradeId":"trade","quoteCommitment":"quote","journalCommitment":"journal","recoveryCommitment":"recovery",
++            "transactionCommitment":"transaction","dispatchCommitment":null,"sequence":"20","inputTxid":"parent","inputVout":"0","chainObserved":false});
++        let approved=review_commitment(&review)?;
++        for key in review.as_object().unwrap().keys() {
++            let mut changed=review.clone();changed[key]=serde_json::json!("changed");
++            assert_ne!(approved,review_commitment(&changed)?,"unbound field {key}");
++        }
++        let mut hash=Sha256::new();hash.update(b"MONZERO-LTC-LOCK-FUNDING-APPROVAL-V1\0");hash.update(serde_json::to_vec(&review)?);
++        assert_ne!(approved,<[u8;32]>::from(hash.finalize()));Ok(())
++    }
++}
+diff --git a/swap-machine/src/litecoin_rpc/redeem_submission.rs b/swap-machine/src/litecoin_rpc/redeem_submission.rs
+index 6eaf9a5b9..f6cd1c512 100644
+--- a/swap-machine/src/litecoin_rpc/redeem_submission.rs
++++ b/swap-machine/src/litecoin_rpc/redeem_submission.rs
+@@ -17,6 +17,24 @@ impl LitecoinRpc {
+         Ok(())
+     }
+ 
++    /// Read-only reconciliation of an exact retained contract spend. Absence
++    /// grants no send authority; callers must still run timelock preflight.
++    pub(crate) async fn contract_spend_in_mempool(&self,transaction:&Transaction)->Result<bool> {
++        let before=self.chain().await?;
++        let txid=transaction.compute_txid();
++        let entry=self.rpc_lookup(false,"getmempoolentry",json!([txid.to_string()]),true).await?;
++        let found=if let Some(entry)=entry {
++            let entry:Value=serde_json::from_str(entry.get())?;
++            ensure!(entry["vsize"].as_u64()==Some(transaction.vsize() as u64)
++                && entry["weight"].as_u64()==Some(transaction.weight().to_wu()),"recovery mempool size differs");
++            let raw:String=serde_json::from_str(self.rpc(false,"getrawtransaction",json!([txid.to_string(),false])).await?.get())?;
++            ensure!(raw==serialize_hex(transaction),"mempool recovery differs from retained signed bytes");
++            true
++        } else {false};
++        ensure!(self.chain().await?==before,"Litecoin chain changed during recovery reconciliation");
++        Ok(found)
++    }
++
+     /// The execution owner must durably commit dispatch before calling this.
+     /// Any transport failure or unexpected reply is an uncertain broadcast.
+     pub(crate) async fn dispatch_contract_spend(&self,transaction:&Transaction)->bool {

@@ -1,0 +1,15 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
+index 5c54b361a..38aea1e1f 100644
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
+@@ -19,7 +19,9 @@ impl FundingObserver for Native {
+     async fn snapshot(&self)->Result<ChainSnapshot> {
+         let call=self.snapshots.fetch_add(1,Ordering::SeqCst);
+         Ok(ChainSnapshot {genesis:self.genesis.clone(),tip_height:110,
+-            tip_hash:if self.mode.load(Ordering::SeqCst)==3 && call>=2 {"09"}else{"08"}.repeat(32)})
++            // Mode 3 is a chain that keeps moving: verification retries a single new
++            // block, so every read from the third on returns a different tip.
++            tip_hash:if self.mode.load(Ordering::SeqCst)==3 && call>=2 {format!("{:064x}",call)}else{"08".repeat(32)}})
+     }
+     async fn observe(&self,request:&FundingRequest)->Result<FundingObservation> {
+         ensure!(request.proof.tx_hash.0=="ab".repeat(32) && request.proof.tx_key==PrivateKey::from_scalar(Scalar::ONE),

@@ -1,0 +1,92 @@
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -419,6 +419,7 @@
+     mod vault_format { include!("native-ltc-light/vault_format.rs"); }
+     mod recovery { include!("native-ltc-light/recovery.rs"); }
+     mod import { include!("native-ltc-light/import.rs"); }
++    mod discovery { include!("native-ltc-light/discovery.rs"); }
+     fn output(response:&Value)->Result<()> {
+         let bytes=serde_json::to_vec(response)?;ensure!(bytes.len()<=4096,"oversized light-chain response");
+         std::io::stdout().write_all(&bytes)?;Ok(())
+@@ -426,6 +427,7 @@
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
++        if args[1]=="--wallet-import-discover-stdio-v1" {return discovery::run(Path::new(&args[2]));}
+         if args[1]=="--wallet-import-preview-stdio-v1" {return import::run(Path::new(&args[2]),false);}
+         if args[1]=="--wallet-import-stdio-v1" {return import::run(Path::new(&args[2]),true);}
+         if args[1]=="--wallet-recovery-stdio-v1" {return recovery::reveal(Path::new(&args[2]));}
+diff --git a/swap-machine/src/bin/native-ltc-light/discovery.rs b/swap-machine/src/bin/native-ltc-light/discovery.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/discovery.rs
+@@ -0,0 +1,68 @@
++// Explicit bounded discovery for imported keys. This can update selected header
++// cache records, but never allocations, vaults, backups or wallet activation.
++use super::*;
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct DiscoveryRequest {
++    schema:String,request_id:uuid::Uuid,approved_config_digest:String,discovery_approved:bool,
++    maximum_download_headers:u32,known_minimum:[u32;2],wallet_scan:WalletScan,
++}
++pub(super) fn run(path:&Path)->Result<()> {
++    let mut input=Vec::with_capacity(8193);std::io::stdin().take(8193).read_to_end(&mut input)?;
++    ensure!(!input.is_empty() && input.len()<=8192,"invalid import discovery request size");
++    let request:DiscoveryRequest=serde_json::from_slice(&input)?;
++    let tag=["ltc","btc","bch","doge"].into_iter()
++        .find(|tag|request.schema==format!("monzero-{tag}-light-wallet-import-discover-request-v1"))
++        .context("invalid import discovery schema")?;
++    ensure!(request.discovery_approved && !request.request_id.is_nil() && request.maximum_download_headers<=10_000
++        && request.known_minimum.iter().all(|count|*count<=10_000)
++        && (1..=500).contains(&request.wallet_scan.gap) && (1..=500).contains(&request.wallet_scan.addresses_per_branch)
++        && (1..=1000).contains(&request.wallet_scan.history_entries_per_branch),"invalid discovery approval or limits");
++    let (_lease,raw)=private_config(path)?;
++    let approved:sha256::Hash=request.approved_config_digest.parse()?;
++    ensure!(approved.to_string()==request.approved_config_digest && sha256::Hash::hash(&raw)==approved,
++        "pending wallet differs from discovery approval");
++    let mut value:Value=serde_json::from_slice(&raw)?;
++    ensure!(value["schema"]==format!("monzero-private-{tag}-light-recovery-pending-v1")
++        && value["recovery"]==json!({"status":"discovery-required","addressRecordsRestored":false,"activeSwapRecovery":false}),
++        "wallet is not pending discovery");
++    // In-memory adaptation solely for shared read-only chain routines. Never
++    // publish this normal schema or permit ordinary wallet operations here.
++    value.as_object_mut().context("invalid pending wallet")?.remove("recovery");
++    value["schema"]=json!(format!("monzero-private-{tag}-light-v1"));
++    let config:Config=serde_json::from_value(value)?;
++    ensure!(config.maximum_height<=10_000_000,"invalid discovery height limit");
++    let network=network_for(tag,&config.network)?;
++    let wallet=config.wallet.as_ref().context("missing imported wallet")?;
++    let vault=wallet.vault.as_ref().context("missing imported vault")?;
++    ensure!(matches!(vault.seed_encoding,vault_format::VaultFormat::Mnemonic),"wrong imported key format");
++    let account=PublicAccount::from_descriptor(&wallet.account,network)?;
++    let book=AddressBook::open(&wallet.address_book_directory,PublicAccount::from_descriptor(&wallet.account,network)?)?;
++    let allocated=[book.allocated_count(Branch::Receive)?.max(request.known_minimum[0]),
++        book.allocated_count(Branch::Change)?.max(request.known_minimum[1])];
++    ensure!(allocated.iter().all(|count|count.checked_add(request.wallet_scan.gap)
++        .is_some_and(|end|end<=request.wallet_scan.addresses_per_branch)),"scan budget cannot cover required allocations and gap");
++    let selected=config.endpoint.as_ref().context("missing approved discovery endpoint")?;
++    let endpoint=TlsEndpoint::new(selected.host.clone(),selected.port,network)?;
++    let mut state=ChainState::open(&config.cache_directory,network,config.maximum_height,now()?)?;
++    let (review,synchronization)=tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
++        tokio::time::timeout(std::time::Duration::from_secs(120),async {
++            let synchronization=synchronize(&config,network,&mut state,request.maximum_download_headers).await?;
++            let mut session=endpoint.connect().await?;
++            let observation=session.refresh_wallet(state.chain()?,&account,allocated,&RefreshLimits {
++                gap:request.wallet_scan.gap,addresses_per_branch:request.wallet_scan.addresses_per_branch,
++                history_entries_per_branch:request.wallet_scan.history_entries_per_branch}).await?;
++            let coverage=observation.review_recovery_coverage(state.chain()?,&book,request.known_minimum)?;
++            Ok::<_,anyhow::Error>((json!({"schema":format!("monzero-{tag}-light-import-discovery-review-v1"),
++                "configurationDigest":approved.to_string(),"walletId":vault.wallet_id,
++                "endpoint":{"host":selected.host,"port":selected.port},
++                "coverage":coverage.review(),"coverageCommitment":coverage.commitment().to_string(),
++                "observedConfirmedAtomic":observation.accounting().observed_mature().to_sat().to_string(),
++                "balanceStatus":"provisional","historyCompleteness":"unproven","spendable":false,
++                "allocationsRetained":false,"activationRequired":true,"activeSwapRecovery":false}),synchronization))
++        }).await.context("import discovery deadline exceeded")?
++    })?;
++    let commitment=sha256::Hash::hash(&serde_json::to_vec(&review)?);
++    output(&json!({"schema":format!("monzero-{tag}-light-wallet-import-discover-response-v1"),
++        "requestId":request.request_id,"review":review,"reviewDigest":commitment.to_string(),"synchronization":synchronization,"executable":false}))
++}

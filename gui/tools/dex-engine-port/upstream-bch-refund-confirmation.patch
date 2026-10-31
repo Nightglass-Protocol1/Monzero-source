@@ -1,0 +1,100 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay/observation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay/observation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay/observation.rs
+@@ -0,0 +1,33 @@
++//! Fresh confirmation resolves chain outcome without rewriting dispatch history.
++use super::*;
++use crate::bch_rpc::confirmed::ConfirmedTransaction;
++
++pub struct ConfirmedRefund {
++    quote: [u8;32],admission: [u8;32],review: [u8;32],confirmation: ConfirmedTransaction,
++}
++impl ConfirmedRefund {
++    pub fn quote(&self) -> &[u8;32] {&self.quote}
++    pub fn admission(&self) -> &[u8;32] {&self.admission}
++    pub fn review(&self) -> &[u8;32] {&self.review}
++    pub fn confirmation(&self) -> &ConfirmedTransaction {&self.confirmation}
++}
++impl AdmittedExecution<'_> {
++    /// Observe the exact refund associated with our retained dispatch intent.
++    /// Acknowledgement is unnecessary; every call checks current chain evidence.
++    /// This neither retransmits the refund nor authorizes a native wallet action.
++    pub async fn observe_bch_refund(&self,bch: &BchRpc,block: Option<BlockHash>) -> Result<ConfirmedRefund> {
++        let (attempt,_)=self.refund_attempt()?.context("missing BCH refund relay intent")?;
++        let (review,recovery,deployment)=self.refund_relay_materials(attempt.safety_blocks)?;
++        self.refund_state(&review,&recovery,attempt.safety_blocks)?.context("missing BCH refund relay state")?;
++        ensure!(bch.deployment_commitment()?==deployment,"BCH refund confirmation observer changed");
++        let admission=self.admission_digest()?;
++        let txid=recovery.refund_txid()?;let minimum=u64::from(self.policy.bch_confirmations);
++        let confirmation=match block {
++            Some(block)=>bch.confirmed_transaction(txid,block,minimum).await?,
++            None=>bch.indexed_confirmed_transaction(txid,minimum).await?,
++        };
++        ensure!(confirmation.deployment()==&deployment && serialize(confirmation.transaction())==recovery.refund_bytes(),
++            "confirmed BCH refund differs from retained recovery");
++        Ok(ConfirmedRefund {quote:*self.quote.commitment(),admission,review:review.commitment,confirmation})
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/refund/relay.rs
+@@ -84,3 +84,5 @@
+         Ok(txid)
+     }
+ }
++
++pub mod observation;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel/refund.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel/refund.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel/refund.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel/refund.rs
+@@ -22,6 +22,7 @@
+         let calls=server.state.lock().unwrap().refund_relay_calls;
+         let review=execution.review_bch_refund_relay(rpc,2042,5)?;
+         assert!(execution.bch_refund_relay_state()?.is_none());
++        assert!(execution.observe_bch_refund(rpc,block).await.is_err());
+         let mut bad=review.commitment;bad[0]^=1;
+         assert!(execution.relay_bch_refund(rpc,block,&bad,2043,5).await.is_err());
+         assert!(execution.relay_bch_refund(rpc,block,&review.commitment,2043,6).await.is_err());
+@@ -51,11 +52,26 @@
+         let result=restored.relay_bch_refund(rpc,None,&review.commitment,2044,5).await;
+         if mode==0 {assert_eq!(result?,txid);} else {assert!(result.is_err());}
+         assert_eq!(server.state.lock().unwrap().refund_relay_calls,calls+1);
++        let observed=restored.observe_bch_refund(rpc,block).await?;
++        assert_eq!(observed.quote(),setup.quote.commitment());assert_eq!(observed.review(),&review.commitment);
++        assert_eq!(observed.confirmation().transaction().compute_txid(),txid);
++        assert_eq!(observed.confirmation().confirmations(),3);
++        assert_eq!(restored.observe_bch_refund(rpc,None).await?.confirmation().transaction().compute_txid(),txid);
++        assert_eq!(restored.bch_refund_relay_state()?,Some(expected));
++        assert_eq!(server.state.lock().unwrap().refund_relay_calls,calls+1);
+         if mode==0 {
++            for invalid in [1,2,3] {
++                server.state.lock().unwrap().redemption_confirmation_mode=invalid;
++                assert!(restored.observe_bch_refund(rpc,block).await.is_err());
++            }
++            server.state.lock().unwrap().redemption_confirmation_mode=0;
++            assert_eq!(restored.observe_bch_refund(rpc,block).await?.confirmation().transaction().compute_txid(),txid);
+             let saved=std::fs::read(&ack)?;std::fs::write(&ack,b"{}")?;
+-            assert!(restored.bch_refund_relay_state().is_err());std::fs::write(&ack,saved)?;
++            assert!(restored.bch_refund_relay_state().is_err());
++            assert!(restored.observe_bch_refund(rpc,block).await.is_err());std::fs::write(&ack,saved)?;
+             let held=copied.0.join("held-refund-intent");std::fs::rename(&intent,&held)?;
+-            assert!(restored.bch_refund_relay_state().is_err());std::fs::rename(&held,&intent)?;
++            assert!(restored.bch_refund_relay_state().is_err());
++            assert!(restored.observe_bch_refund(rpc,block).await.is_err());std::fs::rename(&held,&intent)?;
+         }
+     }
+     let mut state=server.state.lock().unwrap();state.refund=None;state.relay_mode=0;state.relay_intent=None;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+@@ -70,7 +70,8 @@
+                     "getblockhash" => json!(if request["params"][0] == 0 {network.genesis().into()} else {"07".repeat(32)}),
+                     "getrawtransaction" => {
+                         use bitcoin::consensus::encode::serialize_hex;
+-                        let expected=state.cancel.as_ref().or(state.redemption.as_ref()).context("missing contract observation fixture")?;
++                        let expected=state.refund.as_ref().filter(|tx|request["params"][0]==tx.compute_txid().to_string())
++                            .or(state.cancel.as_ref()).or(state.redemption.as_ref()).context("missing contract observation fixture")?;
+                         let block="06".repeat(32);
+                         ensure!(request["params"]==json!([expected.compute_txid(),true])
+                             || request["params"]==json!([expected.compute_txid(),true,block]),"wrong redemption observation lookup");

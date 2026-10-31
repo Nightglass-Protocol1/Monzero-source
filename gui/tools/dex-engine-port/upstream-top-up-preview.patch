@@ -1,0 +1,107 @@
+diff --git a/swap-machine/src/native_funding_rpc/full_proceeds.rs b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+index 9e5b09a05..6620f9a76 100644
+--- a/swap-machine/src/native_funding_rpc/full_proceeds.rs
++++ b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+@@ -48,6 +48,22 @@ pub struct ExactNetPreview {
+ /// exclusively from the reserve-return output, never the exact-net payout.
+ pub async fn preview_exact_net(client: &NativeFundingRpc, request: &ExactNetRequest,
+     genesis: &str) -> Result<ExactNetPreview> {
++    preview_exact_net_inner(client, request, genesis, None).await
++}
++
++/// Experimental delayed-top-up construction only. `source.locked` is the total
++/// of principal and top-up; the original lock must contain exactly `principal`.
++/// Caller must independently authorize the top-up and bind it to the recovered
++/// swap. This does not prove its funder, Bitcoin outcome or permission to relay.
++pub async fn preview_exact_net_with_top_up(client: &NativeFundingRpc, request: &ExactNetRequest,
++    genesis: &str, top_up_txid: &str) -> Result<ExactNetPreview> {
++    ensure!(hash(top_up_txid) && top_up_txid != "0".repeat(64)
++        && top_up_txid != request.source.lock_txid, "invalid or repeated top-up identity");
++    preview_exact_net_inner(client, request, genesis, Some(top_up_txid)).await
++}
++
++async fn preview_exact_net_inner(client: &NativeFundingRpc, request: &ExactNetRequest,
++    genesis: &str, top_up_txid: Option<&str>) -> Result<ExactNetPreview> {
+     let source = &request.source;
+     let params = exact_net_params(request)?;
+     ensure!(hash(genesis) && hash(&source.lock_txid), "invalid exact-net chain or lock");
+@@ -57,7 +73,10 @@ pub async fn preview_exact_net(client: &NativeFundingRpc, request: &ExactNetRequ
+         "unexpected exact-net wallet");
+     let incoming = client.rpc(client.wallet, "incoming_transfers",
+         json!({"transfer_type":"available", "account_index":source.account})).await?;
+-    let inputs = lock_inputs(&incoming, source)?;
++    let inputs = match top_up_txid {
++        Some(top_up) => top_up_inputs(&incoming, request, top_up)?,
++        None => lock_inputs(&incoming, source)?,
++    };
+     let response = client.rpc(client.wallet, "transfer", params).await?;
+     let preview = check_exact_net(&response, request, &inputs)?;
+     ensure!(client.opened_wallet(source.wallet.network()).await?.as_ref() == Some(&source.wallet),
+@@ -66,6 +85,26 @@ pub async fn preview_exact_net(client: &NativeFundingRpc, request: &ExactNetRequ
+     Ok(preview)
+ }
+ 
++fn top_up_inputs(incoming: &Value, request: &ExactNetRequest,
++    top_up_txid: &str) -> Result<BTreeSet<String>> {
++    let source = &request.source;
++    ensure!(hash(top_up_txid) && top_up_txid != "0".repeat(64)
++        && top_up_txid != source.lock_txid, "invalid or repeated top-up identity");
++    let reserve = source.locked.atoms().checked_sub(request.principal.atoms())
++        .context("top-up principal exceeds total")?;
++    ensure!(request.principal.atoms() > 0 && reserve > 0, "empty top-up or principal");
++    let bound = |txid: &str, amount| FullProceedsRequest {
++        wallet: source.wallet.clone(), destination: source.destination.clone(),
++        lock_txid: txid.into(), locked: XmzAmount::from_atoms(amount),
++        maximum_fee: source.maximum_fee, account: source.account, priority: source.priority,
++    };
++    let mut keys = lock_inputs(incoming, &bound(&source.lock_txid, request.principal.atoms()))?;
++    for key in lock_inputs(incoming, &bound(top_up_txid, reserve))? {
++        ensure!(keys.insert(key), "overlapping top-up inputs");
++    }
++    Ok(keys)
++}
++
+ fn exact_net_params(request: &ExactNetRequest) -> Result<Value> {
+     let source = &request.source;
+     let reserve = source.locked.atoms().checked_sub(request.principal.atoms())
+@@ -228,6 +267,40 @@ mod tests {
+         Ok(())
+     }
+     #[test]
++    fn top_up_requires_both_exact_sources_and_rejects_substitution() -> Result<()> {
++        let request = ExactNetRequest { source: request(), principal: XmzAmount::from_atoms(90),
++            reserve_return: request().wallet };
++        let mut incoming = incoming();
++        incoming["transfers"][0]["amount"] = json!(90);
++        let mut reserve = incoming["transfers"][0].clone();
++        reserve["tx_hash"] = json!("d".repeat(64));
++        reserve["key_image"] = json!("e".repeat(64));
++        reserve["amount"] = json!(12);
++        incoming["transfers"].as_array_mut().unwrap().push(reserve);
++        let expected = BTreeSet::from(["b".repeat(64),"e".repeat(64)]);
++        assert_eq!(top_up_inputs(&incoming,&request,&"d".repeat(64))?, expected);
++        for txid in ["a".repeat(64),"f".repeat(64),"0".repeat(64),"invalid".into()] {
++            assert!(top_up_inputs(&incoming,&request,&txid).is_err());
++        }
++        for index in [0,1] {
++            for (field,value) in [("amount",json!(11)),("spent",json!(true)),
++                ("unlocked",json!(false)),("frozen",json!(true)),
++                ("key_image",json!("b".repeat(64)))] {
++                if index == 0 && field == "key_image" { continue; }
++                let mut changed=incoming.clone();changed["transfers"][index][field]=value;
++                assert!(top_up_inputs(&changed,&request,&"d".repeat(64)).is_err());
++            }
++        }
++        let mut response=response();
++        response["amounts_by_dest"]["amounts"]=json!([90,10]);
++        assert!(check_exact_net(&response,&request,&expected).is_err());
++        response["spent_key_images"]["key_images"]=json!(["b".repeat(64),"e".repeat(64)]);
++        check_exact_net(&response,&request,&expected)?;
++        response["spent_key_images"]["key_images"]=json!(["b".repeat(64),"e".repeat(64),"f".repeat(64)]);
++        assert!(check_exact_net(&response,&request,&expected).is_err());
++        Ok(())
++    }
++    #[test]
+     fn full_proceeds_requests_never_relay_or_export_metadata() {
+         let value = params(&request());
+         assert_eq!(value["do_not_relay"], true);

@@ -1,0 +1,279 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation.rs
+@@ -0,0 +1,86 @@
++//! Immutable exact native payout preparation. An unresolved intent never grants
++//! permission to construct another transaction. Private checkpoints never relay.
++use super::*;
++use crate::native_funding_rpc::full_proceeds::lock_payout::PreparedLockPayout;
++use serde_json::Value;
++use sha2::{Digest,Sha256};
++
++const INTENT: &str="monzero-bch-native-refund-payout-intent-v1";
++const PIN: &str="monzero-bch-native-refund-payout-pin-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Intent {
++    schema: String,quote: [u8;32],admission: [u8;32],payment: [u8;32],wallet_intent: [u8;32],
++    refund: Txid,at: u64,priority: u32,
++}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Pin {schema: String,intent: [u8;32],prepared: [u8;32]}
++fn slot(quote: &VerifiedBchQuote,part: &str) -> String {format!("{}.bch-native-refund-payout-{part}",quote.terms()["swapId"])}
++impl AdmittedExecution<'_> {
++    fn refund_payout_intent(&self) -> Result<Option<(Intent,Vec<u8>)>> {
++        ensure!(self.role==Role::NativeFunder,"wrong BCH native payout role");
++        let Some(bytes)=optional(&self.metadata,&slot(self.quote,"intent"))? else {
++            ensure!(optional(&self.metadata,&slot(self.quote,"pin"))?.is_none()
++                && optional(&Journal::open(&self.snapshots)?,&slot(self.quote,"prepared"))?.is_none(),
++                "BCH native payout artifact lacks original intent");return Ok(None)
++        };
++        ensure!(bytes.len()<=4096,"oversized BCH native payout intent");
++        let intent: Intent=serde_json::from_slice(&bytes)?;
++        ensure!(intent.schema==INTENT && intent.quote==*self.quote.commitment()
++            && intent.admission==self.admission_digest()? && (1..=4).contains(&intent.priority)
++            && serde_json::to_vec(&intent)?==bytes,"BCH native payout intent changed");
++        Ok(Some((intent,bytes)))
++    }
++    fn refund_payout_request(&self,intent: &Intent) -> Result<BoundRefund> {
++        let (payment,receipt,received_at,_)=self.native_refund_payment()?;
++        ensure!(receipt==intent.payment && intent.at>=received_at,"BCH payout differs from original native receipt");
++        let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
++        let binding=self.refund_wallet_binding_values(&payment.address,&payment.proof.tx_hash.0,intent.refund,&id)?;
++        ensure!(self.required_refund_wallet_intent(&binding,intent.at)?==intent.wallet_intent,"BCH payout wallet intent changed");
++        BoundRefund::from_parts(self.quote,&payment.address,&payment.proof.tx_hash.0,intent.priority)
++    }
++    pub(super) fn load_bch_native_refund_payout(&self) -> Result<PreparedLockPayout> {
++        let (intent,bytes)=self.refund_payout_intent()?.context("missing BCH native payout intent")?;
++        let bound=self.refund_payout_request(&intent)?;let binding=hash(INTENT,&bytes);
++        let private=optional(&Journal::open(&self.snapshots)?,&slot(self.quote,"prepared"))?.map(Zeroizing::new);
++        let pin=optional(&self.metadata,&slot(self.quote,"pin"))?.context("BCH payout construction unresolved; do not reconstruct")?;
++        ensure!(pin.len()<=4096,"oversized BCH payout pin");let decoded: Pin=serde_json::from_slice(&pin)?;
++        ensure!(decoded.schema==PIN && decoded.intent==binding && serde_json::to_vec(&decoded)?==pin,"BCH native payout pin changed");
++        let private=private.context("private BCH payout checkpoint missing")?;
++        PreparedLockPayout::decode(&private,binding,decoded.prepared,&bound.request,&bound.genesis)
++    }
++    /// Public accounting only. Offline restoration is never confirmation or approval.
++    pub fn recover_prepared_bch_native_refund_payout(&self) -> Result<Value> {
++        Ok(self.load_bch_native_refund_payout()?.terms().clone())
++    }
++    /// Construct at most once. No new funding/quote expiry extension or relay.
++    pub async fn prepare_bch_native_refund_payout(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++        refund: Txid,block: Option<BlockHash>,now: u64,session: &mut NativeWalletSession,priority: u32) -> Result<Value> {
++        ensure!((1..=4).contains(&priority),"invalid BCH native payout priority");
++        if let Some((intent,_))=self.refund_payout_intent()? {
++            ensure!(intent.priority==priority && intent.refund==refund && now>=intent.at,"BCH payout already prepared with different context");
++            return self.recover_prepared_bch_native_refund_payout()
++        }
++        let refund=self.recover_bch_native_refund(native,bch,refund,block,now).await?;
++        let bound=BoundRefund::from_quote(self.quote,&refund,priority)?;
++        let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
++        let wallet_binding=self.refund_wallet_binding(&refund,&id)?;
++        let wallet_intent=self.required_refund_wallet_intent(&wallet_binding,now)?;
++        let deadline=refund.observed_at.checked_add(std::time::Duration::from_secs(30)).context("native payout deadline overflow")?;
++        refund.check_wallet(session).await?;
++        ensure!(std::time::Instant::now()<deadline,"native payout evidence expired before intent");
++        let intent=Intent {schema:INTENT.into(),quote:refund.quote,admission:refund.admission,
++            payment:refund.payment,wallet_intent,refund:refund.refund,at:now,priority};
++        let bytes=serde_json::to_vec(&intent)?;let binding=hash(INTENT,&bytes);
++        self.metadata.retain(&slot(self.quote,"intent"),&bytes)?;
++        let prepared=session.prepare_lock_payout(&bound.request,&bound.genesis,deadline).await?;
++        let private=prepared.encode(binding)?;let digest=Sha256::digest(&*private).into();
++        PreparedLockPayout::decode(&private,binding,digest,&bound.request,&bound.genesis)?;
++        let pin=Pin {schema:PIN.into(),intent:binding,prepared:digest};
++        self.metadata.retain(&slot(self.quote,"pin"),&serde_json::to_vec(&pin)?)?;
++        Journal::open(&self.snapshots)?.retain(&slot(self.quote,"prepared"),&private)?;
++        Ok(prepared.terms().clone())
++    }
++}
++
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout.rs
+@@ -0,0 +1,68 @@
++//! Refund accounting sends both portions to the signed refund address.
++//! The recipient receives the original lock minus the actual bounded refund fee.
++use super::*;
++use crate::native_funding_rpc::full_proceeds::{ExactNetRequest,FullProceedsRequest};
++use swap_core::xmz::XmzAmount;
++
++pub(super) struct BoundRefund {pub(super) request: ExactNetRequest,pub(super) genesis: String}
++impl BoundRefund {
++    pub(super) fn from_quote(quote: &VerifiedBchQuote,refund: &NativeRefund,priority: u32) -> Result<Self> {
++        ensure!(refund.quote==*quote.commitment(),"native payout refund belongs to another BCH quote");
++        Self::from_parts(quote,&refund.address,&refund.native_txid,priority)
++    }
++    fn from_parts(quote: &VerifiedBchQuote,wallet: &XmzAddress,txid: &str,priority: u32) -> Result<Self> {
++        ensure!((1..=4).contains(&priority),"invalid BCH native payout priority");
++        ensure!(wallet.network()==quote.xmz_payout().network()
++            && wallet!=quote.xmz_payout() && wallet!=quote.xmz_refund(),"invalid BCH native payout wallet or destinations");
++        ensure!(txid.len()==64 && txid!="0".repeat(64)
++            && txid.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid BCH native payout funding identity");
++        let amount=|field:&str| -> Result<XmzAmount> {Ok(XmzAmount::from_atoms(quote.terms()[field].parse()?))};
++        Ok(Self {genesis:quote.terms()["xmzGenesis"].clone(),request:ExactNetRequest {
++            source:FullProceedsRequest {wallet:wallet.clone(),destination:quote.xmz_refund().clone(),
++                lock_txid:txid.to_owned(),locked:amount("xmzAtoms")?,maximum_fee:amount("xmzRefundFeeMaxAtoms")?,account:0,priority},
++            principal:XmzAmount::from_atoms(amount("xmzAtoms")?.atoms().checked_sub(amount("xmzRefundFeeMaxAtoms")?.atoms()).context("refund fee consumes lock")?),reserve_return:quote.xmz_refund().clone()}})
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bitcoin::hashes::Hash;
++    fn refund(quote: &VerifiedBchQuote) -> Result<NativeRefund> {
++        let mut bytes=[0;32];bytes[0]=2;
++        let scalar=monero_oxide_wallet::ed25519::Scalar::read(&mut bytes.as_slice())?;
++        let point=monero_oxide_ext::PublicKey::from_private_key(&monero_oxide_ext::PrivateKey::from_scalar(scalar)).decompress();
++        let address=XmzAddress::new(quote.xmz_payout().network(),monero_address::AddressType::Legacy,point.clone(),point)?;
++        Ok(NativeRefund {quote:*quote.commitment(),admission:[3;32],payment:[7;32],observed_at:std::time::Instant::now(),spend:Zeroizing::new([2;32]),view:Zeroizing::new([2;32]),
++            address,native_txid:"ab".repeat(32),refund:Txid::from_byte_array([4;32]),block:BlockHash::from_byte_array([5;32]),commitment:[6;32]})
++    }
++    #[test]
++    fn bch_native_refund_payout_preserves_signed_principal_reserve_and_destinations() -> Result<()> {
++        let (policy,mut terms)=crate::bch_quote::tests::fixture();terms.insert("xmzRefundFeeMaxAtoms".into(),"700".into());let quote=crate::bch_quote::tests::signed(&terms,&policy,1000)?;
++        let refund=refund(&quote)?;
++        for priority in 1..=4 {
++            let bound=BoundRefund::from_quote(&quote,&refund,priority)?;let source=&bound.request.source;
++            assert_eq!(source.wallet,refund.address);assert_eq!(source.lock_txid,refund.native_txid);
++            assert_eq!(source.locked.atoms(),101000);assert_eq!(source.maximum_fee.atoms(),700);
++            assert_eq!(bound.request.principal.atoms(),100300);assert_eq!(source.account,0);assert_eq!(source.priority,priority);
++            assert_eq!(&source.destination,quote.xmz_refund());assert_eq!(&bound.request.reserve_return,quote.xmz_refund());
++            assert_eq!(bound.genesis,policy.xmz_genesis);
++        }
++        Ok(())
++    }
++    #[test]
++    fn bch_native_refund_payout_rejects_mismatched_refund_and_invalid_inputs() -> Result<()> {
++        let (policy,mut terms)=crate::bch_quote::tests::fixture();terms.insert("xmzRefundFeeMaxAtoms".into(),"700".into());let quote=crate::bch_quote::tests::signed(&terms,&policy,1000)?;
++        let mut refund=refund(&quote)?;
++        for priority in [0,5,u32::MAX] {assert!(BoundRefund::from_quote(&quote,&refund,priority).is_err());}
++        for txid in ["0".repeat(64),"AB".repeat(32),"ab".repeat(31)] {
++            refund.native_txid=txid;assert!(BoundRefund::from_quote(&quote,&refund,1).is_err());
++        }
++        refund.native_txid="ab".repeat(32);refund.quote=[0;32];assert!(BoundRefund::from_quote(&quote,&refund,1).is_err());
++        refund.quote=*quote.commitment();refund.address=quote.xmz_payout().clone();
++        assert!(BoundRefund::from_quote(&quote,&refund,1).is_err());
++        Ok(())
++    }
++}
++
++pub mod preparation;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet.rs
+@@ -100,3 +100,5 @@
+     }
+ }
+ 
++
++pub mod payout;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs
+@@ -0,0 +1,75 @@
++use super::*;
++use crate::native_funding_rpc::{full_proceeds::{ExactNetRequest,FullProceedsRequest},wallet_session::fixture::Payout};
++use swap_core::xmz::XmzAmount;
++
++fn copy_store(source: &std::path::Path) -> Result<PrivateStore> {
++    let target=PrivateStore::new()?;
++    for entry in std::fs::read_dir(source)? {
++        let entry=entry?;if entry.file_type()?.is_file() {std::fs::copy(entry.path(),target.0.join(entry.file_name()))?;}
++    }
++    Ok(target)
++}
++
++pub(super) async fn exercise(metadata: &std::path::Path,setup: &Setup,snapshots: &PrivateStore,
++    observer_fixture: &Fixture,rpc: &BchRpc,refund: Txid,address: &XmzAddress,wallet: &WalletFixture) -> Result<()> {
++    let observer=observer_fixture.funding_client()?;let block=Some(BlockHash::from_byte_array([6;32]));
++    let amount=|field:&str| -> Result<XmzAmount> {Ok(XmzAmount::from_atoms(setup.quote.terms()[field].parse()?))};
++    let request=ExactNetRequest {source:FullProceedsRequest {wallet:address.clone(),destination:setup.quote.xmz_refund().clone(),
++        lock_txid:"ab".repeat(32),locked:amount("xmzAtoms")?,maximum_fee:amount("xmzRefundFeeMaxAtoms")?,account:0,priority:1},
++        principal:XmzAmount::from_atoms(amount("xmzAtoms")?.atoms()-amount("xmzRefundFeeMaxAtoms")?.atoms()),reserve_return:setup.quote.xmz_refund().clone()};
++    for lost in [true,false] {
++        let copied=copy_store(metadata)?;let private=copy_store(&snapshots.0)?;
++        let slot=|part:&str|format!("{}.bch-native-refund-payout-{part}",setup.quote.terms()["swapId"]);
++        let intent=copied.0.join(slot("intent"));let pin=copied.0.join(slot("pin"));let prepared=private.0.join(slot("prepared"));
++        {
++            let mut state=wallet.state.lock().unwrap();state.payout=Some(Payout {request:request.clone(),intent:intent.clone(),fee:900});
++            state.lose_payout=lost;
++        }
++        let mut execution=AdmittedExecution::resume(&copied.0,&private.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        let mut session=wallet.payout_session(&observer)?;
++        let transfers=wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="transfer").count();
++        assert!(execution.prepare_bch_native_refund_payout(&observer,rpc,refund,block,2048,&mut session,0).await.is_err());
++        assert!(!intent.exists());
++        let result=execution.prepare_bch_native_refund_payout(&observer,rpc,refund,block,2048,&mut session,1).await;
++        assert!(intent.exists());
++        assert_eq!(wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="transfer").count(),transfers+1);
++        let expected=if lost {assert!(result.is_err());assert!(!pin.exists() && !prepared.exists());None}
++            else {
++                let terms=result?;assert!(pin.exists() && prepared.exists());
++                assert_eq!(terms["payoutAtoms"],"100000");assert_eq!(terms["reserveReturnAtoms"],"100");
++                assert_eq!(terms["feeAtoms"],"900");assert_eq!(terms["destination"],setup.quote.xmz_refund().to_string());
++                assert_eq!(terms["reserveReturn"],setup.quote.xmz_refund().to_string());
++                for secret in ["tx_metadata","tx_key","spendKey","viewKey"] {assert!(terms.get(secret).is_none());}
++                Some(terms)
++            };
++        let calls=wallet.state.lock().unwrap().calls.len();let observations=observer_fixture.calls.lock().unwrap().len();
++        drop(execution);
++        let mut execution=AdmittedExecution::resume(&copied.0,&private.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        let mut restarted=wallet.payout_session(&observer)?;
++        let restored=execution.prepare_bch_native_refund_payout(&observer,rpc,refund,block,2049,&mut restarted,1).await;
++        if let Some(expected)=expected {
++            assert_eq!(restored?,expected);assert_eq!(execution.recover_prepared_bch_native_refund_payout()?,expected);
++            assert!(execution.prepare_bch_native_refund_payout(&observer,rpc,refund,block,2049,&mut restarted,2).await.is_err());
++            // Every incomplete/corrupt checkpoint must reject offline recovery.
++            let saved=std::fs::read(&prepared)?;std::fs::write(&prepared,b"{}")?;
++            assert!(execution.recover_prepared_bch_native_refund_payout().is_err());
++            std::fs::write(&prepared,&saved)?;
++            let held=copied.0.join("held-payout-pin");std::fs::rename(&pin,&held)?;
++            assert!(execution.recover_prepared_bch_native_refund_payout().is_err());std::fs::rename(&held,&pin)?;
++            let held=copied.0.join("held-payout-intent");std::fs::rename(&intent,&held)?;
++            assert!(execution.recover_prepared_bch_native_refund_payout().is_err());std::fs::rename(&held,&intent)?;
++            assert_eq!(execution.recover_prepared_bch_native_refund_payout()?,expected);
++            assert_eq!(std::fs::read(&prepared)?,saved);
++        } else {
++            assert!(restored.is_err());assert!(execution.recover_prepared_bch_native_refund_payout().is_err());
++        }
++        assert_eq!(wallet.state.lock().unwrap().calls.len(),calls,"saved or uncertain payout performed another wallet operation");
++        assert_eq!(observer_fixture.calls.lock().unwrap().len(),observations,"offline recovery performed chain observations");
++        assert!(!wallet.state.lock().unwrap().calls.iter().any(|s|s=="relay_tx"));
++        if lost {continue;}
++
++
++    }
++    Ok(())
++}
++
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet.rs
+@@ -46,7 +46,10 @@
+         assert_eq!(state.calls.iter().filter(|m|m.as_str()=="generate_from_keys").count(),1);
+         assert!(state.calls.iter().all(|m|matches!(m.as_str(),"get_address"|"generate_from_keys"|"query_key"|"scan_tx"|"open_wallet"|"close_wallet")));
+         drop(state);
++        if lost==0 {payout::exercise(&copied.0,setup,snapshots,observer_fixture,rpc,txid,address,&wallet).await?;}
+     }
+     Ok(())
+ }
+ 
++
++mod payout;
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs b/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
+--- a/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
++++ b/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
+@@ -95,7 +95,7 @@
+                             let payout=state.payout.clone().context("unexpected payout construction")?;
+                             ensure!(state.opened,"payout wallet closed");
+                             let intent:serde_json::Value=serde_json::from_slice(&std::fs::read(&payout.intent)?)?;
+-                            ensure!(intent["schema"]=="monzero-bch-native-payout-intent-v1","construction preceded durable payout intent");
++                            ensure!(matches!(intent["schema"].as_str(),Some("monzero-bch-native-payout-intent-v1"|"monzero-bch-native-refund-payout-intent-v1")),"construction preceded durable payout intent");
+                             let r=&payout.request;let source=&r.source;
+                             ensure!(source.wallet.to_string()==address && source.lock_txid==txid,"payout fixture changed wallet or lock");
+                             let reserve=source.locked.atoms()-r.principal.atoms();

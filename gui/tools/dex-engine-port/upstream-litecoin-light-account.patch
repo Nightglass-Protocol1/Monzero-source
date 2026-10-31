@@ -1,0 +1,287 @@
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -125,3 +125,5 @@
+ pub mod headers;
+ 
+ pub mod state;
++
++pub mod account;
+diff --git a/swap-machine/src/litecoin_light/account.rs b/swap-machine/src/litecoin_light/account.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/account.rs
+@@ -0,0 +1,72 @@
++//! Litecoin BIP84 public-account derivation. No seed generation/storage, signing,
++//! address allocation, discovery or balance claim. Caller owns the master key.
++use anyhow::{Result,ensure};
++use bitcoin::{bip32::{ChildNumber,DerivationPath,Fingerprint,Xpriv,Xpub},
++    secp256k1::Secp256k1,CompressedPublicKey,NetworkKind,Script,ScriptBuf};
++use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub enum Branch {Receive,Change}
++impl Branch {fn index(self)->u32 {match self {Self::Receive=>0,Self::Change=>1}}}
++
++/// Public derivation data only. No Debug/Serialize to avoid accidental logging
++/// of the account's address-linking data. Not proof of present spending control.
++pub struct PublicAccount {
++    network:LtcNetwork,
++    account:u32,
++    fingerprint:Fingerprint,
++    public:Xpub,
++}
++pub struct DerivedAddress {
++    address:LtcSegwitAddress,
++    public_key:CompressedPublicKey,
++    path:DerivationPath,
++}
++impl PublicAccount {
++    /// Mainnet m/84'/2'/account'; test networks m/84'/1'/account'.
++    /// Borrowed master key must be a root of the correct network kind.
++    /// The existing BIP32 dependency can internally copy secrets; this API is
++    /// not a secure-memory or encrypted-vault implementation.
++    pub fn from_master(master:&Xpriv,network:LtcNetwork,account:u32)->Result<Self> {
++        let kind=if network==LtcNetwork::Mainnet {NetworkKind::Main} else {NetworkKind::Test};
++        ensure!(master.depth==0 && master.parent_fingerprint==Fingerprint::default()
++            && master.child_number==(ChildNumber::Normal {index:0}) && master.network==kind,
++            "Litecoin account requires a matching master key");
++        let path=account_path(network,account)?;
++        let secp=Secp256k1::new();
++        let mut derived=master.derive_priv(&secp,&path)?;
++        let public=Xpub::from_priv(&secp,&derived);
++        derived.private_key.non_secure_erase();
++        Ok(Self {network,account,fingerprint:master.fingerprint(&secp),public})
++    }
++    pub fn network(&self)->LtcNetwork {self.network}
++    pub fn account_index(&self)->u32 {self.account}
++    pub fn master_fingerprint(&self)->Fingerprint {self.fingerprint}
++    /// Pure derivation, not allocation: callers must persist address indices
++    /// and backup/discovery policy before displaying a new receiving address.
++    pub fn derive(&self,branch:Branch,index:u32)->Result<DerivedAddress> {
++        let suffix=[ChildNumber::from_normal_idx(branch.index())?,ChildNumber::from_normal_idx(index)?];
++        let public=self.public.derive_pub(&Secp256k1::verification_only(),&suffix)?;
++        let public_key=CompressedPublicKey(public.public_key);
++        let script=ScriptBuf::new_p2wpkh(&public_key.wpubkey_hash());
++        let address=LtcSegwitAddress::from_script(self.network,&script)?;
++        let mut path=account_path(self.network,self.account)?.as_ref().to_vec();path.extend(suffix);
++        Ok(DerivedAddress {address,public_key,path:DerivationPath::from(path)})
++    }
++    /// Script matching only; does not prove that an output exists or is unspent.
++    pub fn matches_script(&self,branch:Branch,index:u32,script:&Script)->Result<bool> {
++        Ok(self.derive(branch,index)?.address.script_pubkey().as_script()==script)
++    }
++}
++impl DerivedAddress {
++    pub fn address(&self)->&LtcSegwitAddress {&self.address}
++    pub fn public_key(&self)->CompressedPublicKey {self.public_key}
++    pub fn path(&self)->&DerivationPath {&self.path}
++}
++fn account_path(network:LtcNetwork,account:u32)->Result<DerivationPath> {
++    let coin=if network==LtcNetwork::Mainnet {2} else {1};
++    Ok(DerivationPath::from(vec![ChildNumber::from_hardened_idx(84)?,
++        ChildNumber::from_hardened_idx(coin)?,ChildNumber::from_hardened_idx(account)?]))
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/account/tests.rs b/swap-machine/src/litecoin_light/account/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/account/tests.rs
+@@ -0,0 +1,65 @@
++use super::*;
++use serde_json::Value;
++fn decode(hex:&str)->Vec<u8> {(0..hex.len()).step_by(2).map(|i|u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect()}
++fn master(network:LtcNetwork)->Xpriv {
++    Xpriv::new_master(if network==LtcNetwork::Mainnet {NetworkKind::Main} else {NetworkKind::Test},&(0u8..16).collect::<Vec<_>>()).unwrap()
++}
++#[test]
++fn account_matches_independent_public_seed_vectors() -> Result<()> {
++    let fixture:Value=serde_json::from_str(include_str!("vectors.json"))?;
++    let seed=decode(fixture["seed"].as_str().unwrap());
++    for vector in fixture["vectors"].as_array().unwrap() {
++        let network=match vector["network"].as_str().unwrap() {"main"=>LtcNetwork::Mainnet,"test"=>LtcNetwork::Testnet,"regtest"=>LtcNetwork::Regtest,_=>unreachable!()};
++        let root=Xpriv::new_master(if network==LtcNetwork::Mainnet {NetworkKind::Main} else {NetworkKind::Test},&seed)?;
++        let original=root;
++        let account_index=vector["account"].as_u64().unwrap() as u32;
++        let account=PublicAccount::from_master(&root,network,account_index)?;
++        let branch=if vector["branch"]==0 {Branch::Receive} else {Branch::Change};
++        let index=vector["index"].as_u64().unwrap() as u32;
++        let derived=account.derive(branch,index)?;
++        assert_eq!(root,original);assert_eq!(account.network(),network);assert_eq!(account.account_index(),account_index);
++        assert_eq!(account.master_fingerprint().to_string(),"3442193e");
++        assert_eq!(derived.public_key().to_string(),vector["publicKey"].as_str().unwrap());
++        assert_eq!(derived.address().to_string(),vector["address"].as_str().unwrap());
++        assert_eq!(derived.path().to_string(),vector["path"].as_str().unwrap());
++        let script=ScriptBuf::from_bytes(decode(vector["script"].as_str().unwrap()));
++        assert_eq!(derived.address().script_pubkey(),&script);assert!(account.matches_script(branch,index,&script)?);
++        assert!(!account.matches_script(branch,index+1,&script)?);
++        assert_eq!(LtcSegwitAddress::parse(network,&derived.address().to_string())?.script_pubkey(),&script);
++    }
++    Ok(())
++}
++#[test]
++fn account_rejects_wrong_roots_and_hardened_address_indices() -> Result<()> {
++    let network=LtcNetwork::Mainnet;let root=master(network);
++    for changed in 0..4 {
++        let mut invalid=root;
++        match changed {0=>invalid.depth=1,1=>invalid.parent_fingerprint=Fingerprint::from([1;4]),
++            2=>invalid.child_number=ChildNumber::from_normal_idx(1)?,3=>invalid.network=NetworkKind::Test,_=>unreachable!()}
++        assert!(PublicAccount::from_master(&invalid,network,0).is_err());
++    }
++    for index in [1<<31,u32::MAX] {assert!(PublicAccount::from_master(&root,network,index).is_err());}
++    let account=PublicAccount::from_master(&root,network,0)?;
++    for branch in [Branch::Receive,Branch::Change] {
++        for index in [1<<31,u32::MAX] {assert!(account.derive(branch,index).is_err());}
++        assert!(account.derive(branch,(1<<31)-1)?.address().script_pubkey().is_p2wpkh());
++    }
++    Ok(())
++}
++#[test]
++fn account_separates_mainnet_branches_accounts_and_test_addresses() -> Result<()> {
++    let root=master(LtcNetwork::Mainnet);let a=PublicAccount::from_master(&root,LtcNetwork::Mainnet,0)?;
++    let b=PublicAccount::from_master(&root,LtcNetwork::Mainnet,1)?;
++    let receiving=a.derive(Branch::Receive,0)?;
++    assert_ne!(receiving.address().script_pubkey(),a.derive(Branch::Change,0)?.address().script_pubkey());
++    assert_ne!(receiving.address().script_pubkey(),b.derive(Branch::Receive,0)?.address().script_pubkey());
++    let test=PublicAccount::from_master(&master(LtcNetwork::Testnet),LtcNetwork::Testnet,0)?;
++    let reg=PublicAccount::from_master(&master(LtcNetwork::Regtest),LtcNetwork::Regtest,0)?;
++    let t=test.derive(Branch::Receive,0)?;let r=reg.derive(Branch::Receive,0)?;
++    assert_ne!(receiving.address().script_pubkey(),t.address().script_pubkey());
++    // Shared all-testnets coin path, but chain-specific Litecoin address encoding.
++    assert_eq!(t.address().script_pubkey(),r.address().script_pubkey());
++    assert_ne!(t.address().to_string(),r.address().to_string());
++    assert!(LtcSegwitAddress::parse(LtcNetwork::Testnet,&r.address().to_string()).is_err());
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/account/vectors.json b/swap-machine/src/litecoin_light/account/vectors.json
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/account/vectors.json
+@@ -0,0 +1,126 @@
++{
++  "seed": "000102030405060708090a0b0c0d0e0f",
++  "warning": "PUBLIC TEST SEED; never fund these addresses",
++  "vectors": [
++    {
++      "network": "main",
++      "account": 0,
++      "branch": 0,
++      "index": 0,
++      "path": "84'/2'/0'/0/0",
++      "publicKey": "02034b1e5f5ec012b5cce178218475c636c4e3a3584d0af78d235513818b00860a",
++      "address": "ltc1qpa9dqm7kclf48mpl6estf0t0qu2q3qfdvdfld5",
++      "script": "00140f4ad06fd6c7d353ec3fd660b4bd6f071408812d"
++    },
++    {
++      "network": "main",
++      "account": 0,
++      "branch": 0,
++      "index": 1,
++      "path": "84'/2'/0'/0/1",
++      "publicKey": "0307b599f0602132750fe50649cfb6374fd936181a06fc38a1c22f9c5e691f1b1b",
++      "address": "ltc1qhzwt6cgcxh5lxmgzkwdzqn9kx25q60pvwyy5gu",
++      "script": "0014b89cbd611835e9f36d02b39a204cb632a80d3c2c"
++    },
++    {
++      "network": "main",
++      "account": 0,
++      "branch": 1,
++      "index": 0,
++      "path": "84'/2'/0'/1/0",
++      "publicKey": "03940ead9fd5cbedbb04ff0f63002939870b433f847eb8d0c90f2d6f506a2ea496",
++      "address": "ltc1q622sea6mmxw5a5y507zfnjah3rhrs7a243gtmk",
++      "script": "0014d2950cf75bd99d4ed0947f8499cbb788ee387baa"
++    },
++    {
++      "network": "main",
++      "account": 1,
++      "branch": 1,
++      "index": 7,
++      "path": "84'/2'/1'/1/7",
++      "publicKey": "033de99cf6aac5453d5e34c69d21ea8ae86940751bb770368815af03babd14126b",
++      "address": "ltc1qn2pxxflley99hsmd8ugds3na0ynfunn8khsp74",
++      "script": "00149a826327ffc90a5bc36d3f10d8467d79269e4e67"
++    },
++    {
++      "network": "test",
++      "account": 0,
++      "branch": 0,
++      "index": 0,
++      "path": "84'/1'/0'/0/0",
++      "publicKey": "020c7f4de1cc760fc068775b1513d67d0a7802f0b4b1c61aa85784ebf722905b27",
++      "address": "tltc1q7f0pjwhc3jzzv0w4uurm589506glv2dgngxqjs",
++      "script": "0014f25e193af88c84263dd5e707ba1cb47e91f629a8"
++    },
++    {
++      "network": "test",
++      "account": 0,
++      "branch": 0,
++      "index": 1,
++      "path": "84'/1'/0'/0/1",
++      "publicKey": "02393c9d27b815c337a96931b7f68b679054b7c4ea9504bc14a72f8b8cd45b9e4b",
++      "address": "tltc1q3jeqwzg70pfkc9k4pvynlmfjlrrghp0ckl58sx",
++      "script": "00148cb207091e78536c16d50b093fed32f8c68b85f8"
++    },
++    {
++      "network": "test",
++      "account": 0,
++      "branch": 1,
++      "index": 0,
++      "path": "84'/1'/0'/1/0",
++      "publicKey": "02c4712f76e49ea79347c5c4cb434ba5ba7ad76778fe5f94253eb4028d82a3e268",
++      "address": "tltc1q4mecjzu9uc7wavhk6k2j92nnudvt8lpupkw220",
++      "script": "0014aef3890b85e63ceeb2f6d59522aa73e358b3fc3c"
++    },
++    {
++      "network": "test",
++      "account": 1,
++      "branch": 1,
++      "index": 7,
++      "path": "84'/1'/1'/1/7",
++      "publicKey": "02d1e9dc6f9eca4b0615df15d6c713fc3f51653b838a8f7208b9009617502374fc",
++      "address": "tltc1q3fsn6eds2t5chdvk5z6t0a9z34p6s3x0emlepk",
++      "script": "00148a613d65b052e98bb596a0b4b7f4a28d43a844cf"
++    },
++    {
++      "network": "regtest",
++      "account": 0,
++      "branch": 0,
++      "index": 0,
++      "path": "84'/1'/0'/0/0",
++      "publicKey": "020c7f4de1cc760fc068775b1513d67d0a7802f0b4b1c61aa85784ebf722905b27",
++      "address": "rltc1q7f0pjwhc3jzzv0w4uurm589506glv2dgky86zw",
++      "script": "0014f25e193af88c84263dd5e707ba1cb47e91f629a8"
++    },
++    {
++      "network": "regtest",
++      "account": 0,
++      "branch": 0,
++      "index": 1,
++      "path": "84'/1'/0'/0/1",
++      "publicKey": "02393c9d27b815c337a96931b7f68b679054b7c4ea9504bc14a72f8b8cd45b9e4b",
++      "address": "rltc1q3jeqwzg70pfkc9k4pvynlmfjlrrghp0cnn4aqc",
++      "script": "00148cb207091e78536c16d50b093fed32f8c68b85f8"
++    },
++    {
++      "network": "regtest",
++      "account": 0,
++      "branch": 1,
++      "index": 0,
++      "path": "84'/1'/0'/1/0",
++      "publicKey": "02c4712f76e49ea79347c5c4cb434ba5ba7ad76778fe5f94253eb4028d82a3e268",
++      "address": "rltc1q4mecjzu9uc7wavhk6k2j92nnudvt8lpuy60s63",
++      "script": "0014aef3890b85e63ceeb2f6d59522aa73e358b3fc3c"
++    },
++    {
++      "network": "regtest",
++      "account": 1,
++      "branch": 1,
++      "index": 7,
++      "path": "84'/1'/1'/1/7",
++      "publicKey": "02d1e9dc6f9eca4b0615df15d6c713fc3f51653b838a8f7208b9009617502374fc",
++      "address": "rltc1q3fsn6eds2t5chdvk5z6t0a9z34p6s3x0uh7r3g",
++      "script": "00148a613d65b052e98bb596a0b4b7f4a28d43a844cf"
++    }
++  ]
++}

@@ -1,0 +1,356 @@
+--- a/swap-machine/src/bch_rpc.rs
++++ b/swap-machine/src/bch_rpc.rs
+@@ -162,5 +162,6 @@
+     Ok(())
+ }
+ mod locks;
++mod signing;
+ #[cfg(test)]
+ mod tests;
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
+@@ -1,11 +1,13 @@
+ //! Retained unsigned funding preparation and local input claims. Advisory wallet
+-//! locking lives in `locks`; neither path grants approval, signing or relay rights.
++//! locking lives in `locks`; explicit sign-only approval lives in `signing`.
++//! Preparation alone grants neither signing nor relay rights.
+ //! Snapshot publication precedes metadata.
+ use super::*;
+ use swap_core::bch::funding::FundingPreview;
+ 
+ mod claims;
+ mod locks;
++pub mod signing;
+ 
+ const TEMPLATE: &str = "monzero-bch-funding-template-v1";
+ const PIN: &str = "monzero-bch-funding-pin-v2";
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/locks.rs
+@@ -6,12 +6,24 @@
+ const LOCK: &str = "monzero-bch-wallet-lock-intent-v1";
+ #[derive(Serialize,Deserialize)]
+ #[serde(deny_unknown_fields)]
+-struct Intent {
+-    schema: String, admission: [u8;32], preparation: [u8;32], deployment: [u8;32],
+-    change_address: String, minimum_confirmations: u64, admitted_at: u64,
++pub(super) struct Intent {
++    schema: String, admission: [u8;32], preparation: [u8;32], pub(super) deployment: [u8;32],
++    pub(super) change_address: String, pub(super) minimum_confirmations: u64, pub(super) admitted_at: u64,
+ }
+ 
+ impl AdmittedExecution<'_> {
++    pub(super) fn funding_lock_intent(&self, prepared: &PreparedBchFunding) -> Result<(Intent,[u8;32])> {
++        let bytes = self.metadata.read(&record_name(self.quote,"wallet-lock-intent"))?;
++        ensure!(bytes.len() <= 4096,"oversized BCH wallet lock intent");
++        let intent: Intent = serde_json::from_slice(&bytes)?;
++        ensure!(intent.schema == LOCK && intent.admission == self.admission_digest()?
++            && intent.preparation == prepared.commitment && intent.admitted_at >= prepared.prepared_at
++            && intent.minimum_confirmations > 0 && intent.change_address.len() <= 200
++            && serde_json::to_vec(&intent)? == bytes,"invalid BCH wallet lock intent");
++        self.quote.check_policy(self.policy,intent.admitted_at)?;
++        Ok((intent,hash(LOCK,&bytes)))
++    }
++
+     /// The caller must exclusively control the wallet and use one metadata
+     /// directory for all trades. BCHN locks are advisory and disappear on node
+     /// restart; another wallet controller can override them. A returned snapshot
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+@@ -7,7 +7,8 @@
+     sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
+ 
+ #[derive(Default)]
+-struct State { locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8 }
++struct State { locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8,
++    sign_calls: usize, sign_mode: u8, sign_intent: Option<std::path::PathBuf> }
+ struct Server {
+     port: u16, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>,
+     thread: Option<std::thread::JoinHandle<Result<()>>>,
+@@ -51,7 +52,7 @@
+                 let mut body = vec![0;length]; reader.read_exact(&mut body)?;
+                 let request: Value = serde_json::from_slice(&body)?;
+                 let method = request["method"].as_str().context("missing method")?;
+-                let wallet = matches!(method,"getwalletinfo"|"getaddressinfo"|"listlockunspent"|"lockunspent");
++                let wallet = matches!(method,"getwalletinfo"|"getaddressinfo"|"listlockunspent"|"lockunspent"|"signrawtransactionwithwallet");
+                 ensure!(path == if wallet {"/wallet/test"} else {"/"},"incorrect wallet path");
+                 let mut state = shared.lock().unwrap();
+                 let point = json!({"txid":outpoint.txid,"vout":outpoint.vout});
+@@ -83,6 +84,9 @@
+                         if state.ambiguous { state.ambiguous = false; continue; } // Applied, reply lost.
+                         json!(true)
+                     },
++                    "signrawtransactionwithwallet" => match signing::reply(&request,&script,&mut state)? {
++                        Some(reply) => reply, None => continue,
++                    },
+                     _ => anyhow::bail!("unexpected method: {method}"),
+                 };
+                 let body = serde_json::to_vec(&json!({"id":request["id"],"error":null,"result":result}))?;
+@@ -111,7 +115,9 @@
+     let pins = NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
+     let mut execution = AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
+         Role::BchFunder,setup.quote.commitment(),pins,1005)?;
+-    let script = setup.quote.recovery_plan().recovery().terms().redeem_destination.clone();
++    let secret = bitcoin::secp256k1::SecretKey::from_slice(&[5;32])?;
++    let public = bitcoin::PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(&bitcoin::secp256k1::Secp256k1::new(),&secret));
++    let script = bitcoin::ScriptBuf::new_p2pkh(&public.pubkey_hash());
+     let parent = Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
+         input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([9;32]),vout:0},
+             script_sig:bitcoin::ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}],
+@@ -126,6 +132,7 @@
+     let backend = |wallet: &str,password: &str| BchRpc::new(server.port,"user".into(),password.into(),network,
+         wallet.into(),"bchreg:qanchor".into(),script.clone(),"/Bitcoin Cash Node:29.0.0/".into());
+     let rpc = backend("test","pass")?;
++    assert!(execution.review_bch_funding_signing(&rpc,1007).is_err());
+     assert_eq!(BchNetwork::Mainnet.quote_name(),"bch-mainnet");
+     assert_eq!(BchNetwork::Testnet.quote_name(),"bch-testnet");
+     execution.observe_bch_funding_inputs(&rpc,1007,"bchreg:qchange",3).await?;
+@@ -160,5 +167,8 @@
+     assert!(execution.lock_bch_funding_inputs(&rpc,1010,"bchreg:qchange",3).await.is_err());
+     assert_eq!(server.state.lock().unwrap().calls,3); // Acknowledgement alone is insufficient.
+     assert_eq!(std::fs::read(&intent)?,original);
++    signing::exercise(execution,&setup,&metadata,&snapshots,&server,&rpc).await?;
+     Ok(())
+ }
++
++mod signing;
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/signing.rs
+@@ -0,0 +1,21 @@
++use super::*;
++use bitcoin::hex::{DisplayHex,FromHex};
++
++#[derive(Deserialize)]
++struct SignedReply { hex: String, complete: bool, errors: Option<Value> }
++impl BchRpc {
++    /// Crate-private: the executor must retain approval and intent first.
++    /// No retry, unlock, broadcast or caller-provided previous-output override.
++    pub(crate) async fn sign_funding(&self, preview: &FundingPreview) -> Result<Vec<u8>> {
++        ensure!(preview.previous_outputs().iter().all(|o|o.script_pubkey.is_p2pkh()),
++            "BCH signing currently requires P2PKH inputs");
++        let raw = serialize(preview.transaction()).to_lower_hex_string();
++        let reply = self.rpc(true,"signrawtransactionwithwallet",json!([raw,[],"ALL|FORKID"])).await?;
++        let reply: SignedReply = serde_json::from_str(reply.get())?;
++        ensure!(reply.complete && reply.errors.is_none() && reply.hex.len() <= 1_000_000,
++            "BCH wallet signing incomplete, rejected or oversized");
++        let bytes = Vec::<u8>::from_hex(&reply.hex).context("invalid BCH signed transaction hex")?;
++        preview.verify_signed(&bytes)?;
++        Ok(bytes)
++    }
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/signing.rs
+@@ -0,0 +1,112 @@
++//! Sign-only approval and immutable exact signed funding. No relay permission.
++//! An uncertain signing attempt cannot be retried: legacy signatures set txid.
++use super::*;
++use crate::bch_rpc::BchRpc;
++use swap_core::bch::funding::SignedFunding;
++use serde_json::{Value,json};
++
++const REVIEW: &str = "monzero-bch-funding-signing-review-v1";
++const ATTEMPT: &str = "monzero-bch-funding-signing-intent-v1";
++const SIGNED: &str = "monzero-bch-signed-funding-v1";
++
++pub struct SigningReview { pub details: Value, pub commitment: [u8;32] }
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Intent { schema: String, review: [u8;32], approved_at: u64 }
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Record { schema: String, intent: [u8;32], raw: Vec<u8> }
++
++fn optional(journal: &Journal, name: &str) -> Result<Option<Vec<u8>>> {
++    match journal.read(name) {
++        Ok(bytes) => Ok(Some(bytes)),
++        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound) => Ok(None),
++        Err(e) => Err(e),
++    }
++}
++impl AdmittedExecution<'_> {
++    fn signing_review(&self) -> Result<(SigningReview,PreparedBchFunding,locks::Intent)> {
++        let prepared = self.prepared_bch_funding()?.context("BCH funding preparation is absent")?;
++        ensure!(prepared.preview().previous_outputs().iter().all(|o|o.script_pubkey.is_p2pkh()),
++            "BCH signing currently requires P2PKH inputs");
++        let (locked,lock_digest) = self.funding_lock_intent(&prepared)?;
++        let preview = prepared.preview();
++        let inputs: Vec<_> = preview.transaction().input.iter().zip(preview.previous_outputs()).map(|(i,o)|json!({
++            "txid":i.previous_output.txid,"vout":i.previous_output.vout,"atoms":o.value.to_sat(),
++            "script":o.script_pubkey.to_hex_string()})).collect();
++        let outputs: Vec<_> = preview.transaction().output.iter().enumerate().map(|(i,o)|json!({
++            "vout":i,"atoms":o.value.to_sat(),"script":o.script_pubkey.to_hex_string()})).collect();
++        let details = json!({"schema":REVIEW,"action":"sign-only","swapId":self.quote.terms()["swapId"],
++            "quote":self.quote.commitment(),"admission":self.admission_digest()?,"preparation":prepared.commitment,
++            "walletLockIntent":lock_digest,"deployment":locked.deployment,
++            "network":self.quote.terms()["bchNetwork"],"genesis":self.quote.terms()["bchGenesis"],
++            "expiresAt":self.quote.terms()["expiresAt"],"inputs":inputs,"outputs":outputs,
++            "contractVout":preview.lock_vout(),"feeAtoms":preview.fee().to_sat(),
++            "changeAddress":locked.change_address,"minimumConfirmations":locked.minimum_confirmations});
++        let commitment = hash(REVIEW,&serde_json::to_vec(&details)?);
++        Ok((SigningReview {details,commitment},prepared,locked))
++    }
++
++    /// Render this exact review in the approval UI. Preparing a review does not
++    /// approve anything or assert that advisory locks still exist in the wallet.
++    pub fn review_bch_funding_signing(&self, backend: &BchRpc, now: u64) -> Result<SigningReview> {
++        self.quote.check_policy(self.policy,now)?;
++        let (review,_,locked) = self.signing_review()?;
++        ensure!(now >= locked.admitted_at && backend.deployment_commitment()? == locked.deployment,
++            "BCH signing deployment or time differs from retained wallet lock intent");
++        Ok(review)
++    }
++
++    /// Restore exact signed funding after historical validation, including after
++    /// quote expiry. None does not grant retry rights: inspect the signing intent
++    /// through sign_bch_funding, which refuses any uncertain previous attempt.
++    pub fn signed_bch_funding(&self) -> Result<Option<SignedFunding>> {
++        Ok(self.restore_signed_bch_funding()?.map(|(signed,_)|signed))
++    }
++
++    fn restore_signed_bch_funding(&self) -> Result<Option<(SignedFunding,u64)>> {
++        let Some(bytes) = optional(&self.metadata,&record_name(self.quote,"signed"))? else {return Ok(None)};
++        let (review,prepared,locked) = self.signing_review()?;
++        let intent_bytes = self.metadata.read(&record_name(self.quote,"signing-intent"))?;
++        ensure!(intent_bytes.len() <= 4096,"oversized BCH signing intent");
++        let intent: Intent = serde_json::from_slice(&intent_bytes)?;
++        ensure!(intent.schema == ATTEMPT && intent.review == review.commitment
++            && intent.approved_at >= locked.admitted_at && serde_json::to_vec(&intent)? == intent_bytes,
++            "BCH signing intent differs from retained approval");
++        self.quote.check_policy(self.policy,intent.approved_at)?;
++        let record: Record = serde_json::from_slice(&bytes)?;
++        ensure!(record.schema == SIGNED && record.intent == hash(ATTEMPT,&intent_bytes)
++            && serde_json::to_vec(&record)? == bytes,"BCH signed funding record changed");
++        Ok(Some((prepared.preview().verify_signed(&record.raw)?,intent.approved_at)))
++    }
++
++    /// The approved digest must come from an explicit user action over the
++    /// separately displayed review. No automatic approval or transaction relay.
++    /// Persist the attempt before RPC; persist verified signed bytes before
++    /// returning them. Any attempt without a retained result requires manual
++    /// reconciliation, never another signature or an input replacement.
++    pub async fn sign_bch_funding(&mut self, backend: &BchRpc, approved: &[u8;32], now: u64)
++        -> Result<SignedFunding> {
++        let review = self.review_bch_funding_signing(backend,now)?;
++        ensure!(review.commitment == *approved,"BCH signing approval is stale or mismatched");
++        if let Some((signed,approved_at)) = self.restore_signed_bch_funding()? {
++            ensure!(now >= approved_at,"BCH signing request predates retained approval");
++            return Ok(signed)
++        }
++        let name = record_name(self.quote,"signing-intent");
++        ensure!(optional(&self.metadata,&name)?.is_none(),
++            "BCH signing attempt has no retained result; reconcile manually without signing again");
++        let (_,prepared,locked) = self.signing_review()?;
++        backend.observe_funding_inputs(prepared.preview(),&locked.change_address,locked.minimum_confirmations).await?;
++        let wallet_locks = backend.locked_outpoints().await?;
++        ensure!(prepared.preview().transaction().input.iter().all(|i|wallet_locks.contains(&i.previous_output)),
++            "BCH funding inputs are not wallet-locked; reconcile locks explicitly first");
++        let intent = Intent {schema:ATTEMPT.into(),review:*approved,approved_at:now};
++        let intent_bytes = serde_json::to_vec(&intent)?;
++        self.metadata.retain(&name,&intent_bytes)?;
++        let raw = backend.sign_funding(prepared.preview()).await?;
++        let record = Record {schema:SIGNED.into(),intent:hash(ATTEMPT,&intent_bytes),raw};
++        self.metadata.retain(&record_name(self.quote,"signed"),&serde_json::to_vec(&record)?)?;
++        self.signed_bch_funding()?.context("BCH signed funding was not retained")
++    }
++}
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing.rs
+@@ -0,0 +1,99 @@
++use super::*;
++use bitcoin::{consensus::deserialize,hex::{DisplayHex,FromHex},hashes::sha256d,
++    sighash::{SighashCache,EcdsaSighashType},secp256k1};
++use std::os::unix::fs::PermissionsExt;
++
++pub(super) fn reply(request: &Value,script: &bitcoin::ScriptBuf,state: &mut State) -> Result<Option<Value>> {
++    ensure!(request["params"].as_array().is_some_and(|p|p.len()==3)
++        && request["params"][1] == json!([]) && request["params"][2] == "ALL|FORKID","unexpected signing parameters");
++    let intent: Value = serde_json::from_slice(&std::fs::read(state.sign_intent.as_ref().context("missing signing intent path")?)?)?;
++    ensure!(intent["schema"] == "monzero-bch-funding-signing-intent-v1" && state.locked,
++        "approval intent and wallet locks must precede signing");
++    state.sign_calls += 1;
++    let raw = Vec::<u8>::from_hex(request["params"][0].as_str().context("missing template")?)?;
++    let mut tx: Transaction = deserialize(&raw)?;
++    ensure!(tx.input.len()==1 && tx.input[0].script_sig.is_empty(),"unexpected signing template");
++    if state.sign_mode == 2 { tx.output[1].value -= Amount::from_sat(1); }
++    if state.sign_mode != 3 {
++        // Independent Bitcoin BIP143 encoder with BCH's 0x41 suffix. Production
++        // verifier builds its own preimage, also checked against BCHN vectors.
++        let mut preimage = Vec::new();
++        SighashCache::new(&tx).segwit_v0_encode_signing_data_to(&mut preimage,0,script,
++            Amount::from_sat(111_000),EcdsaSighashType::All)?;
++        let end = preimage.len(); preimage[end-4..].copy_from_slice(&0x41u32.to_le_bytes());
++        let secp = secp256k1::Secp256k1::new(); let secret = secp256k1::SecretKey::from_slice(&[5;32])?;
++        let signature = secp.sign_ecdsa(&secp256k1::Message::from_digest(sha256d::Hash::hash(&preimage).to_byte_array()),&secret).serialize_der();
++        let key = secp256k1::PublicKey::from_secret_key(&secp,&secret).serialize();
++        let mut bytes = vec![(signature.len()+1) as u8]; bytes.extend(signature.as_ref());
++        bytes.push(if state.sign_mode == 7 {1} else {0x41}); bytes.push(33); bytes.extend(key);
++        tx.input[0].script_sig = bitcoin::ScriptBuf::from_bytes(bytes);
++    }
++    if state.sign_mode == 4 { return Ok(None); } // Signed, reply lost.
++    let mut reply = json!({"hex":serialize(&tx).to_lower_hex_string(),"complete":state.sign_mode!=1});
++    if state.sign_mode == 5 {reply["errors"] = json!([{"error":"fixture"}]);}
++    if state.sign_mode == 6 {reply["hex"] = json!("invalid-hex");}
++    Ok(Some(reply))
++}
++
++pub(super) async fn exercise(mut execution: AdmittedExecution<'_>,setup: &Setup,metadata: &PrivateStore,
++    snapshots: &PrivateStore,server: &Server,rpc: &BchRpc) -> Result<()> {
++    let review = execution.review_bch_funding_signing(rpc,1011)?;
++    assert_eq!(review.details["action"],"sign-only");
++    assert_eq!(review.details["feeAtoms"],1000);
++    let intent_name = format!("{}.bch-funding-signing-intent",setup.quote.terms()["swapId"]);
++    let signed_name = format!("{}.bch-funding-signed",setup.quote.terms()["swapId"]);
++    let intent = metadata.0.join(&intent_name); let signed_path = metadata.0.join(&signed_name);
++    server.state.lock().unwrap().sign_intent = Some(intent.clone());
++    assert!(execution.sign_bch_funding(rpc,&[0;32],1011).await.is_err());
++    assert!(execution.sign_bch_funding(rpc,&review.commitment,2000).await.is_err());
++    assert!(execution.sign_bch_funding(rpc,&review.commitment,1006).await.is_err());
++    // Previous wallet-lock test left the selected input unlocked.
++    assert!(execution.sign_bch_funding(rpc,&review.commitment,1011).await.is_err());
++    assert!(!intent.exists()); assert_eq!(server.state.lock().unwrap().sign_calls,0);
++    server.state.lock().unwrap().ignore = false;
++    execution.lock_bch_funding_inputs(rpc,1011,"bchreg:qchange",3).await?;
++    assert_eq!(execution.review_bch_funding_signing(rpc,1011)?.commitment,review.commitment);
++    // Keep a pre-signing fixture for isolated failure scenarios below.
++    let baseline: Vec<_> = std::fs::read_dir(&metadata.0)?.map(|entry| {
++        let entry = entry?; Ok((entry.file_name(),std::fs::read(entry.path())?))
++    }).collect::<std::io::Result<_>>()?;
++    let signed = execution.sign_bch_funding(rpc,&review.commitment,1012).await?;
++    let raw = serialize(signed.transaction()); let outpoint = signed.lock_outpoint();
++    assert!(signed_path.is_file()); assert_eq!(server.state.lock().unwrap().sign_calls,1);
++    assert_eq!(execution.sign_bch_funding(rpc,&review.commitment,1013).await?.lock_outpoint(),outpoint);
++    assert_eq!(server.state.lock().unwrap().sign_calls,1);
++    assert!(execution.sign_bch_funding(rpc,&review.commitment,1011).await.is_err());
++    drop(execution);
++    let execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    assert_eq!(serialize(execution.signed_bch_funding()?.unwrap().transaction()),raw);
++    assert!(execution.review_bch_funding_signing(rpc,2000).is_err());
++    let record = std::fs::read(&signed_path)?;
++    std::fs::write(&signed_path,b"{}")?;
++    assert!(execution.signed_bch_funding().is_err());
++    std::fs::write(&signed_path,&record)?;
++    let approval = std::fs::read(&intent)?; std::fs::remove_file(&intent)?;
++    assert!(execution.signed_bch_funding().is_err());
++    std::fs::write(&intent,&approval)?; std::fs::set_permissions(&intent,std::fs::Permissions::from_mode(0o600))?;
++    assert_eq!(execution.signed_bch_funding()?.unwrap().lock_outpoint(),outpoint);
++    drop(execution);
++    for mode in 1..=7 {
++        let metadata = PrivateStore::new()?;
++        for (name,bytes) in &baseline {
++            let path = metadata.0.join(name); std::fs::write(&path,bytes)?;
++            std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600))?;
++        }
++        let mut execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        server.state.lock().unwrap().sign_mode = mode;
++        server.state.lock().unwrap().sign_intent = Some(metadata.0.join(&intent_name));
++        let calls = server.state.lock().unwrap().sign_calls;
++        assert!(execution.sign_bch_funding(rpc,&review.commitment,1012).await.is_err(),"mode {mode}");
++        assert_eq!(server.state.lock().unwrap().sign_calls,calls+1);
++        assert!(metadata.0.join(&intent_name).is_file());
++        assert!(!metadata.0.join(&signed_name).exists());
++        drop(execution);
++        let mut execution = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        assert!(execution.sign_bch_funding(rpc,&review.commitment,1013).await.is_err());
++        assert_eq!(server.state.lock().unwrap().sign_calls,calls+1); // No signing retry after restart.
++    }
++    Ok(())
++}

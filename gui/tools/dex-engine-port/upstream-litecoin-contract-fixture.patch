@@ -1,0 +1,544 @@
+diff --git a/swap-core/tests/litecoin_settlement.rs b/swap-core/tests/litecoin_settlement.rs
+new file mode 100644
+index 000000000..52557ce7d
+--- /dev/null
++++ b/swap-core/tests/litecoin_settlement.rs
+@@ -0,0 +1,538 @@
++//! Litecoin contract fixture: builds the redeem, cancel and refund transactions
++//! for a funded Litecoin lock with the shared Bitcoin-family contract code.
++//! Offline only. It never contacts a node or broadcasts anything, and its keys
++//! are public test-only keys, so its output must only ever touch disposable chains.
++#![cfg(unix)]
++#![allow(non_snake_case)]
++
++use anyhow::{Context, Result, ensure};
++use bitcoin::consensus::encode::serialize_hex;
++use bitcoin::psbt::Psbt;
++use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction};
++use ecdsa_fun::adaptor::{Adaptor, HashTranscript};
++use ecdsa_fun::nonce::Deterministic;
++use swap_core::monero::{ScalarExt, private_key_from_secp256k1_scalar};
++use rand::SeedableRng;
++use rand_chacha::ChaCha20Rng;
++use serde::Deserialize;
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::str::FromStr;
++use std::sync::Arc;
++use swap_core::bitcoin::{
++    CancelTimelock, PublicKey, SecretKey, TxCancel, TxFullRefund, TxLock, TxRedeem,
++    build_shared_output_descriptor, recover,
++};
++
++const SCHEMA: &str = "monzero-ltc-contract-fixture-v1";
++/// BIP68 relative block locks use the low 16 bits; larger values set type or disable flags.
++const MAX_CANCEL_BLOCKS: u32 = 0xFFFF;
++const MAX_REQUEST_BYTES: u64 = 1 << 20;
++
++#[derive(Deserialize)]
++#[serde(tag = "mode", rename_all = "lowercase")]
++enum Request {
++    Describe(DescribeRequest),
++    Build(BuildRequest),
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct DescribeRequest {}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct BuildRequest {
++    lock_psbt: String,
++    amount_atoms: String,
++    redeem_script: String,
++    refund_script: String,
++    fee_atoms: String,
++    cancel_blocks: u32,
++}
++
++/// Public, deterministic test-only keys. Anyone can derive them from this file.
++struct FixtureKeys {
++    a: SecretKey,
++    b: SecretKey,
++    s_a: SecretKey,
++    s_b: SecretKey,
++}
++
++#[test]
++#[ignore = "driven by the private Litecoin contract fixture harness"]
++fn export_litecoin_settlement() -> Result<()> {
++    let request_path =
++        std::env::var_os("MONZERO_LTC_FIXTURE_REQUEST").context("missing fixture request path")?;
++    let response_path =
++        std::env::var_os("MONZERO_LTC_FIXTURE_RESPONSE").context("missing fixture response path")?;
++    let request = read_request(request_path.as_ref())?;
++    let response = handle(&request)?;
++    write_private(response_path.as_ref(), &serde_json::to_vec(&response)?)
++}
++
++fn handle(request: &[u8]) -> Result<Value> {
++    let request: Request =
++        serde_json::from_slice(request).context("invalid fixture request JSON")?;
++    let keys = FixtureKeys::new();
++    match request {
++        Request::Describe(DescribeRequest {}) => describe(&keys),
++        Request::Build(request) => build(request, &keys),
++    }
++}
++
++fn describe(keys: &FixtureKeys) -> Result<Value> {
++    let mut response = contract(keys)?;
++    response["mode"] = json!("describe");
++    response["executable"] = json!(false);
++    Ok(response)
++}
++
++fn build(request: BuildRequest, keys: &FixtureKeys) -> Result<Value> {
++    let amount = parse_atoms(&request.amount_atoms).context("invalid amountAtoms")?;
++    let fee = parse_atoms(&request.fee_atoms).context("invalid feeAtoms")?;
++    // The refund spends the cancel output, so the refund path pays the fee twice.
++    let refund_value = fee
++        .checked_mul(2)
++        .and_then(|fees| amount.checked_sub(fees))
++        .filter(|value| *value > 0)
++        .context("fees consume the lock amount")?;
++    ensure!(
++        (1..=MAX_CANCEL_BLOCKS).contains(&request.cancel_blocks),
++        "cancelBlocks must be between 1 and {MAX_CANCEL_BLOCKS}"
++    );
++    let redeem_address = script_carrier(&request.redeem_script).context("invalid redeemScript")?;
++    let refund_address = script_carrier(&request.refund_script).context("invalid refundScript")?;
++
++    let (A, B, S_a) = (keys.a.public(), keys.b.public(), keys.s_a.public());
++    let shared_script = build_shared_output_descriptor(A.into(), B.into())?.script_pubkey();
++    ensure!(
++        redeem_address.script_pubkey() != shared_script
++            && refund_address.script_pubkey() != shared_script,
++        "redeemScript and refundScript must not pay the shared output"
++    );
++
++    let psbt = Psbt::from_str(&request.lock_psbt).context("invalid lockPsbt")?;
++    check_lock_psbt(&psbt)?;
++    let tx_lock = TxLock::from_psbt(psbt, A, B, Amount::from_sat(amount))
++        .context("lockPsbt does not fund the shared output with amountAtoms")?;
++    let lock_fee = tx_lock.fee()?;
++    let fee = Amount::from_sat(fee);
++
++    let tx_redeem = TxRedeem::new(&tx_lock, &redeem_address, fee);
++    let redeem_encsig = keys.b.encsign(S_a, tx_redeem.digest());
++    let redeem = tx_redeem.clone().complete(
++        redeem_encsig.clone(),
++        keys.a.clone(),
++        keys.s_a.clone().into(),
++        B,
++    )?;
++    let redeem_sig = tx_redeem.extract_signature_by_key(Arc::new(redeem.clone()), B)?;
++    let recovered = recover(S_a, redeem_sig, redeem_encsig)?;
++    ensure!(
++        recovered == keys.s_a,
++        "adaptor secret recovered from the redeem signature does not match"
++    );
++
++    let tx_cancel = TxCancel::new(
++        &tx_lock,
++        CancelTimelock::new(request.cancel_blocks),
++        A,
++        B,
++        fee,
++    )?;
++    let tx_refund = TxFullRefund::new(&tx_cancel, &refund_address, fee);
++    let refund_encsig = keys.a.encsign(keys.s_b.public(), tx_refund.digest());
++    let adaptor = Adaptor::<HashTranscript<Sha256>, Deterministic<Sha256>>::default();
++    let refund_sig_a = adaptor.decrypt_signature(&keys.s_b.clone().into(), refund_encsig);
++    let refund_sigs = (
++        (A, refund_sig_a),
++        (B, keys.b.sign(tx_refund.digest())),
++    );
++    let cancel_sig_a = keys.a.sign(tx_cancel.digest());
++    let cancel = tx_cancel.complete_as_bob(A, keys.b.clone(), cancel_sig_a)?;
++    let refund = tx_refund.clone().add_signatures(refund_sigs.0, refund_sigs.1)?;
++    let native_a = private_key_from_secp256k1_scalar(keys.s_a.clone().into());
++    let native_b = private_key_from_secp256k1_scalar(keys.s_b.clone().into());
++    let recovered_refund = tx_refund.extract_monero_private_key(
++        Arc::new(refund.clone()), native_a, keys.a.clone(), keys.s_b.public(),
++    )?;
++    ensure!(recovered_refund == native_a + native_b,
++        "refund signature did not recover the expected shared native spend key");
++
++    let lock_outpoint = tx_lock.as_outpoint();
++    ensure!(
++        redeem.input[0].previous_output == lock_outpoint
++            && cancel.input[0].previous_output == lock_outpoint
++            && refund.input[0].previous_output.txid == cancel.compute_txid()
++            && refund.input[0].previous_output.vout == 0,
++        "settlement transactions do not chain from the lock"
++    );
++    ensure!(
++        cancel.input[0].sequence.0 == request.cancel_blocks,
++        "cancel transaction lost its relative timelock"
++    );
++    ensure!(
++        redeem.output[0].value.to_sat() == amount - fee.to_sat()
++            && cancel.output[0].value.to_sat() == amount - fee.to_sat()
++            && refund.output[0].value.to_sat() == refund_value
++            && redeem.output[0].script_pubkey == redeem_address.script_pubkey()
++            && refund.output[0].script_pubkey == refund_address.script_pubkey()
++            && cancel.output[0].script_pubkey == shared_script,
++        "settlement accounting does not match the request"
++    );
++
++    let mut response = contract(keys)?;
++    response["mode"] = json!("build");
++    response["executable"] = json!(false);
++    response["lock"] = json!({
++        "txid": lock_outpoint.txid.to_string(),
++        "vout": lock_outpoint.vout,
++        "amountAtoms": amount.to_string(),
++        "feeAtoms": lock_fee.to_sat().to_string(),
++    });
++    response["redeem"] = settlement_json(&redeem, fee);
++    response["cancel"] = settlement_json(&cancel, fee);
++    response["cancel"]["cancelBlocks"] = json!(request.cancel_blocks);
++    response["refund"] = settlement_json(&refund, fee);
++    response["adaptorSecretRecovered"] = json!(true);
++    response["refundAdaptorSecretRecovered"] = json!(true);
++    Ok(response)
++}
++
++impl FixtureKeys {
++    fn new() -> Self {
++        Self {
++            a: fixture_key("alice-redeem-key"),
++            b: fixture_key("bob-refund-key"),
++            s_a: fixture_adaptor_key("alice-adaptor-secret"),
++            s_b: fixture_adaptor_key("bob-adaptor-secret"),
++        }
++    }
++}
++
++fn fixture_key(label: &str) -> SecretKey {
++    let seed: [u8; 32] = Sha256::digest(format!("{SCHEMA}/{label}")).into();
++    SecretKey::new_random(&mut ChaCha20Rng::from_seed(seed))
++}
++
++fn fixture_adaptor_key(label: &str) -> SecretKey {
++    let seed: [u8; 32] = Sha256::digest(format!("{SCHEMA}/{label}")).into();
++    let scalar = swap_core::monero::Scalar::random(&mut ChaCha20Rng::from_seed(seed));
++    SecretKey::from(scalar.to_secpfun_scalar())
++}
++
++/// Public contract parameters shared by both modes.
++fn contract(keys: &FixtureKeys) -> Result<Value> {
++    let (A, B) = (keys.a.public(), keys.b.public());
++    let descriptor = build_shared_output_descriptor(A.into(), B.into())?;
++    Ok(json!({
++        "schema": SCHEMA,
++        "keyA": compressed_hex(A)?,
++        "keyB": compressed_hex(B)?,
++        "witnessScript": descriptor.explicit_script()?.to_hex_string(),
++        "scriptPubKey": descriptor.script_pubkey().to_hex_string(),
++    }))
++}
++
++fn compressed_hex(key: PublicKey) -> Result<String> {
++    Ok(bitcoin::PublicKey::try_from(key)?.to_string())
++}
++
++fn settlement_json(tx: &Transaction, fee: Amount) -> Value {
++    json!({
++        "txid": tx.compute_txid().to_string(),
++        "rawHex": serialize_hex(tx),
++        "vsize": tx.vsize(),
++        "amountAtoms": tx.output[0].value.to_sat().to_string(),
++        "feeAtoms": fee.to_sat().to_string(),
++    })
++}
++
++fn check_lock_psbt(psbt: &Psbt) -> Result<()> {
++    let tx = &psbt.unsigned_tx;
++    ensure!(!tx.input.is_empty(), "lockPsbt has no inputs");
++    ensure!(tx.output.len() <= 2, "lockPsbt has more than two outputs");
++    for (input, psbt_input) in tx.input.iter().zip(&psbt.inputs) {
++        ensure!(
++            input.script_sig.is_empty()
++                && psbt_input.final_script_sig.is_none()
++                && psbt_input.redeem_script.is_none(),
++            "lockPsbt input uses scriptSig funding"
++        );
++        let utxo = psbt_input
++            .witness_utxo
++            .as_ref()
++            .context("lockPsbt input lacks a witness UTXO")?;
++        ensure!(
++            is_native_segwit(&utxo.script_pubkey),
++            "lockPsbt input is not native segwit"
++        );
++        if let Some(previous) = &psbt_input.non_witness_utxo {
++            ensure!(
++                previous.compute_txid() == input.previous_output.txid
++                    && previous.output.get(input.previous_output.vout as usize) == Some(utxo),
++                "lockPsbt input has inconsistent UTXO data"
++            );
++        }
++    }
++    ensure!(
++        tx.output
++            .iter()
++            .all(|output| is_native_segwit(&output.script_pubkey)),
++        "lockPsbt has an unsupported output script"
++    );
++    Ok(())
++}
++
++/// Litecoin and Bitcoin share scriptPubKey encodings. The regtest `Address`
++/// only carries the script into the shared transaction builders and is never
++/// rendered or exported.
++fn script_carrier(script_hex: &str) -> Result<Address> {
++    let script = ScriptBuf::from_hex(script_hex)?;
++    ensure!(is_native_segwit(&script), "unsupported output script shape");
++    let address = Address::from_script(&script, Network::Regtest)?;
++    ensure!(
++        address.script_pubkey() == script,
++        "script carrier changed the output script"
++    );
++    Ok(address)
++}
++
++fn is_native_segwit(script: &ScriptBuf) -> bool {
++    script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr()
++}
++
++fn parse_atoms(value: &str) -> Result<u64> {
++    ensure!(
++        !value.is_empty()
++            && value.bytes().all(|byte| byte.is_ascii_digit())
++            && !value.starts_with('0'),
++        "atoms must be a positive canonical decimal string"
++    );
++    Ok(value.parse()?)
++}
++
++fn read_request(path: &std::path::Path) -> Result<Vec<u8>> {
++    use std::io::Read;
++    let mut request = Vec::new();
++    std::fs::File::open(path)
++        .context("open fixture request")?
++        .take(MAX_REQUEST_BYTES + 1)
++        .read_to_end(&mut request)?;
++    ensure!(
++        request.len() as u64 <= MAX_REQUEST_BYTES,
++        "fixture request is too large"
++    );
++    Ok(request)
++}
++
++fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
++    use std::io::Write;
++    use std::os::unix::fs::OpenOptionsExt;
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .mode(0o600)
++        .open(path)
++        .context("create private fixture response")?;
++    file.write_all(contents)?;
++    file.sync_all()?;
++    Ok(())
++}
++
++mod tests {
++    use super::*;
++    use bitcoin::hashes::Hash;
++    use bitcoin::{
++        OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Txid, WPubkeyHash, Witness, absolute,
++        transaction,
++    };
++
++    const FUNDING: u64 = 1_000_000;
++    const AMOUNT: u64 = 900_000;
++
++    fn p2wpkh(byte: u8) -> ScriptBuf {
++        ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([byte; 20]))
++    }
++
++    fn shared_script() -> ScriptBuf {
++        let keys = FixtureKeys::new();
++        build_shared_output_descriptor(keys.a.public().into(), keys.b.public().into())
++            .unwrap()
++            .script_pubkey()
++    }
++
++    fn funded_psbt(outputs: Vec<TxOut>) -> Psbt {
++        let tx = Transaction {
++            version: transaction::Version::TWO,
++            lock_time: absolute::LockTime::ZERO,
++            input: vec![TxIn {
++                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
++                script_sig: ScriptBuf::new(),
++                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
++                witness: Witness::new(),
++            }],
++            output: outputs,
++        };
++        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
++        psbt.inputs[0].witness_utxo = Some(TxOut {
++            value: Amount::from_sat(FUNDING),
++            script_pubkey: p2wpkh(1),
++        });
++        psbt
++    }
++
++    fn lock_output(value: u64) -> TxOut {
++        TxOut {
++            value: Amount::from_sat(value),
++            script_pubkey: shared_script(),
++        }
++    }
++
++    fn change_output() -> TxOut {
++        TxOut {
++            value: Amount::from_sat(FUNDING - AMOUNT - 1_000),
++            script_pubkey: p2wpkh(2),
++        }
++    }
++
++    fn valid_request() -> Value {
++        json!({
++            "mode": "build",
++            "lockPsbt": funded_psbt(vec![lock_output(AMOUNT), change_output()]).to_string(),
++            "amountAtoms": AMOUNT.to_string(),
++            "redeemScript": p2wpkh(3).to_hex_string(),
++            "refundScript": p2wpkh(4).to_hex_string(),
++            "feeAtoms": "2000",
++            "cancelBlocks": 12,
++        })
++    }
++
++    fn rejection(request: Value) -> String {
++        let error = handle(&serde_json::to_vec(&request).unwrap())
++            .err()
++            .expect("request to be rejected");
++        format!("{error:#}")
++    }
++
++    #[test]
++    fn describe_exports_public_contract_only() {
++        let response = handle(br#"{"mode":"describe"}"#).unwrap();
++        assert_eq!(response["schema"], SCHEMA);
++        assert_eq!(response["executable"], false);
++        assert_eq!(response["scriptPubKey"], shared_script().to_hex_string());
++        assert_eq!(response["keyA"].as_str().unwrap().len(), 66);
++        assert_eq!(response["keyB"].as_str().unwrap().len(), 66);
++        assert_eq!(response.as_object().unwrap().len(), 7);
++    }
++
++    #[test]
++    fn build_settles_and_recovers_adaptor_secret() {
++        let request = serde_json::to_vec(&valid_request()).unwrap();
++        let response = handle(&request).unwrap();
++        assert_eq!(response, handle(&request).unwrap(), "fixture is deterministic");
++        assert_eq!(response["adaptorSecretRecovered"], true);
++        assert_eq!(response["refundAdaptorSecretRecovered"], true);
++        assert_eq!(response["lock"]["amountAtoms"], "900000");
++        assert_eq!(response["lock"]["feeAtoms"], "1000");
++        assert_eq!(response["redeem"]["amountAtoms"], "898000");
++        assert_eq!(response["cancel"]["amountAtoms"], "898000");
++        assert_eq!(response["cancel"]["cancelBlocks"], 12);
++        assert_eq!(response["refund"]["amountAtoms"], "896000");
++
++        let refund: Transaction = bitcoin::consensus::encode::deserialize_hex(
++            response["refund"]["rawHex"].as_str().unwrap(),
++        )
++        .unwrap();
++        assert_eq!(
++            refund.input[0].previous_output.txid.to_string(),
++            response["cancel"]["txid"].as_str().unwrap()
++        );
++        assert_eq!(refund.input[0].witness.len(), 3);
++    }
++
++    #[test]
++    fn build_rejects_invalid_requests() {
++        let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
++            ("feeAtoms", Box::new(|r: &mut Value| r["feeAtoms"] = json!("0"))),
++            ("feeAtoms", Box::new(|r: &mut Value| r["feeAtoms"] = json!("+5"))),
++            ("amountAtoms", Box::new(|r: &mut Value| r["amountAtoms"] = json!("0900000"))),
++            ("fees consume", Box::new(|r: &mut Value| r["feeAtoms"] = json!("450000"))),
++            ("cancelBlocks", Box::new(|r: &mut Value| r["cancelBlocks"] = json!(0))),
++            ("cancelBlocks", Box::new(|r: &mut Value| r["cancelBlocks"] = json!(65_536))),
++            ("request JSON", Box::new(|r: &mut Value| r["cancelBlocks"] = json!(-1))),
++            (
++                "request JSON",
++                Box::new(|r: &mut Value| r["rpcUrl"] = json!("http://example.invalid")),
++            ),
++            ("request JSON", Box::new(|r: &mut Value| r["mode"] = json!("broadcast"))),
++            (
++                "redeemScript",
++                Box::new(|r: &mut Value| {
++                    r["redeemScript"] = json!(
++                        ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array([3; 20]))
++                            .to_hex_string()
++                    )
++                }),
++            ),
++            (
++                "shared output",
++                Box::new(|r: &mut Value| {
++                    r["refundScript"] = json!(shared_script().to_hex_string())
++                }),
++            ),
++            ("Shared output pays", Box::new(|r: &mut Value| r["amountAtoms"] = json!("899999"))),
++        ];
++        for (expected, mutate) in cases {
++            let mut request = valid_request();
++            mutate(&mut request);
++            let error = rejection(request);
++            assert!(error.contains(expected), "{expected}: {error}");
++        }
++    }
++
++    #[test]
++    fn build_rejects_invalid_lock_psbts() {
++        let other_script = TxOut {
++            value: Amount::from_sat(AMOUNT),
++            script_pubkey: ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([9; 32])),
++        };
++        let p2pkh_change = TxOut {
++            value: Amount::from_sat(1_000),
++            script_pubkey: ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array([2; 20])),
++        };
++        let mut script_sig = funded_psbt(vec![lock_output(AMOUNT)]);
++        script_sig.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x51]));
++        let mut nested = funded_psbt(vec![lock_output(AMOUNT)]);
++        nested.inputs[0].redeem_script = Some(p2wpkh(1));
++        let mut legacy_input = funded_psbt(vec![lock_output(AMOUNT)]);
++        legacy_input.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey =
++            ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array([1; 20]));
++        let mut missing_utxo = funded_psbt(vec![lock_output(AMOUNT)]);
++        missing_utxo.inputs[0].witness_utxo = None;
++
++        let cases = [
++            (
++                "more than two outputs",
++                funded_psbt(vec![lock_output(AMOUNT), change_output(), change_output()]),
++            ),
++            ("shared output", funded_psbt(vec![other_script])),
++            ("shared output", funded_psbt(vec![lock_output(AMOUNT), lock_output(AMOUNT)])),
++            ("unsupported output script", funded_psbt(vec![lock_output(AMOUNT), p2pkh_change])),
++            ("scriptSig funding", script_sig),
++            ("scriptSig funding", nested),
++            ("not native segwit", legacy_input),
++            ("witness UTXO", missing_utxo),
++        ];
++        for (expected, psbt) in cases {
++            let mut request = valid_request();
++            request["lockPsbt"] = json!(psbt.to_string());
++            let error = rejection(request);
++            assert!(error.contains(expected), "{expected}: {error}");
++        }
++        let mut request = valid_request();
++        request["lockPsbt"] = json!("not-base64");
++        assert!(rejection(request).contains("lockPsbt"));
++    }
++}

@@ -1,0 +1,342 @@
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -110,10 +110,13 @@
+     }
+     fn config(path:&Path,tag:&str)->Result<(File,Config)> {
+         let (file,bytes)=private_config(path)?;
+-        let config: Config=serde_json::from_slice(&bytes)?;
++        Ok((file,parse_config(&bytes,tag)?))
++    }
++    fn parse_config(bytes:&[u8],tag:&str)->Result<Config> {
++        let config:Config=serde_json::from_slice(bytes)?;
+         ensure!(config.schema==format!("monzero-private-{tag}-light-v1") && config.maximum_height<=10_000_000,
+             "invalid light-chain configuration");
+-        Ok((file,config))
++        Ok(config)
+     }
+     fn snapshot(state: &ChainState) -> Result<Value> {
+         let chain=state.chain()?;
+@@ -416,6 +419,7 @@
+             "receivingAllocated":0,"changeAllocated":0,"scope":"seed-and-address-allocations",
+             "allocationFreshness":"unassessed","activeSwapRecovery":false}))
+     }
++    mod dex { include!("native-ltc-light/dex.rs"); }
+     mod backup_import { include!("native-ltc-light/backup_import.rs"); }
+     mod vault_format { include!("native-ltc-light/vault_format.rs"); }
+     mod recovery { include!("native-ltc-light/recovery.rs"); }
+@@ -430,6 +434,7 @@
+     pub fn run() -> Result<()> {
+         let args: Vec<_>=std::env::args_os().collect();
+         ensure!(args.len()==3,"invalid light-chain helper arguments");
++        if let Some(mode)=args[1].to_str().and_then(dex::mode) {return dex::run(Path::new(&args[2]),mode);}
+         if args[1]=="--wallet-backup-preview-stdio-v1" {return backup_import::run(Path::new(&args[2]),false);}
+         if args[1]=="--wallet-backup-import-stdio-v1" {return backup_import::run(Path::new(&args[2]),true);}
+         if args[1]=="--wallet-import-activate-stdio-v1" {return import_activation::run(Path::new(&args[2]));}
+diff --git a/swap-machine/src/litecoin_negotiation/execution/light_funding.rs b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+--- a/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
++++ b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+@@ -39,3 +39,21 @@
+ pub mod approval;
+ 
+ pub mod relay;
++
++impl Execution {
++    /// Admit wallet preparation before reserving addresses/inputs. This checks
++    /// payment policy only; it is neither a reservation nor spending authority.
++    pub fn check_light_funding_payment(&self,payment:&bitcoin::TxOut,fee:bitcoin::Amount,
++        minimum_change:bitcoin::Amount,now:u64)->Result<()> {
++        ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong light funding role");
++        let (_,_,quote,_,exchange)=self.load()?;
++        quote.check_policy(&self.policy,now)?;
++        let keys=exchange.finish()?;
++        ensure!(payment.script_pubkey==*keys.contract_address().script_pubkey()
++            && payment.value.to_sat()==quote.terms()["ltcAtoms"].parse::<u64>()?
++            && fee.to_sat()>0 && fee.to_sat()<=quote.terms()["ltcFundingFeeMaxAtoms"].parse::<u64>()?
++            && minimum_change.to_sat()>=quote.terms()["ltcMinimumOutputAtoms"].parse::<u64>()?,
++            "light funding payment differs from negotiated policy");
++        Ok(())
++    }
++}
+diff --git a/swap-machine/src/litecoin_light/funding_tests.rs b/swap-machine/src/litecoin_light/funding_tests.rs
+--- a/swap-machine/src/litecoin_light/funding_tests.rs
++++ b/swap-machine/src/litecoin_light/funding_tests.rs
+@@ -56,6 +56,10 @@
+         block_hash:chain.header(0).unwrap().block_hash()},&credit)?;
+     let payment=TxOut {value:Amount::from_sat(100_000_000),script_pubkey:keys.contract_address().script_pubkey().clone()};
+     let mut transaction=credit.clone();transaction.input[0].previous_output=OutPoint::new(credit.compute_txid(),0);transaction.output=vec![payment.clone()];
++    bob.check_light_funding_payment(&payment,Amount::from_sat(1000),Amount::from_sat(100000),1002)?;
++    assert!(bob.check_light_funding_payment(&payment,Amount::ZERO,Amount::from_sat(100000),1002).is_err());
++    assert!(bob.check_light_funding_payment(&payment,Amount::from_sat(1000),Amount::from_sat(1),1002).is_err());
++    assert!(bob.check_light_funding_payment(&payment,Amount::from_sat(1000),Amount::from_sat(100000),2001).is_err());
+     let inputs=[IncludedInput {transaction:&included,vout:0,branch:Branch::Receive,index:0}];
+     let observed=ObservedWallet::reconcile(&chain,&[prevout.script_pubkey.clone()],std::slice::from_ref(&included))?;
+     let spent=ObservedWallet::reconcile_with_pending(&chain,&[prevout.script_pubkey.clone()],std::slice::from_ref(&included),&[transaction.clone()])?;
+@@ -144,3 +148,5 @@
+     Ok(())
+ }
+ mod relay;
++
++mod helper_fixture;
+diff --git a/swap-machine/src/bin/native-ltc-light/dex.rs b/swap-machine/src/bin/native-ltc-light/dex.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/dex.rs
+@@ -0,0 +1,205 @@
++// Isolated-chain DEX commands over a local private pipe. No identity key input.
++use super::*;
++use swap_machine::{litecoin_quote::Policy,litecoin_negotiation::{LocalRole,execution::{Execution,
++    light_funding::approval::LightFundingVault}}};
++use swap_machine::litecoin_light::vault::mnemonic::storage::MnemonicVault;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct DexConfig {schema:String,wallet_config_file:PathBuf,metadata_directory:PathBuf,
++    snapshot_directory:PathBuf,trade_id:uuid::Uuid,pins:[[u8;32];2],policy:Policy}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct DexRequest {schema:String,request_id:uuid::Uuid,approved_config_digest:String,
++    maximum_download_headers:u32,payment:Payment,retained_review:Option<RetainedReview>,
++    wallet_scan:Option<WalletScan>,maximum_history_entries:Option<usize>,
++    approval:Option<String>,password:Option<Password>}
++
++pub(super) fn mode(flag:&str)->Option<&str> {
++    let name=flag.strip_prefix("--dex-funding-")?.strip_suffix("-stdio-v1")?;
++    ["prepare","review","sign","send-review","send","observe","retry-review","retry"].contains(&name).then_some(name)
++}
++fn cold(mode:&str)->bool {matches!(mode,"observe"|"retry-review"|"retry")}
++fn digest(value:&str)->Result<sha256::Hash> {
++    let hash:sha256::Hash=value.parse()?;
++    ensure!(hash.to_string()==value,"noncanonical DEX approval digest");Ok(hash)
++}
++fn validate(request:&DexRequest,mode:&str)->Result<()> {
++    ensure!(request.schema==format!("monzero-ltc-light-dex-funding-{mode}-request-v1")
++        && !request.request_id.is_nil() && (1..=10_000_000).contains(&request.maximum_download_headers),"invalid light DEX request");
++    digest(&request.approved_config_digest)?;
++    ensure!(request.retained_review.is_some() || mode=="prepare","missing retained DEX funding review");
++    ensure!(request.password.is_some()==(mode=="sign"),"unexpected DEX password field");
++    ensure!(request.approval.is_some()==matches!(mode,"sign"|"send"|"retry"),"invalid DEX approval fields");
++    if let Some(value)=&request.approval {digest(value)?;}
++    ensure!(if cold(mode) {request.wallet_scan.is_none() && request.maximum_history_entries.is_some_and(|n|(1..=1000).contains(&n))}
++        else {request.maximum_history_entries.is_none() && request.wallet_scan.as_ref().is_some_and(|s|
++            (1..=500).contains(&s.gap) && (1..=500).contains(&s.addresses_per_branch)
++                && (1..=1000).contains(&s.history_entries_per_branch))},"invalid DEX observation budget");
++    ensure!((1..=1000).contains(&request.payment.minimum_confirmations),"invalid DEX input confirmation policy");
++    if let Some(review)=&request.retained_review {digest(&review.signing_commitment)?;}
++    Ok(())
++}
++fn context_digest(dex:&[u8],wallet:&[u8])->Result<sha256::Hash> {
++    Ok(sha256::Hash::hash(&serde_json::to_vec(&json!({"schema":"monzero-ltc-light-dex-context-v1",
++        "dexDigest":sha256::Hash::hash(dex),"walletDigest":sha256::Hash::hash(wallet)}))?))
++}
++fn public_review(review:swap_machine::litecoin_negotiation::execution::lock_approval::LockFundingReview)->Value {
++    json!({"details":review.details,"commitment":sha256::Hash::from_byte_array(review.commitment).to_string()})
++}
++pub(super) fn run(path:&Path,mode:&str)->Result<()> {
++    let mut input=Zeroizing::new(Vec::new());std::io::stdin().take(8193).read_to_end(&mut input)?;
++    ensure!(!input.is_empty() && input.len()<=8192,"invalid light DEX request size");
++    let request:DexRequest=serde_json::from_slice(&input)?;drop(input);validate(&request,mode)?;
++    let (_lease,bytes)=private_config(path)?;let dex:DexConfig=serde_json::from_slice(&bytes)?;
++    ensure!(dex.schema=="monzero-private-ltc-light-dex-v1" && !dex.trade_id.is_nil()
++        && dex.policy.ltc_network==LtcNetwork::Regtest,"light DEX helper is limited to isolated Litecoin regtest");
++    let (_wallet_lease,wallet_bytes)=private_config(&dex.wallet_config_file)?;
++    let expected=context_digest(&bytes,&wallet_bytes)?;
++    ensure!(expected==digest(&request.approved_config_digest)?,"light DEX configuration changed");
++    let wallet_config=parse_config(&wallet_bytes,"ltc")?;
++    let network=network_for("ltc",&wallet_config.network)?;
++    ensure!(network==LightNetwork::from(LtcNetwork::Regtest),"wrong light DEX wallet network");
++    let mut execution=Execution::resume(&dex.metadata_directory,&dex.snapshot_directory,dex.trade_id,
++        &dex.policy,LocalRole::LitecoinFunder,dex.pins)?;
++    let result=tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
++        tokio::time::timeout(std::time::Duration::from_secs(3600),execute(&wallet_config,network,&dex,&request,mode,&mut execution))
++            .await.context("light DEX operation deadline exceeded")?
++    })?;
++    let response=json!({"schema":format!("monzero-ltc-light-dex-funding-{mode}-response-v1"),
++        "requestId":request.request_id,"tradeId":dex.trade_id,"configurationDigest":expected,
++        "executable":false,"result":result});
++    let bytes=serde_json::to_vec(&response)?;ensure!(bytes.len()<=262144,"oversized light DEX response");
++    std::io::stdout().write_all(&bytes)?;Ok(())
++}
++async fn execute(config:&Config,network:LightNetwork,dex:&DexConfig,request:&DexRequest,
++    mode:&str,execution:&mut Execution)->Result<Value> {
++    let payment=&request.payment;
++    let address=LightAddress::parse(network,&payment.address)?;
++    let output=TxOut {value:atomic(&payment.amount_atomic)?,script_pubkey:address.script_pubkey().clone()};
++    let policy=PreparationPolicy {fee:atomic(&payment.fee_atomic)?,minimum_change:atomic(&payment.minimum_change_atomic)?,
++        minimum_confirmations:payment.minimum_confirmations};
++    if !cold(mode) {execution.check_light_funding_payment(&output,policy.fee,policy.minimum_change,now()?)?;}
++    let mut state=ChainState::open(&config.cache_directory,network,config.maximum_height,now()?)?;
++    let sync=synchronize(config,network,&mut state,request.maximum_download_headers).await?;
++    ensure!(sync["reportedTipOnSelectedChain"]==json!(true)
++        && sync["reportedHeight"].as_u64()==Some(u64::from(state.chain()?.height())),"DEX peer tip differs from selected chain");
++    let endpoint=config.endpoint.as_ref().context("missing DEX TLS endpoint")?;
++    let target=TlsEndpoint::new(endpoint.host.clone(),endpoint.port,network)?;
++    if cold(mode) {
++        let retained=request.retained_review.as_ref().context("missing DEX retained review")?;
++        let expected=digest(&retained.signing_commitment)?;
++        let (claim,mut result)=recovered_payment(config,network,payment,dex.trade_id,retained)?;
++        let mut session=target.connect().await?;
++        let observation=execution.observe_light_funding_on(&claim,state.chain()?,expected,&mut session,
++            request.maximum_history_entries.context("missing DEX history budget")?).await?;
++        drop(session);
++        apply_broadcast_status(&mut result,&claim,endpoint,&target,expected)?;
++        result["observation"]=match observation.position_on(state.chain()?)? {
++            PaymentPosition::NotReported=>json!({"position":"not-reported"}),
++            PaymentPosition::ReportedPending=>json!({"position":"reported-pending"}),
++            PaymentPosition::Included {height,block_hash,confirmations}=>json!({"position":"included","height":height,"blockHash":block_hash,"confirmations":confirmations}),
++        };
++        result["selectedHeight"]=json!(observation.selected_height());result["selectedTip"]=json!(observation.selected_tip());
++        if mode=="retry-review" {result["review"]=public_review(execution.review_light_funding_retry(&claim,state.chain()?,expected,&target,&observation)?);}
++        if mode=="retry" {
++            let approved=digest(request.approval.as_deref().context("missing DEX retry approval")?)?.to_byte_array();
++            result["txid"]=json!(execution.retry_light_funding(&claim,state.chain()?,expected,&target,&observation,&approved).await?);
++            apply_broadcast_status(&mut result,&claim,endpoint,&target,expected)?;
++            result["watchOnly"]=json!(false);
++        }
++        return Ok(result);
++    }
++    let wallet=config.wallet.as_ref().context("missing DEX wallet")?;
++    let directory=wallet.spend_directory.as_ref().context("missing DEX spend journal")?;
++    let account=PublicAccount::from_descriptor(&wallet.account,network)?;
++    let mut book=AddressBook::open(&wallet.address_book_directory,PublicAccount::from_descriptor(&wallet.account,network)?)?;
++    let retained=request.retained_review.as_ref().map(|r|retained_context(&book,r,dex.trade_id)).transpose()?;
++    let allocated=[book.allocated_count(Branch::Receive)?,book.allocated_count(Branch::Change)?];
++    let scan=request.wallet_scan.as_ref().context("missing DEX wallet scan")?;
++    let mut session=target.connect().await?;
++    let observation=session.refresh_wallet(state.chain()?,&account,allocated,&RefreshLimits {gap:scan.gap,
++        addresses_per_branch:scan.addresses_per_branch,history_entries_per_branch:scan.history_entries_per_branch}).await?;drop(session);
++    let prepared=if let Some((expected,change))=retained {
++        observation.reopen_payment(state.chain()?,&output,change,policy.fee,policy.minimum_confirmations,directory,dex.trade_id,expected)?
++    } else {observation.prepare_payment(state.chain()?,&output,&policy,&mut book,directory,dex.trade_id)?};
++    ensure!(prepared.fee()==policy.fee && prepared.transaction().output.get(1).is_none_or(|o|o.value>=policy.minimum_change),"DEX wallet payment policy changed");
++    let expected=prepared.signing_commitment();
++    let mut result=payment_view(network,&address.to_string(),&output,prepared.transaction(),prepared.fee(),expected)?;
++    match mode {
++        "prepare"=>{
++            let frame=execution.light_recovery_signing_frame(&prepared,state.chain()?,observation.accounting(),expected,now()?)?;
++            result["recoveryFrame"]=json!(frame.iter().map(|b|format!("{b:02x}")).collect::<String>());
++            result["fundingPsbt"]=json!(prepared.funding_psbt_on(state.chain()?,observation.accounting(),dex.trade_id,expected)?.to_string());
++        },
++        "review"=>result["review"]=public_review(execution.review_light_funding(&prepared,state.chain()?,observation.accounting(),expected,now()?)?),
++        "sign"=>{
++            let vault=wallet.vault.as_ref().context("missing DEX vault")?;
++            let approved=digest(request.approval.as_deref().context("missing DEX signing approval")?)?.to_byte_array();
++            let password=request.password.as_ref().context("missing DEX password")?.0.as_bytes();
++            let signed=match vault.seed_encoding {
++                vault_format::VaultFormat::Raw=>{
++                    let local=SeedVault::open(&vault.directory,network,vault.wallet_id)?;
++                    execution.sign_light_funding(&prepared,state.chain()?,observation.accounting(),expected,&approved,LightFundingVault::Seed(&local),password,now()?)?
++                },
++                vault_format::VaultFormat::Mnemonic=>{
++                    let local=MnemonicVault::open(&vault.directory,network,vault.wallet_id)?;
++                    execution.sign_light_funding(&prepared,state.chain()?,observation.accounting(),expected,&approved,LightFundingVault::Mnemonic(&local),password,now()?)?
++                },
++            };
++            result["signed"]=json!(true);result["watchOnly"]=json!(false);
++            result["txid"]=json!(signed.compute_txid());result["broadcast"]=json!(false);
++        },
++        "send-review"=>{
++            result["review"]=public_review(execution.review_light_funding_send(&prepared,state.chain()?,observation.accounting(),expected,&target,now()?)?);
++            result["signed"]=json!(true);
++        },
++        "send"=>{
++            let approved=digest(request.approval.as_deref().context("missing DEX send approval")?)?.to_byte_array();
++            result["txid"]=json!(execution.send_light_funding(&prepared,state.chain()?,observation.accounting(),expected,&target,&approved,now()?).await?);
++            result["signed"]=json!(true);result["watchOnly"]=json!(false);result["broadcastStatus"]=json!("server-acknowledged");result["confirmationStatus"]=json!("unassessed");
++        },
++        _=>anyhow::bail!("invalid fresh DEX operation"),
++    }
++    Ok(result)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn request(mode:&str)->Value {
++        let mut value=json!({"schema":format!("monzero-ltc-light-dex-funding-{mode}-request-v1"),
++            "requestId":uuid::Uuid::new_v4(),"approvedConfigDigest":"11".repeat(32),"maximumDownloadHeaders":1000,
++            "payment":{"address":"fixture","amountAtomic":"100000000","feeAtomic":"1000","minimumChangeAtomic":"100000","minimumConfirmations":1}});
++        if mode!="prepare" {value["retainedReview"]=json!({"signingCommitment":"22".repeat(32),"changeAddress":null});}
++        if cold(mode) {value["maximumHistoryEntries"]=json!(10);} else {value["walletScan"]=json!({"gap":2,"addressesPerBranch":10,"historyEntriesPerBranch":50});}
++        if matches!(mode,"sign"|"send"|"retry") {value["approval"]=json!("33".repeat(32));}
++        if mode=="sign" {value["password"]=json!("test credential");}value
++    }
++    #[test]
++    fn modes_isolate_passwords_approvals_and_observation_budgets()->Result<()> {
++        for name in ["prepare","review","sign","send-review","send","observe","retry-review","retry"] {
++            assert_eq!(mode(&format!("--dex-funding-{name}-stdio-v1")),Some(name));
++            let valid=request(name);validate(&serde_json::from_value(valid.clone())?,name)?;
++            for field in ["schema","requestId","approvedConfigDigest","maximumDownloadHeaders"] {
++                let mut bad=valid.clone();bad.as_object_mut().unwrap().remove(field);
++                assert!(serde_json::from_value::<DexRequest>(bad).is_err());
++            }
++            let mut bad=valid.clone();bad["password"]=if name=="sign" {Value::Null}else{json!("unexpected")};
++            assert!(validate(&serde_json::from_value(bad)?,name).is_err());
++            let mut bad=valid.clone();bad["approval"]=if matches!(name,"sign"|"send"|"retry") {Value::Null}else{json!("33".repeat(32))};
++            assert!(validate(&serde_json::from_value(bad)?,name).is_err());
++            let mut bad=valid.clone();bad["maximumDownloadHeaders"]=json!(0);
++            assert!(validate(&serde_json::from_value(bad)?,name).is_err());
++            let mut bad=valid;bad["unknown"]=json!(true);assert!(serde_json::from_value::<DexRequest>(bad).is_err());
++        }
++        assert!(mode("--dex-funding-sign-stdio-v2").is_none());assert!(mode("--wallet-sign-stdio-v1").is_none());Ok(())
++    }
++    #[test]
++    fn context_fingerprint_binds_both_exact_private_files()->Result<()> {
++        let a=context_digest(b"dex",b"wallet")?;
++        assert_ne!(a,context_digest(b"dex ",b"wallet")?);
++        assert_ne!(a,context_digest(b"dex",b"wallet ")?);
++        assert_ne!(a,context_digest(b"wallet",b"dex")?);Ok(())
++    }
++}
+diff --git a/swap-machine/src/litecoin_light/funding_tests/helper_fixture.rs b/swap-machine/src/litecoin_light/funding_tests/helper_fixture.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/funding_tests/helper_fixture.rs
+@@ -0,0 +1,47 @@
++//! Owned-regtest driver fixture: real helper owns all wallet funding operations.
++use super::*;
++use std::{io::Write,os::unix::fs::OpenOptionsExt};
++use serde::{Deserialize,Serialize};
++use crate::litecoin_quote::Policy;
++#[derive(Deserialize,Serialize)]
++struct Context {policy:Policy,trade:uuid::Uuid,pins:[[u8;32];2]}
++fn write(path:&Path,value:&serde_json::Value)->Result<()> {
++    let mut file=fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
++    file.write_all(&serde_json::to_vec(value)?)?;file.sync_all()?;Ok(())
++}
++#[test]
++#[ignore="requires owned helper/node/TLS fixture"]
++fn actual_light_dex_helper_context()->Result<()> {
++    let root=PathBuf::from(std::env::var("MONZERO_LIGHT_DEX_FIXTURE_ROOT")?).canonicalize()?;
++    let stage=std::env::var("MONZERO_LIGHT_DEX_FIXTURE_STAGE")?;
++    let bi=SigningKey::from_bytes(&[1;32]);let ai=SigningKey::from_bytes(&[2;32]);
++    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    if stage=="init" {
++        for name in ["bob-meta","bob-secrets","alice-meta","alice-secrets"] {fs::DirBuilder::new().mode(0o700).create(root.join(name))?;}
++        let (policy,mut terms)=crate::litecoin_quote::tests::fixture();terms.insert("expiresAt".into(),(now+1800).to_string());
++        let quote=crate::litecoin_quote::tests::signed(&terms,&policy,now)?;
++        let trade=quote.terms()["swapId"].parse()?;let pins=[bi.verifying_key().to_bytes(),ai.verifying_key().to_bytes()];
++        let mut rng=rand::rngs::StdRng::seed_from_u64(91452);
++        let mut bob=Execution::begin(&root.join("bob-meta"),&root.join("bob-secrets"),&quote,&policy,LocalRole::LitecoinFunder,quote.commitment(),now,&mut rng)?;
++        let mut alice=Execution::begin(&root.join("alice-meta"),&root.join("alice-secrets"),&quote,&policy,LocalRole::NativeFunder,quote.commitment(),now,&mut rng)?;
++        let message=bob.outgoing(&bi,now)?;alice.accept_peer(message.bytes(),message.signature(),now)?;
++        let message=alice.outgoing(&ai,now)?;bob.accept_peer(message.bytes(),message.signature(),now)?;
++        write(&root.join("context.json"),&serde_json::to_value(Context {policy,trade,pins})?)?;
++        write(&root.join("payment.json"),&serde_json::json!({"address":bob.completed_keys()?.contract_address().to_string(),
++            "amountAtomic":"100000000","feeAtomic":"10000","minimumChangeAtomic":"100000","minimumConfirmations":1}))?;
++    } else {
++        anyhow::ensure!(stage=="peer","invalid helper fixture stage");
++        let context:Context=serde_json::from_slice(&fs::read(root.join("context.json"))?)?;
++        let mut bob=Execution::resume(&root.join("bob-meta"),&root.join("bob-secrets"),context.trade,&context.policy,LocalRole::LitecoinFunder,context.pins)?;
++        let mut alice=Execution::resume(&root.join("alice-meta"),&root.join("alice-secrets"),context.trade,&context.policy,LocalRole::NativeFunder,context.pins)?;
++        let prepared:serde_json::Value=serde_json::from_slice(&fs::read(root.join("prepared.json"))?)?;
++        use bitcoin::hex::FromHex;
++        let frame=Vec::from_hex(prepared["result"]["recoveryFrame"].as_str().unwrap())?;
++        let psbt:bitcoin::psbt::Psbt=prepared["result"]["fundingPsbt"].as_str().unwrap().parse()?;
++        let signature=bi.sign(&crate::litecoin_negotiation::recovery::signing_bytes(&frame)?).to_bytes();
++        let message=bob.submit_recovery_signature(&frame,&signature,now)?;
++        let other=alice.prepare_recovery(&psbt,&ai,now)?;
++        bob.accept_recovery(other.bytes(),other.signature())?;alice.accept_recovery(message.bytes(),message.signature())?;
++    }
++    Ok(())
++}

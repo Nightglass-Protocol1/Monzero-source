@@ -1,0 +1,79 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
+@@ -20,34 +20,34 @@
+     Ok(response)
+ }
+ 
+-pub(super) fn exercise(helper: &std::path::Path,path: &std::path::Path,server: &Server,
++pub(super) fn exercise(program: &std::path::Path,helper: &std::path::Path,path: &std::path::Path,server: &Server,
+     setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,rpc_path: &std::path::Path,
+     descriptor: &Value) -> Result<Value> {
+     let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
+-    let status=invoke(helper,path,"signing-status",None,true)?;
++    let status=invoke(program,path,"signing-status",None,true)?;
+     assert!(status["signingIntent"].is_null() && status["signedFunding"].is_null());
+-    let review=invoke(helper,path,"signing-review",None,true)?;
++    let review=invoke(program,path,"signing-review",None,true)?;
+     assert_eq!(review["review"]["details"]["action"],"sign-only");
+     assert_eq!(review["review"],status["review"]);
+     assert_eq!(review["tradeId"],setup.quote.terms()["swapId"]);
+     let approved=review["review"]["commitment"].as_str().context("missing signing review")?;
+-    invoke(helper,path,"signing-submit",None,false)?;
+-    let lock=locking::invoke(helper,path,"lock-review",None,true)?;
+-    invoke(helper,path,"signing-submit",lock["review"]["commitment"].as_str(),false)?;
++    invoke(program,path,"signing-submit",None,false)?;
++    let lock=locking::invoke(program,path,"lock-review",None,true)?;
++    invoke(program,path,"signing-submit",lock["review"]["commitment"].as_str(),false)?;
+     let mut wrong=descriptor.clone();wrong["wallet"]=json!("other");
+     save(rpc_path,&serde_json::to_vec(&wrong)?)?;
+-    invoke(helper,path,"signing-submit",Some(approved),false)?;
++    invoke(program,path,"signing-submit",Some(approved),false)?;
+     save(rpc_path,&serde_json::to_vec(descriptor)?)?;
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     assert_eq!(server.state.lock().unwrap().sign_calls,0);
+     let intent_path=metadata.0.join(format!("{}.bch-funding-signing-intent",setup.quote.terms()["swapId"]));
+     {let mut state=server.state.lock().unwrap();state.sign_intent=Some(intent_path);state.sign_mode=4;}
+-    invoke(helper,path,"signing-submit",Some(approved),false)?;
+-    let uncertain=invoke(helper,path,"signing-status",None,true)?;
++    invoke(program,path,"signing-submit",Some(approved),false)?;
++    let uncertain=invoke(program,path,"signing-status",None,true)?;
+     assert!(uncertain["signingIntent"].is_object());assert!(uncertain["signedFunding"].is_null());
+     assert_eq!(uncertain["review"],review["review"]);
+     let before=contents(&metadata.0)?;
+-    invoke(helper,path,"signing-submit",Some(approved),false)?;
++    invoke(program,path,"signing-submit",Some(approved),false)?;
+     assert_eq!(contents(&metadata.0)?,before);
+     assert_eq!(server.state.lock().unwrap().sign_calls,1);
+     let raw=server.state.lock().unwrap().signed_candidate.clone();
+@@ -79,11 +79,11 @@
+     invoke(helper,&recovery_path,"signing-recovery-submit",Some(recovery_approval),true)?;
+     assert_eq!(contents(&metadata.0)?,retained_records);
+     save(rpc_path,&serde_json::to_vec(descriptor)?)?;
+-    let restored=invoke(helper,path,"signing-status",None,true)?;
++    let restored=invoke(program,path,"signing-status",None,true)?;
+     assert_eq!(restored["signingIntent"],uncertain["signingIntent"]);
+     assert_eq!(restored["signedFunding"],expected);
+     let before=contents(&metadata.0)?;
+-    assert_eq!(invoke(helper,path,"signing-submit",Some(approved),true)?["signedFunding"],expected);
++    assert_eq!(invoke(program,path,"signing-submit",Some(approved),true)?["signedFunding"],expected);
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     {let state=server.state.lock().unwrap();assert_eq!(state.sign_calls,1);
+         assert_eq!(state.preparation_calls,1);assert_eq!(state.relay_calls,0);}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+@@ -91,11 +91,11 @@
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     let locked=locking::exercise(&program,&path,&server,metadata,snapshots,&response["review"],
+         &rpc_path,&descriptor)?;
+-    let signed=signing::exercise(helper,&path,&server,setup,metadata,snapshots,&rpc_path,&descriptor)?;
++    let signed=signing::exercise(&program,helper,&path,&server,setup,metadata,snapshots,&rpc_path,&descriptor)?;
+     let before=contents(&metadata.0)?;
+     drop(server);std::fs::remove_file(&rpc_path)?;std::fs::remove_file(&cookie)?;
+     assert_eq!(locking::invoke(&program,&path,"lock-status",None,true)?["lockIntent"],locked);
+-    assert_eq!(signing::invoke(helper,&path,"signing-status",None,true)?["signedFunding"],signed);
++    assert_eq!(signing::invoke(&program,&path,"signing-status",None,true)?["signedFunding"],signed);
+ 
+     assert_eq!(invoke("preparation-status",true)?["review"],response["review"]);
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);

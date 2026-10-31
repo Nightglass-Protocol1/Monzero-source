@@ -1,0 +1,171 @@
+diff --git a/swap-machine/src/native_execution_claim/checkpoint.rs b/swap-machine/src/native_execution_claim/checkpoint.rs
+index 304f62add..1845b9b94 100644
+--- a/swap-machine/src/native_execution_claim/checkpoint.rs
++++ b/swap-machine/src/native_execution_claim/checkpoint.rs
+@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
+ mod submission;
+ pub use submission::{RecordedBitcoinSubmission, BitcoinSubmissionObserver,
+     BitcoinSubmissionSnapshot, BitcoinSubmissionObservation};
++pub use submission::HistoricalBitcoinObservation;
+ 
+ const DOMAIN: &[u8] = b"monzero-native-bob-pending-checkpoint-v1\0";
+ const LOCK_DOMAIN: &[u8] = b"monzero-native-bob-bitcoin-lock-v1\0";
+diff --git a/swap-machine/src/native_execution_claim/checkpoint/submission.rs b/swap-machine/src/native_execution_claim/checkpoint/submission.rs
+index 52ffce8e1..759b0b09b 100644
+--- a/swap-machine/src/native_execution_claim/checkpoint/submission.rs
++++ b/swap-machine/src/native_execution_claim/checkpoint/submission.rs
+@@ -1,10 +1,13 @@
+ //! Exact Bitcoin lock submission intent and read-only observations. No signature validation, broadcast
+ //! authority or acceptance receipt. Never infer rejection from a missing receipt.
+ use super::*;
++mod history;
++pub use history::HistoricalBitcoinObservation;
+ 
+ const SUBMISSION_DOMAIN: &[u8] = b"monzero-native-bitcoin-submission-v1\0";
+ 
+-#[derive(Clone, PartialEq, Eq)]
++#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
+ pub struct BitcoinSubmissionSnapshot {
+     pub genesis: bitcoin::BlockHash,
+     pub tip: bitcoin::BlockHash,
+@@ -19,11 +22,16 @@ pub trait BitcoinSubmissionObserver: Sync {
+ }
+ 
+ /// Neither result authorizes another submission or proves confirmation/finality.
+-#[derive(Debug, PartialEq, Eq)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub enum BitcoinSubmissionObservation { NotObserved, ExactTransactionObserved }
+ 
+ async fn observe(record: &RecordedBitcoinSubmission, expected_genesis: bitcoin::BlockHash,
+     observer: &impl BitcoinSubmissionObserver) -> Result<BitcoinSubmissionObservation> {
++    Ok(observe_snapshot(record,expected_genesis,observer).await?.0)
++}
++
++async fn observe_snapshot(record: &RecordedBitcoinSubmission, expected_genesis: bitcoin::BlockHash,
++    observer: &impl BitcoinSubmissionObserver) -> Result<(BitcoinSubmissionObservation,BitcoinSubmissionSnapshot)> {
+     let before=observer.snapshot().await?;
+     ensure!(before.genesis==expected_genesis,"wrong Bitcoin submission chain");
+     let transaction=observer.transaction(record.transaction.compute_txid()).await?;
+@@ -32,9 +40,9 @@ async fn observe(record: &RecordedBitcoinSubmission, expected_genesis: bitcoin::
+     match transaction {
+         Some(transaction)=>{
+             ensure!(transaction==record.transaction,"observed Bitcoin submission bytes differ");
+-            Ok(BitcoinSubmissionObservation::ExactTransactionObserved)
++            Ok((BitcoinSubmissionObservation::ExactTransactionObserved,before))
+         }
+-        None=>Ok(BitcoinSubmissionObservation::NotObserved),
++        None=>Ok((BitcoinSubmissionObservation::NotObserved,before)),
+     }
+ }
+ 
+diff --git a/swap-machine/src/native_execution_claim/checkpoint/submission/history.rs b/swap-machine/src/native_execution_claim/checkpoint/submission/history.rs
+new file mode 100644
+index 000000000..b97c1c64d
+--- /dev/null
++++ b/swap-machine/src/native_execution_claim/checkpoint/submission/history.rs
+@@ -0,0 +1,78 @@
++//! Append-only historical observations, NOT cached execution authority.
++use super::*;
++const HISTORY_DOMAIN: &[u8]=b"monzero-bitcoin-observation-v1\0";
++
++#[derive(serde::Serialize,serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Record {
++    id:uuid::Uuid,
++    txid:bitcoin::Txid,
++    wtxid:bitcoin::Wtxid,
++    snapshot:BitcoinSubmissionSnapshot,
++    observation:BitcoinSubmissionObservation,
++}
++
++/// A past node observation. Never proves current presence, confirmation,
++/// spendability, finality or permission to retry. Fresh reconciliation is required.
++pub struct HistoricalBitcoinObservation { record:Record }
++impl HistoricalBitcoinObservation {
++    pub fn id(&self) -> uuid::Uuid { self.record.id }
++    pub fn observation(&self) -> BitcoinSubmissionObservation { self.record.observation }
++    pub fn snapshot(&self) -> &BitcoinSubmissionSnapshot { &self.record.snapshot }
++}
++
++fn suffix(id:uuid::Uuid) -> Result<String> {
++    ensure!(!id.is_nil(),"missing Bitcoin observation identity");
++    Ok(format!("bitcoin-observation-{id}"))
++}
++
++impl RecoveryLease {
++    /// Fresh read-only observation followed by exclusive pin-first persistence.
++    /// IDs are caller-retained audit identities, not a monotonic state sequence.
++    /// Failure may leave occupied records; do not delete or overwrite to retry.
++    #[cfg(target_os = "linux")]
++    pub async fn record_bitcoin_observation(&self,store:&CheckpointPinStore,lock:bitcoin::Txid,
++        id:uuid::Uuid,observer:&impl BitcoinSubmissionObserver) -> Result<HistoricalBitcoinObservation> {
++        let suffix=suffix(id)?;
++        let submission=self.load_bitcoin_submission(store,lock)?;
++        let quote=self.record.quote();
++        let (observation,snapshot)=observe_snapshot(&submission,quote.terms()["btcGenesis"].parse()?,observer).await?;
++        let record=Record {id,txid:lock,wtxid:submission.transaction.compute_wtxid(),snapshot,observation};
++        let payload=serde_json::to_vec(&record)?;
++        let bytes=[HISTORY_DOMAIN,quote.commitment(),payload.as_slice()].concat();
++        let digest:[u8;32]=Sha256::digest(&bytes).into();
++        let name=format!("{}.{suffix}",filename(quote)?);
++        write_once(&store.directory,&format!("{name}.pin"),
++            &pin_record(quote.terms()["swapId"].parse()?,quote.commitment(),&digest))?;
++        write_once(&self.directory,&name,&bytes)?;
++        Ok(HistoricalBitcoinObservation {record})
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub async fn record_bitcoin_observation(&self,_:&CheckpointPinStore,_:bitcoin::Txid,
++        _:uuid::Uuid,_:&impl BitcoinSubmissionObserver) -> Result<HistoricalBitcoinObservation> {
++        anyhow::bail!("Bitcoin observation persistence is not implemented on this platform")
++    }
++
++    /// Load and bind a historical record; this performs NO fresh node query.
++    #[cfg(target_os = "linux")]
++    pub fn load_bitcoin_observation(&self,store:&CheckpointPinStore,lock:bitcoin::Txid,
++        id:uuid::Uuid) -> Result<HistoricalBitcoinObservation> {
++        let suffix=suffix(id)?;
++        let submission=self.load_bitcoin_submission(store,lock)?;
++        let quote=self.record.quote();
++        let bytes=read_record(&self.directory,store,quote,&suffix,HISTORY_DOMAIN)?;
++        let record:Record=serde_json::from_slice(&bytes[HISTORY_DOMAIN.len()+32..])
++            .map_err(|_|anyhow::anyhow!("invalid historical Bitcoin observation"))?;
++        ensure!(record.id==id && record.txid==lock && record.wtxid==submission.transaction.compute_wtxid()
++            && record.snapshot.genesis.to_string()==quote.terms()["btcGenesis"],
++            "historical Bitcoin observation identity mismatch");
++        Ok(HistoricalBitcoinObservation {record})
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    pub fn load_bitcoin_observation(&self,_:&CheckpointPinStore,_:bitcoin::Txid,
++        _:uuid::Uuid) -> Result<HistoricalBitcoinObservation> {
++        anyhow::bail!("Bitcoin observation recovery is not implemented on this platform")
++    }
++}
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 8c999d058..e14950d4d 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -892,6 +892,21 @@ async fn resume_pending_in_child() -> Result<()> {
+             anyhow::ensure!(lease.reconcile_bitcoin_submission(&store,lock,&node).await?
+                 ==swap_machine::native_execution_claim::checkpoint::BitcoinSubmissionObservation::ExactTransactionObserved,
+                 "retained Bitcoin submission was not observed");
++            let first=std::env::var_os("MONZERO_TEST_CHILD_REJECTION").is_some();
++            let observation_id=Uuid::from_u128(if first {1} else {2});
++            if !first {
++                let prior=lease.load_bitcoin_observation(&store,lock,Uuid::from_u128(1))?;
++                anyhow::ensure!(prior.observation()==swap_machine::native_execution_claim::checkpoint::BitcoinSubmissionObservation::ExactTransactionObserved,
++                    "previous child observation was not retained");
++            }
++            let saved=lease.record_bitcoin_observation(&store,lock,observation_id,&node).await?;
++            let restored=lease.load_bitcoin_observation(&store,lock,observation_id)?;
++            anyhow::ensure!(saved.id()==restored.id() && saved.observation()==restored.observation()
++                && saved.snapshot()==restored.snapshot(),"historical observation changed on reload");
++            anyhow::ensure!(lease.record_bitcoin_observation(&store,lock,observation_id,&node).await.is_err(),
++                "historical observation was overwritten");
++            anyhow::ensure!(lease.load_bitcoin_observation(&store,lock,Uuid::nil()).is_err(),
++                "nil observation identity accepted");
+             pre_lock.check_recorded_quote(&association.verify_record(quote_fixture::now()?)?)?;
+             let pending=lease.load_pinned_pending(&store,lock,&policy)?;
+             anyhow::ensure!(pre_lock.cancel(swap_core::monero::BlockHeight {height:0})

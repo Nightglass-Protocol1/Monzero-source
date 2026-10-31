@@ -1,0 +1,235 @@
+--- a/swap-core/src/lib.rs
++++ b/swap-core/src/lib.rs
+@@ -3,3 +3,4 @@
+ pub mod monero;
+ pub mod xmz;
+ pub mod xmz_address;
++pub mod litecoin_address;
+--- a/swap-core/tests/litecoin_settlement.rs
++++ b/swap-core/tests/litecoin_settlement.rs
+@@ -25,7 +25,8 @@
+     build_shared_output_descriptor, recover,
+ };
+ 
+-const SCHEMA: &str = "monzero-ltc-contract-fixture-v2";
++const SCHEMA: &str = "monzero-ltc-contract-fixture-v3";
++use swap_core::litecoin_address::{LtcNetwork, LtcSegwitAddress};
+ /// BIP68 relative block locks use the low 16 bits; larger values set type or disable flags.
+ const MAX_CANCEL_BLOCKS: u32 = 0xFFFF;
+ const MAX_REQUEST_BYTES: u64 = 1 << 20;
+@@ -44,6 +45,10 @@
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields, rename_all = "camelCase")]
+ struct BuildRequest {
++    chain: String,
++    genesis: String,
++    redeem_address: String,
++    refund_address: String,
+     lock_psbt: String,
+     amount_atoms: String,
+     redeem_script: String,
+@@ -91,6 +96,9 @@
+ }
+ 
+ fn build(request: BuildRequest, keys: &FixtureKeys) -> Result<Value> {
++    LtcNetwork::Regtest.verify_chain(&request.chain, &request.genesis)?;
++    let redeem_address = LtcSegwitAddress::parse(LtcNetwork::Regtest, &request.redeem_address)?;
++    let refund_address = LtcSegwitAddress::parse(LtcNetwork::Regtest, &request.refund_address)?;
+     let amount = parse_atoms(&request.amount_atoms).context("invalid amountAtoms")?;
+     let fee = parse_atoms(&request.fee_atoms).context("invalid feeAtoms")?;
+     // The refund spends the cancel output, so the refund path pays the fee twice.
+@@ -108,6 +116,9 @@
+     let redeem_script = destination_script(&request.redeem_script).context("invalid redeemScript")?;
+     let refund_script = destination_script(&request.refund_script).context("invalid refundScript")?;
+ 
++    ensure!(redeem_address.script_pubkey() == &redeem_script
++        && refund_address.script_pubkey() == &refund_script,
++        "Litecoin address differs from destination script");
+     let (A, B, S_a) = (keys.a.public(), keys.b.public(), keys.s_a.public());
+     let shared_script = build_shared_output_descriptor(A.into(), B.into())?.script_pubkey();
+     ensure!(
+@@ -250,6 +261,9 @@
+     let descriptor = build_shared_output_descriptor(A.into(), B.into())?;
+     Ok(json!({
+         "schema": SCHEMA,
++        "chain": LtcNetwork::Regtest.name(),
++        "genesis": LtcNetwork::Regtest.genesis(),
++        "lockAddress": LtcSegwitAddress::from_script(LtcNetwork::Regtest, &descriptor.script_pubkey())?.to_string(),
+         "keyA": compressed_hex(A)?,
+         "keyB": compressed_hex(B)?,
+         "witnessScript": descriptor.explicit_script()?.to_hex_string(),
+@@ -416,6 +430,10 @@
+     fn valid_request() -> Value {
+         json!({
+             "mode": "build",
++            "chain": LtcNetwork::Regtest.name(),
++            "genesis": LtcNetwork::Regtest.genesis(),
++            "redeemAddress": LtcSegwitAddress::from_script(LtcNetwork::Regtest, &p2wpkh(3)).unwrap().to_string(),
++            "refundAddress": LtcSegwitAddress::from_script(LtcNetwork::Regtest, &p2wpkh(4)).unwrap().to_string(),
+             "lockPsbt": funded_psbt(vec![lock_output(AMOUNT), change_output()]).to_string(),
+             "amountAtoms": AMOUNT.to_string(),
+             "redeemScript": p2wpkh(3).to_hex_string(),
+@@ -441,7 +459,7 @@
+         assert_eq!(response["scriptPubKey"], shared_script().to_hex_string());
+         assert_eq!(response["keyA"].as_str().unwrap().len(), 66);
+         assert_eq!(response["keyB"].as_str().unwrap().len(), 66);
+-        assert_eq!(response.as_object().unwrap().len(), 7);
++        assert_eq!(response.as_object().unwrap().len(), 10);
+     }
+ 
+     #[test]
+@@ -540,6 +558,12 @@
+     #[test]
+     fn build_rejects_invalid_requests() {
+         let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
++            ("chain identity", Box::new(|r: &mut Value| r["chain"] = json!("main"))),
++            ("chain identity", Box::new(|r: &mut Value| r["genesis"] = json!(LtcNetwork::Mainnet.genesis()))),
++            ("address network", Box::new(|r: &mut Value| r["redeemAddress"] = json!(
++                LtcSegwitAddress::from_script(LtcNetwork::Mainnet, &p2wpkh(3)).unwrap().to_string()))),
++            ("destination script", Box::new(|r: &mut Value| r["refundAddress"] = json!(
++                LtcSegwitAddress::from_script(LtcNetwork::Regtest, &p2wpkh(9)).unwrap().to_string()))),
+             ("punishBlocks", Box::new(|r: &mut Value| r["punishBlocks"] = json!(0))),
+             ("punishBlocks", Box::new(|r: &mut Value| r["punishBlocks"] = json!(65536))),
+             ("feeAtoms", Box::new(|r: &mut Value| r["feeAtoms"] = json!("0"))),
+@@ -566,7 +590,8 @@
+             (
+                 "shared output",
+                 Box::new(|r: &mut Value| {
+-                    r["refundScript"] = json!(shared_script().to_hex_string())
++                    r["refundScript"] = json!(shared_script().to_hex_string());
++                    r["refundAddress"] = json!(LtcSegwitAddress::from_script(LtcNetwork::Regtest, &shared_script()).unwrap().to_string());
+                 }),
+             ),
+             ("Shared output pays", Box::new(|r: &mut Value| r["amountAtoms"] = json!("899999"))),
+diff --git a/swap-core/src/litecoin_address.rs b/swap-core/src/litecoin_address.rs
+new file mode 100644
+index 000000000..a65fd420c
+--- /dev/null
++++ b/swap-core/src/litecoin_address.rs
+@@ -0,0 +1,126 @@
++//! Transparent native-SegWit Litecoin destinations. No Bitcoin address wrapper.
++//! Network parameters: litecoin-project/litecoin v0.21.5.8 src/chainparams.cpp.
++use anyhow::{Context, Result, ensure};
++use bitcoin::{ScriptBuf, WitnessProgram, WitnessVersion};
++use bitcoin::bech32::{Hrp, segwit};
++use std::fmt;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum LtcNetwork { Mainnet, Testnet, Regtest }
++
++impl LtcNetwork {
++    pub fn name(self) -> &'static str {
++        match self { Self::Mainnet => "main", Self::Testnet => "test", Self::Regtest => "regtest" }
++    }
++
++    pub fn hrp(self) -> &'static str {
++        match self { Self::Mainnet => "ltc", Self::Testnet => "tltc", Self::Regtest => "rltc" }
++    }
++
++    pub fn genesis(self) -> &'static str {
++        match self {
++            Self::Mainnet => "12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2",
++            Self::Testnet => "4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0",
++            Self::Regtest => "530827f38f93b43ed12af0b3ad25a288dc02ed74d6d7857862df51fc56c416f9",
++        }
++    }
++
++    /// Compare independently obtained node identity with the configured deployment.
++    /// This does not authenticate the node or attest its consensus validation.
++    pub fn verify_chain(self, chain: &str, genesis: &str) -> Result<()> {
++        ensure!(chain == self.name() && genesis == self.genesis(), "wrong Litecoin chain identity");
++        Ok(())
++    }
++}
++
++/// Supports P2WPKH, P2WSH and P2TR only. Legacy and MWEB addresses are rejected.
++/// Parsing does not establish wallet ownership, chain activation or fee policy.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct LtcSegwitAddress {
++    network: LtcNetwork,
++    encoded: String,
++    script: ScriptBuf,
++}
++
++impl LtcSegwitAddress {
++    pub fn parse(network: LtcNetwork, value: &str) -> Result<Self> {
++        ensure!(value.len() <= 90, "Litecoin address too long");
++        let (hrp, version, program) = segwit::decode(value).context("invalid Litecoin SegWit address")?;
++        ensure!(hrp == Hrp::parse(network.hrp())?, "wrong Litecoin address network");
++        let version = match version.to_u8() {
++            0 => WitnessVersion::V0,
++            1 if program.len() == 32 => WitnessVersion::V1,
++            _ => anyhow::bail!("unsupported Litecoin witness program"),
++        };
++        let script = ScriptBuf::new_witness_program(&WitnessProgram::new(version, &program)?);
++        let address = Self::from_script(network, &script)?;
++        ensure!(address.encoded == value, "noncanonical Litecoin address");
++        Ok(address)
++    }
++
++    pub fn from_script(network: LtcNetwork, script: &ScriptBuf) -> Result<Self> {
++        ensure!(script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr(),
++            "unsupported Litecoin destination script");
++        let hrp = Hrp::parse(network.hrp())?;
++        let program = &script.as_bytes()[2..];
++        let encoded = if script.is_p2tr() { segwit::encode_v1(hrp, program)? }
++            else { segwit::encode_v0(hrp, program)? };
++        Ok(Self { network, encoded, script: script.clone() })
++    }
++
++    pub fn network(&self) -> LtcNetwork { self.network }
++    pub fn script_pubkey(&self) -> &ScriptBuf { &self.script }
++}
++
++impl fmt::Display for LtcSegwitAddress {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.encoded) }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn binds_every_supported_script_to_each_network() {
++        let networks = [LtcNetwork::Mainnet, LtcNetwork::Testnet, LtcNetwork::Regtest];
++        for network in networks {
++            for (version, size) in [(WitnessVersion::V0, 20), (WitnessVersion::V0, 32), (WitnessVersion::V1, 32)] {
++                let script = ScriptBuf::new_witness_program(&WitnessProgram::new(version, &vec![42; size]).unwrap());
++                let address = LtcSegwitAddress::from_script(network, &script).unwrap();
++                assert_eq!(address.script_pubkey(), &script);
++                assert_eq!(address.network(), network);
++                assert_eq!(LtcSegwitAddress::parse(network, &address.to_string()).unwrap(), address);
++                for other in networks {
++                    assert_eq!(LtcSegwitAddress::parse(other, &address.to_string()).is_ok(), network == other);
++                    assert_eq!(network.verify_chain(other.name(), other.genesis()).is_ok(), network == other);
++                    if network != other {
++                        assert!(network.verify_chain(network.name(), other.genesis()).is_err());
++                        assert!(network.verify_chain(other.name(), network.genesis()).is_err());
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn rejects_bad_checksum_wrong_chain_noncanonical_and_unsupported_programs() {
++        let network = LtcNetwork::Regtest;
++        let hrp = Hrp::parse("rltc").unwrap();
++        let good = segwit::encode_v0(hrp, &[42; 20]).unwrap();
++        let mut bad = good.clone().into_bytes();
++        let last = bad.len()-1;
++        bad[last] = if bad[last] == b'q' { b'p' } else { b'q' };
++        for value in [String::from_utf8(bad).unwrap(), good.to_uppercase(), format!(" {good}"),
++            format!("{good}\n"), "x".repeat(91), segwit::encode_v0(Hrp::parse("bcrt").unwrap(), &[42;20]).unwrap(),
++            segwit::encode_v0(Hrp::parse("ltcmweb").unwrap(), &[42;20]).unwrap(),
++            segwit::encode(hrp, bitcoin::bech32::Fe32::try_from(2u8).unwrap(), &[42;32]).unwrap(),
++            segwit::encode_v1(hrp, &[42;20]).unwrap()] {
++            assert!(LtcSegwitAddress::parse(network, &value).is_err());
++        }
++        for script in [ScriptBuf::new(), ScriptBuf::from_hex("51").unwrap(),
++            ScriptBuf::from_hex("001401").unwrap()] {
++            assert!(LtcSegwitAddress::from_script(network, &script).is_err());
++        }
++        assert!(network.verify_chain("regtest", "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943").is_err());
++    }
++}

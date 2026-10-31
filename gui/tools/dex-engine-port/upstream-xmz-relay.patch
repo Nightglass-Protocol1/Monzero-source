@@ -1,0 +1,198 @@
+diff --git a/swap-machine/src/native_funding_rpc/relay.rs b/swap-machine/src/native_funding_rpc/relay.rs
+new file mode 100644
+index 0000000..1a7059d
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/relay.rs
+@@ -0,0 +1,173 @@
++//! The one primitive in this module that actually broadcasts an XMZ transaction.
++//! Deliberately kept separate from `fee_estimation`, which only ever constructs
++//! with `do_not_relay:true` and must never be given this module's `transfer`
++//! parameters. There is no decode-from-untrusted-bytes entry point here, unlike
++//! `fee_estimation::decode_preview_request` or `wallet_session::decode_control`:
++//! callers are the swap orchestration layer only, acting on amounts/destinations
++//! it has already derived and verified itself (the negotiated shared-lock address,
++//! or a locally recovered output's sweep destination) -- never raw peer/GUI input.
++//! Exclusive caller-owned wallet ownership is required, as everywhere else in
++//! this module; this type does not provide or enforce that itself.
++use super::{NativeFundingRpc, number, string};
++use crate::xmz_funding::FundingObserver;
++use anyhow::{Context, Result, ensure};
++use serde_json::{Value, json};
++use swap_core::{xmz::XmzAmount, xmz_address::XmzAddress};
++
++pub struct RelayRequest {
++    pub wallet: XmzAddress,
++    pub destination: XmzAddress,
++    pub amount: XmzAmount,
++    pub account: u32,
++    pub priority: u32,
++}
++
++pub struct RelayedTransfer {
++    pub txid: String,
++    pub fee: XmzAmount,
++    pub weight: u64,
++}
++
++pub struct NativeTransferRelay {
++    client: NativeFundingRpc,
++}
++
++impl NativeTransferRelay {
++    /// Consumes the client; caller must guarantee exclusive wallet ownership.
++    /// This primitive is single-shot and holds no idempotency key of its own:
++    /// a crash between broadcast and the caller durably recording the returned
++    /// `txid` can leave the caller unable to tell whether relay happened. The
++    /// caller must reconcile that by observing the chain/wallet history before
++    /// ever calling `relay` again for the same logical transfer -- retrying
++    /// blindly can double-spend the wallet's remaining balance into a second
++    /// transaction. This module deliberately has no automatic retry.
++    pub fn new(client: NativeFundingRpc) -> Self {
++        Self { client }
++    }
++
++    /// Constructs, signs and broadcasts a single-destination transfer. The
++    /// caller is responsible for having already decided this exact transfer
++    /// should happen now (e.g. by first calling `fee_estimation::NativeFeeEstimator`
++    /// with the same request shape and accepting its preview); this call does
++    /// not itself present anything for approval.
++    pub async fn relay(&mut self, request: RelayRequest, expected_genesis: &str) -> Result<RelayedTransfer> {
++        ensure!(canonical_hash(expected_genesis), "invalid relay chain policy");
++        ensure!(request.amount.atoms() > 0 && (1..=4).contains(&request.priority),
++            "invalid relay construction request");
++        ensure!(request.wallet.network() == request.destination.network(), "relay address network mismatch");
++        let before = self.client.snapshot().await?;
++        ensure!(before.genesis == expected_genesis && canonical_hash(&before.tip_hash),
++            "unexpected relay chain");
++        self.check_wallet(&request).await?;
++        let balance = self.balance(request.account).await?;
++        ensure!(balance.1 >= request.amount.atoms(), "insufficient unlocked principal");
++        let response = self.client.rpc(self.client.wallet, "transfer", relay_params(&request)).await?;
++        parse_relay(&response, request.amount)
++    }
++
++    async fn check_wallet(&self, request: &RelayRequest) -> Result<()> {
++        // Primary address binds wallet identity; account selection is separately explicit.
++        let response = self.client.rpc(self.client.wallet, "get_address", json!({"account_index":0})).await?;
++        ensure!(string(&response, "address")? == request.wallet.to_string(), "unexpected relay wallet");
++        Ok(())
++    }
++
++    async fn balance(&self, account: u32) -> Result<(u64, u64)> {
++        let response = self.client.rpc(self.client.wallet, "get_balance", json!({"account_index":account})).await?;
++        Ok((number(&response, "balance")?, number(&response, "unlocked_balance")?))
++    }
++}
++
++fn canonical_hash(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
++fn relay_params(request: &RelayRequest) -> Value {
++    json!({
++        "destinations":[{"address":request.destination.to_string(), "amount":request.amount.atoms()}],
++        "account_index":request.account, "priority":request.priority,
++        "do_not_relay":false, "get_tx_key":false, "get_tx_hex":false, "get_tx_metadata":false,
++        "unlock_time":0, "subtract_fee_from_outputs":[]
++    })
++}
++
++fn parse_relay(response: &Value, amount: XmzAmount) -> Result<RelayedTransfer> {
++    ensure!(number(response, "amount")? == amount.atoms(), "relay principal mismatch");
++    let fee = number(response, "fee")?;
++    let weight = number(response, "weight")?;
++    ensure!(fee > 0 && weight > 0, "invalid relayed fee or weight");
++    // Broadcasting signs internally; the RPC must still not hand signing
++    // material back to us just because we asked it to relay.
++    for field in ["tx_key", "tx_blob", "tx_metadata", "multisig_txset", "unsigned_txset"] {
++        ensure!(response.get(field).and_then(Value::as_str) == Some(""),
++            "unexpected signing artifacts in relay response");
++    }
++    let txid = string(response, "tx_hash").context("missing relay transaction hash")?;
++    ensure!(canonical_hash(&txid), "invalid relay transaction hash");
++    ensure!(amount.checked_add(XmzAmount::from_atoms(fee)).is_some(), "relay debit overflow");
++    Ok(RelayedTransfer { txid, fee: XmzAmount::from_atoms(fee), weight })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn address() -> XmzAddress {
++        XmzAddress::parse(swap_core::xmz_address::XmzNetwork::Mainnet,
++            "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H")
++            .expect("fixture address")
++    }
++
++    #[test]
++    fn relay_params_always_disable_signing_artifact_export_and_never_omit_relay_flag() {
++        let request = RelayRequest { wallet: address(), destination: address(),
++            amount: XmzAmount::from_atoms(200000000001), account: 2, priority: 3 };
++        let params = relay_params(&request);
++        assert_eq!(params["do_not_relay"], json!(false));
++        for field in ["get_tx_key", "get_tx_hex", "get_tx_metadata"] {
++            assert_eq!(params[field], json!(false));
++        }
++        assert_eq!(params["destinations"][0]["amount"], json!(200000000001u64));
++        assert_eq!(params["destinations"][0]["address"], json!(request.destination.to_string()));
++        assert_eq!(params["account_index"], json!(2));
++        assert_eq!(params["priority"], json!(3));
++        assert_eq!(params["unlock_time"], json!(0));
++        assert_eq!(params["subtract_fee_from_outputs"], json!([]));
++    }
++
++    fn response() -> Value {
++        json!({"amount":200000000000u64,"fee":250000000u64,"weight":2000,
++            "tx_hash":"a".repeat(64),"tx_key":"","tx_blob":"","tx_metadata":"",
++            "multisig_txset":"","unsigned_txset":""})
++    }
++
++    #[test]
++    fn extracts_txid_fee_and_weight_from_a_valid_relay_response() -> Result<()> {
++        let relayed = parse_relay(&response(), XmzAmount::from_atoms(200000000000))?;
++        assert_eq!(relayed.txid, "a".repeat(64));
++        assert_eq!(relayed.fee.atoms(), 250000000);
++        assert_eq!(relayed.weight, 2000);
++        Ok(())
++    }
++
++    #[test]
++    fn rejects_bad_relay_evidence() {
++        let amount = XmzAmount::from_atoms(200000000000);
++        for (field, value) in [
++            ("amount", json!(1)), ("fee", json!(0)), ("fee", json!("250000000")),
++            ("fee", json!(-1)), ("fee", json!(u64::MAX)), ("weight", json!(0)),
++            ("weight", json!(true)), ("tx_hash", json!("")), ("tx_hash", json!("short")),
++            ("tx_hash", json!("g".repeat(64))), ("tx_hash", json!("A".repeat(64))),
++            ("tx_key", json!("leaked")), ("tx_blob", json!("leaked")),
++            ("tx_metadata", json!("leaked")), ("multisig_txset", json!("leaked")),
++            ("unsigned_txset", json!("leaked")),
++        ] {
++            let mut candidate = response();
++            candidate[field] = value;
++            assert!(parse_relay(&candidate, amount).is_err());
++        }
++        let mut missing = response();
++        missing.as_object_mut().unwrap().remove("tx_hash");
++        assert!(parse_relay(&missing, amount).is_err());
++    }
++}
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index c2b97fd..f305e9f 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -1,7 +1,12 @@
+-//! Experimental read-only XMZ funding observer for caller-owned loopback services.
+-//! This does not create wallets, sign, broadcast, or authorize live execution.
++//! Experimental XMZ funding/wallet-lifecycle RPC bridge for caller-owned loopback
++//! services. Observation, fee preview and wallet lifecycle here never sign or
++//! broadcast. `relay` is the sole exception: it is the only submodule capable of
++//! constructing, signing and broadcasting a real transaction, and it has no
++//! decode-from-untrusted-bytes entry point -- only swap orchestration code calls
++//! it directly. Nothing here authorizes live/mainnet execution on its own.
+ //! Credentials are required and intentionally have no Debug or serialization API.
+ pub mod fee_estimation;
++pub mod relay;
+ pub mod wallet_session;
+ use anyhow::{Context, Result, ensure};
+ use serde_json::{Value, json};

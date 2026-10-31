@@ -1,0 +1,126 @@
+diff --git a/swap-machine/src/litecoin_light/session/fees/tests.rs b/swap-machine/src/litecoin_light/session/fees/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/fees/tests.rs
+@@ -0,0 +1,45 @@
++use super::*;
++use crate::litecoin_light::session::tests::{server,reply,regtest_handshake};
++#[test]
++fn fee_decimal_conversion_is_exact_and_bounded()->Result<()> {
++    for (raw,expected) in [("0.00001",1000),("1.169e-05",1169),("1e-8",1),("1e-9",1),("0",0),("1E+0",100000000),("0.0000000100000001",2)] {
++        assert_eq!(parse_rate(raw,u64::MAX)?,Some(expected));
++    }
++    assert_eq!(parse_rate("-1",1000)?,None);
++    assert_eq!(parse_rate("184467440737.09551615",u64::MAX)?,Some(u64::MAX));
++    for raw in ["-2","-0","null","true","\"0.00001\"","[]","184467440737.09551616","1e100","1e-1001"] {
++        assert!(parse_rate(raw,u64::MAX).is_err(),"{raw}");
++    }
++    assert!(parse_rate("0.00001001",1000).is_err());Ok(())
++}
++#[tokio::test]
++async fn fee_query_preserves_unavailable_and_poisoning_semantics()->Result<()> {
++    for response in [json!(0.00001),json!(-1),json!(-2),json!("0.00001"),json!(1)] {
++        let mut responses=regtest_handshake();responses.push(reply(3,response.clone()));
++        let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++        assert!(session.reported_fee_rate(0,1000).await.is_err());assert!(session.usable);
++        let outcome=session.reported_fee_rate(6,1000).await;
++        if response==json!(0.00001) {let rate=outcome?.unwrap();assert_eq!(rate.target_blocks(),6);assert_eq!(rate.atomic_per_kvb(),1000);assert!(session.usable);}
++        else if response==json!(-1) {assert!(outcome?.is_none());assert!(session.usable);}
++        else {assert!(outcome.is_err());assert!(!session.usable);}
++        drop(session);let requests=task.await?;assert_eq!(requests.len(),3);
++        assert_eq!(requests[2]["method"],"blockchain.estimatefee");assert_eq!(requests[2]["params"],json!([6]));
++    }Ok(())
++}
++#[cfg(target_os="linux")]
++#[test]
++fn fee_size_bound_covers_actual_p2wpkh_signatures()->Result<()> {
++    use crate::litecoin_light::{account::Branch,vault::SecretSeed};
++    use bitcoin::{absolute,transaction,OutPoint,Txid,TxIn,TxOut,ScriptBuf,Sequence,hashes::Hash};
++    let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([42;32]));let account=seed.public_account(LtcNetwork::Regtest,0)?;
++    let prevout=TxOut {value:Amount::from_sat(100000),script_pubkey:account.derive(Branch::Receive,0)?.address().script_pubkey().clone()};
++    let tx=Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
++        input:(0..2).map(|vout|TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([1;32]),vout},script_sig:ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new()}).collect(),
++        output:vec![TxOut {value:Amount::from_sat(199000),script_pubkey:prevout.script_pubkey.clone()}]};
++    let rate=ReportedFeeRate {target:6,atomic_per_kvb:1001};let (size,fee)=rate.p2wpkh_fee(&tx,Amount::from_sat(10000))?;
++    let mut signed=tx.clone();
++    for index in 0..2 {signed.input[index].witness=seed.sign_p2wpkh_input(&account,Branch::Receive,0,&tx,index,&prevout)?;}
++    assert!(size>=signed.vsize() as u64);assert_eq!(fee.to_sat(),(size*1001).div_ceil(1000));
++    assert!(rate.p2wpkh_fee(&tx,Amount::from_sat(fee.to_sat()-1)).is_err());
++    assert!(rate.p2wpkh_fee(&signed,Amount::from_sat(10000)).is_err());Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/session/fees.rs b/swap-machine/src/litecoin_light/session/fees.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/fees.rs
+@@ -0,0 +1,62 @@
++//! Untrusted server fee estimates, never approval or a confirmation guarantee.
++//! Electrum reports coin units per kilobyte; retain a rounded-up atomic rate.
++use super::*;
++use bitcoin::{Amount,Transaction,Witness};
++
++pub struct ReportedFeeRate {target:u16,atomic_per_kvb:u64}
++impl ReportedFeeRate {
++    pub fn target_blocks(&self)->u16 {self.target}
++    pub fn atomic_per_kvb(&self)->u64 {self.atomic_per_kvb}
++    /// Conservative virtual size assuming every input is native P2WPKH with a
++    /// maximum 73-byte DER+hashtype signature and a 33-byte compressed key.
++    /// The caller must verify input types and review the resulting absolute fee.
++    /// No MWEB, legacy or arbitrary-script input estimate is supported here.
++    pub fn p2wpkh_fee(&self,unsigned:&Transaction,maximum_fee:Amount)->Result<(u64,Amount)> {
++        ensure!(!unsigned.input.is_empty() && unsigned.input.len()<=1000
++            && !unsigned.output.is_empty() && unsigned.output.len()<=1000
++            && unsigned.output.iter().all(|out|out.script_pubkey.len()<=10000)
++            && unsigned.input.iter().all(|input|!input.previous_output.is_null()
++                && input.script_sig.is_empty() && input.witness.is_empty()),"invalid Litecoin fee template");
++        let mut template=unsigned.clone();
++        for input in &mut template.input {input.witness=Witness::from_slice(&[vec![0u8;73],vec![0u8;33]]);}
++        let virtual_bytes=template.vsize() as u64;
++        let fee=(u128::from(self.atomic_per_kvb)*u128::from(virtual_bytes)).div_ceil(1000);
++        ensure!(fee<=u128::from(maximum_fee.to_sat()),"Litecoin estimated fee exceeds maximum");
++        Ok((virtual_bytes,Amount::from_sat(u64::try_from(fee)?)))
++    }
++}
++// Parse the JSON number's original decimal/exponent spelling without binary
++// floating-point amount conversion. Round fractional atomic rates upward.
++fn parse_rate(raw:&str,maximum:u64)->Result<Option<u64>> {
++    let raw=raw.trim();ensure!(raw.len()<=128,"oversized Litecoin fee rate");
++    let _:serde_json::Number=serde_json::from_str(raw)?;
++    if raw=="-1" {return Ok(None)}
++    ensure!(!raw.starts_with('-'),"negative Litecoin fee rate");
++    let (mantissa,exponent)=if let Some(index)=raw.find(['e','E']) {
++        (&raw[..index],raw[index+1..].parse::<i32>()?)
++    } else {(raw,0)};
++    ensure!((-1000..=1000).contains(&exponent),"Litecoin fee exponent exceeds limit");
++    let decimals=mantissa.split_once('.').map(|(_,fraction)|fraction.len()).unwrap_or(0);
++    let digits=mantissa.replace('.', "");ensure!(digits.len()<=38,"Litecoin fee precision exceeds limit");
++    let value=digits.parse::<u128>()?;let shift=8+exponent-decimals as i32;
++    let atomic=if value==0 {0} else if shift>=0 {
++        value.checked_mul(10u128.checked_pow(shift as u32).context("Litecoin fee scale overflow")?)
++            .context("Litecoin fee rate overflow")?
++    } else if shift<=-39 {1} else {value.div_ceil(10u128.pow((-shift) as u32))};
++    ensure!(atomic<=u128::from(maximum),"Litecoin reported fee rate exceeds maximum");
++    Ok(Some(u64::try_from(atomic)?))
++}
++impl<S:AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
++    /// Explicit target and caller rate ceiling; no default fee if unavailable.
++    pub async fn reported_fee_rate(&mut self,target:u16,maximum_atomic_per_kvb:u64)->Result<Option<ReportedFeeRate>> {
++        ensure!((1..=1008).contains(&target) && maximum_atomic_per_kvb>0,"invalid Litecoin fee request policy");
++        let outcome=async {
++            let (_,bytes)=self.exchange("blockchain.estimatefee",json!([target]),512).await?;
++            let raw:Box<RawValue>=result(&bytes)?;
++            Ok(parse_rate(raw.get(),maximum_atomic_per_kvb)?.map(|atomic_per_kvb|ReportedFeeRate {target,atomic_per_kvb}))
++        }.await;
++        if outcome.is_err() {self.usable=false;}outcome
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -194,3 +194,5 @@
+ pub mod wallet;
+ 
+ pub mod unspent;
++
++pub mod fees;

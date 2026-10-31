@@ -70,6 +70,7 @@ public slots:
             QDir(m_accountsDir.path()).filePath(QStringLiteral("Monero/wallets")));
         engine->rootContext()->setContextProperty(QStringLiteral("defaultAccountName"), QStringLiteral("qml-test-wallet"));
         engine->rootContext()->setContextProperty(QStringLiteral("isAndroid"), false);
+        engine->rootContext()->setContextProperty(QStringLiteral("miningEnabled"), true);
         engine->rootContext()->setContextProperty(QStringLiteral("isIOS"), false);
         engine->rootContext()->setContextProperty(QStringLiteral("isLinux"), false);
         engine->rootContext()->setContextProperty(QStringLiteral("isMac"), false);

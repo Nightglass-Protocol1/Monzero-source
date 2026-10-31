@@ -1,0 +1,109 @@
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -1136,11 +1136,11 @@
+         } else {None};
+         let path=submission.as_ref().map_or(path,|(_,config)|config.cancel_config_file.as_path());
+         let (_wrapper_lease,bytes)=private_bytes(path)?;
+-        let wrapper: FundingConfig=serde_json::from_slice(&bytes)?;
+-        ensure!(wrapper.schema=="monzero-private-bch-cancel-v1"
+-            && wrapper.admission_config_file.is_absolute(),"invalid cancellation configuration");
++        let wrapper=native_observer::cancel_config(&bytes)?;
+         let deployment=parse_digest(&wrapper.deployment_commitment)?;
+         let (_config_lease,config)=load(&wrapper.admission_config_file)?;
++        ensure!(wrapper.bch_observer_kind.is_none() || matches!(config.role,Role::NativeFunder),
++            "owned cancellation helper currently requires native funder");
+         let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
+         let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
+             &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
+@@ -1155,12 +1155,12 @@
+         if let Some((_,submission))=&submission {
+             if let Some(approved)=approved {ensure!(approved==review.commitment,"cancellation approval changed");}
+             let (_rpc_lease,bytes)=private_bytes(&submission.rpc_file)?;
+-            let rpc: FundingRpc=serde_json::from_slice(&bytes)?;
+-            let (_cookie_lease,cookie)=private_file(&rpc.cookie_file,true)?;
++            let rpc=native_observer::Descriptor::parse(wrapper.bch_observer_kind,&bytes)?;
++            let (_cookie_lease,cookie)=private_file(rpc.cookie_file(),true)?;
+             let backend=rpc.backend(&cookie)?;
+             ensure!(backend.deployment_commitment()?==deployment,"cancellation RPC deployment changed");
+             if action=="observe" {
+-                let observed=execution.observe_bch_cancel(&backend,None).await?;
++                let observed=backend.observe_cancellation(&execution,now).await?;
+                 let confirmed=observed.confirmation();
+                 let observed_at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                 observation=serde_json::json!({"state":"confirmed","txid":confirmed.transaction().compute_txid().to_string(),
+@@ -1169,7 +1169,7 @@
+                     "observedAt":observed_at.to_string()});
+             } else {
+                 let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+-                execution.relay_bch_cancel(&backend,&approved.context("missing cancellation approval")?,dispatch).await?;
++                backend.relay_cancellation(&mut execution,&approved.context("missing cancellation approval")?,dispatch).await?;
+             }
+         }
+         let (state,txid)=match execution.bch_cancel_relay_state()? {
+--- a/swap-machine/src/bin/native-bch-admission/native_observer.rs
++++ b/swap-machine/src/bin/native-bch-admission/native_observer.rs
+@@ -44,9 +44,64 @@
+         }
+     }
+ }
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++pub(super) struct CancelConfig {
++    schema:String,pub(super) admission_config_file:PathBuf,pub(super) deployment_commitment:String,
++    #[serde(default,deserialize_with="required_kind")]
++    pub(super) bch_observer_kind:Option<Kind>,
++}
++pub(super) fn cancel_config(bytes:&[u8])->Result<CancelConfig> {
++    let config:CancelConfig=serde_json::from_slice(bytes)?;
++    let valid=match config.schema.as_str() {
++        "monzero-private-bch-cancel-v1"=>config.bch_observer_kind.is_none(),
++        "monzero-private-bch-cancel-v2"=>config.bch_observer_kind==Some(Kind::OwnedNode),
++        _=>false,
++    };
++    ensure!(valid && config.admission_config_file.is_absolute(),"invalid cancellation configuration");
++    parse_digest(&config.deployment_commitment)?;Ok(config)
++}
++impl Backend {
++    pub(super) async fn observe_cancellation(&self,execution:&AdmittedExecution<'_>,now:u64)
++        ->Result<swap_machine::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::recovery::cancel::observation::ConfirmedCancellation> {
++        match self {
++            Self::Node(bch)=>execution.observe_bch_cancel(bch,None).await,
++            Self::Owned(bch)=>execution.observe_light_bch_cancel(bch,None,now).await,
++        }
++    }
++    pub(super) async fn relay_cancellation(&self,execution:&mut AdmittedExecution<'_>,approved:&[u8;32],now:u64)
++        ->Result<bitcoin::Txid> {
++        match self {
++            Self::Node(bch)=>execution.relay_bch_cancel(bch,approved,now).await,
++            Self::Owned(bch)=>{
++                let relay=swap_machine::bch_rpc::contract_relay::OwnedBchContractRelay::new(bch);
++                execution.relay_light_bch_cancel(&relay,approved,now).await
++            },
++        }
++    }
++}
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[test]
++    fn cancellation_config_requires_explicit_versioned_kind()->Result<()> {
++        let base=serde_json::json!({"schema":"monzero-private-bch-cancel-v1",
++            "admissionConfigFile":"/private/admission","deploymentCommitment":"ab".repeat(32)});
++        assert!(cancel_config(&serde_json::to_vec(&base)?).is_ok());
++        for (version,kind,valid) in [("v1",Some(serde_json::json!("owned-node")),false),("v1",Some(serde_json::Value::Null),false),
++            ("v2",None,false),("v2",Some(serde_json::Value::Null),false),("v2",Some(serde_json::json!("owned-node")),true),
++            ("v2",Some(serde_json::json!("node-wallet")),false),("v3",Some(serde_json::json!("owned-node")),false)] {
++            let mut value=base.clone();value["schema"]=serde_json::json!(format!("monzero-private-bch-cancel-{version}"));
++            if let Some(kind)=kind {value["bchObserverKind"]=kind;}
++            assert_eq!(cancel_config(&serde_json::to_vec(&value)?).is_ok(),valid);
++        }
++        let mut value=base.clone();value["admissionConfigFile"]="relative".into();
++        assert!(cancel_config(&serde_json::to_vec(&value)?).is_err());
++        let mut value=base.clone();value["deploymentCommitment"]="invalid".into();
++        assert!(cancel_config(&serde_json::to_vec(&value)?).is_err());
++        let mut value=base;value["unexpected"]=true.into();
++        assert!(cancel_config(&serde_json::to_vec(&value)?).is_err());Ok(())
++    }
+     #[test]
+     fn config_requires_explicit_versioned_observer_kind()->Result<()> {
+         let base=serde_json::json!({"schema":"monzero-private-bch-native-preparation-v1",

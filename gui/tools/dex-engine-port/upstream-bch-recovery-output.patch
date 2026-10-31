@@ -1,0 +1,244 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel/observation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel/observation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel/observation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/cancel/observation.rs
+@@ -34,3 +34,19 @@
+             review:review.commitment,confirmation})
+     }
+ }
++
++/// Both records are fresh within one stable BCH tip. Neither grants refund release.
++pub struct ConfirmedRecoveryOutput {
++    cancellation: ConfirmedCancellation,output: crate::bch_rpc::unspent::ConfirmedUnspentOutput,
++}
++impl ConfirmedRecoveryOutput {
++    pub fn cancellation(&self) -> &ConfirmedCancellation {&self.cancellation}
++    pub fn output(&self) -> &crate::bch_rpc::unspent::ConfirmedUnspentOutput {&self.output}
++}
++impl AdmittedExecution<'_> {
++    pub async fn observe_bch_recovery_output(&self,bch: &BchRpc,block: Option<BlockHash>) -> Result<ConfirmedRecoveryOutput> {
++        let cancellation=self.observe_bch_cancel(bch,block).await?;
++        let output=bch.confirmed_unspent_output(cancellation.confirmation(),0).await?;
++        Ok(ConfirmedRecoveryOutput {cancellation,output})
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/cancel.rs
+@@ -53,6 +53,18 @@
+         assert_eq!(observed.quote(),setup.quote.commitment());assert_eq!(observed.review(),&review.commitment);
+         assert_eq!(observed.confirmation().transaction(),cancel);assert_eq!(observed.confirmation().confirmations(),3);
+         assert_eq!(restored.observe_bch_cancel(rpc,None).await?.confirmation().transaction(),cancel);
++        let recovery_output=restored.observe_bch_recovery_output(rpc,block).await?;
++        assert_eq!(recovery_output.output().outpoint(),bitcoin::OutPoint {txid,vout:0});
++        assert_eq!(recovery_output.output().output(),&cancel.output[0]);
++        recovery_output.output().require_refund_window(2,30,5)?;
++        assert!(recovery_output.output().require_punish_maturity(2,30).is_err());
++        if mode==0 {
++            server.state.lock().unwrap().recovery_output_spent=true;
++            let spent=restored.observe_bch_recovery_output(rpc,block).await;
++            server.state.lock().unwrap().recovery_output_spent=false;
++            assert!(spent.is_err());
++        }
++
+         assert_eq!(restored.bch_cancel_relay_state()?,Some(expected));
+         assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls+1);
+         if mode==0 {
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks.rs
+@@ -7,7 +7,7 @@
+     sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}}};
+ 
+ #[derive(Default)]
+-struct State { cancel: Option<Transaction>,cancel_relay_calls: usize,redemption_confirmation_mode: u8, redemption: Option<Transaction>, redemption_relay_calls: usize, locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8,
++struct State { recovery_output_spent: bool,cancel: Option<Transaction>,cancel_relay_calls: usize,redemption_confirmation_mode: u8, redemption: Option<Transaction>, redemption_relay_calls: usize, locked: bool, calls: usize, ambiguous: bool, ignore: bool, malformed: u8,
+     sign_calls: usize, sign_mode: u8, signed_candidate: Vec<u8>, sign_intent: Option<std::path::PathBuf>, observed: Option<Transaction>, observed_vout: u32,
+     observation_mode: u8, observation_chain_calls: usize, relay_mode: u8, relay_calls: usize, relay_intent: Option<std::path::PathBuf> }
+ struct Server {
+@@ -87,6 +87,15 @@
+                     },
+                     "getwalletinfo" => json!({"walletname":"test","private_keys_enabled":true}),
+                     "getaddressinfo" => json!({"ismine":true,"iswatchonly":false,"scriptPubKey":script.to_hex_string()}),
++                    "gettxout" if state.cancel.as_ref().is_some_and(|tx|request["params"][0]==tx.compute_txid().to_string()) => {
++                        let cancel=state.cancel.as_ref().unwrap();
++                        ensure!(request["params"]==json!([cancel.compute_txid(),0,true]),"wrong recovery output lookup");
++                        ensure!(cancel.output[0].value.to_sat()==99000,"unexpected recovery fixture amount");
++                        if state.recovery_output_spent {Value::Null} else {
++                            json!({"bestblock":"08".repeat(32),"confirmations":3,"value":0.00099,"coinbase":false,
++                                "scriptPubKey":{"hex":cancel.output[0].script_pubkey.to_hex_string(),"addresses":[]}})
++                        }
++                    },
+                     "gettxout" if state.observed.as_ref().is_some_and(|tx| request["params"][0]==tx.compute_txid().to_string()) => {
+                         observation::output(&request,&state)?
+                     },
+diff --git a/swap-machine/src/bch_rpc/unspent/tests.rs b/swap-machine/src/bch_rpc/unspent/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/unspent/tests.rs
+@@ -0,0 +1,100 @@
++use super::*;
++use bitcoin::{Amount,Transaction,TxIn,Txid,Sequence,Witness,absolute,transaction,consensus::encode::serialize_hex};
++use std::{io::{BufRead,BufReader,Read,Write},net::TcpListener,time::{Duration,Instant}};
++
++#[test]
++fn bch_recovery_output_enforces_refund_and_punishment_boundaries() {
++    let evidence=|confirmations|ConfirmedUnspentOutput {deployment:[1;32],outpoint:OutPoint::null(),tip:BlockHash::all_zeros(),
++        confirmations,output:TxOut {value:Amount::from_sat(10000),script_pubkey:ScriptBuf::new()}};
++    for depth in [2,3,24] {assert!(evidence(depth).require_refund_window(2,30,5).is_ok());}
++    for depth in [0,1,25,29,30,31,u64::MAX] {assert!(evidence(depth).require_refund_window(2,30,5).is_err());}
++    for depth in [0,1,29] {assert!(evidence(depth).require_punish_maturity(2,30).is_err());}
++    for depth in [30,31,65535] {assert!(evidence(depth).require_punish_maturity(2,30).is_ok());}
++    for (minimum,delay,margin) in [(0,30,5),(2,0,5),(2,65536,5),(2,30,0),(25,30,5),(u64::MAX,30,1)] {
++        assert!(evidence(3).require_refund_window(minimum,delay,margin).is_err());
++    }
++    for (minimum,delay) in [(0,30),(2,0),(2,65536)] {assert!(evidence(30).require_punish_maturity(minimum,delay).is_err());}
++    assert!(evidence(30).require_punish_maturity(31,30).is_err());
++}
++
++#[tokio::test]
++async fn bch_confirmed_output_rpc_rejects_spends_mismatches_and_tip_changes() -> Result<()> {
++    for mode in 0..=9 {
++        let tx=Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,
++            input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([1;32]),vout:0},script_sig:ScriptBuf::new(),
++                sequence:Sequence::ZERO,witness:Witness::new()}],
++            output:vec![TxOut {value:Amount::from_sat(10000),script_pubkey:ScriptBuf::from_bytes(vec![0x51])}]};
++        let txid=tx.compute_txid();let block=BlockHash::from_byte_array([7;32]);let tip=BlockHash::from_byte_array([8;32]);
++        let checkpoint=BlockHash::from_byte_array([4;32]);let network=BchNetwork::Regtest {checkpoint_height:1,checkpoint};
++        let listener=TcpListener::bind("127.0.0.1:0")?;listener.set_nonblocking(true)?;let port=listener.local_addr()?.port();
++        let server=std::thread::spawn(move || -> Result<()> {
++            let mut methods=vec!["getnetworkinfo","getblockchaininfo","getblockhash","getblockhash","getrawtransaction","getblockheader",
++                "getnetworkinfo","getblockchaininfo","getblockhash","getblockhash",
++                "getnetworkinfo","getblockchaininfo","getblockhash","getblockhash","gettxout",
++                "getnetworkinfo","getblockchaininfo","getblockhash","getblockhash"];
++            if (1..=7).contains(&mode) {methods.truncate(15);} else if mode==8 {methods.truncate(14);}
++            for (i,method) in methods.iter().enumerate() {
++                let deadline=Instant::now()+Duration::from_secs(10);
++                let (mut socket,_)=loop {
++                    match listener.accept() {
++                        Ok(pair)=>break pair,
++                        Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{
++                            ensure!(Instant::now()<deadline,"missing expected BCH output RPC");std::thread::sleep(Duration::from_millis(1));
++                        },
++                        Err(e)=>return Err(e.into()),
++                    }
++                };
++                socket.set_read_timeout(Some(Duration::from_secs(10)))?;
++                let mut reader=BufReader::new(socket.try_clone()?);let mut line=String::new();let mut length=None;
++                loop {
++                    line.clear();ensure!(reader.read_line(&mut line)?>0,"missing BCH output fixture headers");
++                    if line=="\r\n" {break;}
++                    if let Some(value)=line.to_ascii_lowercase().strip_prefix("content-length:") {length=Some(value.trim().parse::<usize>()?);}
++                }
++                let length=length.context("missing BCH output request length")?;ensure!(length<4096,"oversized BCH output test request");
++                let mut bytes=vec![0;length];reader.read_exact(&mut bytes)?;let request:Value=serde_json::from_slice(&bytes)?;
++                ensure!(request["method"]==*method,"unexpected BCH output observation RPC order");
++                let result=match *method {
++                    "getnetworkinfo"=>json!({"subversion":"/Bitcoin Cash Node:29.0.0/","networkactive":true}),
++                    "getblockchaininfo"=>json!({"chain":"regtest","blocks":102,"headers":102,"initialblockdownload":false,
++                        "bestblockhash":if (mode==8 && i==11)||(mode==9 && i==16) {BlockHash::from_byte_array([9;32])} else {tip}}),
++                    "getblockhash"=>if request["params"]==json!([0]) {json!(network.genesis())}
++                        else {ensure!(request["params"]==json!([1]),"wrong BCH checkpoint");json!(checkpoint)},
++                    "getrawtransaction"=>{
++                        ensure!(request["params"]==json!([txid,true,block]),"wrong BCH parent lookup");
++                        json!({"in_active_chain":true,"hex":serialize_hex(&tx),"txid":txid,"blockhash":block,"confirmations":3})
++                    },
++                    "getblockheader"=>{ensure!(request["params"]==json!([block,true]),"wrong parent block");json!({"hash":block,"height":100,"confirmations":3})},
++                    _=>{
++                        ensure!(request["params"]==json!([txid,0,true]),"output lookup omitted mempool spends or changed outpoint");
++                        if mode==1 {Value::Null} else {
++                            let mut output=json!({"bestblock":tip,"confirmations":3,"value":0.0001,"coinbase":false,
++                                "scriptPubKey":{"hex":"51","addresses":[]}});
++                            match mode {
++                                2=>output["value"]=json!(0.0002),3=>output["scriptPubKey"]["hex"]=json!("52"),
++                                4=>output["coinbase"]=json!(true),5=>output["tokenData"]=json!({"category":"01".repeat(32)}),
++                                6=>output["bestblock"]=json!(BlockHash::from_byte_array([9;32])),7=>output["confirmations"]=json!(2),_=>(),
++                            }
++                            output
++                        }
++                    },
++                };
++                let body=serde_json::to_vec(&json!({"id":request["id"],"error":null,"result":result}))?;
++                write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;socket.write_all(&body)?;
++            }
++            Ok(())
++        });
++        let rpc=BchRpc::new(port,"fixture".into(),"fixture".into(),network,"fixture".into(),"bchreg:qanchor".into(),
++            ScriptBuf::from_bytes(vec![0x51]),"/Bitcoin Cash Node:29.0.0/".into())?;
++        let parent=rpc.confirmed_transaction(txid,block,3).await?;
++        assert!(rpc.confirmed_unspent_output(&parent,1).await.is_err());
++        let result=rpc.confirmed_unspent_output(&parent,0).await;
++        server.join().unwrap()?;
++        if mode==0 {
++            let output=result?;assert_eq!(output.outpoint(),OutPoint {txid,vout:0});assert_eq!(output.confirmations(),3);
++            assert_eq!(output.output(),&parent.transaction().output[0]);assert_eq!(output.tip(),parent.tip());
++            assert_eq!(output.deployment(),parent.deployment());output.require_refund_window(2,30,5)?;
++        } else {assert!(result.is_err(),"accepted invalid recovery output mode {mode}");}
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_rpc/unspent.rs b/swap-machine/src/bch_rpc/unspent.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/unspent.rs
+@@ -0,0 +1,52 @@
++//! Fresh exact-output evidence, including mempool spends, under the same tip
++//! as the independently verified parent transaction. No spending authority.
++use super::*;
++use super::confirmed::ConfirmedTransaction;
++use bitcoin::OutPoint;
++
++pub struct ConfirmedUnspentOutput {deployment: [u8;32],outpoint: OutPoint,tip: BlockHash,confirmations: u64,output: TxOut}
++impl ConfirmedUnspentOutput {
++    pub fn deployment(&self) -> &[u8;32] {&self.deployment}
++    pub fn outpoint(&self) -> OutPoint {self.outpoint}
++    pub fn tip(&self) -> BlockHash {self.tip}
++    pub fn confirmations(&self) -> u64 {self.confirmations}
++    pub fn output(&self) -> &TxOut {&self.output}
++    pub fn require_refund_window(&self,minimum: u64,punish_blocks: u32,safety_blocks: u32) -> Result<()> {
++        ensure!(minimum>0 && safety_blocks>0 && (1..=0xffff).contains(&punish_blocks)
++            && minimum.checked_add(u64::from(safety_blocks)).is_some_and(|v|v<u64::from(punish_blocks)),"invalid BCH refund safety policy");
++        ensure!(self.confirmations>=minimum && self.confirmations.checked_add(u64::from(safety_blocks))
++            .is_some_and(|v|v<u64::from(punish_blocks)),"BCH refund output is shallow or too close to punishment");
++        Ok(())
++    }
++    pub fn require_punish_maturity(&self,minimum: u64,punish_blocks: u32) -> Result<()> {
++        ensure!(minimum>0 && (1..=0xffff).contains(&punish_blocks),"invalid BCH punishment maturity policy");
++        ensure!(self.confirmations>=minimum && self.confirmations>=u64::from(punish_blocks),"BCH punishment is not mature");
++        Ok(())
++    }
++}
++impl BchRpc {
++    /// Reobserve after every tip change. Null includes both chain and mempool
++    /// spends; it never establishes who spent the output or a safe retry.
++    pub async fn confirmed_unspent_output(&self,parent: &ConfirmedTransaction,vout: u32) -> Result<ConfirmedUnspentOutput> {
++        ensure!(parent.deployment()==&self.deployment_commitment()?,"BCH output observer deployment changed");
++        let expected=parent.transaction().output.get(vout as usize).context("missing BCH parent output")?;
++        let chain=self.chain_state().await?;
++        ensure!(chain.bestblockhash==parent.tip() && chain.blocks.checked_sub(parent.height()).and_then(|v|v.checked_add(1))
++            ==Some(parent.confirmations()),"BCH parent confirmation is stale");
++        let outpoint=OutPoint {txid:parent.transaction().compute_txid(),vout};
++        let raw=self.rpc(false,"gettxout",json!([outpoint.txid,outpoint.vout,true])).await?;
++        let output: Option<Output>=serde_json::from_str(raw.get())?;
++        let output=output.context("BCH confirmed output is spent or unavailable")?;
++        ensure!(output.bestblock==chain.bestblockhash && output.confirmations==parent.confirmations()
++            && output.confirmations>0 && !output.coinbase && output.tokens.is_none()
++            && atoms(output.value.get())?==expected.value.to_sat()
++            && ScriptBuf::from_hex(&output.script.hex)?==expected.script_pubkey,"BCH confirmed output differs from exact parent");
++        let after=self.chain_state().await?;
++        ensure!(after.bestblockhash==chain.bestblockhash && after.blocks==chain.blocks,"BCH tip changed during output observation");
++        Ok(ConfirmedUnspentOutput {deployment:*parent.deployment(),outpoint,tip:chain.bestblockhash,
++            confirmations:output.confirmations,output:expected.clone()})
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/bch_rpc.rs b/swap-machine/src/bch_rpc.rs
+--- a/swap-machine/src/bch_rpc.rs
++++ b/swap-machine/src/bch_rpc.rs
+@@ -184,3 +184,5 @@
+ mod tests;
+ 
+ pub mod confirmed;
++
++pub mod unspent;

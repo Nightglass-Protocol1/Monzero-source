@@ -1,0 +1,145 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message.rs
+@@ -210,6 +210,16 @@
+     /// every later relay/release must independently recheck the chain window.
+     pub async fn check_bch_lock_for_native_funding(&self,backend: &BchRpc,now: u64,safety_blocks: u32)
+         -> Result<NativeFundingLockCheck> {
++        let (deadline,destination,amount,maximum_fee)=self.native_funding_lock_terms(now)?;
++        let observation = self.observe_received_bch_funding(backend).await?;
++        observation.require_funding_window(u64::from(self.policy.bch_confirmations),
++            u32::from(self.policy.cancel_blocks),safety_blocks)?;
++        ensure!(std::time::Instant::now() < deadline,"BCH quote expired during native funding check");
++        Ok(NativeFundingLockCheck {observation,destination,amount,maximum_fee})
++    }
++
++    // Shared authenticated payment terms for node-wallet and walletless reads.
++    fn native_funding_lock_terms(&self,now:u64)->Result<(std::time::Instant,XmzAddress,u64,u64)> {
+         let started = std::time::Instant::now();
+         ensure!(self.role == Role::NativeFunder,"wrong native funding role");
+         let agreed = self.message_context(now)?;
+@@ -222,11 +232,7 @@
+         agreed.check_native_funding(self.quote,self.policy,now,&destination,amount,maximum_fee)?;
+         let (receipt,_,_) = self.message_record("message-received")?.context("missing BCH funding receipt")?;
+         ensure!(now >= receipt.at,"native funding check predates BCH funding receipt");
+-        let observation = self.observe_received_bch_funding(backend).await?;
+-        observation.require_funding_window(u64::from(self.policy.bch_confirmations),
+-            u32::from(self.policy.cancel_blocks),safety_blocks)?;
+-        ensure!(std::time::Instant::now() < deadline,"BCH quote expired during native funding check");
+-        Ok(NativeFundingLockCheck {observation,destination,amount,maximum_fee})
++        Ok((deadline,destination,amount,maximum_fee))
+     }
+ 
+     pub async fn observe_received_bch_funding(&self,backend: &BchRpc) -> Result<FundingObservation> {
+@@ -238,3 +244,5 @@
+ }
+ 
+ pub mod approval;
++
++pub mod walletless;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message/walletless.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message/walletless.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message/walletless.rs
+@@ -0,0 +1,38 @@
++//! Native payer's read-only BCH preflight through an authenticated owned node.
++//! No BCH wallet access, native wallet construction, consent or relay authority.
++use super::*;
++use crate::bch_rpc::{observer::OwnedBchObserver,observation::BoundFundingObservation};
++
++pub struct LightNativeFundingLockCheck {
++    observation:BoundFundingObservation,destination:XmzAddress,amount:u64,maximum_fee:u64,
++}
++impl LightNativeFundingLockCheck {
++    pub fn observation(&self)->&BoundFundingObservation {&self.observation}
++    pub fn destination(&self)->&XmzAddress {&self.destination}
++    pub fn amount_atoms(&self)->u64 {self.amount}
++    pub fn maximum_fee_atoms(&self)->u64 {self.maximum_fee}
++}
++impl AdmittedExecution<'_> {
++    /// Historical authenticated funding observation. No quote renewal and no
++    /// inference that an unobserved transaction was never sent.
++    pub async fn observe_received_light_bch_funding(&self,observer:&OwnedBchObserver)->Result<BoundFundingObservation> {
++        ensure!(observer.network().quote_name()==self.quote.terms()["bchNetwork"]
++            && observer.network().genesis()==self.quote.terms()["bchGenesis"],"BCH peer funding observer has another network");
++        let message=self.received_bch_funding_message()?.context("missing authenticated BCH funding receipt")?;
++        observer.observe_funding(message.signed()).await
++    }
++    /// Fresh payment preflight only. The caller authenticates the owned process;
++    /// this is trusted local RPC, not public SPV consensus verification.
++    pub async fn check_light_bch_lock_for_native_funding(&self,observer:&OwnedBchObserver,now:u64,safety_blocks:u32)
++        ->Result<LightNativeFundingLockCheck> {
++        let (deadline,destination,amount,maximum_fee)=self.native_funding_lock_terms(now)?;
++        ensure!(safety_blocks>0 && u64::from(self.policy.bch_confirmations)+u64::from(safety_blocks)
++            < u64::from(self.policy.cancel_blocks),"invalid BCH native preparation safety margin");
++        let deployment=observer.deployment_commitment()?;
++        let observation=self.observe_received_light_bch_funding(observer).await?;
++        observation.for_deployment(&deployment)?.require_funding_window(u64::from(self.policy.bch_confirmations),
++            u32::from(self.policy.cancel_blocks),safety_blocks)?;
++        ensure!(std::time::Instant::now()<deadline,"BCH quote expired during native funding check");
++        Ok(LightNativeFundingLockCheck {observation,destination,amount,maximum_fee})
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message.rs
+@@ -1,6 +1,7 @@
+ use super::*;
+ use agreement::execution::funding::message;
+ mod native;
++mod walletless;
+ 
+ pub(super) async fn exercise(sender: &mut AdmittedExecution<'_>,setup: &Setup,snapshots: &PrivateStore,
+     rpc: &BchRpc,server: &Server,txid: Txid) -> Result<()> {
+@@ -69,6 +70,7 @@
+         assert!(native.check_bch_lock_for_native_funding(rpc,1023,5).await.is_err(),"unsafe funding window {mode}");
+     }
+     server.state.lock().unwrap().observation_mode = 0;
++    walletless::exercise(sender,&native,setup,&metadata,snapshots,rpc,server,txid).await?;
+     native::exercise(sender,&mut native,setup,&metadata,snapshots,rpc,server).await?;
+     drop(native);
+     let native = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/walletless.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/walletless.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/walletless.rs
+@@ -0,0 +1,39 @@
++use super::*;
++use crate::bch_rpc::{observer::OwnedBchObserver,observation::FundingStatus};
++fn hashes(path:&std::path::Path)->Result<std::collections::BTreeMap<std::ffi::OsString,bitcoin::hashes::sha256::Hash>> {
++    let mut result=std::collections::BTreeMap::new();
++    for entry in std::fs::read_dir(path)? {
++        let entry=entry?;ensure!(entry.file_type()?.is_file(),"unexpected non-file journal entry");
++        result.insert(entry.file_name(),bitcoin::hashes::sha256::Hash::hash(&std::fs::read(entry.path())?));
++    }
++    Ok(result)
++}
++pub(super) async fn exercise(sender:&AdmittedExecution<'_>,native:&AdmittedExecution<'_>,setup:&Setup,
++    metadata:&PrivateStore,snapshots:&PrivateStore,rpc:&BchRpc,server:&Server,txid:Txid)->Result<()> {
++    let observer=OwnedBchObserver::new(server.port,"user".into(),"pass".into(),rpc.network(),"/Bitcoin Cash Node:29.0.0/".into())?;
++    let public=hashes(&metadata.0)?;let private=hashes(&snapshots.0)?;
++    let deployment=observer.deployment_commitment()?;
++    let seen=native.observe_received_light_bch_funding(&observer).await?;
++    assert_eq!(seen.for_deployment(&deployment)?.status(),FundingStatus::ConfirmedUnspent {confirmations:3});
++    assert!(seen.for_deployment(&rpc.deployment_commitment()?).is_err());
++    let checked=native.check_light_bch_lock_for_native_funding(&observer,1023,5).await?;
++    assert_eq!(checked.observation().for_deployment(&deployment)?.txid(),txid);
++    assert_eq!(checked.amount_atoms(),101_000);assert_eq!(checked.maximum_fee_atoms(),1000);
++    assert_eq!(checked.destination(),native.restore_agreement()?.owned().wallet().address());
++    assert!(sender.check_light_bch_lock_for_native_funding(&observer,1023,5).await.is_err());
++    assert!(sender.observe_received_light_bch_funding(&observer).await.is_err());
++    for at in [1021,2000] {assert!(native.check_light_bch_lock_for_native_funding(&observer,at,5).await.is_err());}
++    for margin in [0,u32::from(setup.policy.cancel_blocks),u32::MAX] {
++        assert!(native.check_light_bch_lock_for_native_funding(&observer,1023,margin).await.is_err());
++    }
++    let other=OwnedBchObserver::new(server.port,"user".into(),"pass".into(),crate::bch_rpc::BchNetwork::Mainnet,
++        "/Bitcoin Cash Node:29.0.0/".into())?;
++    assert!(native.observe_received_light_bch_funding(&other).await.is_err());
++    assert!(native.check_light_bch_lock_for_native_funding(&other,1023,5).await.is_err());
++    for mode in [1,2,3,11,21,22] {
++        {let mut state=server.state.lock().unwrap();state.observation_mode=mode;state.observation_chain_calls=0;}
++        assert!(native.check_light_bch_lock_for_native_funding(&observer,1023,5).await.is_err(),"unsafe walletless funding window {mode}");
++    }
++    server.state.lock().unwrap().observation_mode=0;
++    assert_eq!(hashes(&metadata.0)?,public);assert_eq!(hashes(&snapshots.0)?,private);Ok(())
++}

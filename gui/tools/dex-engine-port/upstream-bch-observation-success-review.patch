@@ -1,0 +1,466 @@
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -542,6 +542,49 @@
+             "invalid native proof configuration");
+         Ok(config)
+     }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct SuccessReleaseReviewConfig {
++        schema: String,admission_config_file: PathBuf,deployment_commitment: String,safety_blocks: u32,
++    }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct SuccessReleaseReviewRequest {schema: String,request_id: uuid::Uuid}
++    fn success_release_review_request(bytes: &[u8]) -> Result<uuid::Uuid> {
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid success review request size");
++        let request: SuccessReleaseReviewRequest=serde_json::from_slice(bytes)?;
++        ensure!(request.schema=="monzero-bch-success-release-review-request-v1" && !request.request_id.is_nil(),
++            "invalid success review request");Ok(request.request_id)
++    }
++    fn success_release_review_config(bytes: &[u8]) -> Result<SuccessReleaseReviewConfig> {
++        let config: SuccessReleaseReviewConfig=serde_json::from_slice(bytes)?;
++        ensure!(config.schema=="monzero-private-bch-success-release-review-v1"
++            && config.admission_config_file.is_absolute() && config.safety_blocks>0,
++            "invalid success review configuration");
++        parse_digest(&config.deployment_commitment)?;Ok(config)
++    }
++    fn success_release_review_operation(path: &Path,bytes: &[u8]) -> Result<serde_json::Value> {
++        let request_id=success_release_review_request(bytes)?;
++        let (_wrapper_lease,bytes)=private_bytes(path)?;
++        let wrapper=success_release_review_config(&bytes)?;
++        let (_admission_lease,config)=load(&wrapper.admission_config_file)?;
++        ensure!(matches!(config.role,Role::BchFunder),"success review requires BCH funder");
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"success review trade changed");
++        let execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        // This offline path cannot construct or export spend-enabling bytes.
++        let review=execution.review_bch_success_release(&parse_digest(&wrapper.deployment_commitment)?,wrapper.safety_blocks,now)?;
++        Ok(serde_json::json!({"schema":"monzero-bch-success-release-review-response-v1",
++            "requestId":request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
++            "review":{"details":review.details,
++                "commitment":review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()}}))
++    }
++
+     fn native_proof_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
+         let request=native_proof_request(bytes,action)?;
+         let (_wrapper_lease,bytes)=private_bytes(path)?;
+@@ -588,6 +631,66 @@
+         Ok(serde_json::json!({"schema":format!("monzero-bch-native-proof-{action}-response-v1"),
+             "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
+             "review":review,"receipt":receipt}))
++    }
++
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct NativeObservationConfig {schema: String,admission_config_file: PathBuf,native_rpc_file: PathBuf}
++    fn native_observation_request(bytes: &[u8]) -> Result<Request> {
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid native observation request size");
++        let request: Request=serde_json::from_slice(bytes)?;
++        ensure!(request.schema=="monzero-bch-native-observation-request-v1"
++            && !request.request_id.is_nil() && request.commitment.is_none(),"invalid native observation request");
++        Ok(request)
++    }
++    fn native_observation_config(bytes: &[u8]) -> Result<NativeObservationConfig> {
++        let config: NativeObservationConfig=serde_json::from_slice(bytes)?;
++        ensure!(config.schema=="monzero-private-bch-native-observation-v1"
++            && config.admission_config_file.is_absolute() && config.native_rpc_file.is_absolute(),
++            "invalid native observation configuration");Ok(config)
++    }
++    async fn native_observation_operation(path: &Path,bytes: &[u8]) -> Result<serde_json::Value> {
++        use swap_machine::native_funding_rpc::NativeFundingRpc;
++        let request=native_observation_request(bytes)?;
++        let (_wrapper_lease,bytes)=private_bytes(path)?;
++        let wrapper=native_observation_config(&bytes)?;
++        let (_admission_lease,config)=load(&wrapper.admission_config_file)?;
++        ensure!(matches!(config.role,Role::BchFunder),"native observation requires BCH funder");
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"native observation trade changed");
++        let execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        let saved=execution.saved_bch_native_proof_review()?.context("native observation requires retained proof")?;
++        // Validate retained proof before credentials. Keep descriptor leases
++        // through the fresh observation; this operation creates no spend intent.
++        let (_native_lease,bytes)=private_bytes(&wrapper.native_rpc_file)?;
++        let native: NativePreparationRpc=serde_json::from_slice(&bytes)?;
++        ensure!(native.schema=="monzero-private-bch-native-rpc-v1" && native.daemon_port>0
++            && native.wallet_port>0 && native.daemon_port!=native.wallet_port
++            && native.login_file.is_absolute(),"invalid native observer descriptor");
++        isolated_native_preparation(native.daemon_port).await?;
++        let (_login_lease,login)=private_file(&native.login_file,true)?;
++        let text=std::str::from_utf8(&login)?;
++        let text=text.strip_suffix('\n').unwrap_or(text);
++        let (user,password)=text.split_once(':').context("invalid native observer credentials")?;
++        ensure!(!user.is_empty() && !password.is_empty() && !text.bytes().any(|b|b.is_ascii_control()),"invalid native observer login");
++        let observer=NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?;
++        let confirmation=execution.observe_bch_native_payment(&observer).await?;
++        let funding=confirmation.funding();let snapshot=funding.snapshot();
++        let depth=snapshot.tip_height.checked_sub(funding.height()).and_then(|v|v.checked_add(1))
++            .context("invalid native observation depth")?;
++        let observed=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        let review=serde_json::json!({"details":saved.review.details,
++            "commitment":saved.review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
++        Ok(serde_json::json!({"schema":"monzero-bch-native-observation-response-v1",
++            "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":true,
++            "review":review,"observation":{"state":"confirmed","txid":funding.request().proof.tx_hash.0,
++                "destination":funding.request().address.to_string(),"amountAtoms":funding.request().amount.atom_string(),
++                "genesis":snapshot.genesis,"tip":snapshot.tip_hash,"tipHeight":snapshot.tip_height.to_string(),
++                "height":funding.height().to_string(),"confirmations":depth.to_string(),"observedAt":observed.to_string()}}))
+     }
+ 
+     #[derive(Deserialize)]
+@@ -1112,7 +1215,12 @@
+             "--native-proof-context-stdio-v1"=>Some("context"),
+             _=>None,
+         };
+-        let result = if let Some(operation)=native_proof_action {
++        let result = if action=="--success-release-review-stdio-v1" {
++            success_release_review_operation(Path::new(&args[2]),&bytes)?
++        } else if action=="--native-observation-stdio-v1" {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(native_observation_operation(Path::new(&args[2]),&bytes))?
++        } else if let Some(operation)=native_proof_action {
+             native_proof_operation(Path::new(&args[2]),&bytes,operation)?
+         } else if let Some(operation)=native_relay_action {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+@@ -1161,6 +1269,29 @@
+     #[cfg(test)]
+     mod tests {
+         #[test]
++        fn success_review_cannot_accept_release_or_private_output_fields() -> anyhow::Result<()> {
++            let request=serde_json::json!({"schema":"monzero-bch-success-release-review-request-v1","requestId":uuid::Uuid::new_v4()});
++            assert!(super::success_release_review_request(&serde_json::to_vec(&request)?).is_ok());
++            for field in ["commitment","frame","signature","outputFile"] {
++                let mut invalid=request.clone();invalid[field]=serde_json::Value::Null;
++                assert!(super::success_release_review_request(&serde_json::to_vec(&invalid)?).is_err());
++            }
++            let mut invalid=request.clone();invalid["requestId"]=serde_json::json!(uuid::Uuid::nil());
++            assert!(super::success_release_review_request(&serde_json::to_vec(&invalid)?).is_err());
++            assert!(super::success_release_review_request(&vec![b' ';513]).is_err());
++            let wrapper=serde_json::json!({"schema":"monzero-private-bch-success-release-review-v1",
++                "admissionConfigFile":"/private/admission.json","deploymentCommitment":"ab".repeat(32),"safetyBlocks":5});
++            assert!(super::success_release_review_config(&serde_json::to_vec(&wrapper)?).is_ok());
++            for (field,value) in [("admissionConfigFile",serde_json::json!("relative.json")),
++                ("deploymentCommitment",serde_json::json!("AB".repeat(32))),
++                ("safetyBlocks",serde_json::json!(0)),("outputFile",serde_json::json!("/private/adaptor")),
++                ("nativeRpcFile",serde_json::json!("/private/rpc.json"))] {
++                let mut invalid=wrapper.clone();invalid[field]=value;
++                assert!(super::success_release_review_config(&serde_json::to_vec(&invalid)?).is_err());
++            }
++            Ok(())
++        }
++        #[test]
+         fn native_preparation_requests_require_exact_consent() -> anyhow::Result<()> {
+             for action in ["review","submit","status"] {
+                 let mut value=serde_json::json!({"schema":format!("monzero-bch-native-preparation-{action}-request-v1"),
+@@ -1173,6 +1304,21 @@
+             }
+             assert!(super::native_preparation_request(&vec![b' ';513],"status").is_err());
+             Ok(())
++        }
++        #[test]
++        fn native_observation_boundary_is_read_only() -> anyhow::Result<()> {
++            let mut request=serde_json::json!({"schema":"monzero-bch-native-observation-request-v1","requestId":uuid::Uuid::new_v4()});
++            assert!(super::native_observation_request(&serde_json::to_vec(&request)?).is_ok());
++            request["commitment"]=serde_json::json!("11".repeat(32));
++            assert!(super::native_observation_request(&serde_json::to_vec(&request)?).is_err());
++            assert!(super::native_observation_request(&vec![b' ';513]).is_err());
++            let mut wrapper=serde_json::json!({"schema":"monzero-private-bch-native-observation-v1",
++                "admissionConfigFile":"/private/admission.json","nativeRpcFile":"/private/observer.json"});
++            assert!(super::native_observation_config(&serde_json::to_vec(&wrapper)?).is_ok());
++            wrapper["nativeRpcFile"]=serde_json::json!("relative.json");
++            assert!(super::native_observation_config(&serde_json::to_vec(&wrapper)?).is_err());
++            wrapper["nativeRpcFile"]=serde_json::json!("/private/observer.json");wrapper["peerMessageFile"]=serde_json::json!("/private/peer.json");
++            assert!(super::native_observation_config(&serde_json::to_vec(&wrapper)?).is_err());Ok(())
+         }
+         #[test]
+         fn native_proof_requests_require_exact_consent() -> anyhow::Result<()> {
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -195,3 +195,7 @@
+ mod preparation_helper;
+ 
+ mod proof_helper;
++
++mod observation_helper;
++
++mod success_release_helper;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/native_payment.rs
+@@ -53,6 +53,7 @@
+     let saved=sender.saved_bch_native_proof_review()?.context("missing public proof review")?;
+     assert_eq!(saved.review.commitment,review.commitment);assert_eq!(saved.received_at,now+6);
+ 
++    observation_helper::exercise(config,setup,sender_metadata,snapshots,pins,base,false,&sent.txid,&context)?;
+     let observer=observer_backend()?;
+     assert!(sender.observe_bch_native_payment(&observer).await.is_err());
+     let pending=event.with_extension("pending");
+@@ -66,9 +67,26 @@
+         }
+     }).await.context("native confirmation fixture timed out")?;
+     let confirmed=sender.observe_bch_native_payment(&observer).await?;
++    observation_helper::exercise(config,setup,sender_metadata,snapshots,pins,base,true,&sent.txid,&context)?;
+     assert_eq!(confirmed.quote(),setup.quote.commitment());
+     assert!(matches!(native.bch_native_relay_state()?,Some(NativeRelayState::Acknowledged {..})));
+     assert!(native.recover_bch_native_funding()?.txid==prepared.txid);
++    let release_time=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().max(now+7);
++    let deployment=bch.deployment_commitment()?;
++    let release=sender.review_bch_success_release(&deployment,5,release_time)?;
++    assert_eq!(release.details.as_object().unwrap().len(),19);
++    assert_eq!(release.details["nativeTxid"],sent.txid);
++    assert_eq!(release.details["bchPayoutAtoms"],"99000");assert_eq!(release.details["bchFeeAtoms"],"1000");
++    assert!(native.review_bch_success_release(&deployment,5,release_time).is_err());
++    assert!(sender.review_bch_success_release(&[0;32],5,release_time).is_err());
++    assert!(sender.review_bch_success_release(&deployment,0,release_time).is_err());
++    let before=contents(&sender_metadata.0)?;let secrets=contents(&snapshots.0)?;
++    assert!(sender.prepare_reviewed_bch_success_release(&observer,bch,5,release_time,&[0;32]).await.is_err());
++    assert_eq!(contents(&sender_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    success_release_helper::exercise(setup,sender_metadata,snapshots,pins,base,&deployment,&release.details,&release.commitment,
++        &json!({"details":saved.review.details,"commitment":hex(&saved.review.commitment)}),&context)?;
++    let adaptor=sender.prepare_reviewed_bch_success_release(&observer,bch,5,release_time,&release.commitment).await?;
++    assert!(!adaptor.is_empty());drop(adaptor);
+     // Keep the private snapshot directory live through the final observation.
+     assert!(!contents(&snapshots.0)?.is_empty());
+     Ok(())
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/observation_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/observation_helper.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/observation_helper.rs
+@@ -0,0 +1,77 @@
++//! Fresh production-helper observation; cloned stores must remain unchanged.
++use super::*;
++pub(super) fn exercise(native: &Value,setup: &Setup,original: &PrivateStore,snapshots: &PrivateStore,
++    pins: &NegotiationPins,base: u64,confirmed: bool,txid: &str,context: &Value) -> Result<()> {
++    let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
++    let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper
++        && hex(&Sha256::digest(std::fs::read(&helper)?))==digest,"observation helper changed");
++    let program=match (std::env::var_os("MONZERO_BCH_QT_NATIVE_OBSERVATION_PROBE"),
++        std::env::var_os("MONZERO_BCH_QT_NATIVE_OBSERVATION_PROBE_SHA256")) {
++        (None,None)=>helper.clone(),
++        (Some(path),Some(expected))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && expected.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),"Qt native observation probe changed");path
++        },
++        _=>anyhow::bail!("incomplete Qt observation probe pin"),
++    };
++    let metadata=PrivateStore::new()?;let private=PrivateStore::new()?;let config=PrivateStore::new()?;
++    for (name,bytes) in contents(&original.0)? {save(&metadata.0.join(name),&bytes)?;}
++    for (name,bytes) in contents(&snapshots.0)? {save(&private.0.join(name),&bytes)?;}
++    let quote=config.0.join("quote.json");save(&quote,&setup.quote.record()?)?;
++    let admission=config.0.join("admission.json");
++    save(&admission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-admission-v1",
++        "helper":helper,"helperDigest":digest,"quoteFile":quote,
++        "quoteCommitment":hex(setup.quote.commitment()),"admittedAt":base,
++        "tradeId":setup.quote.terms()["swapId"],"identityPins":[
++            SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++            SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++        "policy":setup.policy,"role":"bch-funder","metadataDirectory":metadata.0,
++        "snapshotDirectory":private.0,"negotiationPins":pins}))?)?;
++    let login=config.0.join("observer-login");
++    save(&login,format!("{}:{}",native["observerUsername"].as_str().context("observer username")?,
++        native["observerPassword"].as_str().context("observer password")?).as_bytes())?;
++    let rpc=config.0.join("observer.json");
++    save(&rpc,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-rpc-v1",
++        "daemonPort":native["daemonPort"],"walletPort":native["observerPort"],"loginFile":login}))?)?;
++    let wrapper=config.0.join("observation.json");
++    save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-observation-v1",
++        "admissionConfigFile":admission,"nativeRpcFile":rpc}))?)?;
++    // Derived by the controller from retained agreement/funding journals.
++    save(&PathBuf::from(format!("{}.public-context.json",wrapper.display())),&serde_json::to_vec(context)?)?;
++    let invoke=|success: bool| -> Result<Value> {
++        let id=uuid::Uuid::new_v4();
++        let request=json!({"schema":"monzero-bch-native-observation-request-v1","requestId":id});
++        let mut child=Command::new(&program).arg("--native-observation-stdio-v1").arg(&wrapper)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("observer stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++        if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++        assert!(output.stderr.is_empty() && output.stdout.len()<=16384);
++        let value: Value=serde_json::from_slice(&output.stdout)?;
++        assert_eq!(value.as_object().unwrap().len(),7);
++        assert_eq!(value["schema"],"monzero-bch-native-observation-response-v1");
++        assert_eq!(value["requestId"],id.to_string());assert_eq!(value["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(value["executable"],false);assert_eq!(value["chainObserved"],true);
++        assert_eq!(value["review"]["details"].as_object().unwrap().len(),13);
++        let observed=&value["observation"];assert_eq!(observed.as_object().unwrap().len(),10);
++        assert_eq!(observed["state"],"confirmed");assert_eq!(observed["txid"],txid);
++        assert_eq!(observed["destination"],value["review"]["details"]["destination"]);
++        assert_eq!(observed["amountAtoms"],setup.quote.terms()["xmzAtoms"]);
++        assert_eq!(observed["genesis"],setup.policy.xmz_genesis);
++        let number=|key: &str| -> Result<u64> {Ok(observed[key].as_str().context("observation count")?.parse()?)};
++        assert!(number("height")?>0 && number("tipHeight")?>=number("height")?);
++        assert_eq!(number("confirmations")?,number("tipHeight")?-number("height")?+1);
++        assert!(number("confirmations")?>=u64::from(setup.policy.xmz_confirmations));
++        assert!(number("observedAt")?>=base);Ok(value)
++    };
++    let before=contents(&metadata.0)?;let secrets=contents(&private.0)?;
++    invoke(confirmed)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&private.0)?,secrets);
++    // A missing backend cannot be replaced by previously observed chain status.
++    std::fs::remove_file(&login)?;invoke(false)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&private.0)?,secrets);
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs
+@@ -0,0 +1,62 @@
++//! Public release review via the real helper; neither journal may change.
++use super::*;
++pub(super) fn exercise(setup: &Setup,original: &PrivateStore,snapshots: &PrivateStore,
++    pins: &NegotiationPins,base: u64,deployment: &[u8;32],details: &Value,commitment: &[u8;32],proof_review: &Value,context: &Value) -> Result<()> {
++    let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
++    let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper
++        && hex(&Sha256::digest(std::fs::read(&helper)?))==digest,"success review helper changed");
++    let program=PathBuf::from(std::env::var("MONZERO_BCH_QT_SUCCESS_RELEASE_REVIEW_PROBE")?);
++    let expected=std::env::var("MONZERO_BCH_QT_SUCCESS_RELEASE_REVIEW_PROBE_SHA256")?;
++    ensure!(program.is_absolute() && program.canonicalize()?==program
++        && hex(&Sha256::digest(std::fs::read(&program)?))==expected,"Qt success release review probe changed");
++    let metadata=PrivateStore::new()?;let private=PrivateStore::new()?;let config=PrivateStore::new()?;
++    for (name,bytes) in contents(&original.0)? {save(&metadata.0.join(name),&bytes)?;}
++    for (name,bytes) in contents(&snapshots.0)? {save(&private.0.join(name),&bytes)?;}
++    let quote=config.0.join("quote.json");save(&quote,&setup.quote.record()?)?;
++    let admission=config.0.join("admission.json");
++    let admission_record=json!({"schema":"monzero-private-bch-admission-v1",
++        "helper":helper,"helperDigest":digest,"quoteFile":quote,
++        "quoteCommitment":hex(setup.quote.commitment()),"admittedAt":base,
++        "tradeId":setup.quote.terms()["swapId"],"identityPins":[
++            SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++            SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++        "policy":setup.policy,"role":"bch-funder","metadataDirectory":metadata.0,
++        "snapshotDirectory":private.0,"negotiationPins":pins});
++    save(&admission,&serde_json::to_vec(&admission_record)?)?;
++    let wrapper=config.0.join("success-review.json");
++    let record=json!({"schema":"monzero-private-bch-success-release-review-v1",
++        "admissionConfigFile":admission,"deploymentCommitment":hex(deployment),"safetyBlocks":5});
++    save(&wrapper,&serde_json::to_vec(&record)?)?;
++    save(&PathBuf::from(format!("{}.public-context.json",wrapper.display())),&serde_json::to_vec(context)?)?;
++    save(&PathBuf::from(format!("{}.public-proof.json",wrapper.display())),&serde_json::to_vec(proof_review)?)?;
++    let invoke=|success: bool| -> Result<Value> {
++        let id=uuid::Uuid::new_v4();
++        let request=json!({"schema":"monzero-bch-success-release-review-request-v1","requestId":id});
++        let mut child=Command::new(&program).arg("--success-release-review-stdio-v1").arg(&wrapper)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("success review stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++        if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++        assert!(output.stderr.is_empty() && output.stdout.len()<=16384);
++        let value: Value=serde_json::from_slice(&output.stdout)?;
++        assert_eq!(value.as_object().unwrap().len(),6);
++        assert_eq!(value["schema"],"monzero-bch-success-release-review-response-v1");
++        assert_eq!(value["requestId"],id.to_string());assert_eq!(value["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(value["executable"],false);assert_eq!(value["chainObserved"],false);
++        assert_eq!(value["review"],json!({"details":details,"commitment":hex(commitment)}));
++        Ok(value["review"].clone())
++    };
++    let before=contents(&metadata.0)?;let secrets=contents(&private.0)?;
++    let reviewed=invoke(true)?;assert_eq!(invoke(true)?,reviewed);
++    let mut changed=record.clone();changed["deploymentCommitment"]=json!("00".repeat(32));
++    save(&wrapper,&serde_json::to_vec(&changed)?)?;invoke(false)?;
++    changed=record.clone();changed["safetyBlocks"]=json!(0);
++    save(&wrapper,&serde_json::to_vec(&changed)?)?;invoke(false)?;
++    save(&wrapper,&serde_json::to_vec(&record)?)?;
++    let mut wrong_role=admission_record.clone();wrong_role["role"]=json!("native-funder");
++    save(&admission,&serde_json::to_vec(&wrong_role)?)?;invoke(false)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&private.0)?,secrets);
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success.rs
+@@ -42,6 +42,9 @@
+ }
+ impl AdmittedExecution<'_> {
+     fn success_context(&self,bch: &BchRpc,now: u64) -> Result<ReleaseContext> {
++        self.success_context_for_deployment(&bch.deployment_commitment()?,now)
++    }
++    fn success_context_for_deployment(&self,deployment: &[u8;32],now: u64) -> Result<ReleaseContext> {
+         ensure!(self.role == Role::BchFunder,"wrong BCH success release role");
+         // The receipt accessor is supplied by the native proof module and must
+         // revalidate its private record, signature, quote and agreement binding.
+@@ -51,7 +54,7 @@
+         let funding = self.signed_bch_funding()?.context("missing exact BCH funding")?;
+         let prepared = self.prepared_bch_funding()?.context("missing BCH funding preparation")?;
+         let (locked,_) = self.funding_lock_intent(&prepared)?;
+-        ensure!(bch.deployment_commitment()? == locked.deployment,"BCH success observer changed");
++        ensure!(*deployment == locked.deployment,"BCH success observer changed");
+         self.retained_bch_recovery()?.context("missing retained BCH recovery")?;
+         Ok(ReleaseContext {agreement,funding,request,receipt,received_at,admission:self.admission_digest()?})
+     }
+@@ -152,3 +155,5 @@
+ pub mod receipt;
+ 
+ pub mod native_claim;
++
++pub mod approval;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/approval.rs
+@@ -0,0 +1,49 @@
++//! Public consent before exposing any spend-enabling success adaptor bytes.
++use super::*;
++use serde_json::json;
++const REVIEW: &str="monzero-bch-success-release-review-v1";
++pub struct SuccessReleaseReview {pub details: serde_json::Value,pub commitment: [u8;32]}
++impl AdmittedExecution<'_> {
++    /// Offline review validates retained funding/proof/recovery state. It neither
++    /// constructs an adaptor nor establishes live chain approval.
++    pub fn review_bch_success_release(&self,deployment: &[u8;32],safety_blocks: u32,now: u64)
++        -> Result<SuccessReleaseReview> {
++        ensure!(self.policy.bch_confirmations>0 && self.policy.xmz_confirmations>0 && safety_blocks>0
++            && u64::from(self.policy.bch_confirmations)+u64::from(safety_blocks)<u64::from(self.policy.cancel_blocks),
++            "invalid BCH success release margin");
++        let context=self.success_context_for_deployment(deployment,now)?;
++        let prepared=self.load_success("prepared",&context)?;
++        let signed=self.load_success("signed",&context)?;
++        ensure!(signed.is_none() || prepared.is_some(),"signed BCH success lacks preparation");
++        if let Some(prepared)=&prepared {
++            ensure!(now>=prepared.at,"BCH success review predates preparation");
++            if let Some(signed)=&signed {
++                ensure!(signed.frame==prepared.frame && signed.at>=prepared.at && now>=signed.at,
++                    "BCH success review retained state changed");
++            }
++        }
++        let terms=self.quote.terms();let principal=terms["bchAtoms"].parse::<u64>()?;
++        let fee=terms["bchLockFeeAtoms"].parse::<u64>()?;
++        let payout=principal.checked_sub(fee).context("invalid BCH success payout")?;
++        ensure!(payout>0 && fee>0,"empty BCH success payout or fee");
++        let details=json!({"schema":REVIEW,"action":"prepare-bch-success-release",
++            "swapId":terms["swapId"],"quote":self.quote.commitment(),"agreement":context.agreement.commitment(),
++            "admission":context.admission,"nativeProof":context.receipt,"bchDeployment":deployment,
++            "bchFundingOutpoint":context.funding.lock_outpoint().to_string(),"bchAtoms":principal.to_string(),
++            "bchPayoutScript":terms["bchPayoutScript"],"bchPayoutAtoms":payout.to_string(),"bchFeeAtoms":fee.to_string(),
++            "nativeTxid":context.request.proof.tx_hash.0,"nativeDestination":context.request.address.to_string(),
++            "nativeAmountAtoms":context.request.amount.atom_string(),
++            "minimumBchConfirmations":self.policy.bch_confirmations,"minimumNativeConfirmations":self.policy.xmz_confirmations,
++            "cancellationMarginBlocks":safety_blocks});
++        let commitment=hash(REVIEW,&serde_json::to_vec(&details)?);
++        Ok(SuccessReleaseReview {details,commitment})
++    }
++    /// Exact consent precedes adaptor construction. The existing production path
++    /// still reobserves both chains for every initial or repeated exposure.
++    pub async fn prepare_reviewed_bch_success_release(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++        safety_blocks: u32,now: u64,approved: &[u8;32]) -> Result<Zeroizing<Vec<u8>>> {
++        let review=self.review_bch_success_release(&bch.deployment_commitment()?,safety_blocks,now)?;
++        ensure!(review.commitment==*approved,"BCH success release consent changed");
++        self.bch_success_signing_frame(native,bch,safety_blocks,now).await
++    }
++}

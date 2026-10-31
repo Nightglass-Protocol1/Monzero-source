@@ -1,0 +1,172 @@
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+--- a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+@@ -74,6 +74,17 @@
+         let bytes=journal.read(RECORD)?;check(&bytes,network,wallet)?;
+         journal.retain(RECORD,&bytes)?;
+         Ok(Self {journal,network,wallet,bytes})
++    }
++
++    /// Authenticate and bind the mnemonic/passphrase to the reviewed account
++    /// before any signing intent is published.
++    pub fn unlock_for_account(&self,password:&[u8],expected:&PublicAccountDescriptor)->Result<UnlockedMnemonic> {
++        let account=PublicAccount::from_descriptor(expected,self.network)?;
++        let unlocked=self.unlock(password)?;
++        let actual=unlocked.public_account(self.network,account.account_index())?;
++        ensure!(serde_json::to_vec(&actual.descriptor())?==serde_json::to_vec(expected)?,
++            "mnemonic vault does not match public account");
++        Ok(unlocked)
+     }
+ 
+     pub fn unlock(&self,password:&[u8])->Result<UnlockedMnemonic> {
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -56,11 +56,21 @@
+         let seed=vault.unlock_for_account(password,&self.review.account.descriptor())?;
+         self.approve_and_sign(&seed,expected)
+     }
++    pub(in crate::litecoin_light::vault::signing::review) fn approve_with_mnemonic(&self,
++        vault:&crate::litecoin_light::vault::mnemonic::storage::MnemonicVault,password:&[u8],expected:sha256::Hash)->Result<Transaction> {
++        self.check_signing_review(expected)?;
++        self.ensure_not_submitted()?;
++        let keys=vault.unlock_for_account(password,&self.review.account.descriptor())?;
++        self.approve_with_keys(SpendKeys::Mnemonic(&keys),expected)
++    }
+     /// Retains signing intent before signing, then durably retains the signed
+     /// bytes before returning them. Exact retries (including after reopening
+     /// with the same operation/review) retain the same deterministic signature.
+     /// This does not establish human consent, unspentness or broadcast approval.
+     pub fn approve_and_sign(&self,seed:&SecretSeed,expected:sha256::Hash)->Result<Transaction> {
++        self.approve_with_keys(SpendKeys::Legacy(seed),expected)
++    }
++    fn approve_with_keys(&self,seed:SpendKeys<'_>,expected:sha256::Hash)->Result<Transaction> {
+         self.check_signing_review(expected)?;
+         self.ensure_not_submitted()?;
+         let commitment=self.signing_commitment();
+@@ -69,7 +79,7 @@
+             "schema":"monzero-ltc-signing-intent-v1","commitment":commitment.to_string()
+         }))?;
+         self.journal.retain(&approval_name,&approval)?;
+-        let signed=self.review.sign(seed)?;
++        let signed=self.review.sign_with(seed)?;
+         let bytes=serialize(&signed);
+         let signed_name=format!("ltc-signed-{commitment}.tx");
+         self.journal.retain(&signed_name,&bytes)?;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+@@ -142,3 +142,61 @@
+     assert_eq!(reopened.approve_with_vault_on(&chain,&observed,&vault,password,commitment)?,signed);
+     drop(reopened);drop(vault);assert_eq!(open()?.load_signed()?,signed);Ok(())
+ }
++
++#[test]
++fn mnemonic_approval_binds_observation_claims_password_and_account_before_intent()->Result<()> {
++    use crate::litecoin_light::vault::mnemonic::{MnemonicMaterial,storage::MnemonicVault};
++    use crate::litecoin_light::network::{BtcNetwork,BchNetwork,DogeNetwork};
++    for network in [LightNetwork::Litecoin(LtcNetwork::Regtest),LightNetwork::Bitcoin(BtcNetwork::Regtest),
++        LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
++    use bitcoin::{consensus::serialize,hashes::Hash};
++    // Public fixture seed; injected inclusion tests policy rather than consensus.
++    let (_,_,mut spend,mut prevout)=super::super::super::super::tests::fixture()?;
++    let seed=MnemonicMaterial::from_entropy(&[42;32])?;
++    let account=seed.public_account(network,2,"test passphrase")?;
++    prevout.script_pubkey=account.derive(Branch::Receive,3)?.address().script_pubkey().clone();
++    let chain=HeaderSequence::new(network)?;
++    let mut credit=spend.clone();credit.output=vec![prevout.clone()];
++    let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),
++        block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},&credit)?;
++    spend.input[0].previous_output=OutPoint {txid:included.txid(),vout:0};
++    let payment=spend.output[0].clone();let fee=Amount::from_sat(1000);
++    let inputs=[IncludedInput {transaction:&included,vout:0,branch:Branch::Receive,index:3}];
++    let observed=ObservedWallet::reconcile(&chain,&[prevout.script_pubkey.clone()],std::slice::from_ref(&included))?;
++    let spent=ObservedWallet::reconcile_with_pending(&chain,&[prevout.script_pubkey],std::slice::from_ref(&included),&[spend.clone()])?;
++    let directory=Directory::new()?;let vault_dir=Directory::new()?;let other_dir=Directory::new()?;
++    let operation=Uuid::new_v4();let wallet=Uuid::new_v4();
++    let prepared=ConfirmedSpendReview::new(&chain,&account,spend.clone(),&inputs,&payment,None,fee,1)?
++        .retain_observed(&chain,&observed,&directory.0,operation)?;
++    let commitment=prepared.signing_commitment();
++    let password=b"PUBLIC TEST PASSWORD ONLY";
++    let vault=MnemonicVault::create(&vault_dir.0,network,wallet,password,&seed,"test passphrase")?;
++    let wrong=MnemonicMaterial::from_entropy(&[43;32])?;
++    let other=MnemonicVault::create(&other_dir.0,network,Uuid::new_v4(),password,&wrong,"test passphrase")?;drop(wrong);drop(seed);
++    let before=fs::read_dir(&directory.0)?.map(|entry|{let path=entry?.path();Ok((path.clone(),fs::read(path)?))}).collect::<Result<BTreeMap<_,_>>>()?;
++    let assert_unchanged=||->Result<()> {
++        let after=fs::read_dir(&directory.0)?.map(|entry|{let path=entry?.path();Ok((path.clone(),fs::read(path)?))}).collect::<Result<BTreeMap<_,_>>>()?;
++        assert_eq!(after,before);Ok(())
++    };
++    let error=prepared.approve_with_mnemonic_on(&chain,&spent,&vault,b"wrong",commitment).unwrap_err();
++    assert!(error.to_string().contains("observed spent"));assert_unchanged()?;
++    let error=prepared.approve_with_mnemonic_on(&chain,&observed,&vault,b"wrong",sha256::Hash::hash(b"different review")).unwrap_err();
++    assert!(error.to_string().contains("commitment mismatch"));assert_unchanged()?;
++    assert!(prepared.approve_with_mnemonic_on(&chain,&observed,&vault,b"wrong",commitment).is_err());assert_unchanged()?;
++    let error=prepared.approve_with_mnemonic_on(&chain,&observed,&other,password,commitment).unwrap_err();
++    assert!(error.to_string().contains("does not match public account"));assert_unchanged()?;
++    let manifest=directory.0.join(format!("ltc-spend-{operation}.json"));let bytes=fs::read(&manifest)?;fs::write(&manifest,b"changed")?;
++    let error=prepared.approve_with_mnemonic_on(&chain,&observed,&vault,b"wrong",commitment).unwrap_err();
++    assert!(error.to_string().contains("claim changed"));fs::write(&manifest,bytes)?;assert_unchanged()?;
++    drop(prepared);drop(vault);
++    let vault=MnemonicVault::open(&vault_dir.0,network,wallet)?;
++    let open=||ClaimedSpend::open(&directory.0,operation,&account,&payment,None,fee,commitment);
++    let reopened=ObservedClaimedSpend::revalidate(open()?,&chain,&observed,&inputs,1)?;
++    let signed=reopened.approve_with_mnemonic_on(&chain,&observed,&vault,password,commitment)?;
++    assert_eq!(crate::litecoin_light::script::unsigned(&signed),spend);
++    assert_eq!(fs::read(directory.0.join(format!("ltc-signed-{commitment}.tx")))?,serialize(&signed));
++    assert_eq!(reopened.approve_with_mnemonic_on(&chain,&observed,&vault,password,commitment)?,signed);
++    drop(reopened);drop(vault);assert_eq!(open()?.load_signed()?,signed);
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+@@ -73,6 +73,13 @@
+         require_observed(chain,observed,self.network,self.height,self.tip,&self.inputs)?;
+         self.claimed.approve_with_vault(vault,password,expected)
+     }
++    /// Mnemonic vaults obey the identical observed-input, retained-review and
++    /// durable-signing policy. Approval does not authorize broadcast.
++    pub fn approve_with_mnemonic_on(&self,chain:&HeaderSequence,observed:&ObservedWallet,
++        vault:&crate::litecoin_light::vault::mnemonic::storage::MnemonicVault,password:&[u8],expected:sha256::Hash)->Result<Transaction> {
++        require_observed(chain,observed,self.network,self.height,self.tip,&self.inputs)?;
++        self.claimed.approve_with_mnemonic(vault,password,expected)
++    }
+     /// Require a current caller-supplied observation even on retry. A caller
+     /// must refresh it; equality of tips alone cannot prove wall-clock freshness.
+     /// The lower-level recovery API can inspect previously retained bytes.
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review.rs b/swap-machine/src/litecoin_light/vault/signing/review.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review.rs
+@@ -2,6 +2,21 @@
+ //! not an unspentness proof; consent and durable reservations remain external.
+ use super::*;
+ use bitcoin::{Amount,OutPoint};
++
++enum SpendKeys<'a> {
++    Legacy(&'a SecretSeed),
++    Mnemonic(&'a crate::litecoin_light::vault::mnemonic::storage::UnlockedMnemonic),
++}
++impl SpendKeys<'_> {
++    fn sign_owned_input(&self,account:&PublicAccount,branch:Branch,index:u32,
++        transaction:&Transaction,input:usize,prevout:&TxOut)
++        ->Result<(bitcoin::secp256k1::ecdsa::Signature,bitcoin::CompressedPublicKey)> {
++        match self {
++            Self::Legacy(seed)=>seed.sign_owned_input(account,branch,index,transaction,input,prevout),
++            Self::Mnemonic(seed)=>seed.sign_owned_input(account,branch,index,transaction,input,prevout),
++        }
++    }
++}
+ 
+ pub struct OwnedInput {
+     pub outpoint:OutPoint,
+@@ -50,6 +65,9 @@
+     /// Signs only the retained transaction; does not submit it or establish
+     /// freshness, unspentness, relay policy or user approval.
+     pub fn sign(&self,seed:&SecretSeed)->Result<Transaction> {
++        self.sign_with(SpendKeys::Legacy(seed))
++    }
++    fn sign_with(&self,seed:SpendKeys<'_>)->Result<Transaction> {
+         let mut signed=self.transaction.clone();
+         let kind=self.account.network().script_kind();
+         for (index,input) in self.inputs.iter().enumerate() {

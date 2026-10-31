@@ -1,0 +1,109 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index b26ee8657..e4b5f8500 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -25,6 +25,9 @@ mod linux {
+     enum Action {Send,Retransmit}
+     fn valid_request(request:&Request,mode:&str)->bool {
+         let (schema,action,approval,funding)=match mode {
++            "--redemption-review-stdio-v1"=>("monzero-ltc-redemption-review-request-v1",false,false,false),
++            "--redemption-submit-stdio-v1"=>("monzero-ltc-redemption-submit-request-v1",false,true,false),
++            "--redemption-check-stdio-v1"=>("monzero-ltc-redemption-check-request-v1",false,false,false),
+             "--redeem-review-stdio-v1"=>("monzero-ltc-redeem-review-request-v1",false,false,false),
+             "--negotiation-status-stdio-v1"=>("monzero-ltc-negotiation-status-request-v1",false,false,false),
+             "--outgoing-review-stdio-v1"=>("monzero-ltc-outgoing-review-request-v1",false,false,false),
+@@ -737,6 +740,45 @@ mod linux {
+             "snapshot":execution.saved_status()?,"outcome":{"state":"acknowledged","txid":payment.txid,
+                 "feeAtoms":payment.fee.atom_string(),"chainObserved":false,"executable":false}}))
+     }
++    async fn redemption_rpc(config:&Config,execution:&mut Execution,request:&Request,mode:&str)->Result<serde_json::Value> {
++        use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
++            litecoin_negotiation::execution::funding_approval::FundingAction};
++        use swap_core::litecoin_address::{LtcNetwork,LtcSegwitAddress};
++        ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder"
++            && config.policy.ltc_network==LtcNetwork::Regtest,"redemption requires isolated native funder funding configuration");
++        if mode=="--redemption-review-stdio-v1" {
++            let review=execution.review_completed_redeem()?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-redemption-review-response-v1","requestId":request.request_id,
++                "snapshot":execution.saved_status()?,"review":{"details":review.details,
++                    "commitment":review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()}}));
++        }
++        let checking=mode=="--redemption-check-stdio-v1";
++        ensure!(checking || mode=="--redemption-submit-stdio-v1","invalid redemption mode");
++        let approved=if checking {None} else {
++            let approved=parse_commitment(request.commitment.as_deref().context("missing redemption approval")?)?;
++            ensure!(execution.review_completed_redeem()?.commitment==approved,"redemption review changed");Some(approved)
++        };
++        let (_rpc,bytes)=private_bytes(config.funding_rpc_file.as_deref().context("missing redemption RPC configuration")?,false)?;
++        let rpc:FundingRpc=serde_json::from_slice(&bytes)?;ensure!(rpc.valid(),"invalid redemption RPC configuration");
++        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
++        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,LtcNetwork::Regtest,rpc.ltc_wallet.clone(),
++            LtcSegwitAddress::parse(LtcNetwork::Regtest,&rpc.ltc_anchor)?)?;
++        if checking {
++            let observation=execution.check_completed_redeem(&ltc).await?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-redemption-check-response-v1","requestId":request.request_id,
++                "snapshot":execution.saved_status()?,"observation":observation}));
++        }
++        // The source is the already dispatched native payment. This does not
++        // prepare, sign or send native funds, nor impose a new lock margin.
++        ensure!(rpc.matches_source(&execution.review_native_lock_payment(FundingAction::Retransmit,1)?.details),
++            "redemption native source differs from configured source");
++        isolated_native(rpc.native_daemon_port).await?;
++        let (_login,user,password)=credentials(&rpc.native_login_file)?;
++        let native=NativeTransferRelay::new(NativeFundingRpc::new(rpc.native_daemon_port,rpc.native_wallet_port,user,password)?);
++        let outcome=execution.submit_reviewed_completed_redeem(&native,&ltc,approved.context("missing redemption approval")?).await?;
++        Ok(serde_json::json!({"schema":"monzero-ltc-redemption-submit-response-v1","requestId":request.request_id,
++            "snapshot":execution.saved_status()?,"outcome":outcome}))
++    }
+     #[cfg(test)]
+     mod tests {
+         use super::*;
+@@ -744,6 +786,25 @@ mod linux {
+         struct OwnedDirectory(PathBuf);
+         impl Drop for OwnedDirectory {fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);}}
+         #[test]
++        fn redemption_requests_separate_review_submission_and_confirmation()->Result<()> {
++            for operation in ["review","submit","check"] {
++                let mode=format!("--redemption-{operation}-stdio-v1");
++                let mut value=serde_json::json!({"schema":format!("monzero-ltc-redemption-{operation}-request-v1"),"requestId":uuid::Uuid::new_v4()});
++                if operation=="submit" {value["commitment"]=serde_json::json!("a".repeat(64));}
++                assert!(valid_request(&serde_json::from_value(value.clone())?,&mode));
++                for key in ["action","safetyBlocks","priority"] {
++                    let mut changed=value.clone();changed[key]=if key=="action" {serde_json::json!("send")} else {serde_json::json!(1)};
++                    assert!(!valid_request(&serde_json::from_value(changed)?,&mode));
++                }
++                for other in ["review","submit","check"] {
++                    assert_eq!(valid_request(&serde_json::from_value(value.clone())?,&format!("--redemption-{other}-stdio-v1")),operation==other);
++                }
++                value["commitment"]=if operation=="submit" {serde_json::Value::Null} else {serde_json::json!("a".repeat(64))};
++                assert!(!valid_request(&serde_json::from_value(value)?,&mode));
++            }
++            Ok(())
++        }
++        #[test]
+         fn funding_preparation_source_is_explicit_and_bound()->Result<()> {
+             let base=serde_json::json!({"schema":"monzero-private-ltc-funding-rpc-v1",
+                 "ltcPort":1,"ltcWallet":"fixture","ltcAnchor":"fixture","ltcCookieFile":"/cookie",
+@@ -940,6 +1001,22 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
++        if args.len()==4 && ["--redemption-review-stdio-v1","--redemption-submit-stdio-v1","--redemption-check-stdio-v1"].iter().any(|m|args[1]==*m) && args[2]=="--config-file" {
++            let mut input=Vec::new();std::io::stdin().take(513).read_to_end(&mut input)?;
++            ensure!(input.len()<=512,"oversized redemption request");
++            let request:Request=serde_json::from_slice(&input)?;
++            let mode=args[1].to_str().context("invalid redemption mode")?;
++            ensure!(valid_request(&request,mode),"invalid redemption request");
++            let (_lease,config)=load(Path::new(&args[3]))?;
++            ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder","invalid redemption configuration role");
++            let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,config.trade_id,
++                &config.policy,LocalRole::NativeFunder,config.pins)?;
++            let response=tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(redemption_rpc(&config,&mut execution,&request,mode))?;
++            let output=serde_json::to_vec(&response)?;ensure!(output.len()<=8192,"oversized redemption response");
++            std::io::stdout().write_all(&output)?;return Ok(());
++        }
++
+         if args.len()==4 && ["--redeem-review-stdio-v1","--redeem-submit-stdio-v1","--funding-proof-accept-stdio-v1"].iter().any(|mode|args[1]==*mode) && args[2]=="--config-file" {
+             let mut input=zeroize::Zeroizing::new(Vec::new());std::io::stdin().take(34001).read_to_end(&mut input)?;
+             ensure!(input.len()<=34000,"oversized redeem release request");

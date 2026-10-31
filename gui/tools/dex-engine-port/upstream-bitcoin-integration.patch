@@ -1,0 +1,158 @@
+diff --git a/bitcoin-wallet/tests/harness/bitcoind.rs b/bitcoin-wallet/tests/harness/bitcoind.rs
+index 34c4f3d..50e1d08 100644
+--- a/bitcoin-wallet/tests/harness/bitcoind.rs
++++ b/bitcoin-wallet/tests/harness/bitcoind.rs
+@@ -22,13 +22,17 @@ impl Image for Bitcoind {
+     }
+ 
+     fn tag(&self) -> String {
+-        "0.21.0".into()
++        "0.21.0@sha256:a223f25bff9fa4bf54fbfbc0fe5ba685efabd24c22e20f4f7a323312d3cd822f".into()
+     }
+ 
+     fn ready_conditions(&self) -> Vec<WaitFor> {
+         vec![WaitFor::message_on_stdout("init message: Done loading")]
+     }
+ 
++    fn expose_ports(&self) -> Vec<u16> {
++        vec![RPC_PORT]
++    }
++
+     fn volumes(&self) -> Box<dyn Iterator<Item = (&String, &String)> + '_> {
+         Box::new(self.volumes.iter())
+     }
+diff --git a/bitcoin-wallet/tests/harness/electrs.rs b/bitcoin-wallet/tests/harness/electrs.rs
+index f791e77..8e8fb49 100644
+--- a/bitcoin-wallet/tests/harness/electrs.rs
++++ b/bitcoin-wallet/tests/harness/electrs.rs
+@@ -32,6 +32,10 @@ impl Image for Electrs {
+         vec![WaitFor::message_on_stderr(self.wait_for_message.clone())]
+     }
+ 
++    fn expose_ports(&self) -> Vec<u16> {
++        vec![RPC_PORT]
++    }
++
+     fn volumes(&self) -> Box<dyn Iterator<Item = (&String, &String)> + '_> {
+         Box::new(self.volumes.iter())
+     }
+@@ -44,7 +48,7 @@ impl Image for Electrs {
+ impl Default for Electrs {
+     fn default() -> Self {
+         Electrs {
+-            tag: "v0.16.0.3".into(),
++            tag: "latest@sha256:0b7d01aafbb432a0042529ded7c9de8057c5ca65e0d2aaded4a0e2bd6d479ae7".into(),
+             args: ElectrsArgs::default(),
+             entrypoint: Some("/build/electrs".into()),
+             wait_for_message: "Running accept thread".to_string(),
+diff --git a/bitcoin-wallet/tests/harness/mod.rs b/bitcoin-wallet/tests/harness/mod.rs
+index dda409c..8cb7bc8 100644
+--- a/bitcoin-wallet/tests/harness/mod.rs
++++ b/bitcoin-wallet/tests/harness/mod.rs
+@@ -17,6 +17,48 @@ pub struct TestEnv<'a> {
+     pub electrs_port: u16,
+     _bitcoind_container: Container<'a, bitcoind::Bitcoind>,
+     _electrs_container: Container<'a, electrs::Electrs>,
++    // Drop containers before their owned network.
++    _network: IsolatedNetwork,
++}
++
++struct IsolatedNetwork(String);
++
++impl IsolatedNetwork {
++    fn new(name: String) -> Result<Self> {
++        let output = std::process::Command::new("docker").args([
++            "network", "create", "--internal", "--driver", "bridge", "--opt",
++            "com.docker.network.bridge.host_binding_ipv4=127.0.0.1", &name,
++        ]).output().context("create isolated test network")?;
++        if !output.status.success() { anyhow::bail!("Failed to create isolated test network"); }
++        let owned = Self(name);
++        let inspected = std::process::Command::new("docker")
++            .args(["network", "inspect", &owned.0]).output().context("inspect test network")?;
++        if !inspected.status.success() { anyhow::bail!("Failed to inspect test network"); }
++        let value: serde_json::Value = serde_json::from_slice(&inspected.stdout)?;
++        let network = &value[0];
++        if network["Internal"] != true || network["Driver"] != "bridge"
++            || network["Options"]["com.docker.network.bridge.host_binding_ipv4"] != "127.0.0.1" {
++            anyhow::bail!("Test network isolation settings did not match");
++        }
++        Ok(owned)
++    }
++}
++
++impl Drop for IsolatedNetwork {
++    fn drop(&mut self) {
++        let removed = std::process::Command::new("docker")
++            .args(["network", "rm", &self.0]).output();
++        if !removed.is_ok_and(|output| output.status.success()) {
++            eprintln!("Could not remove owned test network {}", self.0);
++        }
++    }
++}
++
++#[test]
++fn isolated_network_configuration() {
++    let name = format!("monzero-btc-it-{}", random_prefix());
++    let network = IsolatedNetwork::new(name).expect("isolated local Docker network");
++    drop(network);
+ }
+ 
+ pub async fn setup<'a>(cli: &'a Cli) -> Result<TestEnv<'a>> {
+@@ -24,6 +66,7 @@ pub async fn setup<'a>(cli: &'a Cli) -> Result<TestEnv<'a>> {
+ 
+     let prefix = random_prefix();
+     let network = format!("{}-btc", prefix);
++    let owned_network = IsolatedNetwork::new(network.clone())?;
+     let bitcoind_name = format!("{}-bitcoind", prefix);
+ 
+     let (bitcoind_container, bitcoind_url) = init_bitcoind_container(cli, prefix.clone(), bitcoind_name.clone(), network.clone())
+@@ -34,9 +77,9 @@ pub async fn setup<'a>(cli: &'a Cli) -> Result<TestEnv<'a>> {
+         .await
+         .context("init electrs container")?;
+ 
+-    let electrs_port = electrs_container.get_host_port_ipv4(electrs::RPC_PORT);
++    let electrs_port = electrs::RPC_PORT;
+     // Use a plain TCP electrum URL; we explicitly wait for electrs readiness below.
+-    let electrum_url = format!("tcp://127.0.0.1:{}", electrs_port);
++    let electrum_url = format!("tcp://{}:{}", electrs_container.get_bridge_ip_address(), electrs_port);
+ 
+     let bitcoind = BitcoindClient::new(bitcoind_url.clone());
+ 
+@@ -54,6 +97,7 @@ pub async fn setup<'a>(cli: &'a Cli) -> Result<TestEnv<'a>> {
+         electrs_port,
+         _bitcoind_container: bitcoind_container,
+         _electrs_container: electrs_container,
++        _network: owned_network,
+     })
+ }
+ 
+@@ -222,14 +266,16 @@ async fn init_bitcoind_container<'a>(
+         .with_network(network);
+ 
+     let docker = cli.run(image);
+-    let host_rpc_port = docker.get_host_port_ipv4(bitcoind::RPC_PORT);
++    // Local Linux Docker: reach the isolated bridge directly, without host publication.
++    let rpc_address = docker.get_bridge_ip_address();
+ 
+     let bitcoind_url = {
+         let input = format!(
+-            "http://{}:{}@127.0.0.1:{}",
++            "http://{}:{}@{}:{}",
+             bitcoind::RPC_USER,
+             bitcoind::RPC_PASSWORD,
+-            host_rpc_port
++            rpc_address,
++            bitcoind::RPC_PORT
+         );
+         Url::parse(&input).expect("valid bitcoind rpc url")
+     };
+@@ -247,8 +293,7 @@ async fn init_electrs_container<'a>(
+     let bitcoind_rpc_addr = format!("{}:{}", bitcoind_container_name, bitcoind_rpc_port_in_network);
+     let image = electrs::Electrs::default()
+         .with_volume(volume)
+-        .with_daemon_rpc_addr(bitcoind_rpc_addr)
+-        .with_tag("latest");
++        .with_daemon_rpc_addr(bitcoind_rpc_addr);
+ 
+     let image = RunnableImage::from(image.self_and_args())
+         .with_network(network.clone())

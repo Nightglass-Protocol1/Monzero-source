@@ -1,0 +1,250 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index 37508fc3f..150ca1e76 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -25,6 +25,7 @@ mod linux {
+     enum Action {Send,Retransmit}
+     fn valid_request(request:&Request,mode:&str)->bool {
+         let (schema,action,approval,funding)=match mode {
++            "--outgoing-review-stdio-v1"=>("monzero-ltc-outgoing-review-request-v1",false,false,false),
+             "--snapshot-stdio-v1"=>("monzero-ltc-journal-request-v1",false,false,false),
+             "--start-review-stdio-v1"=>("monzero-ltc-start-review-request-v1",false,false,false),
+             "--start-submit-stdio-v1"=>("monzero-ltc-start-submit-request-v1",false,true,false),
+@@ -123,27 +124,44 @@ mod linux {
+         (0..value.len()).step_by(2).map(|offset|
+             u8::from_str_radix(&value[offset..offset+2],16).map_err(Into::into)).collect()
+     }
+-    fn accept_peer(config:&Config,input:&[u8],now:u64)->Result<serde_json::Value> {
++    fn negotiate(config:&Config,input:&[u8],now:u64,mode:&str)->Result<serde_json::Value> {
+         ensure!(config.schema=="monzero-private-ltc-journal-v5"
+             && config.policy.ltc_network==swap_core::litecoin_address::LtcNetwork::Regtest,
+             "peer admission helper requires isolated trade startup configuration");
+-        let request:PeerRequest=serde_json::from_slice(input)?;
+-        ensure!(request.schema=="monzero-ltc-peer-accept-request-v1" && !request.request_id.is_nil(),
+-            "invalid peer admission request");
+-        let frame=zeroize::Zeroizing::new(decode_peer_hex(&request.frame_hex,200_000)?);
+-        let signature=decode_peer_hex(&request.signature_hex,64)?;
+-        ensure!(signature.len()==64,"invalid peer signature size");
+         let role=match config.role.as_str() {"litecoin-funder"=>LocalRole::LitecoinFunder,
+             "native-funder"=>LocalRole::NativeFunder,_=>anyhow::bail!("invalid peer admission role")};
+         let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
+             config.trade_id,&config.policy,role,config.pins)?;
+-        // The controller authenticates the peer, quote, sequence and proof before
+-        // publication. Identical redelivery recovers the same durable checkpoint.
++        if mode=="--outgoing-review-stdio-v1" {
++            let request:Request=serde_json::from_slice(input)?;
++            ensure!(valid_request(&request,mode),"invalid outgoing review request");
++            let frame=execution.outgoing_signing_frame(now)?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-outgoing-review-response-v1",
++                "requestId":request.request_id,"frameHex":frame.iter().map(|b|format!("{b:02x}")).collect::<String>(),
++                "snapshot":execution.saved_status()?}));
++        }
++        let request:PeerRequest=serde_json::from_slice(input)?;
++        let outgoing=mode=="--outgoing-submit-stdio-v1";
++        ensure!(request.schema==if outgoing {"monzero-ltc-outgoing-submit-request-v1"}
++            else {"monzero-ltc-peer-accept-request-v1"} && !request.request_id.is_nil(),"invalid negotiation request");
++        let frame=zeroize::Zeroizing::new(decode_peer_hex(&request.frame_hex,200_000)?);
++        let signature=decode_peer_hex(&request.signature_hex,64)?;
++        ensure!(signature.len()==64,"invalid negotiation signature size");
++        if outgoing {
++            let retained=execution.submit_outgoing_signature(&frame,&signature,now)?;
++            return Ok(serde_json::json!({"schema":"monzero-ltc-outgoing-submit-response-v1",
++                "requestId":request.request_id,"frameHex":request.frame_hex,
++                "signatureHex":retained.signature().iter().map(|b|format!("{b:02x}")).collect::<String>(),
++                "snapshot":execution.saved_status()?}));
++        }
++        // Authentication and durable publication precede acknowledgement.
++        // Identical redelivery cannot replace keys or repeat a transition.
+         let checkpoint=execution.accept_peer(&frame,&signature,now)?;
+         Ok(serde_json::json!({"schema":"monzero-ltc-peer-accept-response-v1","requestId":request.request_id,
+             "checkpoint":checkpoint.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+             "snapshot":execution.saved_status()?}))
+     }
++
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct RefundRpc {
+@@ -347,7 +365,8 @@ mod linux {
+         }
+         #[test]
+         fn payment_request_modes_reject_cross_operation_and_extra_authority()->Result<()> {
+-            let modes=[("--snapshot-stdio-v1","monzero-ltc-journal-request-v1",false,false,false),
++            let modes=[("--outgoing-review-stdio-v1","monzero-ltc-outgoing-review-request-v1",false,false,false),
++                ("--snapshot-stdio-v1","monzero-ltc-journal-request-v1",false,false,false),
+                 ("--start-review-stdio-v1","monzero-ltc-start-review-request-v1",false,false,false),
+                 ("--start-submit-stdio-v1","monzero-ltc-start-submit-request-v1",false,true,false),
+                 ("--refund-review-stdio-v1","monzero-ltc-refund-review-request-v1",true,false,false),
+@@ -422,7 +441,7 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
+-        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
++        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
+             && args[2]=="--config-file","invalid journal helper arguments");
+         let review_mode=args[1]=="--refund-review-stdio-v1";
+         let payout_review_mode=args[1]=="--payout-review-stdio-v1";
+@@ -434,14 +453,14 @@ mod linux {
+         let payout_submit_mode=args[1]=="--payout-submit-stdio-v1";
+         let payout_check_mode=args[1]=="--payout-check-stdio-v1";
+         let (_lease,config)=load(Path::new(&args[3]))?;
+-        if args[1]=="--peer-accept-stdio-v1" {
++        if args[1]=="--peer-accept-stdio-v1" || args[1]=="--outgoing-review-stdio-v1" || args[1]=="--outgoing-submit-stdio-v1" {
+             let mut input=zeroize::Zeroizing::new(Vec::new());
+             std::io::stdin().take(401025).read_to_end(&mut input)?;
+             ensure!(input.len()<=401024,"oversized peer admission request");
+             let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+-            let response=accept_peer(&config,&input,now)?;
+-            let result=serde_json::to_vec(&response)?;
+-            ensure!(result.len()<=8192,"oversized peer admission response");
++            let response=negotiate(&config,&input,now,args[1].to_str().context("invalid negotiation mode")?)?;
++            let result=zeroize::Zeroizing::new(serde_json::to_vec(&response)?);
++            ensure!(result.len()<=410000,"oversized negotiation response");
+             std::io::stdout().write_all(&result)?;
+             return Ok(());
+         }
+diff --git a/swap-machine/src/litecoin_negotiation/execution.rs b/swap-machine/src/litecoin_negotiation/execution.rs
+index 4f8597e41..dbb33dcf6 100644
+--- a/swap-machine/src/litecoin_negotiation/execution.rs
++++ b/swap-machine/src/litecoin_negotiation/execution.rs
+@@ -292,6 +292,28 @@ impl Execution {
+         Ok(outgoing)
+     }
+ 
++    /// Read the local message for an external identity signer. Secret trade keys
++    /// remain in the engine; the returned message contains private view material.
++    pub fn outgoing_signing_frame(&self,now:u64)->Result<zeroize::Zeroizing<Vec<u8>>> {
++        let (head,_,quote,_,_)=self.load()?;
++        storage::local_signing_frame(&self.snapshots,&quote,&self.policy,self.role,
++            &head.outgoing_source.unwrap_or(head.checkpoint),now)
++    }
++
++    /// Publish an externally signed local message before allowing delivery. A
++    /// changed message or identity cannot replace the held keys or prior frame.
++    pub fn submit_outgoing_signature(&mut self,bytes:&[u8],signature:&[u8],now:u64)->Result<storage::OutgoingFrame> {
++        let (head,previous,quote,_,_)=self.load()?;
++        let source=head.outgoing_source.unwrap_or(head.checkpoint);
++        let outgoing=storage::retain_signed_outgoing(&self.snapshots,&quote,&self.policy,self.role,
++            &source,bytes,signature,now)?;
++        if head.outgoing_source.is_none() {
++            let successor=storage::recover_outgoing_acceptance(&self.snapshots,&quote,&self.policy,self.role,&source)?;
++            self.advance(head,&previous,successor,Some(source))?;
++        }
++        Ok(outgoing)
++    }
++
+     /// Recover the exact retained outgoing operation without an identity key.
+     /// If the prior process stopped before head publication, complete that
+     /// publication before returning the saved frame. No new frame is created.
+diff --git a/swap-machine/src/litecoin_negotiation/storage.rs b/swap-machine/src/litecoin_negotiation/storage.rs
+index 9f01c4584..070992b05 100644
+--- a/swap-machine/src/litecoin_negotiation/storage.rs
++++ b/swap-machine/src/litecoin_negotiation/storage.rs
+@@ -92,27 +92,50 @@ fn checked_outgoing(bytes: &[u8], checkpoint: &[u8;32], mut exchange: KeyExchang
+ pub fn prepare_outgoing(directory: &Path, quote: &VerifiedLtcQuote, policy: &Policy,
+     role: LocalRole, checkpoint: &[u8;32], identity: &ed25519_dalek::SigningKey, now: u64) -> Result<OutgoingFrame> {
+     use ed25519_dalek::Signer;
++    let bytes=local_signing_frame(directory,quote,policy,role,checkpoint,now)?;
++    let signature=identity.sign(&signing_bytes(&bytes)?).to_bytes();
++    retain_signed_outgoing(directory,quote,policy,role,checkpoint,&bytes,&signature,now)
++}
++
++/// Return the deterministic local message from retained keys, or the original
++/// retained message after signing. This read does not advance the execution.
++pub fn local_signing_frame(directory:&Path,quote:&VerifiedLtcQuote,policy:&Policy,
++    role:LocalRole,checkpoint:&[u8;32],now:u64)->Result<Zeroizing<Vec<u8>>> {
++    let journal=Journal::open(directory)?;
++    let (_,exchange)=restore_locked(&journal,quote,policy,role,checkpoint)?;
++    match journal.read(&outgoing_name(quote,role,checkpoint)) {
++        Ok(bytes)=>Ok(checked_outgoing(&bytes,checkpoint,exchange)?.0.bytes),
++        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>
++            Ok(Zeroizing::new(exchange.prepare_local(now)?)),
++        Err(e)=>Err(e),
++    }
++}
++
++/// Accept an external identity signature only over this checkpoint's exact
++/// local message. Repeated submission cannot replace a retained signature.
++pub fn retain_signed_outgoing(directory:&Path,quote:&VerifiedLtcQuote,policy:&Policy,
++    role:LocalRole,checkpoint:&[u8;32],bytes:&[u8],signature:&[u8],now:u64)->Result<OutgoingFrame> {
+     let journal=Journal::open(directory)?;
+     let (_,mut exchange)=restore_locked(&journal,quote,policy,role,checkpoint)?;
+-    ensure!(identity.verifying_key()==exchange.pins[usize::from(exchange.local_sequence)],
+-        "Litecoin outgoing signing identity differs from quote pin");
+     let name=outgoing_name(quote,role,checkpoint);
+     match journal.read(&name) {
+-        Ok(bytes)=> {
+-            let (outgoing,_)=checked_outgoing(&bytes,checkpoint,exchange)?;
+-            journal.retain(&name,&bytes)?;
++        Ok(record)=> {
++            let (outgoing,_)=checked_outgoing(&record,checkpoint,exchange)?;
++            ensure!(outgoing.bytes()==bytes && outgoing.signature()==signature,
++                "conflicting retained Litecoin local signature");
++            journal.retain(&name,&record)?;
+             return Ok(outgoing);
+         }
+         Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>(),
+         Err(e)=>return Err(e),
+     }
+-    let bytes=exchange.prepare_local(now)?;
+-    let signature=identity.sign(&signing_bytes(&bytes)?).to_bytes();
+-    exchange.accept(&bytes,&signature,now)?;
++    ensure!(exchange.prepare_local(now)?==bytes,"signed Litecoin local frame differs from held keys");
++    exchange.accept(bytes,signature,now)?;
++    let signature:[u8;64]=signature.try_into().map_err(|_|anyhow::anyhow!("invalid outgoing signature size"))?;
+     let record=OutgoingRecord { schema:"monzero-ltc-key-outgoing-v1".into(),checkpoint:*checkpoint,
+-        prepared_at:now,bytes:bytes.clone(),signature:signature.to_vec() };
++        prepared_at:now,bytes:bytes.to_vec(),signature:signature.to_vec() };
+     journal.retain(&name,&serde_json::to_vec(&record)?)?;
+-    Ok(OutgoingFrame { bytes:Zeroizing::new(bytes),signature })
++    Ok(OutgoingFrame { bytes:Zeroizing::new(bytes.to_vec()),signature })
+ }
+ 
+ /// Recover an already-retained frame without requiring the identity secret or
+diff --git a/swap-machine/src/litecoin_negotiation/tests.rs b/swap-machine/src/litecoin_negotiation/tests.rs
+index 751e1c02e..20699dc92 100644
+--- a/swap-machine/src/litecoin_negotiation/tests.rs
++++ b/swap-machine/src/litecoin_negotiation/tests.rs
+@@ -1131,3 +1131,43 @@ fn contract_spend_node(tx:bitcoin::Transaction,active:bool,relay:Option<(std::pa
+ #[cfg(target_os="linux")]
+ #[path="payout_fixture.rs"]
+ mod payout_fixture;
++
++
++#[cfg(target_os="linux")]
++#[test]
++fn external_local_signature_is_exact_durable_and_recovers_after_expiry()->Result<()> {
++    use std::os::unix::fs::DirBuilderExt;
++    use execution::Execution;
++    let root=std::env::temp_dir().canonicalize()?.join(format!("ltc-external-{}",uuid::Uuid::new_v4()));
++    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
++    let metadata=root.join("metadata");let secrets=root.join("secrets");
++    for path in [&metadata,&secrets] {std::fs::DirBuilder::new().mode(0o700).create(path)?;}
++    let (policy,quote,_,_)=setup();let trade=quote.terms()["swapId"].parse()?;
++    let pins=[SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()];
++    let mut rng=rand::rngs::StdRng::seed_from_u64(516);
++    let mut execution=Execution::begin(&metadata,&secrets,&quote,&policy,LocalRole::LitecoinFunder,
++        quote.commitment(),1000,&mut rng)?;
++    let before=execution.checkpoint()?;
++    let frame=execution.outgoing_signing_frame(1000)?;
++    assert_eq!(frame,execution.outgoing_signing_frame(1001)?);
++    assert_eq!(execution.checkpoint()?,before);
++    assert!(execution.submit_outgoing_signature(&frame,&signature(&frame,2),1000).is_err());
++    let mut altered=frame.to_vec();altered.push(b' ');
++    assert!(execution.submit_outgoing_signature(&altered,&signature(&altered,1),1000).is_err());
++    assert!(execution.submit_outgoing_signature(&frame,&signature(&frame,1),2000).is_err());
++    assert_eq!(execution.checkpoint()?,before);
++    // Simulate a crash after signed retention but before publishing the head.
++    let signed=storage::retain_signed_outgoing(&secrets,&quote,&policy,LocalRole::LitecoinFunder,
++        &before,&frame,&signature(&frame,1),1000)?;
++    drop(execution);
++    let mut execution=Execution::resume(&metadata,&secrets,trade,&policy,LocalRole::LitecoinFunder,pins)?;
++    assert_eq!(execution.outgoing_signing_frame(2000)?.as_slice(),frame.as_slice());
++    let recovered=execution.submit_outgoing_signature(&frame,signed.signature(),2000)?;
++    assert_eq!(recovered.bytes(),frame.as_slice());
++    let after=execution.checkpoint()?;assert_ne!(after,before);
++    execution.submit_outgoing_signature(&frame,signed.signature(),2001)?;
++    assert!(execution.submit_outgoing_signature(&frame,&signature(&frame,2),2001).is_err());
++    assert_eq!(execution.checkpoint()?,after);
++    drop(execution);std::fs::remove_dir_all(root)?;
++    Ok(())
++}

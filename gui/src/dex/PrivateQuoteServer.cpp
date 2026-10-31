@@ -2,7 +2,7 @@
 #include <QSslKey>
 
 PrivateQuoteServer::PrivateQuoteServer(QSslConfiguration configuration, QByteArray peerPin,
-    QObject *parent) : QTcpServer(parent), m_configuration(std::move(configuration)), m_pin(std::move(peerPin))
+    QObject *parent, PrivateQuoteChannel::Profile profile) : QTcpServer(parent), m_profile(profile), m_configuration(std::move(configuration)), m_pin(std::move(peerPin))
 {
     setMaxPendingConnections(8);
 }
@@ -29,7 +29,7 @@ void PrivateQuoteServer::incomingConnection(qintptr descriptor)
     if (m_peers.size() >= 8) {
         QTcpSocket socket; socket.setSocketDescriptor(descriptor); socket.abort(); return;
     }
-    auto *channel = new PrivateQuoteChannel(m_configuration, m_pin, this);
+    auto *channel = new PrivateQuoteChannel(m_configuration, m_pin, this, m_profile);
     if (!channel->acceptPeer(descriptor)) {
         QTcpSocket socket; socket.setSocketDescriptor(descriptor); socket.abort(); delete channel; return;
     }
@@ -43,7 +43,7 @@ void PrivateQuoteServer::incomingConnection(qintptr descriptor)
     connect(channel, &PrivateQuoteChannel::rejected, this, release);
     connect(channel, &PrivateQuoteChannel::authenticated, this, [this, channel] { emit authenticated(channel); });
     auto *idle = new QTimer(channel);
-    idle->setSingleShot(true); idle->setInterval(60000);
+    idle->setSingleShot(true); idle->setInterval(m_profile==PrivateQuoteChannel::Profile::LitecoinNegotiation?300000:60000);
     connect(idle, &QTimer::timeout, channel, &PrivateQuoteChannel::close);
     connect(channel, &PrivateQuoteChannel::received, idle, [idle](const QByteArray &) { idle->start(); });
     idle->start();

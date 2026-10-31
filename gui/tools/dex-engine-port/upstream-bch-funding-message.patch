@@ -1,0 +1,349 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding.rs
+@@ -10,6 +10,7 @@
+ pub mod signing;
+ pub mod recovery;
+ pub mod relay;
++pub mod message;
+ 
+ const TEMPLATE: &str = "monzero-bch-funding-template-v1";
+ const PIN: &str = "monzero-bch-funding-pin-v2";
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message.rs
+@@ -0,0 +1,185 @@
++//! Authenticated exact funding handoff. Parent bytes validate values/signatures,
++//! not chain membership. A receipt never authorizes XMZ funding or key release.
++use super::*;
++use crate::bch_rpc::{BchRpc,observation::FundingObservation};
++use bitcoin::{consensus::serialize,Script};
++use serde_json::Value;
++use swap_core::bch::funding::SignedFunding;
++
++const FRAME: &str = "monzero-bch-funding-message-v1";
++const RECORD: &str = "monzero-bch-funding-message-record-v1";
++const MAX_FRAME: usize = 1_500_000;
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Frame {
++    schema: String, quote: [u8;32], agreement: [u8;32], swap: String,
++    unsigned: Vec<u8>, signed: Vec<u8>, sources: Vec<Vec<u8>>, change: Vec<u8>,
++    maximum_fee: u64, minimum_change: u64,
++}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Record {
++    schema: String, admission: [u8;32], at: u64, frame: Value, signature: Option<Vec<u8>>,
++}
++pub struct AuthenticatedFunding { frame: Vec<u8>, signature: Vec<u8>, signed: SignedFunding }
++impl AuthenticatedFunding {
++    pub fn frame(&self) -> &[u8] { &self.frame }
++    pub fn signature(&self) -> &[u8] { &self.signature }
++    pub fn signed(&self) -> &SignedFunding { &self.signed }
++}
++pub fn signing_bytes(frame: &[u8]) -> Result<Vec<u8>> {
++    ensure!(!frame.is_empty() && frame.len() <= MAX_FRAME,"invalid BCH funding message size");
++    let mut message = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:",FRAME.len(),FRAME,frame.len()).into_bytes();
++    message.extend_from_slice(frame); Ok(message)
++}
++fn optional(journal: &Journal,name: &str) -> Result<Option<Vec<u8>>> {
++    match journal.read(name) {
++        Ok(bytes) => Ok(Some(bytes)),
++        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound) => Ok(None),
++        Err(e) => Err(e),
++    }
++}
++impl AdmittedExecution<'_> {
++    fn message_context(&self,now: u64) -> Result<AgreedNativeWallet> {
++        self.quote.check_policy(self.policy,now)?;
++        ensure!(now >= self.read_admission()?.admitted_at,"BCH funding message predates admission");
++        self.restore_agreement()
++    }
++    fn check_funding_message(&self,bytes: &[u8]) -> Result<SignedFunding> {
++        ensure!(!bytes.is_empty() && bytes.len() <= MAX_FRAME,"invalid BCH funding message size");
++        let frame: Frame = serde_json::from_slice(bytes)?;
++        let agreed = self.restore_agreement()?;
++        ensure!(frame.schema == FRAME && frame.quote == *self.quote.commitment()
++            && frame.agreement == *agreed.commitment() && frame.swap == self.quote.terms()["swapId"]
++            && serde_json::to_vec(&serde_json::to_value(&frame)?)? == bytes,"BCH funding message context or encoding mismatch");
++        ensure!(frame.maximum_fee > 0 && frame.maximum_fee <= self.quote.terms()["bchFundingFeeMaxAtoms"].parse::<u64>()?
++            && frame.minimum_change >= self.quote.terms()["bchMinimumOutputAtoms"].parse::<u64>()?,
++            "BCH funding message fee/change policy differs from quote");
++        let sources: Vec<_> = frame.sources.iter().map(Vec::as_slice).collect();
++        let preview = FundingPreview::verify(&frame.unsigned,&sources,self.quote.recovery_plan().lock(),
++            self.quote.recovery_plan().terms().locked_atoms,Script::from_bytes(&frame.change),
++            frame.maximum_fee,frame.minimum_change)?;
++        preview.verify_signed(&frame.signed)
++    }
++    fn authenticate_funding_message(&self,bytes: &[u8],signature: &[u8]) -> Result<SignedFunding> {
++        let identity = &self.quote.terms()[Role::BchFunder.identity()]; let mut pin = [0;32];
++        for (i,byte) in pin.iter_mut().enumerate() { *byte = u8::from_str_radix(&identity[i*2..i*2+2],16)?; }
++        VerifyingKey::from_bytes(&pin)?.verify_strict(&signing_bytes(bytes)?,&Signature::from_slice(signature)?)?;
++        self.check_funding_message(bytes)
++    }
++
++    // Relay review checks capacity/encoding before publication can lock funds.
++    // This helper does not expose the frame beyond the funding implementation.
++    pub(super) fn funding_message_material(&self) -> Result<Vec<u8>> {
++        ensure!(self.role == Role::BchFunder,"only BCH funder prepares a funding message");
++        let prepared = self.prepared_bch_funding()?.context("missing BCH funding preparation")?;
++        let bytes = Journal::open(&self.snapshots)?.read(&record_name(self.quote,"template"))?;
++        ensure!(hash(TEMPLATE,&bytes) == *prepared.commitment(),"BCH funding source template changed");
++        let template: Template = serde_json::from_slice(&bytes)?;
++        let signed = self.signed_bch_funding()?.context("missing exact signed BCH funding")?;
++        let agreed = self.restore_agreement()?;
++        let frame = Frame {schema:FRAME.into(),quote:*self.quote.commitment(),agreement:*agreed.commitment(),
++            swap:self.quote.terms()["swapId"].clone(),unsigned:template.unsigned,
++            signed:serialize(signed.transaction()),sources:template.sources,change:template.change,
++            maximum_fee:template.maximum_fee,minimum_change:template.minimum_change};
++        let bytes = serde_json::to_vec(&serde_json::to_value(&frame)?)?;
++        self.check_funding_message(&bytes)?;
++        Ok(bytes)
++    }
++
++    fn message_record(&self,stage: &str) -> Result<Option<(Record,Vec<u8>,SignedFunding)>> {
++        let Some(bytes) = optional(&self.metadata,&record_name(self.quote,stage))? else {return Ok(None)};
++        let record: Record = serde_json::from_slice(&bytes)?;
++        self.message_context(record.at)?;
++        ensure!(record.schema == RECORD && record.admission == self.admission_digest()?
++            && serde_json::to_vec(&record)? == bytes,"BCH funding message record changed");
++        let frame = serde_json::to_vec(&record.frame)?;
++        let signed = if stage == "message-prepared" {
++            ensure!(self.role == Role::BchFunder && record.signature.is_none(),"invalid BCH message preparation");
++            self.check_funding_message(&frame)?
++        } else {
++            self.authenticate_funding_message(&frame,record.signature.as_deref().context("missing BCH message identity signature")?)?
++        };
++        if self.role == Role::BchFunder {
++            ensure!(record.at >= self.acknowledged_bch_funding_at()? && self.funding_message_material()? == frame,
++                "BCH funding message differs from acknowledged funding");
++        } else {
++            let (_,sent_at) = self.outgoing_bch_refund_record()?.context("missing retained outgoing BCH refund protection")?;
++            ensure!(record.at >= sent_at,"BCH funding message predates outgoing refund protection");
++        }
++        Ok(Some((record,frame,signed)))
++    }
++
++    /// Retain the exact public frame before external identity signing. Only
++    /// acknowledged, explicitly approved BCH funding may be handed to the peer.
++    pub fn prepare_bch_funding_message(&mut self,now: u64) -> Result<Vec<u8>> {
++        ensure!(self.role == Role::BchFunder,"wrong BCH funding message sender");
++        self.message_context(now)?;
++        ensure!(now >= self.acknowledged_bch_funding_at()?,"BCH funding message predates relay approval");
++        if let Some((record,frame,_)) = self.message_record("message-prepared")? {
++            ensure!(now >= record.at,"BCH message preparation time moved backwards"); return Ok(frame)
++        }
++        let frame = self.funding_message_material()?;
++        let record = Record {schema:RECORD.into(),admission:self.admission_digest()?,at:now,
++            frame:serde_json::from_slice(&frame)?,signature:None};
++        self.metadata.retain(&record_name(self.quote,"message-prepared"),&serde_json::to_vec(&record)?)?;
++        Ok(frame)
++    }
++
++    /// Persist the signature before exposing the authenticated outgoing message.
++    pub fn retain_outgoing_bch_funding_message(&mut self,now: u64,signature: &[u8]) -> Result<AuthenticatedFunding> {
++        ensure!(self.role == Role::BchFunder,"wrong BCH funding message sender"); self.message_context(now)?;
++        let (prepared,frame,_) = self.message_record("message-prepared")?.context("missing BCH funding message preparation")?;
++        ensure!(now >= prepared.at,"BCH funding message signature predates preparation");
++        self.authenticate_funding_message(&frame,signature)?;
++        if let Some((old,_,_)) = self.message_record("message-outgoing")? {
++            ensure!(now >= old.at && old.frame == prepared.frame && old.signature.as_deref() == Some(signature),
++                "outgoing BCH funding message already retained differently");
++        } else {
++            let record = Record {schema:RECORD.into(),admission:self.admission_digest()?,at:now,
++                frame:prepared.frame,signature:Some(signature.to_vec())};
++            self.metadata.retain(&record_name(self.quote,"message-outgoing"),&serde_json::to_vec(&record)?)?;
++        }
++        self.outgoing_bch_funding_message()?.context("BCH outgoing funding message was not retained")
++    }
++
++    pub fn outgoing_bch_funding_message(&self) -> Result<Option<AuthenticatedFunding>> {
++        ensure!(self.role == Role::BchFunder,"wrong BCH funding message sender");
++        let Some((record,frame,signed)) = self.message_record("message-outgoing")? else {return Ok(None)};
++        let (prepared,original,_) = self.message_record("message-prepared")?.context("missing BCH funding message preparation")?;
++        ensure!(record.at >= prepared.at && frame == original,"outgoing BCH funding message differs from preparation");
++        Ok(Some(AuthenticatedFunding {frame,signature:record.signature.context("missing BCH message signature")?,signed}))
++    }
++
++    /// Authenticate and persist before observing the contract on the owned node.
++    /// Peer claims alone cannot authorize XMZ payment or success-signature release.
++    pub fn accept_bch_funding_message(&mut self,now: u64,frame: &[u8],signature: &[u8]) -> Result<AuthenticatedFunding> {
++        ensure!(self.role == Role::NativeFunder,"wrong BCH funding message receiver"); self.message_context(now)?;
++        let (_,sent_at) = self.outgoing_bch_refund_record()?.context("missing outgoing BCH refund protection")?;
++        ensure!(now >= sent_at,"BCH funding message predates outgoing refund");
++        self.authenticate_funding_message(frame,signature)?;
++        if let Some((record,old,_)) = self.message_record("message-received")? {
++            ensure!(now >= record.at && old == frame && record.signature.as_deref() == Some(signature),
++                "received BCH funding message already retained differently");
++        } else {
++            let record = Record {schema:RECORD.into(),admission:self.admission_digest()?,at:now,
++                frame:serde_json::from_slice(frame)?,signature:Some(signature.to_vec())};
++            self.metadata.retain(&record_name(self.quote,"message-received"),&serde_json::to_vec(&record)?)?;
++        }
++        self.received_bch_funding_message()?.context("BCH funding receipt was not retained")
++    }
++
++    /// Historical receipt restoration does not renew quote validity.
++    pub fn received_bch_funding_message(&self) -> Result<Option<AuthenticatedFunding>> {
++        ensure!(self.role == Role::NativeFunder,"wrong BCH funding message receiver");
++        let Some((record,frame,signed)) = self.message_record("message-received")? else {return Ok(None)};
++        Ok(Some(AuthenticatedFunding {frame,signature:record.signature.context("missing BCH message signature")?,signed}))
++    }
++
++    pub async fn observe_received_bch_funding(&self,backend: &BchRpc) -> Result<FundingObservation> {
++        ensure!(backend.network().quote_name() == self.quote.terms()["bchNetwork"]
++            && backend.network().genesis() == self.quote.terms()["bchGenesis"],"BCH peer funding observer has another network");
++        let message = self.received_bch_funding_message()?.context("missing authenticated BCH funding receipt")?;
++        backend.observe_funding(message.signed()).await
++    }
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/relay.rs
+@@ -59,6 +59,7 @@
+         let (review,_,prepared_at,locked) = self.funding_relay_materials()?;
+         ensure!(now >= prepared_at && backend.deployment_commitment()? == locked.deployment,
+             "BCH funding relay predates recovery or targets another deployment");
++        self.funding_message_material()?; // Check new publication, not historical relay status.
+         Ok(review)
+     }
+ 
+@@ -89,6 +90,13 @@
+         ensure!(ack.schema == ACK && ack.intent == intent && ack.txid == txid
+             && serde_json::to_vec(&ack)? == bytes,"BCH relay acknowledgement changed");
+         Ok(Some(FundingRelayState::Acknowledged {txid}))
++    }
++
++    pub(super) fn acknowledged_bch_funding_at(&self) -> Result<u64> {
++        ensure!(matches!(self.bch_funding_relay_state()?,Some(FundingRelayState::Acknowledged {..})),
++            "BCH funding message requires acknowledged funding relay");
++        let (review,_,prepared_at,_) = self.funding_relay_materials()?;
++        Ok(self.relay_intent(&review,prepared_at)?.context("missing BCH relay intent")?.0.approved_at)
+     }
+ 
+     /// Broadcast once, only after explicit approval and fresh input checks.
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/refund.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/refund.rs
+@@ -123,6 +123,13 @@
+         Ok(self.received_bch_refund_record()?.map(|(encrypted,_,_)|encrypted))
+     }
+ 
++    pub(super) fn outgoing_bch_refund_record(&self) -> Result<Option<(OutgoingRefund,u64)>> {
++        ensure!(self.role == Role::NativeFunder,"wrong BCH outgoing refund owner");
++        let Some(bytes) = optional(&self.metadata,&name(self.quote,self.role,"authenticated"))? else {return Ok(None)};
++        let (receipt,_) = self.refund_receipt(&bytes)?;
++        Ok(Some((OutgoingRefund {frame:receipt.signed.bytes.clone(),signature:receipt.signed.signature.clone()},receipt.signed.admitted_at)))
++    }
++
+     pub(super) fn received_bch_refund_record(&self) -> Result<Option<(EncryptedSignature,[u8;32],u64)>> {
+         ensure!(self.role == Role::BchFunder,"wrong BCH refund receipt owner");
+         let Some(bytes) = optional(&self.metadata,&name(self.quote,self.role,"authenticated"))? else {return Ok(None)};
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay.rs
+@@ -32,6 +32,7 @@
+         assert!(execution.bch_funding_relay_state()?.is_none());
+         if mode == 0 {
+             assert!(rpc.relay_funding(signed,std::time::Instant::now()).await.is_err());
++            assert!(execution.prepare_bch_funding_message(1018).is_err());
+             let pin = metadata.0.join(format!("{swap}.bch-funding-recovery-pin"));
+             let saved = std::fs::read(&pin)?; std::fs::remove_file(&pin)?;
+             assert!(execution.review_bch_funding_relay(rpc,1018).is_err());
+@@ -54,6 +55,7 @@
+         let result = execution.relay_bch_funding(rpc,&review.commitment,1018).await;
+         assert_eq!(server.state.lock().unwrap().relay_calls,calls+1);
+         assert!(intent.is_file());
++        if mode == 0 { message::exercise(&mut execution,setup,snapshots,rpc,server,txid).await?; }
+         let expected = if mode == 0 {
+             assert_eq!(result?,txid); assert!(ack.is_file());
+             assert_eq!(execution.relay_bch_funding(rpc,&review.commitment,1019).await?,txid);
+@@ -61,6 +63,7 @@
+             FundingRelayState::Acknowledged {txid}
+         } else {
+             assert!(result.is_err()); assert!(!ack.exists());
++            assert!(execution.prepare_bch_funding_message(1019).is_err());
+             assert!(execution.relay_bch_funding(rpc,&review.commitment,1019).await.is_err());
+             FundingRelayState::Attempted {txid}
+         };
+@@ -70,6 +73,7 @@
+         // Historical state survives expiry; submission cannot renew approval.
+         assert!(execution.relay_bch_funding(rpc,&review.commitment,2000).await.is_err());
+         if mode == 0 {
++            assert_eq!(execution.outgoing_bch_funding_message()?.unwrap().signed().lock_outpoint().txid,txid);
+             let saved = std::fs::read(&ack)?; std::fs::write(&ack,b"{}")?;
+             assert!(execution.bch_funding_relay_state().is_err());
+             assert!(execution.relay_bch_funding(rpc,&review.commitment,1019).await.is_err());
+@@ -88,3 +92,5 @@
+     assert_eq!(state.sign_calls,1);
+     Ok(())
+ }
++
++mod message;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message.rs
+@@ -0,0 +1,68 @@
++use super::*;
++use agreement::execution::funding::message;
++
++pub(super) async fn exercise(sender: &mut AdmittedExecution<'_>,setup: &Setup,snapshots: &PrivateStore,
++    rpc: &BchRpc,server: &Server,txid: Txid) -> Result<()> {
++    let (n,nv,initial) = selected_with_outgoing(setup,&snapshots.0,1)?;
++    let (_,bv,_) = selected_with_outgoing(setup,&snapshots.0,0)?;
++    let (wallet,received) = n.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++        1003,nv.commitment(),bv.frame(),bv.signature())?;
++    let ack = wallet.acknowledgement(&setup.quote)?;
++    let agreed = wallet.accept_agreement(&setup.quote,&setup.policy,1004,&ack,
++        &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++    let agreement = agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder,&agreed)?;
++    let pins = NegotiationPins {initial,selection:*n.commitment(),outgoing:*nv.commitment(),received,agreement};
++    let metadata = PrivateStore::new()?;
++    let mut native = AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++        Role::NativeFunder,setup.quote.commitment(),pins,1005)?;
++    let key = SigningKey::from_bytes(&[1;32]); let wrong = SigningKey::from_bytes(&[2;32]);
++    assert!(sender.prepare_bch_funding_message(1017).is_err());
++    let frame = sender.prepare_bch_funding_message(1020)?;
++    assert_eq!(sender.prepare_bch_funding_message(1021)?,frame);
++    assert!(sender.prepare_bch_funding_message(1019).is_err());
++    assert!(native.prepare_bch_funding_message(1020).is_err());
++    let signature = key.sign(&message::signing_bytes(&frame)?).to_bytes();
++    assert!(sender.retain_outgoing_bch_funding_message(1021,&wrong.sign(&message::signing_bytes(&frame)?).to_bytes()).is_err());
++    let outgoing = sender.retain_outgoing_bch_funding_message(1021,&signature)?;
++    assert_eq!(outgoing.signed().lock_outpoint().txid,txid);
++    assert_eq!(sender.outgoing_bch_funding_message()?.unwrap().frame(),frame);
++    assert!(sender.accept_bch_funding_message(1022,&frame,&signature).is_err());
++    assert!(native.accept_bch_funding_message(1022,&frame,&signature).is_err());
++    let refund = native.prepare_bch_refund_adaptor(1006)?;
++    let refund_signature = wrong.sign(&agreement::refund::signing_bytes(&refund)?).to_bytes();
++    native.retain_outgoing_bch_refund(1007,&refund_signature)?;
++    assert!(native.accept_bch_funding_message(1022,&frame,&wrong.sign(&message::signing_bytes(&frame)?).to_bytes()).is_err());
++    for field in ["schema","quote","agreement","swap","signed","sources","maximum_fee","minimum_change"] {
++        let mut changed: Value = serde_json::from_slice(&frame)?;
++        changed[field] = match field {
++            "schema"|"swap" => json!("changed"), "maximum_fee" => json!(5001), "minimum_change" => json!(1),
++            _ => json!([]),
++        };
++        let bytes = serde_json::to_vec(&changed)?;
++        let signature = key.sign(&message::signing_bytes(&bytes)?).to_bytes();
++        assert!(native.accept_bch_funding_message(1022,&bytes,&signature).is_err(),"changed {field}");
++    }
++    let mut noncanonical = frame.clone(); noncanonical.push(b' ');
++    let bad_signature = key.sign(&message::signing_bytes(&noncanonical)?).to_bytes();
++    assert!(native.accept_bch_funding_message(1022,&noncanonical,&bad_signature).is_err());
++    assert!(native.accept_bch_funding_message(1006,&frame,&signature).is_err());
++    assert!(native.accept_bch_funding_message(2000,&frame,&signature).is_err());
++    let received = native.accept_bch_funding_message(1022,&frame,&signature)?;
++    assert_eq!(received.signed().lock_outpoint().txid,txid);
++    assert_eq!(native.accept_bch_funding_message(1023,&frame,&signature)?.frame(),frame);
++    assert!(native.accept_bch_funding_message(1021,&frame,&signature).is_err());
++    server.state.lock().unwrap().observation_mode = 0;
++    assert_eq!(native.observe_received_bch_funding(rpc).await?.status(),
++        crate::bch_rpc::observation::FundingStatus::ConfirmedUnspent {confirmations:3});
++    drop(native);
++    let native = AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++    assert_eq!(native.received_bch_funding_message()?.unwrap().frame(),frame);
++    let record = metadata.0.join(format!("{}.bch-funding-message-received",setup.quote.terms()["swapId"]));
++    let saved = std::fs::read(&record)?; std::fs::write(&record,b"{}")?;
++    assert!(native.received_bch_funding_message().is_err());
++    assert!(native.observe_received_bch_funding(rpc).await.is_err());
++    std::fs::write(&record,saved)?;
++    assert_eq!(native.received_bch_funding_message()?.unwrap().signed().lock_outpoint().txid,txid);
++    server.state.lock().unwrap().observation_mode = 2;
++    Ok(())
++}

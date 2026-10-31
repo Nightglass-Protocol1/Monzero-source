@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/bitcoin-cash-node/bitcoin-cash-node",
+  "commit": "89a591f7c5b1fd110c0819377ad8f2647d656800",
+  "tag": "v29.0.0",
+  "license": "MIT; COPYING retained in bchn-source-review-89a591f7c5b1",
+  "sha256": {
+    "src/rpc/rawtransaction.cpp": "7510615f8e0e549492f1ca9838ab4d86be6b53ba2a868c37acf9ea7ad8e5303e"
+  },
+  "review": "sendrawtransaction accepts serialized hex plus an allowhighfees boolean, default false, and returns the transaction hash. This adapter always passes false and validates the exact expected hash."
+}

@@ -75,6 +75,18 @@ Rectangle {
                 }
             }
 
+            Image {
+                Layout.fillWidth: true
+                Layout.preferredHeight: width / 3
+                Layout.bottomMargin: 12
+                source: "qrc:///images/branding/monzero-banner.jpg"
+                fillMode: Image.PreserveAspectFit
+                smooth: true
+                mipmap: true
+                Accessible.name: "Monzero. Private by design. Open by nature."
+                Accessible.role: Accessible.Graphic
+            }
+
             WizardMenuItem {
                 id: createWalletButton
                 headerText: {

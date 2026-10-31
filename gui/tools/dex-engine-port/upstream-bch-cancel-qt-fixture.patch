@@ -1,0 +1,61 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/cancellation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/cancellation.rs
+@@ -23,6 +23,17 @@
+ pub(super) fn exercise(setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
+     server: &Server,rpc: &BchRpc,signed: &SignedFunding,helper: &std::path::Path,
+     admission: &std::path::Path,script: &bitcoin::Script) -> Result<()> {
++    let program=match (std::env::var_os("MONZERO_BCH_QT_CANCEL_PROBE"),std::env::var_os("MONZERO_BCH_QT_CANCEL_PROBE_SHA256")) {
++        (None,None)=>helper.to_path_buf(),
++        (Some(path),Some(expected))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && expected.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),"invalid Qt cancellation probe pin");
++            path
++        }
++        _=>anyhow::bail!("incomplete Qt cancellation probe configuration"),
++    };
++    let via_qt=program!=helper;
+     let secrets=contents(&snapshots.0)?;
+     let original:Value=serde_json::from_slice(&std::fs::read(admission)?)?;
+     for mode in [0,1] {
+@@ -55,29 +66,30 @@
+         }
+         let calls=server.state.lock().unwrap().cancel_relay_calls;
+         let before=contents(&copied.0)?;
+-        let reviewed=invoke(helper,&wrapper,"review",None,true)?;
++        let reviewed=invoke(&program,&wrapper,"review",None,true)?;
+         let approval=reviewed["review"]["commitment"].as_str().context("missing commitment")?;
+         assert_eq!(reviewed["review"]["details"]["txid"],txid);
+-        assert_eq!(invoke(helper,&wrapper,"status",None,true)?["relay"]["state"],"not-attempted");
+-        invoke(helper,&submission,"submit",Some(&"00".repeat(32)),false)?;
++        assert_eq!(invoke(&program,&wrapper,"status",None,true)?["relay"]["state"],"not-attempted");
++        invoke(&program,&submission,"submit",Some(&"00".repeat(32)),false)?;
+         assert_eq!(contents(&copied.0)?,before);
+         server.state.lock().unwrap().observation_mode=0;
+-        invoke(helper,&submission,"submit",Some(approval),false)?;
++        invoke(&program,&submission,"submit",Some(approval),false)?;
+         assert!(!intent.exists());assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls);
+         server.state.lock().unwrap().observation_mode=23;
+-        invoke(helper,&submission,"submit",Some(approval),mode==0)?;
++        invoke(&program,&submission,"submit",Some(approval),mode==0)?;
+         assert!(intent.exists());assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls+1);
+         let state=if mode==0 {"acknowledged"} else {"attempted"};
+-        assert_eq!(invoke(helper,&wrapper,"status",None,true)?["relay"],json!({"state":state,"txid":txid,"confirmed":false}));
+-        invoke(helper,&submission,"submit",Some(approval),mode==0)?;
++        assert_eq!(invoke(&program,&wrapper,"status",None,true)?["relay"],json!({"state":state,"txid":txid,"confirmed":false}));
++        // Qt deliberately disables a second submission even after acknowledgement.
++        invoke(&program,&submission,"submit",Some(approval),mode==0 && !via_qt)?;
+         assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls+1);
+-        let observed=invoke(helper,&submission,"observe",None,true)?;
++        let observed=invoke(&program,&submission,"observe",None,true)?;
+         assert_eq!(observed["observation"]["txid"],txid);assert_eq!(observed["observation"]["confirmations"],"3");
+         assert_eq!(observed["relay"]["state"],state);
+         server.state.lock().unwrap().redemption_confirmation_mode=1;
+-        invoke(helper,&submission,"observe",None,false)?;
++        invoke(&program,&submission,"observe",None,false)?;
+         server.state.lock().unwrap().redemption_confirmation_mode=0;
+-        assert_eq!(invoke(helper,&wrapper,"status",None,true)?["relay"]["state"],state);
++        assert_eq!(invoke(&program,&wrapper,"status",None,true)?["relay"]["state"],state);
+         assert_eq!(server.state.lock().unwrap().cancel_relay_calls,calls+1);
+         assert_eq!(contents(&snapshots.0)?,secrets);
+     }

@@ -41,6 +41,17 @@ private slots:
         t.quoteExpiry = 200; t.refundDeadline = 300; t.feeFromAcquiredXmz = true;
         const auto original = SettlementTerms::build(t, 100);
         QVERIFY(original.valid);
+        // Preview registration must not extend the Bitcoin-shaped signing domain.
+        for (const QString &asset : {QString("XMR"), QString("DOGE"), QString("ETH"), QString("RUNE")}) {
+            auto substituted = t;
+            substituted.payAsset = asset;
+            QCOMPARE(SettlementTerms::build(substituted, 100).error, QString("Unsupported asset pair"));
+            QVERIFY(!SettlementTerms::rebuildAccepted(substituted).valid);
+            substituted = t;
+            substituted.receiveAsset = asset;
+            QCOMPARE(SettlementTerms::build(substituted, 100).error, QString("Unsupported asset pair"));
+            QVERIFY(!SettlementTerms::rebuildAccepted(substituted).valid);
+        }
         QCOMPARE(original.commitment, SettlementTerms::build(t, 100).commitment);
         const auto acceptedAfterExpiry = SettlementTerms::rebuildAccepted(t);
         QVERIFY(acceptedAfterExpiry.valid);
@@ -64,6 +75,16 @@ private slots:
         QVERIFY(!SettlementTerms::build(changed, 100).valid);
         changed = t; changed.feeAtomic = "01";
         QVERIFY(!SettlementTerms::build(changed, 100).valid);
+        // The fee-free native BTC/XMZ milestone must use a distinct signing
+        // domain, not reinterpret fee-bearing V7 quotes (including recovery).
+        changed = t; changed.feeAtomic = "0";
+        QVERIFY(!SettlementTerms::build(changed, 100).valid);
+        QVERIFY(!SettlementTerms::rebuildAccepted(changed).valid);
+        changed.feeRecipient.clear();
+        changed.xmzFeeLockCommitment.clear();
+        changed.xmzFeeRefundCommitment.clear();
+        QVERIFY(!SettlementTerms::build(changed, 100).valid);
+        QVERIFY(!SettlementTerms::rebuildAccepted(changed).valid);
         changed = t; changed.feeFromAcquiredXmz = false;
         QVERIFY(!SettlementTerms::build(changed, 100).valid);
         changed = t; changed.xmzGenesis = QString(64, 'c');

@@ -1,0 +1,299 @@
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index b8e3d6adb..8c1babc28 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -8,6 +8,7 @@
+ pub mod fee_estimation;
+ pub mod relay;
+ pub mod spendable;
++pub mod spend_journal;
+ pub mod wallet_session;
+ use anyhow::{Context, Result, ensure};
+ use serde_json::{Value, json};
+diff --git a/swap-machine/src/native_funding_rpc/spendable.rs b/swap-machine/src/native_funding_rpc/spendable.rs
+index 4cc78bd59..e4ac8b898 100644
+--- a/swap-machine/src/native_funding_rpc/spendable.rs
++++ b/swap-machine/src/native_funding_rpc/spendable.rs
+@@ -13,8 +13,8 @@
+ //! Treat this file as the least reviewed code in the module, even relative to
+ //! `relay.rs` -- it is newly designed, not just newly written.
+ //!
+-//! Single-shot, same as `relay` itself: calling this twice for the same swap
+-//! risks a duplicate broadcast. No decode-from-untrusted-bytes entry point;
++//! A durable intent prevents another spend of the same lock through this path
++//! when the same caller-controlled journal directory is retained. No decode-from-untrusted-bytes entry point;
+ //! every parameter must already come from the caller's own verified swap state
+ //! (e.g. `bob::State5`), never from a peer or the GUI.
+ use super::relay::{NativeTransferRelay, RelayRequest, RelayedTransfer};
+@@ -25,6 +25,7 @@ use anyhow::{Result, ensure};
+ use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
+ 
+ pub struct SpendRequest {
++    pub journal_directory: std::path::PathBuf,
+     pub id: SwapWalletId,
+     pub password: String,
+     pub spend_key: String,
+@@ -38,6 +39,12 @@ pub struct SpendRequest {
+     pub priority: u32,
+ }
+ 
++pub struct SpendOutcome {
++    pub transfer: RelayedTransfer,
++    pub receipt_persisted: bool,
++    pub wallet_closed: bool,
++}
++
+ /// Connects three independent RPC clients to the same wallet-rpc/daemon
+ /// service, one per primitive, matching this module's existing convention
+ /// that each primitive exclusively owns its own client rather than sharing
+@@ -48,18 +55,12 @@ pub struct SpendRequest {
+ /// After a successful restore, attempts to close that wallet on normal return,
+ /// success or failure. A failed restore must not close a pre-existing wallet.
+ /// Cancellation can skip cleanup and requires caller-owned reconciliation.
+-/// This prevents an ordinarily completed call from leaving the wallet-rpc
+-/// service wedged with a wallet open for every later caller (including a
+-/// caller's own next attempt). A close failure is deliberately never allowed
+-/// to override the real outcome: if the relay already succeeded, the funds
+-/// already moved, and reporting that as an error here -- just because
+-/// cleanup afterward also failed -- would be actively dangerous, since a
+-/// caller who believes the operation failed may reasonably retry it, and
+-/// `relay` has no protection against a resulting double spend. A close
+-/// failure here is silent by design, not overlooked; there is no logging
+-/// facility in this module to report it through instead.
++/// A successful relay remains successful even if receipt persistence or close
++/// fails; those health flags are returned separately in SpendOutcome. The
++/// retained intent blocks blind resubmission. An error or cancellation requires
++/// reconciliation; neither means the wallet was closed or the transfer absent.
+ pub async fn swap_wallet_spendable(daemon: u16, wallet_port: u16, username: String, password: String,
+-    network: XmzNetwork, expected_genesis: &str, request: SpendRequest) -> Result<RelayedTransfer> {
++    network: XmzNetwork, expected_genesis: &str, request: SpendRequest) -> Result<SpendOutcome> {
+     ensure!(request.wallet.network() == network && request.destination.network() == network,
+         "spendable request network mismatch");
+     let mut session = NativeWalletSession::new(
+@@ -68,13 +69,13 @@ pub async fn swap_wallet_spendable(daemon: u16, wallet_port: u16, username: Stri
+         request.password.clone(), &request.wallet).await?;
+     let result = import_and_spend(&mut session, daemon, wallet_port, username, password,
+         expected_genesis, &request).await;
+-    let _ = session.close(&request.wallet).await;
+-    result
++    let wallet_closed = session.close(&request.wallet).await.is_ok();
++    result.map(|mut outcome| { outcome.wallet_closed = wallet_closed; outcome })
+ }
+ 
+ async fn import_and_spend(session: &mut NativeWalletSession, daemon: u16, wallet_port: u16,
+     username: String, password: String, expected_genesis: &str,
+-    request: &SpendRequest) -> Result<RelayedTransfer> {
++    request: &SpendRequest) -> Result<SpendOutcome> {
+     session.import_transaction(&request.lock_txid, &request.wallet).await?;
+ 
+     let mut estimator = NativeFeeEstimator::new(
+@@ -86,5 +87,9 @@ async fn import_and_spend(session: &mut NativeWalletSession, daemon: u16, wallet
+     let mut relay = NativeTransferRelay::new(NativeFundingRpc::new(daemon, wallet_port, username, password)?);
+     let spend = RelayRequest { wallet: request.wallet.clone(), destination: request.destination.clone(),
+         amount: request.amount, account: request.account, priority: request.priority };
+-    relay.relay(spend, expected_genesis).await
++    let journal = super::spend_journal::SpendJournal::reserve(
++        &request.journal_directory, expected_genesis, request)?;
++    let transfer = relay.relay(spend, expected_genesis).await?;
++    let receipt_persisted = journal.record_relay(&transfer).is_ok();
++    Ok(SpendOutcome { transfer, receipt_persisted, wallet_closed: false })
+ }
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index c8f15d006..a85078a2a 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -107,6 +107,8 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+     let (daemon, wallet_port, username, password) = native_rpc::fixture_connection()?;
+ 
+     let request = |id: SwapWalletId| SpendRequest {
++        journal_directory: std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_SPEND_RESULT")
++            .expect("private fixture result path")).parent().expect("fixture directory").to_owned(),
+         id, password: "fixture-password".into(), spend_key: spend_key.clone(), view_key: view_key.clone(),
+         restore_height, lock_txid: lock_txid.clone(), wallet: wallet.clone(), destination: destination.clone(),
+         amount, account: 0, priority: 1,
+@@ -138,8 +140,13 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+     // the first attempt's wallet was actually closed, not left wedged open.
+     let relayed = swap_wallet_spendable(daemon, wallet_port, username, password,
+         XmzNetwork::Mainnet, genesis, request(SwapWalletId::new(Uuid::new_v4())?)).await?;
+-    anyhow::ensure!(relayed.fee.atoms() > 0 && relayed.weight > 0, "invalid relayed transfer");
+-    anyhow::ensure!(export_fixture("MONZERO_TEST_SPEND_RESULT", &format!("{}\n", relayed.txid))?,
++    anyhow::ensure!(relayed.receipt_persisted && relayed.wallet_closed, "spend cleanup or receipt failed");
++    anyhow::ensure!(relayed.transfer.fee.atoms() > 0 && relayed.transfer.weight > 0, "invalid relayed transfer");
++    // A new retry UUID cannot bypass the durable lock identity reservation.
++    anyhow::ensure!(swap_machine::native_funding_rpc::spend_journal::SpendJournal::reserve(
++        &request(SwapWalletId::new(Uuid::new_v4())?).journal_directory, genesis,
++        &request(SwapWalletId::new(Uuid::new_v4())?)).is_err(), "duplicate durable intent accepted");
++    anyhow::ensure!(export_fixture("MONZERO_TEST_SPEND_RESULT", &format!("{}\n", relayed.transfer.txid))?,
+         "missing spend fixture result path");
+     Ok(())
+ }
+diff --git a/swap-machine/src/native_funding_rpc/spend_journal.rs b/swap-machine/src/native_funding_rpc/spend_journal.rs
+new file mode 100644
+index 000000000..2fabfff33
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/spend_journal.rs
+@@ -0,0 +1,164 @@
++//! Local single-use spend intents. Caller supplies an exclusively controlled,
++//! durable private directory, never a peer-selected or temporary production path.
++//! Pending intent means reconcile, not retry. No reset/delete operation is exposed.
++use anyhow::{Result, ensure};
++use serde_json::json;
++use sha2::{Digest, Sha256};
++use std::{fs::{File, OpenOptions}, io::Write, path::Path};
++use super::{relay::RelayedTransfer, spendable::SpendRequest};
++
++pub struct SpendJournal {
++    directory: File,
++    receipt: String,
++}
++
++impl SpendJournal {
++    /// Durably reserves one locked output before any relay can be attempted.
++    /// Filename excludes mutable destination, amount and retry UUID deliberately.
++    #[cfg(unix)]
++    pub fn reserve(directory: &Path, genesis: &str, request: &SpendRequest) -> Result<Self> {
++        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++        ensure!(directory.is_absolute() && directory.canonicalize()? == directory,
++            "journal directory must be canonical and absolute");
++        let parent = OpenOptions::new().read(true)
++            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(directory)?;
++        let metadata = parent.metadata()?;
++        ensure!(metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() }
++            && metadata.mode() & 0o077 == 0, "journal directory must be private and owned");
++        ensure!(canonical_hash(genesis) && canonical_hash(&request.lock_txid), "invalid journal chain or lock");
++        let wallet = request.wallet.to_string();
++        let mut digest = Sha256::new();
++        digest.update(b"monzero-native-spend-journal-v1\0");
++        for field in [genesis, wallet.as_str(), request.lock_txid.as_str()] {
++            digest.update((field.len() as u64).to_be_bytes());
++            digest.update(field.as_bytes());
++        }
++        let identity = format!("{:x}", digest.finalize());
++        let intent = json!({"schema":"monzero-native-spend-intent-v1", "genesis":genesis,
++            "wallet":wallet, "lockTxid":request.lock_txid,
++            "destination":request.destination.to_string(), "amountAtoms":request.amount.atom_string(),
++            "account":request.account, "priority":request.priority});
++        // O_EXCL is the cross-process reservation. Existing, malformed and
++        // truncated records all fail closed. Never truncate or remove them.
++        let mut file = create_record(&parent, &format!("{identity}.intent"))?;
++        file.write_all(&serde_json::to_vec(&intent)?)?;
++        file.sync_all()?;
++        parent.sync_all()?;
++        Ok(Self { directory: parent, receipt: format!("{identity}.receipt") })
++    }
++
++    #[cfg(not(unix))]
++    pub fn reserve(_: &Path, _: &str, _: &SpendRequest) -> Result<Self> {
++        anyhow::bail!("native spend journal not implemented on this platform")
++    }
++
++    /// Receipt failure must never erase a successful broadcast result. Caller
++    /// reports persistence health separately and reconciles the retained intent.
++    #[cfg(unix)]
++    pub fn record_relay(&self, transfer: &RelayedTransfer) -> Result<()> {
++        ensure!(canonical_hash(&transfer.txid), "invalid journal relay hash");
++        let value = json!({"schema":"monzero-native-spend-receipt-v1", "txid":transfer.txid,
++            "feeAtoms":transfer.fee.atom_string(), "weight":transfer.weight});
++        let mut file = create_record(&self.directory, &self.receipt)?;
++        file.write_all(&serde_json::to_vec(&value)?)?;
++        file.sync_all()?;
++        self.directory.sync_all()?;
++        Ok(())
++    }
++
++    #[cfg(not(unix))]
++    pub fn record_relay(&self, _: &RelayedTransfer) -> Result<()> {
++        anyhow::bail!("native spend journal not implemented on this platform")
++    }
++}
++
++#[cfg(unix)]
++fn create_record(directory: &File, name: &str) -> Result<File> {
++    use std::os::fd::{AsRawFd, FromRawFd};
++    let name = std::ffi::CString::new(name)?;
++    // Anchor creation to the checked directory descriptor, not a path which
++    // could be replaced between validation and receipt persistence.
++    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(),
++        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
++    if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
++    Ok(unsafe { File::from_raw_fd(fd) })
++}
++
++fn canonical_hash(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++#[cfg(all(test, unix))]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
++    use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
++    use super::super::wallet_session::SwapWalletId;
++
++    fn request(directory: &Path) -> SpendRequest {
++        let wallet = XmzAddress::parse(XmzNetwork::Mainnet,
++            "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H").unwrap();
++        SpendRequest { journal_directory: directory.into(), id: SwapWalletId::new(uuid::Uuid::new_v4()).unwrap(),
++            password: String::new(), spend_key: String::new(), view_key: String::new(), restore_height: 0,
++            lock_txid: "b".repeat(64), destination: wallet.clone(), wallet,
++            amount: XmzAmount::from_atoms(1), account: 0, priority: 1 }
++    }
++
++    struct PrivateDirectory(std::path::PathBuf);
++    impl PrivateDirectory {
++        fn new() -> Self {
++            let path = std::env::temp_dir().canonicalize().unwrap().join(format!("xmz-journal-{}", uuid::Uuid::new_v4()));
++            std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
++            Self(path)
++        }
++    }
++    impl Drop for PrivateDirectory {
++        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
++    }
++
++    #[test]
++    fn durable_intent_rejects_new_uuid_and_changed_terms_after_reopen() -> Result<()> {
++        if let Some(path) = std::env::var_os("MONZERO_JOURNAL_REOPEN_CHILD") {
++            let path = std::path::PathBuf::from(path);
++            let error = SpendJournal::reserve(&path, &"a".repeat(64), &request(&path))
++                .err().expect("child accepted existing intent");
++            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::AlreadyExists);
++            return Ok(());
++        }
++        let directory = PrivateDirectory::new();
++        let genesis = "a".repeat(64);
++        let journal = SpendJournal::reserve(&directory.0, &genesis, &request(&directory.0))?;
++        drop(journal);
++        let child = std::process::Command::new(std::env::current_exe()?)
++            .args(["--exact", "native_funding_rpc::spend_journal::tests::durable_intent_rejects_new_uuid_and_changed_terms_after_reopen"])
++            .env("MONZERO_JOURNAL_REOPEN_CHILD", &directory.0).output()?;
++        assert!(child.status.success());
++        assert!(String::from_utf8_lossy(&child.stdout).contains("1 passed"));
++        let mut retry = request(&directory.0);
++        retry.amount = XmzAmount::from_atoms(2);
++        retry.priority = 2;
++        let error = SpendJournal::reserve(&directory.0, &genesis, &retry).err().expect("must reject");
++        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::AlreadyExists);
++        let record = std::fs::read_dir(&directory.0)?.next().unwrap()?.path();
++        assert_eq!(std::fs::metadata(&record)?.permissions().mode() & 0o777, 0o600);
++        // A torn record is not treated as permission to broadcast again.
++        std::fs::write(record, b"")?;
++        assert!(SpendJournal::reserve(&directory.0, &genesis, &retry).is_err());
++        Ok(())
++    }
++
++    #[test]
++    fn private_directory_and_write_once_receipt_are_required() -> Result<()> {
++        let directory = PrivateDirectory::new();
++        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o755))?;
++        assert!(SpendJournal::reserve(&directory.0, &"a".repeat(64), &request(&directory.0)).is_err());
++        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))?;
++        let journal = SpendJournal::reserve(&directory.0, &"a".repeat(64), &request(&directory.0))?;
++        let transfer = RelayedTransfer { txid: "c".repeat(64), fee: XmzAmount::from_atoms(1), weight: 1 };
++        journal.record_relay(&transfer)?;
++        assert!(journal.record_relay(&transfer).is_err());
++        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.0.join(&journal.receipt))?)?;
++        assert_eq!(value["txid"], transfer.txid);
++        Ok(())
++    }
++}

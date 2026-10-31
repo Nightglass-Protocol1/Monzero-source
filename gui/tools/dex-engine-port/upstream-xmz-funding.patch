@@ -1,0 +1,378 @@
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -1,6 +1,7 @@
+ pub mod alice;
+ pub mod bob;
+ pub mod common;
++pub mod xmz_funding;
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/swap-machine/src/xmz_funding.rs b/swap-machine/src/xmz_funding.rs
+new file mode 100644
+index 0000000..7794a89
+--- /dev/null
++++ b/swap-machine/src/xmz_funding.rs
+@@ -0,0 +1,361 @@
++//! Native funding verification against a caller-owned, trusted chain/wallet backend.
++//! Peer-supplied observations must never implement this trust boundary directly.
++use anyhow::{Result, ensure};
++use swap_core::{monero::TransferProof, xmz::XmzAmount, xmz_address::XmzAddress};
++
++pub struct FundingRequest {
++    pub address: XmzAddress,
++    pub amount: XmzAmount,
++    pub proof: TransferProof,
++}
++
++#[derive(Clone, PartialEq, Eq)]
++pub struct ChainSnapshot {
++    pub genesis: String,
++    pub tip_hash: String,
++    /// Height of the last block, not the chain's block count.
++    pub tip_height: u64,
++}
++
++#[derive(Clone)]
++pub struct FundingObservation {
++    pub txid: String,
++    pub address: String,
++    pub received_atoms: u64,
++    pub in_pool: bool,
++    pub height: u64,
++    pub confirmations: u64,
++}
++
++#[async_trait::async_trait]
++pub trait FundingObserver: Sync {
++    async fn snapshot(&self) -> Result<ChainSnapshot>;
++    /// Must verify the transaction key, destination and amount against native data.
++    async fn observe(&self, request: &FundingRequest) -> Result<FundingObservation>;
++}
++
++pub struct VerifiedFunding {
++    request: FundingRequest,
++    snapshot: ChainSnapshot,
++    height: u64,
++}
++
++impl VerifiedFunding {
++    pub fn request(&self) -> &FundingRequest { &self.request }
++    pub fn snapshot(&self) -> &ChainSnapshot { &self.snapshot }
++    pub fn height(&self) -> u64 { self.height }
++}
++
++/// `expected_genesis` and `required_confirmations` are local policy, not peer inputs.
++/// Evidence is point-in-time: revalidate before signing after delays or restarts.
++pub async fn verify(
++    observer: &impl FundingObserver,
++    request: FundingRequest,
++    expected_genesis: &str,
++    required_confirmations: u64,
++) -> Result<VerifiedFunding> {
++    ensure!(hash(expected_genesis) && hash(&request.proof.tx_hash.0), "invalid funding identity");
++    ensure!(required_confirmations > 0 && request.amount.atoms() > 0, "invalid funding policy");
++    let before = observer.snapshot().await?;
++    ensure!(before.genesis == expected_genesis && hash(&before.tip_hash), "unexpected native chain");
++    let observed = observer.observe(&request).await?;
++    ensure!(observed.txid == request.proof.tx_hash.0 && observed.address == request.address.to_string(),
++        "native funding identity mismatch");
++    ensure!(observed.received_atoms == request.amount.atoms(), "native funding amount mismatch");
++    ensure!(!observed.in_pool && observed.height > 0 && observed.height <= before.tip_height,
++        "native funding is not mined");
++    let depth = before.tip_height - observed.height + 1;
++    ensure!(observed.confirmations == depth && depth >= required_confirmations,
++        "native funding confirmation mismatch");
++    let after = observer.snapshot().await?;
++    ensure!(before == after, "native chain changed during funding verification");
++    Ok(VerifiedFunding { request, snapshot: after, height: observed.height })
++}
++
++fn hash(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct FundingPolicy {
++    network: String,
++    genesis: String,
++    confirmations: u64,
++    bitcoin_genesis: String,
++    bitcoin_confirmations: u64,
++}
++
++impl FundingPolicy {
++    pub fn new(network: swap_core::xmz_address::XmzNetwork, genesis: String, confirmations: u64,
++        bitcoin_network: bitcoin::Network, bitcoin_confirmations: u64) -> Result<Self> {
++        use swap_core::xmz_address::XmzNetwork;
++        let policy = Self { network: match network {
++            XmzNetwork::Mainnet => "mainnet", XmzNetwork::Testnet => "testnet", XmzNetwork::Stagenet => "stagenet",
++        }.into(), genesis, confirmations,
++            bitcoin_genesis: bitcoin::blockdata::constants::genesis_block(bitcoin_network).block_hash().to_string(),
++            bitcoin_confirmations };
++        policy.validate()?;
++        Ok(policy)
++    }
++
++    fn network(&self) -> Result<swap_core::xmz_address::XmzNetwork> {
++        use swap_core::xmz_address::XmzNetwork;
++        match self.network.as_str() {
++            "mainnet" => Ok(XmzNetwork::Mainnet), "testnet" => Ok(XmzNetwork::Testnet),
++            "stagenet" => Ok(XmzNetwork::Stagenet), _ => anyhow::bail!("invalid persisted XMZ network"),
++        }
++    }
++
++    fn validate(&self) -> Result<()> {
++        self.network()?;
++        ensure!(hash(&self.genesis) && self.confirmations > 0, "invalid persisted XMZ policy");
++        ensure!(hash(&self.bitcoin_genesis) && self.bitcoin_confirmations > 0, "invalid persisted Bitcoin policy");
++        Ok(())
++    }
++}
++
++const CHECKPOINT_DOMAIN: &str = "monzero-btc-xmz-pending-funding-v2";
++const MAX_CHECKPOINT_BYTES: usize = 1_048_576;
++
++/// Contains secret recovery material. Store only in protected local storage; never log.
++/// This codec is not encryption/authentication and cannot detect all state tampering.
++#[derive(serde::Serialize, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct PendingRecord {
++    domain: String,
++    swap_id: uuid::Uuid,
++    policy: FundingPolicy,
++    state: crate::bob::State3,
++    proof: TransferProof,
++}
++
++pub struct PendingFunding(PendingRecord);
++
++impl PendingFunding {
++    pub fn new(swap_id: uuid::Uuid, policy: FundingPolicy, state: crate::bob::State3, proof: TransferProof) -> Result<Self> {
++        policy.validate()?;
++        ensure!(hash(&proof.tx_hash.0) && state.xmr_amount().as_pico() > 0, "invalid pending funding");
++        Ok(Self(PendingRecord { domain: CHECKPOINT_DOMAIN.into(), swap_id, policy, state, proof }))
++    }
++
++    pub fn encode(&self) -> Result<Vec<u8>> {
++        let bytes = serde_json::to_vec(&self.0)?;
++        ensure!(bytes.len() <= MAX_CHECKPOINT_BYTES, "oversized pending funding record");
++        Ok(bytes)
++    }
++
++    /// Expected identity/policy comes from trusted local configuration or journal.
++    /// Successfully decoding a record does not authorize settlement.
++    pub fn decode(bytes: &[u8], swap_id: uuid::Uuid, lock_txid: bitcoin::Txid, policy: &FundingPolicy) -> Result<Self> {
++        policy.validate()?;
++        ensure!(bytes.len() <= MAX_CHECKPOINT_BYTES, "oversized pending funding record");
++        let record: PendingRecord = serde_json::from_slice(bytes)?;
++        ensure!(record.domain == CHECKPOINT_DOMAIN && record.swap_id == swap_id, "wrong pending funding identity");
++        ensure!(&record.policy == policy, "pending funding policy mismatch");
++        ensure!(record.state.tx_lock.txid() == lock_txid, "pending Bitcoin lock mismatch");
++        Self::new(record.swap_id, record.policy, record.state, record.proof)
++    }
++
++    /// Preserve offline refund preparation even when trade resumption is refused.
++    pub fn prepare_cancellation(&self) -> crate::bob::State6 {
++        // Offline preparation only: no broadcast or claim that cancellation is mature.
++        // Start native recovery scanning conservatively at genesis.
++        self.0.state.cancel(swap_core::monero::BlockHeight { height: 0 })
++    }
++
++    /// Generate the redeem adaptor signature only after fresh chain/window checks.
++    /// This does not broadcast; callers must still handle races after returning.
++    pub async fn redeem_signature(&self, observer: &impl FundingObserver,
++        bitcoin: &impl BitcoinLockObserver) -> Result<swap_core::bitcoin::EncryptedSignature> {
++        let fresh = self.resume(observer, bitcoin).await?;
++        Ok(fresh.tx_redeem_encsig())
++    }
++
++    /// Every trade resume re-observes both chains and the cancellation window.
++    pub async fn resume(&self, observer: &impl FundingObserver, bitcoin: &impl BitcoinLockObserver) -> Result<crate::bob::State4> {
++        let before = verify_bitcoin_lock(bitcoin, &self.0.state.tx_lock, &self.0.policy).await?;
++        verify_redeem_window(before.confirmations, self.0.state.cancel_timelock)?;
++        let state = verify_state3(observer, &self.0.state, self.0.proof.clone(), self.0.policy.network()?,
++            &self.0.policy.genesis, self.0.policy.confirmations).await?;
++        let after = verify_bitcoin_lock(bitcoin, &self.0.state.tx_lock, &self.0.policy).await?;
++        verify_redeem_window(after.confirmations, self.0.state.cancel_timelock)?;
++        ensure!(before == after, "Bitcoin lock changed during native verification");
++        Ok(state)
++    }
++}
++
++#[derive(Clone, PartialEq, Eq)]
++pub struct BitcoinLockObservation {
++    pub genesis: bitcoin::BlockHash,
++    pub tip: bitcoin::BlockHash,
++    pub script: bitcoin::ScriptBuf,
++    pub amount: bitcoin::Amount,
++    pub confirmations: u64,
++}
++
++fn verify_redeem_window(confirmations: u64, cancel: swap_core::bitcoin::CancelTimelock) -> Result<()> {
++    // At this depth a relative-height cancellation can enter the next block.
++    // Do not resume the trade path; retain the pending state for recovery handling.
++    ensure!(confirmations < u64::from(cancel.0), "Bitcoin cancellation window reached; recovery required");
++    Ok(())
++}
++
++#[async_trait::async_trait]
++pub trait BitcoinLockObserver: Sync {
++    /// Query the active chain and include mempool spends; None means absent/spent.
++    async fn unspent(&self, outpoint: bitcoin::OutPoint) -> Result<Option<BitcoinLockObservation>>;
++}
++
++async fn verify_bitcoin_lock(observer: &impl BitcoinLockObserver, lock: &swap_core::bitcoin::TxLock,
++    policy: &FundingPolicy) -> Result<BitcoinLockObservation> {
++    let observed = observer.unspent(lock.as_outpoint()).await?
++        .ok_or_else(|| anyhow::anyhow!("Bitcoin lock absent or spent"))?;
++    validate_bitcoin_output(&observed, &lock.script_pubkey(), lock.lock_amount(), policy)?;
++    Ok(observed)
++}
++
++fn validate_bitcoin_output(observed: &BitcoinLockObservation, script: &bitcoin::ScriptBuf,
++    amount: bitcoin::Amount, policy: &FundingPolicy) -> Result<()> {
++    ensure!(observed.genesis.to_string() == policy.bitcoin_genesis, "wrong Bitcoin chain");
++    ensure!(&observed.script == script && observed.amount == amount,
++        "Bitcoin lock output mismatch");
++    ensure!(observed.confirmations >= policy.bitcoin_confirmations, "Bitcoin lock is not sufficiently confirmed");
++    Ok(())
++}
++
++/// Port boundary for the legacy state, which currently carries raw XMZ atoms.
++/// Local network/policy must be persisted separately until protocol identity is ported.
++/// Borrows the original state so verification failure does not discard recovery data.
++pub async fn verify_state3(
++    observer: &impl FundingObserver,
++    state: &crate::bob::State3,
++    proof: TransferProof,
++    network: swap_core::xmz_address::XmzNetwork,
++    expected_genesis: &str,
++    required_confirmations: u64,
++) -> Result<crate::bob::State4> {
++    let (spend, view) = state.xmr_view_keys();
++    let address = XmzAddress::new(network, monero_address::AddressType::Legacy,
++        spend.decompress(), view.public().0.decompress())?;
++    let request = FundingRequest { address,
++        amount: XmzAmount::from_atoms(state.xmr_amount().as_pico()), proof };
++    let verified = verify(observer, request, expected_genesis, required_confirmations).await?;
++    Ok(state.clone().xmr_locked(swap_core::monero::BlockHeight { height: verified.height },
++        verified.request.proof.into(), None))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use monero_oxide_ext::PrivateKey;
++    use swap_core::{monero::{Scalar, TxHash}, xmz_address::XmzNetwork};
++
++    #[test]
++    fn pending_trade_resume_stops_at_cancellation_boundary() {
++        let cancel = swap_core::bitcoin::CancelTimelock::new(100);
++        assert!(verify_redeem_window(99, cancel).is_ok());
++        assert!(verify_redeem_window(100, cancel).is_err());
++        assert!(verify_redeem_window(101, cancel).is_err());
++        assert!(verify_redeem_window(u64::MAX, cancel).is_err());
++        assert!(verify_redeem_window(1, swap_core::bitcoin::CancelTimelock::new(0)).is_err());
++    }
++
++    #[test]
++    fn rejects_wrong_bitcoin_lock_outputs_and_policy() {
++        let policy = FundingPolicy::new(XmzNetwork::Mainnet, "cd".repeat(32), 10,
++            bitcoin::Network::Regtest, 2).unwrap();
++        let script = bitcoin::ScriptBuf::new();
++        let amount = bitcoin::Amount::from_sat(500_000);
++        let valid = BitcoinLockObservation {
++            genesis: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).block_hash(),
++            tip: "ef".repeat(32).parse().unwrap(), script: script.clone(), amount, confirmations: 2,
++        };
++        assert!(validate_bitcoin_output(&valid, &script, amount, &policy).is_ok());
++        for case in ["chain", "script", "amount", "depth"] {
++            let mut changed = valid.clone();
++            match case {
++                "chain" => changed.genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin).block_hash(),
++                "script" => changed.script = bitcoin::ScriptBuf::from_hex("51").unwrap(),
++                "amount" => changed.amount += bitcoin::Amount::from_sat(1),
++                "depth" => changed.confirmations = 1,
++                _ => unreachable!(),
++            }
++            assert!(validate_bitcoin_output(&changed, &script, amount, &policy).is_err(), "accepted {case}");
++        }
++        assert!(FundingPolicy::new(XmzNetwork::Mainnet, "cd".repeat(32), 10,
++            bitcoin::Network::Regtest, 0).is_err());
++    }
++
++    struct Observer {
++        before: ChainSnapshot,
++        after: ChainSnapshot,
++        observation: FundingObservation,
++        calls: AtomicUsize,
++        fail: bool,
++    }
++
++    #[async_trait::async_trait]
++    impl FundingObserver for Observer {
++        async fn snapshot(&self) -> Result<ChainSnapshot> {
++            Ok(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
++                self.before.clone()
++            } else { self.after.clone() })
++        }
++        async fn observe(&self, _: &FundingRequest) -> Result<FundingObservation> {
++            ensure!(!self.fail, "test backend unavailable");
++            Ok(self.observation.clone())
++        }
++    }
++
++    fn fixture() -> (Observer, FundingRequest) {
++        let address = XmzAddress::parse(XmzNetwork::Mainnet,
++            include_str!("../../swap-core/src/xmz_address_vectors.txt").lines().next().unwrap()).unwrap();
++        let request = FundingRequest { address, amount: "2".parse().unwrap(),
++            proof: TransferProof::new(TxHash("ab".repeat(32)), PrivateKey::from_scalar(Scalar::ONE)) };
++        let chain = ChainSnapshot { genesis: "cd".repeat(32), tip_hash: "ef".repeat(32), tip_height: 141 };
++        let observation = FundingObservation { txid: request.proof.tx_hash.0.clone(),
++            address: request.address.to_string(), received_atoms: request.amount.atoms(),
++            in_pool: false, height: 132, confirmations: 10 };
++        (Observer { before: chain.clone(), after: chain, observation,
++            calls: AtomicUsize::new(0), fail: false }, request)
++    }
++
++    #[tokio::test]
++    async fn verifies_exact_stable_native_funding() {
++        let (observer, request) = fixture();
++        let verified = verify(&observer, request, &"cd".repeat(32), 10).await.unwrap();
++        assert_eq!(verified.height(), 132);
++        assert_eq!(verified.request().amount.atoms(), 200_000_000_000);
++        assert_eq!(verified.snapshot().tip_height, 141);
++    }
++
++    #[tokio::test]
++    async fn rejects_inconsistent_or_unconfirmed_native_funding() {
++        for case in ["chain", "tip", "txid", "address", "amount", "pool", "height",
++            "future", "depth", "shallow", "reorg", "growth", "backend"] {
++            let (mut observer, request) = fixture();
++            let mut required = 10;
++            match case {
++                "chain" => observer.before.genesis = "00".repeat(32),
++                "tip" => observer.before.tip_hash = "invalid".into(),
++                "txid" => observer.observation.txid = "00".repeat(32),
++                "address" => observer.observation.address = "other".into(),
++                "amount" => observer.observation.received_atoms += 1,
++                "pool" => observer.observation.in_pool = true,
++                "height" => observer.observation.height = 0,
++                "future" => observer.observation.height = 142,
++                "depth" => observer.observation.confirmations = 9,
++                "shallow" => required = 11,
++                "reorg" => observer.after.tip_hash = "00".repeat(32),
++                "growth" => observer.after.tip_height += 1,
++                "backend" => observer.fail = true,
++                _ => unreachable!(),
++            }
++            assert!(verify(&observer, request, &"cd".repeat(32), required).await.is_err(), "accepted {case}");
++        }
++        let (observer, request) = fixture();
++        assert!(verify(&observer, request, &"cd".repeat(32), 0).await.is_err());
++    }
++}

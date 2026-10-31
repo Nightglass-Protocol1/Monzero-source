@@ -1,0 +1,15 @@
+# Opt-in public wallet directory
+
+Profiles are private by default. Publication and removal require a SigV2 spend-key signature over a five-minute, one-use server challenge bound to the exact primary mainnet address, visibility mode, atomic balance string, wallet height, name, origin and current revision. A successful mutation invalidates every outstanding challenge for that address. Signatures prove address control only; balances are explicitly wallet-reported snapshots, not reserve proofs.
+
+GenesisWallet1 is permanently seeded from the already-public founder disclosure: 376,052.80 XMZ at block 9,838. Its timestamp is deliberately unset. The entry is labelled historical and unverified; it is not a genesis-block allocation. Its actual owner can update the balance with a spend signature, but cannot remove it through the ordinary profile API. No private founder wallet file is read.
+
+The verifier uses the core's existing signature verification. It never opens a wallet, generates keys, connects to a node or sends funds. Build with `build-verifier.py CORE OUTPUT` inside the existing pinned Ubuntu Linux build container. Record the core revision and binary checksum alongside deployment. Verification accepts primary mainnet addresses and spend signatures only; view-key signatures are rejected.
+
+`server.py` binds loopback port 18794, stores records in a private SQLite database and calls the fixed local verifier executable with bounded JSON on stdin and a five-second timeout. Caddy exposes `/wallet-profiles-api/*` under the existing pool TLS host. Every request requires an unguessable proxy token. The website's fixed-destination HTTPS PHP proxy reads that token from `dirname(DOCUMENT_ROOT)/monzero-private/profile-proxy-token`; no token or arbitrary upstream URL comes from the browser. The service has no wallet RPC access.
+
+Public responses use `Cache-Control: no-store`. Removal clears the stored public name/balance/height and leaves a minimal address/revision tombstone for replay protection. Ordinary search excludes tombstones. Previously copied data and infrastructure backups cannot be retroactively erased. Request bodies and searched addresses are not written to application access logs.
+
+Run `python3 -m unittest discover -s utils/public-wallets -v`. Real-signature integration must additionally check a disposable wallet's spend signature, rejection of modified messages and view-key signatures, publication, removal and absence afterward. GUI tests cover default privacy, address-only redaction, atomic precision, no testnet requests, synchronization gating and acknowledgement before removal is reported.
+
+The wallet's creation option saves a preference only. After opening and syncing, the owner explicitly publishes in Settings → Wallet → Public wallet profile. Opening the panel and selecting a mode do not send network requests. Snapshot refreshes are manual, and Stop sharing remains pending until server acknowledgement. Failed/uncertain requests never claim the profile is private.

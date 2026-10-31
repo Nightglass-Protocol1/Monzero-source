@@ -1,0 +1,350 @@
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -505,6 +505,79 @@
+             "review":review,"receipt":receipt}))
+     }
+ 
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct FundingReceiptConfig {
++        schema: String, admission_config_file: PathBuf, peer_message_file: PathBuf,
++    }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct FundingReceiptMessage { schema: String, frame: Vec<u8>, signature: Vec<u8> }
++    fn funding_receipt_request(bytes: &[u8],action: &str) -> Result<Request> {
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid funding receipt request size");
++        let request: Request=serde_json::from_slice(bytes)?;
++        ensure!(matches!(action,"review"|"submit"|"status") && !request.request_id.is_nil()
++            && request.schema==format!("monzero-bch-funding-receipt-{action}-request-v1"),
++            "invalid funding receipt request");
++        if action=="submit" {
++            parse_digest(request.commitment.as_deref().context("missing funding receipt approval")?)?;
++        } else {ensure!(request.commitment.is_none(),"unexpected funding receipt approval");}
++        Ok(request)
++    }
++    fn funding_receipt_config(bytes: &[u8]) -> Result<FundingReceiptConfig> {
++        let config: FundingReceiptConfig=serde_json::from_slice(bytes)?;
++        ensure!(config.schema=="monzero-private-bch-funding-receipt-v1"
++            && config.admission_config_file.is_absolute() && config.peer_message_file.is_absolute(),
++            "invalid funding receipt configuration");
++        Ok(config)
++    }
++    fn funding_receipt_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
++        let request=funding_receipt_request(bytes,action)?;
++        let (_wrapper_lease,bytes)=private_bytes(path)?;
++        let wrapper=funding_receipt_config(&bytes)?;
++        let (_admission_lease,config)=load(&wrapper.admission_config_file)?;
++        ensure!(matches!(config.role,Role::NativeFunder),"funding receipt requires native funder");
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"funding receipt trade changed");
++        let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        let mut review=serde_json::Value::Null;
++        if action!="status" {
++            // Keep the bounded private peer-message lease through acceptance.
++            // No RPC credentials, chain checks or payment authority enter this interface.
++            let (_message_lease,bytes)=private_file_limit(&wrapper.peer_message_file,false,6_004_096)?;
++            let message: FundingReceiptMessage=serde_json::from_slice(&bytes)?;
++            ensure!(message.schema=="monzero-bch-peer-funding-receipt-v1"
++                && !message.frame.is_empty() && message.frame.len()<=1_500_000 && message.signature.len()==64,
++                "invalid peer funding receipt message");
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            let checked=execution.review_bch_funding_receipt(now,&message.frame,&message.signature)?;
++            if action=="submit" {
++                let approved=parse_digest(request.commitment.as_deref().context("missing funding receipt approval")?)?;
++                let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                execution.accept_reviewed_bch_funding_receipt(dispatch,&message.frame,&message.signature,&approved)?;
++            }
++            review=serde_json::json!({"details":checked.details,
++                "commitment":checked.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
++        }
++        let saved=execution.saved_bch_funding_receipt()?;
++        if action=="status" {
++            if let Some(saved)=&saved {
++                review=serde_json::json!({"details":saved.review.details,"commitment":
++                    saved.review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
++            }
++        }
++        let receipt=saved.map(|saved|serde_json::json!({
++            "commitment":saved.receipt.iter().map(|b|format!("{b:02x}")).collect::<String>(),
++            "receivedAt":saved.received_at.to_string()}));
++        Ok(serde_json::json!({"schema":format!("monzero-bch-funding-receipt-{action}-response-v1"),
++            "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
++            "review":review,"receipt":receipt}))
++    }
++
+     fn recovery_retention_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
+         ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid recovery retention request size");
+         let request: Request=serde_json::from_slice(bytes)?;
+@@ -737,7 +810,15 @@
+             "--refund-observe-stdio-v1"=>Some("observe"),
+             _=>None,
+         };
+-        let result = if let Some(operation)=refund_action {
++        let receipt_action=match action {
++            "--funding-receipt-review-stdio-v1"=>Some("review"),
++            "--funding-receipt-submit-stdio-v1"=>Some("submit"),
++            "--funding-receipt-status-stdio-v1"=>Some("status"),
++            _=>None,
++        };
++        let result = if let Some(operation)=receipt_action {
++            funding_receipt_operation(Path::new(&args[2]),&bytes,operation)?
++        } else if let Some(operation)=refund_action {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(refund_operation(Path::new(&args[2]),&bytes,operation))?
+         } else if let Some(operation)=cancel_action {
+@@ -795,6 +876,29 @@
+             }
+             let mut bad=config;bad["broadcast"]=serde_json::json!(true);
+             assert!(refund_protection_config(&serde_json::to_vec(&bad)?).is_err());
++            Ok(())
++        }
++
++        #[test]
++        fn funding_receipt_requires_separate_approval_and_strict_config() -> Result<()> {
++            for action in ["review","submit","status"] {
++                let mut value=serde_json::json!({"schema":format!("monzero-bch-funding-receipt-{action}-request-v1"),
++                    "requestId":uuid::Uuid::new_v4()});
++                assert_eq!(funding_receipt_request(&serde_json::to_vec(&value)?,action).is_ok(),action!="submit");
++                value["commitment"]=serde_json::json!("11".repeat(32));
++                assert_eq!(funding_receipt_request(&serde_json::to_vec(&value)?,action).is_ok(),action=="submit");
++                value["schema"]=serde_json::json!("monzero-bch-funding-submit-request-v1");
++                assert!(funding_receipt_request(&serde_json::to_vec(&value)?,action).is_err());
++            }
++            let config=serde_json::json!({"schema":"monzero-private-bch-funding-receipt-v1",
++                "admissionConfigFile":"/private/admission.json","peerMessageFile":"/private/peer.json"});
++            funding_receipt_config(&serde_json::to_vec(&config)?)?;
++            for field in ["schema","admissionConfigFile","peerMessageFile"] {
++                let mut bad=config.clone();bad[field]=serde_json::json!("relative");
++                assert!(funding_receipt_config(&serde_json::to_vec(&bad)?).is_err());
++            }
++            let mut bad=config;bad["broadcast"]=serde_json::json!(true);
++            assert!(funding_receipt_config(&serde_json::to_vec(&bad)?).is_err());
+             Ok(())
+         }
+ 
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -6,17 +6,20 @@
+ #[tokio::test]
+ #[ignore = "requires a disposable owned BCHN regtest wallet and digest-pinned context"]
+ async fn bch_owned_node_executes_funding_controller() -> Result<()> {
+-    exercise(false,false).await
++    exercise(false,false,false).await
+ }
+ #[tokio::test]
+ #[ignore = "requires a disposable owned BCHN wallet and phase-coordinated driver"]
+ async fn bch_owned_node_validates_authenticated_funding_window() -> Result<()> {
+-    exercise(true,false).await
++    exercise(true,false,false).await
+ }
+ #[tokio::test]
+ #[ignore = "requires owned BCHN and XMZ fakechain services"]
+-async fn bch_paired_nodes_fund_native_contract() -> Result<()> {exercise(true,true).await}
+-async fn exercise(handoff: bool,paired: bool) -> Result<()> {
++async fn bch_paired_nodes_fund_native_contract() -> Result<()> {exercise(true,true,false).await}
++#[tokio::test]
++#[ignore = "requires an owned BCHN and digest-pinned receipt helper"]
++async fn bch_owned_node_reviews_funding_receipt_through_helper() -> Result<()> {exercise(true,false,true).await}
++async fn exercise(handoff: bool,paired: bool,helper_receipt: bool) -> Result<()> {
+     let path=PathBuf::from(std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG")?);
+     let bytes=std::fs::read(&path)?;
+     ensure!(bytes.len()<16384 && hex(&Sha256::digest(&bytes))==std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG_SHA256")?,"node fixture context changed");
+@@ -67,8 +70,10 @@
+     let native_pins=NegotiationPins {initial:native_initial,selection:*native_selected.commitment(),
+         outgoing:*peer.commitment(),received:native_received,agreement:native_agreement};
+     let native_metadata=PrivateStore::new()?;
+-    let mut native=AdmittedExecution::admit(&native_metadata.0,&snapshots.0,&setup.quote,&setup.policy,
+-        Role::NativeFunder,setup.quote.commitment(),native_pins,base+5)?;
++    let native_consent=agreement::execution::approval::review_admission(&setup.quote,&setup.policy,
++        Role::NativeFunder,&native_pins,base+5)?;
++    let mut native=AdmittedExecution::admit_reviewed(&native_metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++        Role::NativeFunder,&native_consent.commitment,native_pins.clone(),base+5)?;
+     let frame=native.prepare_bch_refund_adaptor(base+6)?;
+     let signature=SigningKey::from_bytes(&[2;32]).sign(&agreement::refund::signing_bytes(&frame)?).to_bytes();
+     let refund=native.retain_outgoing_bch_refund(base+7,&signature)?;
+@@ -98,10 +103,29 @@
+         let wrong=SigningKey::from_bytes(&[2;32]).sign(&message::signing_bytes(&frame)?).to_bytes();
+         assert!(native.accept_bch_funding_message(base+16,&frame,&wrong).is_err());
+         assert_eq!(contents(&native_metadata.0)?,before);
+-        let received=native.accept_bch_funding_message(base+16,&frame,&signature)?;
++        let secrets=contents(&snapshots.0)?;
++        let review=native.review_bch_funding_receipt(base+16,&frame,&signature)?;
++        assert_eq!(review.details["principalAtoms"],"100000");
++        assert_eq!(review.details["feeAtoms"],fee.to_string());
++        assert_eq!(review.details["fundingOutpoint"],signed.lock_outpoint().to_string());
++        assert!(restored.review_bch_funding_receipt(base+16,&frame,&signature).is_err());
++        assert!(native.review_bch_funding_receipt(base+3500,&frame,&signature).is_err());
++        assert!(native.review_bch_funding_receipt(base+16,&frame,&wrong).is_err());
++        assert!(native.accept_reviewed_bch_funding_receipt(base+16,&frame,&signature,&[0;32]).is_err());
++        assert_eq!(contents(&native_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++        let unreceived=before.clone();
++        let received=native.accept_reviewed_bch_funding_receipt(base+16,&frame,&signature,&review.commitment)?;
++        let saved=native.saved_bch_funding_receipt()?.context("missing funding receipt")?;
++        assert_eq!(saved.review.commitment,review.commitment);assert_eq!(saved.received_at,base+16);
++        let accepted=contents(&native_metadata.0)?;
++        native.accept_reviewed_bch_funding_receipt(base+17,&frame,&signature,&review.commitment)?;
++        assert_eq!(contents(&native_metadata.0)?,accepted);
++
+         assert_eq!(received.signed().lock_outpoint(),signed.lock_outpoint());drop(native);
+         let mut native=AdmittedExecution::resume(&native_metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
+         assert_eq!(native.received_bch_funding_message()?.unwrap().frame(),frame);
++        let resumed=native.saved_bch_funding_receipt()?.context("missing resumed receipt")?;
++        assert_eq!(resumed.receipt,saved.receipt);assert_eq!(resumed.review.commitment,review.commitment);
+         assert_eq!(native.observe_received_bch_funding(&rpc).await?.status(),FundingStatus::Mempool {lock_output_unspent:true});
+         assert!(native.check_bch_lock_for_native_funding(&rpc,base+17,5).await.is_err());
+         let before=contents(&native_metadata.0)?;let secrets=contents(&snapshots.0)?;
+@@ -123,11 +147,14 @@
+         assert!(native.check_bch_lock_for_native_funding(&rpc,base+19,5).await.is_err());
+         assert_eq!(contents(&native_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+         }
++        if helper_receipt {
++            receipt_helper::exercise(&setup,&snapshots,&unreceived,&native_pins,base,&frame,&signature,&review.commitment)?;
++        }
+     }
+     let report=PathBuf::from(field("report")?);ensure!(!report.exists(),"fixture report exists");
+     save(&report,&serde_json::to_vec(&json!({"schema":"monzero-bch-node-executor-result-v1","executable":false,
+         "txid":txid.to_string(),"lockVout":signed.lock_outpoint().vout,"lockScript":setup.quote.recovery_plan().lock().script_pubkey().to_hex_string(),
+-        "authenticatedHandoff":handoff,"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff && !paired,"pairedNativeFunding":paired,
++        "authenticatedHandoff":handoff,"fundingReceiptApprovalVerified":handoff,"fundingReceiptHelperVerified":helper_receipt,"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff && !paired,"pairedNativeFunding":paired,
+         "principalAtoms":100000,"feeAtoms":fee,"productionWalletLockSignRelay":true,"restartSavedBytes":true,
+         "inputs":inputs.iter().map(|p|json!({"txid":p.txid.to_string(),"vout":p.vout})).collect::<Vec<_>>() }))?)?;
+     Ok(())
+@@ -151,3 +178,5 @@
+ 
+ mod native_payment;
+ use native_payment::exercise as native_payment;
++
++mod receipt_helper;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/receipt_helper.rs
+@@ -0,0 +1,66 @@
++//! Production helper approval and restart over an isolated copy of pre-receipt state.
++use super::*;
++
++pub(super) fn exercise(setup: &Setup,snapshots: &PrivateStore,
++    original: &std::collections::BTreeMap<std::ffi::OsString,Vec<u8>>,pins: &NegotiationPins,
++    base: u64,frame: &[u8],signature: &[u8],expected: &[u8;32]) -> Result<()> {
++    let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
++    let helper_digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper
++        && hex(&Sha256::digest(std::fs::read(&helper)?))==helper_digest,"receipt helper changed");
++    let metadata=PrivateStore::new()?;let config=PrivateStore::new()?;
++    for (name,bytes) in original {save(&metadata.0.join(name),bytes)?;}
++    let quote_path=config.0.join("quote.json");save(&quote_path,&setup.quote.record()?)?;
++    let admission=config.0.join("admission.json");
++    save(&admission,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-admission-v1",
++        "helper":helper,"helperDigest":helper_digest,"quoteFile":quote_path,
++        "quoteCommitment":hex(setup.quote.commitment()),"admittedAt":base,
++        "tradeId":setup.quote.terms()["swapId"],"identityPins":[
++            SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),
++            SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++        "policy":setup.policy,"role":"native-funder","metadataDirectory":metadata.0,
++        "snapshotDirectory":snapshots.0,"negotiationPins":pins}))?)?;
++    let peer=config.0.join("peer.json");
++    let message=json!({"schema":"monzero-bch-peer-funding-receipt-v1","frame":frame,"signature":signature});
++    let message_bytes=serde_json::to_vec(&message)?;save(&peer,&message_bytes)?;
++    let wrapper=config.0.join("receipt.json");
++    save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-funding-receipt-v1",
++        "admissionConfigFile":admission,"peerMessageFile":peer}))?)?;
++    let invoke=|action: &str,approval: Option<&str>,success: bool| -> Result<Value> {
++        let id=uuid::Uuid::new_v4();
++        let mut request=json!({"schema":format!("monzero-bch-funding-receipt-{action}-request-v1"),"requestId":id});
++        if let Some(approval)=approval {request["commitment"]=approval.into();}
++        let mut child=Command::new(&helper).arg(format!("--funding-receipt-{action}-stdio-v1")).arg(&wrapper)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("helper stdin missing")?.write_all(&serde_json::to_vec(&request)?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++        if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++        assert!(output.stderr.is_empty() && output.stdout.len()<=16384);
++        let result:Value=serde_json::from_slice(&output.stdout)?;
++        assert_eq!(result.as_object().unwrap().len(),7);
++        assert_eq!(result["schema"],format!("monzero-bch-funding-receipt-{action}-response-v1"));
++        assert_eq!(result["requestId"],id.to_string());assert_eq!(result["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(result["executable"],false);assert_eq!(result["chainObserved"],false);
++        Ok(result)
++    };
++    let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    let initial=invoke("status",None,true)?;assert!(initial["receipt"].is_null() && initial["review"].is_null());
++    let reviewed=invoke("review",None,true)?;assert_eq!(reviewed["review"]["commitment"],hex(expected));
++    assert!(reviewed["receipt"].is_null());
++    invoke("submit",Some(&"00".repeat(32)),false)?;
++    let mut wrong=message.clone();wrong["signature"][0]=json!(signature[0]^1);save(&peer,&serde_json::to_vec(&wrong)?)?;
++    invoke("review",None,false)?;save(&peer,&message_bytes)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    let accepted=invoke("submit",Some(&hex(expected)),true)?;assert!(!accepted["receipt"].is_null());
++    let retained=contents(&metadata.0)?;
++    let again=invoke("submit",Some(&hex(expected)),true)?;
++    assert_eq!(again["receipt"],accepted["receipt"]);assert_eq!(again["review"],accepted["review"]);
++    assert_eq!(contents(&metadata.0)?,retained);
++    std::fs::remove_file(&peer)?;
++    let status=invoke("status",None,true)?;
++    assert_eq!(status["receipt"],accepted["receipt"]);assert_eq!(status["review"],accepted["review"]);
++    invoke("review",None,false)?;
++    assert_eq!(contents(&metadata.0)?,retained);assert_eq!(contents(&snapshots.0)?,secrets);
++    Ok(())
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message.rs
+@@ -236,3 +236,5 @@
+         backend.observe_funding(message.signed()).await
+     }
+ }
++
++pub mod approval;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/message/approval.rs
+@@ -0,0 +1,48 @@
++//! Offline consent to retain an authenticated funding handoff, never payment authority.
++use super::*;
++use serde_json::json;
++
++const REVIEW: &str="monzero-bch-funding-receipt-review-v1";
++pub struct FundingReceiptReview {pub details: Value,pub commitment: [u8;32]}
++pub struct SavedFundingReceipt {
++    pub review: FundingReceiptReview,pub receipt: [u8;32],pub received_at: u64,
++}
++impl AdmittedExecution<'_> {
++    fn funding_receipt_details(&self,frame: &[u8],signature: &[u8],signed: &SignedFunding) -> Result<FundingReceiptReview> {
++        let message=hash("monzero-bch-authenticated-funding-v1",&[frame,signature].concat());
++        let outpoint=signed.lock_outpoint();let output=&signed.transaction().output[outpoint.vout as usize];
++        let details=json!({"schema":REVIEW,"action":"accept-bch-funding-message",
++            "swapId":self.quote.terms()["swapId"],"quote":self.quote.commitment(),
++            "admission":self.admission_digest()?,"messageCommitment":message,
++            "bchNetwork":self.quote.terms()["bchNetwork"],"bchGenesis":self.quote.terms()["bchGenesis"],
++            "fundingOutpoint":outpoint,"contractScript":output.script_pubkey.to_hex_string(),
++            "principalAtoms":output.value.to_sat().to_string(),"feeAtoms":signed.fee().to_sat().to_string()});
++        Ok(FundingReceiptReview {commitment:hash(REVIEW,&serde_json::to_vec(&details)?),details})
++    }
++    pub fn review_bch_funding_receipt(&self,now: u64,frame: &[u8],signature: &[u8]) -> Result<FundingReceiptReview> {
++        ensure!(self.role==Role::NativeFunder,"wrong BCH funding receipt role");
++        self.message_context(now)?;
++        let (_,sent_at)=self.outgoing_bch_refund_record()?.context("missing outgoing BCH refund protection")?;
++        ensure!(now>=sent_at,"BCH funding receipt predates outgoing refund");
++        let signed=self.authenticate_funding_message(frame,signature)?;
++        if let Some((record,old,_))=self.message_record("message-received")? {
++            ensure!(now>=record.at && old==frame && record.signature.as_deref()==Some(signature),
++                "BCH funding receipt already retained differently");
++        }
++        self.funding_receipt_details(frame,signature,&signed)
++    }
++    pub fn accept_reviewed_bch_funding_receipt(&mut self,now: u64,frame: &[u8],signature: &[u8],approved: &[u8;32])
++        -> Result<AuthenticatedFunding> {
++        let review=self.review_bch_funding_receipt(now,frame,signature)?;
++        ensure!(*approved==review.commitment,"BCH funding receipt approval changed");
++        self.accept_bch_funding_message(now,frame,signature)
++    }
++    /// Historical signed receipt only. Does not read the chain or renew the quote.
++    pub fn saved_bch_funding_receipt(&self) -> Result<Option<SavedFundingReceipt>> {
++        ensure!(self.role==Role::NativeFunder,"wrong BCH funding receipt role");
++        let Some((record,frame,signed))=self.message_record("message-received")? else {return Ok(None)};
++        let signature=record.signature.as_deref().context("missing BCH receipt signature")?;
++        let review=self.funding_receipt_details(&frame,signature,&signed)?;
++        Ok(Some(SavedFundingReceipt {review,receipt:hash(RECORD,&serde_json::to_vec(&record)?),received_at:record.at}))
++    }
++}

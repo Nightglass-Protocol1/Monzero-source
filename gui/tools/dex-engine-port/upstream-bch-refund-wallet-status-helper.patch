@@ -1,0 +1,131 @@
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -1258,6 +1258,7 @@
+             "relay":{"state":state,"txid":txid,"confirmed":false},"observation":observation}))
+     }
+ 
++    mod refund_wallet {include!("native-bch-admission/refund_wallet.rs");}
+     mod punishment {include!("native-bch-admission/punishment.rs");}
+     mod publication {include!("native-bch-admission/publication.rs");}
+     mod native_observer {include!("native-bch-admission/native_observer.rs");}
+@@ -1333,7 +1334,9 @@
+             "--native-proof-context-stdio-v1"=>Some("context"),
+             _=>None,
+         };
+-        let result = if matches!(action,"--punish-review-stdio-v1"|"--punish-status-stdio-v1"|"--punish-observe-stdio-v1"|"--punish-submit-stdio-v1") {
++        let result = if action=="--native-refund-wallet-status-stdio-v1" {
++            refund_wallet::operation(Path::new(&args[2]),&bytes)?
++        } else if matches!(action,"--punish-review-stdio-v1"|"--punish-status-stdio-v1"|"--punish-observe-stdio-v1"|"--punish-submit-stdio-v1") {
+             let operation=if action=="--punish-review-stdio-v1" {"review"} else if action=="--punish-status-stdio-v1" {"status"} else if action=="--punish-submit-stdio-v1" {"submit"} else {"observe"};
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(punishment::operation(Path::new(&args[2]),&bytes,operation))?
+--- /dev/null
++++ b/swap-machine/src/bin/native-bch-admission/refund_wallet.rs
+@@ -0,0 +1,107 @@
++// Offline historical local refund-wallet status. No wallet RPC or key export.
++use super::*;
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct WalletStatusConfig {
++    schema:String,admission_config_file:PathBuf,refund_txid:String,deployment_commitment:String,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct StatusRequest {schema:String,request_id:uuid::Uuid}
++fn request(bytes:&[u8])->Result<StatusRequest> {
++    ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid refund wallet status request size");
++    let request:StatusRequest=serde_json::from_slice(bytes)?;
++    ensure!(request.schema=="monzero-bch-native-refund-wallet-status-request-v1"
++        && !request.request_id.is_nil(),"invalid refund wallet status request");
++    Ok(request)
++}
++fn config(bytes:&[u8])->Result<WalletStatusConfig> {
++    let config:WalletStatusConfig=serde_json::from_slice(bytes)?;
++    ensure!(config.schema=="monzero-private-bch-native-refund-wallet-v1"
++        && config.admission_config_file.is_absolute(),"invalid refund wallet status configuration");
++    ensure!(parse_digest(&config.refund_txid)?!=[0;32]
++        && parse_digest(&config.deployment_commitment)?!=[0;32],"empty refund wallet status binding");
++    Ok(config)
++}
++fn public_status(value:serde_json::Value)->Result<serde_json::Value> {
++    let object=value.as_object().context("invalid refund wallet status")?;
++    let fields=["schema","swapId","quote","admission","walletFile","address","nativePayment","refundHint",
++        "walletBinding","walletIntent","state","bchDeployment","bchNetwork","bchGenesis","xmzNetwork","chainObserved","executable"];
++    ensure!(object.len()==fields.len() && fields.iter().all(|key|object.contains_key(*key))
++        && value["schema"]=="monzero-bch-native-refund-wallet-status-v1"
++        && value["chainObserved"]==false && value["executable"]==false
++        && matches!(value["state"].as_str(),Some("not-attempted"|"attempted"|"ready")),
++        "invalid public refund wallet status fields");
++    Ok(value)
++}
++pub(super) fn operation(path:&Path,bytes:&[u8])->Result<serde_json::Value> {
++    let request=request(bytes)?;
++    let (_wrapper_lease,bytes)=private_bytes(path)?;let wrapper=config(&bytes)?;
++    let deployment=parse_digest(&wrapper.deployment_commitment)?;
++    let (_config_lease,config)=load(&wrapper.admission_config_file)?;
++    ensure!(matches!(config.role,Role::NativeFunder),"refund wallet status requires native funder");
++    let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++    let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++        &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++    ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"refund wallet trade changed");
++    let execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,&quote,&config.policy,config.role)?;
++    execution.saved_admission_review(&config.negotiation_pins)?;
++    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    let wallet=public_status(execution.bch_native_refund_wallet_status(wrapper.refund_txid.parse()?,now)?)?;
++    let retained:[u8;32]=serde_json::from_value(wallet["bchDeployment"].clone())?;
++    ensure!(retained==deployment,"refund wallet observer changed");
++    Ok(serde_json::json!({"schema":"monzero-bch-native-refund-wallet-status-response-v1",
++        "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,"wallet":wallet}))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++    #[test]
++    fn public_output_rejects_extra_private_fields_or_authority() {
++        let mut base=json!({"schema":"monzero-bch-native-refund-wallet-status-v1","swapId":null,"quote":null,"admission":null,
++            "walletFile":null,"address":null,"nativePayment":null,"refundHint":null,"walletBinding":null,"walletIntent":null,
++            "state":"not-attempted","bchDeployment":null,"bchNetwork":null,"bchGenesis":null,"xmzNetwork":null,
++            "chainObserved":false,"executable":false});
++        // Shape/privacy guard only; engine and desktop validate the field values.
++        assert!(public_status(base.clone()).is_ok());
++        for field in ["privateKey","password","spendKey","viewKey","rawTransaction"] {
++            let mut changed=base.clone();changed[field]=json!("unexpected");assert!(public_status(changed).is_err());
++        }
++        for field in ["chainObserved","executable"] {
++            let mut changed=base.clone();changed[field]=json!(true);assert!(public_status(changed).is_err());
++        }
++        base["state"]=json!("confirmed");assert!(public_status(base).is_err());
++    }
++    #[test]
++    fn status_request_never_accepts_approval_or_unknown_fields() {
++        let base=json!({"schema":"monzero-bch-native-refund-wallet-status-request-v1","requestId":uuid::Uuid::new_v4()});
++        assert!(request(&serde_json::to_vec(&base).unwrap()).is_ok());
++        for field in ["commitment","password","action"] {
++            let mut changed=base.clone();changed[field]=json!("a".repeat(64));
++            assert!(request(&serde_json::to_vec(&changed).unwrap()).is_err());
++        }
++        let mut changed=base.clone();changed["commitment"]=serde_json::Value::Null;
++        assert!(request(&serde_json::to_vec(&changed).unwrap()).is_err());
++        let mut changed=base;changed["requestId"]=json!(uuid::Uuid::nil());
++        assert!(request(&serde_json::to_vec(&changed).unwrap()).is_err());
++        assert!(request(&[]).is_err());assert!(request(&vec![b' ';513]).is_err());
++    }
++    #[test]
++    fn status_config_rejects_unbound_or_mutating_input() {
++        let base=json!({"schema":"monzero-private-bch-native-refund-wallet-v1",
++            "admissionConfigFile":"/private/admission.json","refundTxid":"a".repeat(64),"deploymentCommitment":"b".repeat(64)});
++        assert!(config(&serde_json::to_vec(&base).unwrap()).is_ok());
++        for (field,value) in [("admissionConfigFile",json!("relative")),("refundTxid",json!("A".repeat(64))),
++            ("refundTxid",json!("0".repeat(64))),("deploymentCommitment",json!("0".repeat(64))),
++            ("schema",json!("wrong")),("rpcFile",json!("/private/rpc"))] {
++            let mut changed=base.clone();changed[field]=value;
++            assert!(config(&serde_json::to_vec(&changed).unwrap()).is_err());
++        }
++        for field in ["admissionConfigFile","refundTxid","deploymentCommitment"] {
++            let mut changed=base.clone();changed.as_object_mut().unwrap().remove(field);
++            assert!(config(&serde_json::to_vec(&changed).unwrap()).is_err());
++        }
++    }
++}

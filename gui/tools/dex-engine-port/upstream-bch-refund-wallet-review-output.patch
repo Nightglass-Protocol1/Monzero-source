@@ -1,0 +1,104 @@
+--- a/swap-machine/src/bin/native-bch-admission/refund_wallet/review.rs
++++ b/swap-machine/src/bin/native-bch-admission/refund_wallet/review.rs
+@@ -5,7 +5,8 @@
+ #[derive(Deserialize)]
+ #[serde(rename_all="kebab-case")]
+ enum Action {Restore,Open,Check}
+-impl Action {fn engine(&self)->RefundWalletAction {match self {Self::Restore=>RefundWalletAction::Restore,Self::Open=>RefundWalletAction::Open,Self::Check=>RefundWalletAction::Check}}}
++impl Action {fn name(&self)->&'static str {match self {Self::Restore=>"restore",Self::Open=>"open",Self::Check=>"check"}}
++fn engine(&self)->RefundWalletAction {match self {Self::Restore=>RefundWalletAction::Restore,Self::Open=>RefundWalletAction::Open,Self::Check=>RefundWalletAction::Check}}}
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields,rename_all="camelCase")]
+ struct ReviewRequest {schema:String,request_id:uuid::Uuid,action:Action}
+@@ -23,14 +24,36 @@
+         && value.status_config_file.is_absolute() && value.bch_rpc_file.is_absolute() && value.native_rpc_file.is_absolute(),
+         "invalid refund wallet review configuration");Ok(value)
+ }
+-fn public_review(value:serde_json::Value)->Result<serde_json::Value> {
++fn public_review(value:serde_json::Value,action:&Action,trade:uuid::Uuid,deployment:&[u8;32],refund:&str)->Result<serde_json::Value> {
+     let fields=["schema","action","state","swapId","quote","admission","walletFile","address","nativePayment","refund",
+         "walletBinding","walletIntent","restoreHeight","minimumBchConfirmations","minimumXmzConfirmations","bchDeployment",
+         "bchNetwork","bchGenesis","xmzNetwork","walletBackend"];
+     let object=value.as_object().context("invalid wallet review")?;
+     ensure!(object.len()==fields.len() && fields.iter().all(|field|object.contains_key(*field)),"unexpected wallet review fields");
++    ensure!(value["schema"]=="monzero-bch-native-refund-wallet-review-v1" && value["action"]==action.name()
++        && value["swapId"]==trade.to_string() && value["refund"]==refund,"wallet review binding changed");
++    ensure!(value["walletFile"]==format!("swap-{}",trade.simple()) && value["restoreHeight"]==0,"wallet review identity changed");
++    let state=value["state"].as_str().context("invalid wallet review state")?;
++    ensure!(match action {Action::Restore=>state=="not-attempted",Action::Open|Action::Check=>matches!(state,"attempted"|"ready")},"wallet review action changed");
++    for field in ["quote","admission","walletBinding","bchDeployment"] {
++        let pin:[u8;32]=serde_json::from_value(value[field].clone())?;
++        if field=="bchDeployment" {ensure!(pin==*deployment,"wallet review deployment changed");}
++    }
++    if state=="not-attempted" {ensure!(value["walletIntent"].is_null(),"unexpected wallet intent");}
++    else {let _:[u8;32]=serde_json::from_value(value["walletIntent"].clone())?;}
++    for field in ["nativePayment","refund","bchGenesis"] {parse_digest(value[field].as_str().context("invalid wallet review transaction")?)?;}
++    let address=value["address"].as_str().context("invalid wallet review address")?;
++    ensure!(matches!(address.len(),95|106) && address.bytes().all(|b|b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(&b)),"invalid wallet review address");
++    ensure!(value["bchNetwork"]=="bch-regtest" && matches!(value["xmzNetwork"].as_str(),Some("xmz-mainnet"|"xmz-testnet"|"xmz-stagenet")),"unexpected wallet review network");
++    for field in ["minimumBchConfirmations","minimumXmzConfirmations"] {
++        let depth=value[field].as_u64().context("invalid wallet review depth")?;ensure!((1..=1000).contains(&depth),"invalid wallet review depth");
++    }
+     let backend=object["walletBackend"].as_object().context("invalid wallet review backend")?;
+-    ensure!(backend.len()==4 && ["schema","host","daemonPort","walletPort"].iter().all(|field|backend.contains_key(*field)),"unexpected wallet backend fields");
++    ensure!(backend.len()==4 && ["schema","host","daemonPort","walletPort"].iter().all(|field|backend.contains_key(*field))
++        && backend["schema"]=="monzero-local-wallet-endpoint-v1" && backend["host"]=="127.0.0.1","unexpected wallet backend fields");
++    let daemon=backend["daemonPort"].as_u64().context("invalid wallet daemon port")?;
++    let wallet=backend["walletPort"].as_u64().context("invalid wallet RPC port")?;
++    ensure!((1..=65535).contains(&daemon) && (1..=65535).contains(&wallet) && daemon!=wallet,"invalid wallet backend ports");
+     Ok(value)
+ }
+ pub(super) async fn operation(path:&Path,bytes:&[u8])->Result<serde_json::Value> {
+@@ -71,7 +94,9 @@
+     let observed=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+     let recovered=execution.recover_light_bch_native_refund(&observer,&bch,refund,None,observed).await?;
+     let review=execution.review_recovered_bch_refund_wallet(&recovered,request.action.engine(),&session,observed)?;
+-    let details=public_review(review.details)?;
++    let details=public_review(review.details,&request.action,config.trade_id,&deployment,&wrapper.refund_txid)?;
++    ensure!(details["walletBackend"]==serde_json::json!({"schema":"monzero-local-wallet-endpoint-v1","host":"127.0.0.1",
++        "daemonPort":native.daemon_port,"walletPort":native.wallet_port}),"wallet review service changed");
+     Ok(serde_json::json!({"schema":"monzero-bch-native-refund-wallet-review-response-v1",
+         "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":true,"observedAt":observed,
+         "review":{"details":details,"commitment":review.commitment.iter().map(|byte|format!("{byte:02x}")).collect::<String>()}}))
+@@ -80,6 +105,41 @@
+ mod tests {
+     use super::*;
+     use serde_json::json;
++    fn fixture()->serde_json::Value {
++        let trade=uuid::Uuid::from_u128(1);
++        json!({"schema":"monzero-bch-native-refund-wallet-review-v1","action":"restore","state":"not-attempted",
++            "swapId":trade,"quote":vec![1u8;32],"admission":vec![2u8;32],"walletBinding":vec![3u8;32],"walletIntent":null,
++            "walletFile":format!("swap-{}",trade.simple()),"address":"4".repeat(95),"nativePayment":"aa".repeat(32),"refund":"bb".repeat(32),
++            "restoreHeight":0,"minimumBchConfirmations":2,"minimumXmzConfirmations":3,"bchDeployment":vec![4u8;32],
++            "bchNetwork":"bch-regtest","bchGenesis":"cc".repeat(32),"xmzNetwork":"xmz-mainnet",
++            "walletBackend":{"schema":"monzero-local-wallet-endpoint-v1","host":"127.0.0.1","daemonPort":18081,"walletPort":18083}})
++    }
++    fn accepted(value:serde_json::Value,action:&Action)->bool {
++        public_review(value,action,uuid::Uuid::from_u128(1),&[4;32],&"bb".repeat(32)).is_ok()
++    }
++    #[test]
++    fn public_review_rejects_nested_private_material() {
++        let base=fixture();assert!(accepted(base.clone(),&Action::Restore));
++        for field in ["quote","admission","walletBinding","walletIntent","refund","nativePayment","address","bchNetwork","bchGenesis","xmzNetwork"] {
++            let mut value=base.clone();value[field]=json!({"privateKey":"must-not-escape"});assert!(!accepted(value,&Action::Restore),"{field}");
++        }
++        let mut value=base.clone();value["walletBackend"]["password"]=json!("must-not-escape");assert!(!accepted(value,&Action::Restore));
++        let mut value=base;value["privateKey"]=json!("must-not-escape");assert!(!accepted(value,&Action::Restore));
++    }
++    #[test]
++    fn public_review_checks_action_state_and_bound_identity() {
++        let base=fixture();
++        for (field,replacement) in [("action",json!("check")),("swapId",json!(uuid::Uuid::from_u128(2))),
++            ("refund",json!("cc".repeat(32))),("bchDeployment",json!(vec![5u8;32])),("walletFile",json!("other")),
++            ("restoreHeight",json!(1)),("minimumBchConfirmations",json!(0)),("minimumXmzConfirmations",json!(true))] {
++            let mut value=base.clone();value[field]=replacement;assert!(!accepted(value,&Action::Restore),"{field}");
++        }
++        for (name,action) in [("open",Action::Open),("check",Action::Check)] {
++            let mut value=base.clone();value["action"]=json!(name);assert!(!accepted(value.clone(),&action));
++            value["walletIntent"]=json!(vec![2u8;32]);
++            for state in ["attempted","ready"] {value["state"]=json!(state);assert!(accepted(value.clone(),&action));}
++        }
++    }
+     #[test]
+     fn review_request_has_no_mutation_or_secret_fields()->Result<()> {
+         for action in ["restore","open","check"] {

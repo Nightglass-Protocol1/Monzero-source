@@ -1,0 +1,260 @@
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index 69f43e927..3cb3e5b7c 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -6,6 +6,7 @@
+ //! it directly. Nothing here authorizes live/mainnet execution on its own.
+ //! Credentials are required and intentionally have no Debug or serialization API.
+ pub mod fee_estimation;
++pub mod full_proceeds;
+ pub mod relay;
+ pub mod spendable;
+ pub mod spend_journal;
+diff --git a/swap-machine/src/native_funding_rpc/full_proceeds.rs b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+new file mode 100644
+index 000000000..72696093d
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+@@ -0,0 +1,201 @@
++//! Non-executable full-lock accounting experiment, not signed quote policy.
++//! Constructs a single transaction with fees deducted from the destination.
++//! No metadata, signing artifacts or relay-capable object is returned. The
++//! trusted caller must exclusively own the restored wallet service. Native RPC
++//! constructs/signs internally; this is not a read-only wallet operation.
++use super::{number, NativeFundingRpc};
++use crate::xmz_funding::FundingObserver;
++use anyhow::{ensure, Context, Result};
++use serde_json::{json, Value};
++use std::collections::BTreeSet;
++use swap_core::{xmz::XmzAmount, xmz_address::XmzAddress};
++
++pub struct FullProceedsRequest {
++    pub wallet: XmzAddress,
++    pub destination: XmzAddress,
++    pub lock_txid: String,
++    /// Gross lock amount for this experiment only, not a reinterpretation of
++    /// xmzAtoms in a historical or current signed quote.
++    pub locked: XmzAmount,
++    pub maximum_fee: XmzAmount,
++    pub account: u32,
++    pub priority: u32,
++}
++
++/// Display/test evidence only; cannot be passed to relay_prepared or a journal.
++pub struct FullProceedsPreview {
++    pub locked: XmzAmount,
++    pub recipient: XmzAmount,
++    pub network_fee: XmzAmount,
++    pub weight: u64,
++}
++
++/// Fail closed if a single transaction cannot consume exactly the intended
++/// lock. No automatic split, sweep-all, output freezing or relay fallback.
++pub async fn preview(client: &NativeFundingRpc, request: &FullProceedsRequest,
++    genesis: &str) -> Result<FullProceedsPreview> {
++    ensure!(hash(genesis) && hash(&request.lock_txid), "invalid full-proceeds chain or lock");
++    ensure!(request.wallet.network() == request.destination.network()
++        && request.wallet != request.destination, "invalid full-proceeds destination");
++    ensure!(request.locked.atoms() > 0 && request.maximum_fee.atoms() > 0
++        && request.maximum_fee.atoms() < request.locked.atoms()
++        && (1..=4).contains(&request.priority), "invalid full-proceeds amounts or priority");
++    let before = client.snapshot().await?;
++    ensure!(before.genesis == genesis && hash(&before.tip_hash), "unexpected full-proceeds chain");
++    ensure!(client.opened_wallet(request.wallet.network()).await?.as_ref() == Some(&request.wallet),
++        "unexpected full-proceeds wallet");
++    let incoming = client.rpc(client.wallet, "incoming_transfers",
++        json!({"transfer_type":"available", "account_index":request.account})).await?;
++    let expected_inputs = lock_inputs(&incoming, request)?;
++    let response = client.rpc(client.wallet, "transfer", params(request)).await?;
++    let preview = check_response(&response, request, &expected_inputs)?;
++    ensure!(client.opened_wallet(request.wallet.network()).await?.as_ref() == Some(&request.wallet),
++        "full-proceeds wallet changed");
++    ensure!(client.snapshot().await? == before, "full-proceeds chain changed");
++    Ok(preview)
++}
++
++fn params(request: &FullProceedsRequest) -> Value {
++    json!({"destinations":[{"address":request.destination.to_string(),"amount":request.locked.atoms()}],
++        "account_index":request.account,"priority":request.priority,"unlock_time":0,
++        "subtract_fee_from_outputs":[0],"do_not_relay":true,
++        "get_tx_key":false,"get_tx_hex":false,"get_tx_metadata":false})
++}
++
++fn lock_inputs(incoming: &Value, request: &FullProceedsRequest) -> Result<BTreeSet<String>> {
++    let outputs = incoming["transfers"].as_array().context("missing full-proceeds outputs")?;
++    let mut all_keys = BTreeSet::new();
++    let mut keys = BTreeSet::new();
++    let mut total = 0u64;
++    for output in outputs {
++        let key = output["key_image"].as_str().context("missing output key image")?;
++        ensure!(hash(key) && key != "0".repeat(64) && all_keys.insert(key),
++            "invalid or ambiguous full-proceeds input");
++        if output["tx_hash"] != request.lock_txid { continue; }
++        ensure!(output["spent"] == false && output["unlocked"] == true && output["frozen"] == false
++            && number(&output["subaddr_index"], "major")? == u64::from(request.account),
++            "full-proceeds lock output is not available");
++        let amount = number(output, "amount")?;
++        ensure!(amount > 0, "zero full-proceeds input");
++        total = total.checked_add(amount).context("full-proceeds input overflow")?;
++        keys.insert(key.to_owned());
++    }
++    ensure!(!keys.is_empty() && total == request.locked.atoms(),
++        "available lock total differs from approved full-proceeds principal");
++    Ok(keys)
++}
++
++fn check_response(response: &Value, request: &FullProceedsRequest,
++    expected_inputs: &BTreeSet<String>) -> Result<FullProceedsPreview> {
++    for field in ["tx_key", "tx_blob", "tx_metadata", "multisig_txset", "unsigned_txset"] {
++        ensure!(response.get(field).and_then(Value::as_str) == Some(""),
++            "unexpected full-proceeds signing artifact");
++    }
++    ensure!(response["tx_hash"].as_str().is_some_and(hash), "invalid full-proceeds transaction hash");
++    let amount = number(response, "amount")?;
++    let fee = number(response, "fee")?;
++    let weight = number(response, "weight")?;
++    ensure!(amount > 0 && fee > 0 && fee <= request.maximum_fee.atoms() && weight > 0
++        && amount.checked_add(fee) == Some(request.locked.atoms()),
++        "full-proceeds payment and fee do not exactly consume lock");
++    ensure!(response["amounts_by_dest"]["amounts"] == json!([amount]),
++        "full-proceeds destination amount mismatch");
++    let selected = response["spent_key_images"]["key_images"].as_array()
++        .context("missing full-proceeds selected inputs")?;
++    let mut actual = BTreeSet::new();
++    for key in selected {
++        let key = key.as_str().context("invalid full-proceeds selected input")?;
++        ensure!(actual.insert(key.to_owned()), "duplicate full-proceeds selected input");
++    }
++    ensure!(!actual.is_empty() && &actual == expected_inputs,
++        "full-proceeds must consume all and only approved lock inputs");
++    Ok(FullProceedsPreview { locked: request.locked, recipient: XmzAmount::from_atoms(amount),
++        network_fee: XmzAmount::from_atoms(fee), weight })
++}
++
++fn hash(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn request() -> FullProceedsRequest {
++        let wallet = XmzAddress::parse(swap_core::xmz_address::XmzNetwork::Mainnet,
++            "FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H").unwrap();
++        FullProceedsRequest { destination: wallet.clone(), wallet, lock_txid:"a".repeat(64),
++            locked:XmzAmount::from_atoms(102),maximum_fee:XmzAmount::from_atoms(10),account:0,priority:1 }
++    }
++    fn incoming() -> Value {
++        json!({"transfers":[{"tx_hash":"a".repeat(64),"key_image":"b".repeat(64),"amount":102,
++            "spent":false,"unlocked":true,"frozen":false,"subaddr_index":{"major":0}}]})
++    }
++    fn response() -> Value {
++        json!({"amount":100,"fee":2,"weight":10,"tx_hash":"c".repeat(64),
++            "amounts_by_dest":{"amounts":[100]},"spent_key_images":{"key_images":["b".repeat(64)]},
++            "tx_key":"","tx_blob":"","tx_metadata":"","multisig_txset":"","unsigned_txset":""})
++    }
++    #[test]
++    fn full_proceeds_requests_never_relay_or_export_metadata() {
++        let value = params(&request());
++        assert_eq!(value["do_not_relay"], true);
++        assert_eq!(value["subtract_fee_from_outputs"], json!([0]));
++        assert_eq!(value["destinations"][0]["amount"], 102);
++        for field in ["get_tx_key","get_tx_hex","get_tx_metadata"] { assert_eq!(value[field],false); }
++    }
++    #[test]
++    fn full_proceeds_requires_exact_lock_and_available_unique_outputs() -> Result<()> {
++        let request = request();
++        let source = incoming();
++        assert_eq!(lock_inputs(&source,&request)?, BTreeSet::from(["b".repeat(64)]));
++        let mut unrelated=source.clone();
++        let mut other=source["transfers"][0].clone();
++        other["tx_hash"]=json!("d".repeat(64));other["key_image"]=json!("e".repeat(64));
++        unrelated["transfers"].as_array_mut().unwrap().push(other);
++        assert_eq!(lock_inputs(&unrelated,&request)?,BTreeSet::from(["b".repeat(64)]));
++        for (field,value) in [("amount",json!(101)),("spent",json!(true)),("unlocked",json!(false)),
++            ("frozen",json!(true)),("tx_hash",json!("d".repeat(64))),
++            ("key_image",json!("0".repeat(64))), ("subaddr_index",json!({"major":1}))] {
++            let mut changed=source.clone();changed["transfers"][0][field]=value;
++            assert!(lock_inputs(&changed,&request).is_err());
++        }
++        let mut split=source.clone();split["transfers"][0]["amount"]=json!(51);
++        let mut second=split["transfers"][0].clone(); second["key_image"]=json!("d".repeat(64));
++        split["transfers"].as_array_mut().unwrap().push(second);
++        assert_eq!(lock_inputs(&split,&request)?.len(),2);
++        split["transfers"][1]["key_image"]=json!("b".repeat(64));
++        assert!(lock_inputs(&split,&request).is_err());
++        let mut overflow=source.clone();overflow["transfers"][0]["amount"]=json!(u64::MAX);
++        let mut extra=source["transfers"][0].clone();extra["key_image"]=json!("d".repeat(64));
++        overflow["transfers"].as_array_mut().unwrap().push(extra);
++        assert!(lock_inputs(&overflow,&request).is_err());
++        Ok(())
++    }
++    #[test]
++    fn full_proceeds_rejects_residuals_extra_inputs_and_artifacts() -> Result<()> {
++        let request=request();let expected=lock_inputs(&incoming(),&request)?;
++        let valid=response();let checked=check_response(&valid,&request,&expected)?;
++        assert_eq!(checked.recipient.atoms()+checked.network_fee.atoms(),checked.locked.atoms());
++        let two_inputs=BTreeSet::from(["b".repeat(64),"d".repeat(64)]);
++        assert!(check_response(&valid,&request,&two_inputs).is_err());
++        let mut complete=valid.clone();
++        complete["spent_key_images"]["key_images"]=json!(["d".repeat(64),"b".repeat(64)]);
++        check_response(&complete,&request,&two_inputs)?;
++        for (field,value) in [("amount",json!(99)),("amount",json!(u64::MAX)),("fee",json!(3)),
++            ("fee",json!(0)),("weight",json!(0)),("tx_hash",json!("invalid")),
++            ("amounts_by_dest",json!({"amounts":[99]})),("amounts_by_dest",json!({"amounts":[50,50]})),
++            ("spent_key_images",json!({"key_images":[]})),
++            ("spent_key_images",json!({"key_images":["b".repeat(64),"d".repeat(64)]})),
++            ("spent_key_images",json!({"key_images":["b".repeat(64),"b".repeat(64)]}))] {
++            let mut changed=valid.clone();changed[field]=value;
++            assert!(check_response(&changed,&request,&expected).is_err());
++        }
++        for field in ["tx_key","tx_blob","tx_metadata","multisig_txset","unsigned_txset"] {
++            let mut changed=valid.clone();changed[field]=json!("private");
++            assert!(check_response(&changed,&request,&expected).is_err());
++        }
++        let mut capped=request;capped.maximum_fee=XmzAmount::from_atoms(1);
++        assert!(check_response(&valid,&capped,&expected).is_err());
++        Ok(())
++    }
++}
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index cd3eef05e..806a339fe 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -113,6 +113,8 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+     let restore_height: u64 = std::env::var("MONZERO_TEST_SPEND_RESTORE_HEIGHT")?.parse()?;
+     let lock_txid = std::env::var("MONZERO_TEST_SPEND_LOCK_TXID")?;
+     anyhow::ensure!(lock_txid.len() == 64, "invalid spend fixture lock txid");
++    let locked = XmzAmount::from_atom_string(&std::env::var("MONZERO_TEST_SPEND_LOCKED_ATOMS")?)
++        .map_err(|_| anyhow::anyhow!("invalid full-lock fixture amount"))?;
+     let amount = XmzAmount::from_atom_string(&std::env::var("MONZERO_TEST_SPEND_ATOMS")?)
+         .map_err(|_| anyhow::anyhow!("invalid spend fixture amount"))?;
+     let genesis = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
+@@ -171,6 +173,27 @@ async fn native_swap_wallet_spendable() -> Result<()> {
+     anyhow::ensure!(error.to_string() == "wallet already open", "unexpected ownership rejection");
+     anyhow::ensure!(native_rpc::authenticated_fixture()?.opened_wallet(XmzNetwork::Mainnet).await?
+         .as_ref() == Some(&wallet), "rejected restore closed a pre-existing wallet");
++    // Experiment only: construct full-lock net-of-fee proceeds without relay or
++    // retained signing metadata. Existing signed quote/spend semantics stay intact.
++    existing.import_transaction(&lock_txid, &wallet).await?;
++    let mut full = swap_machine::native_funding_rpc::full_proceeds::FullProceedsRequest {
++        wallet: wallet.clone(), destination: destination.clone(), lock_txid: lock_txid.clone(),
++        locked, maximum_fee, account: 0, priority: 1,
++    };
++    let client = native_rpc::authenticated_fixture()?;
++    let preview = swap_machine::native_funding_rpc::full_proceeds::preview(&client,&full,genesis).await?;
++    anyhow::ensure!(preview.locked == locked && preview.weight > 0
++        && preview.recipient.checked_add(preview.network_fee) == Some(locked),
++        "full-lock preview left residual funds");
++    full.locked = XmzAmount::from_atoms(locked.atoms()-1);
++    anyhow::ensure!(swap_machine::native_funding_rpc::full_proceeds::preview(&client,&full,genesis)
++        .await.err().context("incorrect lock principal accepted")?.to_string()
++        == "available lock total differs from approved full-proceeds principal", "wrong principal rejection");
++    full.locked = locked;
++    full.maximum_fee = XmzAmount::from_atoms(1);
++    anyhow::ensure!(swap_machine::native_funding_rpc::full_proceeds::preview(&client,&full,genesis)
++        .await.err().context("excess fee accepted")?.to_string()
++        == "full-proceeds payment and fee do not exactly consume lock", "wrong fee rejection");
+     existing.close(&wallet).await?;
+ 
+     // Restore and import must succeed even under a chain-policy mismatch that

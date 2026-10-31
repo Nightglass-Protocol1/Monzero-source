@@ -1,0 +1,209 @@
+diff --git a/swap-machine/src/bch_rpc.rs b/swap-machine/src/bch_rpc.rs
+--- a/swap-machine/src/bch_rpc.rs
++++ b/swap-machine/src/bch_rpc.rs
+@@ -182,3 +182,5 @@
+ pub mod observation;
+ #[cfg(test)]
+ mod tests;
++
++pub mod confirmed;
+diff --git a/swap-machine/src/bch_rpc/confirmed.rs b/swap-machine/src/bch_rpc/confirmed.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/confirmed.rs
+@@ -0,0 +1,116 @@
++//! Fresh active-chain transaction evidence from the independently pinned BCHN
++//! deployment. Not a serializable peer assertion or cached settlement approval.
++use super::*;
++use bitcoin::{Transaction,Txid,consensus::encode::{deserialize,serialize_hex}};
++use bitcoin::hex::FromHex;
++
++pub struct ConfirmedTransaction {
++    deployment: [u8;32],tip: BlockHash,block: BlockHash,height: u64,
++    confirmations: u64,transaction: Transaction,
++}
++impl ConfirmedTransaction {
++    pub fn deployment(&self) -> &[u8;32] {&self.deployment}
++    pub fn tip(&self) -> BlockHash {self.tip}
++    pub fn block(&self) -> BlockHash {self.block}
++    pub fn height(&self) -> u64 {self.height}
++    pub fn confirmations(&self) -> u64 {self.confirmations}
++    pub fn transaction(&self) -> &Transaction {&self.transaction}
++}
++#[derive(Deserialize)]
++struct RawTransaction {in_active_chain: bool,hex: String,txid: Txid,blockhash: BlockHash,confirmations: u64}
++#[derive(Deserialize)]
++struct Header {hash: BlockHash,height: u64,confirmations: i64}
++fn validate(raw: RawTransaction,header: &Header,txid: Txid,block: BlockHash,tip_height: u64,
++    minimum: u64) -> Result<Transaction> {
++    let depth = tip_height.checked_sub(header.height).and_then(|h|h.checked_add(1))
++        .context("invalid BCH transaction block height")?;
++    ensure!(minimum > 0 && block != BlockHash::all_zeros() && raw.in_active_chain && raw.txid == txid
++        && raw.blockhash == block && header.hash == block && header.confirmations > 0
++        && u64::try_from(header.confirmations)? == depth && raw.confirmations == depth && depth >= minimum,
++        "BCH transaction is not confirmed in the requested active block");
++    ensure!(!raw.hex.is_empty() && raw.hex.len() <= 400_000,"invalid BCH transaction observation size");
++    let transaction: Transaction = deserialize(&Vec::<u8>::from_hex(&raw.hex)?)?;
++    ensure!(serialize_hex(&transaction) == raw.hex && transaction.compute_txid() == txid
++        && transaction.input.iter().all(|input|input.witness.is_empty()),"BCH transaction bytes differ from identity or contain witness");
++    ensure!(!transaction.input.is_empty() && !transaction.output.is_empty()
++        && !transaction.is_coinbase() && transaction.output.iter().all(|o|o.script_pubkey.as_bytes().first()!=Some(&0xef)),
++        "unsupported BCH transaction observation shape or token prefix");
++    Ok(transaction)
++}
++impl BchRpc {
++    /// Index lookup supplies a location hint only; block lookup below performs
++    /// all active-chain and byte checks. Missing index/confirmation is an error.
++    pub async fn indexed_confirmed_transaction(&self,txid: Txid,minimum: u64) -> Result<ConfirmedTransaction> {
++        ensure!(minimum > 0,"zero BCH confirmation requirement");
++        #[derive(Deserialize)] struct Location {txid: Txid,blockhash: BlockHash}
++        let location: Location = serde_json::from_str(self.rpc(false,"getrawtransaction",json!([txid,true])).await?.get())?;
++        ensure!(location.txid == txid,"indexed BCH transaction identity mismatch");
++        self.confirmed_transaction(txid,location.blockhash,minimum).await
++    }
++    /// Explicit block hints avoid requiring a transaction index. A hint grants
++    /// no trust: require active membership, exact depth and a stable pinned tip.
++    pub async fn confirmed_transaction(&self,txid: Txid,block: BlockHash,minimum: u64) -> Result<ConfirmedTransaction> {
++        ensure!(minimum > 0 && block != BlockHash::all_zeros(),"invalid BCH confirmation requirement or block hint");
++        let chain = self.chain_state().await?;
++        let raw: RawTransaction = serde_json::from_str(self.rpc(false,"getrawtransaction",json!([txid,true,block])).await?.get())?;
++        let header: Header = serde_json::from_str(self.rpc(false,"getblockheader",json!([block,true])).await?.get())?;
++        let confirmations = raw.confirmations;
++        let transaction = validate(raw,&header,txid,block,chain.blocks,minimum)?;
++        let after = self.chain_state().await?;
++        ensure!(after.bestblockhash == chain.bestblockhash && after.blocks == chain.blocks,
++            "BCH tip changed during transaction observation");
++        Ok(ConfirmedTransaction {deployment:self.deployment_commitment()?,tip:chain.bestblockhash,
++            block,height:header.height,confirmations,transaction})
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bitcoin::{absolute,transaction::Version,Amount,OutPoint,Sequence,TxIn,TxOut,Witness};
++    pub(super) fn transaction() -> Transaction {
++        Transaction {version:Version::TWO,lock_time:absolute::LockTime::ZERO,
++            input:vec![TxIn {previous_output:OutPoint {txid:Txid::from_byte_array([3;32]),vout:0},
++                script_sig:ScriptBuf::new(),sequence:Sequence::ZERO,witness:Witness::new()}],
++            output:vec![TxOut {value:Amount::from_sat(900),script_pubkey:ScriptBuf::from_bytes(vec![0x51])}]}
++    }
++    #[test]
++    fn bch_confirmed_transaction_rejects_inconsistent_chain_and_bytes() -> Result<()> {
++        let tx = transaction();let txid = tx.compute_txid();let block = BlockHash::from_byte_array([7;32]);
++        let raw = || RawTransaction {in_active_chain:true,hex:serialize_hex(&tx),txid,blockhash:block,confirmations:3};
++        let header = || Header {hash:block,height:100,confirmations:3};
++        assert_eq!(validate(raw(),&header(),txid,block,102,3)?,tx);
++        assert!(validate(raw(),&header(),txid,block,102,0).is_err());
++        assert!(validate(raw(),&header(),txid,block,102,4).is_err());
++        for case in 0..10 {
++            let mut r=raw();let mut h=header();
++            match case {
++                0=>r.in_active_chain=false,
++                1=>r.blockhash=BlockHash::from_byte_array([8;32]),
++                2=>h.hash=BlockHash::from_byte_array([8;32]),
++                3=>h.confirmations=-1,
++                4=>h.height=103,
++                5=>h.confirmations=4,
++                6=>r.confirmations=4,
++                7=>r.txid=Txid::from_byte_array([8;32]),
++                8=>r.hex.push_str("00"),
++                _=>{let mut changed=tx.clone();changed.output[0].value=Amount::from_sat(901);r.hex=serialize_hex(&changed);},
++            }
++            assert!(validate(r,&h,txid,block,102,3).is_err(),"invalid evidence {case}");
++        }
++        for case in 0..3 {
++            let mut changed=tx.clone();
++            match case {
++                0=>changed.input[0].witness=Witness::from_slice(&[vec![1]]),
++                1=>changed.output[0].script_pubkey=ScriptBuf::from_bytes(vec![0xef,0x51]),
++                _=>changed.input[0].previous_output=OutPoint::null(),
++            }
++            let id=changed.compute_txid();let mut r=raw();r.txid=id;r.hex=serialize_hex(&changed);
++            assert!(validate(r,&header(),id,block,102,3).is_err(),"unsupported shape {case}");
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod rpc_tests;
+diff --git a/swap-machine/src/bch_rpc/confirmed/rpc_tests.rs b/swap-machine/src/bch_rpc/confirmed/rpc_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_rpc/confirmed/rpc_tests.rs
+@@ -0,0 +1,74 @@
++use super::*;
++use std::{io::{BufRead,BufReader,Read,Write},net::TcpListener,time::{Duration,Instant}};
++
++#[tokio::test]
++async fn bch_confirmation_rpc_checks_exact_lookup_and_stable_deployment_tip() -> Result<()> {
++    for (indexed,mode) in [(false,0),(false,1),(true,0),(true,1),(true,2)] {
++        let tx=tests::transaction();let txid=tx.compute_txid();let block=BlockHash::from_byte_array([7;32]);
++        let tip=BlockHash::from_byte_array([8;32]);let checkpoint=BlockHash::from_byte_array([4;32]);
++        let network=BchNetwork::Regtest {checkpoint_height:1,checkpoint};
++        let listener=TcpListener::bind("127.0.0.1:0")?;listener.set_nonblocking(true)?;
++        let port=listener.local_addr()?.port();
++        let server=std::thread::spawn(move || -> Result<()> {
++            let mut methods=vec!["getnetworkinfo","getblockchaininfo","getblockhash","getblockhash",
++                "getrawtransaction","getblockheader","getnetworkinfo","getblockchaininfo","getblockhash","getblockhash"];
++            if indexed {methods.insert(0,"getrawtransaction");}
++            if mode==2 {methods.truncate(1);}
++            for (i,method) in methods.iter().enumerate() {
++                let deadline=Instant::now()+Duration::from_secs(10);
++                let (mut socket,_)=loop {
++                    match listener.accept() {
++                        Ok(pair)=>break pair,
++                        Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{
++                            ensure!(Instant::now()<deadline,"missing expected BCH observation RPC");
++                            std::thread::sleep(Duration::from_millis(1));
++                        },
++                        Err(e)=>return Err(e.into()),
++                    }
++                };
++                socket.set_read_timeout(Some(Duration::from_secs(10)))?;
++                let mut reader=BufReader::new(socket.try_clone()?);let mut line=String::new();let mut length=None;
++                loop {
++                    line.clear();ensure!(reader.read_line(&mut line)?>0,"missing BCH request headers");
++                    if line=="\r\n" {break;}
++                    if let Some(value)=line.to_ascii_lowercase().strip_prefix("content-length:") {length=Some(value.trim().parse::<usize>()?);}
++                }
++                let length=length.context("missing BCH request length")?;ensure!(length<4096,"oversized BCH test request");
++                let mut bytes=vec![0;length];reader.read_exact(&mut bytes)?;let request:Value=serde_json::from_slice(&bytes)?;
++                ensure!(request["method"]==*method,"unexpected BCH confirmation RPC order");
++                let result=match *method {
++                    "getnetworkinfo"=>json!({"subversion":"/Bitcoin Cash Node:29.0.0/","networkactive":true}),
++                    "getblockchaininfo"=>json!({"chain":"regtest","blocks":102,"headers":102,"initialblockdownload":false,
++                        "bestblockhash":if mode==1 && i==7+usize::from(indexed) {BlockHash::from_byte_array([9;32])} else {tip}}),
++                    "getblockhash"=>{
++                        if request["params"]==json!([0]) {json!(network.genesis())}
++                        else {ensure!(request["params"]==json!([1]),"wrong BCH checkpoint");json!(checkpoint)}
++                    },
++                    "getrawtransaction" if indexed && i==0=>{
++                        ensure!(request["params"]==json!([txid,true]),"wrong BCH index lookup");
++                        json!({"txid":if mode==2 {Txid::from_byte_array([9;32])} else {txid},"blockhash":block})
++                    },
++                    "getrawtransaction"=>{
++                        ensure!(request["params"]==json!([txid,true,block]),"wrong BCH explicit block lookup");
++                        json!({"in_active_chain":true,"hex":serialize_hex(&tx),"txid":txid,"blockhash":block,"confirmations":3})
++                    },
++                    _=>{ensure!(request["params"]==json!([block,true]),"wrong BCH header lookup");json!({"hash":block,"height":100,"confirmations":3})},
++                };
++                let body=serde_json::to_vec(&json!({"id":request["id"],"error":null,"result":result}))?;
++                write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;socket.write_all(&body)?;
++            }
++            Ok(())
++        });
++        let rpc=BchRpc::new(port,"fixture".into(),"fixture".into(),network,"fixture".into(),
++            "bchreg:qanchor".into(),ScriptBuf::from_bytes(vec![0x51]),"/Bitcoin Cash Node:29.0.0/".into())?;
++        let result=if indexed {rpc.indexed_confirmed_transaction(txid,3).await} else {rpc.confirmed_transaction(txid,block,3).await};
++        server.join().unwrap()?;
++        if mode!=0 {assert!(result.is_err());} else {
++            let observed=result?;
++            assert_eq!(observed.transaction().compute_txid(),txid);assert_eq!(observed.confirmations(),3);
++            assert_eq!(observed.height(),100);assert_eq!(observed.block(),block);assert_eq!(observed.tip(),tip);
++            assert_eq!(observed.deployment(),&rpc.deployment_commitment()?);
++        }
++    }
++    Ok(())
++}

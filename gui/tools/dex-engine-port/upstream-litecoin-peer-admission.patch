@@ -1,0 +1,119 @@
+diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
+index d0b7c5ab9..37508fc3f 100644
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -114,6 +114,38 @@ mod linux {
+     }
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct PeerRequest {schema:String,request_id:uuid::Uuid,frame_hex:String,signature_hex:String}
++    impl Drop for PeerRequest {fn drop(&mut self) {use zeroize::Zeroize;self.frame_hex.zeroize();}}
++    fn decode_peer_hex(value:&str,maximum:usize)->Result<Vec<u8>> {
++        ensure!(!value.is_empty() && value.len()<=maximum*2 && value.len()%2==0
++            && value.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
++            "invalid peer message encoding");
++        (0..value.len()).step_by(2).map(|offset|
++            u8::from_str_radix(&value[offset..offset+2],16).map_err(Into::into)).collect()
++    }
++    fn accept_peer(config:&Config,input:&[u8],now:u64)->Result<serde_json::Value> {
++        ensure!(config.schema=="monzero-private-ltc-journal-v5"
++            && config.policy.ltc_network==swap_core::litecoin_address::LtcNetwork::Regtest,
++            "peer admission helper requires isolated trade startup configuration");
++        let request:PeerRequest=serde_json::from_slice(input)?;
++        ensure!(request.schema=="monzero-ltc-peer-accept-request-v1" && !request.request_id.is_nil(),
++            "invalid peer admission request");
++        let frame=zeroize::Zeroizing::new(decode_peer_hex(&request.frame_hex,200_000)?);
++        let signature=decode_peer_hex(&request.signature_hex,64)?;
++        ensure!(signature.len()==64,"invalid peer signature size");
++        let role=match config.role.as_str() {"litecoin-funder"=>LocalRole::LitecoinFunder,
++            "native-funder"=>LocalRole::NativeFunder,_=>anyhow::bail!("invalid peer admission role")};
++        let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
++            config.trade_id,&config.policy,role,config.pins)?;
++        // The controller authenticates the peer, quote, sequence and proof before
++        // publication. Identical redelivery recovers the same durable checkpoint.
++        let checkpoint=execution.accept_peer(&frame,&signature,now)?;
++        Ok(serde_json::json!({"schema":"monzero-ltc-peer-accept-response-v1","requestId":request.request_id,
++            "checkpoint":checkpoint.iter().map(|b|format!("{b:02x}")).collect::<String>(),
++            "snapshot":execution.saved_status()?}))
++    }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct RefundRpc {
+         schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
+         native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,ltc_refund_block:bitcoin::BlockHash,
+@@ -298,6 +330,22 @@ mod linux {
+         struct OwnedDirectory(PathBuf);
+         impl Drop for OwnedDirectory {fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);}}
+         #[test]
++        fn peer_encoding_and_request_reject_ambiguous_or_excess_authority()->Result<()> {
++            assert_eq!(decode_peer_hex("00ff",2)?,vec![0,255]);
++            for value in ["","0","AA","gg","é","000000"] {
++                assert!(decode_peer_hex(value,2).is_err());
++            }
++            let mut request=serde_json::json!({"schema":"monzero-ltc-peer-accept-request-v1",
++                "requestId":uuid::Uuid::new_v4(),"frameHex":"00","signatureHex":"00".repeat(64)});
++            assert!(serde_json::from_value::<PeerRequest>(request.clone()).is_ok());
++            for field in ["action","commitment","safetyBlocks","privateKey"] {
++                request[field]=serde_json::json!("forbidden");
++                assert!(serde_json::from_value::<PeerRequest>(request.clone()).is_err());
++                request.as_object_mut().unwrap().remove(field);
++            }
++            Ok(())
++        }
++        #[test]
+         fn payment_request_modes_reject_cross_operation_and_extra_authority()->Result<()> {
+             let modes=[("--snapshot-stdio-v1","monzero-ltc-journal-request-v1",false,false,false),
+                 ("--start-review-stdio-v1","monzero-ltc-start-review-request-v1",false,false,false),
+@@ -374,7 +422,7 @@ mod linux {
+     }
+     pub fn run()->Result<()> {
+         let args:Vec<_>=std::env::args_os().collect();
+-        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
++        ensure!(args.len()==4 && (args[1]=="--snapshot-stdio-v1" || args[1]=="--peer-accept-stdio-v1" || args[1]=="--start-review-stdio-v1" || args[1]=="--start-submit-stdio-v1" || args[1]=="--refund-review-stdio-v1" || args[1]=="--payout-review-stdio-v1" || args[1]=="--refund-submit-stdio-v1" || args[1]=="--refund-check-stdio-v1" || args[1]=="--payout-submit-stdio-v1" || args[1]=="--payout-check-stdio-v1" || args[1]=="--funding-review-stdio-v1" || args[1]=="--funding-submit-stdio-v1" || args[1]=="--funding-check-stdio-v1")
+             && args[2]=="--config-file","invalid journal helper arguments");
+         let review_mode=args[1]=="--refund-review-stdio-v1";
+         let payout_review_mode=args[1]=="--payout-review-stdio-v1";
+@@ -386,6 +434,17 @@ mod linux {
+         let payout_submit_mode=args[1]=="--payout-submit-stdio-v1";
+         let payout_check_mode=args[1]=="--payout-check-stdio-v1";
+         let (_lease,config)=load(Path::new(&args[3]))?;
++        if args[1]=="--peer-accept-stdio-v1" {
++            let mut input=zeroize::Zeroizing::new(Vec::new());
++            std::io::stdin().take(401025).read_to_end(&mut input)?;
++            ensure!(input.len()<=401024,"oversized peer admission request");
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            let response=accept_peer(&config,&input,now)?;
++            let result=serde_json::to_vec(&response)?;
++            ensure!(result.len()<=8192,"oversized peer admission response");
++            std::io::stdout().write_all(&result)?;
++            return Ok(());
++        }
+         let mut input=Vec::new();std::io::stdin().take(513).read_to_end(&mut input)?;
+         ensure!(input.len()<=512,"oversized journal request");
+         let request:Request=serde_json::from_slice(&input)?;
+diff --git a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+index bb5e7fc54..fdd82cb89 100644
+--- a/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
++++ b/swap-machine/src/litecoin_negotiation/paired_chain_fixture.rs
+@@ -84,7 +84,7 @@ async fn actual_paired_chain_execution()->Result<()> {
+     }
+     let mut result=serde_json::json!({"schema":"monzero-paired-chain-fixture-v1","action":request.action,"executable":false});
+     match request.action.as_str() {
+-        "begin"|"begin_prepared"=>{
++        "begin"|"begin_prepared"|"begin_negotiated"=>{
+             result["startApprovalBound"]=serde_json::json!(true);
+             let keys=bob.completed_keys()?;
+             ensure!(keys.transcript_commitment()==alice.completed_keys()?.transcript_commitment(),"fixture key disagreement");
+@@ -95,6 +95,12 @@ async fn actual_paired_chain_execution()->Result<()> {
+             result["contract"]=serde_json::json!(keys.contract_address().to_string());
+             result["nativeAddress"]=serde_json::json!(keys.native_address().to_string());
+         },
++        "outgoing_bob"|"outgoing_alice"=>{
++            let frame=if request.action=="outgoing_bob" {bob.outgoing(&bob_identity,now)?}
++                else {alice.outgoing(&alice_identity,now)?};
++            result["frameHex"]=serde_json::json!(hex(frame.bytes()));
++            result["signatureHex"]=serde_json::json!(hex(frame.signature()));
++        },
+         "ltc_lock"=>{
+             let rpc=litecoin(&root,&request)?;let keys=bob.completed_keys()?;
+             let amount=bitcoin::Amount::from_sat(request.terms["ltcAtoms"].parse()?);

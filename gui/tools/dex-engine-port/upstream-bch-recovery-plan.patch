@@ -1,0 +1,178 @@
+--- a/swap-core/src/bch.rs
++++ b/swap-core/src/bch.rs
+@@ -76,3 +76,4 @@
+ 
+ pub mod covenant;
+ pub mod spend;
++pub mod recovery;
+--- /dev/null
++++ b/swap-core/src/bch/recovery.rs
+@@ -0,0 +1,85 @@
++//! The two BCH covenant stages and their amount flow. This is not a negotiated
++//! swap: authentication, cross-curve key proofs, chain observation, durable
++//! ownership and protocol release conditions are still caller responsibilities.
++use anyhow::{Context, Result, ensure};
++use bitcoin::{OutPoint, Script, ScriptBuf, secp256k1::PublicKey};
++use super::{covenant::{Covenant, CovenantTerms}, spend::SpendTerms};
++
++#[derive(Clone, Debug)]
++pub struct RecoveryTerms {
++    pub locked_atoms: u64,
++    pub lock_fee_atoms: u64,
++    pub recovery_fee_atoms: u64,
++    pub minimum_output_atoms: u64,
++    pub cancel_delay_blocks: u16,
++    pub punish_delay_blocks: u16,
++    pub bch_funder_signing_key: PublicKey,
++    pub native_funder_signing_key: PublicKey,
++    pub bch_funder_refund: ScriptBuf,
++    pub native_funder_payout: ScriptBuf,
++}
++
++/// Success sends BCH to the native funder. Cancellation forwards it into the
++/// recovery contract. Its signed branch refunds the BCH funder; its later
++/// timeout sends BCH to the native funder if the refund signature is withheld.
++pub struct RecoveryPlan {
++    terms: RecoveryTerms,
++    lock: Covenant,
++    recovery: Covenant,
++    recovery_atoms: u64,
++    final_recovery_atoms: u64,
++}
++
++impl RecoveryPlan {
++    pub fn new(terms: RecoveryTerms) -> Result<Self> {
++        ensure!(terms.locked_atoms <= 2_100_000_000_000_000 && terms.minimum_output_atoms > 0,
++            "invalid BCH recovery amount policy");
++        ensure!(terms.bch_funder_signing_key != terms.native_funder_signing_key,
++            "BCH recovery requires distinct participant signing keys");
++        let recovery_atoms = terms.locked_atoms.checked_sub(terms.lock_fee_atoms)
++            .context("BCH cancellation fee exceeds lock")?;
++        let final_recovery_atoms = recovery_atoms.checked_sub(terms.recovery_fee_atoms)
++            .context("BCH recovery fee exceeds cancellation output")?;
++        ensure!(final_recovery_atoms >= terms.minimum_output_atoms,
++            "BCH recovery proceeds below agreed minimum output");
++        let recovery = Covenant::new(CovenantTerms {
++            fee_atoms: terms.recovery_fee_atoms, delay_blocks: terms.punish_delay_blocks,
++            signing_key: terms.native_funder_signing_key,
++            redeem_destination: terms.bch_funder_refund.clone(),
++            timeout_destination: terms.native_funder_payout.clone(),
++        })?;
++        let lock = Covenant::new(CovenantTerms {
++            fee_atoms: terms.lock_fee_atoms, delay_blocks: terms.cancel_delay_blocks,
++            signing_key: terms.bch_funder_signing_key,
++            redeem_destination: terms.native_funder_payout.clone(),
++            timeout_destination: recovery.script_pubkey(),
++        })?;
++        Ok(Self { terms, lock, recovery, recovery_atoms, final_recovery_atoms })
++    }
++
++    pub fn terms(&self) -> &RecoveryTerms { &self.terms }
++    pub fn lock(&self) -> &Covenant { &self.lock }
++    pub fn recovery(&self) -> &Covenant { &self.recovery }
++    pub fn recovery_atoms(&self) -> u64 { self.recovery_atoms }
++    pub fn final_recovery_atoms(&self) -> u64 { self.final_recovery_atoms }
++
++    pub fn verify_scripts(&self, lock: &Script, recovery: &Script) -> Result<()> {
++        self.lock.verify_script(lock)?;
++        self.recovery.verify_script(recovery)
++    }
++
++    pub fn lock_spend_terms(&self, outpoint: OutPoint) -> SpendTerms {
++        SpendTerms { outpoint, locked_atoms: self.terms.locked_atoms,
++            maximum_fee_atoms: self.terms.lock_fee_atoms,
++            minimum_output_atoms: self.terms.minimum_output_atoms }
++    }
++
++    pub fn recovery_spend_terms(&self, outpoint: OutPoint) -> SpendTerms {
++        SpendTerms { outpoint, locked_atoms: self.recovery_atoms,
++            maximum_fee_atoms: self.terms.recovery_fee_atoms,
++            minimum_output_atoms: self.terms.minimum_output_atoms }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-core/src/bch/recovery/tests.rs
+@@ -0,0 +1,80 @@
++use super::*;
++use bitcoin::{absolute, consensus::serialize, hashes::Hash, transaction::Version,
++    Amount, PubkeyHash, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
++use ecdsa_fun::{ECDSA, fun::{Point, Scalar}};
++fn public(key: &Scalar) -> Point { ECDSA::verify_only().verification_key_for(key) }
++fn terms(bch: &Scalar, native: &Scalar) -> RecoveryTerms {
++    RecoveryTerms { locked_atoms: 100_000, lock_fee_atoms: 1000, recovery_fee_atoms: 2000,
++        minimum_output_atoms: 546, cancel_delay_blocks: 2, punish_delay_blocks: 5,
++        bch_funder_signing_key: PublicKey::from_slice(&public(bch).to_bytes()).unwrap(),
++        native_funder_signing_key: PublicKey::from_slice(&public(native).to_bytes()).unwrap(),
++        bch_funder_refund: ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([3;20])),
++        native_funder_payout: ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([4;20])) }
++}
++
++#[test]
++fn success_refund_and_punishment_follow_bound_stages() -> Result<()> {
++    let bch = Scalar::random(&mut rand::thread_rng()); let native = Scalar::random(&mut rand::thread_rng());
++    // Separate adaptor encryption shares; linking them to XMZ needs cross-curve proofs.
++    let bch_share = Scalar::random(&mut rand::thread_rng()); let native_share = Scalar::random(&mut rand::thread_rng());
++    let plan = RecoveryPlan::new(terms(&bch, &native))?;
++    let funding = Transaction { version: Version::TWO, lock_time: absolute::LockTime::ZERO,
++        input: vec![TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([9;32]), vout: 1 },
++            script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() }],
++        output: vec![TxOut { value: Amount::from_sat(plan.terms().locked_atoms), script_pubkey: plan.lock().script_pubkey() }] };
++    let raw = serialize(&funding);
++    let spend = plan.lock_spend_terms(OutPoint { txid: funding.compute_txid(), vout: 0 });
++    let encrypted = plan.lock().data_message().encrypted_sign(&bch, &public(&native_share));
++    let signature = plan.lock().data_message().decrypt(&public(&bch), &native_share, encrypted.clone())?;
++    let success = plan.lock().prepare_redemption(&raw, &spend, &signature)?;
++    assert_eq!(success.output[0].script_pubkey, plan.terms().native_funder_payout);
++    assert_eq!(success.output[0].value.to_sat(), 99_000);
++    let extracted = plan.lock().redemption_signature(&raw, &spend, &serialize(&success))?;
++    assert_eq!(plan.lock().data_message().recover(&public(&bch), &public(&native_share), &encrypted, &extracted)?.to_bytes(), native_share.to_bytes());
++
++    // Alternative branch, not a claim that conflicting transactions can coexist.
++    let cancel = plan.lock().prepare_timeout(&raw, &spend)?;
++    plan.lock().verify_timeout(&raw, &spend, &serialize(&cancel))?;
++    assert_eq!(cancel.input[0].sequence, Sequence(2));
++    assert_eq!(cancel.output[0].script_pubkey, plan.recovery().script_pubkey());
++    assert_eq!(cancel.output[0].value.to_sat(), plan.recovery_atoms());
++    let recovery_spend = plan.recovery_spend_terms(OutPoint { txid: cancel.compute_txid(), vout: 0 });
++    let encrypted = plan.recovery().data_message().encrypted_sign(&native, &public(&bch_share));
++    let signature = plan.recovery().data_message().decrypt(&public(&native), &bch_share, encrypted.clone())?;
++    let refund = plan.recovery().prepare_redemption(&serialize(&cancel), &recovery_spend, &signature)?;
++    assert_eq!(refund.output[0].script_pubkey, plan.terms().bch_funder_refund);
++    assert_eq!(refund.output[0].value.to_sat(), plan.final_recovery_atoms());
++    let extracted = plan.recovery().redemption_signature(&serialize(&cancel), &recovery_spend, &serialize(&refund))?;
++    assert_eq!(plan.recovery().data_message().recover(&public(&native), &public(&bch_share), &encrypted, &extracted)?.to_bytes(), bch_share.to_bytes());
++    let punish = plan.recovery().prepare_timeout(&serialize(&cancel), &recovery_spend)?;
++    assert_eq!(punish.input[0].sequence, Sequence(5));
++    assert_eq!(punish.output[0].script_pubkey, plan.terms().native_funder_payout);
++    assert_eq!(punish.output[0].value.to_sat(), 97_000);
++    plan.recovery().verify_timeout(&serialize(&cancel), &recovery_spend, &serialize(&punish))?;
++    Ok(())
++}
++
++#[test]
++fn insufficient_recovery_budget_and_substituted_stage_are_rejected() -> Result<()> {
++    let bch = Scalar::random(&mut rand::thread_rng()); let native = Scalar::random(&mut rand::thread_rng());
++    let agreed = terms(&bch, &native); let plan = RecoveryPlan::new(agreed.clone())?;
++    plan.verify_scripts(plan.lock().redeem_script(), plan.recovery().redeem_script())?;
++    let mut changed = agreed.clone(); changed.punish_delay_blocks = 7;
++    let other = RecoveryPlan::new(changed)?;
++    assert!(plan.verify_scripts(other.lock().redeem_script(), plan.recovery().redeem_script()).is_err());
++    assert!(plan.verify_scripts(plan.lock().redeem_script(), other.recovery().redeem_script()).is_err());
++    for amount in [0, 999, 2999, 3545, 2_100_000_000_000_001, u64::MAX] {
++        let mut invalid = agreed.clone(); invalid.locked_atoms = amount;
++        assert!(RecoveryPlan::new(invalid).is_err());
++    }
++    let mut exact = agreed.clone(); exact.locked_atoms = 3546;
++    assert_eq!(RecoveryPlan::new(exact)?.final_recovery_atoms(), 546);
++    let mut invalid = agreed.clone(); invalid.native_funder_signing_key = invalid.bch_funder_signing_key;
++    assert!(RecoveryPlan::new(invalid).is_err());
++    let mut invalid = agreed.clone(); invalid.lock_fee_atoms = 0; assert!(RecoveryPlan::new(invalid).is_err());
++    let mut invalid = agreed.clone(); invalid.recovery_fee_atoms = 0; assert!(RecoveryPlan::new(invalid).is_err());
++    let mut invalid = agreed.clone(); invalid.cancel_delay_blocks = 0; assert!(RecoveryPlan::new(invalid).is_err());
++    let mut invalid = agreed.clone(); invalid.punish_delay_blocks = 0; assert!(RecoveryPlan::new(invalid).is_err());
++    let mut invalid = agreed; invalid.minimum_output_atoms = 0; assert!(RecoveryPlan::new(invalid).is_err());
++    Ok(())
++}

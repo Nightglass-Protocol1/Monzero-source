@@ -1,0 +1,208 @@
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -439,6 +439,72 @@
+         Ok(response)
+     }
+ 
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct RefundProtectionConfig {
++        schema: String, admission_config_file: PathBuf, peer_message_file: PathBuf,
++    }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct RefundProtectionMessage { schema: String, frame: Vec<u8>, signature: Vec<u8> }
++    fn refund_protection_request(bytes: &[u8],action: &str) -> Result<Request> {
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid refund protection request size");
++        let request: Request=serde_json::from_slice(bytes)?;
++        ensure!(matches!(action,"review"|"submit"|"status") && !request.request_id.is_nil()
++            && request.schema==format!("monzero-bch-refund-protection-{action}-request-v1"),
++            "invalid refund protection request");
++        if action=="submit" {
++            parse_digest(request.commitment.as_deref().context("missing refund protection approval")?)?;
++        } else {ensure!(request.commitment.is_none(),"unexpected refund protection approval");}
++        Ok(request)
++    }
++    fn refund_protection_config(bytes: &[u8]) -> Result<RefundProtectionConfig> {
++        let config: RefundProtectionConfig=serde_json::from_slice(bytes)?;
++        ensure!(config.schema=="monzero-private-bch-refund-protection-v1"
++            && config.admission_config_file.is_absolute() && config.peer_message_file.is_absolute(),
++            "invalid refund protection configuration");
++        Ok(config)
++    }
++    fn refund_protection_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
++        let request=refund_protection_request(bytes,action)?;
++        let (_wrapper_lease,bytes)=private_bytes(path)?;
++        let wrapper=refund_protection_config(&bytes)?;
++        let (_admission_lease,config)=load(&wrapper.admission_config_file)?;
++        ensure!(matches!(config.role,Role::BchFunder),"refund protection requires BCH funder");
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"refund protection trade changed");
++        let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        let mut review=serde_json::Value::Null;
++        if action!="status" {
++            // Keep the bounded private message lease through acceptance. No RPC
++            // credentials or raw refund transaction enter this interface.
++            let (_message_lease,bytes)=private_file_limit(&wrapper.peer_message_file,false,65536)?;
++            let message: RefundProtectionMessage=serde_json::from_slice(&bytes)?;
++            ensure!(message.schema=="monzero-bch-peer-refund-protection-v1"
++                && !message.frame.is_empty() && message.frame.len()<=8192 && message.signature.len()==64,
++                "invalid peer refund protection message");
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            let checked=execution.review_bch_refund_protection(now,&message.frame,&message.signature)?;
++            if action=="submit" {
++                let approved=parse_digest(request.commitment.as_deref().context("missing refund protection approval")?)?;
++                let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                execution.accept_reviewed_bch_refund_protection(dispatch,&message.frame,&message.signature,&approved)?;
++            }
++            review=serde_json::json!({"details":checked.details,
++                "commitment":checked.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()});
++        }
++        let receipt=execution.saved_bch_refund_protection()?.map(|saved|serde_json::json!({
++            "commitment":saved.receipt.iter().map(|b|format!("{b:02x}")).collect::<String>(),
++            "receivedAt":saved.received_at.to_string()}));
++        Ok(serde_json::json!({"schema":format!("monzero-bch-refund-protection-{action}-response-v1"),
++            "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
++            "review":review,"receipt":receipt}))
++    }
++
+     pub fn run() -> Result<()> {
+         let args: Vec<_> = std::env::args_os().collect();
+         ensure!(args.len() == 3,"expected mode and private configuration path");
+@@ -459,7 +525,15 @@
+             "--funding-preparation-status-stdio-v1"=>Some("preparation-status"),
+             _=>None,
+         };
+-        let result = if let Some(operation)=preparation_action {
++        let protection_action=match action {
++            "--refund-protection-review-stdio-v1"=>Some("review"),
++            "--refund-protection-submit-stdio-v1"=>Some("submit"),
++            "--refund-protection-status-stdio-v1"=>Some("status"),
++            _=>None,
++        };
++        let result = if let Some(operation)=protection_action {
++            refund_protection_operation(Path::new(&args[2]),&bytes,operation)?
++        } else if let Some(operation)=preparation_action {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                 .block_on(preparation_operation(Path::new(&args[2]),&bytes,operation))?
+         } else if let Some(operation) = match action {
+@@ -487,6 +561,29 @@
+ 
+     #[cfg(test)]
+     mod tests {
++        #[test]
++        fn refund_protection_requires_separate_approval_and_strict_config() -> Result<()> {
++            for action in ["review","submit","status"] {
++                let mut value=serde_json::json!({"schema":format!("monzero-bch-refund-protection-{action}-request-v1"),
++                    "requestId":uuid::Uuid::new_v4()});
++                assert_eq!(refund_protection_request(&serde_json::to_vec(&value)?,action).is_ok(),action!="submit");
++                value["commitment"]=serde_json::json!("11".repeat(32));
++                assert_eq!(refund_protection_request(&serde_json::to_vec(&value)?,action).is_ok(),action=="submit");
++                value["schema"]=serde_json::json!("monzero-bch-funding-submit-request-v1");
++                assert!(refund_protection_request(&serde_json::to_vec(&value)?,action).is_err());
++            }
++            let config=serde_json::json!({"schema":"monzero-private-bch-refund-protection-v1",
++                "admissionConfigFile":"/private/admission.json","peerMessageFile":"/private/peer.json"});
++            refund_protection_config(&serde_json::to_vec(&config)?)?;
++            for field in ["schema","admissionConfigFile","peerMessageFile"] {
++                let mut bad=config.clone();bad[field]=serde_json::json!("relative");
++                assert!(refund_protection_config(&serde_json::to_vec(&bad)?).is_err());
++            }
++            let mut bad=config;bad["broadcast"]=serde_json::json!(true);
++            assert!(refund_protection_config(&serde_json::to_vec(&bad)?).is_err());
++            Ok(())
++        }
++
+         #[test]
+         fn signing_recovery_requires_exact_approval_and_private_bounded_candidate() -> Result<()> {
+             for action in ["signing-recovery-review","signing-recovery-submit"] {
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -29,6 +29,7 @@
+ async fn bch_funding_helper_status_survives_expiry_without_relay() -> Result<()> {roundtrip(Some(submit::Case::Expired),false,false).await}
+ 
+ mod preparation;
++mod refund_protection;
+ #[tokio::test]
+ #[ignore = "requires a separately built and digest-pinned BCH helper"]
+ async fn bch_wallet_preparation_retains_candidate_before_funding_and_resumes_without_rpc() -> Result<()> {
+@@ -201,6 +202,8 @@
+     // Stop the mock before review: successful helper execution cannot rely on RPC.
+     assert_eq!(server.state.lock().unwrap().relay_calls,0);
+     drop(server);
++    refund_protection::exercise(&helper,&config_path,&config_store,&metadata,&snapshots,
++        &setup,refund.frame(),refund.signature(),&protection.commitment)?;
+     if wallet_preparation { preparation::helper_status(&setup,&metadata,&snapshots,&rpc,&program,&funding_path,&config_store,&script)?; }
+     let invoke=|success: bool| -> Result<Value> {
+         let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/refund_protection.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/refund_protection.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/refund_protection.rs
+@@ -0,0 +1,60 @@
++//! Production helper receipt acceptance with no running wallet backend.
++use super::*;
++pub(super) fn exercise(helper: &std::path::Path,admission: &std::path::Path,
++    config: &PrivateStore,metadata: &PrivateStore,snapshots: &PrivateStore,
++    setup: &Setup,frame: &[u8],signature: &[u8],expected: &[u8;32]) -> Result<()> {
++    let wrapper=config.0.join("refund-protection.json");
++    let message=config.0.join("peer-refund.json");
++    let original=json!({"schema":"monzero-bch-peer-refund-protection-v1","frame":frame,"signature":signature});
++    save(&message,&serde_json::to_vec(&original)?)?;
++    save(&wrapper,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-refund-protection-v1",
++        "admissionConfigFile":admission,"peerMessageFile":message}))?)?;
++    let invoke=|action: &str,commitment: Option<&str>,success: bool| -> Result<Value> {
++        let id=uuid::Uuid::new_v4();
++        let mut request=json!({"schema":format!("monzero-bch-refund-protection-{action}-request-v1"),"requestId":id});
++        if let Some(commitment)=commitment {request["commitment"]=json!(commitment);}
++        let mut child=Command::new(helper).arg(format!("--refund-protection-{action}-stdio-v1")).arg(&wrapper)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("missing stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++        if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++        assert!(output.stderr.is_empty());assert!(output.stdout.len()<=16384);
++        let response:Value=serde_json::from_slice(&output.stdout)?;
++        assert_eq!(response.as_object().unwrap().len(),7);
++        assert_eq!(response["schema"],format!("monzero-bch-refund-protection-{action}-response-v1"));
++        assert_eq!(response["requestId"],id.to_string());assert_eq!(response["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(response["executable"],false);assert_eq!(response["chainObserved"],false);
++        Ok(response)
++    };
++    let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    let status=invoke("status",None,true)?;assert!(status["review"].is_null());
++    let review=invoke("review",None,true)?;
++    assert_eq!(review["review"]["commitment"],hex(expected));
++    invoke("submit",Some(&"00".repeat(32)),false)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    let receipt_path=metadata.0.join(format!("{}.bch-refund-bch-funder-authenticated",setup.quote.terms()["swapId"]));
++    let receipt=std::fs::read(&receipt_path)?;
++    // Isolate first acceptance from the older receipt already referenced by
++    // the surrounding funding fixture. Restore its exact bytes afterwards.
++    std::fs::remove_file(&receipt_path)?;
++    assert!(invoke("status",None,true)?["receipt"].is_null());
++    let absent=contents(&metadata.0)?;
++    let mut corrupt=original.clone();corrupt["signature"][0]=json!(signature[0]^1);
++    save(&message,&serde_json::to_vec(&corrupt)?)?;
++    invoke("review",None,false)?;invoke("submit",Some(&hex(expected)),false)?;
++    assert_eq!(contents(&metadata.0)?,absent);
++    save(&message,&serde_json::to_vec(&original)?)?;
++    let accepted=invoke("submit",Some(&hex(expected)),true)?;
++    assert!(accepted["receipt"]["commitment"].as_str().is_some_and(|s|s.len()==64));
++    assert!(accepted["receipt"]["receivedAt"].as_str().context("missing receipt time")?.parse::<u64>()?>0);
++    let saved=contents(&metadata.0)?;
++    assert_eq!(invoke("submit",Some(&hex(expected)),true)?["receipt"],accepted["receipt"]);
++    assert_eq!(contents(&metadata.0)?,saved);assert_eq!(contents(&snapshots.0)?,secrets);
++    std::fs::remove_file(&message)?;
++    assert_eq!(invoke("status",None,true)?["receipt"],accepted["receipt"]);
++    invoke("review",None,false)?;
++    save(&receipt_path,&receipt)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    Ok(())
++}

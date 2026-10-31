@@ -1,0 +1,165 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -896,8 +896,14 @@
+     exercise_local_wallet_funding(LocalFundingExercise::PublicationRepair).await
+ }
+ #[cfg(target_os="linux")]
++#[tokio::test]
++#[ignore="requires explicitly pinned MONZERO_BCH_ADMISSION_HELPER and SHA256"]
++async fn admitted_bch_success_publication_helper_repairs_retained_local_trade()->Result<()> {
++    exercise_local_wallet_funding(LocalFundingExercise::PublicationHelper).await
++}
++#[cfg(target_os="linux")]
+ #[derive(Clone,Copy,PartialEq,Eq)]
+-enum LocalFundingExercise {Complete,Recovery,PublicationRepair}
++enum LocalFundingExercise {Complete,Recovery,PublicationRepair,PublicationHelper}
+ #[cfg(target_os="linux")]
+ async fn exercise_local_wallet_funding(mode:LocalFundingExercise)->Result<()> {
+     use agreement::execution::{AdmittedExecution,NegotiationPins};
+@@ -925,8 +931,14 @@
+         &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
+     let agreement=agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder,&agreed)?;
+     let pins=NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
+-    let mut execution=AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
+-        Role::BchFunder,setup.quote.commitment(),pins,1005)?;
++    let mut execution=if mode==LocalFundingExercise::PublicationHelper {
++        let review=agreement::execution::approval::review_admission(&setup.quote,&setup.policy,Role::BchFunder,&pins,1005)?;
++        AdmittedExecution::admit_reviewed(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++            Role::BchFunder,&review.commitment,pins.clone(),1005)?
++    } else {
++        AdmittedExecution::admit(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++            Role::BchFunder,setup.quote.commitment(),pins.clone(),1005)?
++    };
+     let observer_wallet=sha256::Hash::hash(b"owned observer fixture wallet");
+     if light_network==BchNetwork::Regtest {execution.select_light_funding_source(light_network.into(),observer_wallet,1006)?;}
+     let amount=setup.quote.recovery_plan().terms().locked_atoms;
+@@ -1051,6 +1063,10 @@
+             assert!(cold.light_bch_cancel_relay_state(&fixture.observer,12000)?.is_none());
+             fixture.finish()?;continue;
+         }
++        if mode==LocalFundingExercise::PublicationHelper {
++            light_success::publication_helper::exercise(&mut resumed,&setup,&fixture,&signed,&metadata.0,&snapshots.0,&pins).await?;
++            fixture.finish()?;continue;
++        }
+         if mode==LocalFundingExercise::PublicationRepair {
+             light_success::publication::exercise(&mut resumed,&setup,&fixture,&signed,&metadata.0,&snapshots.0).await?;
+             fixture.finish()?;continue;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success.rs
+@@ -121,3 +121,5 @@
+ pub(super) mod claim;
+ 
+ pub(super) mod publication;
++
++pub(super) mod publication_helper;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/publication_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/publication_helper.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_success/publication_helper.rs
+@@ -0,0 +1,104 @@
++//! Real pinned helper processes over retained local-wallet trade records.
++use super::*;
++use agreement::execution::{NegotiationPins,funding::success::publication::SuccessRecordStage};
++use std::{path::{Path,PathBuf},process::{Command,Stdio},io::Write,os::unix::fs::OpenOptionsExt};
++use sha2::{Digest,Sha256};
++fn hex(bytes:&[u8])->String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
++fn write(path:&Path,bytes:&[u8])->Result<()> {
++    let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
++    file.write_all(bytes)?;file.sync_all()?;Ok(())
++}
++fn copy(path:&Path)->Result<PrivateStore> {
++    let store=PrivateStore::new()?;
++    for entry in std::fs::read_dir(path)? {let entry=entry?;if entry.file_type()?.is_file() {std::fs::copy(entry.path(),store.0.join(entry.file_name()))?;}}
++    Ok(store)
++}
++fn hashes(path:&Path)->Result<std::collections::BTreeMap<std::ffi::OsString,[u8;32]>> {
++    let mut result=std::collections::BTreeMap::new();
++    for entry in std::fs::read_dir(path)? {let entry=entry?;ensure!(entry.file_type()?.is_file(),"unexpected non-file journal entry");result.insert(entry.file_name(),Sha256::digest(std::fs::read(entry.path())?).into());}
++    Ok(result)
++}
++fn invoke(helper:&Path,config:&Path,stage:&str,approval:Option<&str>,success:bool)->Result<serde_json::Value> {
++    let action=if approval.is_some() {"submit"}else{"review"};let id=uuid::Uuid::new_v4();
++    let mut request=serde_json::json!({"schema":format!("monzero-bch-success-publication-repair-{action}-request-v1"),"requestId":id,"stage":stage});
++    if let Some(approved)=approval {request["commitment"]=approved.into();}
++    let mut child=Command::new(helper).arg(format!("--success-publication-repair-{action}-stdio-v1")).arg(config)
++        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++    child.stdin.take().context("missing repair helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++    let output=child.wait_with_output()?;
++    ensure!(output.status.success()==success,"unexpected repair helper result for {stage} {action}");
++    if !success {
++        ensure!(output.stdout.is_empty() && output.stderr==b"BCH admission request failed; inspect retained state before retrying\n",
++            "failed repair helper disclosed unexpected output");return Ok(serde_json::Value::Null)
++    }
++    ensure!(output.stderr.is_empty() && output.stdout.len()<=16384,"unexpected repair helper output");
++    let value:serde_json::Value=serde_json::from_slice(&output.stdout)?;
++    let object=value.as_object().context("repair response is not an object")?;
++    assert_eq!(object.len(),8);assert_eq!(value["schema"],format!("monzero-bch-success-publication-repair-{action}-response-v1"));
++    assert_eq!(value["requestId"],id.to_string());assert_eq!(value["executable"],false);
++    assert_eq!(value["chainObserved"],false);assert_eq!(value["releasesPrivateMaterial"],false);
++    assert_eq!(value["state"],if approval.is_some() {"repaired"}else{"reviewed"});Ok(value)
++}
++pub(in crate::bch_key_recovery::authenticated::native_wallet::tests)
++async fn exercise(execution:&mut AdmittedExecution<'_>,setup:&Setup,fixture:&super::super::light_observer::Fixture,
++    funding:&Transaction,metadata:&Path,snapshots:&Path,pins:&NegotiationPins)->Result<()> {
++    let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
++    ensure!(helper.is_absolute() && helper.canonicalize()?==helper,"noncanonical repair helper");
++    let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
++    ensure!(hex(&Sha256::digest(std::fs::read(&helper)?))==digest,"repair helper digest mismatch");
++    let native=Native::new(execution,setup)?;let observer=&fixture.observer;
++    retain_proof(execution,setup,funding,&native)?;
++    let review=execution.review_light_bch_success_release(observer,5,2010)?;
++    let frame=execution.prepare_reviewed_light_bch_success_release(&native,observer,5,2010,&review.commitment).await?;
++    let review=execution.review_light_bch_success_signature_retention(observer,5,2011)?;
++    let signature=SigningKey::from_bytes(&[1;32]).sign(&agreement::success::signing_bytes(&frame)?).to_bytes();
++    drop(execution.retain_reviewed_light_bch_success_signature(&native,observer,5,2011,&frame,&signature,&review.commitment).await?);
++    let original_public=hashes(metadata)?;let original_private=hashes(snapshots)?;
++    for (stage,label,retain_pin) in [(SuccessRecordStage::Prepared,"prepared",false),(SuccessRecordStage::Signed,"signed",true)] {
++        let public=copy(metadata)?;let private=copy(snapshots)?;let configs=PrivateStore::new()?;
++        let slot=format!("{}.bch-success-{label}",setup.quote.terms()["swapId"]);
++        let expected=Zeroizing::new(std::fs::read(private.0.join(&slot))?);
++        std::fs::remove_file(private.0.join(&slot))?;
++        if !retain_pin {std::fs::remove_file(public.0.join(format!("{slot}-pin")))?;}
++        let cold=AdmittedExecution::resume(&public.0,&private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let expected_review=cold.review_light_bch_success_publication_repair(observer,stage,2020)?;drop(cold);
++        let quote_file=configs.0.join("quote");write(&quote_file,&setup.quote.record()?)?;
++        let admission=configs.0.join("admission");
++        write(&admission,&serde_json::to_vec(&serde_json::json!({"schema":"monzero-private-bch-admission-v1",
++            "helper":helper,"helperDigest":digest,"quoteFile":quote_file,"quoteCommitment":hex(setup.quote.commitment()),
++            "admittedAt":1000,"tradeId":setup.quote.terms()["swapId"],"identityPins":[
++                SigningKey::from_bytes(&[1;32]).verifying_key().to_bytes(),SigningKey::from_bytes(&[2;32]).verifying_key().to_bytes()],
++            "policy":setup.policy,"role":Role::BchFunder,"metadataDirectory":public.0,"snapshotDirectory":private.0,"negotiationPins":pins}))?)?;
++        let cookie=configs.0.join("cookie");write(&cookie,b"user:pass\n")?;
++        let context=observer.deployment_context()?;let rpc=configs.0.join("rpc");
++        write(&rpc,&serde_json::to_vec(&serde_json::json!({"schema":"monzero-private-bch-observer-rpc-v1",
++            "cookieFile":cookie,"port":context["port"],"checkpointHeight":context["checkpointHeight"],
++            "checkpoint":context["checkpoint"],"subversion":context["subversion"]}))?)?;
++        let wrapper=configs.0.join("repair");
++        write(&wrapper,&serde_json::to_vec(&serde_json::json!({"schema":"monzero-private-bch-success-publication-repair-v1",
++            "admissionConfigFile":admission,"rpcFile":rpc,"deploymentCommitment":hex(&observer.deployment_commitment()?),"fundingSource":"local-wallet"}))?)?;
++        let calls=fixture.calls.load(Ordering::Relaxed);let before_public=hashes(&public.0)?;let before_private=hashes(&private.0)?;
++        let review=invoke(&helper,&wrapper,label,None,true)?;
++        assert_eq!(review["tradeId"],setup.quote.terms()["swapId"]);
++        assert_eq!(review["review"]["details"],expected_review.details);
++        assert_eq!(review["review"]["commitment"],hex(&expected_review.commitment));
++        assert_eq!(hashes(&public.0)?,before_public);assert_eq!(hashes(&private.0)?,before_private);
++        invoke(&helper,&wrapper,label,Some(&"00".repeat(32)),false)?;
++        assert_eq!(hashes(&public.0)?,before_public);assert_eq!(hashes(&private.0)?,before_private);
++        let approval=hex(&expected_review.commitment);
++        invoke(&helper,&wrapper,if label=="prepared" {"signed"}else{"prepared"},Some(&approval),false)?;
++        assert_eq!(hashes(&public.0)?,before_public);assert_eq!(hashes(&private.0)?,before_private);
++        let repaired=invoke(&helper,&wrapper,label,Some(&approval),true)?;
++        // Response echoes the exact consent; journal checks below prove restoration.
++        assert_eq!(repaired["review"],review["review"]);
++        assert_eq!(*Zeroizing::new(std::fs::read(private.0.join(&slot))?),*expected);
++        let after_public=hashes(&public.0)?;let after_private=hashes(&private.0)?;
++        assert_eq!(after_public,original_public);assert_eq!(after_private,original_private);
++        invoke(&helper,&wrapper,label,Some(&approval),true)?;
++        assert_eq!(hashes(&public.0)?,after_public);assert_eq!(hashes(&private.0)?,after_private);
++        assert_eq!(fixture.calls.load(Ordering::Relaxed),calls);
++        let cold=AdmittedExecution::resume(&public.0,&private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        assert!(cold.saved_light_bch_success_preparation(observer,5,2020)?.signature_retained);
++    }
++    assert_eq!(hashes(metadata)?,original_public);assert_eq!(hashes(snapshots)?,original_private);Ok(())
++}

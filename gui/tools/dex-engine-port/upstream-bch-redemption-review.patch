@@ -1,0 +1,144 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/native.rs
+@@ -35,6 +35,13 @@
+     RelayedTransfer {txid:value.txid.clone(),fee:value.fee,weight:value.weight}
+ }
+ impl AdmittedExecution<'_> {
++    /// Historical observer and cancellation margin from authenticated payment preparation.
++    pub(super) fn native_bch_observation_policy(&self) -> Result<([u8;32],u32)> {
++        ensure!(self.role == Role::NativeFunder,"wrong native BCH observation policy owner");
++        let (intent,_) = self.retained_native_intent()?;
++        Ok((intent.deployment,intent.safety_blocks))
++    }
++
+     fn native_preparation_intent(&self,source: &NativeFundingSource,deployment: [u8;32],
+         safety_blocks: u32,now: u64) -> Result<Intent> {
+         ensure!(self.role == Role::NativeFunder,"wrong BCH native funding role");
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/relay.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption/relay.rs
+@@ -0,0 +1,41 @@
++//! Explicit approval review for the exact private redemption. Review contains
++//! no spend signature and grants no permission to broadcast by itself.
++use super::*;
++use crate::bch_rpc::BchRpc;
++use serde_json::{Value,json};
++
++const REVIEW: &str = "monzero-bch-redemption-relay-review-v1";
++pub struct RedemptionRelayReview {pub details: Value,pub commitment: [u8;32]}
++
++impl AdmittedExecution<'_> {
++    fn redemption_relay_materials(&self) -> Result<(RedemptionRelayReview,Record,[u8;32],u32)> {
++        let record = self.load_private_redemption()?.context("missing private BCH redemption")?;
++        let retained = summary(&record)?;
++        let (deployment,safety_blocks) = self.native_bch_observation_policy()?;
++        let transaction: Transaction = deserialize(&record.transaction)?;
++        ensure!(transaction.input.len()==1 && transaction.output.len()==1,"invalid retained BCH redemption shape");
++        let output = &transaction.output[0];let plan = self.quote.recovery_plan();
++        let fee = plan.terms().locked_atoms.checked_sub(output.value.to_sat()).context("invalid redemption fee")?;
++        ensure!(fee == plan.lock().terms().fee_atoms,"BCH redemption fee changed");
++        let details = json!({"schema":REVIEW,"action":"broadcast-bch-redemption",
++            "swapId":self.quote.terms()["swapId"],"quote":self.quote.commitment(),
++            "admission":record.admission,"successReceipt":record.receipt,"funding":record.funding,
++            "privateRedemption":retained.commitment(),"bchDeployment":deployment,
++            "network":self.quote.terms()["bchNetwork"],"genesis":self.quote.terms()["bchGenesis"],
++            "txid":retained.txid(),"fundingOutpoint":transaction.input[0].previous_output,
++            "destinationScript":output.script_pubkey.to_hex_string(),"payoutAtoms":output.value.to_sat().to_string(),
++            "feeAtoms":fee.to_string(),"preparedAt":record.prepared_at,
++            "minimumBchConfirmations":self.policy.bch_confirmations,
++            "minimumXmzConfirmations":self.policy.xmz_confirmations,"cancellationMarginBlocks":safety_blocks});
++        let commitment = hash(REVIEW,&serde_json::to_vec(&details)?);
++        Ok((RedemptionRelayReview {details,commitment},record,deployment,safety_blocks))
++    }
++    /// Read-only approval details, including after commercial expiry. Approval
++    /// submission must independently revalidate exact bytes and both chains.
++    pub fn review_bch_redemption_relay(&self,bch: &BchRpc,now: u64) -> Result<RedemptionRelayReview> {
++        let (review,record,deployment,_) = self.redemption_relay_materials()?;
++        ensure!(now >= record.prepared_at,"BCH redemption review predates preparation");
++        ensure!(bch.deployment_commitment()? == deployment,"BCH redemption observer changed");
++        Ok(review)
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/receipt/redemption.rs
+@@ -87,3 +87,5 @@
+         self.load_private_redemption()?.as_ref().map(summary).transpose()
+     }
+ }
++
++pub mod relay;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption.rs
+@@ -2,7 +2,7 @@
+ use bitcoin::{consensus::{deserialize,serialize},Transaction};
+ 
+ pub(super) fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
+-    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,frame: &[u8]) -> Result<()> {
++    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,rpc: &BchRpc,frame: &[u8]) -> Result<()> {
+     assert!(bch.retain_bch_redemption(2035).is_err());
+     assert!(bch.retained_bch_redemption().is_err());
+     assert!(native.retained_bch_redemption()?.is_none());
+@@ -11,6 +11,17 @@
+     assert_eq!(prepared.prepared_at(),2035);
+     assert_eq!(native.retain_bch_redemption(2036)?.commitment(),prepared.commitment());
+     assert!(native.retain_bch_redemption(2034).is_err());
++    assert!(bch.review_bch_redemption_relay(rpc,2036).is_err());
++    assert!(native.review_bch_redemption_relay(rpc,2034).is_err());
++    let review = native.review_bch_redemption_relay(rpc,2036)?;
++    assert_eq!(review.details["action"],"broadcast-bch-redemption");
++    assert_eq!(review.details["txid"],prepared.txid().to_string());
++    assert_eq!(review.details["feeAtoms"],setup.quote.recovery_plan().lock().terms().fee_atoms.to_string());
++    assert_eq!(review.details["cancellationMarginBlocks"],5);
++    for secret in ["transaction","signature","encrypted","tx_key","nativeSpendShare"] {
++        assert!(review.details.get(secret).is_none(),"exposed {secret}");
++    }
++    assert_eq!(native.review_bch_redemption_relay(rpc,2037)?.commitment,review.commitment);
+     let slot = format!("{}.bch-private-redemption",setup.quote.terms()["swapId"]);
+     let private = snapshots.0.join(&slot);
+     let bytes = zeroize::Zeroizing::new(std::fs::read(&private)?);
+@@ -18,6 +29,8 @@
+     let raw: Vec<u8> = serde_json::from_value(record["transaction"].clone())?;
+     let transaction: Transaction = deserialize(&raw)?;
+     assert_eq!(transaction.compute_txid(),prepared.txid());
++    assert_eq!(review.details["destinationScript"],transaction.output[0].script_pubkey.to_hex_string());
++    assert_eq!(review.details["payoutAtoms"],transaction.output[0].value.to_sat().to_string());
+     let funding = native.received_bch_funding_message()?.unwrap();
+     let plan = setup.quote.recovery_plan();let terms = plan.lock_spend_terms(funding.signed().lock_outpoint());
+     plan.lock().redemption_signature(&serialize(funding.signed().transaction()),&terms,&raw)?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt.rs
+@@ -3,7 +3,7 @@
+ mod redemption;
+ 
+ pub(super) fn exercise(bch: &mut AdmittedExecution<'_>,native: &mut AdmittedExecution<'_>,
+-    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,fixture: &Fixture,
++    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,fixture: &Fixture,rpc: &BchRpc,
+     frame: &[u8],signature: &[u8]) -> Result<()> {
+     let before = fixture.calls.lock().unwrap().len();
+     assert!(bch.accept_bch_success(2033,frame,signature).is_err());
+@@ -33,7 +33,7 @@
+     native.accept_bch_success(2034,frame,signature)?;
+     assert!(native.has_received_bch_success()?);
+     assert!(native.accept_bch_success(2032,frame,signature).is_err());
+-    redemption::exercise(bch,native,setup,metadata,snapshots,frame)?;
++    redemption::exercise(bch,native,setup,metadata,snapshots,rpc,frame)?;
+     let restored_metadata = copy_store(metadata)?;
+     let restored = AdmittedExecution::resume(&restored_metadata.0,&snapshots.0,
+         &setup.quote,&setup.policy,Role::NativeFunder)?;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success.rs
+@@ -52,7 +52,7 @@
+     assert!(bch.recover_bch_success_release(&observer,rpc,5,2032).await.is_err());
+     std::fs::write(&prepared,&*saved)?;
+     assert_eq!(bch.recover_bch_success_release(&observer,rpc,5,2032).await?.signature(),sig);
+-    receipt::exercise(bch,native,setup,metadata,snapshots,fixture,&frame,&sig)?;
++    receipt::exercise(bch,native,setup,metadata,snapshots,fixture,rpc,&frame,&sig)?;
+     fixture.confirmed.store(false,Ordering::SeqCst);
+     Ok(())
+ }

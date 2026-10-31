@@ -3,12 +3,33 @@
 Status: inactive design document. No public network accepts DEX orders or
 settlements, and the GUI must keep live execution disabled.
 
+## Multi-coin implementation checkpoint
+
+The current research UI also lists XMR/XMZ, DOGE/XMZ, ETH/XMZ and native
+THORChain RUNE/XMZ, with chain-specific decimal precision and explicit
+settlement-unavailable status. This does not expand the signing or settlement
+protocol below. See [multi-coin progress](DEX_MULTICOIN_PROGRESS.md) for current
+capabilities, validation and remaining work.
+
 ## Markets and custody
 
 The initial market family is BTC/XMZ, LTC/XMZ, and BCH/XMZ. Orders are intended
 to settle through non-custodial, chain-specific atomic swaps. The exchange must
 not accept account deposits, hold customer keys, fabricate balances, or treat
 reference-market data as an executable quote.
+
+## Explicit sequential routes
+
+Explicit routed trades are approved as a product direction, for example
+XMZ → BTC → XMR. This is a sequence of independently settled swaps, not one
+atomic swap. Each leg needs its own current quote, fee disclosure, destination,
+expiry, approval and durable recovery record. Approval of an earlier leg does
+not authorize a later leg. If a later leg cannot proceed, the user retains the
+intermediate asset and must be able to withdraw or recover it independently.
+No routed execution is currently implemented. Provider-specific fees must be
+shown separately; the direct XMZ-leg fee policy below does not imply that an
+external provider charges no fee. See the multi-coin progress document for the
+execution-driver prerequisites.
 
 ## Fee policy
 

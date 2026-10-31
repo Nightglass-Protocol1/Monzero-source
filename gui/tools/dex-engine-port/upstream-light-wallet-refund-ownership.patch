@@ -1,0 +1,101 @@
+--- a/swap-machine/src/bin/native-ltc-light/dex.rs
++++ b/swap-machine/src/bin/native-ltc-light/dex.rs
+@@ -76,6 +76,14 @@
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields,rename_all="camelCase")]
+ struct TermsRequest {schema:String,request_id:uuid::Uuid,approved_config_digest:String}
++fn verify_refund_wallet(config:&Config,network:LightNetwork,terms:&Value)->Result<()> {
++    let wallet=config.wallet.as_ref().context("missing local refund wallet")?;
++    let refund=LightAddress::parse(network,terms["refundAddress"].as_str().context("missing negotiated refund address")?)?;
++    let account=PublicAccount::from_descriptor(&wallet.account,network)?;
++    let book=AddressBook::open(&wallet.address_book_directory,account)?;
++    ensure!(book.contains_allocated_address(&refund)?,"negotiated refund address is not retained by this local wallet");
++    Ok(())
++}
+ fn terms(path:&Path,input:&[u8])->Result<()> {
+     let request:TermsRequest=serde_json::from_slice(input)?;
+     ensure!(request.schema=="monzero-ltc-light-dex-funding-terms-request-v1" && !request.request_id.is_nil(),"invalid funding terms request");
+@@ -89,8 +97,10 @@
+     ensure!(network_for("ltc",&config.network)?==LightNetwork::from(LtcNetwork::Regtest),"wrong funding terms wallet network");
+     let execution=Execution::resume(&dex.metadata_directory,&dex.snapshot_directory,dex.trade_id,
+         &dex.policy,LocalRole::LitecoinFunder,dex.pins)?;
++    let terms=execution.light_funding_terms(now()?)?;
++    verify_refund_wallet(&config,LightNetwork::from(LtcNetwork::Regtest),&terms)?;
+     let response=json!({"schema":"monzero-ltc-light-dex-funding-terms-response-v1","requestId":request.request_id,
+-        "tradeId":dex.trade_id,"configurationDigest":expected,"executable":false,"result":execution.light_funding_terms(now()?)?});
++        "tradeId":dex.trade_id,"configurationDigest":expected,"executable":false,"result":terms});
+     let bytes=serde_json::to_vec(&response)?;ensure!(bytes.len()<=4096,"oversized funding terms response");
+     std::io::stdout().write_all(&bytes)?;Ok(())
+ }
+@@ -101,7 +111,10 @@
+     let output=TxOut {value:atomic(&payment.amount_atomic)?,script_pubkey:address.script_pubkey().clone()};
+     let policy=PreparationPolicy {fee:atomic(&payment.fee_atomic)?,minimum_change:atomic(&payment.minimum_change_atomic)?,
+         minimum_confirmations:payment.minimum_confirmations};
+-    if !cold(mode) {execution.check_light_funding_payment(&output,policy.fee,policy.minimum_change,now()?)?;}
++    if !cold(mode) {
++        execution.check_light_funding_payment(&output,policy.fee,policy.minimum_change,now()?)?;
++        verify_refund_wallet(config,network,&execution.light_funding_terms(now()?)?)?;
++    }
+     let mut state=ChainState::open(&config.cache_directory,network,config.maximum_height,now()?)?;
+     let sync=synchronize(config,network,&mut state,request.maximum_download_headers).await?;
+     ensure!(sync["reportedTipOnSelectedChain"]==json!(true)
+--- a/swap-machine/src/litecoin_light/account/allocation/tests.rs
++++ b/swap-machine/src/litecoin_light/account/allocation/tests.rs
+@@ -108,3 +108,22 @@
+     assert_eq!(fs::read(dir.0.join(NAME))?,bytes);
+     fs::write(dir.0.join(NAME),b"{}")?;assert!(book.reserved(operation,Branch::Change).is_err());Ok(())
+ }
++
++#[test]
++fn ownership_requires_retained_allocation_and_matching_account()->Result<()> {
++    let dir=Directory::new()?;let mut book=AddressBook::create(&dir.0,standard())?;
++    let receive=standard().derive(Branch::Receive,0)?;
++    assert!(!book.contains_allocated_address(receive.address())?);
++    book.reserve(Uuid::new_v4(),Branch::Receive)?;
++    let before=fs::read(dir.0.join(NAME))?;
++    assert!(book.contains_allocated_address(receive.address())?);
++    assert!(!book.contains_allocated_address(standard().derive(Branch::Receive,1)?.address())?);
++    assert!(!book.contains_allocated_address(account(LtcNetwork::Regtest,0,2).derive(Branch::Receive,0)?.address())?);
++    assert!(!book.contains_allocated_address(account(LtcNetwork::Testnet,0,1).derive(Branch::Receive,0)?.address())?);
++    assert_eq!(fs::read(dir.0.join(NAME))?,before);
++    book.retain_discovered([2,1])?;
++    assert!(book.contains_allocated_address(standard().derive(Branch::Receive,1)?.address())?);
++    assert!(book.contains_allocated_address(standard().derive(Branch::Change,0)?.address())?);
++    fs::write(dir.0.join(NAME),before)?;
++    assert!(book.contains_allocated_address(receive.address()).is_err());Ok(())
++}
+--- a/swap-machine/src/litecoin_light/account/allocation.rs
++++ b/swap-machine/src/litecoin_light/account/allocation.rs
+@@ -54,6 +54,21 @@
+     pub(in crate::litecoin_light) fn restore_record(journal:Journal,account:PublicAccount,bytes:Vec<u8>)->Result<Self> {
+         let record=validate_record(&account,&bytes)?;journal.retain(NAME,&bytes)?;
+         Ok(Self {journal,account,record,bytes,usable:true})
++    }
++    /// Match only retained allocations, including explicitly retained discovery.
++    /// This is public account membership, not proof of an unlocked signing key.
++    /// The validated journal bounds the search to MAX_ENTRIES and is rechecked.
++    pub fn contains_allocated_address(&self,address:&LightAddress)->Result<bool> {
++        ensure!(self.usable && self.journal.read(NAME)?==self.bytes,"address book changed before ownership check");
++        let mut found=false;
++        if address.network()==self.account.network() {
++            for entry in &self.record.entries {
++                let branch=if entry.branch==0 {Branch::Receive}else{Branch::Change};
++                if self.account.derive(branch,entry.index)?.address().script_pubkey()==address.script_pubkey() {found=true;break;}
++            }
++        }
++        ensure!(self.journal.read(NAME)?==self.bytes,"address book changed during ownership check");
++        Ok(found)
+     }
+     /// Number of allocated indices that discovery must cover on this branch.
+     pub fn allocated_count(&self,branch:Branch)->Result<u32> {
+--- a/swap-machine/src/litecoin_light/funding_tests/helper_fixture.rs
++++ b/swap-machine/src/litecoin_light/funding_tests/helper_fixture.rs
+@@ -19,6 +19,8 @@
+     if stage=="init" {
+         for name in ["bob-meta","bob-secrets","alice-meta","alice-secrets"] {fs::DirBuilder::new().mode(0o700).create(root.join(name))?;}
+         let (policy,mut terms)=crate::litecoin_quote::tests::fixture();terms.insert("expiresAt".into(),(now+1800).to_string());
++        let refund:String=serde_json::from_slice(&fs::read(root.join("refund-address.json"))?)?;
++        terms.insert("ltcRefund".into(),refund);
+         let quote=crate::litecoin_quote::tests::signed(&terms,&policy,now)?;
+         let trade=quote.terms()["swapId"].parse()?;let pins=[bi.verifying_key().to_bytes(),ai.verifying_key().to_bytes()];
+         let mut rng=rand::rngs::StdRng::seed_from_u64(91452);

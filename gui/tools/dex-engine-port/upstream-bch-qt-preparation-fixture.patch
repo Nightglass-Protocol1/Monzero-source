@@ -1,0 +1,31 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+@@ -4,6 +4,18 @@
+ pub(super) fn exercise(setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
+     pins: &NegotiationPins,server: Server,rpc: &BchRpc,script: &bitcoin::Script,
+     helper: &std::path::Path,helper_digest: &str,base: u64) -> Result<()> {
++    let program=match (std::env::var_os("MONZERO_BCH_QT_PREPARATION_PROBE"),
++        std::env::var_os("MONZERO_BCH_QT_PREPARATION_PROBE_SHA256")) {
++        (None,None)=>helper.to_owned(),
++        (Some(path),Some(expected))=>{
++            let path=PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()?==path
++                && expected.to_str()==Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),
++                "invalid Qt preparation probe pin");
++            path
++        }
++        _=>anyhow::bail!("incomplete Qt preparation probe configuration"),
++    };
+     let config=PrivateStore::new()?;
+     let quote=config.0.join("quote.json");save(&quote,&setup.quote.record()?)?;
+     let admission=config.0.join("admission.json");
+@@ -34,7 +46,7 @@
+     save(&path,&serde_json::to_vec(&wrapper)?)?;
+     let invoke=|action: &str,success: bool| -> Result<Value> {
+         let id=uuid::Uuid::new_v4();
+-        let mut child=Command::new(helper).arg(format!("--funding-{action}-stdio-v1")).arg(&path)
++        let mut child=Command::new(&program).arg(format!("--funding-{action}-stdio-v1")).arg(&path)
+             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+         child.stdin.take().context("missing preparation stdin")?.write_all(&serde_json::to_vec(&json!({
+             "schema":format!("monzero-bch-funding-{action}-request-v1"),"requestId":id}))?)?;

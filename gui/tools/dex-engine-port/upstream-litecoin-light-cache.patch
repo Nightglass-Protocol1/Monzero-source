@@ -1,0 +1,216 @@
+diff --git a/swap-machine/src/litecoin_light/headers.rs b/swap-machine/src/litecoin_light/headers.rs
+--- a/swap-machine/src/litecoin_light/headers.rs
++++ b/swap-machine/src/litecoin_light/headers.rs
+@@ -184,3 +184,5 @@
+ 
+ #[cfg(test)]
+ pub(super) mod tests;
++
++pub mod cache;
+diff --git a/swap-machine/src/litecoin_light/headers/cache.rs b/swap-machine/src/litecoin_light/headers/cache.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/headers/cache.rs
+@@ -0,0 +1,100 @@
++//! Raw-header restart cache. Every load replays validation from pinned genesis.
++//! No cached work, validation flags, wallet keys or confirmation authority.
++//! Blocking disk/Scrypt work belongs on a caller-owned blocking worker.
++use super::*;
++use std::{ffi::CString, fs::{File, OpenOptions}, io::{BufReader, BufWriter, Read, Write},
++    os::{fd::{AsRawFd, FromRawFd}, unix::fs::{MetadataExt, OpenOptionsExt}}, path::Path};
++
++const MAGIC: &[u8;8] = b"MZLTC001";
++const PREFIX: u64 = 44; // magic, genesis identity, post-genesis header count
++const NAME: &str = "headers.bin";
++
++/// Exclusive cooperative-process lease, following the wallet journal pattern.
++/// Directory must already exist, be canonical, owned and private. One network
++/// per directory. A missing cache is explicit; corruption never becomes genesis.
++pub struct HeaderCache { directory: File, network: LtcNetwork }
++impl HeaderCache {
++    pub fn open(path: &Path,network: LtcNetwork) -> Result<Self> {
++        ensure!(path.is_absolute() && path.canonicalize()?==path, "noncanonical Litecoin header cache");
++        let directory=OpenOptions::new().read(true)
++            .custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC).open(path)?;
++        let metadata=directory.metadata()?;
++        ensure!(metadata.uid()==unsafe {libc::geteuid()} && metadata.mode()&0o077==0,
++            "Litecoin header cache must be private and owned");
++        ensure!(unsafe {libc::flock(directory.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0,
++            "Litecoin header cache is busy");
++        Ok(Self {directory,network})
++    }
++    fn file(&self,name: &str,flags: i32) -> Result<File> {
++        let name=CString::new(name)?;
++        let fd=unsafe {libc::openat(self.directory.as_raw_fd(),name.as_ptr(),
++            flags|libc::O_NOFOLLOW|libc::O_CLOEXEC|libc::O_NONBLOCK,0o600)};
++        if fd<0 {return Err(std::io::Error::last_os_error().into())}
++        Ok(unsafe {File::from_raw_fd(fd)})
++    }
++    fn record(&self) -> Result<Option<File>> {
++        let file=match self.file(NAME,libc::O_RDONLY) {
++            Ok(file)=>file,
++            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>return Ok(None),
++            Err(error)=>return Err(error),
++        };
++        let metadata=file.metadata()?;
++        ensure!(metadata.is_file() && metadata.uid()==unsafe {libc::geteuid()}
++            && metadata.mode()&0o077==0 && metadata.nlink()==1,"invalid Litecoin header cache record");
++        Ok(Some(file))
++    }
++    fn prefix(&self,file: &mut File) -> Result<u32> {
++        let mut prefix=[0u8;44]; file.read_exact(&mut prefix)?;
++        ensure!(&prefix[..8]==MAGIC,"unknown Litecoin header cache format");
++        let genesis: BlockHash=self.network.genesis().parse()?;
++        ensure!(prefix[8..40]==genesis.to_byte_array(),"Litecoin header cache network mismatch");
++        let count=u32::from_le_bytes(prefix[40..44].try_into()?);
++        ensure!(file.metadata()?.len()==PREFIX+u64::from(count)*80,"invalid Litecoin header cache length");
++        Ok(count)
++    }
++    /// Caller supplies a resource ceiling and its own clock, never server time.
++    /// No trusted state escapes if any cached header or trailing byte is invalid.
++    pub fn load(&self,maximum_height: u32,now: u64) -> Result<Option<HeaderSequence>> {
++        let Some(mut file)=self.record()? else {return Ok(None)};
++        ensure!(file.metadata()?.len()<=PREFIX+u64::from(maximum_height)*80,"Litecoin header cache exceeds limit");
++        let count=self.prefix(&mut file)?;
++        ensure!(count<=maximum_height,"Litecoin header cache height exceeds limit");
++        let mut reader=BufReader::new(file);
++        let mut sequence=HeaderSequence::new(self.network)?;
++        for _ in 0..count {
++            let mut bytes=[0u8;80];reader.read_exact(&mut bytes)?;
++            sequence.append(&bytes,now)?;
++        }
++        let mut extra=[0u8;1];ensure!(reader.read(&mut extra)?==0,"trailing Litecoin header cache data");
++        Ok(Some(sequence))
++    }
++    /// Complete, synced temporary file then atomic replacement and directory sync.
++    /// A failed final directory sync is reported even if replacement took effect.
++    /// This is a cache, not an anti-rollback journal or a freshness assertion.
++    pub fn save(&self,sequence: &HeaderSequence) -> Result<()> {
++        ensure!(sequence.network()==self.network,"Litecoin cache save network mismatch");
++        if let Some(mut existing)=self.record()? {self.prefix(&mut existing)?;}
++        let temporary=CString::new(format!("{}.headers.tmp",uuid::Uuid::new_v4()))?;
++        let target=CString::new(NAME)?;
++        let file=self.file(temporary.to_str()?,libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL)?;
++        let outcome=(|| -> Result<()> {
++            let mut writer=BufWriter::new(file);
++            writer.write_all(MAGIC)?;
++            writer.write_all(&sequence.headers[0].block_hash().to_byte_array())?;
++            writer.write_all(&sequence.height().to_le_bytes())?;
++            for header in sequence.headers.iter().skip(1) {writer.write_all(&serialize(header))?;}
++            writer.flush()?;writer.get_ref().sync_all()?;
++            if unsafe {libc::renameat(self.directory.as_raw_fd(),temporary.as_ptr(),
++                self.directory.as_raw_fd(),target.as_ptr())}!=0 {
++                return Err(std::io::Error::last_os_error().into())
++            }
++            self.directory.sync_all()?;
++            Ok(())
++        })();
++        if outcome.is_err() {unsafe {libc::unlinkat(self.directory.as_raw_fd(),temporary.as_ptr(),0);}}
++        outcome
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/headers/cache/tests.rs b/swap-machine/src/litecoin_light/headers/cache/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/headers/cache/tests.rs
+@@ -0,0 +1,97 @@
++use super::*;
++use std::{fs, os::unix::fs::{PermissionsExt, symlink}, path::PathBuf};
++struct Directory(PathBuf);
++impl Directory {
++    fn new() -> Result<Self> {
++        let path=std::env::temp_dir().join(format!("monzero-header-cache-{}",uuid::Uuid::new_v4()));
++        fs::create_dir(&path)?;fs::set_permissions(&path,fs::Permissions::from_mode(0o700))?;
++        Ok(Self(path.canonicalize()?))
++    }
++}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++fn chain() -> Result<HeaderSequence> {
++    let mut sequence=HeaderSequence::new(LtcNetwork::Regtest)?;
++    sequence.append(&serialize(&super::super::tests::child()),1296688902)?;
++    Ok(sequence)
++}
++#[test]
++fn cache_restart_revalidates_identity_and_work() -> Result<()> {
++    for network in [LtcNetwork::Mainnet,LtcNetwork::Testnet,LtcNetwork::Regtest] {
++        let dir=Directory::new()?;let cache=HeaderCache::open(&dir.0,network)?;
++        assert!(cache.load(0,1296688902)?.is_none());
++        let sequence=if network==LtcNetwork::Regtest {chain()?} else {HeaderSequence::new(network)?};
++        cache.save(&sequence)?;drop(cache);
++        let cache=HeaderCache::open(&dir.0,network)?;
++        let restored=cache.load(sequence.height(),1296688902)?.unwrap();
++        assert_eq!(restored.network(),network);assert_eq!(restored.height(),sequence.height());
++        assert_eq!(restored.chain_work(),sequence.chain_work());
++        for height in 0..=sequence.height() {assert_eq!(restored.header(height),sequence.header(height));}
++    }
++    Ok(())
++}
++#[test]
++fn cache_rejects_corruption_bounds_and_wrong_clock_without_mutating_selected_chain() -> Result<()> {
++    let dir=Directory::new()?;let cache=HeaderCache::open(&dir.0,LtcNetwork::Regtest)?;
++    let selected=chain()?;cache.save(&selected)?;let path=dir.0.join(NAME);let original=fs::read(&path)?;
++    assert!(cache.load(0,1296688902).is_err());
++    assert!(cache.load(1,0).is_err());
++    for case in 0..7 {
++        let mut bytes=original.clone();
++        match case {
++            0=>bytes[0]^=1,
++            1=>bytes[8]^=1,
++            2=>bytes[40..44].copy_from_slice(&u32::MAX.to_le_bytes()),
++            3=>{bytes.pop();},
++            4=>bytes.push(0),
++            5=>bytes[48]^=1, // disconnected parent, same framing
++            6=>bytes.truncate(20),
++            _=>unreachable!(),
++        }
++        fs::write(&path,&bytes)?;
++        assert!(cache.load(1,1296688902).is_err(),"case {case}");
++        assert_eq!(selected.height(),1);assert_eq!(selected.chain_work(),&BigUint::from(4u8));
++    }
++    fs::write(&path,&original)?;assert!(cache.load(1,1296688902)?.is_some());
++    Ok(())
++}
++#[test]
++fn cache_atomic_replacement_and_abandoned_temporary_are_distinct() -> Result<()> {
++    let dir=Directory::new()?;let cache=HeaderCache::open(&dir.0,LtcNetwork::Regtest)?;
++    let mut sequence=chain()?;cache.save(&sequence)?;
++    let mut old=File::open(dir.0.join(NAME))?;let before=fs::read(dir.0.join(NAME))?;
++    fs::write(dir.0.join("abandoned.headers.tmp"),b"incomplete")?;
++    let mut candidate=sequence.fork(0)?;
++    let mut alternate=super::super::tests::child();alternate.nonce=0;
++    candidate.append(&serialize(&alternate),1296688902)?;
++    let raw="000000209d08f789f2afaf053878d9b21add2f847fff4a9c32fb58b8c5c79ca166f94a9d111111111111111111111111111111111111111111111111111111111111111106e7494dffff7f2000000000";
++    let bytes: Vec<u8>=(0..raw.len()).step_by(2).map(|i|u8::from_str_radix(&raw[i..i+2],16).unwrap()).collect();
++    candidate.append(&bytes,1296688902)?;sequence.adopt(candidate)?;cache.save(&sequence)?;
++    let mut retained=Vec::new();old.read_to_end(&mut retained)?;assert_eq!(retained,before);
++    let restored=cache.load(2,1296688902)?.unwrap();
++    assert_eq!(restored.header(1),Some(alternate));assert_eq!(restored.header(2),sequence.header(2));
++    assert_eq!(restored.chain_work(),sequence.chain_work());
++    let stable=fs::read(dir.0.join(NAME))?;
++    assert!(cache.save(&HeaderSequence::new(LtcNetwork::Mainnet)?).is_err());
++    assert_eq!(fs::read(dir.0.join(NAME))?,stable);
++    Ok(())
++}
++#[test]
++fn cache_lease_permissions_links_and_network_are_enforced() -> Result<()> {
++    let dir=Directory::new()?;let cache=HeaderCache::open(&dir.0,LtcNetwork::Regtest)?;
++    assert!(HeaderCache::open(&dir.0,LtcNetwork::Regtest).is_err());
++    cache.save(&chain()?)?;drop(cache);
++    let wrong=HeaderCache::open(&dir.0,LtcNetwork::Mainnet)?;
++    assert!(wrong.load(1,1296688902).is_err());
++    assert!(wrong.save(&HeaderSequence::new(LtcNetwork::Mainnet)?).is_err());drop(wrong);
++    let cache=HeaderCache::open(&dir.0,LtcNetwork::Regtest)?;let path=dir.0.join(NAME);
++    fs::set_permissions(&path,fs::Permissions::from_mode(0o644))?;
++    assert!(cache.load(1,1296688902).is_err());fs::set_permissions(&path,fs::Permissions::from_mode(0o600))?;
++    fs::hard_link(&path,dir.0.join("linked"))?;assert!(cache.load(1,1296688902).is_err());
++    fs::remove_file(dir.0.join("linked"))?;
++    fs::rename(&path,dir.0.join("real"))?;symlink("real",&path)?;
++    assert!(cache.load(1,1296688902).is_err());assert!(cache.save(&chain()?).is_err());
++    fs::remove_file(&path)?;fs::create_dir(&path)?;assert!(cache.load(1,1296688902).is_err());
++    drop(cache);fs::set_permissions(&dir.0,fs::Permissions::from_mode(0o755))?;
++    assert!(HeaderCache::open(&dir.0,LtcNetwork::Regtest).is_err());
++    Ok(())
++}

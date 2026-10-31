@@ -1,0 +1,76 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -6,6 +6,14 @@
+ #[tokio::test]
+ #[ignore = "requires a disposable owned BCHN regtest wallet and digest-pinned context"]
+ async fn bch_owned_node_executes_funding_controller() -> Result<()> {
++    exercise(false).await
++}
++#[tokio::test]
++#[ignore = "requires a disposable owned BCHN wallet and phase-coordinated driver"]
++async fn bch_owned_node_validates_authenticated_funding_window() -> Result<()> {
++    exercise(true).await
++}
++async fn exercise(handoff: bool) -> Result<()> {
+     let path=PathBuf::from(std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG")?);
+     let bytes=std::fs::read(&path)?;
+     ensure!(bytes.len()<16384 && hex(&Sha256::digest(&bytes))==std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG_SHA256")?,"node fixture context changed");
+@@ -77,10 +85,58 @@
+     assert_eq!(serialize(restored.signed_bch_funding()?.unwrap().transaction()),serialize(signed.transaction()));
+     assert_eq!(restored.relay_bch_funding(&rpc,&approval.commitment,base+13).await?,txid);
+     assert_eq!(contents(&metadata.0)?,before);
++    if handoff {
++        use agreement::execution::funding::message;
++        use crate::bch_rpc::observation::FundingStatus;
++        let frame=restored.prepare_bch_funding_message(base+14)?;
++        let signature=SigningKey::from_bytes(&[1;32]).sign(&message::signing_bytes(&frame)?).to_bytes();
++        restored.retain_outgoing_bch_funding_message(base+15,&signature)?;
++        let before=contents(&native_metadata.0)?;
++        let wrong=SigningKey::from_bytes(&[2;32]).sign(&message::signing_bytes(&frame)?).to_bytes();
++        assert!(native.accept_bch_funding_message(base+16,&frame,&wrong).is_err());
++        assert_eq!(contents(&native_metadata.0)?,before);
++        let received=native.accept_bch_funding_message(base+16,&frame,&signature)?;
++        assert_eq!(received.signed().lock_outpoint(),signed.lock_outpoint());drop(native);
++        let native=AdmittedExecution::resume(&native_metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        assert_eq!(native.received_bch_funding_message()?.unwrap().frame(),frame);
++        assert_eq!(native.observe_received_bch_funding(&rpc).await?.status(),FundingStatus::Mempool {lock_output_unspent:true});
++        assert!(native.check_bch_lock_for_native_funding(&rpc,base+17,5).await.is_err());
++        let before=contents(&native_metadata.0)?;let secrets=contents(&snapshots.0)?;
++        let event=PathBuf::from(field("eventFile")?);let gate=PathBuf::from(field("continueFile")?);
++        phase(&event,&gate,"funded","confirmed",txid).await?;
++        assert_eq!(restored.observe_signed_bch_funding(&rpc).await?.status(),FundingStatus::ConfirmedUnspent {confirmations:3});
++        let checked=native.check_bch_lock_for_native_funding(&rpc,base+18,5).await?;
++        assert_eq!(checked.observation().txid(),txid);
++        assert_eq!(checked.observation().status(),FundingStatus::ConfirmedUnspent {confirmations:3});
++        assert_eq!(checked.amount_atoms(),setup.quote.terms()["xmzAtoms"].parse::<u64>()?);
++        assert_eq!(checked.maximum_fee_atoms(),setup.quote.terms()["xmzFundingFeeMaxAtoms"].parse::<u64>()?);
++        assert_eq!(checked.destination(),native.restore_agreement()?.owned().wallet().address());
++        phase(&event,&gate,"observed","aged",txid).await?;
++        assert_eq!(native.observe_received_bch_funding(&rpc).await?.status(),FundingStatus::ConfirmedUnspent {confirmations:15});
++        assert!(native.check_bch_lock_for_native_funding(&rpc,base+19,5).await.is_err());
++        assert_eq!(contents(&native_metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    }
+     let report=PathBuf::from(field("report")?);ensure!(!report.exists(),"fixture report exists");
+     save(&report,&serde_json::to_vec(&json!({"schema":"monzero-bch-node-executor-result-v1","executable":false,
+         "txid":txid.to_string(),"lockVout":signed.lock_outpoint().vout,"lockScript":setup.quote.recovery_plan().lock().script_pubkey().to_hex_string(),
++        "authenticatedHandoff":handoff,"nativeFundingWindowVerified":handoff,"nearCancellationRejected":handoff,
+         "principalAtoms":100000,"feeAtoms":fee,"productionWalletLockSignRelay":true,"restartSavedBytes":true,
+         "inputs":inputs.iter().map(|p|json!({"txid":p.txid.to_string(),"vout":p.vout})).collect::<Vec<_>>() }))?)?;
+     Ok(())
+ }
++
++async fn phase(event: &std::path::Path,gate: &std::path::Path,stage: &str,expected: &str,txid: Txid) -> Result<()> {
++    let pending=event.with_extension("pending");
++    save(&pending,&serde_json::to_vec(&json!({"phase":stage,"txid":txid.to_string()}))?)?;
++    std::fs::rename(&pending,event)?;
++    tokio::time::timeout(std::time::Duration::from_secs(90),async {
++        loop {
++            match std::fs::read(gate) {
++                Ok(bytes)=>{ensure!(bytes.len()<64,"oversized fixture phase");if bytes==expected.as_bytes() {return Ok(())}},
++                Err(e) if e.kind()==std::io::ErrorKind::NotFound=>(),
++                Err(e)=>return Err(e.into()),
++            }
++            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
++        }
++    }).await.context("node fixture phase timed out")?
++}

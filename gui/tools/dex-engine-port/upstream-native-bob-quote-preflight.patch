@@ -1,0 +1,98 @@
+diff --git a/swap-machine/src/bob/mod.rs b/swap-machine/src/bob/mod.rs
+index 8edcdbf91..6548dd428 100644
+--- a/swap-machine/src/bob/mod.rs
++++ b/swap-machine/src/bob/mod.rs
+@@ -799,6 +799,43 @@ impl State2 {
+         })
+     }
+ 
++    /// Preflight for the native full-refund profile. This is not funding authority:
++    /// authenticated transcript, durable approval, chain observations and price
++    /// policy must still be enforced by the native driver.
++    pub fn check_native_quote(
++        &self, quote: &crate::native_trade_quote::VerifiedQuote,
++        policy: &crate::native_trade_quote::DeploymentPolicy, now: u64,
++    ) -> Result<()> {
++        quote.check_deployment(policy, now)?;
++        let number = |field: &str| -> Result<u64> { Ok(quote.terms()[field].parse()?) };
++        anyhow::ensure!(self.tx_lock.lock_amount().to_sat() == number("btcSatoshis")?
++            && self.xmr.as_pico() == number("xmzAtoms")?, "negotiated principal differs from quote");
++        anyhow::ensure!(self.refund_address == quote.destinations().btc_refund
++            && self.redeem_address == quote.destinations().btc_payout,
++            "negotiated destination differs from quote");
++        anyhow::ensure!(u64::from(u32::from(self.cancel_timelock)) == number("cancelBlocks")?
++            && u64::from(u32::from(self.punish_timelock)) == number("punishBlocks")?
++            && self.min_monero_confirmations == number("xmzConfirmations")?,
++            "negotiated timing differs from quote");
++        anyhow::ensure!(self.btc_amnesty_amount == Some(bitcoin::Amount::ZERO)
++            && matches!(self.refund_signatures, RefundSignatures::Legacy { .. }),
++            "unsupported native refund profile");
++        let lock = u128::from(self.tx_lock.fee()?.to_sat());
++        let cancel = u128::from(self.tx_cancel_fee.to_sat());
++        let refund = u128::from(self.tx_refund_fee.to_sat());
++        let redeem = u128::from(self.tx_redeem_fee.to_sat());
++        let punish = u128::from(self.tx_punish_fee.to_sat());
++        let cap = u128::from(number("btcNativeFeeMaxSatoshis")?);
++        let principal = u128::from(self.tx_lock.lock_amount().to_sat());
++        // Bound each complete mutually exclusive path, not each fee in isolation.
++        // Early refund (lock + refund) is bounded by the cancel/refund path too.
++        for path in [redeem, cancel + refund, cancel + punish] {
++            anyhow::ensure!(path < principal && lock + path <= cap,
++                "negotiated Bitcoin path exceeds quote fee budget");
++        }
++        Ok(())
++    }
++
+     pub async fn lock_btc(self) -> Result<(State3, TxLock)> {
+         Ok((
+             State3 {
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index 3586023af..80ff2fe36 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -263,10 +263,12 @@ mod tests {
+         use swap_core::bitcoin::{CancelTimelock, PunishTimelock, RemainingRefundTimelock};
+         use swap_env::env::{GetConfig, Regtest};
+         let bob_wallet = TestWalletBuilder::new(1_000_000).build().await;
+-        let alice_wallet = TestWalletBuilder::new(1_000_000).build().await;
++        let alice_wallet = TestWalletBuilder::new(1_000_000)
++            .with_key(bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[42; 32])?).build().await;
+         let mut proposed = fixture();
+         proposed["btcPayout"] = alice_wallet.new_address().await?.to_string().into();
+         proposed["btcRefund"] = bob_wallet.new_address().await?.to_string().into();
++        assert_ne!(proposed["btcPayout"], proposed["btcRefund"]);
+         // Deliberately differ from the existing settlement fixture's constants.
+         proposed["btcSatoshis"] = "450000".into();
+         proposed["xmzAtoms"] = "150000000000".into();
+@@ -359,6 +361,31 @@ mod tests {
+         let alice3 = alice2.receive(message4)?;
+         assert!(alice_transcript.completed_commitment().is_some());
+         assert_eq!(alice_transcript.completed_commitment(), bob_transcript.completed_commitment());
++        bob2.check_native_quote(&bob_quote, &policy, 1000)?;
++        assert!(bob2.check_native_quote(&bob_quote, &policy, 1100).is_err());
++        let mut changed_state = bob2.clone();
++        changed_state.tx_cancel_fee = bitcoin::Amount::from_sat(u64::MAX);
++        assert!(changed_state.check_native_quote(&bob_quote, &policy, 1000).is_err());
++        changed_state = bob2.clone();
++        changed_state.btc_amnesty_amount = Some(bitcoin::Amount::from_sat(1));
++        assert!(changed_state.check_native_quote(&bob_quote, &policy, 1000).is_err());
++        changed_state = bob2.clone();
++        changed_state.refund_address = alice_wallet.new_address().await?;
++        assert!(changed_state.check_native_quote(&bob_quote, &policy, 1000).is_err());
++        changed_state = bob2.clone();
++        changed_state.cancel_timelock = CancelTimelock::new(policy.cancel_blocks + 1);
++        assert!(changed_state.check_native_quote(&bob_quote, &policy, 1000).is_err());
++        changed_state = bob2.clone();
++        changed_state.punish_timelock = PunishTimelock::new(policy.punish_blocks + 1);
++        assert!(changed_state.check_native_quote(&bob_quote, &policy, 1000).is_err());
++        for (field, value) in [("btcSatoshis", "450001"), ("xmzAtoms", "150000000001"),
++            ("btcNativeFeeMaxSatoshis", "2999")] {
++            let mut changed = proposed.clone(); changed[field] = value.into();
++            let changed = verify(&changed, 1000)?;
++            assert!(bob2.check_native_quote(&changed, &policy, 1000).is_err(), "accepted changed {field}");
++        }
++        let mut exact_cap = proposed.clone(); exact_cap["btcNativeFeeMaxSatoshis"] = "3000".into();
++        bob2.check_native_quote(&verify(&exact_cap, 1000)?, &policy, 1000)?;
+         let (bob3, lock) = bob2.lock_btc().await?;
+         assert_eq!(alice3.lock_xmr_transfer_request().amount.as_pico(), 150000000000);
+         assert_eq!(bob3.xmr_amount().as_pico(), 150000000000);

@@ -1,0 +1,277 @@
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+index e9ea783bb..7a3063f88 100644
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -373,3 +373,5 @@ mod tests {
+ pub mod litecoin_rpc;
+ pub mod litecoin_quote;
+ pub mod litecoin_negotiation;
++
++pub mod dogecoin_rpc;
+diff --git a/swap-machine/src/dogecoin_rpc.rs b/swap-machine/src/dogecoin_rpc.rs
+new file mode 100644
+index 000000000..50798e53d
+--- /dev/null
++++ b/swap-machine/src/dogecoin_rpc.rs
+@@ -0,0 +1,129 @@
++//! Read-only observations from a caller-authenticated, loopback Dogecoin Core node.
++//! RPC shape follows dogecoin/dogecoin v1.14.9 src/rpc/{blockchain,rawtransaction}.cpp.
++//! This boundary neither signs nor broadcasts and cannot authorize settlement.
++use anyhow::{Context, Result, ensure};
++use bitcoin::{BlockHash, Transaction, Txid, consensus::encode::{deserialize, serialize_hex}, hex::FromHex};
++use serde::{Deserialize, de::DeserializeOwned};
++use serde_json::{Value, json, value::RawValue};
++use std::sync::atomic::{AtomicU64, Ordering};
++use swap_core::dogecoin::DogeNetwork;
++use zeroize::Zeroizing;
++
++pub struct DogecoinRpc {
++    client: reqwest::Client,
++    port: u16,
++    username: Zeroizing<String>,
++    password: Zeroizing<String>,
++    network: DogeNetwork,
++    request_id: AtomicU64,
++}
++
++/// Ephemeral evidence; cannot be manufactured by deserializing peer input.
++/// A later operation must reobserve it, especially following a reorganisation.
++pub struct ConfirmedTransaction {
++    network: DogeNetwork,
++    tip: BlockHash,
++    block: BlockHash,
++    confirmations: u64,
++    transaction: Transaction,
++}
++impl ConfirmedTransaction {
++    pub fn network(&self) -> DogeNetwork { self.network }
++    pub fn tip(&self) -> BlockHash { self.tip }
++    pub fn block(&self) -> BlockHash { self.block }
++    pub fn confirmations(&self) -> u64 { self.confirmations }
++    pub fn transaction(&self) -> &Transaction { &self.transaction }
++}
++
++#[derive(Deserialize)]
++struct Envelope { id: u64, error: Option<Value>, result: Box<RawValue> }
++#[derive(Deserialize)]
++struct ChainInfo {
++    chain: String, bestblockhash: BlockHash, blocks: u64, headers: u64,
++    initialblockdownload: bool,
++}
++#[derive(Deserialize)]
++struct RawTransaction {
++    hex: String, txid: Txid, hash: Txid, blockhash: BlockHash, confirmations: u64,
++}
++#[derive(Deserialize)]
++struct Header { hash: BlockHash, height: u64, confirmations: i64 }
++
++impl DogecoinRpc {
++    /// The caller authenticates ownership of the service before handing over
++    /// credentials. Matching chain data does not authenticate the listening process.
++    pub fn new(port: u16, username: String, password: String, network: DogeNetwork) -> Result<Self> {
++        let username = Zeroizing::new(username);
++        let password = Zeroizing::new(password);
++        ensure!(port != 0 && !username.is_empty() && !password.is_empty()
++            && username.len() + password.len() <= 1024 && !username.contains(':'),
++            "invalid Dogecoin RPC credentials or port");
++        let client = reqwest::Client::builder().no_proxy().pool_max_idle_per_host(0)
++            .redirect(reqwest::redirect::Policy::none())
++            .timeout(std::time::Duration::from_secs(15)).build()?;
++        Ok(Self { client, port, username, password, network, request_id: AtomicU64::new(0) })
++    }
++
++    async fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
++        ensure!(matches!(method, "getblockchaininfo" | "getblockhash" | "getrawtransaction" | "getblockheader"),
++            "unsupported Dogecoin observation RPC");
++        let id = self.request_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
++            .map_err(|_| anyhow::anyhow!("Dogecoin RPC identity exhausted"))?;
++        let mut response = self.client.post(format!("http://127.0.0.1:{}", self.port))
++            .basic_auth(self.username.as_str(), Some(self.password.as_str()))
++            .json(&json!({"jsonrpc":"1.0", "id":id, "method":method, "params":params}))
++            .send().await.map_err(|_| anyhow::anyhow!("Dogecoin local RPC transport failed"))?;
++        ensure!(response.status().is_success(), "Dogecoin local RPC HTTP rejection");
++        let mut bytes = Vec::new();
++        while let Some(chunk) = response.chunk().await.map_err(|_| anyhow::anyhow!("Dogecoin RPC body failed"))? {
++            ensure!(bytes.len() + chunk.len() <= 2_000_000, "oversized Dogecoin RPC response");
++            bytes.extend_from_slice(&chunk);
++        }
++        let reply: Envelope = serde_json::from_slice(&bytes).context("invalid Dogecoin RPC envelope")?;
++        ensure!(reply.id == id && reply.error.is_none(), "Dogecoin RPC rejection or identity mismatch");
++        serde_json::from_str(reply.result.get()).context("invalid Dogecoin RPC result")
++    }
++
++    async fn chain(&self) -> Result<ChainInfo> {
++        let info: ChainInfo = self.rpc("getblockchaininfo", json!([])).await?;
++        let genesis: String = self.rpc("getblockhash", json!([0])).await?;
++        self.network.verify_chain(&info.chain, &genesis)?;
++        ensure!(!info.initialblockdownload && info.blocks == info.headers, "Dogecoin node is not synchronized");
++        Ok(info)
++    }
++
++    /// Requires the node's transaction index for spent historical transactions.
++    /// An expected block is a binding, not evidence of active-chain membership.
++    /// Does not prove unspentness, CLTV activation, maturity or swap completion.
++    pub async fn confirmed_transaction(&self, txid: Txid, block: BlockHash, minimum: u64) -> Result<ConfirmedTransaction> {
++        ensure!(minimum > 0, "zero Dogecoin confirmation requirement");
++        let before = self.chain().await?;
++        // Dogecoin 1.14.9 accepts only txid and verbose, unlike Litecoin's block argument.
++        let raw: RawTransaction = self.rpc("getrawtransaction", json!([txid.to_string(), true])).await?;
++        let header: Header = self.rpc("getblockheader", json!([block.to_string(), true])).await?;
++        let confirmations = raw.confirmations;
++        let transaction = validate(raw, header, txid, block, minimum, before.blocks)?;
++        let after = self.chain().await?;
++        ensure!(before.bestblockhash == after.bestblockhash && before.blocks == after.blocks,
++            "Dogecoin tip changed during observation");
++        Ok(ConfirmedTransaction { network: self.network, tip: before.bestblockhash, block, confirmations, transaction })
++    }
++}
++
++fn validate(raw: RawTransaction, header: Header, txid: Txid, block: BlockHash, minimum: u64, height: u64) -> Result<Transaction> {
++    let depth = height.checked_sub(header.height).and_then(|n| n.checked_add(1)).context("invalid Dogecoin block height")?;
++    ensure!(minimum > 0 && raw.txid == txid && raw.hash == txid && raw.blockhash == block
++        && header.hash == block && header.confirmations > 0
++        && u64::try_from(header.confirmations)? == raw.confirmations
++        && raw.confirmations == depth && raw.confirmations >= minimum,
++        "Dogecoin transaction is not confirmed in the requested active block");
++    ensure!(!raw.hex.is_empty() && raw.hex.len() <= 400_000, "invalid Dogecoin legacy transaction size");
++    let transaction: Transaction = deserialize(&Vec::<u8>::from_hex(&raw.hex)?)?;
++    ensure!(serialize_hex(&transaction) == raw.hex && transaction.compute_txid() == txid
++        && transaction.input.iter().all(|input| input.witness.is_empty()),
++        "Dogecoin legacy transaction bytes differ from node identity");
++    Ok(transaction)
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/dogecoin_rpc/tests.rs b/swap-machine/src/dogecoin_rpc/tests.rs
+new file mode 100644
+index 000000000..cb9790baa
+--- /dev/null
++++ b/swap-machine/src/dogecoin_rpc/tests.rs
+@@ -0,0 +1,126 @@
++use super::*;
++use bitcoin::{hashes::Hash, Amount, ScriptBuf, TxIn, TxOut, absolute, transaction::Version};
++
++fn transaction() -> Transaction {
++    Transaction { version: Version::ONE, lock_time: absolute::LockTime::ZERO,
++        input: vec![TxIn::default()], output: vec![TxOut {value: Amount::from_sat(999_000_000), script_pubkey: ScriptBuf::new()}] }
++}
++
++#[test]
++fn rejects_inconsistent_confirmation_and_legacy_bytes() -> Result<()> {
++    let tx = transaction(); let txid = tx.compute_txid(); let block = BlockHash::from_byte_array([7;32]);
++    let raw = || RawTransaction {hex: serialize_hex(&tx), txid, hash: txid, blockhash: block, confirmations: 3};
++    let header = || Header {hash: block, height: 98, confirmations: 3};
++    assert_eq!(validate(raw(), header(), txid, block, 3, 100)?, tx);
++    assert!(validate(raw(), header(), txid, block, 0, 100).is_err());
++    assert!(validate(raw(), header(), txid, block, 4, 100).is_err());
++    for case in 0..9 {
++        let mut r = raw(); let mut h = header();
++        match case {
++            0 => r.confirmations = 0,
++            1 => r.blockhash = BlockHash::from_byte_array([8;32]),
++            2 => h.confirmations = -1,
++            3 => h.height = 97,
++            4 => h.height = 101,
++            5 => r.hash = Txid::from_byte_array([8;32]),
++            6 => r.hex.push_str("00"),
++            7 => {let mut changed = tx.clone(); changed.input[0].witness.push([1]); r.hex = serialize_hex(&changed);},
++            _ => {let mut changed = tx.clone(); changed.output[0].value = Amount::from_sat(1); r.hex = serialize_hex(&changed);},
++        }
++        assert!(validate(r, h, txid, block, 3, 100).is_err(), "case {case}");
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn observation_checks_rpc_context_and_stable_tip() -> Result<()> {
++    use std::{net::TcpListener, io::{BufRead, BufReader, Read, Write}};
++    for case in 0..8 {
++        let tx = transaction(); let txid = tx.compute_txid(); let block = BlockHash::from_byte_array([7;32]);
++        let listener = TcpListener::bind("127.0.0.1:0")?; let port = listener.local_addr()?.port();
++        listener.set_nonblocking(true)?;
++        let server = std::thread::spawn(move || -> Result<()> {
++            let methods = ["getblockchaininfo", "getblockhash", "getrawtransaction", "getblockheader", "getblockchaininfo", "getblockhash"];
++            let count = match case { 2..=4 => 2, 5..=7 => 1, _ => 6 };
++            for (i, method) in methods.iter().take(count).enumerate() {
++                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
++                let (mut socket, _) = loop {
++                    match listener.accept() {
++                        Ok(connection) => break connection,
++                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
++                            ensure!(std::time::Instant::now() < deadline, "missing expected RPC request");
++                            std::thread::sleep(std::time::Duration::from_millis(10));
++                        }
++                        Err(error) => return Err(error.into()),
++                    }
++                };
++                socket.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
++                let mut reader = BufReader::new(socket.try_clone()?); let mut line = String::new(); let mut length = None;
++                loop {
++                    line.clear(); ensure!(reader.read_line(&mut line)? > 0, "missing RPC headers");
++                    if line == "\r\n" { break; }
++                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = Some(value.trim().parse::<usize>()?); }
++                }
++                let length = length.context("missing RPC length")?; ensure!(length < 4096, "oversized request");
++                let mut body = vec![0;length]; reader.read_exact(&mut body)?; let request: Value = serde_json::from_slice(&body)?;
++                ensure!(request["method"] == *method, "unexpected RPC method");
++                let result = match *method {
++                    "getblockchaininfo" => json!({"chain":"regtest", "blocks":100, "headers":if case == 4 {101} else {100}, "initialblockdownload":case == 3,
++                        "bestblockhash": if case == 1 && i == 4 { "09".repeat(32) } else { "08".repeat(32) }}),
++                    "getblockhash" => {ensure!(request["params"] == json!([0]), "wrong genesis request"); json!(if case == 2 {DogeNetwork::Mainnet.genesis()} else {DogeNetwork::Regtest.genesis()})},
++                    "getrawtransaction" => {ensure!(request["params"] == json!([txid.to_string(),true]), "wrong raw lookup");
++                        json!({"hex":serialize_hex(&tx), "txid":txid, "hash":txid, "blockhash":block, "confirmations":3})},
++                    _ => {ensure!(request["params"] == json!([block.to_string(),true]), "wrong block lookup");
++                        json!({"hash":block, "height":98, "confirmations":3})},
++                };
++                let mut envelope = json!({"id":request["id"], "error":null, "result":result});
++                if case == 5 { envelope["id"] = json!(999); }
++                if case == 6 { envelope["error"] = json!({"code":-1,"message":"fixture"}); }
++                if case == 7 { envelope["result"].as_object_mut().unwrap().remove("initialblockdownload"); }
++                let body = serde_json::to_vec(&envelope)?;
++                write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?; socket.write_all(&body)?;
++            }
++            Ok(())
++        });
++        let rpc = DogecoinRpc::new(port,"fixture".into(),"fixture".into(),DogeNetwork::Regtest)?;
++        let result = rpc.confirmed_transaction(txid,block,3).await;
++        server.join().unwrap()?;
++        if case != 0 { assert!(result.is_err(), "case {case}"); } else {
++            let observed = result?; assert_eq!(observed.transaction().compute_txid(),txid); assert_eq!(observed.confirmations(),3);
++        }
++    }
++    Ok(())
++}
++
++#[tokio::test]
++#[ignore = "requires owned Dogecoin regtest request and response paths"]
++#[cfg(unix)]
++async fn actual_dogecoin_observation_fixture() -> Result<()> {
++    use std::{io::{Read, Write}, os::unix::fs::OpenOptionsExt};
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields, rename_all = "camelCase")]
++    struct Request { schema: String, request_id: uuid::Uuid, port: u16, cookie: String,
++        txid: Txid, block: BlockHash, minimum: u64, expected_hex: String }
++    let input = std::env::var_os("MONZERO_DOGE_OBSERVATION_REQUEST").context("missing observation request")?;
++    let output = std::env::var_os("MONZERO_DOGE_OBSERVATION_RESPONSE").context("missing observation response")?;
++    let mut bytes = Vec::new(); std::fs::File::open(input)?.take(500_001).read_to_end(&mut bytes)?;
++    ensure!(bytes.len() <= 500_000, "oversized observation request");
++    let request: Request = serde_json::from_slice(&bytes)?;
++    ensure!(request.schema == "monzero-doge-observation-request-v1" && !request.request_id.is_nil(), "wrong fixture context");
++    let cookie = Zeroizing::new(request.cookie);
++    let (user, password) = cookie.trim().split_once(':').context("invalid owned-node cookie")?;
++    let rpc = DogecoinRpc::new(request.port, user.into(), password.into(), DogeNetwork::Regtest)?;
++    let evidence = rpc.confirmed_transaction(request.txid, request.block, request.minimum).await;
++    let result = match evidence {
++        Ok(observed) => {
++            ensure!(serialize_hex(observed.transaction()) == request.expected_hex, "observed different transaction bytes");
++            json!({"confirmed":true,"confirmations":observed.confirmations(),"block":observed.block(),"tip":observed.tip()})
++        }
++        Err(_) => json!({"confirmed":false}),
++    };
++    let response = json!({"schema":"monzero-doge-observation-response-v1", "requestId":request.request_id,
++        "observation":result,"executable":false});
++    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(output)?;
++    file.write_all(&serde_json::to_vec(&response)?)?; file.sync_all()?;
++    Ok(())
++}

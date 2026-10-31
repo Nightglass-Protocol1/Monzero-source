@@ -1,0 +1,201 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout.rs
+@@ -0,0 +1,70 @@
++use super::*;
++use crate::native_funding_rpc::{full_proceeds::{ExactNetRequest,FullProceedsRequest},wallet_session::fixture::Payout};
++use swap_core::xmz::XmzAmount;
++
++fn copy_store(source: &std::path::Path) -> Result<PrivateStore> {
++    let target=PrivateStore::new()?;
++    for entry in std::fs::read_dir(source)? {
++        let entry=entry?;if entry.file_type()?.is_file() {std::fs::copy(entry.path(),target.0.join(entry.file_name()))?;}
++    }
++    Ok(target)
++}
++
++pub(super) async fn exercise(metadata: &std::path::Path,setup: &Setup,snapshots: &PrivateStore,
++    observer_fixture: &Fixture,rpc: &BchRpc,redemption: Txid,address: &XmzAddress,wallet: &WalletFixture) -> Result<()> {
++    let observer=observer_fixture.funding_client()?;let block=Some(BlockHash::from_byte_array([6;32]));
++    let amount=|field:&str| -> Result<XmzAmount> {Ok(XmzAmount::from_atoms(setup.quote.terms()[field].parse()?))};
++    let request=ExactNetRequest {source:FullProceedsRequest {wallet:address.clone(),destination:setup.quote.xmz_payout().clone(),
++        lock_txid:"ab".repeat(32),locked:amount("xmzAtoms")?,maximum_fee:amount("xmzClaimFeeMaxAtoms")?,account:0,priority:1},
++        principal:amount("xmzPayoutAtoms")?,reserve_return:setup.quote.xmz_refund().clone()};
++    for lost in [false,true] {
++        let copied=copy_store(metadata)?;let private=copy_store(&snapshots.0)?;
++        let slot=|part:&str|format!("{}.bch-native-payout-{part}",setup.quote.terms()["swapId"]);
++        let intent=copied.0.join(slot("intent"));let pin=copied.0.join(slot("pin"));let prepared=private.0.join(slot("prepared"));
++        {
++            let mut state=wallet.state.lock().unwrap();state.payout=Some(Payout {request:request.clone(),intent:intent.clone(),fee:900});
++            state.lose_payout=lost;
++        }
++        let mut execution=AdmittedExecution::resume(&copied.0,&private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let mut session=wallet.payout_session(&observer)?;
++        let transfers=wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="transfer").count();
++        assert!(execution.prepare_bch_native_payout(&observer,rpc,redemption,block,2048,&mut session,0).await.is_err());
++        assert!(!intent.exists());
++        let result=execution.prepare_bch_native_payout(&observer,rpc,redemption,block,2048,&mut session,1).await;
++        assert!(intent.exists());
++        assert_eq!(wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="transfer").count(),transfers+1);
++        let expected=if lost {assert!(result.is_err());assert!(!pin.exists() && !prepared.exists());None}
++            else {
++                let terms=result?;assert!(pin.exists() && prepared.exists());
++                assert_eq!(terms["payoutAtoms"],"100000");assert_eq!(terms["reserveReturnAtoms"],"100");
++                assert_eq!(terms["feeAtoms"],"900");assert_eq!(terms["destination"],setup.quote.xmz_payout().to_string());
++                assert_eq!(terms["reserveReturn"],setup.quote.xmz_refund().to_string());
++                for secret in ["tx_metadata","tx_key","spendKey","viewKey"] {assert!(terms.get(secret).is_none());}
++                Some(terms)
++            };
++        let calls=wallet.state.lock().unwrap().calls.len();let observations=observer_fixture.calls.lock().unwrap().len();
++        drop(execution);
++        let mut execution=AdmittedExecution::resume(&copied.0,&private.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++        let mut restarted=wallet.payout_session(&observer)?;
++        let restored=execution.prepare_bch_native_payout(&observer,rpc,redemption,block,2049,&mut restarted,1).await;
++        if let Some(expected)=expected {
++            assert_eq!(restored?,expected);assert_eq!(execution.recover_prepared_bch_native_payout()?,expected);
++            assert!(execution.prepare_bch_native_payout(&observer,rpc,redemption,block,2049,&mut restarted,2).await.is_err());
++            // Every incomplete/corrupt checkpoint must reject offline recovery.
++            let saved=std::fs::read(&prepared)?;std::fs::write(&prepared,b"{}")?;
++            assert!(execution.recover_prepared_bch_native_payout().is_err());std::fs::write(&prepared,&saved)?;
++            let held=copied.0.join("held-payout-pin");std::fs::rename(&pin,&held)?;
++            assert!(execution.recover_prepared_bch_native_payout().is_err());std::fs::rename(&held,&pin)?;
++            let held=copied.0.join("held-payout-intent");std::fs::rename(&intent,&held)?;
++            assert!(execution.recover_prepared_bch_native_payout().is_err());std::fs::rename(&held,&intent)?;
++            assert_eq!(execution.recover_prepared_bch_native_payout()?,expected);
++            assert_eq!(std::fs::read(&prepared)?,saved);
++        } else {
++            assert!(restored.is_err());assert!(execution.recover_prepared_bch_native_payout().is_err());
++        }
++        assert_eq!(wallet.state.lock().unwrap().calls.len(),calls,"saved or uncertain payout performed another wallet operation");
++        assert_eq!(observer_fixture.calls.lock().unwrap().len(),observations,"offline recovery performed chain observations");
++        assert!(!wallet.state.lock().unwrap().calls.iter().any(|s|s=="relay_tx"));
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet.rs
+@@ -45,6 +45,10 @@
+         let state=wallet.state.lock().unwrap();
+         assert_eq!(state.calls.iter().filter(|m|m.as_str()=="generate_from_keys").count(),1);
+         assert!(state.calls.iter().all(|m|matches!(m.as_str(),"get_address"|"generate_from_keys"|"query_key"|"scan_tx"|"open_wallet"|"close_wallet")));
++        drop(state);
++        if lost==0 {payout::exercise(&copied.0,setup,snapshots,observer_fixture,rpc,txid,address,&wallet).await?;}
+     }
+     Ok(())
+ }
++
++mod payout;
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs b/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
+--- a/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
++++ b/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
+@@ -1,6 +1,11 @@
+ //! Synthetic authenticated local wallet service; never a real daemon/wallet.
+ use super::*;
+ use std::sync::{Arc,Mutex};
++use crate::native_funding_rpc::full_proceeds::ExactNetRequest;
++
++#[derive(Clone)]
++pub(crate) struct Payout {pub request: ExactNetRequest,pub intent: std::path::PathBuf,pub fee: u64}
++
+ use tokio::io::{AsyncReadExt,AsyncWriteExt};
+ 
+ #[derive(Default)]
+@@ -8,6 +13,7 @@
+     pub calls: Vec<String>,pub opened: bool,pub exists: bool,
+     pub lose_restore: bool,pub lose_scan: bool,pub wrong_key: bool,pub fail_open: bool,
+     pub intent: Option<std::path::PathBuf>,
++    pub payout: Option<Payout>,pub lose_payout: bool,
+ }
+ pub(crate) struct Fixture {
+     pub state: Arc<Mutex<State>>,daemon: tokio::net::TcpListener,wallet: u16,
+@@ -15,6 +21,10 @@
+ }
+ impl Drop for Fixture {fn drop(&mut self) {self.task.abort();}}
+ impl Fixture {
++    pub fn payout_session(&self,observer: &NativeFundingRpc) -> Result<NativeWalletSession> {
++        Ok(NativeWalletSession::new(NativeFundingRpc::new(observer.daemon,self.wallet,
++            "fixture".into(),"fixture".into())?,self.network))
++    }
+     pub fn session(&self) -> Result<NativeWalletSession> {
+         Ok(NativeWalletSession::new(NativeFundingRpc::new(self.daemon.local_addr()?.port(),self.wallet,
+             "fixture".into(),"fixture".into())?,self.network))
+@@ -73,6 +83,35 @@
+                             ensure!(state.opened && p==&json!({"txids":[txid]}),"changed wallet transaction import");
+                             lost=std::mem::take(&mut state.lose_scan);json!({})
+                         },
++                        "incoming_transfers"=>{
++                            let payout=state.payout.as_ref().context("unexpected payout input query")?;
++                            ensure!(state.opened && p==&json!({"transfer_type":"available","account_index":0}),"wrong payout input query");
++                            json!({"transfers":[{"tx_hash":txid,"amount":payout.request.source.locked.atoms(),
++                                "key_image":"cc".repeat(32),"spent":false,"unlocked":true,"frozen":false,"subaddr_index":{"major":0}}]})
++                        },
++                        "transfer"=>{
++                            let payout=state.payout.clone().context("unexpected payout construction")?;
++                            ensure!(state.opened,"payout wallet closed");
++                            let intent:serde_json::Value=serde_json::from_slice(&std::fs::read(&payout.intent)?)?;
++                            ensure!(intent["schema"]=="monzero-bch-native-payout-intent-v1","construction preceded durable payout intent");
++                            let r=&payout.request;let source=&r.source;
++                            ensure!(source.wallet.to_string()==address && source.lock_txid==txid,"payout fixture changed wallet or lock");
++                            let reserve=source.locked.atoms()-r.principal.atoms();
++                            let combined=source.destination==r.reserve_return;
++                            let destinations=if combined {json!([{"address":source.destination.to_string(),"amount":source.locked.atoms()}])}
++                                else {json!([{"address":source.destination.to_string(),"amount":r.principal.atoms()},
++                                    {"address":r.reserve_return.to_string(),"amount":reserve}])};
++                            ensure!(p==&json!({"destinations":destinations,"account_index":0,"priority":source.priority,"unlock_time":0,
++                                "subtract_fee_from_outputs":[if combined {0} else {1}],"do_not_relay":true,
++                                "get_tx_key":true,"get_tx_metadata":true,"get_tx_hex":false}),"changed payout terms or attempted relay");
++                            let paid=source.locked.atoms()-payout.fee;
++                            let amounts=if combined {json!([paid])} else {json!([r.principal.atoms(),reserve-payout.fee])};
++                            lost=std::mem::take(&mut state.lose_payout);
++                            json!({"tx_hash":"dd".repeat(32),"amount":paid,"fee":payout.fee,"weight":2000,
++                                "amounts_by_dest":{"amounts":amounts},"spent_key_images":{"key_images":["cc".repeat(32)]},
++                                "tx_metadata":"abcd","tx_key":"01".to_owned()+&"00".repeat(31),
++                                "tx_blob":"","unsigned_txset":"","multisig_txset":""})
++                        },
+                         "close_wallet"=>{ensure!(state.opened,"closing absent wallet");state.opened=false;json!({})},
+                         _=>anyhow::bail!("unexpected wallet fixture method: {method}"),
+                     };
+@@ -124,3 +163,41 @@
+     assert_eq!(f.state.lock().unwrap().calls.iter().filter(|m|m.as_str()=="generate_from_keys").count(),1);
+     Ok(())
+ }
++
++#[tokio::test]
++async fn bch_native_payout_wallet_constructs_without_relay_and_retains_uncertainty() -> Result<()> {
++    use crate::native_funding_rpc::{full_proceeds::FullProceedsRequest,relay::lock_checkpoint::tests::Fixture as ChainFixture};
++    use swap_core::xmz::XmzAmount;
++    let addresses=include_str!("../../../../swap-core/src/xmz_address_vectors.txt").lines().take(2)
++        .map(|s|XmzAddress::parse(XmzNetwork::Mainnet,s)).collect::<Result<Vec<_>>>()?;
++    let request=ExactNetRequest {source:FullProceedsRequest {wallet:addresses[0].clone(),destination:addresses[1].clone(),
++        lock_txid:"ab".repeat(32),locked:XmzAmount::from_atoms(110),maximum_fee:XmzAmount::from_atoms(3),account:0,priority:1},
++        principal:XmzAmount::from_atoms(100),reserve_return:addresses[1].clone()};
++    let dir=std::env::temp_dir().join(format!("monzero-payout-fixture-{}",uuid::Uuid::new_v4()));std::fs::create_dir(&dir)?;
++    let intent=dir.join("intent");std::fs::write(&intent,br#"{"schema":"monzero-bch-native-payout-intent-v1"}"#)?;
++    let chain=ChainFixture::new(addresses[0].clone(),addresses[1].clone(),"aa".repeat(32),110,3).await?;
++    let observer=chain.funding_client()?;
++    for lost in [false,true] {
++        let id=SwapWalletId::new(uuid::Uuid::new_v4())?;
++        let wallet=Fixture::new(&id,&addresses[0],&[1;32],&[2;32],&request.source.lock_txid).await?;
++        {
++            let mut state=wallet.state.lock().unwrap();state.opened=true;state.exists=true;
++            state.payout=Some(Payout {request:request.clone(),intent:intent.clone(),fee:2});state.lose_payout=lost;
++        }
++        let mut session=wallet.payout_session(&observer)?;
++        session.verify_spend_key(&[1;32],&addresses[0]).await?;
++        let result=session.prepare_lock_payout(&request,&"aa".repeat(32),std::time::Instant::now()+std::time::Duration::from_secs(30)).await;
++        if lost {
++            assert!(result.is_err());assert!(session.uncertain);
++            assert!(session.prepare_lock_payout(&request,&"aa".repeat(32),std::time::Instant::now()+std::time::Duration::from_secs(30)).await.is_err());
++        } else {
++            let prepared=result?;assert!(!session.uncertain);
++            assert_eq!(prepared.terms()["payoutAtoms"],"100");assert_eq!(prepared.terms()["reserveReturnAtoms"],"8");
++            assert_eq!(prepared.terms()["feeAtoms"],"2");
++        }
++        let state=wallet.state.lock().unwrap();assert_eq!(state.calls.iter().filter(|s|s.as_str()=="transfer").count(),1);
++        assert!(!state.calls.iter().any(|s|s=="relay_tx"));
++    }
++    std::fs::remove_dir_all(dir)?;
++    Ok(())
++}

@@ -1,0 +1,239 @@
+diff --git a/swap-machine/src/litecoin_light/account/allocation.rs b/swap-machine/src/litecoin_light/account/allocation.rs
+--- a/swap-machine/src/litecoin_light/account/allocation.rs
++++ b/swap-machine/src/litecoin_light/account/allocation.rs
+@@ -70,11 +70,20 @@
+     }
+     fn retain_discovered_with(&mut self,minimum:[u32;2],
+         publish:impl FnOnce(&Journal,&[u8],&[u8])->Result<()>)->Result<()> {
++        let bytes=self.prepare_discovered(minimum)?;
++        if bytes==self.bytes {return Ok(())}
++        let record=validate_record(&self.account,&bytes)?;
++        self.usable=false;publish(&self.journal,&self.bytes,&bytes)?;
++        self.record=record;self.bytes=bytes;self.usable=true;Ok(())
++    }
++    /// Prepare exact allocation identities for retention in a recovery intent.
++    /// This performs no writes; publication must preserve the original prefix.
++    pub(in crate::litecoin_light) fn prepare_discovered(&self,minimum:[u32;2])->Result<Vec<u8>> {
+         ensure!(minimum.iter().all(|count|*count<=MAX_ENTRIES as u32),"Litecoin discovered allocation limit exceeded");
+         let current=[self.allocated_count(Branch::Receive)?,self.allocated_count(Branch::Change)?];
+         let target=[current[0].max(minimum[0]),current[1].max(minimum[1])];
+         ensure!(target[0] as usize+target[1] as usize<=MAX_ENTRIES,"Litecoin address journal capacity reached");
+-        if target==current {return Ok(())}
++        if target==current {return Ok(self.bytes.clone())}
+         let mut record=self.record.clone();
+         let mut requests=record.entries.iter().map(|entry|entry.request).collect::<BTreeSet<_>>();
+         for branch in 0..2 {
+@@ -84,9 +93,23 @@
+                 record.entries.push(Entry {request,branch:branch as u8,index});
+             }
+         }
+-        let bytes=serde_json::to_vec(&record)?;
+-        self.usable=false;publish(&self.journal,&self.bytes,&bytes)?;
+-        self.record=record;self.bytes=bytes;self.usable=true;Ok(())
++        Ok(serde_json::to_vec(&record)?)
++    }
++    /// Apply precisely the saved transition, or reconcile its exact completed
++    /// retry. Equal counts with different identities are never accepted here.
++    pub(in crate::litecoin_light) fn apply_recovery_record(&mut self,before:&[u8],after:&[u8])->Result<()> {
++        let original=validate_record(&self.account,before)?;
++        let replacement=validate_record(&self.account,after)?;
++        ensure!(replacement.entries.len()>=original.entries.len()
++            && original.entries.iter().zip(&replacement.entries).all(|(a,b)|
++                a.request==b.request && a.branch==b.branch && a.index==b.index),
++            "recovery transition changes existing reservations");
++        let (_,current)=self.backup_parts()?;
++        ensure!(current==before || current==after,"recovery allocation record changed");
++        self.usable=false;
++        if current==after {self.journal.retain(NAME,after)?;}
++        else {self.journal.replace_record(NAME,before,after)?;}
++        self.record=replacement;self.bytes=after.to_vec();self.usable=true;Ok(())
+     }
+     /// Look up an existing operation without allocating an address. Missing
+     /// identity is absence, never permission to create recovery change.
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery.rs b/swap-machine/src/litecoin_light/session/wallet/recovery.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/recovery.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery.rs
+@@ -76,3 +76,6 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++/// Durable allocation retention only; backup verification and activation are separate.
++pub mod retention;
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery/retention.rs b/swap-machine/src/litecoin_light/session/wallet/recovery/retention.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery/retention.rs
+@@ -0,0 +1,93 @@
++//! Allocation-only recovery intent and completion. Never activates a wallet.
++//! Private local records are not protection against malicious local rollback.
++use super::*;
++use crate::litecoin_rpc::reservation::Journal;
++use serde::{Deserialize,Serialize};
++use std::path::Path;
++const INTENT:&str="light-recovery-allocation-intent.json";
++const COMPLETE:&str="light-recovery-allocation-complete.json";
++#[derive(Deserialize,Serialize)]
++#[serde(deny_unknown_fields)]
++struct Intent {schema:String,context:sha256::Hash,review:Value,before:String,after:String}
++
++impl RecoveryCoverage {
++    /// Persist exact new reservation identities before changing the address book.
++    /// `context` must bind the caller's reviewed configuration; approval must be
++    /// supplied independently of retained files. No password or secret is stored.
++    pub fn retain_journaled(&self,directory:&Path,chain:&HeaderSequence,book:&mut AddressBook,
++        approved:sha256::Hash,context:sha256::Hash)->Result<Value> {
++        ensure!(approved==self.commitment,"recovery coverage differs from approval");
++        let journal=Journal::open(directory)?;
++        match journal.read(INTENT) {
++            Ok(_)=>{},
++            Err(error) if error.downcast_ref::<std::io::Error>()
++                .is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
++                ensure!(chain.network()==self.account.network() && chain.height()==self.height
++                    && chain.contains(self.height,self.tip),"recovery coverage chain changed");
++                let (descriptor,before)=book.backup_parts()?;
++                ensure!(serde_json::to_vec(&descriptor)?==serde_json::to_vec(&self.account.descriptor())?
++                    && sha256::Hash::hash(&before)==self.before,"recovery allocation source changed");
++                let intent=Intent {schema:"monzero-light-recovery-allocation-intent-v1".into(),context,
++                    review:self.review.clone(),before:String::from_utf8(before)?,
++                    after:String::from_utf8(book.prepare_discovered(self.target)?)?};
++                let bytes=serde_json::to_vec(&intent)?;
++                // Conflicting completion must fail before even retaining intent.
++                journal.compatible(COMPLETE,&receipt(&bytes,&intent)?)?;
++                journal.retain(INTENT,&bytes)?;
++            },
++            Err(error)=>return Err(error),
++        }
++        resume(&journal,chain,book,approved,context)
++    }
++}
++
++/// Resume a previously approved allocation transition after reopening the book.
++/// The expected coverage commitment and configuration context must come from the
++/// caller's saved approval, never be automatically adopted from this journal.
++/// This does not deserialize coverage into a new scan/proof capability.
++pub fn resume_retention(directory:&Path,chain:&HeaderSequence,book:&mut AddressBook,
++    approved:sha256::Hash,context:sha256::Hash)->Result<Value> {
++    resume(&Journal::open(directory)?,chain,book,approved,context)
++}
++fn receipt(bytes:&[u8],intent:&Intent)->Result<Vec<u8>> {
++    Ok(serde_json::to_vec(&json!({"schema":"monzero-light-recovery-allocation-complete-v1",
++        "context":intent.context,"intentDigest":sha256::Hash::hash(bytes),
++        "coverageCommitment":sha256::Hash::hash(&serde_json::to_vec(&intent.review)?),
++        "allocationDigest":sha256::Hash::hash(intent.after.as_bytes()),
++        "allocationsRetained":true,"backupRefreshRequired":true,"activated":false,
++        "historyCompleteness":"unproven","activeSwapRecovery":false}))?)
++}
++fn resume(journal:&Journal,chain:&HeaderSequence,book:&mut AddressBook,
++    approved:sha256::Hash,context:sha256::Hash)->Result<Value> {
++    let bytes=journal.read(INTENT)?;
++    let intent:Intent=serde_json::from_slice(&bytes)?;
++    ensure!(intent.schema=="monzero-light-recovery-allocation-intent-v1" && intent.context==context
++        && sha256::Hash::hash(&serde_json::to_vec(&intent.review)?)==approved,
++        "retained recovery differs from approval or configuration");
++    let (descriptor,_)=book.backup_parts()?;
++    let account=PublicAccount::from_descriptor(&descriptor,chain.network())?;
++    ensure!(intent.review["account"]==serde_json::to_value(&descriptor)?
++        && intent.review["network"]==chain.network().name()
++        && intent.review["schema"]==format!("monzero-{}-recovery-coverage-v1",chain.network().tag()),
++        "retained recovery account or network changed");
++    let height:u32=serde_json::from_value(intent.review["height"].clone())?;
++    let tip:bitcoin::BlockHash=serde_json::from_value(intent.review["tip"].clone())?;
++    // An extension is safe for conservative allocation retention; a fork is not
++    // accepted as fresh balance evidence or permission to activate.
++    ensure!(chain.contains(height,tip),"retained recovery chain changed");
++    let digest:sha256::Hash=serde_json::from_value(intent.review["allocationDigest"].clone())?;
++    ensure!(sha256::Hash::hash(intent.before.as_bytes())==digest,"retained recovery source mismatch");
++    let before:[u32;2]=serde_json::from_value(intent.review["allocatedBefore"].clone())?;
++    let after:[u32;2]=serde_json::from_value(intent.review["allocatedAfter"].clone())?;
++    ensure!(AddressBook::backup_counts(&account,intent.before.as_bytes())?==before
++        && AddressBook::backup_counts(&account,intent.after.as_bytes())?==after,
++        "retained recovery allocation counts mismatch");
++    let completed=receipt(&bytes,&intent)?;
++    journal.compatible(COMPLETE,&completed)?;
++    // Reconcile possible previous publication before any address mutation.
++    journal.retain(INTENT,&bytes)?;
++    book.apply_recovery_record(intent.before.as_bytes(),intent.after.as_bytes())?;
++    journal.retain(COMPLETE,&completed)?;
++    ensure!(journal.read(COMPLETE)?==completed,"recovery completion read-back mismatch");
++    Ok(serde_json::from_slice(&completed)?)
++}
+diff --git a/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs b/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs
+--- a/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs
++++ b/swap-machine/src/litecoin_light/session/wallet/recovery/tests.rs
+@@ -67,3 +67,75 @@
+     assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,before);
+     Ok(())
+ }
++
++
++#[tokio::test]
++async fn journaled_recovery_resumes_exact_allocation_transition_on_four_chains()->Result<()> {
++    use super::retention::resume_retention;
++    for network in [LightNetwork::Litecoin(LtcNetwork::Regtest),LightNetwork::Bitcoin(BtcNetwork::Regtest),
++        LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
++        let directory=Directory::new()?;let journal=Directory::new()?;
++        let mut book=AddressBook::create(&directory.0,account(network,1)?)?;
++        let request=Uuid::new_v4();let first=book.reserve(request,Branch::Receive)?.address().to_string();
++        let before=fs::read(directory.0.join("litecoin-address-book.json"))?;
++        let (chain,observation)=empty_scan(network,[2,1]).await?;
++        let coverage=observation.review_recovery_coverage(&chain,&book,[2,1])?;
++        let approved=coverage.commitment();let context=sha256::Hash::hash(b"reviewed configuration");
++        let wrong=sha256::Hash::hash(b"wrong");
++        assert!(coverage.retain_journaled(&journal.0,&chain,&mut book,wrong,context).is_err());
++        assert_eq!(fs::read_dir(&journal.0)?.count(),0);
++        let receipt=coverage.retain_journaled(&journal.0,&chain,&mut book,approved,context)?;
++        assert_eq!(receipt["activated"],false);assert_eq!(receipt["backupRefreshRequired"],true);
++        let after=fs::read(directory.0.join("litecoin-address-book.json"))?;
++        let intent_path=journal.0.join("light-recovery-allocation-intent.json");
++        let complete_path=journal.0.join("light-recovery-allocation-complete.json");
++        let intent=fs::read(&intent_path)?;let complete=fs::read(&complete_path)?;
++        drop(book);drop(coverage);drop(observation);
++        // Simulate interruption after intent publication but before allocation.
++        fs::write(directory.0.join("litecoin-address-book.json"),&before)?;
++        fs::remove_file(&complete_path)?;
++        let mut book=AddressBook::open(&directory.0,account(network,1)?)?;
++        assert!(resume_retention(&journal.0,&chain,&mut book,wrong,context).is_err());
++        assert!(resume_retention(&journal.0,&chain,&mut book,approved,wrong).is_err());
++        assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,before);
++        // An invalid retained replacement cannot rewrite an original identity.
++        let mut altered:Value=serde_json::from_slice(&intent)?;
++        let mut replacement:Value=serde_json::from_str(altered["after"].as_str().unwrap())?;
++        replacement["entries"][0]["request"]=json!(Uuid::new_v4());
++        altered["after"]=json!(serde_json::to_string(&replacement)?);
++        fs::write(&intent_path,serde_json::to_vec(&altered)?)?;
++        assert!(resume_retention(&journal.0,&chain,&mut book,approved,context).is_err());
++        assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,before);
++        fs::write(&intent_path,&intent)?;
++        assert_eq!(resume_retention(&journal.0,&chain,&mut book,approved,context)?,receipt);
++        assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,after);
++        assert_eq!(fs::read(&complete_path)?,complete);
++        assert_eq!(book.reserved(request,Branch::Receive)?.unwrap().address().to_string(),first);
++        drop(book);
++        // Simulate interruption after allocation rename, before completion.
++        fs::remove_file(&complete_path)?;
++        let mut book=AddressBook::open(&directory.0,account(network,1)?)?;
++        assert_eq!(resume_retention(&journal.0,&chain,&mut book,approved,context)?,receipt);
++        assert_eq!(fs::read(&intent_path)?,intent);assert_eq!(fs::read(&complete_path)?,complete);
++        assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,after);
++        let other=Directory::new()?;let mut other_book=AddressBook::create(&other.0,account(network,2)?)?;
++        assert!(resume_retention(&journal.0,&chain,&mut other_book,approved,context).is_err());
++        let other_chain=HeaderSequence::new(if network==LightNetwork::Litecoin(LtcNetwork::Regtest) {
++            LightNetwork::Bitcoin(BtcNetwork::Regtest)}else {LightNetwork::Litecoin(LtcNetwork::Regtest)})?;
++        assert!(resume_retention(&journal.0,&other_chain,&mut book,approved,context).is_err());
++        // Even a same-count unrelated book is not an exact completed retry.
++        drop(book);
++        let mut altered_book:Value=serde_json::from_slice(&after)?;
++        altered_book["entries"][0]["request"]=json!(Uuid::new_v4());
++        fs::write(directory.0.join("litecoin-address-book.json"),serde_json::to_vec(&altered_book)?)?;
++        let mut book=AddressBook::open(&directory.0,account(network,1)?)?;
++        assert!(resume_retention(&journal.0,&chain,&mut book,approved,context).is_err());
++        drop(book);fs::write(directory.0.join("litecoin-address-book.json"),&after)?;
++        let mut book=AddressBook::open(&directory.0,account(network,1)?)?;
++        book.reserve(Uuid::new_v4(),Branch::Receive)?;
++        let later=fs::read(directory.0.join("litecoin-address-book.json"))?;
++        assert!(resume_retention(&journal.0,&chain,&mut book,approved,context).is_err());
++        assert_eq!(fs::read(directory.0.join("litecoin-address-book.json"))?,later);
++    }
++    Ok(())
++}

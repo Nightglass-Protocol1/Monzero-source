@@ -1,0 +1,296 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation.rs
+@@ -0,0 +1,85 @@
++//! Immutable exact native payout preparation. An unresolved intent never grants
++//! permission to construct another transaction. Private checkpoints never relay.
++use super::*;
++use crate::native_funding_rpc::full_proceeds::lock_payout::PreparedLockPayout;
++use serde_json::Value;
++use sha2::{Digest,Sha256};
++
++const INTENT: &str="monzero-bch-native-payout-intent-v1";
++const PIN: &str="monzero-bch-native-payout-pin-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Intent {
++    schema: String,quote: [u8;32],admission: [u8;32],native_receipt: [u8;32],wallet_intent: [u8;32],
++    redemption: Txid,at: u64,priority: u32,
++}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Pin {schema: String,intent: [u8;32],prepared: [u8;32]}
++fn slot(quote: &VerifiedBchQuote,part: &str) -> String {format!("{}.bch-native-payout-{part}",quote.terms()["swapId"])}
++impl AdmittedExecution<'_> {
++    fn payout_intent(&self) -> Result<Option<(Intent,Vec<u8>)>> {
++        ensure!(self.role==Role::BchFunder,"wrong BCH native payout role");
++        let Some(bytes)=optional(&self.metadata,&slot(self.quote,"intent"))? else {
++            ensure!(optional(&self.metadata,&slot(self.quote,"pin"))?.is_none()
++                && optional(&Journal::open(&self.snapshots)?,&slot(self.quote,"prepared"))?.is_none(),
++                "BCH native payout artifact lacks original intent");return Ok(None)
++        };
++        ensure!(bytes.len()<=4096,"oversized BCH native payout intent");
++        let intent: Intent=serde_json::from_slice(&bytes)?;
++        ensure!(intent.schema==INTENT && intent.quote==*self.quote.commitment()
++            && intent.admission==self.admission_digest()? && (1..=4).contains(&intent.priority)
++            && serde_json::to_vec(&intent)?==bytes,"BCH native payout intent changed");
++        Ok(Some((intent,bytes)))
++    }
++    fn payout_request(&self,intent: &Intent) -> Result<BoundPayout> {
++        let (payment,receipt,received_at)=self.native_payment_release_binding()?;
++        ensure!(receipt==intent.native_receipt && intent.at>=received_at,"BCH payout differs from original native receipt");
++        let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
++        let binding=self.claim_wallet_binding_values(&payment.address,&payment.proof.tx_hash.0,intent.redemption,&id)?;
++        ensure!(self.required_claim_wallet_intent(&binding,intent.at)?==intent.wallet_intent,"BCH payout wallet intent changed");
++        BoundPayout::from_parts(self.quote,&payment.address,&payment.proof.tx_hash.0,intent.priority)
++    }
++    pub(super) fn load_bch_native_payout(&self) -> Result<PreparedLockPayout> {
++        let (intent,bytes)=self.payout_intent()?.context("missing BCH native payout intent")?;
++        let bound=self.payout_request(&intent)?;let binding=hash(INTENT,&bytes);
++        let private=optional(&Journal::open(&self.snapshots)?,&slot(self.quote,"prepared"))?.map(Zeroizing::new);
++        let pin=optional(&self.metadata,&slot(self.quote,"pin"))?.context("BCH payout construction unresolved; do not reconstruct")?;
++        ensure!(pin.len()<=4096,"oversized BCH payout pin");let decoded: Pin=serde_json::from_slice(&pin)?;
++        ensure!(decoded.schema==PIN && decoded.intent==binding && serde_json::to_vec(&decoded)?==pin,"BCH native payout pin changed");
++        let private=private.context("private BCH payout checkpoint missing")?;
++        PreparedLockPayout::decode(&private,binding,decoded.prepared,&bound.request,&bound.genesis)
++    }
++    /// Public accounting only. Offline restoration is never confirmation or approval.
++    pub fn recover_prepared_bch_native_payout(&self) -> Result<Value> {
++        Ok(self.load_bch_native_payout()?.terms().clone())
++    }
++    /// Construct at most once. No new funding/quote expiry extension or relay.
++    pub async fn prepare_bch_native_payout(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++        redemption: Txid,block: Option<BlockHash>,now: u64,session: &mut NativeWalletSession,priority: u32) -> Result<Value> {
++        ensure!((1..=4).contains(&priority),"invalid BCH native payout priority");
++        if let Some((intent,_))=self.payout_intent()? {
++            ensure!(intent.priority==priority && intent.redemption==redemption && now>=intent.at,"BCH payout already prepared with different context");
++            return self.recover_prepared_bch_native_payout()
++        }
++        let claim=self.recover_bch_native_claim(native,bch,redemption,block,now).await?;
++        let bound=BoundPayout::from_quote(self.quote,&claim,priority)?;
++        let id=SwapWalletId::new(self.quote.terms()["swapId"].parse()?)?;
++        let wallet_binding=self.claim_wallet_binding(&claim,&id)?;
++        let wallet_intent=self.required_claim_wallet_intent(&wallet_binding,now)?;
++        let deadline=claim.observed_at.checked_add(std::time::Duration::from_secs(30)).context("native payout deadline overflow")?;
++        claim.check_wallet(session).await?;
++        ensure!(std::time::Instant::now()<deadline,"native payout evidence expired before intent");
++        let intent=Intent {schema:INTENT.into(),quote:claim.quote,admission:claim.admission,
++            native_receipt:claim.native_receipt,wallet_intent,redemption,at:now,priority};
++        let bytes=serde_json::to_vec(&intent)?;let binding=hash(INTENT,&bytes);
++        self.metadata.retain(&slot(self.quote,"intent"),&bytes)?;
++        let prepared=session.prepare_lock_payout(&bound.request,&bound.genesis,deadline).await?;
++        let private=prepared.encode(binding)?;let digest=Sha256::digest(&*private).into();
++        PreparedLockPayout::decode(&private,binding,digest,&bound.request,&bound.genesis)?;
++        let pin=Pin {schema:PIN.into(),intent:binding,prepared:digest};
++        self.metadata.retain(&slot(self.quote,"pin"),&serde_json::to_vec(&pin)?)?;
++        Journal::open(&self.snapshots)?.retain(&slot(self.quote,"prepared"),&private)?;
++        Ok(prepared.terms().clone())
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout.rs
+@@ -8,16 +8,18 @@
+ impl BoundPayout {
+     pub(super) fn from_quote(quote: &VerifiedBchQuote,claim: &NativeClaim,priority: u32) -> Result<Self> {
+         ensure!(claim.quote==*quote.commitment(),"native payout claim belongs to another BCH quote");
++        Self::from_parts(quote,&claim.address,&claim.native_txid,priority)
++    }
++    fn from_parts(quote: &VerifiedBchQuote,wallet: &XmzAddress,txid: &str,priority: u32) -> Result<Self> {
+         ensure!((1..=4).contains(&priority),"invalid BCH native payout priority");
+-        ensure!(claim.address.network()==quote.xmz_payout().network()
+-            && claim.address!=*quote.xmz_payout() && claim.address!=*quote.xmz_refund(),"invalid BCH native payout wallet or destinations");
+-        let txid=&claim.native_txid;
+-        ensure!(txid.len()==64 && txid!=&"0".repeat(64)
++        ensure!(wallet.network()==quote.xmz_payout().network()
++            && wallet!=quote.xmz_payout() && wallet!=quote.xmz_refund(),"invalid BCH native payout wallet or destinations");
++        ensure!(txid.len()==64 && txid!="0".repeat(64)
+             && txid.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid BCH native payout funding identity");
+         let amount=|field:&str| -> Result<XmzAmount> {Ok(XmzAmount::from_atoms(quote.terms()[field].parse()?))};
+         Ok(Self {genesis:quote.terms()["xmzGenesis"].clone(),request:ExactNetRequest {
+-            source:FullProceedsRequest {wallet:claim.address.clone(),destination:quote.xmz_payout().clone(),
+-                lock_txid:txid.clone(),locked:amount("xmzAtoms")?,maximum_fee:amount("xmzClaimFeeMaxAtoms")?,account:0,priority},
++            source:FullProceedsRequest {wallet:wallet.clone(),destination:quote.xmz_payout().clone(),
++                lock_txid:txid.to_owned(),locked:amount("xmzAtoms")?,maximum_fee:amount("xmzClaimFeeMaxAtoms")?,account:0,priority},
+             principal:amount("xmzPayoutAtoms")?,reserve_return:quote.xmz_refund().clone()}})
+     }
+ }
+@@ -31,7 +33,7 @@
+         let scalar=monero_oxide_wallet::ed25519::Scalar::read(&mut bytes.as_slice())?;
+         let point=monero_oxide_ext::PublicKey::from_private_key(&monero_oxide_ext::PrivateKey::from_scalar(scalar)).decompress();
+         let address=XmzAddress::new(quote.xmz_payout().network(),monero_address::AddressType::Legacy,point.clone(),point)?;
+-        Ok(NativeClaim {quote:*quote.commitment(),admission:[3;32],spend:Zeroizing::new([2;32]),view:Zeroizing::new([2;32]),
++        Ok(NativeClaim {quote:*quote.commitment(),admission:[3;32],native_receipt:[7;32],observed_at:std::time::Instant::now(),spend:Zeroizing::new([2;32]),view:Zeroizing::new([2;32]),
+             address,native_txid:"ab".repeat(32),redemption:Txid::from_byte_array([4;32]),block:BlockHash::from_byte_array([5;32]),commitment:[6;32]})
+     }
+     #[test]
+@@ -62,3 +64,5 @@
+         Ok(())
+     }
+ }
++
++pub mod preparation;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
+@@ -24,12 +24,21 @@
+ impl AdmittedExecution<'_> {
+     fn claim_wallet_binding(&self,claim: &NativeClaim,id: &SwapWalletId) -> Result<[u8;32]> {
+         ensure!(claim.quote==*self.quote.commitment() && claim.admission==self.admission_digest()?,"BCH claim belongs to another execution");
+-        // Stable across a reorganization that reconfirms the same exact spend
+-        // in another block. Fresh chain evidence is required separately below.
++        self.claim_wallet_binding_values(&claim.address,&claim.native_txid,claim.redemption,id)
++    }
++    fn claim_wallet_binding_values(&self,address: &XmzAddress,native_txid: &str,redemption: Txid,id: &SwapWalletId) -> Result<[u8;32]> {
++        ensure!(self.role==Role::BchFunder,"wrong BCH claim wallet binding role");
++        // Stable when the same spend is reconfirmed in a different block.
+         Ok(hash(INTENT,&serde_json::to_vec(&json!({"quote":self.quote.commitment(),
+-            "admission":self.admission_digest()?,"wallet":id.filename(),"address":claim.address.to_string(),
+-            "nativePayment":claim.native_txid,"redemption":claim.redemption}))?))
++            "admission":self.admission_digest()?,"wallet":id.filename(),"address":address.to_string(),
++            "nativePayment":native_txid,"redemption":redemption}))?))
+     }
++    fn required_claim_wallet_intent(&self,binding: &[u8;32],now: u64) -> Result<[u8;32]> {
++        let intent=self.claim_wallet_intent(binding,now)?.context("missing BCH claim wallet intent")?;
++        ensure!(optional(&self.metadata,&name(self.quote,"ready"))?.is_some(),"BCH claim wallet is not recorded ready");
++        Ok(intent)
++    }
++
+     fn claim_wallet_intent(&self,binding: &[u8;32],now: u64) -> Result<Option<[u8;32]>> {
+         let Some(bytes)=optional(&self.metadata,&name(self.quote,"intent"))? else {
+             ensure!(optional(&self.metadata,&name(self.quote,"ready"))?.is_none(),
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+@@ -7,7 +7,7 @@
+ /// No Debug, Clone, Serialize or key getters. Future wallet operations must use
+ /// an exclusively owned local session and separate durable execution intent.
+ pub struct NativeClaim {
+-    quote: [u8;32],admission: [u8;32],
++    quote: [u8;32],admission: [u8;32],native_receipt: [u8;32],observed_at: std::time::Instant,
+     spend: Zeroizing<[u8;32]>,view: Zeroizing<[u8;32]>,address: XmzAddress,
+     native_txid: String,redemption: Txid,block: BlockHash,commitment: [u8;32],
+ }
+@@ -50,6 +50,7 @@
+         };
+         ensure!(confirmed.deployment()==&bch.deployment_commitment()?,"BCH native recovery deployment changed");
+         ensure!(native.snapshot().await?==*native_evidence.snapshot(),"native chain changed during BCH claim recovery");
++        let observed_at=std::time::Instant::now();
+         let raw=Zeroizing::new(serialize(confirmed.transaction()));
+         let spend=context.agreement.owned().recover_spend_key(self.quote,
+             &serialize(context.funding.transaction()),context.funding.lock_outpoint(),&raw,&encrypted)?;
+@@ -60,7 +61,7 @@
+             "nativePayment":native_txid,"nativeProof":context.receipt,"address":address.to_string(),
+             "redemption":redemption,"redemptionBlock":confirmed.block(),
+             "bchDeployment":confirmed.deployment()}))?);
+-        Ok(NativeClaim {quote:*self.quote.commitment(),admission:context.admission,spend:Zeroizing::new(spend.as_bytes()),
++        Ok(NativeClaim {quote:*self.quote.commitment(),admission:context.admission,native_receipt:context.receipt,observed_at,spend:Zeroizing::new(spend.as_bytes()),
+             view:Zeroizing::new(wallet.private_view_key().0.as_bytes()),address,native_txid,
+             redemption,block:confirmed.block(),commitment})
+     }
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session/payout_tests.rs b/swap-machine/src/native_funding_rpc/wallet_session/payout_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/wallet_session/payout_tests.rs
+@@ -0,0 +1,61 @@
++//! Exercise session safety without a running blockchain or wallet service.
++use super::*;
++use crate::native_funding_rpc::full_proceeds::{ExactNetRequest,FullProceedsRequest};
++use swap_core::xmz::XmzAmount;
++use std::time::{Duration,Instant};
++
++fn request() -> Result<ExactNetRequest> {
++    let addresses=include_str!("../../../../swap-core/src/xmz_address_vectors.txt").lines().take(3)
++        .map(|s|XmzAddress::parse(XmzNetwork::Mainnet,s)).collect::<Result<Vec<_>>>()?;
++    Ok(ExactNetRequest {source:FullProceedsRequest {wallet:addresses[0].clone(),destination:addresses[1].clone(),
++        lock_txid:"ab".repeat(32),locked:XmzAmount::from_atoms(110),maximum_fee:XmzAmount::from_atoms(3),account:0,priority:1},
++        principal:XmzAmount::from_atoms(100),reserve_return:addresses[2].clone()})
++}
++
++#[tokio::test]
++async fn bch_native_payout_session_rejects_expired_or_wrong_network_before_dispatch() -> Result<()> {
++    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++    let port=listener.local_addr()?.port();
++    let mut session=NativeWalletSession::new(NativeFundingRpc::new(port,port,"fixture".into(),"fixture".into())?,XmzNetwork::Mainnet);
++    let request=request()?;let genesis="aa".repeat(32);
++    let result=session.prepare_lock_payout(&request,&genesis,Instant::now()).await;
++    assert_eq!(result.err().context("accepted expired evidence")?.to_string(),"native payout evidence expired before construction");
++    assert!(!session.uncertain);
++    session.network=XmzNetwork::Testnet;
++    let result=session.prepare_lock_payout(&request,&genesis,Instant::now()+Duration::from_secs(30)).await;
++    assert_eq!(result.err().context("accepted wrong network")?.to_string(),"payout wallet network mismatch");
++    assert!(!session.uncertain);
++    assert!(tokio::time::timeout(Duration::from_millis(20),listener.accept()).await.is_err());
++    Ok(())
++}
++
++#[tokio::test]
++async fn bch_native_payout_session_cancellation_and_timeout_require_reconciliation() -> Result<()> {
++    for cancel in [false,true] {
++        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++        let port=listener.local_addr()?.port();
++        let mut session=NativeWalletSession::new(NativeFundingRpc::new(port,port,"fixture".into(),"fixture".into())?,XmzNetwork::Mainnet);
++        let request=request()?;let genesis="aa".repeat(32);
++        let deadline=Instant::now()+Duration::from_secs(if cancel {30} else {1});
++        {
++            let pending=session.prepare_lock_payout(&request,&genesis,deadline);
++            tokio::pin!(pending);
++            // Confirm real dispatch before cancellation; keep the accepted socket
++            // open without a reply to exercise the controller's own deadline.
++            let (_socket,_)=tokio::select! {
++                connection=listener.accept()=>connection?,
++                _=&mut pending=>anyhow::bail!("preparation ended before dispatch"),
++                _=tokio::time::sleep(Duration::from_secs(5))=>anyhow::bail!("no payout observation request"),
++            };
++            if !cancel {
++                let error=pending.await.err().context("unanswered construction succeeded")?;
++                assert_eq!(error.to_string(),"native payout construction deadline exceeded; result is uncertain");
++            }
++        }
++        assert!(session.uncertain);
++        let retry=session.prepare_lock_payout(&request,&genesis,Instant::now()+Duration::from_secs(30)).await;
++        assert_eq!(retry.err().context("uncertain session retried")?.to_string(),"wallet session requires reconciliation");
++        assert!(tokio::time::timeout(Duration::from_millis(20),listener.accept()).await.is_err());
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session.rs b/swap-machine/src/native_funding_rpc/wallet_session.rs
+--- a/swap-machine/src/native_funding_rpc/wallet_session.rs
++++ b/swap-machine/src/native_funding_rpc/wallet_session.rs
+@@ -1,6 +1,7 @@
+ //! Wallet lifecycle operations, separate from funding observation and fee preview.
+ //! Caller must exclusively own a dedicated RPC service and serialize all users.
+-//! No transaction creation, signing or broadcast. No automatic error retry.
++//! Internal payout construction requires a caller-owned durable intent.
++//! No broadcast or automatic error retry.
+ use super::NativeFundingRpc;
+ use anyhow::{Context, Result, ensure};
+ use serde_json::json;
+@@ -61,6 +62,19 @@
+         self.require_empty().await
+     }
+ 
++    /// Internal construction on the same exclusively owned wallet session.
++    /// Caller must retain an immutable preparation intent before invoking this.
++    pub(crate) async fn prepare_lock_payout(&mut self,request: &super::full_proceeds::ExactNetRequest,
++        genesis: &str,deadline: std::time::Instant) -> Result<super::full_proceeds::lock_payout::PreparedLockPayout> {
++        ensure!(!self.uncertain,"wallet session requires reconciliation");
++        ensure!(request.source.wallet.network()==self.network,"payout wallet network mismatch");
++        ensure!(std::time::Instant::now()<deadline,"native payout evidence expired before construction");
++        self.uncertain=true;
++        let prepared=tokio::time::timeout_at(deadline.into(),super::full_proceeds::lock_payout::prepare(&self.client,request,genesis))
++            .await.context("native payout construction deadline exceeded; result is uncertain")??;
++        self.uncertain=false;Ok(prepared)
++    }
++
+     async fn require_empty(&self) -> Result<()> {
+         ensure!(!self.uncertain, "wallet session requires reconciliation");
+         ensure!(self.client.opened_wallet(self.network).await?.is_none(), "wallet already open");
+@@ -357,3 +371,6 @@
+ 
+ #[cfg(test)]
+ pub(crate) mod fixture;
++
++#[cfg(test)]
++mod payout_tests;

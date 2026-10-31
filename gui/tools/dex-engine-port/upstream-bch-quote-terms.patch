@@ -1,0 +1,259 @@
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -13,6 +13,7 @@
+ pub mod route_approval;
+ pub mod bch_key_recovery;
+ pub mod bch_quote_signatures;
++pub mod bch_quote;
+ 
+ #[cfg(test)]
+ mod tests {
+--- /dev/null
++++ b/swap-machine/src/bch_quote.rs
+@@ -0,0 +1,143 @@
++//! Authenticated BCH/XMZ commercial terms and covenant construction.
++//! This is not user approval, chain evidence or proof of adaptor-key ownership.
++use anyhow::{Context, Result, ensure};
++use bitcoin::{ScriptBuf, secp256k1::PublicKey};
++use std::collections::BTreeMap;
++use swap_core::{bch::recovery::{RecoveryPlan, RecoveryTerms},
++    xmz_address::{XmzAddress, XmzNetwork}};
++
++const FIELDS: &[&str] = &[
++    "schema", "quoteId", "swapId", "bchFunder", "xmzFunder", "bchNetwork", "bchGenesis",
++    "xmzNetwork", "xmzGenesis", "bchAtoms", "xmzAtoms", "xmzPayoutAtoms",
++    "bchPayoutScript", "bchRefundScript", "xmzPayout", "xmzRefund",
++    "bchSigningKey", "xmzSigningKey", "bchFundingFeeMaxAtoms", "bchLockFeeAtoms",
++    "bchRecoveryFeeAtoms", "xmzFundingFeeMaxAtoms", "xmzClaimFeeMaxAtoms",
++    "xmzRefundFeeMaxAtoms", "bchConfirmations", "xmzConfirmations", "cancelBlocks",
++    "punishBlocks", "bchMinimumOutputAtoms", "expiresAt", "appFeeXmzAtoms",
++];
++
++/// Local operator configuration, never taken from a peer's quote. Genesis alone
++/// cannot distinguish BCH from Bitcoin; the BCH node must also be authenticated
++/// and its covenant activation checked by the future chain adapter.
++pub struct Policy {
++    pub bch_network: String, pub bch_genesis: String,
++    pub xmz_network: XmzNetwork, pub xmz_genesis: String,
++    pub bch_confirmations: u32, pub xmz_confirmations: u32,
++    pub cancel_blocks: u16, pub punish_blocks: u16,
++    pub maximum_bch_atoms: u64, pub maximum_xmz_atoms: u64,
++    pub maximum_bch_funding_fee: u64, pub maximum_xmz_fee: u64,
++    pub minimum_covenant_fee: u64, pub maximum_covenant_fee: u64,
++    pub minimum_output_atoms: u64,
++}
++
++pub struct VerifiedBchQuote {
++    terms: BTreeMap<String, String>, commitment: [u8;32], plan: RecoveryPlan,
++    xmz_payout: XmzAddress, xmz_refund: XmzAddress,
++}
++
++fn number(terms: &BTreeMap<String,String>, field: &str) -> Result<u64> {
++    let text = terms.get(field).context("missing BCH quote amount")?;
++    let value: u64 = text.parse()?;
++    ensure!(value > 0 && value.to_string() == *text, "noncanonical BCH quote number");
++    Ok(value)
++}
++fn bytes(text: &str, length: usize) -> Result<Vec<u8>> {
++    ensure!(text.len() == length * 2
++        && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
++        "noncanonical BCH quote hex");
++    (0..length).map(|i| Ok(u8::from_str_radix(&text[i*2..i*2+2],16)?)).collect()
++}
++fn script(text: &str) -> Result<ScriptBuf> {
++    ensure!(text.len() <= 70 && text.len() % 2 == 0, "invalid BCH destination length");
++    Ok(ScriptBuf::from_bytes(bytes(text, text.len()/2)?))
++}
++
++impl VerifiedBchQuote {
++    pub fn verify(payload: &[u8], now: u64, policy: &Policy,
++        bch_pin: &[u8;32], xmz_pin: &[u8;32], bch_signature: &[u8], xmz_signature: &[u8]) -> Result<Self> {
++        let commitment = crate::bch_quote_signatures::verify(payload, bch_pin, xmz_pin,
++            bch_signature, xmz_signature)?;
++        let terms: BTreeMap<String,String> = serde_json::from_slice(payload)?;
++        ensure!(terms.len() == FIELDS.len() && FIELDS.iter().all(|f| terms.contains_key(*f)),
++            "unexpected BCH quote fields");
++        for field in ["quoteId", "swapId"] {
++            let id: uuid::Uuid = terms[field].parse()?;
++            ensure!(!id.is_nil() && id.to_string() == terms[field], "invalid BCH quote identifier");
++        }
++        ensure!(terms["appFeeXmzAtoms"] == "0", "BCH quote application fee unsupported");
++        let n = |field| number(&terms, field);
++        let key = |field: &str| -> Result<PublicKey> {
++            Ok(PublicKey::from_slice(&bytes(&terms[field],33)?)?)
++        };
++        let plan = RecoveryPlan::new(RecoveryTerms {
++            locked_atoms: n("bchAtoms")?, lock_fee_atoms: n("bchLockFeeAtoms")?,
++            recovery_fee_atoms: n("bchRecoveryFeeAtoms")?, minimum_output_atoms: n("bchMinimumOutputAtoms")?,
++            cancel_delay_blocks: n("cancelBlocks")?.try_into()?,
++            punish_delay_blocks: n("punishBlocks")?.try_into()?,
++            bch_funder_signing_key: key("bchSigningKey")?, native_funder_signing_key: key("xmzSigningKey")?,
++            bch_funder_refund: script(&terms["bchRefundScript"])?,
++            native_funder_payout: script(&terms["bchPayoutScript"])?,
++        })?;
++        let xmz_payout = XmzAddress::parse(policy.xmz_network, &terms["xmzPayout"])?;
++        let xmz_refund = XmzAddress::parse(policy.xmz_network, &terms["xmzRefund"])?;
++        let quote = Self { terms, commitment, plan, xmz_payout, xmz_refund };
++        quote.check_policy(policy, now)?;
++        Ok(quote)
++    }
++
++    /// Recheck before new funding; historical recovery must instead use its
++    /// retained admission context, never demand a fresh commercial quote.
++    pub fn check_policy(&self, policy: &Policy, now: u64) -> Result<()> {
++        let t = &self.terms;
++        let n = |field| number(t, field);
++        ensure!(matches!(policy.bch_network.as_str(), "bch-mainnet" | "bch-testnet" | "bch-regtest"),
++            "unsupported BCH network policy");
++        let native = match policy.xmz_network { XmzNetwork::Mainnet => "xmz-mainnet",
++            XmzNetwork::Testnet => "xmz-testnet", XmzNetwork::Stagenet => "xmz-stagenet" };
++        for hash in [&policy.bch_genesis, &policy.xmz_genesis] {
++            ensure!(bytes(hash,32)?.iter().any(|b| *b != 0), "zero quote deployment hash");
++        }
++        ensure!(t["bchNetwork"] == policy.bch_network && t["bchGenesis"] == policy.bch_genesis
++            && t["xmzNetwork"] == native && t["xmzGenesis"] == policy.xmz_genesis
++            && policy.bch_genesis != policy.xmz_genesis, "BCH quote deployment mismatch");
++        let expiry = n("expiresAt")?;
++        ensure!(expiry > now && expiry - now <= 3600, "BCH quote outside validity window");
++        ensure!(policy.bch_confirmations > 0 && policy.bch_confirmations <= 1000
++            && policy.xmz_confirmations > 0 && policy.xmz_confirmations <= 1000
++            && u32::from(policy.cancel_blocks) > policy.bch_confirmations
++            && u32::from(policy.punish_blocks) > policy.bch_confirmations,
++            "invalid BCH confirmation or timeout policy");
++        for (field, expected) in [("bchConfirmations",u64::from(policy.bch_confirmations)),
++            ("xmzConfirmations",u64::from(policy.xmz_confirmations)),
++            ("cancelBlocks",u64::from(policy.cancel_blocks)), ("punishBlocks",u64::from(policy.punish_blocks)),
++            ("bchMinimumOutputAtoms",policy.minimum_output_atoms)] {
++            ensure!(n(field)? == expected, "BCH quote differs from local policy");
++        }
++        ensure!(n("bchAtoms")? <= policy.maximum_bch_atoms && n("xmzAtoms")? <= policy.maximum_xmz_atoms,
++            "BCH quote principal exceeds policy");
++        ensure!(n("bchFundingFeeMaxAtoms")? <= policy.maximum_bch_funding_fee
++            && n("bchFundingFeeMaxAtoms")? < n("bchAtoms")?, "BCH funding fee exceeds policy");
++        ensure!(policy.minimum_covenant_fee > 0, "zero BCH covenant fee floor");
++        for field in ["bchLockFeeAtoms", "bchRecoveryFeeAtoms"] {
++            ensure!(n(field)? >= policy.minimum_covenant_fee && n(field)? <= policy.maximum_covenant_fee,
++                "BCH covenant fee outside policy");
++        }
++        for field in ["xmzFundingFeeMaxAtoms", "xmzClaimFeeMaxAtoms", "xmzRefundFeeMaxAtoms"] {
++            ensure!(n(field)? <= policy.maximum_xmz_fee && n(field)? < n("xmzAtoms")?,
++                "XMZ fee exceeds BCH quote policy");
++        }
++        let reserve = n("xmzAtoms")?.checked_sub(n("xmzPayoutAtoms")?).context("XMZ payout exceeds lock")?;
++        ensure!(reserve >= n("xmzClaimFeeMaxAtoms")? && reserve >= n("xmzRefundFeeMaxAtoms")?,
++            "insufficient signed XMZ settlement reserve");
++        Ok(())
++    }
++
++    pub fn commitment(&self) -> &[u8;32] { &self.commitment }
++    pub fn terms(&self) -> &BTreeMap<String,String> { &self.terms }
++    pub fn recovery_plan(&self) -> &RecoveryPlan { &self.plan }
++    pub fn xmz_payout(&self) -> &XmzAddress { &self.xmz_payout }
++    pub fn xmz_refund(&self) -> &XmzAddress { &self.xmz_refund }
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-machine/src/bch_quote/tests.rs
+@@ -0,0 +1,100 @@
++use super::*;
++use ed25519_dalek::{Signer, SigningKey};
++use bitcoin::secp256k1::{Secp256k1, SecretKey};
++fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
++fn fixture() -> (Policy, BTreeMap<String,String>) {
++    let policy = Policy { bch_network:"bch-regtest".into(), bch_genesis:"b".repeat(64),
++        xmz_network:XmzNetwork::Mainnet, xmz_genesis:"a".repeat(64),
++        bch_confirmations:2, xmz_confirmations:10, cancel_blocks:20, punish_blocks:30,
++        maximum_bch_atoms:1_000_000, maximum_xmz_atoms:2_000_000,
++        maximum_bch_funding_fee:5000, maximum_xmz_fee:1000,
++        minimum_covenant_fee:500, maximum_covenant_fee:3000, minimum_output_atoms:546 };
++    let identity = |tag| hex(&SigningKey::from_bytes(&[tag;32]).verifying_key().to_bytes());
++    let key = |tag| hex(&PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[tag;32]).unwrap()).serialize());
++    let xmz = include_str!("../../../swap-core/src/xmz_address_vectors.txt").lines().next().unwrap();
++    let t = serde_json::json!({"schema":"monzero-native-bch-xmz-quote-v1",
++        "quoteId":"11111111-1111-4111-8111-111111111111", "swapId":"22222222-2222-4222-8222-222222222222",
++        "bchFunder":identity(1), "xmzFunder":identity(2), "bchNetwork":policy.bch_network,
++        "bchGenesis":policy.bch_genesis, "xmzNetwork":"xmz-mainnet", "xmzGenesis":policy.xmz_genesis,
++        "bchAtoms":"100000", "xmzAtoms":"101000", "xmzPayoutAtoms":"100000",
++        "bchPayoutScript":format!("76a914{}88ac","03".repeat(20)),
++        "bchRefundScript":format!("76a914{}88ac","04".repeat(20)), "xmzPayout":xmz, "xmzRefund":xmz,
++        "bchSigningKey":key(3), "xmzSigningKey":key(4), "bchFundingFeeMaxAtoms":"5000",
++        "bchLockFeeAtoms":"1000", "bchRecoveryFeeAtoms":"2000", "xmzFundingFeeMaxAtoms":"1000",
++        "xmzClaimFeeMaxAtoms":"1000", "xmzRefundFeeMaxAtoms":"1000", "bchConfirmations":"2",
++        "xmzConfirmations":"10", "cancelBlocks":"20", "punishBlocks":"30",
++        "bchMinimumOutputAtoms":"546", "expiresAt":"2000", "appFeeXmzAtoms":"0"});
++    (policy, serde_json::from_value(t).unwrap())
++}
++fn signed(t: &BTreeMap<String,String>, p: &Policy, now: u64) -> Result<VerifiedBchQuote> {
++    let payload = serde_json::to_vec(t)?;
++    let b = SigningKey::from_bytes(&[1;32]); let x = SigningKey::from_bytes(&[2;32]);
++    let message = |role| {
++        let d = format!("monzero-native-bch-xmz-quote-v1-{role}");
++        let mut m = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:",d.len(),d,payload.len()).into_bytes();
++        m.extend_from_slice(&payload); m
++    };
++    VerifiedBchQuote::verify(&payload, now, p, &b.verifying_key().to_bytes(), &x.verifying_key().to_bytes(),
++        &b.sign(&message("bch-funder")).to_bytes(), &x.sign(&message("xmz-funder")).to_bytes())
++}
++#[test]
++fn signed_terms_construct_exact_recovery_stages() -> Result<()> {
++    let (policy, terms) = fixture(); let quote = signed(&terms, &policy, 1000)?;
++    let plan = quote.recovery_plan();
++    assert_eq!(plan.recovery_atoms(),99_000); assert_eq!(plan.final_recovery_atoms(),97_000);
++    assert_eq!(plan.lock().terms().delay_blocks,20); assert_eq!(plan.recovery().terms().delay_blocks,30);
++    assert_eq!(plan.lock().terms().timeout_destination,plan.recovery().script_pubkey());
++    assert_eq!(hex(plan.lock().terms().redeem_destination.as_bytes()),terms["bchPayoutScript"]);
++    assert_eq!(hex(plan.recovery().terms().redeem_destination.as_bytes()),terms["bchRefundScript"]);
++    assert_eq!(quote.xmz_payout().to_string(),terms["xmzPayout"]);
++    assert_eq!(quote.xmz_refund().to_string(),terms["xmzRefund"]);
++    assert!(quote.check_policy(&policy,2000).is_err());
++    // Even valid, jointly signed changes produce different commitments and scripts.
++    let mut changed = terms.clone(); changed.insert("bchLockFeeAtoms".into(),"1001".into());
++    let other = signed(&changed,&policy,1000)?;
++    assert_ne!(quote.commitment(),other.commitment());
++    assert!(plan.verify_scripts(other.recovery_plan().lock().redeem_script(),
++        other.recovery_plan().recovery().redeem_script()).is_err());
++    Ok(())
++}
++#[test]
++fn jointly_signed_invalid_terms_are_rejected() {
++    let (policy, terms) = fixture();
++    for (field, value) in [("bchAtoms","0"),("bchAtoms","0100000"),("bchAtoms","1000001"),
++        ("bchAtoms","18446744073709551616"),("bchAtoms","3000"),
++        ("xmzAtoms","2000001"),("xmzPayoutAtoms","101001"),("xmzPayoutAtoms","100001"),
++        ("bchFundingFeeMaxAtoms","5001"),("xmzFundingFeeMaxAtoms","1001"),
++        ("xmzClaimFeeMaxAtoms","1001"),("xmzRefundFeeMaxAtoms","0"),
++        ("bchLockFeeAtoms","499"),("bchRecoveryFeeAtoms","3001"),
++        ("bchMinimumOutputAtoms","1"),("cancelBlocks","65536"),("punishBlocks","2"),
++        ("bchConfirmations","1"),("xmzConfirmations","0"),
++        ("expiresAt","1000"),("expiresAt","4601"),("appFeeXmzAtoms","1"),
++        ("bchNetwork","btc-regtest"),("xmzNetwork","xmz-testnet"),
++        ("bchGenesis","invalid"),("xmzGenesis","invalid"),
++        ("bchPayoutScript","51"),("bchRefundScript","0"),("xmzPayout","invalid"),
++        ("xmzRefund","invalid"),("bchSigningKey","00"),
++        ("xmzSigningKey",terms["bchSigningKey"].as_str()),
++        ("quoteId","00000000-0000-0000-0000-000000000000")] {
++        let mut changed = terms.clone(); changed.insert(field.into(),value.into());
++        assert!(signed(&changed,&policy,1000).is_err(),"accepted {field}={value}");
++    }
++    for field in FIELDS {
++        let mut missing = terms.clone(); missing.remove(*field);
++        assert!(signed(&missing,&policy,1000).is_err(),"accepted missing {field}");
++    }
++    let mut extra = terms.clone(); extra.insert("extra".into(),"1".into());
++    assert!(signed(&extra,&policy,1000).is_err());
++}
++#[test]
++fn policy_changes_are_rechecked_before_funding() -> Result<()> {
++    let (mut policy, terms) = fixture(); let quote = signed(&terms,&policy,1000)?;
++    policy.maximum_bch_atoms = 99_999;
++    assert!(quote.check_policy(&policy,1000).is_err());
++    policy.maximum_bch_atoms = 1_000_000;
++    policy.cancel_blocks = 2;
++    assert!(quote.check_policy(&policy,1000).is_err());
++    policy.cancel_blocks = 20;
++    policy.minimum_covenant_fee = 0;
++    assert!(quote.check_policy(&policy,1000).is_err());
++    Ok(())
++}

@@ -1,0 +1,148 @@
+diff --git a/swap-machine/tests/alice_peer/mod.rs b/swap-machine/tests/alice_peer/mod.rs
+index abbf537a5..f55becfd5 100644
+--- a/swap-machine/tests/alice_peer/mod.rs
++++ b/swap-machine/tests/alice_peer/mod.rs
+@@ -9,6 +9,7 @@ use std::{cell::RefCell, io::{Read, Write}, os::unix::{fs::DirBuilderExt, net::{
+ use swap_machine::{alice, bob};
+ use swap_env::env::{GetConfig, Regtest};
+ use uuid::Uuid;
++use crate::quote_fixture::{Message, Negotiation};
+ 
+ struct Wire { socket: UnixStream, id: Uuid, sequence: u64 }
+ impl Wire {
+@@ -102,7 +103,8 @@ impl AlicePeer {
+     }
+     pub async fn negotiate(id: Uuid, bob0: bob::State0, wallet: &bitcoin_wallet::Wallet,
+         redeem: bitcoin::Address, punish: bitcoin::Address,
+-        btc_amount: bitcoin::Amount, xmz_atoms: u64) -> Result<(Self,bob::State2)> {
++        btc_amount: bitcoin::Amount, xmz_atoms: u64, quote: Option<&Value>) -> Result<(Self,bob::State2)> {
++        let mut negotiation=Negotiation::new(quote,id,true)?;
+         let directory=std::env::temp_dir().join(format!("xmz-alice-{}",Uuid::new_v4()));
+         std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+         let path=directory.join("peer");
+@@ -130,12 +132,16 @@ impl AlicePeer {
+         socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+         let mut wire=Wire {socket,id,sequence:0};
+         let _: bool=wire.call("init",json!({"redeem":redeem.to_string(),"punish":punish.to_string(),
+-            "btcSatoshis":btc_amount.to_sat().to_string(),"xmzAtoms":xmz_atoms.to_string()}))?;
+-        let message=wire.call("message0",bob0.next_message()?)?;
++            "btcSatoshis":btc_amount.to_sat().to_string(),"xmzAtoms":xmz_atoms.to_string(),"quote":quote}))?;
++        let response=wire.call("message0",negotiation.encode(Message::Bob0(bob0.next_message()?))?)?;
++        let Message::Alice1(message)=negotiation.decode(response)? else { anyhow::bail!("expected Alice1"); };
+         let bob1=bob0.receive(wallet,message).await?;
+-        let message=wire.call("message2",bob1.next_message())?;
++        let response=wire.call("message2",negotiation.encode(Message::Bob2(bob1.next_message()))?)?;
++        let Message::Alice3(message)=negotiation.decode(response)? else { anyhow::bail!("expected Alice3"); };
+         let bob2=bob1.receive(message)?;
+-        let funding: (monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey,u64)=wire.call("message4",bob2.next_message()?)?;
++        let (funding,commitment): ((monero_oxide_ext::PublicKey,monero_oxide_ext::PublicKey,u64),Option<[u8;32]>)=
++            wire.call("message4",negotiation.encode(Message::Bob4(bob2.next_message()?))?)?;
++        ensure!(commitment==negotiation.completed()?,"fixture transcript commitments differ");
+         ensure!(funding.2==xmz_atoms && bob2.xmr.as_pico()==xmz_atoms
+             && bob2.tx_lock.lock_amount()==btc_amount,"negotiated fixture amounts differ from request");
+         Ok((Self {wire:RefCell::new(wire),owner,funding},bob2))
+@@ -218,6 +224,8 @@ pub fn serve()->Result<()> {
+         state
+     } else {
+     let init: Value=wire.receive("init")?;
++    let quote=init.get("quote").context("missing fixture negotiation mode")?;
++    let mut negotiation=Negotiation::new(if quote.is_null() {None} else {Some(quote)},id,false)?;
+     let redeem=init["redeem"].as_str().context("missing redeem")?.parse::<bitcoin::Address<_>>()?.require_network(bitcoin::Network::Regtest)?;
+     let punish=init["punish"].as_str().context("missing punish")?.parse::<bitcoin::Address<_>>()?.require_network(bitcoin::Network::Regtest)?;
+     let number = |field: &str| -> Result<u64> {
+@@ -233,16 +241,20 @@ pub fn serve()->Result<()> {
+         swap_core::monero::primitives::Amount::from_pico(xmz_atoms),bitcoin::Amount::ZERO,
+         Regtest::get_config(),redeem,punish,fee,fee,fee,false,&mut rand::rngs::OsRng);
+     wire.send("init",true)?; wire.sequence+=1;
+-    let (received,state)=state.receive(wire.receive("message0")?)?;
++    let Message::Bob0(message)=negotiation.decode(wire.receive("message0")?)? else { anyhow::bail!("expected Bob0"); };
++    let (received,state)=state.receive(message)?;
+     ensure!(received==id,"wrong negotiated swap id");
+-    wire.send("message0",state.next_message()?)?; wire.sequence+=1;
+-    let state=state.receive(wire.receive("message2")?)?;
+-    wire.send("message2",state.next_message()?)?; wire.sequence+=1;
+-    let state=state.receive(wire.receive("message4")?)?;
++    wire.send("message0",negotiation.encode(Message::Alice1(state.next_message()?))?)?; wire.sequence+=1;
++    let Message::Bob2(message)=negotiation.decode(wire.receive("message2")?)? else { anyhow::bail!("expected Bob2"); };
++    let state=state.receive(message)?;
++    wire.send("message2",negotiation.encode(Message::Alice3(state.next_message()?))?)?; wire.sequence+=1;
++    let Message::Bob4(message)=negotiation.decode(wire.receive("message4")?)? else { anyhow::bail!("expected Bob4"); };
++    let state=state.receive(message)?;
+     ensure!(state.btc==btc_amount && state.tx_lock.lock_amount()==btc_amount
+         && state.xmr.as_pico()==xmz_atoms,"Alice negotiated different fixture amounts");
+     let funding=state.lock_xmr_transfer_request();
+-    wire.send("message4",(funding.public_spend_key,funding.public_view_key.0,funding.amount.as_pico()))?; wire.sequence+=1;
++    wire.send("message4",((funding.public_spend_key,funding.public_view_key.0,funding.amount.as_pico()),
++        negotiation.completed()?))?; wire.sequence+=1;
+     state
+     };
+     // Post-negotiation operations remain fixture-only and retain Alice's keys here.
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index b660d6562..014e235db 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -349,7 +349,8 @@ async fn settlement(refund: bool) -> Result<()> {
+         fee, fee, fee, fee, fee, fee);
+     #[cfg(unix)]
+     let (mut alice3,bob2)=alice_peer::AlicePeer::negotiate(swap_id,bob0,&bob_wallet,
+-        btc_payout,alice_wallet.new_address().await?,amount,atoms.atoms()).await?;
++        btc_payout,alice_wallet.new_address().await?,amount,atoms.atoms(),
++        quote_owner.as_ref().map(|owner|owner.context())).await?;
+     #[cfg(not(unix))]
+     let (alice3,bob2)={
+     let (_, alice1) = alice0.receive(bob0.next_message()?)?;
+diff --git a/swap-machine/tests/quote_fixture.rs b/swap-machine/tests/quote_fixture.rs
+index caa5dea59..872d6c2f0 100644
+--- a/swap-machine/tests/quote_fixture.rs
++++ b/swap-machine/tests/quote_fixture.rs
+@@ -7,6 +7,50 @@ use std::{io::Write, os::unix::fs::DirBuilderExt, path::PathBuf, process::{Comma
+ use swap_machine::native_trade_quote::{DeploymentPolicy, VerifiedQuote};
+ use swap_env::env::{GetConfig, Regtest};
+ use uuid::Uuid;
++pub use swap_machine::native_negotiation::Message;
++
++/// Private test transport adapter; transcript state is deliberately not a
++/// production restart record. Never expose frames containing view-key shares.
++pub struct Negotiation {
++    transcript: Option<swap_machine::native_negotiation::Transcript>,
++    btc_sender: bool,
++}
++impl Negotiation {
++    pub fn new(context: Option<&Value>, swap: Uuid, btc_sender: bool) -> Result<Self> {
++        let transcript=match context {
++            Some(context)=>Some(swap_machine::native_negotiation::Transcript::new(&read(context,swap)?,&policy(),now()?)?),
++            None=>None,
++        };
++        Ok(Self {transcript,btc_sender})
++    }
++    pub fn encode(&mut self, message: Message) -> Result<Value> {
++        let Some(transcript)=&mut self.transcript else { return Ok(serde_json::to_value(message)?); };
++        let frame=transcript.prepare(message)?;
++        let key=SigningKey::from_bytes(&[if self.btc_sender {1} else {2};32]);
++        let signature=key.sign(&swap_machine::native_negotiation::signing_bytes(&frame)?).to_bytes();
++        transcript.accept(&frame,&signature)?;
++        Ok(json!({"frame":frame,"signature":signature.to_vec()}))
++    }
++    pub fn decode(&mut self, value: Value) -> Result<Message> {
++        let Some(transcript)=&mut self.transcript else { return Ok(serde_json::from_value(value)?); };
++        #[derive(serde::Deserialize)]
++        #[serde(deny_unknown_fields)]
++        struct Signed { frame: Vec<u8>, signature: Vec<u8> }
++        let signed:Signed=serde_json::from_value(value)?;
++        // Exercise rejection without advancing the cursor on each received
++        // frame in the funded fixture, then accept the original signature.
++        ensure!(signed.signature.len()==64,"invalid fixture signature length");
++        let mut damaged=signed.signature.clone(); damaged[0]^=1;
++        ensure!(transcript.accept(&signed.frame,&damaged).is_err(),"accepted damaged fixture signature");
++        transcript.accept(&signed.frame,&signed.signature)
++    }
++    pub fn completed(&self) -> Result<Option<[u8;32]>> {
++        match &self.transcript {
++            Some(t)=>Ok(Some(t.completed_commitment().context("incomplete fixture transcript")?)),
++            None=>Ok(None),
++        }
++    }
++}
+ 
+ pub fn now() -> Result<u64> {
+     Ok(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())

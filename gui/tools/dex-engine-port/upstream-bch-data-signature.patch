@@ -1,0 +1,179 @@
+--- a/swap-core/src/lib.rs
++++ b/swap-core/src/lib.rs
+@@ -5,3 +5,4 @@
+ pub mod xmz_address;
+ pub mod litecoin_address;
+ pub mod dogecoin;
++pub mod bch;
+--- /dev/null
++++ b/swap-core/src/bch.rs
+@@ -0,0 +1,75 @@
++//! BCH CHECKDATASIG ECDSA messages, distinct from Bitcoin transaction sighashes.
++//! Specification: https://upgradespecs.bitcoincashnode.org/op_checkdatasig/
++//!
++//! A verified signature alone binds no chain, amount, fee or trade identity.
++//! Covenant validation and authenticated per-trade keys must supply that context.
++//! This module neither constructs transactions nor authorizes settlement.
++use anyhow::{Context, Result, ensure};
++use bitcoin::{hashes::{Hash, sha256}, secp256k1::ecdsa};
++use ecdsa_fun::{ECDSA, Signature, adaptor::{Adaptor, EncryptedSignature, HashTranscript},
++    fun::{Point, Scalar}, nonce::Deterministic};
++use sha2::Sha256;
++
++type DataAdaptor = Adaptor<HashTranscript<Sha256, rand_chacha::ChaCha20Rng>, Deterministic<Sha256>>;
++
++/// Single SHA-256 of the exact message consumed by CHECKDATASIG. No transaction
++/// sighash suffix, Bitcoin sighash preimage, or implicit double hashing is used.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct DataMessage([u8; 32]);
++
++impl DataMessage {
++    pub fn new(message: &[u8]) -> Self {
++        Self(sha256::Hash::hash(message).to_byte_array())
++    }
++
++    pub fn encrypted_sign(&self, signing_key: &Scalar, encryption_key: &Point) -> EncryptedSignature {
++        DataAdaptor::default().encrypted_sign(signing_key, encryption_key, &self.0)
++    }
++
++    pub fn verify_encrypted(&self, signing_key: &Point, encryption_key: &Point,
++        encrypted: &EncryptedSignature) -> Result<()> {
++        ensure!(DataAdaptor::default().verify_encrypted_signature(signing_key, encryption_key,
++            &self.0, encrypted), "invalid BCH encrypted data signature");
++        Ok(())
++    }
++
++    pub fn verify_der(&self, signing_key: &Point, der: &[u8]) -> Result<()> {
++        let signature = parse_der(der)?;
++        ensure!(ECDSA::verify_only().verify(signing_key, &self.0, &signature),
++            "invalid BCH data signature");
++        Ok(())
++    }
++
++    /// Publishing the result reveals the decryption key to a holder of the
++    /// encrypted signature. Callers must enforce their protocol release gate.
++    pub fn decrypt(&self, signing_key: &Point, decryption_key: &Scalar,
++        encrypted: EncryptedSignature) -> Result<Vec<u8>> {
++        let encryption_key = ECDSA::verify_only().verification_key_for(decryption_key);
++        self.verify_encrypted(signing_key, &encryption_key, &encrypted)?;
++        let signature = DataAdaptor::default().decrypt_signature(decryption_key, encrypted);
++        let der = ecdsa::Signature::from_compact(&signature.to_bytes())?
++            .serialize_der().to_vec();
++        self.verify_der(signing_key, &der)?;
++        Ok(der)
++    }
++
++    pub fn recover(&self, signing_key: &Point, encryption_key: &Point,
++        encrypted: &EncryptedSignature, der: &[u8]) -> Result<Scalar> {
++        self.verify_encrypted(signing_key, encryption_key, encrypted)?;
++        self.verify_der(signing_key, der)?;
++        DataAdaptor::default().recover_decryption_key(encryption_key, &parse_der(der)?, encrypted)
++            .context("BCH data signature does not reveal the expected decryption key")
++    }
++}
++
++fn parse_der(der: &[u8]) -> Result<Signature> {
++    let signature = ecdsa::Signature::from_der(der).context("invalid BCH DER data signature")?;
++    ensure!(signature.serialize_der().as_ref() == der, "noncanonical BCH DER data signature");
++    let mut normalized = signature;
++    normalized.normalize_s();
++    ensure!(normalized == signature, "BCH data signature must have low S");
++    Signature::from_bytes(signature.serialize_compact()).context("invalid BCH ECDSA scalars")
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-core/src/bch/tests.rs
+@@ -0,0 +1,57 @@
++use super::*;
++
++fn key() -> Scalar { Scalar::random(&mut rand::thread_rng()) }
++fn public(key: &Scalar) -> Point { ECDSA::verify_only().verification_key_for(key) }
++
++#[test]
++fn reference_signature_uses_exact_single_hash_message() -> Result<()> {
++    // Fixture provenance and MIT notice are retained alongside the vector.
++    let vector: serde_json::Value = serde_json::from_str(include_str!("reference-signature.json"))?;
++    let bytes = |name: &str| -> Result<Vec<u8>> {
++        Ok(hex::decode(vector[name].as_str().context("missing reference field")?)?)
++    };
++    let message = bytes("message")?;
++    let signer = Point::from_bytes(bytes("publicKey")?.try_into().unwrap()).unwrap();
++    let signature = bytes("signature")?;
++    let data = DataMessage::new(&message);
++    assert_eq!(hex::encode(data.0), vector["sha256"].as_str().unwrap());
++    data.verify_der(&signer, &signature)?;
++    assert!(DataMessage::new(&data.0).verify_der(&signer, &signature).is_err());
++    let mut changed = message; changed[0] ^= 1;
++    assert!(DataMessage::new(&changed).verify_der(&signer, &signature).is_err());
++    assert!(data.verify_der(&public(&key()), &signature).is_err());
++    assert!(data.verify_der(&signer, &bytes("highSSignature")?).is_err());
++    for length in 0..signature.len() {
++        assert!(data.verify_der(&signer, &signature[..length]).is_err());
++    }
++    let mut with_sighash = signature; with_sighash.push(1);
++    assert!(data.verify_der(&signer, &with_sighash).is_err());
++    Ok(())
++}
++
++#[test]
++fn adaptor_roundtrip_and_recovery_bind_message_and_both_keys() -> Result<()> {
++    let signing = key(); let decryption = key(); let other = key();
++    let signer = public(&signing); let encryption = public(&decryption);
++    let data = DataMessage::new(b"exact covenant destination bytes");
++    let changed = DataMessage::new(b"different covenant destination bytes");
++    let encrypted = data.encrypted_sign(&signing, &encryption);
++    data.verify_encrypted(&signer, &encryption, &encrypted)?;
++    assert!(changed.verify_encrypted(&signer, &encryption, &encrypted).is_err());
++    assert!(data.verify_encrypted(&public(&other), &encryption, &encrypted).is_err());
++    assert!(data.verify_encrypted(&signer, &public(&other), &encrypted).is_err());
++    assert!(data.decrypt(&signer, &other, encrypted.clone()).is_err());
++    assert!(changed.decrypt(&signer, &decryption, encrypted.clone()).is_err());
++    let der = data.decrypt(&signer, &decryption, encrypted.clone())?;
++    data.verify_der(&signer, &der)?;
++    assert_eq!(data.recover(&signer, &encryption, &encrypted, &der)?.to_bytes(), decryption.to_bytes());
++    assert!(changed.recover(&signer, &encryption, &encrypted, &der).is_err());
++    assert!(data.recover(&public(&other), &encryption, &encrypted, &der).is_err());
++    assert!(data.recover(&signer, &public(&other), &encrypted, &der).is_err());
++    // Verify independently through libsecp256k1, not just the adaptor library.
++    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
++    secp.verify_ecdsa(&bitcoin::secp256k1::Message::from_digest(data.0),
++        &ecdsa::Signature::from_der(&der)?,
++        &bitcoin::secp256k1::PublicKey::from_slice(&signer.to_bytes())?)?;
++    Ok(())
++}
+--- /dev/null
++++ b/swap-core/src/bch/reference-signature.json
+@@ -0,0 +1,8 @@
++{
++  "source": "https://github.com/basicswap/basicswap/blob/277b46b0278f1cc76199f7e847988647a1b36e38/tests/basicswap/test_bch_xmr.py",
++  "message": "76a91481ec21969399d15c26af089d5db437ead066c5ba88ac",
++  "publicKey": "024ffcc0481629866671d89f05f3da813a2aacec1b52e69b8c0c586b665f5d4574",
++  "signature": "3045022100a0161ea14d3b41ed41250c8474fc8ec6ce1cab8df7f401e69ecf77c2ab63d82102207a2a57ddf2ea400e09ea059f3b261da96f5098858b17239931f3cc2fb929bb2a",
++  "sha256": "82df1e21fae1f1ec45bdbac7a37675a16598f01d0475b54c1a7196c1b7daa42e",
++  "highSSignature": "3046022100a0161ea14d3b41ed41250c8474fc8ec6ce1cab8df7f401e69ecf77c2ab63d82102210085d5a8220d15bff1f615fa60c4d9e2554b5e446124317ca28dde925d170c8617"
++}
+--- /dev/null
++++ b/swap-core/src/bch/REFERENCE-LICENSE
+@@ -0,0 +1,20 @@
++The MIT License (MIT)
++Copyright (c) 2019-2024 tecnovert
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.

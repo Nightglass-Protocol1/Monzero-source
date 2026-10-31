@@ -1,0 +1,150 @@
+diff --git a/swap-machine/src/litecoin_light/vault.rs b/swap-machine/src/litecoin_light/vault.rs
+--- a/swap-machine/src/litecoin_light/vault.rs
++++ b/swap-machine/src/litecoin_light/vault.rs
+@@ -9,7 +9,7 @@
+ use swap_core::litecoin_address::LtcNetwork;
+ use uuid::Uuid;
+ use zeroize::Zeroizing;
+-use super::account::PublicAccount;
++use super::account::{PublicAccount,descriptor::PublicAccountDescriptor};
+ use crate::litecoin_rpc::reservation::Journal;
+ const NAME:&str="litecoin-seed.vault";
+ const HEADER:usize=128;
+@@ -18,7 +18,7 @@
+ 
+ /// Deliberately neither Clone, Debug nor serializable.
+ pub struct SecretSeed(Zeroizing<[u8;32]>);
+-pub struct SeedVault {journal:Journal,network:LtcNetwork,wallet:Uuid,bytes:Vec<u8>}
++pub struct SeedVault {journal:Journal,network:LtcNetwork,wallet:Uuid,bytes:Vec<u8>,usable:bool}
+ impl SecretSeed {
+     pub fn generate()->Result<Self> {
+         let mut bytes=Zeroizing::new([0u8;32]);OsRng.try_fill_bytes(&mut *bytes).context("seed entropy unavailable")?;
+@@ -38,24 +38,59 @@
+     /// the required backup ceremony, which is not implemented by this API.
+     pub fn create(directory:&Path,network:LtcNetwork,wallet:Uuid,password:&[u8],seed:&SecretSeed)->Result<Self> {
+         let journal=Journal::open(directory)?;
+-        let mut salt=[0u8;16];let mut nonce=[0u8;24];
+-        OsRng.try_fill_bytes(&mut salt).context("vault entropy unavailable")?;
+-        OsRng.try_fill_bytes(&mut nonce).context("vault entropy unavailable")?;
+-        let bytes=seal(seed,password,network,wallet,salt,nonce)?;
++        let bytes=seal_random(seed,password,network,wallet)?;
+         journal.retain(NAME,&bytes)?;
+-        Ok(Self {journal,network,wallet,bytes})
++        Ok(Self {journal,network,wallet,bytes,usable:true})
+     }
+     /// Missing/invalid state is an error. Recover a potentially uncertain
+     /// publication by syncing the existing record before it can be unlocked.
+     pub fn open(directory:&Path,network:LtcNetwork,wallet:Uuid)->Result<Self> {
+         let journal=Journal::open(directory)?;let bytes=journal.read(NAME)?;
+         check(&bytes,network,wallet)?;journal.retain(NAME,&bytes)?;
+-        Ok(Self {journal,network,wallet,bytes})
++        Ok(Self {journal,network,wallet,bytes,usable:true})
++    }
++    /// Authenticate before publishing; restoration never replaces different
++    /// retained ciphertext. Network and wallet identity remain those of backup.
++    pub fn restore_encrypted(directory:&Path,network:LtcNetwork,wallet:Uuid,password:&[u8],backup:&[u8])->Result<Self> {
++        drop(unlock(backup,password,network,wallet)?);
++        let journal=Journal::open(directory)?;journal.retain(NAME,backup)?;
++        Ok(Self {journal,network,wallet,bytes:backup.to_vec(),usable:true})
++    }
++    /// Authenticated ciphertext only. Caller must persist and verify a backup
++    /// at its destination. This does not include address-allocation metadata.
++    pub fn encrypted_backup(&self,password:&[u8])->Result<Vec<u8>> {
++        drop(self.unlock(password)?);Ok(self.bytes.clone())
++    }
++    /// Refuse a watch-only account that is not derived from this unlocked seed.
++    /// This binds key material, not freshness/unspentness or spending consent.
++    pub fn unlock_for_account(&self,password:&[u8],descriptor:&PublicAccountDescriptor)->Result<SecretSeed> {
++        let expected=PublicAccount::from_descriptor(descriptor,self.network)?;
++        let seed=self.unlock(password)?;
++        let actual=seed.public_account(self.network,expected.account_index())?;
++        ensure!(serde_json::to_vec(&actual.descriptor())?==serde_json::to_vec(descriptor)?,
++            "Litecoin vault does not match public account");Ok(seed)
++    }
++    /// Re-encrypt under fresh salt/nonce and atomically replace the record.
++    /// Old backups still work with the old password; this cannot revoke copies.
++    pub fn change_password(&mut self,old:&[u8],new:&[u8])->Result<()> {
++        self.change_password_with(old,new,|journal,before,after|journal.replace_record(NAME,before,after))
++    }
++    fn change_password_with(&mut self,old:&[u8],new:&[u8],
++        publish:impl FnOnce(&Journal,&[u8],&[u8])->Result<()>)->Result<()> {
++        let seed=self.unlock(old)?;let bytes=seal_random(&seed,new,self.network,self.wallet)?;drop(seed);
++        self.usable=false;publish(&self.journal,&self.bytes,&bytes)?;
++        self.bytes=bytes;self.usable=true;Ok(())
+     }
+     pub fn unlock(&self,password:&[u8])->Result<SecretSeed> {
+-        ensure!(self.journal.read(NAME)?==self.bytes,"Litecoin seed vault changed outside its lease");
++        ensure!(self.usable && self.journal.read(NAME)?==self.bytes,"Litecoin seed vault requires validated reopen");
+         unlock(&self.bytes,password,self.network,self.wallet)
+     }
++}
++fn seal_random(seed:&SecretSeed,password:&[u8],network:LtcNetwork,wallet:Uuid)->Result<Vec<u8>> {
++    let mut salt=[0u8;16];let mut nonce=[0u8;24];
++    OsRng.try_fill_bytes(&mut salt).context("vault entropy unavailable")?;
++    OsRng.try_fill_bytes(&mut nonce).context("vault entropy unavailable")?;
++    seal(seed,password,network,wallet,salt,nonce)
+ }
+ fn key(password:&[u8],salt:&[u8])->Result<Zeroizing<[u8;32]>> {
+     ensure!(!password.is_empty() && password.len()<=1024,"invalid vault password length");
+diff --git a/swap-machine/src/litecoin_light/vault/tests.rs b/swap-machine/src/litecoin_light/vault/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/tests.rs
+@@ -62,3 +62,58 @@
+     assert_ne!(first.bytes,second.bytes);assert_eq!(*first.unlock(&password)?.0,*second.unlock(&password)?.0);
+     let generated=SecretSeed::generate()?;assert!(generated.public_account(LtcNetwork::Regtest,0).is_ok());Ok(())
+ }
++
++#[test]
++fn vault_backup_restore_authenticates_before_publication_and_binds_account()->Result<()> {
++    let original=Directory::new()?;let restored=Directory::new()?;let (seed,_,password,wallet)=fixture();
++    let vault=SeedVault::create(&original.0,LtcNetwork::Regtest,wallet,&password,&seed)?;
++    let backup=vault.encrypted_backup(&password)?;assert!(vault.encrypted_backup(b"wrong").is_err());
++    assert!(SeedVault::restore_encrypted(&restored.0,LtcNetwork::Regtest,wallet,b"wrong",&backup).is_err());
++    assert!(!restored.0.join(NAME).exists());
++    let mut bad=backup.clone();bad[LENGTH-1]^=1;
++    assert!(SeedVault::restore_encrypted(&restored.0,LtcNetwork::Regtest,wallet,&password,&bad).is_err());
++    assert!(!restored.0.join(NAME).exists());
++    let recovered=SeedVault::restore_encrypted(&restored.0,LtcNetwork::Regtest,wallet,&password,&backup)?;
++    let descriptor=seed.public_account(LtcNetwork::Regtest,7)?.descriptor();
++    assert_eq!(*recovered.unlock_for_account(&password,&descriptor)?.0,*seed.0);
++    let other=SecretSeed::from_bytes(Zeroizing::new([42;32])).public_account(LtcNetwork::Regtest,7)?.descriptor();
++    assert!(recovered.unlock_for_account(&password,&other).is_err());
++    drop(recovered);
++    let retry=SeedVault::restore_encrypted(&restored.0,LtcNetwork::Regtest,wallet,&password,&backup)?;
++    assert_eq!(retry.encrypted_backup(&password)?,backup);Ok(())
++}
++#[test]
++fn vault_password_change_preserves_seed_and_old_backup_without_overwriting_restore()->Result<()> {
++    let dir=Directory::new()?;let (seed,_,password,wallet)=fixture();
++    let mut vault=SeedVault::create(&dir.0,LtcNetwork::Regtest,wallet,&password,&seed)?;
++    let before=vault.encrypted_backup(&password)?;
++    assert!(vault.change_password(b"wrong",b"new password").is_err());
++    assert!(vault.change_password(&password,b"").is_err());assert_eq!(vault.encrypted_backup(&password)?,before);
++    vault.change_password(&password,b"new password")?;
++    assert!(vault.unlock(&password).is_err());assert_eq!(*vault.unlock(b"new password")?.0,*seed.0);
++    let after=vault.encrypted_backup(b"new password")?;assert_ne!(before,after);drop(vault);
++    let reopened=SeedVault::open(&dir.0,LtcNetwork::Regtest,wallet)?;
++    assert_eq!(*reopened.unlock(b"new password")?.0,*seed.0);drop(reopened);
++    assert!(SeedVault::restore_encrypted(&dir.0,LtcNetwork::Regtest,wallet,&password,&before).is_err());
++    assert_eq!(fs::read(dir.0.join(NAME))?,after);
++    let backup_dir=Directory::new()?;
++    let old=SeedVault::restore_encrypted(&backup_dir.0,LtcNetwork::Regtest,wallet,&password,&before)?;
++    assert_eq!(*old.unlock(&password)?.0,*seed.0);Ok(())
++}
++#[test]
++fn vault_uncertain_password_publication_requires_reopen()->Result<()> {
++    for published in [false,true] {
++        let dir=Directory::new()?;let (seed,_,password,wallet)=fixture();
++        let mut vault=SeedVault::create(&dir.0,LtcNetwork::Regtest,wallet,&password,&seed)?;
++        assert!(vault.change_password_with(&password,b"new password",|journal,before,after| {
++            if published {journal.replace_record(NAME,before,after)?;}
++            anyhow::bail!("injected publication outcome failure")
++        }).is_err());
++        assert!(vault.unlock(&password).is_err());assert!(vault.unlock(b"new password").is_err());
++        assert!(vault.encrypted_backup(&password).is_err());drop(vault);
++        let recovered=SeedVault::open(&dir.0,LtcNetwork::Regtest,wallet)?;
++        let working=if published {b"new password".as_slice()}else{password.as_slice()};
++        assert_eq!(*recovered.unlock(working)?.0,*seed.0);
++    }
++    Ok(())
++}

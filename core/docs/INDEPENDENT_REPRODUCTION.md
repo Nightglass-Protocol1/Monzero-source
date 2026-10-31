@@ -39,6 +39,16 @@ commit, and safe package structure before writing canonical JSON. A mismatch
 is a stop condition; do not normalize timestamps, rebuild an archive from
 extracted files, or compare only executable version strings.
 
+Code-signed Windows references are the one defined exception. Their executables
+carry Authenticode signatures that no independent builder can reproduce, and
+`CODE-SIGNING.txt` records each executable's unsigned hash and the unsigned
+package hash. The comparator rebuilds the unsigned package with
+`utils/release/unsign-windows-package.sh` and continues only when that rebuild
+matches the recorded hash exactly; your reproduced package is then compared
+byte for byte with it. Run it with
+`MONZERO_ZIP="$PWD/utils/release/container-zip.sh"` (or inside the packaging
+image), because other Info-ZIP builds compress differently.
+
 Send `RELEASE.reproduction.json`, its detached signature, and the full public
 fingerprint of the signing key to the release operator through an authenticated
 channel. The operator must verify the builder's identity and fingerprint out

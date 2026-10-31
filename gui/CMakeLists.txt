@@ -17,6 +17,7 @@ option(WITH_SCANNER "Enable webcam QR scanner" OFF)
 option(WITH_DESKTOP_ENTRY "Ask to install desktop entry on first startup" ON)
 option(WITH_UPDATER "Regularly check for new updates" OFF)
 option(WITH_DEX_PROTOTYPE "Compile the private, non-networked DEX prototype" OFF)
+option(WITH_MINING "Include solo and P2Pool mining (OFF for Microsoft Store wallet builds)" ON)
 option(DEV_MODE "Checkout latest monero master on build" OFF)
 cmake_dependent_option(QML_TESTS "Build QML tests" ON "NOT STATIC;NOT ANDROID;NOT IOS" OFF)
 
@@ -62,6 +63,13 @@ if(NOT MANUAL_SUBMODULES)
     # monero links to ../core in the monzero-app repository; core checks its own submodules
     check_submodule(external/quirc)
   endif()
+endif()
+
+if(NOT WITH_MINING)
+    # Microsoft Store policy 10.2.6 forbids on-device mining: build the bundled
+    # monzerod without mining too, and leave out the P2Pool downloader.
+    set(MONZERO_DISABLE_MINING ON CACHE BOOL "Build without the ability to mine (wallet/node only)." FORCE)
+    add_definitions(-DMONZERO_NO_MINING)
 endif()
 
 add_subdirectory(monero)

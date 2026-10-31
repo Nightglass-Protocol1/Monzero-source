@@ -1,0 +1,144 @@
+diff --git a/swap-machine/src/bin/native-ltc-light/recovery.rs b/swap-machine/src/bin/native-ltc-light/recovery.rs
+--- a/swap-machine/src/bin/native-ltc-light/recovery.rs
++++ b/swap-machine/src/bin/native-ltc-light/recovery.rs
+@@ -151,3 +151,50 @@
+     schema:String,request_id:uuid::Uuid,coin:&'a str,network:&'a str,wallet_id:uuid::Uuid,account:u32,
+     seed_encoding:&'static str,phrase_hex:PrivateHex<'a>,passphrase_hex:PrivateHex<'a>,active_swap_recovery:bool,
+ }
++
++// BIP39 permits an empty additional passphrase; the vault password does not.
++struct RecoveryPassphrase(Zeroizing<String>);
++impl<'de> Deserialize<'de> for RecoveryPassphrase {
++    fn deserialize<D:serde::Deserializer<'de>>(deserializer:D)->std::result::Result<Self,D::Error> {
++        let value=Zeroizing::new(String::deserialize(deserializer)?);
++        if value.len()>1024 {return Err(serde::de::Error::custom("invalid recovery passphrase length"));}
++        Ok(Self(value))
++    }
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct MnemonicRestoreRequest {
++    schema:String,request_id:uuid::Uuid,approved_config_digest:String,restore_approved:bool,
++    password:Password,seed_encoding:String,phrase:Password,recovery_passphrase:RecoveryPassphrase,
++}
++pub(super) fn restore_mnemonic(path:&Path)->Result<()> {
++    use swap_machine::litecoin_light::vault::mnemonic::{MnemonicMaterial,storage::MnemonicVault};
++    let mut input=Zeroizing::new(Vec::with_capacity(8193));
++    std::io::stdin().take(8193).read_to_end(&mut input)?;
++    ensure!(!input.is_empty() && input.len()<=8192,"invalid mnemonic restore request size");
++    let request:MnemonicRestoreRequest=serde_json::from_slice(&input)?;
++    let tag=["ltc","btc","bch","doge"].into_iter()
++        .find(|tag|request.schema==format!("monzero-{tag}-light-wallet-mnemonic-restore-request-v1"))
++        .context("invalid mnemonic restore schema")?;
++    ensure!(!request.request_id.is_nil() && request.restore_approved,"missing mnemonic restore approval");
++    ensure!(request.seed_encoding==MnemonicMaterial::ENCODING,"wrong mnemonic recovery format");
++    let (_lease,raw)=private_config(path)?;
++    let approved:sha256::Hash=request.approved_config_digest.parse()?;
++    ensure!(approved.to_string()==request.approved_config_digest && sha256::Hash::hash(&raw)==approved,
++        "recovery configuration differs from approval");
++    let config:Config=serde_json::from_slice(&raw)?;
++    ensure!(config.schema==format!("monzero-private-{tag}-light-v1"),"wrong recovery chain");
++    let network=network_for(tag,&config.network)?;
++    let wallet=config.wallet.as_ref().context("missing recovery wallet")?;
++    let public=PublicAccount::from_descriptor(&wallet.account,network)?;
++    let vault_config=wallet.vault.as_ref().context("missing recovery vault")?;
++    ensure!(matches!(vault_config.seed_encoding,vault_format::VaultFormat::Mnemonic),"wrong recovery vault format");
++    let material=MnemonicMaterial::parse(&request.phrase.0)?;
++    let vault=MnemonicVault::restore_material(&vault_config.directory,network,vault_config.wallet_id,
++        request.password.0.as_bytes(),&material,&request.recovery_passphrase.0,&wallet.account)?;
++    drop(vault.unlock_for_account(request.password.0.as_bytes(),&wallet.account)?);
++    let response=json!({"schema":format!("monzero-{tag}-light-wallet-mnemonic-restore-response-v1"),
++        "requestId":request.request_id,"coin":tag,"network":config.network,"walletId":vault_config.wallet_id,
++        "account":public.account_index(),"restored":true,"activeSwapRecovery":false,"addressRecordsRestored":false});
++    std::io::stdout().write_all(&serde_json::to_vec(&response)?)?;Ok(())
++}
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -428,6 +428,7 @@
+         if args[1]=="--wallet-recovery-stdio-v1" {return recovery::reveal(Path::new(&args[2]));}
+         if args[1]=="--wallet-mnemonic-recovery-stdio-v1" {return recovery::reveal_mnemonic(Path::new(&args[2]));}
+         if args[1]=="--wallet-key-restore-stdio-v1" {return recovery::restore(Path::new(&args[2]));}
++        if args[1]=="--wallet-mnemonic-restore-stdio-v1" {return recovery::restore_mnemonic(Path::new(&args[2]));}
+         let mode=match args[1].to_str() {Some("--wallet-create-stdio-v1")=>"wallet-create",Some("--wallet-restore-stdio-v1")=>"wallet-restore",Some("--wallet-backup-save-stdio-v1")=>"wallet-backup-save",Some("--wallet-backup-verify-stdio-v1")=>"wallet-backup-verify",Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
+             Some("--wallet-reconcile-stdio-v1")=>"wallet-reconcile",Some("--wallet-broadcast-stdio-v1")=>"wallet-broadcast",Some("--wallet-broadcast-status-stdio-v1")=>"wallet-broadcast-status",
+             Some("--wallet-signed-stdio-v1")=>"wallet-signed",Some("--wallet-sign-stdio-v1")=>"wallet-sign",Some("--wallet-reopen-stdio-v1")=>"wallet-reopen",Some("--wallet-receive-stdio-v1")=>"wallet-receive",Some("--wallet-prepare-stdio-v1")=>"wallet-prepare",Some("--wallet-estimate-stdio-v1")=>"wallet-estimate",
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+--- a/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage.rs
+@@ -59,6 +59,31 @@
+         let bytes=journal.read(RECORD)?;check(&bytes,network,wallet)?;
+         journal.retain(RECORD,&bytes)?;
+         Ok(Self {journal,network,wallet,bytes})
++    }
++
++    /// Restore keys only for a separately saved and reviewed public account.
++    /// Never replaces existing ciphertext or resets allocation/trade records.
++    pub fn restore_material(directory:&Path,network:impl Into<LightNetwork>,wallet:Uuid,password:&[u8],
++        material:&MnemonicMaterial,passphrase:&str,expected:&PublicAccountDescriptor)->Result<Self> {
++        let network=network.into();
++        ensure!(!wallet.is_nil() && !password.is_empty() && password.len()<=1024,"invalid mnemonic restore context");
++        let account=PublicAccount::from_descriptor(expected,network)?;
++        let actual=material.public_account(network,account.account_index(),passphrase)?;
++        ensure!(serde_json::to_vec(&actual.descriptor())?==serde_json::to_vec(expected)?,
++            "mnemonic recovery does not match saved public account");
++        let journal=Journal::open(directory)?;
++        let bytes=match journal.read(RECORD) {
++            Ok(bytes)=>{
++                let existing=decode_record(&bytes,password,network,wallet)?;
++                ensure!(*existing.material().derive_seed(existing.passphrase())?==*material.derive_seed(passphrase)?,
++                    "existing mnemonic vault has different keys");bytes
++            },
++            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
++                seal_record(network,wallet,password,material,passphrase)?
++            },
++            Err(error)=>return Err(error),
++        };
++        journal.retain(RECORD,&bytes)?;Ok(Self {journal,network,wallet,bytes})
+     }
+ 
+     pub fn restore_encrypted(directory:&Path,network:impl Into<LightNetwork>,wallet:Uuid,password:&[u8],bytes:&[u8])->Result<Self> {
+@@ -190,3 +215,7 @@
+ }
+ 
+ pub mod backup;
++
++#[cfg(test)]
++#[path="storage/import_tests.rs"]
++mod import_tests;
+diff --git a/swap-machine/src/litecoin_light/vault/mnemonic/storage/import_tests.rs b/swap-machine/src/litecoin_light/vault/mnemonic/storage/import_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/mnemonic/storage/import_tests.rs
+@@ -0,0 +1,31 @@
++use super::*;
++use crate::litecoin_light::network::{BtcNetwork,BchNetwork,DogeNetwork};
++use std::{fs,path::PathBuf,os::unix::fs::DirBuilderExt};
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("mnemonic-import-{}",Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++#[test]
++fn imported_words_and_passphrase_match_saved_account_before_publication()->Result<()> {
++    for network in [LightNetwork::Litecoin(LtcNetwork::Regtest),LightNetwork::Bitcoin(BtcNetwork::Regtest),
++        LightNetwork::BitcoinCash(BchNetwork::Regtest),LightNetwork::Dogecoin(DogeNetwork::Regtest)] {
++        let directory=Directory::new()?;let wallet=Uuid::new_v4();let password=b"disposable import password";
++        let material=MnemonicMaterial::from_entropy(&[7;16])?;let phrase=material.reveal();
++        let account=material.public_account(network,3,"fixture passphrase")?;
++        let imported=MnemonicMaterial::parse(&phrase)?;
++        assert!(MnemonicVault::restore_material(&directory.0,network,wallet,password,&imported,"wrong",&account.descriptor()).is_err());
++        assert_eq!(fs::read_dir(&directory.0)?.count(),0);
++        let wrong=MnemonicMaterial::from_entropy(&[8;16])?;
++        assert!(MnemonicVault::restore_material(&directory.0,network,wallet,password,&wrong,"fixture passphrase",&account.descriptor()).is_err());
++        assert_eq!(fs::read_dir(&directory.0)?.count(),0);
++        let vault=MnemonicVault::restore_material(&directory.0,network,wallet,password,&imported,"fixture passphrase",&account.descriptor())?;
++        assert_eq!(&*vault.unlock_for_account(password,&account.descriptor())?.material().reveal(),&*phrase);
++        let bytes=fs::read(directory.0.join(RECORD))?;drop(vault);
++        drop(MnemonicVault::restore_material(&directory.0,network,wallet,password,&imported,"fixture passphrase",&account.descriptor())?);
++        assert_eq!(fs::read(directory.0.join(RECORD))?,bytes);
++        assert!(MnemonicVault::restore_material(&directory.0,network,wallet,b"wrong password",&imported,"fixture passphrase",&account.descriptor()).is_err());
++        assert!(MnemonicVault::restore_material(&directory.0,network,Uuid::new_v4(),password,&imported,"fixture passphrase",&account.descriptor()).is_err());
++        assert_eq!(fs::read(directory.0.join(RECORD))?,bytes);
++        assert!(MnemonicMaterial::parse("abandon abandon").is_err());
++    }
++    Ok(())
++}

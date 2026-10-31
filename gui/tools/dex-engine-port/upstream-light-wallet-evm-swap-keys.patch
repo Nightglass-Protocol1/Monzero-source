@@ -1,0 +1,559 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c274f7a..7c911ea 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -242,7 +242,7 @@ dependencies = [
+  "objc2-foundation",
+  "parking_lot 0.12.5",
+  "percent-encoding",
+- "windows-sys 0.59.0",
++ "windows-sys 0.60.2",
+  "wl-clipboard-rs",
+  "x11rb",
+ ]
+@@ -1728,7 +1728,7 @@ version = "3.1.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
+ dependencies = [
+- "windows-sys 0.48.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -2583,7 +2583,7 @@ dependencies = [
+  "heck 0.5.0",
+  "indexmap 2.13.0",
+  "itertools",
+- "proc-macro-crate 2.0.2",
++ "proc-macro-crate 3.5.0",
+  "proc-macro2",
+  "quote",
+  "sha3",
+@@ -2795,7 +2795,7 @@ dependencies = [
+  "libc",
+  "option-ext",
+  "redox_users 0.5.2",
+- "windows-sys 0.59.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -3261,7 +3261,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+ dependencies = [
+  "libc",
+- "windows-sys 0.59.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -4613,7 +4613,7 @@ dependencies = [
+  "libc",
+  "percent-encoding",
+  "pin-project-lite",
+- "socket2 0.5.10",
++ "socket2 0.6.3",
+  "system-configuration 0.7.0",
+  "tokio",
+  "tower-layer",
+@@ -4634,7 +4634,7 @@ dependencies = [
+  "js-sys",
+  "log",
+  "wasm-bindgen",
+- "windows-core 0.61.2",
++ "windows-core 0.62.2",
+ ]
+ 
+ [[package]]
+@@ -5264,6 +5264,16 @@ dependencies = [
+  "sha3",
+ ]
+ 
++[[package]]
++name = "k256"
++version = "0.13.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
++dependencies = [
++ "cfg-if",
++ "elliptic-curve",
++]
++
+ [[package]]
+ name = "keccak"
+ version = "0.1.6"
+@@ -6693,6 +6703,18 @@ dependencies = [
+  "zeroize",
+ ]
+ 
++[[package]]
++name = "monzero-evm-keys"
++version = "0.1.0"
++dependencies = [
++ "hex",
++ "hmac",
++ "k256",
++ "sha2",
++ "sha3",
++ "zeroize",
++]
++
+ [[package]]
+ name = "moxcms"
+ version = "0.8.1"
+@@ -6980,7 +7002,7 @@ version = "0.50.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+ dependencies = [
+- "windows-sys 0.59.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -7071,7 +7093,7 @@ version = "0.7.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
+ dependencies = [
+- "proc-macro-crate 2.0.2",
++ "proc-macro-crate 3.5.0",
+  "proc-macro2",
+  "quote",
+  "syn 2.0.117",
+@@ -7371,7 +7393,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
+ dependencies = [
+  "libc",
+- "windows-sys 0.45.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -8290,7 +8312,7 @@ dependencies = [
+  "quinn-udp",
+  "rustc-hash",
+  "rustls 0.23.37",
+- "socket2 0.5.10",
++ "socket2 0.6.3",
+  "thiserror 2.0.18",
+  "tokio",
+  "tracing",
+@@ -8327,9 +8349,9 @@ dependencies = [
+  "cfg_aliases",
+  "libc",
+  "once_cell",
+- "socket2 0.5.10",
++ "socket2 0.6.3",
+  "tracing",
+- "windows-sys 0.59.0",
++ "windows-sys 0.60.2",
+ ]
+ 
+ [[package]]
+@@ -9037,7 +9059,7 @@ dependencies = [
+  "errno",
+  "libc",
+  "linux-raw-sys",
+- "windows-sys 0.59.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -9175,7 +9197,7 @@ dependencies = [
+  "security-framework 3.7.0",
+  "security-framework-sys",
+  "webpki-root-certs 1.0.6",
+- "windows-sys 0.59.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -10937,6 +10959,7 @@ dependencies = [
+  "monero-address",
+  "monero-oxide-ext",
+  "monero-wallet 0.1.0 (git+https://github.com/kayabaNerve/monero-oxide.git)",
++ "monzero-evm-keys",
+  "num-bigint",
+  "rand 0.8.5",
+  "rand_chacha 0.3.1",
+@@ -11673,7 +11696,7 @@ dependencies = [
+  "getrandom 0.4.2",
+  "once_cell",
+  "rustix",
+- "windows-sys 0.59.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -14332,7 +14355,7 @@ version = "0.1.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+ dependencies = [
+- "windows-sys 0.48.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index c762257..06b5be2 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,6 +22,7 @@ members = [
+   "swap-feed",
+   "swap-fs",
+   "swap-machine",
++  "monzero-evm-keys",
+   "swap-orchestrator",
+   "swap-p2p",
+   "swap-proptest",
+diff --git a/monzero-evm-keys/Cargo.toml b/monzero-evm-keys/Cargo.toml
+new file mode 100644
+index 0000000..cf250e0
+--- /dev/null
++++ b/monzero-evm-keys/Cargo.toml
+@@ -0,0 +1,17 @@
++[package]
++name = "monzero-evm-keys"
++version = "0.1.0"
++edition = "2021"
++license = "BSD-3-Clause"
++description = "Keys for XMZ <-> EVM swaps derived from a wallet seed (vendored from monzero-gui dex-contracts/evm-keys; keep identical, the pinned tests guard it)"
++publish = false
++
++[dependencies]
++hmac = "=0.12.1"
++k256 = { version = "=0.13.4", default-features = false, features = ["arithmetic"] }
++sha2 = "=0.10.9"
++sha3 = "=0.10.8"
++zeroize = "=1.8.2"
++
++[dev-dependencies]
++hex = "=0.4.3"
+diff --git a/monzero-evm-keys/src/lib.rs b/monzero-evm-keys/src/lib.rs
+new file mode 100644
+index 0000000..95a04f9
+--- /dev/null
++++ b/monzero-evm-keys/src/lib.rs
+@@ -0,0 +1,141 @@
++//! Keys for XMZ <-> EVM swaps, derived from the wallet seed held in the seed vault.
++//!
++//! Shared by the swap engine (`monzero-dex-evm`) and the vault helper, so the vault can hand
++//! the swap side only what it needs (the swap seed and one EVM account key) and the wallet
++//! seed never leaves it. Changing any output strands trades in flight: the tests pin them.
++
++use hmac::{Hmac, Mac};
++use k256::elliptic_curve::sec1::ToEncodedPoint;
++use k256::elliptic_curve::PrimeField;
++use k256::{FieldBytes, Scalar, SecretKey};
++use sha2::{Sha256, Sha512};
++use zeroize::Zeroizing;
++
++/// Domain of every swap-seed derivation
++pub const DOMAIN: &[u8] = b"monzero-xmz-evm-swap-v1";
++const HARDENED: u32 = 1 << 31;
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum Error {
++    /// A wallet seed is 16 to 64 bytes (64 for a BIP-39 seed)
++    SeedLength,
++    /// Account indexes are below 2^31
++    Index,
++    /// Probability about 2^-127 per step; BIP-32 says to use the next index
++    InvalidChild,
++}
++
++impl std::fmt::Display for Error {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str(match self {
++            Error::SeedLength => "wallet seed must be 16 to 64 bytes",
++            Error::Index => "account index must be below 2^31",
++            Error::InvalidChild => "this index derives an invalid key; use the next one",
++        })
++    }
++}
++
++impl std::error::Error for Error {}
++
++/// HMAC-SHA256 keyed by `key` over the domain and length-prefixed parts.
++pub fn prf(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; 32]> {
++    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key length");
++    mac.update(DOMAIN);
++    for part in parts {
++        mac.update(&(part.len() as u32).to_be_bytes());
++        mac.update(part);
++    }
++    Zeroizing::new(mac.finalize().into_bytes().into())
++}
++
++/// The seed behind every swap of a wallet, from the wallet seed in its vault.
++pub fn swap_seed(wallet_seed: &[u8]) -> Zeroizing<[u8; 32]> {
++    prf(wallet_seed, &[b"swap seed"])
++}
++
++/// The private key of the EVM account at m/44'/60'/0'/0/`index` (BIP-32, the Ethereum path):
++/// the wallet's recovery words restore the same account in any EVM wallet.
++pub fn evm_private_key(wallet_seed: &[u8], index: u32) -> Result<Zeroizing<[u8; 32]>, Error> {
++    if !(16..=64).contains(&wallet_seed.len()) {
++        return Err(Error::SeedLength);
++    }
++    if index >= HARDENED {
++        return Err(Error::Index);
++    }
++    let (mut key, mut chain) = split(hmac512(b"Bitcoin seed", &[wallet_seed]))?;
++    for step in [44 | HARDENED, 60 | HARDENED, HARDENED, 0, index] {
++        (key, chain) = child(&key, &chain, step)?;
++    }
++    Ok(Zeroizing::new(key.to_bytes().into()))
++}
++
++/// The EVM address (20 bytes) of a private key: the last 20 bytes of Keccak-256 over the
++/// uncompressed public key.
++pub fn evm_address(private_key: &[u8; 32]) -> Option<[u8; 20]> {
++    use sha3::{Digest, Keccak256};
++    let public = SecretKey::from_bytes(&FieldBytes::from(*private_key)).ok()?.public_key().to_encoded_point(false);
++    let hash = Keccak256::digest(&public.as_bytes()[1..]);
++    let mut out = [0u8; 20];
++    out.copy_from_slice(&hash[12..]);
++    Some(out)
++}
++
++fn child(key: &Scalar, chain: &[u8; 32], i: u32) -> Result<(Scalar, Zeroizing<[u8; 32]>), Error> {
++    let i_bytes = i.to_be_bytes();
++    let out = if i >= HARDENED {
++        let k = Zeroizing::new(key.to_bytes());
++        hmac512(chain, &[&[0], &k, &i_bytes])
++    } else {
++        let public = SecretKey::from_bytes(&key.to_bytes()).expect("nonzero").public_key().to_encoded_point(true);
++        hmac512(chain, &[public.as_bytes(), &i_bytes])
++    };
++    let (tweak, chain) = split(out)?;
++    let child = tweak + key;
++    if bool::from(child.is_zero()) {
++        return Err(Error::InvalidChild);
++    }
++    Ok((child, chain))
++}
++
++fn hmac512(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; 64]> {
++    let mut mac = Hmac::<Sha512>::new_from_slice(key).expect("HMAC takes any key length");
++    for part in parts {
++        mac.update(part);
++    }
++    Zeroizing::new(mac.finalize().into_bytes().into())
++}
++
++/// Left half as a key (nonzero, below the group order), right half as chain code.
++fn split(i: Zeroizing<[u8; 64]>) -> Result<(Scalar, Zeroizing<[u8; 32]>), Error> {
++    let key = Option::<Scalar>::from(Scalar::from_repr(FieldBytes::from(<[u8; 32]>::try_from(&i[..32]).expect("32 bytes"))))
++        .filter(|k| !bool::from(k.is_zero()))
++        .ok_or(Error::InvalidChild)?;
++    let mut chain = Zeroizing::new([0u8; 32]);
++    chain.copy_from_slice(&i[32..]);
++    Ok((key, chain))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// BIP-39 seed of "test test test test test test test test test test test junk"
++    const SEED: &str = "9dfc3c64c2f8bede1533b6a79f8570e5943e0b8fd1cf77107adf7b72cef42185d564a3aee24cab43f80e3c4538087d70fc824eabbad596a23c97b6ee8322ccc0";
++
++    #[test]
++    fn evm_keys_match_other_wallets() {
++        let seed = hex::decode(SEED).unwrap();
++        // The private keys every EVM tool shows for this phrase's first two accounts
++        assert_eq!(hex::encode(*evm_private_key(&seed, 0).unwrap()), "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
++        assert_eq!(hex::encode(*evm_private_key(&seed, 1).unwrap()), "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
++        assert_eq!(hex::encode(evm_address(&evm_private_key(&seed, 0).unwrap()).unwrap()), "f39fd6e51aad88f6f4ce6ab8827279cfffb92266");
++        assert_eq!(evm_address(&[0; 32]), None);
++        assert_eq!(evm_private_key(&seed[..15], 0), Err(Error::SeedLength));
++        assert_eq!(evm_private_key(&seed, HARDENED), Err(Error::Index));
++    }
++
++    #[test]
++    fn swap_seed_is_pinned() {
++        assert_eq!(hex::encode(*swap_seed(&[9; 32])), "624ec00514813457261791e59284ba6699586bb286481e47f6840cb138a6eaaf");
++    }
++}
+diff --git a/swap-machine/Cargo.toml b/swap-machine/Cargo.toml
+index 0a61b76..eea224b 100644
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -4,6 +4,7 @@ version = "4.0.0"
+ edition = "2024"
+ 
+ [dependencies]
++monzero-evm-keys = { path = "../monzero-evm-keys" }
+ bytes = "=1.11.1"
+ bip39 = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+ chacha20poly1305 = "=0.10.1"
+diff --git a/swap-machine/src/bin/native-ltc-light/evm_keys.rs b/swap-machine/src/bin/native-ltc-light/evm_keys.rs
+new file mode 100644
+index 0000000..dae655c
+--- /dev/null
++++ b/swap-machine/src/bin/native-ltc-light/evm_keys.rs
+@@ -0,0 +1,78 @@
++// Private output: the keys an XMZ <-> EVM swap needs, derived here from the unlocked vault.
++// Only the swap seed and one EVM account key leave the helper, never the wallet seed or its
++// recovery words. The desktop hands them straight to the EVM swap helper; never to QML,
++// public status or logs.
++use super::*;
++use serde::Serialize;
++use swap_machine::litecoin_light::vault::{evm, recovery as material};
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct KeysRequest {
++    schema:String,
++    request_id:uuid::Uuid,
++    approved_config_digest:String,
++    keys_approved:bool,
++    password:Password,
++    evm_account:u32,
++}
++struct KeyHex<'a>(&'a [u8]);
++impl std::fmt::Display for KeyHex<'_> {
++    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
++        for byte in self.0 {write!(f,"{byte:02x}")?;} Ok(())
++    }
++}
++impl Serialize for KeyHex<'_> {
++    fn serialize<S:serde::Serializer>(&self,serializer:S)->std::result::Result<S::Ok,S::Error> {serializer.collect_str(self)}
++}
++#[derive(Serialize)]
++#[serde(rename_all="camelCase")]
++struct KeysResponse<'a> {
++    schema:String,request_id:uuid::Uuid,coin:&'a str,network:&'a str,wallet_id:uuid::Uuid,
++    evm_account:u32,evm_address:String,swap_seed_hex:KeyHex<'a>,evm_key_hex:KeyHex<'a>,
++}
++
++pub(super) fn run(path:&Path)->Result<()> {
++    let mut input=Zeroizing::new(Vec::with_capacity(8193));
++    std::io::stdin().take(8193).read_to_end(&mut input)?;
++    ensure!(!input.is_empty() && input.len()<=8192,"invalid swap-keys request size");
++    let request:KeysRequest=serde_json::from_slice(&input)?;
++    let tag=["ltc","btc","bch","doge"].into_iter()
++        .find(|tag|request.schema==format!("monzero-{tag}-light-wallet-evm-swap-keys-request-v1"))
++        .context("invalid swap-keys schema")?;
++    ensure!(!request.request_id.is_nil() && request.keys_approved,"missing swap-keys approval");
++    ensure!(request.evm_account<(1<<31),"invalid EVM account index");
++    let (_lease,raw)=private_config(path)?;
++    let approved:sha256::Hash=request.approved_config_digest.parse()?;
++    ensure!(approved.to_string()==request.approved_config_digest && sha256::Hash::hash(&raw)==approved,
++        "swap-keys configuration differs from approval");
++    let config:Config=serde_json::from_slice(&raw)?;
++    ensure!(config.schema==format!("monzero-private-{tag}-light-v1"),"wrong swap-keys chain");
++    let network=network_for(tag,&config.network)?;
++    let wallet=config.wallet.as_ref().context("missing wallet")?;
++    let vault_config=wallet.vault.as_ref().context("missing vault")?;
++    let password=request.password.0.as_bytes();
++    // The wallet seed lives only inside this function
++    let keys=match vault_config.seed_encoding {
++        vault_format::VaultFormat::Mnemonic=>{
++            let vault=swap_machine::litecoin_light::vault::mnemonic::storage::MnemonicVault::open(&vault_config.directory,network,vault_config.wallet_id)?;
++            let unlocked=vault.unlock_for_account(password,&wallet.account)?;
++            let seed=unlocked.material().derive_seed(unlocked.passphrase())?;
++            evm::from_wallet_seed(&*seed,request.evm_account)?
++        }
++        vault_format::VaultFormat::Raw=>{
++            let vault=SeedVault::open(&vault_config.directory,network,vault_config.wallet_id)?;
++            let seed=material::reveal(&vault,password,&wallet.account)?;
++            evm::from_wallet_seed(seed.expose_bytes(),request.evm_account)?
++        }
++    };
++    let response=KeysResponse {schema:format!("monzero-{tag}-light-wallet-evm-swap-keys-response-v1"),
++        request_id:request.request_id,coin:tag,network:&config.network,wallet_id:vault_config.wallet_id,
++        evm_account:request.evm_account,evm_address:format!("0x{}",KeyHex(&keys.address)),
++        swap_seed_hex:KeyHex(&*keys.swap_seed),evm_key_hex:KeyHex(&*keys.evm_key)};
++    let mut output=Zeroizing::new(Vec::with_capacity(1024));
++    serde_json::to_writer(&mut *output,&response)?;
++    ensure!(output.len()<=1024,"oversized swap-keys response");
++    std::io::stdout().write_all(&output)?;
++    Ok(())
++}
+diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
+index 306e0c0..ff3f68e 100644
+--- a/swap-machine/src/bin/native-ltc-light.rs
++++ b/swap-machine/src/bin/native-ltc-light.rs
+@@ -428,6 +428,7 @@ mod linux {
+     mod backup_import { include!("native-ltc-light/backup_import.rs"); }
+     mod vault_format { include!("native-ltc-light/vault_format.rs"); }
+     mod recovery { include!("native-ltc-light/recovery.rs"); }
++    mod evm_keys { include!("native-ltc-light/evm_keys.rs"); }
+     mod import { include!("native-ltc-light/import.rs"); }
+     mod discovery { include!("native-ltc-light/discovery.rs"); }
+     mod import_recovery { include!("native-ltc-light/import_recovery.rs"); }
+@@ -450,6 +451,7 @@ mod linux {
+         if args[1]=="--wallet-import-stdio-v1" {return import::run(Path::new(&args[2]),true);}
+         if args[1]=="--wallet-recovery-stdio-v1" {return recovery::reveal(Path::new(&args[2]));}
+         if args[1]=="--wallet-mnemonic-recovery-stdio-v1" {return recovery::reveal_mnemonic(Path::new(&args[2]));}
++        if args[1]=="--wallet-evm-swap-keys-stdio-v1" {return evm_keys::run(Path::new(&args[2]));}
+         if args[1]=="--wallet-key-restore-stdio-v1" {return recovery::restore(Path::new(&args[2]));}
+         if args[1]=="--wallet-mnemonic-restore-stdio-v1" {return recovery::restore_mnemonic(Path::new(&args[2]));}
+         let mode=match args[1].to_str() {Some("--wallet-create-stdio-v1")=>"wallet-create",Some("--wallet-restore-stdio-v1")=>"wallet-restore",Some("--wallet-backup-save-stdio-v1")=>"wallet-backup-save",Some("--wallet-backup-verify-stdio-v1")=>"wallet-backup-verify",Some("--status-stdio-v1")=>"status",Some("--sync-stdio-v1")=>"sync",
+diff --git a/swap-machine/src/litecoin_light/vault/evm.rs b/swap-machine/src/litecoin_light/vault/evm.rs
+new file mode 100644
+index 0000000..3c3ab25
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/evm.rs
+@@ -0,0 +1,50 @@
++//! Keys for XMZ <-> EVM swaps from an unlocked vault seed. Only the swap seed and one EVM
++//! account key leave the vault; the wallet seed (and its recovery words) never do.
++use anyhow::{Context, Result};
++use zeroize::Zeroizing;
++
++pub struct EvmSwapKeys {
++    pub swap_seed: Zeroizing<[u8; 32]>,
++    pub evm_key: Zeroizing<[u8; 32]>,
++    pub address: [u8; 20],
++}
++
++/// `wallet_seed`: the raw vault seed (32 bytes) or the BIP-39 seed of a mnemonic vault (64).
++pub fn from_wallet_seed(wallet_seed: &[u8], account: u32) -> Result<EvmSwapKeys> {
++    let evm_key = monzero_evm_keys::evm_private_key(wallet_seed, account).map_err(|e| anyhow::anyhow!("{e}"))?;
++    let address = monzero_evm_keys::evm_address(&evm_key).context("invalid derived EVM key")?;
++    Ok(EvmSwapKeys { swap_seed: monzero_evm_keys::swap_seed(wallet_seed), evm_key, address })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::litecoin_light::vault::mnemonic::MnemonicMaterial;
++
++    fn hexs(bytes: &[u8]) -> String {
++        bytes.iter().map(|b| format!("{b:02x}")).collect()
++    }
++
++    #[test]
++    fn mnemonic_vault_seed_gives_the_accounts_other_evm_wallets_show() -> Result<()> {
++        let material = MnemonicMaterial::parse("test test test test test test test test test test test junk")?;
++        let seed = material.derive_seed("")?;
++        let keys = from_wallet_seed(&*seed, 0)?;
++        assert_eq!(hexs(&keys.address), "f39fd6e51aad88f6f4ce6ab8827279cfffb92266");
++        assert_eq!(hexs(&*keys.evm_key), "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
++        assert_eq!(*keys.swap_seed, *monzero_evm_keys::swap_seed(&*seed));
++        assert_eq!(hexs(&from_wallet_seed(&*seed, 1)?.address), "70997970c51812dc3a010c7d01b50e0d17dc79c8");
++        // The same key derivation as the swap engine (pinned there and in monzero-evm-keys)
++        assert_eq!(hexs(&*monzero_evm_keys::swap_seed(&[9; 32])), "624ec00514813457261791e59284ba6699586bb286481e47f6840cb138a6eaaf");
++        Ok(())
++    }
++
++    #[test]
++    fn raw_vault_seeds_work_and_bad_indexes_are_refused() -> Result<()> {
++        let keys = from_wallet_seed(&[7u8; 32], 3)?;
++        assert_ne!(*keys.swap_seed, [0; 32]);
++        assert!(from_wallet_seed(&[7u8; 32], 1 << 31).is_err());
++        assert!(from_wallet_seed(&[7u8; 8], 0).is_err());
++        Ok(())
++    }
++}
+diff --git a/swap-machine/src/litecoin_light/vault.rs b/swap-machine/src/litecoin_light/vault.rs
+index d04e72d..4408bbb 100644
+--- a/swap-machine/src/litecoin_light/vault.rs
++++ b/swap-machine/src/litecoin_light/vault.rs
+@@ -143,3 +143,5 @@ pub mod recovery;
+ 
+ /// Standard BIP39 material; never reinterprets existing raw-seed vaults.
+ pub mod mnemonic;
++// Keys for XMZ <-> EVM swaps; only derived keys leave the vault
++pub mod evm;

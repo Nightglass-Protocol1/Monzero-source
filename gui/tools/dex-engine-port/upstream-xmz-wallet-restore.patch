@@ -1,0 +1,155 @@
+--- a/swap-machine/src/native_funding_rpc/wallet_session.rs	2026-09-14 23:02:07.593259930 +0100
++++ b/swap-machine/src/native_funding_rpc/wallet_session.rs	2026-09-14 23:02:07.596051921 +0100
+@@ -40,6 +40,11 @@
+                     self.open(&id, std::mem::take(&mut *password), &address).await?;
+                     ("open", address)
+                 }
++                Control::Restore(id, mut spend_key, mut view_key, restore_height, mut password, address) => {
++                    self.restore(&id, std::mem::take(&mut *spend_key), std::mem::take(&mut *view_key),
++                        restore_height, std::mem::take(&mut *password), &address).await?;
++                    ("restore", address)
++                }
+                 Control::Close(address) => { self.close(&address).await?; ("close", address) }
+             };
+             Ok(json!({"schema":"monzero-wallet-control-result-v1","requestId":request_id.to_string(),
+@@ -76,6 +81,28 @@
+         Ok(())
+     }
+ 
++    /// Restores a wallet from an already-recovered spend/view key pair (for
++    /// example, the shared XMZ key a swap participant obtains after the
++    /// counterparty's secret is revealed). This only opens and verifies the
++    /// wallet against the expected address; it constructs, signs and
++    /// broadcasts nothing, matching this module's existing boundary.
++    pub async fn restore(&mut self, id: &SwapWalletId, spend_key: String, view_key: String,
++        restore_height: u64, password: String, expected: &XmzAddress) -> Result<()> {
++        let spend_key = checked_private_key_hex(spend_key)?;
++        let view_key = checked_private_key_hex(view_key)?;
++        let password = checked_password(password)?;
++        ensure!(expected.network() == self.network, "wallet network mismatch");
++        self.require_empty().await?;
++        self.uncertain = true;
++        self.client.rpc(self.client.wallet, "generate_from_keys", json!({
++            "restore_height":restore_height, "filename":id.filename(), "address":expected.to_string(),
++            "spendkey":spend_key.as_str(), "viewkey":view_key.as_str(),
++            "password":password.as_str(), "autosave_current":true, "language":"English"})).await?;
++        ensure!(self.client.opened_wallet(self.network).await?.as_ref() == Some(expected), "restored wallet identity mismatch");
++        self.uncertain = false;
++        Ok(())
++    }
++
+     pub async fn close(&mut self, expected: &XmzAddress) -> Result<()> {
+         ensure!(!self.uncertain, "wallet session requires reconciliation");
+         ensure!(self.client.opened_wallet(self.network).await?.as_ref() == Some(expected), "unexpected wallet before close");
+@@ -90,6 +117,7 @@
+ enum Control {
+     Create(SwapWalletId, Zeroizing<String>),
+     Open(SwapWalletId, Zeroizing<String>, XmzAddress),
++    Restore(SwapWalletId, Zeroizing<String>, Zeroizing<String>, u64, Zeroizing<String>, XmzAddress),
+     Close(XmzAddress),
+ }
+ 
+@@ -97,8 +125,13 @@
+     ensure!(bytes.len() <= 4096, "oversized wallet command");
+     #[derive(serde::Deserialize)]
+     #[serde(deny_unknown_fields, rename_all="camelCase")]
+-    struct Wire { schema:String, request_id:String, operation:String, wallet_id:String, password:String, expected_address:String }
+-    impl Drop for Wire { fn drop(&mut self) { self.password.zeroize(); } }
++    struct Wire {
++        schema:String, request_id:String, operation:String, wallet_id:String, password:String, expected_address:String,
++        #[serde(default)] spend_key:String, #[serde(default)] view_key:String, #[serde(default)] restore_height:u64,
++    }
++    impl Drop for Wire {
++        fn drop(&mut self) { self.password.zeroize(); self.spend_key.zeroize(); self.view_key.zeroize(); }
++    }
+     // Parser diagnostics may quote an unknown field supplied in private input.
+     // Do not retain them as an anyhow source that callers might log.
+     let mut wire: Wire = serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!("invalid wallet command"))?;
+@@ -109,15 +142,30 @@
+         Ok(id)
+     };
+     let request_id = canonical_id(&wire.request_id)?;
++    let no_restore_fields = |wire: &Wire| -> Result<()> {
++        ensure!(wire.spend_key.is_empty() && wire.view_key.is_empty() && wire.restore_height == 0,
++            "unexpected restore fields");
++        Ok(())
++    };
+     let command = match wire.operation.as_str() {
+         "create" => {
+             ensure!(wire.expected_address.is_empty(), "create must not supply an address");
++            no_restore_fields(&wire)?;
+             Control::Create(SwapWalletId::new(canonical_id(&wire.wallet_id)?)?, checked_password(std::mem::take(&mut wire.password))?)
+         }
+-        "open" => Control::Open(SwapWalletId::new(canonical_id(&wire.wallet_id)?)?,
+-            checked_password(std::mem::take(&mut wire.password))?, XmzAddress::parse(network, &wire.expected_address)?),
++        "open" => {
++            no_restore_fields(&wire)?;
++            Control::Open(SwapWalletId::new(canonical_id(&wire.wallet_id)?)?,
++                checked_password(std::mem::take(&mut wire.password))?, XmzAddress::parse(network, &wire.expected_address)?)
++        }
++        "restore" => Control::Restore(SwapWalletId::new(canonical_id(&wire.wallet_id)?)?,
++            checked_private_key_hex(std::mem::take(&mut wire.spend_key))?,
++            checked_private_key_hex(std::mem::take(&mut wire.view_key))?,
++            wire.restore_height, checked_password(std::mem::take(&mut wire.password))?,
++            XmzAddress::parse(network, &wire.expected_address)?),
+         "close" => {
+             ensure!(wire.wallet_id.is_empty() && wire.password.is_empty(), "unexpected close credentials");
++            no_restore_fields(&wire)?;
+             Control::Close(XmzAddress::parse(network, &wire.expected_address)?)
+         }
+         _ => anyhow::bail!("unsupported wallet operation"),
+@@ -131,6 +179,16 @@
+     Ok(value)
+ }
+ 
++/// Canonical lowercase 32-byte hex, matching this codebase's other private
++/// scalar/key encodings. Uppercase or short/long input is rejected rather
++/// than normalized, so a caller cannot smuggle a noncanonical key through.
++fn checked_private_key_hex(value: String) -> Result<Zeroizing<String>> {
++    let value = Zeroizing::new(value);
++    ensure!(value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
++        "invalid private key encoding");
++    Ok(value)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -174,4 +232,37 @@
+         assert!(checked_password("fixture-password".into()).is_ok());
+         Ok(())
+     }
++    #[test]
++    fn private_key_hex_must_be_canonical_lowercase_32_bytes() {
++        let valid = "a".repeat(64);
++        assert!(checked_private_key_hex(valid.clone()).is_ok());
++        for value in [String::new(), "a".repeat(63), "a".repeat(65), "A".repeat(64),
++            format!("{}g", "a".repeat(63)), format!("{}\0", "a".repeat(63))] {
++            assert!(checked_private_key_hex(value).is_err());
++        }
++    }
++    #[test]
++    fn restore_requires_valid_keys_height_and_no_stray_create_or_open_fields() -> Result<()> {
++        let key = "b".repeat(64);
++        let valid = json!({"schema":"monzero-wallet-control-v1","requestId":"12345678-1234-1234-1234-123456789abc",
++            "operation":"restore","walletId":"23456789-1234-1234-1234-123456789abc","password":"fixture",
++            "expectedAddress":"FSf9UZS3uZwJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ7suhUXwdrDJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmCYGLw3H",
++            "spendKey":key,"viewKey":key,"restoreHeight":100u64});
++        let (_, command) = decode_control(&serde_json::to_vec(&valid)?, XmzNetwork::Mainnet)?;
++        assert!(matches!(command, Control::Restore(..)));
++        for (key_name, value) in [("spendKey", json!("short")), ("viewKey", json!("SHORT".repeat(13))),
++            ("password", json!("")), ("walletId", json!("../wallet")),
++            ("expectedAddress", json!("not-an-address"))] {
++            let mut changed = valid.clone();
++            changed[key_name] = value;
++            assert!(decode_control(&serde_json::to_vec(&changed)?, XmzNetwork::Mainnet).is_err());
++        }
++        // create/open/close must not be able to smuggle restore-only key material through.
++        for operation in ["create", "open", "close"] {
++            let mut changed = valid.clone();
++            changed["operation"] = json!(operation);
++            assert!(decode_control(&serde_json::to_vec(&changed)?, XmzNetwork::Mainnet).is_err());
++        }
++        Ok(())
++    }
+ }

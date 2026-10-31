@@ -1,0 +1,146 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet/helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet/helper.rs
+@@ -26,6 +26,7 @@
+         ensure!([format!("{HELPER}_SHA256"),PROBE.into(),format!("{PROBE}_SHA256")]
+             .iter().all(|key|std::env::var_os(key).is_none()),"incomplete status integration pins");
+         ensure!(std::env::var_os("MONZERO_BCH_REFUND_WALLET_FRESH_REVIEW").is_none(),"fresh review requires integration pins");
++        ensure!(std::env::var_os("MONZERO_BCH_REFUND_WALLET_MUTATION").is_none(),"mutation requires integration pins");
+         return Ok(())
+     }
+     let (helper,digest)=pinned(HELPER)?;let (probe,probe_digest)=pinned(PROBE)?;
+@@ -74,8 +75,18 @@
+             &helper,&digest,&probe,&probe_digest,expected).await?;
+         assert_eq!(contents(&copied.0)?,original);assert_eq!(contents(&private.0)?,secrets);
+     }
++    if let Some(flag)=std::env::var_os("MONZERO_BCH_REFUND_WALLET_MUTATION") {
++        ensure!(flag=="1","invalid mutation fixture setting");
++        let first={let state=wallet.state.lock().unwrap();!state.lose_restore && !state.lose_scan};
++        if expected["state"]=="not-attempted" && first {
++            mutation::exercise(&config.0,&wrapper,&copied,&private,setup,rpc,refund,fixture,server,&helper,&digest).await?;
++            assert_eq!(contents(&copied.0)?,original);assert_eq!(contents(&private.0)?,secrets);
++        }
++    }
+     assert_eq!(contents(metadata)?,original);assert_eq!(contents(&snapshots.0)?,secrets);
+     Ok(())
+ }
+ 
+ mod review;
++
++mod mutation;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/walletless/refund/wallet/helper/mutation.rs
+@@ -0,0 +1,114 @@
++//! Actual helper mutations use independent journals and disposable target wallets.
++use super::*;
++async fn call(program:&Path,path:&Path,kind:&str,action:&str,approval:Option<&str>,success:bool)->Result<Value> {
++    let program=program.to_owned();let path=path.to_owned();let kind=kind.to_owned();let action=action.to_owned();
++    let approval=approval.map(str::to_owned);
++    tokio::task::spawn_blocking(move || ->Result<Value> {
++        let id=uuid::Uuid::new_v4();
++        let mut request=json!({"schema":format!("monzero-bch-native-refund-wallet-{kind}-request-v1"),"requestId":id});
++        if kind!="status" {request["action"]=json!(action);}
++        if kind=="submit" {
++            request["commitment"]=json!(approval.context("missing fixture approval")?);
++            request["password"]=json!(if action=="check" {""} else {"fixture"});
++        }
++        let mut child=Command::new(&program).env_clear()
++            .envs(std::env::vars_os().filter(|(key,_)|matches!(key.to_str(),Some("PATH"|"LD_LIBRARY_PATH"))))
++            .arg(format!("--native-refund-wallet-{kind}-stdio-v1")).arg(path)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        if let Err(error)=child.stdin.take().context("missing mutation stdin")?.write_all(&serde_json::to_vec(&request)?) {
++            let _=child.kill();let _=child.wait();return Err(error.into())
++        }
++        let output=child.wait_with_output()?;
++        if !success {ensure!(!output.status.success() && output.stdout.is_empty(),"unsafe {kind}/{action} accepted");return Ok(Value::Null)}
++        ensure!(output.status.success(),"helper {kind}/{action} failed");
++        ensure!(output.stderr.is_empty() && output.stdout.len()<=16384,"unexpected mutation output");
++        let response:Value=serde_json::from_slice(&output.stdout)?;
++        ensure!(response["schema"]==format!("monzero-bch-native-refund-wallet-{kind}-response-v1")
++            && response["requestId"]==id.to_string() && response["executable"]==false,"mutation response context changed");
++        Ok(response)
++    }).await?
++}
++fn saved(metadata:&PrivateStore,snapshots:&PrivateStore,setup:&Setup,refund:Txid)->Result<Value> {
++    let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++    execution.bch_native_refund_wallet_status(refund,std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs())
++}
++fn submitted(value:&Value,setup:&Setup,action:&str,commitment:&str,wallet:&Value) {
++    assert_eq!(*value,json!({"schema":"monzero-bch-native-refund-wallet-submit-response-v1",
++        "requestId":value["requestId"],"tradeId":setup.quote.terms()["swapId"],"action":action,
++        "approvedCommitment":commitment,"executable":false,"chainObserved":false,"wallet":wallet}));
++}
++pub(super) async fn exercise(original_config:&Path,original_status:&Path,source:&PrivateStore,secrets:&PrivateStore,
++    setup:&Setup,rpc:&OwnedBchObserver,refund:Txid,fixture:&Fixture,server:&Server,helper:&Path,digest:&str)->Result<()> {
++    let original=contents(&source.0)?;let original_secrets=contents(&secrets.0)?;let original_files=contents(original_config)?;
++    let observer=fixture.funding_client()?;
++    for lost in [0,1,2] {
++        let metadata=PrivateStore::new()?;let snapshots=PrivateStore::new()?;let config=PrivateStore::new()?;
++        for (name,bytes) in &original {save(&metadata.0.join(name),bytes)?;}
++        for (name,bytes) in &original_secrets {save(&snapshots.0.join(name),bytes)?;}
++        let (wallet,address)={
++            let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            let recovered=execution.recover_light_bch_native_refund(&observer,rpc,refund,None,now).await?;
++            let id=SwapWalletId::new(setup.quote.terms()["swapId"].parse()?)?;
++            (WalletFixture::new(&id,recovered.address(),recovered.spend_key(),recovered.view_key(),recovered.native_txid()).await?,
++                recovered.address().clone())
++        };
++        let intent=metadata.0.join(format!("{}.bch-native-refund-wallet-intent",setup.quote.terms()["swapId"]));
++        let ready=metadata.0.join(format!("{}.bch-native-refund-wallet-ready",setup.quote.terms()["swapId"]));
++        {let mut state=wallet.state.lock().unwrap();state.intent=Some(intent.clone());state.lose_restore=lost==1;state.lose_scan=lost==2;}
++        let mut admission:Value=serde_json::from_slice(&std::fs::read(original_config.join("admission.json"))?)?;
++        admission["metadataDirectory"]=json!(metadata.0);admission["snapshotDirectory"]=json!(snapshots.0);
++        let admission_file=config.0.join("admission.json");save(&admission_file,&serde_json::to_vec(&admission)?)?;
++        let mut status:Value=serde_json::from_slice(&std::fs::read(original_status)?)?;
++        status["admissionConfigFile"]=json!(admission_file);
++        let status_file=config.0.join("status.json");save(&status_file,&serde_json::to_vec(&status)?)?;
++        let cookie=config.0.join("cookie");save(&cookie,b"user:pass\n")?;
++        let bch=config.0.join("bch.json");save(&bch,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-observer-rpc-v1",
++            "port":server.port,"cookieFile":cookie,"checkpointHeight":1,"checkpoint":"07".repeat(32),"subversion":"/Bitcoin Cash Node:29.0.0/"}))?)?;
++        let login=config.0.join("login");save(&login,b"fixture:fixture\n")?;
++        let endpoint=wallet.payout_session(&observer)?.recovery_endpoint(&address)?;
++        let target=config.0.join("target.json");save(&target,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-rpc-v1",
++            "daemonPort":endpoint["daemonPort"],"walletPort":endpoint["walletPort"],"loginFile":login}))?)?;
++        let (daemon,port)=fixture.rpc_ports();let observation=config.0.join("observer.json");
++        save(&observation,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-rpc-v1","daemonPort":daemon,"walletPort":port,"loginFile":login}))?)?;
++        let review_file=config.0.join("review.json");save(&review_file,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-refund-wallet-review-v1",
++            "statusConfigFile":status_file,"bchRpcFile":bch,"nativeRpcFile":target,"observerRpcFile":observation}))?)?;
++        let config_before=contents(&config.0)?;
++        let review=call(helper,&review_file,"review","restore",None,true).await?;
++        assert!(wallet.state.lock().unwrap().calls.is_empty());
++        let approved=review["review"]["commitment"].as_str().context("missing restore approval")?;
++        let wrong=if approved.starts_with('a') {format!("b{}",&approved[1..])} else {format!("a{}",&approved[1..])};
++        call(helper,&review_file,"submit","restore",Some(&wrong),false).await?;
++        assert!(wallet.state.lock().unwrap().calls.is_empty());assert!(!intent.exists());assert!(!ready.exists());
++        assert_eq!(contents(&metadata.0)?,original);
++        let reply=call(helper,&review_file,"submit","restore",Some(approved),lost==0).await?;
++        assert!(intent.exists());assert_eq!(ready.exists(),lost==0);
++        let record=saved(&metadata,&snapshots,setup,refund)?;
++        assert_eq!(record["state"],if lost==0 {"ready"} else {"attempted"});
++        if lost==0 {submitted(&reply,setup,"restore",approved,&record);}
++        let calls=wallet.state.lock().unwrap().calls.clone();
++        let observed=call(helper,&status_file,"status","",None,true).await?;
++        assert_eq!(observed,json!({"schema":"monzero-bch-native-refund-wallet-status-response-v1","requestId":observed["requestId"],
++            "tradeId":setup.quote.terms()["swapId"],"chainObserved":false,"executable":false,"wallet":record}));
++        call(helper,&review_file,"submit","restore",Some(approved),false).await?;
++        call(helper,&review_file,"submit","check",Some(approved),false).await?;
++        assert_eq!(wallet.state.lock().unwrap().calls,calls);
++        for action in ["check","open"] {
++            if action=="open" {wallet.payout_session(&observer)?.close(&address).await?;}
++            let calls=wallet.state.lock().unwrap().calls.clone();
++            let review=call(helper,&review_file,"review",action,None,true).await?;
++            assert_eq!(wallet.state.lock().unwrap().calls,calls);
++            let approved=review["review"]["commitment"].as_str().context("missing reconciliation approval")?;
++            let response=call(helper,&review_file,"submit",action,Some(approved),true).await?;
++            let record=saved(&metadata,&snapshots,setup,refund)?;assert_eq!(record["state"],"ready");
++            submitted(&response,setup,action,approved,&record);
++        }
++        let calls=wallet.state.lock().unwrap().calls.clone();
++        assert_eq!(calls.iter().filter(|call|call.as_str()=="generate_from_keys").count(),1);
++        assert!(calls.iter().all(|call|matches!(call.as_str(),"get_address"|"generate_from_keys"|"query_key"|"scan_tx"|"open_wallet"|"close_wallet")));
++        assert_eq!(contents(&snapshots.0)?,original_secrets);assert_eq!(contents(&config.0)?,config_before);
++        assert_eq!(hex(&Sha256::digest(std::fs::read(helper)?)),digest);
++    }
++    assert_eq!(contents(&source.0)?,original);assert_eq!(contents(&secrets.0)?,original_secrets);
++    assert_eq!(contents(original_config)?,original_files);Ok(())
++}

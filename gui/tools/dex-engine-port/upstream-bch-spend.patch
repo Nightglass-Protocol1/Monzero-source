@@ -1,0 +1,201 @@
+--- a/swap-core/src/bch.rs
++++ b/swap-core/src/bch.rs
+@@ -3,7 +3,7 @@
+ //!
+ //! A verified signature alone binds no chain, amount, fee or trade identity.
+ //! Covenant validation and authenticated per-trade keys must supply that context.
+-//! This module neither constructs transactions nor authorizes settlement.
++//! Prepared covenant transactions carry no settlement or relay authorization.
+ use anyhow::{Context, Result, ensure};
+ use bitcoin::{hashes::{Hash, sha256}, secp256k1::ecdsa};
+ use ecdsa_fun::{ECDSA, Signature, adaptor::{Adaptor, EncryptedSignature, HashTranscript},
+@@ -75,3 +75,4 @@
+ mod tests;
+ 
+ pub mod covenant;
++pub mod spend;
+--- /dev/null
++++ b/swap-core/src/bch/spend.rs
+@@ -0,0 +1,75 @@
++//! Native-BCH covenant spends. Returned transactions are unobserved and must not
++//! be relayed without authenticated terms, approval and current chain checks.
++use anyhow::{Context, Result, ensure};
++use bitcoin::{absolute, consensus::{deserialize, serialize}, transaction::Version,
++    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
++    script::{Builder, PushBytesBuf}};
++use ecdsa_fun::fun::Point;
++use super::covenant::Covenant;
++
++const MAX_MONEY_ATOMS: u64 = 2_100_000_000_000_000;
++const MAX_FUNDING_BYTES: usize = 2_000_000;
++
++pub struct SpendTerms {
++    pub outpoint: OutPoint,
++    pub locked_atoms: u64,
++    pub maximum_fee_atoms: u64,
++    pub minimum_output_atoms: u64,
++}
++
++impl Covenant {
++    /// Forward to the agreed timeout destination with this stage's CSV delay.
++    /// This checks neither the chain's activation state nor actual maturity.
++    pub fn prepare_timeout(&self, funding_raw: &[u8], terms: &SpendTerms) -> Result<Transaction> {
++        let script_sig = Builder::new()
++            .push_slice(PushBytesBuf::try_from(self.redeem_script().as_bytes().to_vec())?).into_script();
++        self.prepare_spend(funding_raw, terms, script_sig,
++            Sequence(u32::from(self.terms().delay_blocks)), self.terms().timeout_destination.clone())
++    }
++
++    /// Embeds a verified CHECKDATASIG signature. Publishing the result may reveal
++    /// an adaptor decryption key; callers must enforce the protocol release gate.
++    pub fn prepare_redemption(&self, funding_raw: &[u8], terms: &SpendTerms,
++        signature_der: &[u8]) -> Result<Transaction> {
++        let public = Point::from_bytes(self.terms().signing_key.serialize())
++            .context("invalid BCH covenant signing point")?;
++        self.data_message().verify_der(&public, signature_der)?;
++        let script_sig = Builder::new().push_slice(PushBytesBuf::try_from(signature_der.to_vec())?)
++            .push_slice(PushBytesBuf::try_from(self.redeem_script().as_bytes().to_vec())?).into_script();
++        self.prepare_spend(funding_raw, terms, script_sig, Sequence::ZERO,
++            self.terms().redeem_destination.clone())
++    }
++
++    fn prepare_spend(&self, funding_raw: &[u8], terms: &SpendTerms, script_sig: ScriptBuf,
++        sequence: Sequence, destination: ScriptBuf) -> Result<Transaction> {
++        ensure!(funding_raw.len() <= MAX_FUNDING_BYTES, "oversized BCH funding transaction");
++        let funding: Transaction = deserialize(funding_raw).context("invalid BCH funding bytes")?;
++        ensure!(!funding.input.is_empty() && !funding.output.is_empty() && !funding.is_coinbase()
++            && funding.input.iter().all(|input| !input.previous_output.is_null() && input.witness.is_empty()),
++            "BCH swap funding requires non-coinbase legacy inputs");
++        ensure!(serialize(&funding) == funding_raw, "noncanonical BCH funding encoding");
++        // In an unmodified Bitcoin-format decoder the token prefix is retained
++        // at the beginning of the serialized output script field. Never strip it.
++        // https://cashtokens.org/docs/spec/chip/#token-encoding
++        ensure!(funding.output.iter().all(|output| output.script_pubkey.as_bytes().first() != Some(&0xef)),
++            "CashToken-bearing funding is not supported for native BCH swaps");
++        let total = funding.output.iter().try_fold(0u64, |sum, output| sum.checked_add(output.value.to_sat()))
++            .context("BCH funding output total overflow")?;
++        ensure!(total <= MAX_MONEY_ATOMS, "BCH funding exceeds monetary range");
++        ensure!(funding.compute_txid() == terms.outpoint.txid, "BCH funding transaction identity mismatch");
++        let output = funding.output.get(terms.outpoint.vout as usize).context("missing BCH funding output")?;
++        ensure!(output.script_pubkey == self.script_pubkey() && output.value.to_sat() == terms.locked_atoms,
++            "BCH funding output differs from covenant terms");
++        let fee = self.terms().fee_atoms;
++        ensure!(fee <= terms.maximum_fee_atoms && terms.minimum_output_atoms > 0,
++            "BCH spend exceeds fee policy or lacks minimum output");
++        let amount = terms.locked_atoms.checked_sub(fee).context("BCH covenant fee exceeds lock")?;
++        ensure!(amount >= terms.minimum_output_atoms, "BCH covenant spend below minimum output");
++        Ok(Transaction { version: Version::TWO, lock_time: absolute::LockTime::ZERO,
++            input: vec![TxIn { previous_output: terms.outpoint, script_sig, sequence, witness: Witness::new() }],
++            output: vec![TxOut { value: Amount::from_sat(amount), script_pubkey: destination }] })
++    }
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/swap-core/src/bch/spend/tests.rs
+@@ -0,0 +1,100 @@
++use super::*;
++use crate::bch::covenant::CovenantTerms;
++use bitcoin::{hashes::Hash, Txid, secp256k1::PublicKey};
++
++fn fixture() -> Result<(CovenantTerms, Vec<u8>, Transaction)> {
++    let v: serde_json::Value = serde_json::from_str(include_str!("../reference-covenant.json"))?;
++    let sig: serde_json::Value = serde_json::from_str(include_str!("../reference-signature.json"))?;
++    let terms = CovenantTerms { fee_atoms: 1000, delay_blocks: 2,
++        signing_key: PublicKey::from_slice(&hex::decode(v["publicKey"].as_str().unwrap())?)?,
++        redeem_destination: ScriptBuf::from_bytes(hex::decode(v["redeemDestination"].as_str().unwrap())?),
++        timeout_destination: ScriptBuf::from_bytes(hex::decode(v["timeoutDestination"].as_str().unwrap())?) };
++    let reference: Transaction = deserialize(&hex::decode(include_str!("../reference-redemption.hex").trim())?)?;
++    Ok((terms, hex::decode(sig["signature"].as_str().unwrap())?, reference))
++}
++fn funding(contract: &Covenant, amount: u64) -> (Transaction, SpendTerms) {
++    let tx = Transaction { version: Version::TWO, lock_time: absolute::LockTime::ZERO,
++        input: vec![TxIn { previous_output: OutPoint { txid: Txid::from_byte_array([9;32]), vout: 1 },
++            script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() }],
++        output: vec![TxOut { value: Amount::from_sat(amount), script_pubkey: contract.script_pubkey() }] };
++    let terms = SpendTerms { outpoint: OutPoint { txid: tx.compute_txid(), vout: 0 }, locked_atoms: amount,
++        maximum_fee_atoms: contract.terms().fee_atoms, minimum_output_atoms: 546 };
++    (tx, terms)
++}
++
++#[test]
++fn redemption_matches_reference_except_synthetic_parent() -> Result<()> {
++    let (terms, signature, mut reference) = fixture()?;
++    let contract = Covenant::new(terms)?;
++    let (parent, spend) = funding(&contract, reference.output[0].value.to_sat()+1000);
++    reference.input[0].previous_output = spend.outpoint;
++    let tx = contract.prepare_redemption(&serialize(&parent), &spend, &signature)?;
++    assert_eq!(serialize(&tx), serialize(&reference));
++    assert!(contract.prepare_redemption(&serialize(&parent), &spend, &[]).is_err());
++    let mut damaged = signature; damaged.push(1);
++    assert!(contract.prepare_redemption(&serialize(&parent), &spend, &damaged).is_err());
++    Ok(())
++}
++
++#[test]
++fn timeout_stages_use_their_own_delays_and_exact_remaining_amounts() -> Result<()> {
++    let (mut refund_terms, _, _) = fixture()?;
++    refund_terms.delay_blocks = 5; refund_terms.fee_atoms = 2000;
++    let refund = Covenant::new(refund_terms.clone())?;
++    let mut lock_terms = refund_terms; lock_terms.delay_blocks = 2; lock_terms.fee_atoms = 1000;
++    lock_terms.timeout_destination = refund.script_pubkey();
++    let lock = Covenant::new(lock_terms)?;
++    let (parent, spend) = funding(&lock, 100_000);
++    let first = lock.prepare_timeout(&serialize(&parent), &spend)?;
++    assert_eq!(first.input[0].sequence, Sequence(2));
++    assert_eq!(first.output[0].value.to_sat(), 99_000);
++    assert_eq!(first.output[0].script_pubkey, refund.script_pubkey());
++    let next = SpendTerms { outpoint: OutPoint { txid: first.compute_txid(), vout: 0 },
++        locked_atoms: 99_000, maximum_fee_atoms: 2000, minimum_output_atoms: 546 };
++    let second = refund.prepare_timeout(&serialize(&first), &next)?;
++    assert_eq!(second.input[0].sequence, Sequence(5));
++    assert_eq!(second.output[0].value.to_sat(), 97_000);
++    assert_eq!(second.output[0].script_pubkey, refund.terms().timeout_destination);
++    for (tx, contract) in [(&first, &lock), (&second, &refund)] {
++        assert_eq!(tx.version, Version::TWO); assert_eq!(tx.lock_time, absolute::LockTime::ZERO);
++        assert_eq!(tx.input.len(), 1); assert_eq!(tx.output.len(), 1);
++        assert!(tx.input[0].witness.is_empty());
++        assert_eq!(tx.input[0].script_sig, Builder::new().push_slice(
++            PushBytesBuf::try_from(contract.redeem_script().as_bytes().to_vec())?).into_script());
++    }
++    Ok(())
++}
++
++#[test]
++fn funding_and_spend_policy_rejections_apply_to_both_branches() -> Result<()> {
++    let (terms, signature, _) = fixture()?; let contract = Covenant::new(terms)?;
++    let (parent, mut spend) = funding(&contract, 100_000);
++    let rejected = |raw: &[u8], terms: &SpendTerms| {
++        assert!(contract.prepare_timeout(raw, terms).is_err());
++        assert!(contract.prepare_redemption(raw, terms, &signature).is_err());
++    };
++    spend.maximum_fee_atoms = 999; rejected(&serialize(&parent), &spend); spend.maximum_fee_atoms = 1000;
++    spend.minimum_output_atoms = 99_001; rejected(&serialize(&parent), &spend); spend.minimum_output_atoms = 0;
++    rejected(&serialize(&parent), &spend); spend.minimum_output_atoms = 546;
++    spend.locked_atoms -= 1; rejected(&serialize(&parent), &spend); spend.locked_atoms += 1;
++    spend.outpoint.vout = 1; rejected(&serialize(&parent), &spend); spend.outpoint.vout = 0;
++    let mut changed = parent.clone(); changed.output[0].value = Amount::from_sat(99_999);
++    rejected(&serialize(&changed), &spend); // Changed identity.
++    spend.outpoint.txid = changed.compute_txid(); rejected(&serialize(&changed), &spend); // Changed amount.
++    changed = parent.clone(); changed.output[0].script_pubkey = ScriptBuf::new();
++    spend.outpoint.txid = changed.compute_txid(); rejected(&serialize(&changed), &spend);
++    changed = parent.clone(); changed.input[0].witness.push([1]);
++    spend.outpoint.txid = changed.compute_txid(); rejected(&serialize(&changed), &spend);
++    changed = parent.clone(); changed.input[0].previous_output = OutPoint::null();
++    spend.outpoint.txid = changed.compute_txid(); rejected(&serialize(&changed), &spend);
++    // Even an unrelated token-bearing output rejects this native-only boundary.
++    changed = parent.clone(); changed.output.push(TxOut { value: Amount::ZERO,
++        script_pubkey: ScriptBuf::from_bytes([vec![0xef], vec![0xbb;32], vec![0x10,1,0x51]].concat()) });
++    spend.outpoint.txid = changed.compute_txid(); rejected(&serialize(&changed), &spend);
++    changed = parent.clone(); changed.output.push(TxOut { value: Amount::from_sat(MAX_MONEY_ATOMS), script_pubkey: ScriptBuf::new() });
++    spend.outpoint.txid = changed.compute_txid(); rejected(&serialize(&changed), &spend);
++    let (small, policy) = funding(&contract, 999); rejected(&serialize(&small), &policy);
++    spend.outpoint.txid = parent.compute_txid(); let mut raw = serialize(&parent); raw.push(0);
++    rejected(&raw, &spend); rejected(&[], &spend);
++    Ok(())
++}
+--- /dev/null
++++ b/swap-core/src/bch/reference-redemption.hex
+@@ -0,0 +1 @@
++0200000001bfc6bbb47851441c7827059ae337a06aa9064da7f9537eb9243e45766c3dd34c00000000d8473045022100a0161ea14d3b41ed41250c8474fc8ec6ce1cab8df7f401e69ecf77c2ab63d82102207a2a57ddf2ea400e09ea059f3b261da96f5098858b17239931f3cc2fb929bb2a4c8ec3519dc4519d02e80300c600cc949d00ce00d18800cf00d28800d000d39d00cb641976a91481ec21969399d15c26af089d5db437ead066c5ba88ac00cd788821024ffcc0481629866671d89f05f3da813a2aacec1b52e69b8c0c586b665f5d4574ba6752b27523aa20df65a90e9becc316ff5aca44d4e06dfaade56622f32bafa197aba706c5e589758700cd87680000000001251cde06000000001976a91481ec21969399d15c26af089d5db437ead066c5ba88ac00000000

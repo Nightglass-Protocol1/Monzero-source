@@ -98,6 +98,70 @@ primary fingerprint. It requires the independent reproducer to use a distinct
 primary key and rejects missing, malformed, ambiguous, or incorrectly signed
 evidence.
 
+## Windows code signing (Authenticode)
+
+GnuPG signatures prove a release to people who check them; Windows checks only
+Authenticode signatures, so unsigned executables show "Unknown publisher" and
+SmartScreen warnings. Monzero signs Windows executables with a Certum Open Source
+Code Signing certificate. The certificate subject names the key holder, and
+Windows shows that name to every user. Its private key lives on the Certum card
+(or in Certum SimplySign) and never leaves it; the card PIN is entered when the
+PKCS#11 module asks for it, never on a command line or in a file.
+
+One-time setup on the signing workstation:
+
+1. Install `osslsigncode` (tested with 2.15), `libp11` (the OpenSSL PKCS#11 engine),
+   `p11-kit` and Certum's software for the card or SimplySign; note the path of
+   its PKCS#11 library.
+2. Find the key and certificate URIs, for example
+   `p11tool --provider /path/to/certum-pkcs11.so --list-all-privkeys --login`
+   and `--list-all-certs`.
+3. Export the signing certificate as PEM and append Certum's code-signing
+   intermediate certificate to make `certum-chain.pem`. Record the certificate's
+   exact subject; it is the expected signer for verification.
+
+Signing happens after the unsigned packages are built and verified, and before
+release metadata is generated, because the metadata must list the signed files:
+
+```bash
+export MONZERO_ZIP="$PWD/utils/release/container-zip.sh"
+export MONZERO_CODESIGN_PKCS11_MODULE=/path/to/certum-pkcs11.so
+export MONZERO_CODESIGN_KEY='pkcs11:...;type=private'
+export MONZERO_CODESIGN_CERTS=/path/to/certum-chain.pem
+utils/release/sign-windows-package.sh dist/monzero-VERSION-windows-x64.zip dist/signed
+utils/release/sign-windows-package.sh dist/monzero-VERSION-windows-gui-x64.zip dist/signed
+MONZERO_EXPECTED_SIGNER='CN=...' utils/release/verify-windows-package.sh dist/signed/monzero-VERSION-windows-x64.zip
+MONZERO_EXPECTED_SIGNER='CN=...' utils/release/verify-windows-gui-package.sh dist/signed/monzero-VERSION-windows-gui-x64.zip
+```
+
+Each executable is signed with SHA-256 and an RFC 3161 timestamp from
+`http://time.certum.pl`, so signatures stay valid after the certificate expires.
+The signed archive keeps the unsigned file name. Inside, the build manifests are
+left exactly as built (the GUI manifest's `code_signed` field describes the
+build, not the package) and `CODE-SIGNING.txt` records the signer, the unsigned
+package hash and each executable's unsigned hash. Before writing anything, the
+signer checks that removing each signature restores the unsigned executable and
+that `utils/release/unsign-windows-package.sh` rebuilds the original unsigned
+archive byte for byte. Independent builders reproduce the unsigned package; see
+`INDEPENDENT_REPRODUCTION.md`. Then generate the release metadata from
+`dist/signed` and sign it with GnuPG as above.
+
+The verifiers reject a signed package whose executables do not verify, carry a
+different signer from the record (or from `MONZERO_EXPECTED_SIGNER`), lack a
+recorded timestamp, or do not strip back to their recorded hashes, and an
+unsigned package that contains any signed executable. `RELEASE_STRICT=1` also
+requires timestamped signatures.
+
+To rehearse without the card, create a throwaway self-signed certificate,
+export it as PKCS#12, and run the same commands with
+`MONZERO_CODESIGN_PKCS12=test.p12` and `MONZERO_CODESIGN_CAFILE=test-cert.pem`
+instead of the PKCS#11 settings. Never publish a rehearsal package.
+
+Signing does not remove every warning at once. SmartScreen builds reputation per
+certificate from downloads, and software that includes a CPU miner is often
+flagged by antivirus products. Submit each signed release to the Microsoft
+Security Intelligence portal as software developer.
+
 ## Incident response
 
 If the offline system, backup, passphrase, transfer process, or signing subkey

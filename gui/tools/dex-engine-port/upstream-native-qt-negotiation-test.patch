@@ -1,0 +1,89 @@
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index 09abf850f..83cd5fe4a 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -416,6 +416,19 @@ mod tests {
+     /// No transaction broadcast, native funding proof, or public peer transport.
+     #[tokio::test]
+     async fn signed_quote_drives_engine_negotiation() -> Result<()> {
++        negotiate_signed_quote(false).await
++    }
++
++    #[tokio::test]
++    #[cfg(target_os = "linux")]
++    #[ignore = "requires explicitly selected Qt disposable reservation fixture executable"]
++    async fn qt_reserved_quote_drives_engine_negotiation() -> Result<()> {
++        negotiate_signed_quote(true).await
++    }
++
++    /// Qt mode uses the same signatures and wallet destinations, but both peers
++    /// load their terms through actual Qt storage instead of direct verification.
++    async fn negotiate_signed_quote(through_qt: bool) -> Result<()> {
+         use bitcoin_wallet::TestWalletBuilder;
+         use rand::rngs::OsRng;
+         use swap_core::bitcoin::{CancelTimelock, PunishTimelock, RemainingRefundTimelock};
+@@ -430,8 +443,8 @@ mod tests {
+         // Deliberately differ from the existing settlement fixture's constants.
+         proposed["btcSatoshis"] = "450000".into();
+         proposed["xmzAtoms"] = "150000000000".into();
+-        let alice_quote = verify(&proposed, 1000)?;
+-        let bob_quote = verify(&proposed, 1000)?;
++        let mut alice_quote = verify(&proposed, 1000)?;
++        let mut bob_quote = verify(&proposed, 1000)?;
+         let policy = DeploymentPolicy {
+             btc_genesis: "a".repeat(64), xmz_genesis: "b".repeat(64),
+             btc_network: "btc-regtest".into(), xmz_network: "xmz-fakechain".into(),
+@@ -441,6 +454,53 @@ mod tests {
+         };
+         alice_quote.check_deployment(&policy, 1000)?;
+         bob_quote.check_deployment(&policy, 1000)?;
++        if through_qt {
++            #[cfg(not(target_os = "linux"))]
++            anyhow::bail!("Qt reservation fixture requires Linux");
++            #[cfg(target_os = "linux")]
++            {
++                use std::{io::Write, os::unix::fs::DirBuilderExt, process::{Command, Stdio}};
++                struct Directory(std::path::PathBuf);
++                impl Drop for Directory {
++                    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
++                }
++                let directory = Directory(std::env::temp_dir().canonicalize()?
++                    .join(format!("xmz-qt-negotiation-{}", uuid::Uuid::new_v4())));
++                std::fs::DirBuilder::new().mode(0o700).create(&directory.0)?;
++                let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
++                let btc = SigningKey::from_bytes(&[1; 32]);
++                let xmz = SigningKey::from_bytes(&[2; 32]);
++                let payload = serde_json::to_vec(&proposed)?;
++                let sign = |key: &SigningKey, role: &str| {
++                    let domain = format!("monzero-native-btc-xmz-quote-v1-{role}");
++                    let mut framed = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:", domain.len(), domain, payload.len()).into_bytes();
++                    framed.extend_from_slice(&payload);
++                    hex(&key.sign(&framed).to_bytes())
++                };
++                let record = serde_json::to_vec(&serde_json::json!({
++                    "acceptedAt":"1000", "terms":proposed,
++                    "btcSignature":sign(&btc,"btc-funder"), "xmzSignature":sign(&xmz,"xmz-funder")
++                }))?;
++                let driver = std::env::var_os("MONZERO_TEST_QT_QUOTE_DRIVER")
++                    .ok_or_else(|| anyhow::anyhow!("missing Qt fixture executable"))?;
++                let mut child = Command::new(driver).arg("--reserve-signed-fixture")
++                    .arg(&directory.0).arg(hex(&btc.verifying_key().to_bytes()))
++                    .arg(hex(&xmz.verifying_key().to_bytes())).stdin(Stdio::piped())
++                    .stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
++                let written = child.stdin.take().ok_or_else(|| anyhow::anyhow!("missing fixture stdin"))?
++                    .write_all(&record);
++                let status = child.wait()?;
++                written?;
++                ensure!(status.success(), "Qt signed reservation fixture failed");
++                let read = || crate::native_quote_reservation::read_verified_quote(&directory.0,
++                    proposed["quoteId"].as_str().unwrap().parse()?,
++                    proposed["swapId"].as_str().unwrap().parse()?,
++                    bob_quote.commitment(), 1000, &btc.verifying_key().to_bytes(),
++                    &xmz.verifying_key().to_bytes(), Network::Regtest, XmzNetwork::Mainnet, &policy);
++                alice_quote = read()?;
++                bob_quote = read()?;
++            }
++        }
+         assert_eq!(alice_quote.commitment(), bob_quote.commitment());
+         use crate::native_negotiation::{Message, Transcript, signing_bytes};
+         let mut alice_transcript = Transcript::new(&alice_quote, &policy, 1000)?;

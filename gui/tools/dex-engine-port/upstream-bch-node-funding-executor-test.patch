@@ -1,0 +1,97 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper.rs
+@@ -289,3 +289,5 @@
+ }
+ 
+ mod submit;
++
++mod node_executor;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor.rs
+@@ -0,0 +1,86 @@
++//! Owned BCHN acceptance of production preparation, locking, signing and relay.
++use super::*;
++use std::str::FromStr;
++use bitcoin::hex::FromHex;
++use agreement::execution::funding::{preparation::WalletPreparationPolicy,relay::FundingRelayState};
++#[tokio::test]
++#[ignore = "requires a disposable owned BCHN regtest wallet and digest-pinned context"]
++async fn bch_owned_node_executes_funding_controller() -> Result<()> {
++    let path=PathBuf::from(std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG")?);
++    let bytes=std::fs::read(&path)?;
++    ensure!(bytes.len()<16384 && hex(&Sha256::digest(&bytes))==std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG_SHA256")?,"node fixture context changed");
++    let config:Value=serde_json::from_slice(&bytes)?;
++    let field=|name: &str| -> Result<&str> {config[name].as_str().context("missing fixture field")};
++    ensure!(field("schema")?=="monzero-owned-bch-node-executor-test-v1","wrong node fixture");
++    let clock=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    let base=clock.checked_sub(60).context("invalid fixture clock")?;
++    let network = BchNetwork::Regtest {checkpoint_height:1,checkpoint:BlockHash::from_str(field("checkpoint")?)?};
++    let setup = Setup::with_network_at(Some(network),base,base+3500)?;
++    let snapshots = PrivateStore::new()?; let metadata = PrivateStore::new()?;
++    let (selected,own,initial) = selected_with_outgoing_at(&setup,&snapshots.0,0,base)?;
++    let (native_selected,peer,native_initial) = selected_with_outgoing_at(&setup,&snapshots.0,1,base)?;
++    let (wallet,received) = selected.retain_received_view(&snapshots.0,&setup.quote,&setup.policy,
++        base+3,own.commitment(),peer.frame(),peer.signature())?;
++    let ack = wallet.acknowledgement(&setup.quote)?;
++    let agreed = wallet.accept_agreement(&setup.quote,&setup.policy,base+4,&ack,
++        &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++    let agreement = agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder,&agreed)?;
++    let pins = NegotiationPins {initial,selection:*selected.commitment(),outgoing:*own.commitment(),received,agreement};
++    let consent = agreement::execution::approval::review_admission(&setup.quote,&setup.policy,
++        Role::BchFunder,&pins,base+5)?;
++    let mut execution = AdmittedExecution::admit_reviewed(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++        Role::BchFunder,&consent.commitment,pins.clone(),base+5)?;
++
++    let (user,password)=field("cookie")?.split_once(':').context("bad fixture cookie")?;
++    let script=bitcoin::ScriptBuf::from_bytes(Vec::<u8>::from_hex(field("anchorScript")?)?);
++    let rpc=BchRpc::new(u16::try_from(config["port"].as_u64().context("missing port")?)?,user.into(),password.into(),network,
++        "fixture".into(),field("anchor")?.into(),script,field("subversion")?.into())?;
++    let policy=WalletPreparationPolicy {change_address:field("changeAddress")?.into(),
++        change_script:bitcoin::ScriptBuf::from_bytes(Vec::<u8>::from_hex(field("changeScript")?)?),
++        fee_rate_atoms_per_kb:1000,maximum_fee:1000,minimum_change:546,minimum_confirmations:2};
++    let prepared=execution.prepare_bch_funding_from_wallet(&rpc,base+6,&policy).await?;
++    let fee=prepared.preview().fee().to_sat();let template=serialize(prepared.preview().transaction());
++    ensure!(fee>0 && fee<=1000,"funding fee exceeded quote");
++    let inputs:Vec<_>=prepared.preview().transaction().input.iter().map(|i|i.previous_output).collect();
++    execution.lock_bch_funding_inputs(&rpc,base+7,&policy.change_address,2).await?;
++    let locked=rpc.locked_outpoints().await?;assert!(inputs.iter().all(|p|locked.contains(p)));
++    let signing=execution.review_bch_funding_signing(&rpc,base+8)?;
++    assert!(execution.sign_bch_funding(&rpc,&[0;32],base+9).await.is_err());
++    let signed=execution.sign_bch_funding(&rpc,&signing.commitment,base+9).await?;
++    let (native_wallet,native_received)=native_selected.retain_received_view(&snapshots.0,
++        &setup.quote,&setup.policy,base+3,peer.commitment(),own.frame(),own.signature())?;
++    let ack=native_wallet.acknowledgement(&setup.quote)?;
++    let agreed=native_wallet.accept_agreement(&setup.quote,&setup.policy,base+4,&ack,
++        &ack_sign(&ack,Role::BchFunder),&ack_sign(&ack,Role::NativeFunder))?;
++    let native_agreement=agreement::storage::persist(&snapshots.0,&setup.quote,&setup.policy,Role::NativeFunder,&agreed)?;
++    let native_pins=NegotiationPins {initial:native_initial,selection:*native_selected.commitment(),
++        outgoing:*peer.commitment(),received:native_received,agreement:native_agreement};
++    let native_metadata=PrivateStore::new()?;
++    let mut native=AdmittedExecution::admit(&native_metadata.0,&snapshots.0,&setup.quote,&setup.policy,
++        Role::NativeFunder,setup.quote.commitment(),native_pins,base+5)?;
++    let frame=native.prepare_bch_refund_adaptor(base+6)?;
++    let signature=SigningKey::from_bytes(&[2;32]).sign(&agreement::refund::signing_bytes(&frame)?).to_bytes();
++    let refund=native.retain_outgoing_bch_refund(base+7,&signature)?;
++
++    let protection=execution.review_bch_refund_protection(base+10,refund.frame(),refund.signature())?;
++    execution.accept_reviewed_bch_refund_protection(base+10,refund.frame(),refund.signature(),&protection.commitment)?;
++    let recovery=execution.review_bch_recovery(base+11)?;
++    execution.retain_reviewed_bch_recovery(base+11,&recovery.commitment)?;
++    let approval=execution.review_bch_funding_relay(&rpc,base+12)?;
++    assert!(execution.relay_bch_funding(&rpc,&[0;32],base+12).await.is_err());
++    let txid=execution.relay_bch_funding(&rpc,&approval.commitment,base+12).await?;
++    assert_eq!(txid,signed.lock_outpoint().txid);
++    let before=contents(&metadata.0)?;drop(execution);
++    let mut restored=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    assert_eq!(restored.bch_funding_relay_state()?,Some(FundingRelayState::Acknowledged {txid}));
++    assert_eq!(serialize(restored.prepared_bch_funding()?.unwrap().preview().transaction()),template);
++    assert_eq!(serialize(restored.signed_bch_funding()?.unwrap().transaction()),serialize(signed.transaction()));
++    assert_eq!(restored.relay_bch_funding(&rpc,&approval.commitment,base+13).await?,txid);
++    assert_eq!(contents(&metadata.0)?,before);
++    let report=PathBuf::from(field("report")?);ensure!(!report.exists(),"fixture report exists");
++    save(&report,&serde_json::to_vec(&json!({"schema":"monzero-bch-node-executor-result-v1","executable":false,
++        "txid":txid.to_string(),"lockVout":signed.lock_outpoint().vout,"lockScript":setup.quote.recovery_plan().lock().script_pubkey().to_hex_string(),
++        "principalAtoms":100000,"feeAtoms":fee,"productionWalletLockSignRelay":true,"restartSavedBytes":true,
++        "inputs":inputs.iter().map(|p|json!({"txid":p.txid.to_string(),"vout":p.vout})).collect::<Vec<_>>() }))?)?;
++    Ok(())
++}

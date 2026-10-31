@@ -1,0 +1,106 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout.rs
+@@ -0,0 +1,64 @@
++//! Exact native payout request derived from a matching recovered claim and the
++//! signed BCH quote. This binding alone cannot construct or broadcast a payment.
++use super::*;
++use crate::native_funding_rpc::full_proceeds::{ExactNetRequest,FullProceedsRequest};
++use swap_core::xmz::XmzAmount;
++
++pub(super) struct BoundPayout {pub(super) request: ExactNetRequest,pub(super) genesis: String}
++impl BoundPayout {
++    pub(super) fn from_quote(quote: &VerifiedBchQuote,claim: &NativeClaim,priority: u32) -> Result<Self> {
++        ensure!(claim.quote==*quote.commitment(),"native payout claim belongs to another BCH quote");
++        ensure!((1..=4).contains(&priority),"invalid BCH native payout priority");
++        ensure!(claim.address.network()==quote.xmz_payout().network()
++            && claim.address!=*quote.xmz_payout() && claim.address!=*quote.xmz_refund(),"invalid BCH native payout wallet or destinations");
++        let txid=&claim.native_txid;
++        ensure!(txid.len()==64 && txid!=&"0".repeat(64)
++            && txid.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),"invalid BCH native payout funding identity");
++        let amount=|field:&str| -> Result<XmzAmount> {Ok(XmzAmount::from_atoms(quote.terms()[field].parse()?))};
++        Ok(Self {genesis:quote.terms()["xmzGenesis"].clone(),request:ExactNetRequest {
++            source:FullProceedsRequest {wallet:claim.address.clone(),destination:quote.xmz_payout().clone(),
++                lock_txid:txid.clone(),locked:amount("xmzAtoms")?,maximum_fee:amount("xmzClaimFeeMaxAtoms")?,account:0,priority},
++            principal:amount("xmzPayoutAtoms")?,reserve_return:quote.xmz_refund().clone()}})
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use bitcoin::hashes::Hash;
++    fn claim(quote: &VerifiedBchQuote) -> Result<NativeClaim> {
++        let mut bytes=[0;32];bytes[0]=2;
++        let scalar=monero_oxide_wallet::ed25519::Scalar::read(&mut bytes.as_slice())?;
++        let point=monero_oxide_ext::PublicKey::from_private_key(&monero_oxide_ext::PrivateKey::from_scalar(scalar)).decompress();
++        let address=XmzAddress::new(quote.xmz_payout().network(),monero_address::AddressType::Legacy,point.clone(),point)?;
++        Ok(NativeClaim {quote:*quote.commitment(),admission:[3;32],spend:Zeroizing::new([2;32]),view:Zeroizing::new([2;32]),
++            address,native_txid:"ab".repeat(32),redemption:Txid::from_byte_array([4;32]),block:BlockHash::from_byte_array([5;32]),commitment:[6;32]})
++    }
++    #[test]
++    fn bch_native_payout_preserves_signed_principal_reserve_and_destinations() -> Result<()> {
++        let (policy,terms)=crate::bch_quote::tests::fixture();let quote=crate::bch_quote::tests::signed(&terms,&policy,1000)?;
++        let claim=claim(&quote)?;
++        for priority in 1..=4 {
++            let bound=BoundPayout::from_quote(&quote,&claim,priority)?;let source=&bound.request.source;
++            assert_eq!(source.wallet,claim.address);assert_eq!(source.lock_txid,claim.native_txid);
++            assert_eq!(source.locked.atoms(),101000);assert_eq!(source.maximum_fee.atoms(),1000);
++            assert_eq!(bound.request.principal.atoms(),100000);assert_eq!(source.account,0);assert_eq!(source.priority,priority);
++            assert_eq!(&source.destination,quote.xmz_payout());assert_eq!(&bound.request.reserve_return,quote.xmz_refund());
++            assert_eq!(bound.genesis,policy.xmz_genesis);
++        }
++        Ok(())
++    }
++    #[test]
++    fn bch_native_payout_rejects_mismatched_claim_and_invalid_inputs() -> Result<()> {
++        let (policy,terms)=crate::bch_quote::tests::fixture();let quote=crate::bch_quote::tests::signed(&terms,&policy,1000)?;
++        let mut claim=claim(&quote)?;
++        for priority in [0,5,u32::MAX] {assert!(BoundPayout::from_quote(&quote,&claim,priority).is_err());}
++        for txid in ["0".repeat(64),"AB".repeat(32),"ab".repeat(31)] {
++            claim.native_txid=txid;assert!(BoundPayout::from_quote(&quote,&claim,1).is_err());
++        }
++        claim.native_txid="ab".repeat(32);claim.quote=[0;32];assert!(BoundPayout::from_quote(&quote,&claim,1).is_err());
++        claim.quote=*quote.commitment();claim.address=quote.xmz_payout().clone();
++        assert!(BoundPayout::from_quote(&quote,&claim,1).is_err());
++        Ok(())
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet.rs
+@@ -23,6 +23,7 @@
+ }
+ impl AdmittedExecution<'_> {
+     fn claim_wallet_binding(&self,claim: &NativeClaim,id: &SwapWalletId) -> Result<[u8;32]> {
++        ensure!(claim.quote==*self.quote.commitment() && claim.admission==self.admission_digest()?,"BCH claim belongs to another execution");
+         // Stable across a reorganization that reconfirms the same exact spend
+         // in another block. Fresh chain evidence is required separately below.
+         Ok(hash(INTENT,&serde_json::to_vec(&json!({"quote":self.quote.commitment(),
+@@ -89,3 +90,5 @@
+         claim.check_wallet(session).await?;self.retain_claim_wallet_ready(intent)
+     }
+ }
++
++pub mod payout;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim.rs
+@@ -7,6 +7,7 @@
+ /// No Debug, Clone, Serialize or key getters. Future wallet operations must use
+ /// an exclusively owned local session and separate durable execution intent.
+ pub struct NativeClaim {
++    quote: [u8;32],admission: [u8;32],
+     spend: Zeroizing<[u8;32]>,view: Zeroizing<[u8;32]>,address: XmzAddress,
+     native_txid: String,redemption: Txid,block: BlockHash,commitment: [u8;32],
+ }
+@@ -59,7 +60,7 @@
+             "nativePayment":native_txid,"nativeProof":context.receipt,"address":address.to_string(),
+             "redemption":redemption,"redemptionBlock":confirmed.block(),
+             "bchDeployment":confirmed.deployment()}))?);
+-        Ok(NativeClaim {spend:Zeroizing::new(spend.as_bytes()),
++        Ok(NativeClaim {quote:*self.quote.commitment(),admission:context.admission,spend:Zeroizing::new(spend.as_bytes()),
+             view:Zeroizing::new(wallet.private_view_key().0.as_bytes()),address,native_txid,
+             redemption,block:confirmed.block(),commitment})
+     }

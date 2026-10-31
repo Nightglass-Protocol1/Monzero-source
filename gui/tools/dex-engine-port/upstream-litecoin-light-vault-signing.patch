@@ -1,0 +1,113 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -39,16 +39,29 @@
+     pub fn signing_commitment(&self)->sha256::Hash {
+         sha256::Hash::hash(&self.records[0].1)
+     }
++    fn check_signing_review(&self,expected:sha256::Hash)->Result<()> {
++        ensure!(expected==self.signing_commitment(),"Litecoin signing review commitment mismatch");
++        for (name,bytes) in &self.records {
++            ensure!(self.journal.read(name)?==*bytes,"Litecoin spend claim changed; reopen required");
++        }
++        Ok(())
++    }
++    /// Observed-policy callers check the chain before entering this method.
++    /// Validate retained claims before unlocking; wrong password/account cannot
++    /// publish signing intent. The unlocked seed stays inside this call.
++    pub(in crate::litecoin_light::vault::signing::review) fn approve_with_vault(&self,
++        vault:&crate::litecoin_light::vault::SeedVault,password:&[u8],expected:sha256::Hash)->Result<Transaction> {
++        self.check_signing_review(expected)?;
++        let seed=vault.unlock_for_account(password,&self.review.account.descriptor())?;
++        self.approve_and_sign(&seed,expected)
++    }
+     /// Retains signing intent before signing, then durably retains the signed
+     /// bytes before returning them. Exact retries (including after reopening
+     /// with the same operation/review) retain the same deterministic signature.
+     /// This does not establish human consent, unspentness or broadcast approval.
+     pub fn approve_and_sign(&self,seed:&SecretSeed,expected:sha256::Hash)->Result<Transaction> {
++        self.check_signing_review(expected)?;
+         let commitment=self.signing_commitment();
+-        ensure!(expected==commitment,"Litecoin signing review commitment mismatch");
+-        for (name,bytes) in &self.records {
+-            ensure!(self.journal.read(name)?==*bytes,"Litecoin spend claim changed; reopen required");
+-        }
+         let approval_name=format!("ltc-signing-{commitment}.json");
+         let approval=serde_json::to_vec(&serde_json::json!({
+             "schema":"monzero-ltc-signing-intent-v1","commitment":commitment.to_string()
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed/tests.rs
+@@ -92,3 +92,53 @@
+     assert_eq!(signed.compute_txid(),spend.compute_txid());drop(reopened);
+     assert_eq!(open()?.load_signed()?,signed);Ok(())
+ }
++
++#[test]
++fn vault_approval_binds_observation_claims_password_and_account_before_intent()->Result<()> {
++    use crate::litecoin_light::vault::SeedVault;
++    use bitcoin::{consensus::serialize,hashes::Hash};
++    // Public fixture seed; injected inclusion tests policy rather than consensus.
++    let (seed,account,mut spend,prevout)=super::super::super::super::tests::fixture()?;
++    let chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut credit=spend.clone();credit.output=vec![prevout.clone()];
++    let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),
++        block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},&credit)?;
++    spend.input[0].previous_output=OutPoint {txid:included.txid(),vout:0};
++    let payment=spend.output[0].clone();let fee=Amount::from_sat(1000);
++    let inputs=[IncludedInput {transaction:&included,vout:0,branch:Branch::Receive,index:3}];
++    let observed=ObservedWallet::reconcile(&chain,&[prevout.script_pubkey.clone()],std::slice::from_ref(&included))?;
++    let spent=ObservedWallet::reconcile_with_pending(&chain,&[prevout.script_pubkey],std::slice::from_ref(&included),&[spend.clone()])?;
++    let directory=Directory::new()?;let vault_dir=Directory::new()?;let other_dir=Directory::new()?;
++    let operation=Uuid::new_v4();let wallet=Uuid::new_v4();
++    let prepared=ConfirmedSpendReview::new(&chain,&account,spend.clone(),&inputs,&payment,None,fee,1)?
++        .retain_observed(&chain,&observed,&directory.0,operation)?;
++    let commitment=prepared.signing_commitment();
++    let password=b"PUBLIC TEST PASSWORD ONLY";
++    let vault=SeedVault::create(&vault_dir.0,LtcNetwork::Regtest,wallet,password,&seed)?;
++    let wrong=SecretSeed::from_bytes(Zeroizing::new([43;32]));
++    let other=SeedVault::create(&other_dir.0,LtcNetwork::Regtest,Uuid::new_v4(),password,&wrong)?;drop(wrong);drop(seed);
++    let before=fs::read_dir(&directory.0)?.map(|entry|{let path=entry?.path();Ok((path.clone(),fs::read(path)?))}).collect::<Result<BTreeMap<_,_>>>()?;
++    let assert_unchanged=||->Result<()> {
++        let after=fs::read_dir(&directory.0)?.map(|entry|{let path=entry?.path();Ok((path.clone(),fs::read(path)?))}).collect::<Result<BTreeMap<_,_>>>()?;
++        assert_eq!(after,before);Ok(())
++    };
++    let error=prepared.approve_with_vault_on(&chain,&spent,&vault,b"wrong",commitment).unwrap_err();
++    assert!(error.to_string().contains("observed spent"));assert_unchanged()?;
++    let error=prepared.approve_with_vault_on(&chain,&observed,&vault,b"wrong",sha256::Hash::hash(b"different review")).unwrap_err();
++    assert!(error.to_string().contains("commitment mismatch"));assert_unchanged()?;
++    assert!(prepared.approve_with_vault_on(&chain,&observed,&vault,b"wrong",commitment).is_err());assert_unchanged()?;
++    let error=prepared.approve_with_vault_on(&chain,&observed,&other,password,commitment).unwrap_err();
++    assert!(error.to_string().contains("does not match public account"));assert_unchanged()?;
++    let manifest=directory.0.join(format!("ltc-spend-{operation}.json"));let bytes=fs::read(&manifest)?;fs::write(&manifest,b"changed")?;
++    let error=prepared.approve_with_vault_on(&chain,&observed,&vault,b"wrong",commitment).unwrap_err();
++    assert!(error.to_string().contains("claim changed"));fs::write(&manifest,bytes)?;assert_unchanged()?;
++    drop(prepared);drop(vault);
++    let vault=SeedVault::open(&vault_dir.0,LtcNetwork::Regtest,wallet)?;
++    let open=||ClaimedSpend::open(&directory.0,operation,&account,&payment,None,fee,commitment);
++    let reopened=ObservedClaimedSpend::revalidate(open()?,&chain,&observed,&inputs,1)?;
++    let signed=reopened.approve_with_vault_on(&chain,&observed,&vault,password,commitment)?;
++    assert_eq!(signed.compute_txid(),spend.compute_txid());assert_eq!(signed.input[0].witness.len(),2);
++    assert_eq!(fs::read(directory.0.join(format!("ltc-signed-{commitment}.tx")))?,serialize(&signed));
++    assert_eq!(reopened.approve_with_vault_on(&chain,&observed,&vault,password,commitment)?,signed);
++    drop(reopened);drop(vault);assert_eq!(open()?.load_signed()?,signed);Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+@@ -52,6 +52,15 @@
+     pub fn transaction(&self)->&Transaction {self.claimed.transaction()}
+     pub fn fee(&self)->Amount {self.claimed.fee()}
+     pub fn signing_commitment(&self)->sha256::Hash {self.claimed.signing_commitment()}
++    /// Explicit vault-backed approval for this exact review. Observed spends,
++    /// stale anchors and changed claims fail before password-based key unlocking.
++    /// The vault must match the retained account. This does not itself obtain
++    /// human consent, prove complete/fresh unspentness, or authorize broadcast.
++    pub fn approve_with_vault_on(&self,chain:&HeaderSequence,observed:&ObservedWallet,
++        vault:&crate::litecoin_light::vault::SeedVault,password:&[u8],expected:sha256::Hash)->Result<Transaction> {
++        require_observed(chain,observed,self.network,self.height,self.tip,&self.inputs)?;
++        self.claimed.approve_with_vault(vault,password,expected)
++    }
+     /// Require a current caller-supplied observation even on retry. A caller
+     /// must refresh it; equality of tips alone cannot prove wall-clock freshness.
+     /// The lower-level recovery API can inspect previously retained bytes.

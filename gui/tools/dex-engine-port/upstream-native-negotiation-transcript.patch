@@ -1,0 +1,196 @@
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+index 881dda78e..d6ddbd3b1 100644
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -6,6 +6,7 @@ pub mod native_funding_rpc;
+ pub mod native_quote_destinations;
+ pub mod native_quote_signatures;
+ pub mod native_trade_quote;
++pub mod native_negotiation;
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/swap-machine/src/native_trade_quote.rs b/swap-machine/src/native_trade_quote.rs
+index c7e9da045..3586023af 100644
+--- a/swap-machine/src/native_trade_quote.rs
++++ b/swap-machine/src/native_trade_quote.rs
+@@ -282,6 +282,42 @@ mod tests {
+         alice_quote.check_deployment(&policy, 1000)?;
+         bob_quote.check_deployment(&policy, 1000)?;
+         assert_eq!(alice_quote.commitment(), bob_quote.commitment());
++        use crate::native_negotiation::{Message, Transcript, signing_bytes};
++        let mut alice_transcript = Transcript::new(&alice_quote, &policy, 1000)?;
++        let mut bob_transcript = Transcript::new(&bob_quote, &policy, 1000)?;
++        assert!(alice_transcript.completed_commitment().is_none());
++        fn exchange(message: Message, btc_sender: bool, alice: &mut Transcript,
++            bob: &mut Transcript) -> Result<Message> {
++            let bytes = alice.prepare(message.clone())?;
++            assert_eq!(bytes, bob.prepare(message)?);
++            let signer = SigningKey::from_bytes(&[if btc_sender { 1 } else { 2 }; 32]);
++            let wrong_signer = SigningKey::from_bytes(&[if btc_sender { 2 } else { 1 }; 32]);
++            let signature = signer.sign(&signing_bytes(&bytes)?).to_bytes();
++            let wrong_signature = wrong_signer.sign(&signing_bytes(&bytes)?).to_bytes();
++            assert!(alice.accept(&bytes, &wrong_signature).is_err());
++            assert!(alice.accept(&bytes, &[]).is_err());
++            assert!(alice.accept(&bytes, &signer.sign(&bytes).to_bytes()).is_err());
++            let mut duplicate = bytes.clone();
++            duplicate.splice(1..1, b"\"sequence\":0,".iter().copied());
++            assert!(alice.accept(&duplicate, &signer.sign(&signing_bytes(&duplicate)?).to_bytes()).is_err());
++            let mut unknown: serde_json::Value = serde_json::from_slice(&bytes)?;
++            unknown["message"].as_object_mut().unwrap().values_mut().next().unwrap()
++                .as_object_mut().unwrap().insert("unexpected".into(), true.into());
++            let unknown = serde_json::to_vec(&unknown)?;
++            assert!(alice.accept(&unknown, &signer.sign(&signing_bytes(&unknown)?).to_bytes()).is_err());
++            for field in ["swapId", "quoteCommitment", "previous", "schema"] {
++                let mut changed: serde_json::Value = serde_json::from_slice(&bytes)?;
++                changed[field] = "wrong".into();
++                let changed = serde_json::to_vec(&changed)?;
++                let signed = signer.sign(&signing_bytes(&changed)?).to_bytes();
++                assert!(alice.accept(&changed, &signed).is_err(), "accepted changed {field}");
++            }
++            // Invalid frames must leave the expected cursor usable.
++            let accepted = alice.accept(&bytes, &signature)?;
++            bob.accept(&bytes, &signature)?;
++            assert!(alice.accept(&bytes, &signature).is_err(), "accepted replay");
++            Ok(accepted)
++        }
+         let mut config = Regtest::get_config();
+         config.bitcoin_cancel_timelock = policy.cancel_blocks;
+         config.bitcoin_punish_timelock = policy.punish_blocks;
+@@ -305,12 +341,24 @@ mod tests {
+             RemainingRefundTimelock::new(config.bitcoin_remaining_refund_timelock),
+             bob_quote.destinations().btc_refund.clone(), u64::from(policy.xmz_confirmations),
+             fee, fee, fee, fee, fee, fee);
+-        let (received_id, alice1) = alice0.receive(bob0.next_message()?)?;
++        let Message::Bob0(message0) = exchange(Message::Bob0(bob0.next_message()?), true,
++            &mut alice_transcript, &mut bob_transcript)? else { unreachable!() };
++        let (received_id, alice1) = alice0.receive(message0)?;
+         assert_eq!(received_id, id);
+-        let bob1 = bob0.receive(&bob_wallet, alice1.next_message()?).await?;
+-        let alice2 = alice1.receive(bob1.next_message())?;
+-        let bob2 = bob1.receive(alice2.next_message()?)?;
+-        let alice3 = alice2.receive(bob2.next_message()?)?;
++        let Message::Alice1(message1) = exchange(Message::Alice1(alice1.next_message()?), false,
++            &mut alice_transcript, &mut bob_transcript)? else { unreachable!() };
++        let bob1 = bob0.receive(&bob_wallet, message1).await?;
++        let Message::Bob2(message2) = exchange(Message::Bob2(bob1.next_message()), true,
++            &mut alice_transcript, &mut bob_transcript)? else { unreachable!() };
++        let alice2 = alice1.receive(message2)?;
++        let Message::Alice3(message3) = exchange(Message::Alice3(alice2.next_message()?), false,
++            &mut alice_transcript, &mut bob_transcript)? else { unreachable!() };
++        let bob2 = bob1.receive(message3)?;
++        let Message::Bob4(message4) = exchange(Message::Bob4(bob2.next_message()?), true,
++            &mut alice_transcript, &mut bob_transcript)? else { unreachable!() };
++        let alice3 = alice2.receive(message4)?;
++        assert!(alice_transcript.completed_commitment().is_some());
++        assert_eq!(alice_transcript.completed_commitment(), bob_transcript.completed_commitment());
+         let (bob3, lock) = bob2.lock_btc().await?;
+         assert_eq!(alice3.lock_xmr_transfer_request().amount.as_pico(), 150000000000);
+         assert_eq!(bob3.xmr_amount().as_pico(), 150000000000);
+diff --git a/swap-machine/src/native_negotiation.rs b/swap-machine/src/native_negotiation.rs
+new file mode 100644
+index 000000000..4e2917246
+--- /dev/null
++++ b/swap-machine/src/native_negotiation.rs
+@@ -0,0 +1,101 @@
++//! Quote-bound authenticated negotiation. No transport, durable cursor or funding authority.
++use anyhow::{Result, ensure};
++use ed25519_dalek::{Signature, VerifyingKey};
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++use crate::{common, native_trade_quote::{DeploymentPolicy, VerifiedQuote}};
++
++const DOMAIN: &str = "monzero-native-negotiation-v1";
++const MAX_FRAME: usize = 1_048_576;
++
++#[derive(Clone, Serialize, Deserialize)]
++pub enum Message {
++    Bob0(common::Message0), Alice1(common::Message1), Bob2(common::Message2),
++    Alice3(common::Message3), Bob4(common::Message4),
++}
++impl Message {
++    fn sequence(&self) -> u8 {
++        match self { Self::Bob0(_) => 0, Self::Alice1(_) => 1,
++            Self::Bob2(_) => 2, Self::Alice3(_) => 3, Self::Bob4(_) => 4 }
++    }
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct Frame {
++    schema: String, quote_commitment: String, swap_id: String, sequence: u8,
++    previous: String, message: Message,
++}
++
++/// Both sides consume all five authenticated frames, including their own.
++/// On engine rejection, abort: this cursor does not replace engine validation.
++/// Never restore/reset this in-memory object to authorize replay after a crash.
++pub struct Transcript {
++    commitment: String, swap_id: String, keys: [VerifyingKey; 2],
++    next: u8, previous: [u8; 32],
++}
++
++fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
++fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>> {
++    Ok(serde_json::to_vec(&serde_json::to_value(value)?)?)
++}
++
++/// Separate domain from commercial quote signatures. Contains protocol view-key
++/// shares and must not be logged or published as a public order-book artifact.
++pub fn signing_bytes(frame: &[u8]) -> Result<Vec<u8>> {
++    ensure!(!frame.is_empty() && frame.len() <= MAX_FRAME, "invalid negotiation frame size");
++    let mut bytes = format!("MONZERO-DEX-OFFER-V1\n{}:{}{}:", DOMAIN.len(), DOMAIN, frame.len()).into_bytes();
++    bytes.extend_from_slice(frame);
++    Ok(bytes)
++}
++
++impl Transcript {
++    pub fn new(quote: &VerifiedQuote, policy: &DeploymentPolicy, now: u64) -> Result<Self> {
++        quote.check_deployment(policy, now)?;
++        let key = |field: &str| -> Result<VerifyingKey> {
++            let text = &quote.terms()[field];
++            let mut bytes = [0; 32];
++            for (i, byte) in bytes.iter_mut().enumerate() {
++                *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)?;
++            }
++            Ok(VerifyingKey::from_bytes(&bytes)?)
++        };
++        Ok(Self { commitment: hex(quote.commitment()), swap_id: quote.terms()["swapId"].clone(),
++            keys: [key("btcFunder")?, key("xmzFunder")?], next: 0, previous: [0; 32] })
++    }
++
++    pub fn prepare(&self, message: Message) -> Result<Vec<u8>> {
++        ensure!(self.next < 5 && message.sequence() == self.next, "wrong negotiation sequence");
++        if let Message::Bob0(ref first) = message {
++            ensure!(first.swap_id.to_string() == self.swap_id, "wrong engine swap identity");
++        }
++        let bytes = canonical(&Frame { schema: DOMAIN.into(), quote_commitment: self.commitment.clone(),
++            swap_id: self.swap_id.clone(), sequence: self.next, previous: hex(&self.previous), message })?;
++        ensure!(bytes.len() <= MAX_FRAME, "oversized negotiation frame");
++        Ok(bytes)
++    }
++
++    /// Failure never advances the cursor. Success authenticates and orders the
++    /// message; the engine must still validate proofs, transactions and policy.
++    pub fn accept(&mut self, bytes: &[u8], signature: &[u8]) -> Result<Message> {
++        ensure!(self.next < 5 && !bytes.is_empty() && bytes.len() <= MAX_FRAME,
++            "invalid negotiation frame");
++        let frame: Frame = serde_json::from_slice(bytes)?;
++        ensure!(frame.schema == DOMAIN && frame.quote_commitment == self.commitment
++            && frame.swap_id == self.swap_id && frame.sequence == self.next
++            && frame.previous == hex(&self.previous), "wrong negotiation context");
++        // Rebuilding rejects duplicate/unknown nested fields and noncanonical encodings.
++        ensure!(self.prepare(frame.message.clone())? == bytes, "noncanonical negotiation frame");
++        self.keys[usize::from(self.next % 2)].verify_strict(&signing_bytes(bytes)?,
++            &Signature::from_slice(signature)?)?;
++        let mut hash = Sha256::new();
++        hash.update(DOMAIN.as_bytes()); hash.update([0]); hash.update(bytes); hash.update(signature);
++        self.previous = hash.finalize().into();
++        self.next += 1;
++        Ok(frame.message)
++    }
++
++    pub fn completed_commitment(&self) -> Option<[u8; 32]> {
++        (self.next == 5).then_some(self.previous)
++    }
++}

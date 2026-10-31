@@ -1,0 +1,100 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review.rs b/swap-machine/src/litecoin_light/vault/signing/review.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review.rs
+@@ -63,3 +63,5 @@
+ mod tests;
+ 
+ pub mod confirmed;
++
++pub mod claims;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -0,0 +1,45 @@
++//! Cooperative persistent input claims. All preparations for a wallet must use
++//! the same private directory. No node lock, unspentness proof or auto-release.
++use super::*;
++use bitcoin::{consensus::serialize,hashes::{Hash,sha256}};
++pub struct ClaimedSpend {journal:Journal,review:SpendReview,records:Vec<(String,Vec<u8>)>}
++fn records(operation:Uuid,review:&SpendReview)->Result<Vec<(String,Vec<u8>)>> {
++    ensure!(!operation.is_nil(),"missing Litecoin spend operation");
++    let inputs=review.inputs.iter().map(|input|serde_json::json!({"outpoint":input.outpoint.to_string(),
++        "prevout":serialize(&input.prevout),"branch":match input.branch {Branch::Receive=>0,Branch::Change=>1},"index":input.index})).collect::<Vec<_>>();
++    let manifest=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-spend-claim-v1","operation":operation,
++        "network":review.account.network().genesis(),"account":review.account.descriptor(),
++        "transaction":serialize(&review.transaction),"inputs":inputs}))?;
++    ensure!(manifest.len()<=2_000_000,"Litecoin spend claim exceeds record limit");
++    let commitment=sha256::Hash::hash(&manifest).to_string();
++    let mut records=vec![(format!("ltc-spend-{operation}.json"),manifest)];
++    for input in &review.inputs {
++        let scope=serde_json::to_vec(&serde_json::json!({"network":review.account.network().genesis(),"outpoint":input.outpoint.to_string()}))?;
++        let name=format!("ltc-input-{}.claim",sha256::Hash::hash(&scope));
++        let bytes=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-input-claim-v1","operation":operation,"commitment":commitment}))?;
++        records.push((name,bytes));
++    }
++    Ok(records)
++}
++impl ClaimedSpend {
++    /// Holds the shared journal lease through signing. Preflights every record
++    /// before publication. An I/O failure can retain a subset; retry the exact
++    /// operation/review to complete it, never replace it or clear its claims.
++    pub fn retain(directory:&Path,operation:Uuid,review:SpendReview)->Result<Self> {
++        let records=records(operation,&review)?;let journal=Journal::open(directory)?;
++        for (name,bytes) in &records {journal.compatible(name,bytes)?;}
++        // Input claims precede the completed preparation manifest.
++        for (name,bytes) in records.iter().skip(1).chain(records.iter().take(1)) {journal.retain(name,bytes)?;}
++        Ok(Self {journal,review,records})
++    }
++    pub fn transaction(&self)->&Transaction {self.review.transaction()}
++    pub fn fee(&self)->Amount {self.review.fee()}
++    pub fn sign(&self,seed:&SecretSeed)->Result<Transaction> {
++        for (name,bytes) in &self.records {
++            ensure!(self.journal.read(name)?==*bytes,"Litecoin spend claim changed; reopen required");
++        }
++        self.review.sign(seed)
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/tests.rs
+@@ -0,0 +1,36 @@
++use super::*;
++use std::{fs,path::PathBuf,os::unix::fs::DirBuilderExt};
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("ltc-claims-{}",Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++fn review(indices:&[u32])->Result<(SecretSeed,SpendReview)> {
++    let (seed,account,mut tx,prevout)=super::super::super::tests::fixture()?;
++    let template=tx.input[0].clone();tx.input.clear();let mut inputs=Vec::new();
++    for index in indices {let mut input=template.clone();input.previous_output.vout=*index;
++        inputs.push(OwnedInput {outpoint:input.previous_output,prevout:prevout.clone(),branch:Branch::Receive,index:3});tx.input.push(input);}
++    let payment=tx.output[0].clone();
++    Ok((seed,SpendReview::new(&account,tx,inputs,&payment,None,Amount::from_sat(100000*indices.len() as u64))?))
++}
++#[test]
++fn claims_survive_restart_and_reject_conflicts_before_partial_publication()->Result<()> {
++    let directory=Directory::new()?;let operation=Uuid::new_v4();let (seed,first)=review(&[0])?;
++    let claim=ClaimedSpend::retain(&directory.0,operation,first)?;
++    assert_eq!(claim.sign(&seed)?.input[0].witness.len(),2);assert_eq!(claim.fee().to_sat(),1000);
++    assert!(ClaimedSpend::retain(&directory.0,operation,review(&[0])?.1).is_err());drop(claim);
++    drop(ClaimedSpend::retain(&directory.0,operation,review(&[0])?.1)?);
++    let count=fs::read_dir(&directory.0)?.count();
++    assert!(ClaimedSpend::retain(&directory.0,Uuid::new_v4(),review(&[1,0])?.1).is_err());
++    assert_eq!(fs::read_dir(&directory.0)?.count(),count);
++    drop(ClaimedSpend::retain(&directory.0,Uuid::new_v4(),review(&[1])?.1)?);
++    assert!(ClaimedSpend::retain(&directory.0,operation,review(&[2])?.1).is_err());Ok(())
++}
++#[test]
++fn claims_resume_partial_publication_and_refuse_tampered_manifest()->Result<()> {
++    let directory=Directory::new()?;let operation=Uuid::new_v4();let (seed,review)=review(&[0,1])?;
++    let entries=records(operation,&review)?;let journal=Journal::open(&directory.0)?;
++    journal.retain(&entries[1].0,&entries[1].1)?;drop(journal);
++    let claim=ClaimedSpend::retain(&directory.0,operation,review)?;
++    assert_eq!(claim.sign(&seed)?.input.len(),2);
++    fs::write(directory.0.join(&entries[0].0),b"changed")?;
++    assert!(claim.sign(&seed).is_err());Ok(())
++}

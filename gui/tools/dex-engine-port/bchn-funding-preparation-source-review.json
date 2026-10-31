@@ -1,0 +1,29 @@
+{
+  "repository": "https://github.com/bitcoin-cash-node/bitcoin-cash-node",
+  "commit": "89a591f7c5b1fd110c0819377ad8f2647d656800",
+  "tag": "v29.0.0",
+  "license": "MIT; COPYING retained in bchn-source-review-89a591f7c5b1",
+  "sha256": {
+    "src/wallet/rpcwallet.cpp": "a69d9554892d80eb253b3ce1753432d9cadd6f1224c7060e21f47d8410ac84e6",
+    "src/wallet/wallet.cpp": "d010c5e76863dc84ed19f2793a2da474b8f462deea96ac84b987c6cb028a824f",
+    "src/wallet/coincontrol.h": "c3de08d6dbd43a16cdbab80141b7e8edab02b6369ec59ca0ce8cec16b7098ed9",
+    "src/wallet/coincontrol.cpp": "a0034582579ec44858ea4fd6f0de3bf18f2e68a6f58360707fa5d21ca21923b2"
+  },
+  "review": [
+    "RPC FundTransaction accepts explicit changeAddress/changePosition, feeRate in BCH/kB, includeWatching, include_unsafe, lockUnspents and subtractFeeFromOutputs.",
+    "Wallet FundTransaction calls CreateTransaction with signing disabled. It retains the caller transaction header and appends wallet-selected inputs plus change.",
+    "CreateTransaction uses an explicit change destination when supplied; the new-key reservation path is the alternative branch. KeepKey only acts on an existing reserved key.",
+    "New wallet-selected inputs use sequence UINT32_MAX - 1. The Monzero FundingPreview verifier requires Sequence::MAX, so the RPC result is not directly compatible.",
+    "Wallet locks are conditional on lockUnspents. Preparation must keep this false; existing admitted-execution locking and sign-only approval remain separate operations.",
+    "AvailableCoins excludes immature coinbase, conflicted, spent and locked outputs, and filters unsafe transactions when requested. Token outputs require m_allow_tokens; CCoinControl::SetNull initializes that flag false.",
+    "Coin selection can still use the wallet own zero-confirmation change when m_spend_zero_conf_change is enabled, even with include_unsafe false. That flag is not the application minimum-confirmation policy.",
+    "FundTransaction enables fAllowOtherInputs, so a supplied input set is not an exact selection constraint. Any adapter relying on selected inputs must check the returned set explicitly."
+  ],
+  "implementation_gates": [
+    "Before adding wallet preparation, decide and test explicit unsigned sequence handling without weakening the existing FundingPreview verifier.",
+    "Require exact original contract principal, pinned wallet-owned change, canonical unsigned transaction and full parent bytes; independently validate fees, token exclusion, wallet ownership and live spendability.",
+    "Do not infer maturity or confirmation policy from wallet selection; apply existing fresh input observations before retaining/locking/signing.",
+    "Test unavailable parent transactions, unexpected additional/zero-confirmation inputs, partial retained preparation and changed replies before exposing preparation through helper/Qt."
+  ],
+  "scope": "Source review only. No preparation adapter is implemented by this record; no node was launched and no consensus acceptance is claimed."
+}

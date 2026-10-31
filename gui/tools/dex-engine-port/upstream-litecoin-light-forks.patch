@@ -1,0 +1,124 @@
+diff --git a/swap-machine/src/litecoin_light/headers/tests.rs b/swap-machine/src/litecoin_light/headers/tests.rs
+--- a/swap-machine/src/litecoin_light/headers/tests.rs
++++ b/swap-machine/src/litecoin_light/headers/tests.rs
+@@ -171,3 +171,44 @@
+     assert_eq!(sequence.chain_work(),&BigUint::from(4u8));
+     Ok(())
+ }
++
++#[test]
++fn forks_select_validated_work_and_report_disconnected_evidence() -> Result<()> {
++    let mut selected = HeaderSequence::new(LtcNetwork::Regtest)?;
++    selected.append(&serialize(&child()),1296688902)?;
++    let old = child().block_hash();
++    let mut candidate = selected.fork(0)?;
++    let mut alternative = child(); alternative.nonce=0;
++    candidate.append(&serialize(&alternative),1296688902)?;
++    assert!(selected.adopt(candidate.fork(1)?)?.is_none()); // equal work retains first branch
++    assert!(selected.contains(1,old));
++    let descendant = bytes("000000209d08f789f2afaf053878d9b21add2f847fff4a9c32fb58b8c5c79ca166f94a9d111111111111111111111111111111111111111111111111111111111111111106e7494dffff7f2000000000");
++    // Fixed fixture independently checked using Python hashlib.scrypt; no nonce search in tests.
++    assert_eq!(scrypt_hash(&descendant)?.as_slice(),bytes("4ffb10ab764015ff681677358d849316f894e6295b53d86b4afde1b5f9abd60d"));
++    let tip = candidate.append(&descendant,1296688902)?;
++    let change = selected.adopt(candidate)?.unwrap();
++    assert_eq!(change,ChainChange {common_ancestor:0,old_tip:(1,old),new_tip:(2,tip)});
++    assert!(!selected.contains(1,old)); assert!(selected.contains(1,alternative.block_hash()));
++    assert!(selected.contains(2,tip)); assert!(!selected.contains(3,tip));
++    assert_eq!(selected.chain_work(),&BigUint::from(6u8));
++    let prefix = selected.fork(1)?;
++    assert_eq!(prefix.chain_work(),&BigUint::from(4u8));
++    assert!(selected.adopt(prefix)?.is_none());
++    assert!(selected.fork(3).is_err());
++    assert_eq!(selected.height(),2);
++    Ok(())
++}
++#[test]
++fn forks_extension_and_wrong_network_are_distinct() -> Result<()> {
++    let mut selected = HeaderSequence::new(LtcNetwork::Regtest)?;
++    let genesis = selected.header(0).unwrap().block_hash();
++    let mut candidate = selected.fork(0)?;
++    candidate.append(&serialize(&child()),1296688752)?;
++    assert_eq!(selected.height(),0); // fork mutation is isolated
++    assert_eq!(selected.adopt(candidate)?.unwrap(),ChainChange {
++        common_ancestor:0,old_tip:(0,genesis),new_tip:(1,child().block_hash())});
++    let work = selected.chain_work().clone();
++    assert!(selected.adopt(HeaderSequence::new(LtcNetwork::Mainnet)?).is_err());
++    assert_eq!(selected.chain_work(),&work); assert!(selected.contains(1,child().block_hash()));
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/headers.rs b/swap-machine/src/litecoin_light/headers.rs
+--- a/swap-machine/src/litecoin_light/headers.rs
++++ b/swap-machine/src/litecoin_light/headers.rs
+@@ -1,5 +1,5 @@
+ //! Genesis-rooted Litecoin header sequence, pinned to Core v0.21.5.8 rules.
+-//! This validates one branch, not best-chain selection, freshness, checkpoints,
++//! Selects the most-work branch supplied by callers; does not establish freshness, checkpoints,
+ //! block bodies, MWEB consensus or current UTXO state. No spending authority.
+ use anyhow::{Context, Result, ensure};
+ use bitcoin::{BlockHash, TxMerkleNode, block::{Header, Version}, CompactTarget,
+@@ -11,6 +11,13 @@
+     network: LtcNetwork,
+     headers: Vec<Header>,
+     work: BigUint,
++}
++/// A branch replacement. Evidence above the common ancestor must be rechecked.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct ChainChange {
++    pub common_ancestor: u32,
++    pub old_tip: (u32, BlockHash),
++    pub new_tip: (u32, BlockHash),
+ }
+ impl HeaderSequence {
+     pub fn new(network: LtcNetwork) -> Result<Self> {
+@@ -45,6 +52,39 @@
+     pub fn height(&self) -> u32 { (self.headers.len()-1) as u32 }
+     pub fn header(&self,height: u32) -> Option<Header> { self.headers.get(height as usize).copied() }
+     pub fn chain_work(&self) -> &BigUint { &self.work }
++
++    /// Independently extend a previously validated prefix when investigating a fork.
++    pub fn fork(&self,height: u32) -> Result<Self> {
++        ensure!(height<=self.height(), "Litecoin fork height outside retained chain");
++        let headers = self.headers[..=height as usize].to_vec();
++        let mut work = BigUint::from(0u8);
++        for header in &headers { work += block_work(&target(header.bits.to_consensus(),self.network)?); }
++        Ok(Self {network:self.network,headers,work})
++    }
++
++    /// Ties retain the current branch. Candidates cannot bypass header validation:
++    /// their fields are private and construction starts at the pinned genesis.
++    /// This chooses among supplied branches, not necessarily the network's best tip.
++    pub fn adopt(&mut self,candidate: Self) -> Result<Option<ChainChange>> {
++        ensure!(candidate.network==self.network, "Litecoin candidate network mismatch");
++        if candidate.work<=self.work {return Ok(None)}
++        let common = self.headers.iter().zip(&candidate.headers)
++            .take_while(|(left,right)|left.block_hash()==right.block_hash()).count();
++        ensure!(common>0, "Litecoin candidate genesis mismatch");
++        let old_height = self.height(); let new_height = candidate.height();
++        let change = ChainChange {
++            common_ancestor:(common-1) as u32,
++            old_tip:(old_height,self.headers[old_height as usize].block_hash()),
++            new_tip:(new_height,candidate.headers[new_height as usize].block_hash()),
++        };
++        *self = candidate;
++        Ok(Some(change))
++    }
++
++    /// Membership only; does not establish freshness, unspentness or finality.
++    pub fn contains(&self,height: u32,hash: BlockHash) -> bool {
++        self.header(height).is_some_and(|header|header.block_hash()==hash)
++    }
+ 
+     /// `now` must be supplied by the caller's clock, not a server timestamp.
+     /// Validation is completed before either headers or cumulative work change.
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -1,6 +1,7 @@
+ //! Read-only Electrum 1.4 requests over a caller-supplied stream.
+ //! Production callers must supply an authenticated TLS stream. This module
+-//! does not create connections, authenticate servers or validate chain work.
++//! does not create connections or authenticate servers. Header downloads are
++//! validated by HeaderSequence before they extend a retained branch.
+ //! Matching reported genesis prevents accidental wrong-network use, not lies.
+ use super::*;
+ use serde::de::DeserializeOwned;

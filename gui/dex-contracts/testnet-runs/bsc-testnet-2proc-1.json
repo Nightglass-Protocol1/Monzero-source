@@ -1,0 +1,37 @@
+{
+  "run": "two processes on one machine (bsc_trader owner + claimer), accounts #2/#3",
+  "owner": {
+    "bnbTxs": {
+      "new_swap": [
+        "0x0a01c5ec1ca104b74bc9b653017b78f7d9aaccb7ab6a8c6dc4d232bc765324fa"
+      ],
+      "set_ready": [
+        "0x62f8a4b6d6b8b55cec7135249dabec9c5b78a6bbee561f2a0bf18c80470a48e2"
+      ]
+    },
+    "final": "Done(Swapped)",
+    "role": "owner",
+    "sharedXmzAddress": "KgHo7X3rhCULMuvrKW7GRcAD599MGh8Wv8N6H6prgnbG323Qq9Nacy78ZSYakdsPDc6WfqrxzaPGxitvF9Qx3tx8VRkLB7f",
+    "tradeId": "0x739ea8f1dae8ffeae1e800e4911de93239ef960fe2a01d1d673c2fe276e84893"
+  },
+  "claimer": {
+    "bnbTxs": {
+      "claim": [
+        "0xf9595b6e840d635469b251a8e6181bfda941ca70dd55f0c810a7257dc38951f7"
+      ]
+    },
+    "final": "Done(Swapped)",
+    "role": "claimer",
+    "sharedXmzAddress": "KgHo7X3rhCULMuvrKW7GRcAD599MGh8Wv8N6H6prgnbG323Qq9Nacy78ZSYakdsPDc6WfqrxzaPGxitvF9Qx3tx8VRkLB7f",
+    "tradeId": "0x739ea8f1dae8ffeae1e800e4911de93239ef960fe2a01d1d673c2fe276e84893"
+  },
+  "ownerXmzSweep": [
+    "342401cf4a97f868bb7fd57b72490eb9098c44173a116db6443910d4625d018a"
+  ],
+  "claimerXmzLock": "a3ccb69e0e80523de7030eb98aa658d4c92af2d70e283607c566279f595b1ed7",
+  "notes": [
+    "First key answer was lost when the owner's swarm closed right after answering; the owner now keeps answering key requests for as long as it runs (answers repeat).",
+    "The claimer's lock search started after the owner's lock (it saved its start block only when it agreed); its journal start block was set to the owner's (block 139847253, before the lock) and the runner now records the start block before the first request. Both rules documented in the engine.",
+    "Both ended Done(Swapped), each transaction once."
+  ]
+}

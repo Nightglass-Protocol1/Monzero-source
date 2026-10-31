@@ -1,5 +1,6 @@
 #include "OfferIdentity.h"
 #include <stdexcept>
+#include <QtEndian>
 
 namespace {
 // Version pins algorithm and costs: Argon2id v1.3, 3 passes, 64 MiB.
@@ -16,9 +17,9 @@ bool derive(unsigned char *key, const QByteArray &passphrase, const unsigned cha
             crypto_pwhash_ALG_ARGON2ID13) == 0;
 }
 
-QByteArray message(const QByteArray &payload, const QByteArray &network)
+QByteArray message(const QByteArray &payload, const QByteArray &network, int maximum = 16384)
 {
-    if (payload.isEmpty() || payload.size() > 16384 || network.isEmpty() || network.size() > 128)
+    if (payload.isEmpty() || payload.size() > maximum || network.isEmpty() || network.size() > 128)
         return {};
     return QByteArray("MONZERO-DEX-OFFER-V1\n") + QByteArray::number(network.size()) + ":" + network
         + QByteArray::number(payload.size()) + ":" + payload;
@@ -99,7 +100,55 @@ QByteArray OfferIdentity::publicKey() const
 
 QByteArray OfferIdentity::sign(const QByteArray &payload, const QByteArray &network) const
 {
-    const auto bytes = message(payload, network);
+    return signFramed(message(payload, network));
+}
+
+QByteArray OfferIdentity::signLitecoinNegotiation(const QByteArray &frame) const
+{
+    auto bytes = message(frame, "monzero-ltc-xmz-key-exchange-v1", 200000);
+    const auto signature = signFramed(bytes);
+    sodium_memzero(bytes.data(), bytes.size());
+    return signature;
+}
+
+QByteArray OfferIdentity::signLitecoinRecovery(const QByteArray &frame) const
+{
+    if (frame.isEmpty() || frame.size() > 16384) return {};
+    QByteArray bytes("monzero-ltc-xmz-recovery-v1");
+    bytes.append('\0');
+    char length[8];
+    qToBigEndian<quint64>(quint64(frame.size()), reinterpret_cast<uchar *>(length));
+    bytes.append(length, sizeof length);
+    bytes.append(frame);
+    const auto signature = signFramed(bytes);
+    sodium_memzero(bytes.data(), bytes.size());
+    return signature;
+}
+
+QByteArray OfferIdentity::signLitecoinRedeem(const QByteArray &frame) const
+{
+    if (frame.isEmpty() || frame.size() > 16384) return {};
+    QByteArray bytes("monzero-ltc-xmz-redeem-v1");
+    bytes.append('\0');
+    char length[8];
+    qToBigEndian<quint64>(quint64(frame.size()), reinterpret_cast<uchar *>(length));
+    bytes.append(length, sizeof length);
+    bytes.append(frame);
+    const auto signature = signFramed(bytes);
+    sodium_memzero(bytes.data(), bytes.size());
+    return signature;
+}
+
+QByteArray OfferIdentity::signBchSuccess(const QByteArray &frame) const
+{
+    auto bytes = message(frame, "monzero-bch-success-adaptor-v1", 8192);
+    const auto signature = signFramed(bytes);
+    sodium_memzero(bytes.data(), bytes.size());
+    return signature;
+}
+
+QByteArray OfferIdentity::signFramed(const QByteArray &bytes) const
+{
     if (bytes.isEmpty() || !m_initialized) return {};
     QByteArray signature(crypto_sign_BYTES, '\0');
     if (crypto_sign_detached(reinterpret_cast<unsigned char *>(signature.data()), nullptr,

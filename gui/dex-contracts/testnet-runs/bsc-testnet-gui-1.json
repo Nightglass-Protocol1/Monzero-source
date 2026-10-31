@@ -1,0 +1,35 @@
+{
+  "run": "the Monzero GUI (built from gui-wt-evm with the DEX prototype) as the owner/BNB buyer, account #0; a bsc_trader process as the claimer/XMZ seller, account #1; BNB testnet + XMZ testnet",
+  "gui": {
+    "approvedAt": "22:02:36 UTC (one click on 'Approve locking my funds')",
+    "stepsAfterApproval": "all automatic (20 s cycle): lock, setReady, sweep",
+    "screenshots": [
+      "bsc-testnet-gui-1-approval.png",
+      "bsc-testnet-gui-1-done.png"
+    ],
+    "finalPanel": "Status: Swap complete: the XMZ is in your wallet."
+  },
+  "owner": {
+    "final": "Done(Swapped)",
+    "retained": {
+      "new_swap": 1,
+      "set_ready": 1
+    },
+    "xmzSweep": [
+      "c281bd1eb33073ac861b7e262676cba460f578b63f4bb815d7783405fe62a78f"
+    ]
+  },
+  "claimer": {
+    "final": "Done(Swapped)"
+  },
+  "verified": {
+    "ownerXmzWallet": "19.9903232 tXMZ unlocked (20 less the sweep fee)",
+    "claimerBnb": "#1 0.02 -> 0.0399955882 tBNB (+0.02 less claim gas)",
+    "ownerBnb": "#0 0.0998679 -> 0.0798451 tBNB (0.02 plus gas)"
+  },
+  "issues": [
+    "Approve button was hidden during each ~12 s step (fixed: queued approval, 091274feb)",
+    "Test harness started the owner's XMZ wallet RPC while the setup process still held the wallet file: the sweep waited until the RPC was restarted (script fixed); the panel showed the error and the app recovered on its own",
+    "After failed steps the panel kept an older stage (fixed: e7deb9d82)"
+  ]
+}

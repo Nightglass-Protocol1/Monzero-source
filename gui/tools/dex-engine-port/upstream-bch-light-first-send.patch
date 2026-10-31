@@ -1,0 +1,223 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light.rs
+@@ -66,3 +66,5 @@
+ }
+ 
+ pub mod retention;
++
++pub mod relay;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/relay.rs
+@@ -0,0 +1,47 @@
++//! Explicit first publication of local BCH funding after private recovery.
++//! Wallet relay intent precedes TLS; interrupted/unknown attempts require reconciliation.
++use super::*;
++use crate::litecoin_light::{headers::HeaderSequence,accounting::ObservedWallet,tls::TlsEndpoint,
++    vault::signing::review::{confirmed::{IncludedInput,claimed::ObservedClaimedSpend},claims::broadcast::BroadcastStatus}};
++use bitcoin::{consensus::serialize,hashes::{Hash,sha256},Txid};
++use super::super::relay::FundingRelayReview;
++
++impl AdmittedExecution<'_> {
++    /// Review exact retained funding and recovery against same-tip input evidence.
++    /// A wallet's personal-payment confirmation setting cannot weaken trade policy.
++    pub fn review_light_bch_funding_send(&self,spend:&ObservedClaimedSpend,
++        chain:&HeaderSequence,observed:&ObservedWallet,inputs:&[IncludedInput<'_>],
++        expected:sha256::Hash,endpoint:&TlsEndpoint,now:u64)->Result<FundingRelayReview> {
++        self.quote.check_policy(self.policy,now)?;
++        ensure!(endpoint.network()==chain.network(),"wrong BCH light relay endpoint network");
++        spend.check_funding_inputs_on(chain,observed,inputs,u64::from(self.policy.bch_confirmations))?;
++        let claim=spend.retained_claim();
++        let (signed,signed_at)=self.require_local_funding_claim(claim,chain.network(),expected)?;
++        let recovery=self.retained_bch_recovery()?.context("private BCH recovery required before local funding relay")?;
++        ensure!(now>=signed_at && now>=recovery.prepared_at(),"BCH light relay predates funding or recovery");
++        self.funding_message_material()?;
++        ensure!(claim.broadcast_status(endpoint,expected)?==BroadcastStatus::NoLocalAttempt,
++            "BCH local funding already attempted; reconcile first");
++        let details=serde_json::json!({"schema":"monzero-bch-light-relay-review-v1","action":"send",
++            "tradeId":self.quote.terms()["swapId"],"quoteCommitment":hex(self.quote.commitment()),
++            "claimCommitment":expected,"txid":signed.transaction().compute_txid(),
++            "signedDigest":sha256::Hash::hash(&serialize(signed.transaction())),
++            "privateRecovery":hex(recovery.commitment()),"cancelTxid":recovery.cancel().compute_txid(),
++            "refundTxid":recovery.refund_txid()?,"punishTxid":recovery.punish().compute_txid(),
++            "minimumConfirmations":self.policy.bch_confirmations,"observedHeight":chain.height(),
++            "observedTip":observed.tip(),"endpoint":{"network":endpoint.network().storage_identity(),
++                "host":endpoint.host(),"port":endpoint.port()}});
++        let commitment=hash("monzero-bch-light-relay-review-v1",&serde_json::to_vec(&details)?);
++        Ok(FundingRelayReview {details,commitment})
++    }
++
++    /// Fresh consent covers the exact transaction, recovery, selected tip and
++    /// endpoint. No key unlock or re-signing. Cancellation retains unknown intent.
++    pub async fn send_light_bch_funding(&self,spend:&ObservedClaimedSpend,
++        chain:&HeaderSequence,observed:&ObservedWallet,inputs:&[IncludedInput<'_>],
++        expected:sha256::Hash,endpoint:&TlsEndpoint,approved:&[u8;32],now:u64)->Result<Txid> {
++        let review=self.review_light_bch_funding_send(spend,chain,observed,inputs,expected,endpoint,now)?;
++        ensure!(review.commitment==*approved,"BCH local funding send approval is stale or changed");
++        spend.broadcast_on(chain,observed,endpoint,expected).await
++    }
++}
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/retention.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/light/retention.rs
+@@ -97,6 +97,19 @@
+             bitcoin::Script::from_bytes(&record.template.change),record.template.maximum_fee,record.template.minimum_change)?;
+         self.restore_local_signed_funding()?.map(|(signed,_)|signed).context("local BCH funding publication incomplete")
+     }
++    pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
++    fn require_local_funding_claim(&self,claim:&ClaimedSpend,network:LightNetwork,
++        expected:sha256::Hash)->Result<(SignedFunding,u64)> {
++        let bytes=self.local_record_bytes()?.context("missing local BCH source binding")?;
++        let (record,_)=self.validate_local_record(&bytes)?;
++        ensure!(record.network==network.storage_identity() && record.claim==expected.to_byte_array(),
++            "local BCH wallet claim differs from retained trade");
++        let retained=claim.retained_bch_funding(network,self.quote.terms()["swapId"].parse()?,expected)?;
++        let result=self.restore_local_signed_funding()?.context("missing local BCH funding")?;
++        ensure!(retained.signed()==result.0.transaction()
++            && serialize(retained.unsigned())==record.template.unsigned,"local BCH funding bytes changed");
++        Ok(result)
++    }
+     /// Historical exact funding for existing recovery code, including after
+     /// expiry. Missing preparation is a partial publication, never relay consent.
+     pub(in crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding)
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests.rs
+@@ -876,8 +876,8 @@
+ mod admission_helper;
+ 
+ #[cfg(target_os="linux")]
+-#[test]
+-fn admitted_bch_trade_verifies_exact_local_wallet_signed_funding()->Result<()> {
++#[tokio::test]
++async fn admitted_bch_trade_verifies_exact_local_wallet_signed_funding()->Result<()> {
+     use agreement::execution::{AdmittedExecution,NegotiationPins};
+     use crate::litecoin_light::{network::BchNetwork,account::Branch,vault::{SecretSeed,
+         signing::review::{SpendReview,OwnedInput,claims::ClaimedSpend}}};
+@@ -991,6 +991,13 @@
+     let recovery_commitment=*recovery.commitment();drop(execution);
+     let execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
+     assert_eq!(execution.retained_bch_recovery()?.unwrap().commitment(),&recovery_commitment);
+-    }
+-    Ok(())
+-}
++    if light_network==BchNetwork::Regtest {
++        light_send::exercise(&execution,claim,&parent,&account,&payment,&claims.0,&metadata.0,
++            operation,commitment,setup.policy.bch_confirmations).await?;
++    }
++    }
++    Ok(())
++}
++
++#[cfg(target_os="linux")]
++mod light_send;
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/light_send.rs
+@@ -0,0 +1,80 @@
++use super::*;
++use agreement::execution::AdmittedExecution;
++use crate::litecoin_light::{account::PublicAccount,accounting::ObservedWallet,headers::HeaderSequence,
++    network::BchNetwork,session::ReadSession,tls::TlsEndpoint,account::Branch,
++    vault::signing::review::{claims::{ClaimedSpend,broadcast::BroadcastStatus},
++        confirmed::{IncludedInput,claimed::ObservedClaimedSpend}}};
++use bitcoin::hashes::sha256;
++use std::{path::Path,time::Duration};
++use tokio::io::{AsyncBufReadExt,AsyncWriteExt,BufReader};
++
++pub(super) async fn exercise(execution:&AdmittedExecution<'_>,claim:ClaimedSpend,parent:&Transaction,
++    account:&PublicAccount,payment:&TxOut,claims:&Path,metadata:&Path,operation:uuid::Uuid,
++    expected:sha256::Hash,minimum:u32)->Result<()> {
++    // Synthetic block-body inclusion tests policy; these are not live-chain funds.
++    let mut chain=HeaderSequence::new(BchNetwork::Regtest)?;
++    for _ in 0..minimum {
++        let mut header=chain.header(chain.height()).unwrap();header.prev_blockhash=header.block_hash();
++        header.version=bitcoin::block::Version::from_consensus(0x20000000);
++        header.merkle_root=bitcoin::TxMerkleNode::from_byte_array(parent.compute_txid().to_byte_array());
++        header.time+=1;header.nonce=0;
++        while header.validate_pow(header.target()).is_err() {header.nonce+=1;}
++        chain.append(&serialize(&header),u64::from(header.time)+7201)?;
++    }
++    let (client,server)=tokio::io::duplex(65536);
++    let raw=hex(&serialize(parent));let genesis=chain.network().genesis();
++    let server=tokio::spawn(async move {
++        let mut stream=BufReader::new(server);
++        for (method,result) in [
++            ("server.version",serde_json::json!(["fixture","1.4"])),
++            ("server.features",serde_json::json!({"genesis_hash":genesis,"hash_function":"sha256"})),
++            ("blockchain.transaction.get",serde_json::json!(raw)),
++            ("blockchain.transaction.get_merkle",serde_json::json!({"block_height":1,"pos":0,"merkle":[]}))] {
++            let mut line=String::new();assert!(stream.read_line(&mut line).await.unwrap()>0);
++            let request:serde_json::Value=serde_json::from_str(&line).unwrap();assert_eq!(request["method"],method);
++            let mut reply=serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})).unwrap();
++            reply.push(b'\n');stream.get_mut().write_all(&reply).await.unwrap();
++        }
++    });
++    let mut session=ReadSession::negotiate(client,BchNetwork::Regtest).await?;
++    let included=session.transaction_on(&chain,1,parent.compute_txid()).await?;drop(session);server.await?;
++    let scripts=[parent.output[0].script_pubkey.clone()];
++    let inputs=[IncludedInput {transaction:&included,vout:0,branch:Branch::Receive,index:0}];
++    let shallow=chain.fork(1)?;
++    let shallow_observation=ObservedWallet::reconcile(&shallow,&scripts,std::slice::from_ref(&included))?;
++    let held_listener=std::net::TcpListener::bind("127.0.0.1:0")?;
++    let endpoint=TlsEndpoint::new("127.0.0.1".into(),held_listener.local_addr()?.port(),BchNetwork::Regtest)?;
++    let spend=ObservedClaimedSpend::revalidate(claim,&shallow,&shallow_observation,&inputs,1)?;
++    assert!(execution.review_light_bch_funding_send(&spend,&shallow,&shallow_observation,&inputs,expected,&endpoint,1013).is_err());
++    drop(spend);
++    let claim=ClaimedSpend::open(claims,operation,account,payment,None,Amount::from_sat(1000),expected)?;
++    let observed=ObservedWallet::reconcile(&chain,&scripts,std::slice::from_ref(&included))?;
++    let spend=ObservedClaimedSpend::revalidate(claim,&chain,&observed,&inputs,1)?;
++    let review=execution.review_light_bch_funding_send(&spend,&chain,&observed,&inputs,expected,&endpoint,1013)?;
++    assert_eq!(review.details["minimumConfirmations"],minimum);
++    assert_eq!(review.details["txid"],spend.retained_signed()?.compute_txid().to_string());
++    assert!(execution.review_light_bch_funding_send(&spend,&chain,&observed,&[],expected,&endpoint,1013).is_err());
++    assert!(execution.review_light_bch_funding_send(&spend,&chain,&observed,&inputs,sha256::Hash::hash(b"wrong"),&endpoint,1013).is_err());
++    assert!(execution.review_light_bch_funding_send(&spend,&chain,&observed,&inputs,expected,&endpoint,2000).is_err());
++    assert!(execution.review_light_bch_funding_send(&spend,&chain,&observed,&inputs,expected,&endpoint,1011).is_err());
++    let spent=ObservedWallet::reconcile_with_pending(&chain,&scripts,std::slice::from_ref(&included),&[spend.retained_signed()?])?;
++    assert!(execution.review_light_bch_funding_send(&spend,&chain,&spent,&inputs,expected,&endpoint,1013).is_err());
++    let other=TlsEndpoint::new("localhost".into(),endpoint.port(),BchNetwork::Regtest)?;
++    assert_ne!(execution.review_light_bch_funding_send(&spend,&chain,&observed,&inputs,expected,&other,1013)?.commitment,review.commitment);
++    let recovery_pin=metadata.join(format!("{operation}.bch-funding-recovery-pin"));
++    let saved_pin=metadata.join("temporarily-held-recovery-pin");std::fs::rename(&recovery_pin,&saved_pin)?;
++    assert!(execution.review_light_bch_funding_send(&spend,&chain,&observed,&inputs,expected,&endpoint,1013).is_err());
++    std::fs::rename(saved_pin,recovery_pin)?;
++    assert!(execution.send_light_bch_funding(&spend,&chain,&observed,&inputs,expected,&endpoint,&[0;32],1013).await.is_err());
++    assert_eq!(spend.retained_claim().broadcast_status(&endpoint,expected)?,BroadcastStatus::NoLocalAttempt);
++    // Cancel a real owned-loopback TLS connection attempt after intent is durable.
++    let outcome=tokio::time::timeout(Duration::from_millis(200),execution.send_light_bch_funding(
++        &spend,&chain,&observed,&inputs,expected,&endpoint,&review.commitment,1013)).await;
++    assert!(outcome.is_err());
++    assert_eq!(spend.retained_claim().broadcast_status(&endpoint,expected)?,BroadcastStatus::OutcomeUnknown);
++    assert!(execution.review_light_bch_funding_send(&spend,&chain,&observed,&inputs,expected,&endpoint,1013).is_err());
++    // Endpoint-local absence must not bypass the wallet's global submission marker.
++    assert_eq!(spend.retained_claim().broadcast_status(&other,expected)?,BroadcastStatus::NoLocalAttempt);
++    assert!(execution.review_light_bch_funding_send(&spend,&chain,&observed,&inputs,expected,&other,1013).is_err());
++    drop(held_listener);Ok(())
++}
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims/broadcast.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims/broadcast.rs
+@@ -23,7 +23,7 @@
+ }
+ impl ClaimedSpend {
+     fn submission_name(&self)->String {format!("ltc-submission-{}.json",self.signing_commitment())}
+-    pub(super) fn ensure_not_submitted(&self)->Result<()> {
++    pub(in crate::litecoin_light::vault::signing::review) fn ensure_not_submitted(&self)->Result<()> {
+         match self.journal.read(&self.submission_name()) {
+             Ok(_)=>anyhow::bail!("Litecoin submission may have occurred; recover instead of signing again"),
+             Err(error) if error.downcast_ref::<std::io::Error>()
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+@@ -59,6 +59,16 @@
+         require_observed(chain,observed,self.network,self.height,self.tip,&self.inputs)?;
+         self.claimed.recovery_psbt(operation,expected)
+     }
++    /// Recheck exact retained inputs at this observation tip against a trade's
++    /// required depth, which may exceed the original personal-wallet review.
++    /// Requires no global submission marker, including attempts at other endpoints.
++    /// This establishes neither complete unspentness nor broadcast permission.
++    pub fn check_funding_inputs_on(&self,chain:&HeaderSequence,observed:&ObservedWallet,
++        inputs:&[IncludedInput<'_>],minimum_confirmations:u64)->Result<()> {
++        self.claimed.ensure_not_submitted()?;
++        require_observed(chain,observed,self.network,self.height,self.tip,&self.inputs)?;
++        self.claimed.revalidate_inclusions(chain,inputs,minimum_confirmations)
++    }
+     pub fn transaction(&self)->&Transaction {self.claimed.transaction()}
+     pub fn fee(&self)->Amount {self.claimed.fee()}
+     pub fn signing_commitment(&self)->sha256::Hash {self.claimed.signing_commitment()}

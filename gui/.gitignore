@@ -3,6 +3,7 @@
 translations/*.qm
 build
 version.js
+__pycache__/
 # IOS stuff below
 moc_*
 *.o

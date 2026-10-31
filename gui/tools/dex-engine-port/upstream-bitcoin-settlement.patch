@@ -1,0 +1,788 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 5c46a86..ed7afff 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10873,27 +10874,36 @@ version = "4.0.0"
+ dependencies = [
+  "anyhow",
+  "async-trait",
++ "bdk",
+  "bitcoin 0.32.8",
++ "bitcoin-harness",
+  "bitcoin-wallet",
+  "curve25519-dalek-ng",
++ "digest_auth",
+  "ecdsa_fun",
++ "libc",
+  "libp2p",
+  "monero-address",
+  "monero-oxide-ext",
+  "monero-wallet 0.1.0 (git+https://github.com/kayabaNerve/monero-oxide.git)",
+  "rand 0.8.5",
+  "rand_chacha 0.3.1",
++ "reqwest 0.12.28",
+  "rust_decimal",
+  "serde",
++ "serde_json",
+  "sha2",
+  "sigma_fun",
+  "swap-core",
+  "swap-env",
+  "swap-serde",
++ "testcontainers",
+  "thiserror 1.0.69",
+  "tokio",
+  "tracing",
++ "url",
+  "uuid",
++ "zeroize",
+ ]
+ 
+ [[package]]
+diff --git a/swap-machine/Cargo.toml b/swap-machine/Cargo.toml
+index d76b4a1..c13086d 100644
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -4,6 +4,11 @@ version = "4.0.0"
+ edition = "2024"
+ 
+ [dependencies]
++zeroize = { workspace = true }
++digest_auth = "=0.3.1"
++reqwest = { workspace = true }
++tokio = { workspace = true, features = ["io-util", "net"] }
++libc = "=0.2.183"
+ anyhow = { workspace = true }
+ async-trait = { workspace = true }
+ bitcoin = { workspace = true }
+@@ -18,6 +23,7 @@ rand = { workspace = true }
+ rand_chacha = { workspace = true }
+ rust_decimal = { workspace = true }
+ serde = { workspace = true }
++serde_json = { workspace = true, features = ["raw_value"] }
+ sha2 = { workspace = true }
+ sigma_fun = { workspace = true, default-features = false, features = ["ed25519", "serde", "secp256k1", "alloc"] }
+ swap-core = { path = "../swap-core" }
+@@ -28,7 +34,10 @@ tracing = { workspace = true }
+ uuid = { workspace = true, features = ["serde"] }
+ 
+ [dev-dependencies]
+-tokio = { workspace = true }
++bdk = { workspace = true }
++bitcoin-harness = { git = "https://github.com/eigenwallet/bitcoin-harness-rs", branch = "master" }
++testcontainers = { workspace = true }
++url = { workspace = true }
+ 
+ [lints]
+ workspace = true
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+new file mode 100644
+index 0000000..8d8f7e0
+--- /dev/null
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -0,0 +1,614 @@
++//! Bitcoin-side engine settlement only. XMZ funding is deliberately mocked.
++#[path = "../../bitcoin-wallet/tests/harness/mod.rs"]
++mod harness;
++mod native_rpc;
++
++use anyhow::{Context, Result};
++use bitcoin::{Amount, Network, Transaction};
++use bitcoin_harness::BitcoindRpcApi;
++use bitcoin_wallet::{BitcoinWalletSeed, PersisterConfig, Wallet, WalletBuilder};
++use monero_oxide_ext::PrivateKey;
++use rand::rngs::OsRng;
++use std::time::Duration;
++use swap_core::bitcoin::{CancelTimelock, PunishTimelock, RemainingRefundTimelock};
++use swap_core::monero::{Scalar, TransferProof};
++use swap_env::env::{GetConfig, Regtest};
++use swap_machine::{alice, bob};
++use testcontainers::clients::Cli;
++use uuid::Uuid;
++
++struct TestSeed(u8);
++
++#[cfg(unix)]
++#[tokio::test]
++#[ignore = "requires the owned funded fakechain wallet fixture"]
++async fn native_fee_estimation() -> Result<()> {
++    use swap_machine::native_funding_rpc::fee_estimation::{FeeRequest, NativeFeeEstimator};
++    use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
++    let wallet = XmzAddress::parse(XmzNetwork::Mainnet, &std::env::var("MONZERO_TEST_FEE_WALLET")?)?;
++    let destination = XmzAddress::parse(XmzNetwork::Mainnet, &std::env::var("MONZERO_TEST_FEE_DESTINATION")?)?;
++    anyhow::ensure!(wallet != destination, "fixture requires distinct wallet and destination");
++    let amount = XmzAmount::from_atom_string(&std::env::var("MONZERO_TEST_FEE_ATOMS")?)
++        .map_err(|_| anyhow::anyhow!("invalid fee fixture amount"))?;
++    let request = || FeeRequest { wallet: wallet.clone(), destination: destination.clone(),
++        amount, account: 0, priority: 1 };
++    let genesis = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
++    let mut estimator = NativeFeeEstimator::new(native_rpc::authenticated_fixture()?);
++    let error = estimator.estimate(request(), &"0".repeat(64)).await.err()
++        .context("accepted wrong fee chain")?;
++    anyhow::ensure!(error.to_string() == "unexpected fee-estimation chain", "unexpected chain rejection");
++    let mut wrong_wallet = request();
++    wrong_wallet.wallet = destination.clone();
++    let error = estimator.estimate(wrong_wallet, genesis).await.err()
++        .context("accepted wrong fee wallet")?;
++    anyhow::ensure!(error.to_string() == "unexpected estimation wallet", "unexpected wallet rejection");
++    let estimate = estimator.estimate(request(), genesis).await?;
++    anyhow::ensure!(estimate.request().wallet == wallet && estimate.request().destination == destination
++        && estimate.request().amount == amount && estimate.request().account == 0
++        && estimate.request().priority == 1, "fee request binding lost");
++    anyhow::ensure!(estimate.fee().atoms() > 0 && estimate.weight() > 0
++        && estimate.snapshot().genesis == genesis, "invalid native estimate");
++    estimator.revalidate_for_display(&estimate, std::time::Duration::from_secs(30)).await?;
++    let request_id = std::env::var("MONZERO_TEST_FEE_REQUEST_ID")?.parse::<Uuid>()?;
++    let wire = serde_json::json!({"schema":"monzero-native-fee-request-v1","requestId":request_id.to_string(),
++        "wallet":wallet.to_string(),"destination":destination.to_string(),"amountAtoms":amount.atom_string(),
++        "account":"0","priority":"1","genesis":genesis});
++    let bytes = serde_json::to_vec(&wire)?;
++    anyhow::ensure!(estimator.preview_request(&bytes,XmzNetwork::Mainnet,genesis,std::time::Duration::ZERO)
++        .await.err().context("accepted zero operation budget")?.to_string() == "invalid fee request time budget",
++        "unexpected budget rejection");
++    let mut injected = wire;
++    injected["rpcUrl"] = serde_json::json!("http://example.invalid");
++    let error = estimator.preview_request(&serde_json::to_vec(&injected)?,XmzNetwork::Mainnet,genesis,
++        std::time::Duration::from_secs(30)).await.err().context("accepted injected endpoint")?;
++    anyhow::ensure!(error.to_string() == "invalid fee preview request JSON", "unexpected input rejection");
++    let mut response_bytes = Vec::new();
++    estimator.serve_preview(bytes.as_slice(), &mut response_bytes, XmzNetwork::Mainnet,genesis,
++        std::time::Duration::from_secs(30)).await?;
++    let preview: serde_json::Value = serde_json::from_slice(&response_bytes)?;
++    anyhow::ensure!(preview["requestId"] == request_id.to_string()
++        && preview["amountAtoms"] == amount.atom_string()
++        && preview["executable"] == false, "invalid fee display export");
++    // Separate constructions can select different inputs and fees.
++    let exported_fee = XmzAmount::from_atom_string(preview["feeAtoms"].as_str().context("missing fee string")?)
++        .map_err(|_| anyhow::anyhow!("invalid exported fee"))?;
++    anyhow::ensure!(exported_fee.atoms() > 0, "zero exported fee");
++    anyhow::ensure!(export_fixture("MONZERO_TEST_FEE_PREVIEW", &serde_json::to_string(&preview)?)?,
++        "missing fee preview output path");
++    anyhow::ensure!(estimator.preview_for_display(Uuid::nil(), &estimate,
++        std::time::Duration::from_secs(30)).await.is_err(), "accepted missing preview identity");
++    let rejected = estimator.revalidate_for_display(&estimate, std::time::Duration::ZERO).await;
++    anyhow::ensure!(rejected.err().context("accepted invalid estimate age limit")?.to_string()
++        == "fee estimate age limit must be positive", "unexpected freshness rejection");
++    anyhow::ensure!(export_fixture("MONZERO_TEST_FEE_RESULT", "fee-estimation-verified\n")?,
++        "missing fee fixture result path");
++    Ok(())
++}
++
++#[cfg(unix)]
++#[tokio::test]
++#[ignore = "requires a disposable authenticated wallet RPC and private credential file"]
++async fn native_rpc_digest_auth() -> Result<()> {
++    use std::io::Read;
++    use std::os::unix::fs::PermissionsExt;
++    let path = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_AUTH_LOGIN").context("missing auth fixture")?);
++    let metadata = std::fs::symlink_metadata(&path)?;
++    anyhow::ensure!(metadata.is_file() && metadata.permissions().mode() & 0o077 == 0, "nonprivate credentials");
++    let mut bytes = Vec::new();
++    std::fs::File::open(path)?.take(1025).read_to_end(&mut bytes)?;
++    anyhow::ensure!(bytes.len() <= 1024, "oversized credentials");
++    let credentials = std::str::from_utf8(&bytes)?;
++    let (username, password) = credentials.split_once(':').context("invalid credential file")?;
++    let daemon = std::env::var("MONZERO_TEST_AUTH_DAEMON_PORT")?.parse()?;
++    let wallet = std::env::var("MONZERO_TEST_AUTH_WALLET_PORT")?.parse()?;
++    let unauthenticated = reqwest::Client::builder().no_proxy()
++        .redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(5)).build()?
++        .post(format!("http://127.0.0.1:{wallet}/json_rpc"))
++        .json(&serde_json::json!({"jsonrpc":"2.0","id":"auth","method":"get_version"})).send().await?;
++    anyhow::ensure!(unauthenticated.status() == reqwest::StatusCode::UNAUTHORIZED,
++        "accepted unauthenticated request");
++    let wrong = native_rpc::NativeRpc::new(daemon, wallet, username.into(), format!("{password}-wrong"))?;
++    let error = wrong.wallet_version().await.err().context("accepted unauthorised RPC")?;
++    anyhow::ensure!(error.chain().any(|cause| cause.downcast_ref::<reqwest::Error>()
++        .is_some_and(|http| http.status() == Some(reqwest::StatusCode::UNAUTHORIZED))), "unexpected auth rejection");
++    let mut client = native_rpc::NativeRpc::new(daemon, wallet, username.into(), password.into())?;
++    let version = client.wallet_version().await?;
++    let expected_open = match std::env::var("MONZERO_TEST_WALLET_EXPECT_OPEN")?.as_str() {
++        "0" => false, "1" => true, _ => anyhow::bail!("invalid wallet-state fixture"),
++    };
++    anyhow::ensure!(client.opened_wallet(swap_core::xmz_address::XmzNetwork::Mainnet).await?.is_some() == expected_open,
++        "unexpected native wallet state");
++    anyhow::ensure!(client.wallet_version().await? == version, "authenticated repeated request failed");
++    anyhow::ensure!(client.replace_credentials(username.into(), String::new()).is_err(),
++        "accepted empty replacement password");
++    anyhow::ensure!(client.wallet_version().await? == version, "invalid rotation damaged client");
++    client.replace_credentials(username.into(), format!("{password}-rotated-wrong"))?;
++    let error = client.wallet_version().await.err().context("rotation reused old credentials")?;
++    anyhow::ensure!(error.chain().any(|cause| cause.downcast_ref::<reqwest::Error>()
++        .is_some_and(|http| http.status() == Some(reqwest::StatusCode::UNAUTHORIZED))),
++        "unexpected rotation rejection");
++    client.replace_credentials(username.into(), password.into())?;
++    anyhow::ensure!(client.wallet_version().await? == version, "credential restoration failed");
++    use swap_machine::native_funding_rpc::wallet_session::{NativeWalletSession, SwapWalletId};
++    let id = SwapWalletId::new("12345678-1234-1234-1234-123456789abc".parse()?)?;
++    let mut session = NativeWalletSession::new(client, swap_core::xmz_address::XmzNetwork::Mainnet);
++    if expected_open {
++        anyhow::ensure!(session.create(&id, "disposable-lifecycle-test".into()).await.err()
++            .context("switched an existing wallet")?.to_string() == "wallet already open", "unexpected open-wallet rejection");
++    } else {
++        let command = serde_json::json!({"schema":"monzero-wallet-control-v1",
++            "requestId":"34567890-1234-1234-1234-123456789abc","operation":"create",
++            "walletId":"12345678-1234-1234-1234-123456789abc","password":"disposable-lifecycle-test","expectedAddress":""});
++        let reply = session.execute_control(&serde_json::to_vec(&command)?,std::time::Duration::from_secs(30)).await?;
++        anyhow::ensure!(reply["requestId"] == command["requestId"] && reply["operation"] == "create"
++            && reply["schema"] == "monzero-wallet-control-result-v1" && reply["readyForTrading"] == false
++            && reply.as_object().context("invalid control reply")?.len() == 5, "invalid wallet control result");
++        let address = swap_core::xmz_address::XmzAddress::parse(swap_core::xmz_address::XmzNetwork::Mainnet,
++            reply["address"].as_str().context("missing created wallet address")?)?;
++        anyhow::ensure!(session.create(&id, "disposable-lifecycle-test".into()).await.is_err(), "created over an open wallet");
++        session.close(&address).await?;
++        session.open(&id, "disposable-lifecycle-test".into(), &address).await?;
++        session.close(&address).await?;
++        anyhow::ensure!(session.open(&id, "wrong-password".into(), &address).await.is_err(), "accepted wrong wallet password");
++        anyhow::ensure!(session.open(&id, "disposable-lifecycle-test".into(), &address).await.err()
++            .context("retried an uncertain wallet operation")?.to_string() == "wallet session requires reconciliation",
++            "unexpected reconciliation rejection");
++    }
++    anyhow::ensure!(export_fixture("MONZERO_TEST_AUTH_RESULT", if expected_open {
++        "wallet-lifecycle-v1:open\n"
++    } else {
++        "wallet-lifecycle-v1:empty\n"
++    })?, "missing lifecycle completion marker path");
++    Ok(())
++}
++
++impl BitcoinWalletSeed for TestSeed {
++    fn derive_extended_private_key(&self, network: Network) -> Result<bitcoin::bip32::Xpriv> {
++        Ok(bitcoin::bip32::Xpriv::new_master(network, &[self.0; 64])?)
++    }
++
++    fn derive_extended_private_key_legacy(
++        &self, network: bdk::bitcoin::Network,
++    ) -> Result<bdk::bitcoin::util::bip32::ExtendedPrivKey> {
++        Ok(bdk::bitcoin::util::bip32::ExtendedPrivKey::new_master(network, &[self.0; 64])?)
++    }
++}
++
++async fn wallet(env: &harness::TestEnv<'_>, seed: u8) -> Result<Wallet> {
++    WalletBuilder::<TestSeed>::default().seed(TestSeed(seed)).network(Network::Regtest)
++        .electrum_rpc_urls(vec![env.electrum_url.clone()])
++        .persister(PersisterConfig::InMemorySqlite).finality_confirmations(1u32)
++        .target_block(1u32).sync_interval(Duration::from_millis(0))
++        .use_mempool_space_fee_estimation(false).build().await
++}
++
++async fn balance(wallet: &Wallet, expected: Amount) -> Result<()> {
++    tokio::time::timeout(Duration::from_secs(30), async {
++        loop {
++            wallet.sync().await?;
++            if wallet.balance().await? == expected { return Ok::<_, anyhow::Error>(()); }
++            tokio::time::sleep(Duration::from_millis(250)).await;
++        }
++    }).await.context("balance deadline")?
++}
++
++async fn mine(env: &harness::TestEnv<'_>, blocks: u32) -> Result<()> {
++    let address = env.bitcoind.with_wallet(harness::BITCOIN_TEST_WALLET_NAME)?
++        .getnewaddress(None, None).await?.require_network(Network::Regtest)?;
++    env.bitcoind.generatetoaddress(blocks, address).await?;
++    Ok(())
++}
++
++async fn broadcast_confirm(env: &harness::TestEnv<'_>, tx: Transaction) -> Result<()> {
++    let expected = tx.compute_txid().to_string();
++    let actual = env.bitcoind.sendrawtransaction(tx.into()).await?;
++    anyhow::ensure!(actual == expected, "broadcast txid mismatch");
++    mine(env, 1).await
++}
++
++#[tokio::test]
++async fn engine_redeem_is_accepted_on_regtest() -> Result<()> { settlement(false).await }
++
++#[tokio::test]
++async fn engine_cancel_and_full_refund_are_accepted_on_regtest() -> Result<()> { settlement(true).await }
++
++async fn settlement(refund: bool) -> Result<()> {
++    let cli = Cli::default();
++    let env = harness::setup(&cli).await?;
++    let alice_wallet = wallet(&env, 61).await?;
++    let bob_wallet = wallet(&env, 62).await?;
++    let funding = Amount::from_sat(1_000_000);
++    harness::fund_and_mine(&env.bitcoind, bob_wallet.new_address().await?, funding).await?;
++    balance(&bob_wallet, funding).await?;
++
++    let amount = Amount::from_sat(500_000);
++    let fee = Amount::from_sat(1_000);
++    let config = Regtest::get_config();
++    // This does not validate native XMZ funding, network identity, or transfer proof.
++    let atoms: swap_core::xmz::XmzAmount = "2".parse().expect("constant fixture amount");
++    let legacy_amount = swap_core::monero::primitives::Amount::from_pico(atoms.atoms());
++    let alice0 = alice::State0::new(amount, legacy_amount, Amount::ZERO, config,
++        alice_wallet.new_address().await?, alice_wallet.new_address().await?,
++        fee, fee, fee, false, &mut OsRng);
++    let swap_id = Uuid::new_v4();
++    let bob0 = bob::State0::new(swap_id, &mut OsRng, amount, legacy_amount,
++        CancelTimelock::new(config.bitcoin_cancel_timelock),
++        PunishTimelock::new(config.bitcoin_punish_timelock),
++        RemainingRefundTimelock::new(config.bitcoin_remaining_refund_timelock),
++        bob_wallet.new_address().await?, config.monero_finality_confirmations,
++        fee, fee, fee, fee, fee, fee);
++    let (_, alice1) = alice0.receive(bob0.next_message()?)?;
++    let bob1 = bob0.receive(&bob_wallet, alice1.next_message()?).await?;
++    let alice2 = alice1.receive(bob1.next_message())?;
++    let bob2 = bob1.receive(alice2.next_message()?)?;
++    let alice3 = alice2.receive(bob2.next_message()?)?;
++    let (bob3, lock) = bob2.lock_btc().await?;
++    let lock_id = lock.txid();
++    let lock_tx = bob_wallet.sign_and_finalize(lock.into()).await?;
++    broadcast_confirm(&env, lock_tx).await?;
++    let request = alice3.lock_xmr_transfer_request();
++    let address = swap_core::xmz_address::XmzAddress::new(
++        swap_core::xmz_address::XmzNetwork::Mainnet,
++        monero_address::AddressType::Legacy,
++        request.public_spend_key.decompress(), request.public_view_key.0.decompress(),
++    ).expect("fixture lock address");
++    let view = bob3.xmr_view_keys().1;
++    // Standalone Bitcoin tests have no native chain; the combined fixture replaces this.
++    let mut funding_height = 0;
++    let mut verified_state = None;
++    let mut funding_proof = TransferProof::new(
++        swap_core::monero::TxHash("fixture-not-an-xmz-proof".into()),
++        PrivateKey::from_scalar(Scalar::ONE));
++    // Explicit opt-in fixture coordination, not a protocol funding proof.
++    #[cfg(unix)]
++    if export_fixture("MONZERO_TEST_LOCK_EXPORT", &format!("{address}\n{}\n{view}\n", atoms.atoms()))? {
++        let release = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RELEASE")
++            .context("missing fixture release path")?);
++        tokio::time::timeout(Duration::from_secs(120), async {
++            while !release.is_file() { tokio::time::sleep(Duration::from_millis(20)).await; }
++        }).await.context("native fixture funding deadline")?;
++        use std::io::Read;
++        let mut data = Vec::new();
++        std::fs::File::open(release)?.take(4097).read_to_end(&mut data)?;
++        let evidence = NativeFunding::parse(&data, &address.to_string(), atoms.atoms())?;
++        funding_height = evidence.height;
++        funding_proof = TransferProof::new(swap_core::monero::TxHash(evidence.txid),
++            evidence.tx_key.parse().context("fixture transaction key")?);
++        let observer = native_rpc::authenticated_fixture()?;
++        let mut wrong_key_proof = funding_proof.clone();
++        wrong_key_proof.tx_key = PrivateKey::from_scalar(Scalar::ONE);
++        anyhow::ensure!(wrong_key_proof.tx_key != funding_proof.tx_key, "fixture key collision");
++        let wrong_key_error = swap_machine::xmz_funding::verify_state3(&observer, &bob3,
++            wrong_key_proof, swap_core::xmz_address::XmzNetwork::Mainnet,
++            "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4", 10).await.err()
++            .context("engine accepted wrong native transaction key")?;
++        anyhow::ensure!(wrong_key_error.to_string() == "native wallet observations disagree",
++            "wrong-key test failed for an unexpected reason");
++        let wrong_amount = swap_core::xmz::XmzAmount::from_atoms(atoms.atoms() + 1);
++        let wrong_amount_error = swap_machine::xmz_funding::verify(&observer,
++            swap_machine::xmz_funding::FundingRequest {
++                address: address.clone(), amount: wrong_amount, proof: funding_proof.clone(),
++            }, "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4", 10).await.err()
++            .context("engine accepted wrong expected native amount")?;
++        anyhow::ensure!(wrong_amount_error.to_string() == "native funding amount mismatch",
++            "wrong-amount test failed for an unexpected reason");
++        let verified = swap_machine::xmz_funding::verify(&observer,
++            swap_machine::xmz_funding::FundingRequest {
++                address: address.clone(), amount: atoms, proof: funding_proof.clone(),
++            }, "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4", 10).await?;
++        anyhow::ensure!(verified.height() == funding_height, "fixture claimed wrong funding height");
++        use swap_machine::xmz_funding::{FundingPolicy, PendingFunding};
++        let policy = FundingPolicy::new(swap_core::xmz_address::XmzNetwork::Mainnet,
++            "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4".into(), 10, Network::Regtest, 1)?;
++        let pending = PendingFunding::new(swap_id, policy.clone(), bob3.clone(), funding_proof.clone())?;
++        let encoded = pending.encode()?;
++        drop(pending);
++        let lock_id = bob3.tx_lock.txid();
++        anyhow::ensure!(PendingFunding::decode(&encoded, Uuid::new_v4(), lock_id, &policy).is_err(),
++            "accepted another swap's recovery record");
++        anyhow::ensure!(PendingFunding::decode(&encoded, swap_id, "00".repeat(32).parse()?, &policy).is_err(),
++            "accepted another Bitcoin lock's recovery record");
++        let changed_policy = FundingPolicy::new(swap_core::xmz_address::XmzNetwork::Mainnet,
++            "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4".into(), 11, Network::Regtest, 1)?;
++        anyhow::ensure!(PendingFunding::decode(&encoded, swap_id, lock_id, &changed_policy).is_err(),
++            "accepted a changed recovery policy");
++        let mut altered: serde_json::Value = serde_json::from_slice(&encoded)?;
++        altered["verified"] = serde_json::json!(true);
++        anyhow::ensure!(PendingFunding::decode(&serde_json::to_vec(&altered)?, swap_id, lock_id, &policy).is_err(),
++            "accepted a persisted approval flag");
++        // Private checkpoint for separate-process verification and reconstruction.
++        use std::io::Write;
++        use std::os::unix::fs::OpenOptionsExt;
++        let checkpoint_path = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RECOVERY_EXPORT")
++            .context("missing fixture recovery export")?).with_extension("pending-state");
++        let mut checkpoint = std::fs::OpenOptions::new().write(true).create_new(true)
++            .mode(0o600).open(&checkpoint_path)?;
++        checkpoint.write_all(&encoded)?;
++        checkpoint.sync_all()?;
++        drop(checkpoint);
++        anyhow::ensure!(resume_in_process(&checkpoint_path, swap_id, lock_id, true, &env.bitcoind_url).await?.is_none(),
++            "recovery accepted unavailable native RPC");
++        verified_state = Some(resume_in_process(&checkpoint_path, swap_id, lock_id, false, &env.bitcoind_url).await?
++            .context("missing recovered state")?);
++    }
++    let bob4 = match verified_state {
++        Some(state) => state,
++        None => bob3.xmr_locked(swap_core::monero::BlockHeight { height: funding_height },
++            funding_proof.into(), None), // Bitcoin-only fixture, no native chain.
++    };
++
++    if refund {
++        let cancel = alice3.signed_cancel_transaction()?;
++        let error = env.bitcoind.sendrawtransaction(cancel.clone().into()).await
++            .expect_err("cancel must fail before relative timelock");
++        anyhow::ensure!(error.to_string().contains("non-BIP68-final"), "unexpected early-cancel rejection: {error}");
++        mine(&env, config.bitcoin_cancel_timelock.checked_sub(1).context("zero test cancellation delay")?).await?;
++        #[cfg(unix)]
++        if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
++            assert_pending_rejected(&env, swap_id, lock_id,
++                "Bitcoin cancellation window reached; recovery required").await?;
++        }
++        broadcast_confirm(&env, cancel).await?;
++        let mut cancellation = bob4.cancel();
++        #[cfg(unix)]
++        if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
++            cancellation = load_pending_fixture(swap_id, lock_id)?.prepare_cancellation();
++        }
++        let refund_tx = cancellation.signed_full_refund_transaction()?;
++        let refund_id = refund_tx.compute_txid();
++        broadcast_confirm(&env, refund_tx).await?;
++        // Bob pays lock, cancel and refund fees; Alice receives nothing.
++        balance(&bob_wallet, funding - fee - fee - fee).await?;
++        balance(&alice_wallet, Amount::ZERO).await?;
++        let observed = bob_wallet.get_raw_transaction(refund_id).await?
++            .context("confirmed refund missing from Electrum")?;
++        let recovered = alice3.extract_monero_private_key_from_refund(observed)?;
++        assert_eq!(monero_oxide_ext::PublicKey::from_private_key(&recovered),
++            alice3.lock_xmr_transfer_request().public_spend_key);
++        #[cfg(unix)]
++        export_fixture("MONZERO_TEST_RECOVERY_EXPORT", &format!("{address}\n{recovered}\n{view}\n{}\n", atoms.atoms()))?;
++    } else {
++        #[cfg(unix)]
++        let signature = if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
++            let pending = load_pending_fixture(swap_id, lock_id)?;
++            let native = native_rpc::authenticated_fixture()?;
++            let bitcoin = native_rpc::BitcoinRpc::new(env.bitcoind_url.clone())?;
++            pending.redeem_signature(&native, &bitcoin).await?
++        } else { bob4.tx_redeem_encsig() };
++        #[cfg(not(unix))]
++        let signature = bob4.tx_redeem_encsig();
++        let redeem = alice3.signed_redeem_transaction(signature)?;
++        broadcast_confirm(&env, redeem).await?;
++        balance(&alice_wallet, amount - fee).await?;
++        balance(&bob_wallet, funding - amount - fee).await?;
++        let recovered = bob4.check_for_tx_redeem(&bob_wallet).await?
++            .context("confirmed redeem missing from Electrum")?;
++        assert_eq!(monero_oxide_ext::PublicKey::from_private_key(&recovered.xmr_keys().0),
++            alice3.lock_xmr_transfer_request().public_spend_key);
++        #[cfg(unix)]
++        export_fixture("MONZERO_TEST_RECOVERY_EXPORT", &format!("{address}\n{}\n{view}\n{}\n", recovered.xmr_keys().0, atoms.atoms()))?;
++    }
++    #[cfg(unix)]
++    if std::env::var_os("MONZERO_TEST_LOCK_EXPORT").is_some() {
++        assert_pending_rejected(&env, swap_id, lock_id, "Bitcoin lock absent or spent").await?;
++    }
++    Ok(())
++}
++
++#[cfg(unix)]
++async fn assert_pending_rejected(env: &harness::TestEnv<'_>, swap_id: Uuid, lock_id: bitcoin::Txid,
++    reason: &str) -> Result<()> {
++        let pending = load_pending_fixture(swap_id, lock_id)?;
++        let native = native_rpc::authenticated_fixture()?;
++        let bitcoin = native_rpc::BitcoinRpc::new(env.bitcoind_url.clone())?;
++        let error = pending.resume(&native, &bitcoin).await.err().context("resumed an unavailable Bitcoin lock")?;
++        anyhow::ensure!(error.to_string() == reason, "unexpected pending-lock rejection");
++        let signing_error = pending.redeem_signature(&native, &bitcoin).await.err()
++            .context("signed for an unavailable Bitcoin lock")?;
++        anyhow::ensure!(signing_error.to_string() == reason, "unexpected signing rejection");
++    Ok(())
++}
++
++#[cfg(unix)]
++fn load_pending_fixture(swap_id: Uuid, lock_id: bitcoin::Txid) -> Result<swap_machine::xmz_funding::PendingFunding> {
++        use swap_machine::xmz_funding::{FundingPolicy, PendingFunding};
++        let path = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RECOVERY_EXPORT").unwrap())
++            .with_extension("pending-state");
++        let policy = FundingPolicy::new(swap_core::xmz_address::XmzNetwork::Mainnet,
++            "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4".into(), 10, Network::Regtest, 1)?;
++        PendingFunding::decode(&std::fs::read(path)?, swap_id, lock_id, &policy)
++}
++
++#[cfg(unix)]
++async fn resume_in_process(checkpoint: &std::path::Path, swap_id: Uuid, lock_id: bitcoin::Txid,
++    unavailable: bool, bitcoin_url: &url::Url) -> Result<Option<bob::State4>> {
++    use std::io::{Read, Write};
++    let output = checkpoint.with_extension(if unavailable { "refused-state" } else { "resumed-state" });
++    let rejection = checkpoint.with_extension("rpc-rejection");
++    let server = if unavailable {
++        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
++        listener.set_nonblocking(true)?;
++        Some(listener)
++    } else { None };
++    let mut command = std::process::Command::new(std::env::current_exe()?);
++    command
++        .args(["--exact", "resume_pending_in_child", "--ignored", "--test-threads=1"])
++        .env("MONZERO_TEST_CHILD_CHECKPOINT", checkpoint)
++        .env("MONZERO_TEST_CHILD_OUTPUT", &output)
++        .env("MONZERO_TEST_CHILD_SWAP", swap_id.to_string())
++        .env("MONZERO_TEST_CHILD_LOCK", lock_id.to_string())
++        .env("MONZERO_TEST_CHILD_BITCOIN_RPC", bitcoin_url.as_str())
++        .env_remove("MONZERO_TEST_LOCK_EXPORT").env_remove("MONZERO_TEST_RELEASE")
++        .env_remove("MONZERO_TEST_RECOVERY_EXPORT")
++        .env_remove("MONZERO_TEST_CHILD_REJECTION")
++        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
++    if let Some(server) = &server {
++        command.env("MONZERO_TEST_DAEMON_RPC_PORT", server.local_addr()?.port().to_string())
++            .env("MONZERO_TEST_CHILD_REJECTION", &rejection);
++    }
++    let child = command.spawn()?;
++    struct OwnedChild(std::process::Child);
++    impl Drop for OwnedChild {
++        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
++    }
++    let mut child = OwnedChild(child);
++    let mut contacted = false;
++    let status = tokio::time::timeout(Duration::from_secs(45), async {
++        loop {
++            if let Some(server) = &server {
++                match server.accept() {
++                    Ok((mut stream, _)) => {
++                        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
++                        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
++                        let mut request = Vec::new();
++                        loop {
++                            let mut chunk = [0u8; 1024];
++                            let n = stream.read(&mut chunk)?;
++                            anyhow::ensure!(n > 0 && request.len() + n <= 4096, "invalid outage fixture request");
++                            request.extend_from_slice(&chunk[..n]);
++                            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
++                                let headers = std::str::from_utf8(&request[..end])?;
++                                let length: usize = headers.lines().find_map(|line| {
++                                    let (name, value) = line.split_once(':')?;
++                                    name.eq_ignore_ascii_case("content-length").then_some(value.trim())
++                                }).context("missing fixture content length")?.parse()?;
++                                anyhow::ensure!(length <= 2048, "oversized outage fixture body");
++                                if request.len() >= end + 4 + length { break; }
++                            }
++                        }
++                        stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
++                        contacted = true;
++                    }
++                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
++                    Err(error) => return Err(error.into()),
++                }
++            }
++            if let Some(status) = child.0.try_wait()? { return Ok::<_, anyhow::Error>(status); }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    }).await.context("recovery subprocess deadline")??;
++    if unavailable {
++        anyhow::ensure!(contacted && !status.success() && !output.exists(), "outage recovery did not fail closed");
++        anyhow::ensure!(std::fs::read(rejection)? == b"native-rpc-unavailable\n", "unexpected recovery rejection");
++        return Ok(None);
++    }
++    anyhow::ensure!(status.success(), "recovery subprocess failed");
++    let mut bytes = Vec::new();
++    std::fs::File::open(output)?.take(1_048_577).read_to_end(&mut bytes)?;
++    anyhow::ensure!(bytes.len() <= 1_048_576, "oversized resumed state");
++    Ok(Some(serde_json::from_slice(&bytes)?))
++}
++
++/// Only launched by resume_in_process with a disposable private checkpoint.
++#[cfg(unix)]
++#[tokio::test]
++#[ignore = "subprocess helper requires private fixture paths and owned native RPC"]
++async fn resume_pending_in_child() -> Result<()> {
++    use std::io::{Read, Write};
++    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
++    use swap_machine::xmz_funding::{FundingPolicy, PendingFunding};
++    let input = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_CHILD_CHECKPOINT")
++        .context("missing private checkpoint")?);
++    let metadata = std::fs::symlink_metadata(&input)?;
++    anyhow::ensure!(metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
++        "checkpoint must be a private regular file");
++    let mut bytes = Vec::new();
++    std::fs::File::open(input)?.take(1_048_577).read_to_end(&mut bytes)?;
++    let policy = FundingPolicy::new(swap_core::xmz_address::XmzNetwork::Mainnet,
++        "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4".into(), 10, Network::Regtest, 1)?;
++    let pending = PendingFunding::decode(&bytes, std::env::var("MONZERO_TEST_CHILD_SWAP")?.parse()?,
++        std::env::var("MONZERO_TEST_CHILD_LOCK")?.parse()?, &policy)?;
++    let observer = native_rpc::authenticated_fixture()?;
++    let bitcoin = native_rpc::BitcoinRpc::new(std::env::var("MONZERO_TEST_CHILD_BITCOIN_RPC")?.parse()?)?;
++    let resumed = match pending.resume(&observer, &bitcoin).await {
++        Ok(state) => state,
++        Err(error) => {
++            if std::env::var_os("MONZERO_TEST_CHILD_REJECTION").is_some() {
++                anyhow::ensure!(error.chain().any(|cause| cause.downcast_ref::<reqwest::Error>()
++                    .is_some_and(|http| http.status() == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE))),
++                    "unexpected native recovery failure");
++                export_fixture("MONZERO_TEST_CHILD_REJECTION", "native-rpc-unavailable\n")?;
++            }
++            return Err(error);
++        }
++    };
++    let serialized = serde_json::to_vec(&resumed)?;
++    anyhow::ensure!(serialized.len() <= 1_048_576, "oversized resumed state");
++    let mut output = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
++        .open(std::env::var_os("MONZERO_TEST_CHILD_OUTPUT").context("missing recovery output")?)?;
++    output.write_all(&serialized)?;
++    output.sync_all()?;
++    Ok(())
++}
++
++/// Trusted local fixture evidence, NOT an independently verified peer message.
++#[derive(serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct NativeFunding {
++    genesis: String,
++    address: String,
++    atoms: String,
++    txid: String,
++    tx_key: String,
++    height: u64,
++    confirmations: u64,
++}
++
++impl NativeFunding {
++    fn parse(data: &[u8], address: &str, atoms: u64) -> Result<Self> {
++        anyhow::ensure!(data.len() <= 4096, "oversized fixture funding evidence");
++        let evidence: Self = serde_json::from_slice(data).context("fixture funding format")?;
++        anyhow::ensure!(evidence.genesis == "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4",
++            "wrong fixture genesis");
++        anyhow::ensure!(evidence.address == address && evidence.atoms == atoms.to_string(),
++            "fixture funding destination or amount mismatch");
++        let hex = |value: &str| value.len() == 64 && value.bytes()
++            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
++        anyhow::ensure!(hex(&evidence.txid) && hex(&evidence.tx_key), "invalid fixture transaction fields");
++        anyhow::ensure!(evidence.height > 0 && evidence.confirmations >= 10,
++            "unconfirmed fixture funding");
++        let key: PrivateKey = evidence.tx_key.parse().context("fixture transaction scalar")?;
++        anyhow::ensure!(key != PrivateKey::from_scalar(Scalar::ZERO), "zero fixture transaction key");
++        Ok(evidence)
++    }
++}
++
++#[test]
++fn native_funding_rejects_mismatched_evidence() {
++    let valid = serde_json::json!({
++        "genesis": "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4",
++        "address": "test-destination", "atoms": "200000000000",
++        "txid": "ab".repeat(32), "tx_key": PrivateKey::from_scalar(Scalar::ONE).to_string(),
++        "height": 132, "confirmations": 10,
++    });
++    let parse = |value: &serde_json::Value| NativeFunding::parse(
++        &serde_json::to_vec(value).unwrap(), "test-destination", 200_000_000_000);
++    assert!(parse(&valid).is_ok());
++    for (field, value) in [
++        ("genesis", serde_json::json!("wrong-chain")),
++        ("address", serde_json::json!("other-destination")),
++        ("atoms", serde_json::json!("0200000000000")),
++        ("txid", serde_json::json!("invalid")),
++        ("tx_key", serde_json::json!("00".repeat(32))),
++        ("height", serde_json::json!(0)),
++        ("confirmations", serde_json::json!(9)),
++        ("unknown", serde_json::json!(true)),
++    ] {
++        let mut changed = valid.clone();
++        changed[field] = value;
++        assert!(parse(&changed).is_err(), "accepted invalid field {field}");
++    }
++    assert!(NativeFunding::parse(&vec![b' '; 4097], "test-destination", 200_000_000_000).is_err());
++}
++
++#[cfg(unix)]
++fn export_fixture(variable: &str, contents: &str) -> Result<bool> {
++    use std::io::Write;
++    use std::os::unix::fs::OpenOptionsExt;
++    let Some(path) = std::env::var_os(variable) else { return Ok(false); };
++    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
++        .mode(0o600).open(path).context("create private fixture export")?;
++    file.write_all(contents.as_bytes())?;
++    file.sync_all()?;
++    Ok(true)
++}
+diff --git a/swap-machine/tests/native_rpc.rs b/swap-machine/tests/native_rpc.rs
+new file mode 100644
+index 0000000..711759b
+--- /dev/null
++++ b/swap-machine/tests/native_rpc.rs
+@@ -0,0 +1,85 @@
++//! Read-only adapter to owned local fakechain fixtures; not a public RPC client.
++use anyhow::{Context, Result, ensure};
++use serde_json::{Value, json};
++
++pub struct BitcoinRpc {
++    client: reqwest::Client,
++    url: url::Url,
++    username: String,
++    password: String,
++}
++
++impl BitcoinRpc {
++    pub fn new(mut url: url::Url) -> Result<Self> {
++        let host: std::net::Ipv4Addr = url.host_str().context("missing Bitcoin fixture host")?.parse()?;
++        ensure!(url.scheme() == "http" && (host.is_private() || host.is_loopback())
++            && url.query().is_none() && url.fragment().is_none(), "nonlocal Bitcoin fixture endpoint");
++        let username = url.username().to_owned();
++        let password = url.password().context("missing fixture RPC password")?.to_owned();
++        url.set_username("").map_err(|_| anyhow::anyhow!("invalid fixture URL"))?;
++        url.set_password(None).map_err(|_| anyhow::anyhow!("invalid fixture URL"))?;
++        Ok(Self { client: reqwest::Client::builder().no_proxy()
++            .redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(15)).build()?,
++            url, username, password })
++    }
++
++    async fn rpc(&self, method: &str, params: Value) -> Result<Box<serde_json::value::RawValue>> {
++        let mut response = self.client.post(self.url.clone()).basic_auth(&self.username, Some(&self.password))
++            .json(&json!({"jsonrpc":"1.0", "id":"bitcoin-funding", "method":method, "params":params}))
++            .send().await?.error_for_status()?;
++        let mut bytes = Vec::new();
++        while let Some(chunk) = response.chunk().await? {
++            ensure!(bytes.len() + chunk.len() <= 1_048_576, "oversized Bitcoin RPC response");
++            bytes.extend_from_slice(&chunk);
++        }
++        #[derive(serde::Deserialize)]
++        struct Response { id: String, error: Option<Value>, result: Box<serde_json::value::RawValue> }
++        let result: Response = serde_json::from_slice(&bytes)?;
++        ensure!(result.id == "bitcoin-funding" && result.error.is_none(), "Bitcoin RPC rejected request");
++        Ok(result.result)
++    }
++}
++
++#[async_trait::async_trait]
++impl swap_machine::xmz_funding::BitcoinLockObserver for BitcoinRpc {
++    async fn unspent(&self, outpoint: bitcoin::OutPoint) -> Result<Option<swap_machine::xmz_funding::BitcoinLockObservation>> {
++        let genesis = serde_json::from_str(self.rpc("getblockhash", json!([0])).await?.get())?;
++        let raw = self.rpc("gettxout", json!([outpoint.txid.to_string(), outpoint.vout, true])).await?;
++        #[derive(serde::Deserialize)]
++        struct Script { hex: String }
++        #[derive(serde::Deserialize)]
++        struct Output {
++            bestblock: bitcoin::BlockHash, confirmations: u64,
++            value: Box<serde_json::value::RawValue>,
++            #[serde(rename = "scriptPubKey")] script: Script,
++        }
++        let Some(output): Option<Output> = serde_json::from_str(raw.get())? else { return Ok(None); };
++        Ok(Some(swap_machine::xmz_funding::BitcoinLockObservation {
++            genesis, tip: output.bestblock, confirmations: output.confirmations,
++            script: bitcoin::ScriptBuf::from_hex(&output.script.hex)?,
++            // Preserve the JSON decimal lexeme: never round through f64.
++            amount: bitcoin::Amount::from_str_in(output.value.get(), bitcoin::Denomination::Bitcoin)?,
++        }))
++    }
++}
++
++
++pub use swap_machine::native_funding_rpc::NativeFundingRpc as NativeRpc;
++
++#[cfg(unix)]
++pub fn authenticated_fixture() -> Result<NativeRpc> {
++        use std::io::Read;
++        use std::os::unix::fs::PermissionsExt;
++        let path = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_WALLET_RPC_LOGIN")
++            .context("missing private fixture credential path")?);
++        let metadata = std::fs::symlink_metadata(&path)?;
++        ensure!(metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
++            "nonprivate fixture credentials");
++        let mut bytes = Vec::new();
++        std::fs::File::open(path)?.take(1025).read_to_end(&mut bytes)?;
++        ensure!(bytes.len() <= 1024, "oversized fixture credentials");
++        let text = std::str::from_utf8(&bytes)?;
++        let (username, password) = text.split_once(':').context("invalid fixture credentials")?;
++        NativeRpc::new(std::env::var("MONZERO_TEST_DAEMON_RPC_PORT")?.parse()?,
++            std::env::var("MONZERO_TEST_WALLET_RPC_PORT")?.parse()?, username.into(), password.into())
++    }

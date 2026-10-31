@@ -1,0 +1,269 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval/relay/observation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval/relay/observation.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval/relay/observation.rs
+@@ -0,0 +1,49 @@
++//! Fresh settlement evidence after an attempted native payout. Read-only:
++//! no acknowledgement fabrication, journal updates, construction or retransmission.
++use super::*;
++use crate::{bch_rpc::confirmed::ConfirmedTransaction,xmz_funding::ChainSnapshot};
++
++pub struct ConfirmedNativeRefundPayout {
++    quote: [u8;32],admission: [u8;32],review: [u8;32],txid: String,
++    confirmations: u64,native: ChainSnapshot,bch: ConfirmedTransaction,
++}
++impl ConfirmedNativeRefundPayout {
++    pub fn quote(&self) -> &[u8;32] {&self.quote}
++    pub fn admission(&self) -> &[u8;32] {&self.admission}
++    pub fn review(&self) -> &[u8;32] {&self.review}
++    pub fn txid(&self) -> &str {&self.txid}
++    pub fn confirmations(&self) -> u64 {self.confirmations}
++    pub fn native_snapshot(&self) -> &ChainSnapshot {&self.native}
++    pub fn bch_confirmation(&self) -> &ConfirmedTransaction {&self.bch}
++}
++impl AdmittedExecution<'_> {
++    /// A saved relay acknowledgement is not required. A retained, validated
++    /// attempt is required; confirmation never authorizes another dispatch.
++    pub async fn observe_bch_native_refund_payout(&self,native: &impl FundingObserver,bch: &BchRpc,
++        block: Option<BlockHash>,now: u64,session: NativeWalletSession) -> Result<ConfirmedNativeRefundPayout> {
++        let (review,prepared,intent,deployment)=self.native_refund_payout_relay_materials()?;
++        self.native_refund_payout_state(&review,&intent)?.context("missing BCH native payout relay attempt")?;
++        let (attempt,_)=self.native_refund_payout_attempt(&review,&intent)?.context("missing BCH native payout relay attempt")?;
++        ensure!(now>=attempt.approved_at && bch.deployment_commitment()?==deployment,
++            "BCH native payout observation predates dispatch or changes observer");
++        let refund=self.recover_bch_native_refund(native,bch,intent.refund,block,now).await?;
++        ensure!(refund.payment==intent.payment && refund.native_txid==prepared.terms()["lockTxid"]
++            && refund.address.to_string()==prepared.terms()["wallet"],"BCH native payout refund changed");
++        let deadline=refund.observed_at.checked_add(std::time::Duration::from_secs(30)).context("native payout observation deadline overflow")?;
++        let txid=prepared.terms()["txid"].as_str().context("missing saved native payout identity")?.to_owned();
++        let (confirmations,snapshot,confirmed)=tokio::time::timeout_at(deadline.into(),async {
++            // Read-only spend-key check; do not import or rescan a wallet here.
++            session.verify_spend_key(&refund.spend,&refund.address).await?;
++            let observer=session.into_payout_relay()?;
++            let (confirmations,snapshot)=observer.confirm_native_payout_evidence(&prepared,u64::from(self.policy.xmz_confirmations)).await?;
++            let confirmed=bch.confirmed_transaction(intent.refund,refund.block,u64::from(self.policy.bch_confirmations)).await?;
++            ensure!(confirmed.deployment()==&deployment && confirmed.block()==refund.block,
++                "BCH native payout refund changed during confirmation");
++            observer.recheck_native_payout_snapshot(&snapshot).await?;
++            Ok::<_,anyhow::Error>((confirmations,snapshot,confirmed))
++        }).await.context("BCH native payout confirmation timed out")??;
++        ensure!(std::time::Instant::now()<deadline,"BCH native payout evidence expired");
++        Ok(ConfirmedNativeRefundPayout {quote:*self.quote.commitment(),admission:intent.admission,review:review.commitment,
++            txid,confirmations,native:snapshot,bch:confirmed})
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval/relay.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval/relay.rs
+@@ -0,0 +1,86 @@
++//! One explicit dispatch of the exact saved native payout. Lost acknowledgements
++//! remain unresolved intents; no restart or fresh client authorizes retransmission.
++use super::*;
++
++const ATTEMPT: &str="monzero-bch-native-refund-payout-relay-intent-v1";
++const ACK: &str="monzero-bch-native-refund-payout-relay-ack-v1";
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Attempt {schema: String,review: [u8;32],approved_at: u64}
++#[derive(Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Ack {schema: String,attempt: [u8;32],txid: String}
++#[derive(Clone,Debug,PartialEq,Eq)]
++pub enum NativeRefundPayoutRelayState {
++    /// Includes interruption before dispatch; not permission to send again.
++    Attempted {txid: String},
++    /// Exact node acknowledgement, not current confirmation.
++    Acknowledged {txid: String},
++}
++fn relay_slot(quote: &VerifiedBchQuote,part: &str) -> String {
++    format!("{}.bch-native-refund-payout-relay-{part}",quote.terms()["swapId"])
++}
++impl AdmittedExecution<'_> {
++    fn native_refund_payout_attempt(&self,review: &NativeRefundPayoutRelayReview,intent: &Intent) -> Result<Option<(Attempt,[u8;32])>> {
++        let Some(bytes)=optional(&self.metadata,&relay_slot(self.quote,"intent"))? else {return Ok(None)};
++        ensure!(bytes.len()<=4096,"oversized BCH native payout relay intent");
++        let attempt: Attempt=serde_json::from_slice(&bytes)?;
++        ensure!(attempt.schema==ATTEMPT && attempt.review==review.commitment && attempt.approved_at>=intent.at
++            && serde_json::to_vec(&attempt)?==bytes,"BCH native payout relay intent changed");
++        Ok(Some((attempt,hash(ATTEMPT,&bytes))))
++    }
++    fn native_refund_payout_state(&self,review: &NativeRefundPayoutRelayReview,intent: &Intent) -> Result<Option<NativeRefundPayoutRelayState>> {
++        let ack=optional(&self.metadata,&relay_slot(self.quote,"ack"))?;
++        let Some((_,attempt))=self.native_refund_payout_attempt(review,intent)? else {
++            ensure!(ack.is_none(),"BCH native payout acknowledgement lacks relay intent");return Ok(None)
++        };
++        let txid=review.details["payout"]["txid"].as_str().context("missing saved payout transaction identity")?.to_owned();
++        let Some(bytes)=ack else {return Ok(Some(NativeRefundPayoutRelayState::Attempted {txid}))};
++        ensure!(bytes.len()<=4096,"oversized BCH native payout acknowledgement");
++        let ack: Ack=serde_json::from_slice(&bytes)?;
++        ensure!(ack.schema==ACK && ack.attempt==attempt && ack.txid==txid
++            && serde_json::to_vec(&ack)?==bytes,"BCH native payout acknowledgement changed");
++        Ok(Some(NativeRefundPayoutRelayState::Acknowledged {txid}))
++    }
++    pub fn bch_native_refund_payout_relay_state(&self) -> Result<Option<NativeRefundPayoutRelayState>> {
++        let (review,_,intent,_)=self.native_refund_payout_relay_materials()?;
++        self.native_refund_payout_state(&review,&intent)
++    }
++    /// Consumes the dedicated session so spend-key verification and relay use
++    /// the same owned client. Caller approval applies only to retained bytes.
++    pub async fn relay_bch_native_refund_payout(&mut self,native: &impl FundingObserver,bch: &BchRpc,
++        block: Option<BlockHash>,approved: &[u8;32],now: u64,mut session: NativeWalletSession) -> Result<String> {
++        let (review,prepared,intent,deployment)=self.native_refund_payout_relay_materials()?;
++        ensure!(*approved==review.commitment,"BCH native payout approval is stale or mismatched");
++        ensure!(now>=intent.at && bch.deployment_commitment()?==deployment,"BCH native payout predates preparation or changes observer");
++        if let Some((attempt,_))=self.native_refund_payout_attempt(&review,&intent)? {
++            ensure!(now>=attempt.approved_at,"BCH native payout time moved backwards");
++        }
++        match self.native_refund_payout_state(&review,&intent)? {
++            Some(NativeRefundPayoutRelayState::Acknowledged {txid})=>return Ok(txid),
++            Some(NativeRefundPayoutRelayState::Attempted {..})=>anyhow::bail!("BCH native payout result is uncertain; reconcile without retransmitting"),
++            None=>(),
++        }
++        // All saved payout validation precedes fresh two-chain refund evidence.
++        let refund=self.recover_bch_native_refund(native,bch,intent.refund,block,now).await?;
++        ensure!(refund.payment==intent.payment && refund.native_txid==prepared.terms()["lockTxid"]
++            && refund.address.to_string()==prepared.terms()["wallet"],"BCH native payout refund changed");
++        let deadline=refund.observed_at.checked_add(std::time::Duration::from_secs(30)).context("native payout relay deadline overflow")?;
++        tokio::time::timeout_at(deadline.into(),refund.check_wallet(&mut session)).await
++            .context("BCH native payout wallet verification timed out")??;
++        let mut relay=session.into_payout_relay()?;
++        tokio::time::timeout_at(deadline.into(),relay.preflight_native_payout(&prepared)).await
++            .context("BCH native payout relay preflight timed out")??;
++        ensure!(std::time::Instant::now()<deadline,"BCH native payout evidence expired before dispatch intent");
++        let bytes=serde_json::to_vec(&Attempt {schema:ATTEMPT.into(),review:*approved,approved_at:now})?;
++        self.metadata.retain(&relay_slot(self.quote,"intent"),&bytes)?;
++        ensure!(std::time::Instant::now()<deadline,"BCH native payout evidence expired after dispatch intent; reconcile without retransmitting");
++        let result=tokio::time::timeout_at(deadline.into(),relay.dispatch_native_payout(&prepared)).await
++            .context("BCH native payout dispatch timed out; result is uncertain")??;
++        let ack=Ack {schema:ACK.into(),attempt:hash(ATTEMPT,&bytes),txid:result.txid.clone()};
++        self.metadata.retain(&relay_slot(self.quote,"ack"),&serde_json::to_vec(&ack)?)?;
++        Ok(result.txid)
++    }
++}
++
++pub mod observation;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/recovery/native_refund/wallet/payout/preparation/approval.rs
+@@ -38,3 +38,5 @@
+         Ok(review)
+     }
+ }
++
++pub mod relay;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout/relay.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout/relay.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout/relay.rs
+@@ -0,0 +1,82 @@
++use super::*;
++use crate::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::recovery::native_refund::wallet::payout::preparation::approval::relay::NativeRefundPayoutRelayState;
++use std::sync::atomic::Ordering;
++use sha2::{Digest,Sha256};
++
++fn store_hashes(path: &std::path::Path) -> Result<std::collections::BTreeMap<std::ffi::OsString,[u8;32]>> {
++    let mut hashes=std::collections::BTreeMap::new();
++    for entry in std::fs::read_dir(path)? {
++        let entry=entry?;if entry.file_type()?.is_file() {
++            hashes.insert(entry.file_name(),Sha256::digest(std::fs::read(entry.path())?).into());
++        }
++    }
++    Ok(hashes)
++}
++
++pub(super) async fn exercise(metadata: &std::path::Path,setup: &Setup,snapshots: &PrivateStore,
++    observer_fixture: &Fixture,rpc: &BchRpc,wallet: &WalletFixture) -> Result<()> {
++    let observer=observer_fixture.funding_client()?;let block=Some(BlockHash::from_byte_array([6;32]));
++    for lost in [false,true] {
++        let copied=copy_store(metadata)?;let private=copy_store(&snapshots.0)?;
++        let slot=|part:&str|format!("{}.bch-native-refund-payout-relay-{part}",setup.quote.terms()["swapId"]);
++        let intent=copied.0.join(slot("intent"));let ack=copied.0.join(slot("ack"));
++        let mut execution=AdmittedExecution::resume(&copied.0,&private.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        let review=execution.review_bch_native_refund_payout_relay(rpc,2051)?;
++        assert!(execution.bch_native_refund_payout_relay_state()?.is_none());
++        assert!(execution.observe_bch_native_refund_payout(&observer,rpc,block,2051,wallet.payout_session(&observer)?).await.is_err());
++        let transfers=wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="transfer").count();
++        let relays=wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="relay_tx").count();
++        {
++            let mut state=wallet.state.lock().unwrap();state.relay_intent=Some(intent.clone());state.lose_relay=lost;
++        }
++        let mut bad=review.commitment;bad[0]^=1;
++        assert!(execution.relay_bch_native_refund_payout(&observer,rpc,block,&bad,2052,wallet.payout_session(&observer)?).await.is_err());
++        assert!(!intent.exists());
++        if !lost {
++            observer_fixture.confirmed.store(false,Ordering::SeqCst);
++            let rejected=execution.relay_bch_native_refund_payout(&observer,rpc,block,&review.commitment,2052,wallet.payout_session(&observer)?).await;
++            observer_fixture.confirmed.store(true,Ordering::SeqCst);
++            assert!(rejected.is_err());assert!(!intent.exists());
++        }
++        let result=execution.relay_bch_native_refund_payout(&observer,rpc,block,&review.commitment,2052,wallet.payout_session(&observer)?).await;
++        assert!(intent.exists());
++        assert_eq!(wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="relay_tx").count(),relays+1);
++        let expected=if lost {
++            assert!(result.is_err());assert!(!ack.exists());NativeRefundPayoutRelayState::Attempted {txid:"dd".repeat(32)}
++        } else {
++            assert_eq!(result?,"dd".repeat(32));assert!(ack.exists());NativeRefundPayoutRelayState::Acknowledged {txid:"dd".repeat(32)}
++        };
++        assert_eq!(execution.bch_native_refund_payout_relay_state()?,Some(expected.clone()));
++        drop(execution);
++        let mut execution=AdmittedExecution::resume(&copied.0,&private.0,&setup.quote,&setup.policy,Role::NativeFunder)?;
++        let calls=wallet.state.lock().unwrap().calls.len();let observations=observer_fixture.calls.lock().unwrap().len();
++        assert_eq!(execution.bch_native_refund_payout_relay_state()?,Some(expected.clone()));
++        let retry=execution.relay_bch_native_refund_payout(&observer,rpc,block,&review.commitment,2053,wallet.payout_session(&observer)?).await;
++        if lost {assert!(retry.is_err());} else {assert_eq!(retry?,"dd".repeat(32));}
++        assert_eq!(wallet.state.lock().unwrap().calls.len(),calls,"relay replay sent another wallet request");
++        assert_eq!(observer_fixture.calls.lock().unwrap().len(),observations,"relay replay performed chain observations");
++        assert_eq!(wallet.state.lock().unwrap().calls.iter().filter(|s|s.as_str()=="transfer").count(),transfers);
++        let public_before=store_hashes(&copied.0)?;let private_before=store_hashes(&private.0)?;
++        if !lost {
++            wallet.state.lock().unwrap().payout_confirmations=1;
++            assert!(execution.observe_bch_native_refund_payout(&observer,rpc,block,2054,wallet.payout_session(&observer)?).await.is_err());
++        }
++        wallet.state.lock().unwrap().payout_confirmations=10;
++        let evidence=execution.observe_bch_native_refund_payout(&observer,rpc,block,2054,wallet.payout_session(&observer)?).await?;
++        assert_eq!(evidence.txid(),"dd".repeat(32));assert_eq!(evidence.confirmations(),10);
++        assert_eq!(evidence.quote(),setup.quote.commitment());assert_eq!(evidence.review(),&review.commitment);
++        assert_eq!(evidence.native_snapshot().genesis,setup.policy.xmz_genesis);
++        assert_eq!(evidence.bch_confirmation().block(),BlockHash::from_byte_array([6;32]));
++        assert_eq!(execution.bch_native_refund_payout_relay_state()?,Some(expected));
++        assert_eq!(store_hashes(&copied.0)?,public_before);assert_eq!(store_hashes(&private.0)?,private_before);
++        let methods=wallet.state.lock().unwrap().calls[calls..].to_vec();
++        assert!(methods.iter().all(|s|matches!(s.as_str(),"get_address"|"query_key"|"check_tx_key")),"confirmation mutated the wallet");
++        if !lost {
++            let saved=std::fs::read(&ack)?;std::fs::write(&ack,b"{}")?;
++            assert!(execution.bch_native_refund_payout_relay_state().is_err());std::fs::write(&ack,saved)?;
++            let held=copied.0.join("held-payout-relay-intent");std::fs::rename(&intent,&held)?;
++            assert!(execution.bch_native_refund_payout_relay_state().is_err());std::fs::rename(&held,&intent)?;
++        }
++    }
++    Ok(())
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/refund/wallet/payout.rs
+@@ -77,9 +77,12 @@
+         assert_eq!(observer_fixture.calls.lock().unwrap().len(),observations,"offline recovery performed chain observations");
+         assert!(!wallet.state.lock().unwrap().calls.iter().any(|s|s=="relay_tx"));
+         if lost {continue;}
++        relay::exercise(&copied.0,setup,&private,observer_fixture,rpc,wallet).await?;
+ 
+ 
+     }
+     Ok(())
+ }
+ 
++
++mod relay;
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs b/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
+--- a/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
++++ b/swap-machine/src/native_funding_rpc/wallet_session/fixture.rs
+@@ -132,7 +132,7 @@
+                         "relay_tx"=>{
+                             let path=state.relay_intent.as_ref().context("unapproved fixture payout relay")?;
+                             let intent:serde_json::Value=serde_json::from_slice(&std::fs::read(path)?)?;
+-                            ensure!(state.opened && intent["schema"]=="monzero-bch-native-payout-relay-intent-v1"
++                            ensure!(state.opened && matches!(intent["schema"].as_str(),Some("monzero-bch-native-payout-relay-intent-v1"|"monzero-bch-native-refund-payout-relay-intent-v1"))
+                                 && p==&json!({"hex":"abcd"}),"relay preceded intent or changed saved metadata");
+                             lost=std::mem::take(&mut state.lose_relay);json!({"tx_hash":"dd".repeat(32)})
+                         },

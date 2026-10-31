@@ -1,0 +1,56 @@
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index 5d4f40b06..ac97e9217 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -258,6 +258,51 @@ async fn native_recover_confirmed_spend() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++#[ignore = "requires two disposable confirmed XMZ source transactions and an open fixture wallet"]
++async fn native_exact_net_top_up_preview() -> Result<()> {
++    use swap_machine::native_funding_rpc::full_proceeds::{ExactNetRequest,
++        FullProceedsRequest, preview_exact_net_with_top_up};
++    use swap_core::{xmz::XmzAmount, xmz_address::{XmzAddress, XmzNetwork}};
++    let address = |name| -> Result<XmzAddress> {
++        Ok(XmzAddress::parse(XmzNetwork::Mainnet, &std::env::var(name)?)?)
++    };
++    let mut request = ExactNetRequest {
++        source: FullProceedsRequest {
++            wallet: address("MONZERO_TEST_TOP_UP_WALLET")?,
++            destination: address("MONZERO_TEST_TOP_UP_DESTINATION")?,
++            lock_txid: std::env::var("MONZERO_TEST_TOP_UP_LOCK")?,
++            locked: XmzAmount::from_atoms(110_000_000_000),
++            maximum_fee: XmzAmount::from_atoms(2_000_000_000), account: 0, priority: 1,
++        },
++        principal: XmzAmount::from_atoms(100_000_000_000),
++        reserve_return: address("MONZERO_TEST_TOP_UP_RETURN")?,
++    };
++    let top_up = std::env::var("MONZERO_TEST_TOP_UP_TXID")?;
++    let genesis = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
++    let client = native_rpc::authenticated_fixture()?;
++    let checked = preview_exact_net_with_top_up(&client,&request,genesis,&top_up).await?;
++    anyhow::ensure!(checked.recipient == request.principal
++        && checked.reserve_return.checked_add(checked.network_fee)
++            == Some(XmzAmount::from_atoms(10_000_000_000)), "incorrect two-source accounting");
++    for invalid in [&request.source.lock_txid, &"0".repeat(64)] {
++        anyhow::ensure!(preview_exact_net_with_top_up(&client,&request,genesis,invalid).await.is_err(),
++            "invalid top-up identity accepted");
++    }
++    anyhow::ensure!(preview_exact_net_with_top_up(&client,&request,&"0".repeat(64),&top_up)
++        .await.is_err(), "incorrect top-up chain accepted");
++    request.principal = XmzAmount::from_atoms(99_999_999_999);
++    anyhow::ensure!(preview_exact_net_with_top_up(&client,&request,genesis,&top_up).await.is_err(),
++        "incorrect source split accepted");
++    request.principal = XmzAmount::from_atoms(100_000_000_000);
++    for ceiling in [1_000_000_000, 1] {
++        request.source.maximum_fee = XmzAmount::from_atoms(ceiling);
++        anyhow::ensure!(preview_exact_net_with_top_up(&client,&request,genesis,&top_up).await.is_err(),
++            "excessive top-up claim fee accepted");
++    }
++    Ok(())
++}
++
+ #[cfg(unix)]
+ #[tokio::test]
+ #[ignore = "requires a disposable authenticated wallet RPC and private credential file"]

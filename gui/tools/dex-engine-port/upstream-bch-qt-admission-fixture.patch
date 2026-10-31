@@ -1,0 +1,27 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/admission_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/admission_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/admission_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/admission_helper.rs
+@@ -30,7 +30,22 @@
+     let mut request = serde_json::json!({"schema":format!("monzero-bch-admission-{action}-request-v1"),
+         "requestId":request_id});
+     if let Some(approval) = approval {request["commitment"] = serde_json::json!(approval);}
+-    let mut child = Command::new(helper).arg(format!("--admission-{action}-stdio-v1")).arg(config)
++    // Optional test-only routing through the app's actual Qt job. The config
++    // continues to pin the real Rust helper; the Qt executable is independently
++    // authenticated and launches that helper only through BchAdmissionJob.
++    let program = match (std::env::var_os("MONZERO_BCH_QT_ADMISSION_PROBE"),
++        std::env::var_os("MONZERO_BCH_QT_ADMISSION_PROBE_SHA256")) {
++        (None,None) => helper.to_path_buf(),
++        (Some(path),Some(expected)) => {
++            let path = PathBuf::from(path);
++            ensure!(path.is_absolute() && path.canonicalize()? == path,"Qt admission probe path is not canonical");
++            ensure!(expected.to_str() == Some(hex(&Sha256::digest(std::fs::read(&path)?)).as_str()),
++                "Qt admission probe digest mismatch");
++            path
++        }
++        _ => anyhow::bail!("incomplete Qt admission probe configuration"),
++    };
++    let mut child = Command::new(program).arg(format!("--admission-{action}-stdio-v1")).arg(config)
+         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+     child.stdin.take().context("missing helper stdin")?.write_all(&serde_json::to_vec(&request)?)?;
+     let output = child.wait_with_output()?;

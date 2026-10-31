@@ -1,0 +1,113 @@
+diff --git a/swap-machine/src/litecoin_light/session/unspent.rs b/swap-machine/src/litecoin_light/session/unspent.rs
+--- a/swap-machine/src/litecoin_light/session/unspent.rs
++++ b/swap-machine/src/litecoin_light/session/unspent.rs
+@@ -37,3 +37,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++pub mod candidates;
+diff --git a/swap-machine/src/litecoin_light/session/unspent/candidates.rs b/swap-machine/src/litecoin_light/session/unspent/candidates.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/unspent/candidates.rs
+@@ -0,0 +1,48 @@
++//! Inclusion-checked candidates from server unspent claims. Omitted spends
++//! remain possible; these are not spendable coins or signing authorization.
++use super::*;
++use crate::litecoin_light::{headers::HeaderSequence,transaction::IncludedTransaction};
++use std::{collections::BTreeMap,sync::Arc};
++pub struct IncludedCandidate {report:ReportedOutput,transaction:Arc<IncludedTransaction>}
++impl IncludedCandidate {
++    pub fn outpoint(&self)->OutPoint {self.report.outpoint()}
++    pub fn value(&self)->Amount {self.report.value()}
++    pub fn transaction(&self)->&IncludedTransaction {&self.transaction}
++}
++impl<S:AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
++    pub async fn included_unspent_candidates(&mut self,chain:&HeaderSequence,script:&Script,
++        maximum:usize,minimum_confirmations:u64)->Result<Vec<IncludedCandidate>> {
++        ensure!(chain.network()==self.network && minimum_confirmations>0,"invalid Litecoin candidate context");
++        ensure!(!script.is_empty() && script.len()<=10000 && (1..=1000).contains(&maximum),"invalid Litecoin candidate limits");
++        let result=self.candidates_inner(chain,script,maximum,minimum_confirmations).await;
++        if result.is_err() {self.usable=false;}result
++    }
++    async fn candidates_inner(&mut self,chain:&HeaderSequence,script:&Script,maximum:usize,
++        minimum_confirmations:u64)->Result<Vec<IncludedCandidate>> {
++        let reports=self.reported_unspent(script,maximum).await?;
++        let mut transactions:BTreeMap<Txid,Arc<IncludedTransaction>>=BTreeMap::new();
++        let mut candidates=Vec::new();let mut effects=0usize;
++        for report in reports {
++            if report.height()==0 {continue;}
++            ensure!(report.height()<=chain.height(),"Litecoin candidate height exceeds selected chain");
++            let txid=report.outpoint().txid;
++            let transaction=if let Some(existing)=transactions.get(&txid) {
++                ensure!(existing.height()==report.height(),"inconsistent Litecoin candidate heights");existing.clone()
++            } else {
++                let included=self.transaction_on(chain,report.height(),txid).await?;
++                effects=effects.checked_add(included.inputs().len()).and_then(|n|n.checked_add(included.outputs().len()))
++                    .context("Litecoin candidate effect overflow")?;
++                ensure!(effects<=100000,"Litecoin candidate effect budget exceeded");
++                let included=Arc::new(included);transactions.insert(txid,included.clone());included
++            };
++            let output=transaction.outputs().get(report.outpoint().vout as usize).context("missing Litecoin candidate output")?;
++            ensure!(output.value==report.value() && output.script_pubkey.as_script()==script,"Litecoin candidate output mismatch");
++            let depth=transaction.confirmations_on(chain).context("orphaned Litecoin candidate")?;
++            if depth<minimum_confirmations || (transaction.is_coinbase() && depth<100) {continue;}
++            candidates.push(IncludedCandidate {report,transaction});
++        }
++        Ok(candidates)
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session/unspent/candidates/tests.rs b/swap-machine/src/litecoin_light/session/unspent/candidates/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/unspent/candidates/tests.rs
+@@ -0,0 +1,46 @@
++use super::*;
++use crate::litecoin_light::session::tests::{server,reply,regtest_handshake};
++use bitcoin::hex::FromHex;
++fn fixture()->Result<(HeaderSequence,Value,bitcoin::ScriptBuf)> {
++    let fixture:Value=serde_json::from_str(include_str!("../../wallet/fixture.json"))?;
++    let block=fixture["blocks"][0].clone();let mut chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    chain.append(&Vec::from_hex(block["header"].as_str().unwrap())?,2_000_000_000)?;
++    let tx:Transaction=deserialize(&Vec::from_hex(block["transaction"].as_str().unwrap())?)?;
++    Ok((chain,block,tx.output[0].script_pubkey.clone()))
++}
++#[tokio::test]
++async fn candidates_match_real_inclusion_and_filter_depth()->Result<()> {
++    for minimum in [1,2] {
++        let (chain,block,script)=fixture()?;let mut responses=regtest_handshake();
++        responses.push(reply(3,json!([{"tx_hash":block["txid"],"tx_pos":0,"height":1,"value":100000}])));
++        responses.push(reply(4,block["transaction"].clone()));responses.push(reply(5,json!({"block_height":1,"pos":0,"merkle":[]})));
++        let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++        let candidates=session.included_unspent_candidates(&chain,&script,2,minimum).await?;
++        assert_eq!(candidates.len(),if minimum==1 {1}else{0});
++        if let Some(candidate)=candidates.first() {
++            assert_eq!(candidate.value().to_sat(),100000);assert_eq!(candidate.outpoint().vout,0);
++            assert_eq!(candidate.transaction().confirmations_on(&chain),Some(1));
++        }
++        drop(session);assert_eq!(task.await?.len(),5);
++    }Ok(())
++}
++#[tokio::test]
++async fn candidates_reject_value_index_and_script_substitution()->Result<()> {
++    for mode in 0..3 {
++        let (chain,block,mut script)=fixture()?;let mut responses=regtest_handshake();
++        if mode==2 {script=bitcoin::ScriptBuf::from_bytes(vec![0x51]);}
++        responses.push(reply(3,json!([{"tx_hash":block["txid"],"tx_pos":if mode==1 {1}else{0},"height":1,"value":if mode==0 {99999}else{100000}}])));
++        responses.push(reply(4,block["transaction"].clone()));responses.push(reply(5,json!({"block_height":1,"pos":0,"merkle":[]})));
++        let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++        assert!(session.included_unspent_candidates(&chain,&script,2,1).await.is_err());assert!(!session.usable);
++        drop(session);assert_eq!(task.await?.len(),5);
++    }Ok(())
++}
++#[tokio::test]
++async fn mempool_candidates_do_not_trigger_inclusion_queries()->Result<()> {
++    let (chain,block,script)=fixture()?;let mut responses=regtest_handshake();
++    responses.push(reply(3,json!([{"tx_hash":block["txid"],"tx_pos":0,"height":0,"value":100000}])));
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    assert!(session.included_unspent_candidates(&chain,&script,2,1).await?.is_empty());
++    drop(session);assert_eq!(task.await?.len(),3);Ok(())
++}

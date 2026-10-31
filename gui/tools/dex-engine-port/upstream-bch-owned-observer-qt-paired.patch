@@ -1,0 +1,19 @@
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/preparation_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/preparation_helper.rs
+@@ -2,10 +2,13 @@
+ use super::*;
+ pub(super) fn exercise(context: &Value,setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,
+     pins: &NegotiationPins,base: u64,rpc: &BchRpc,observer: Option<&crate::bch_rpc::observer::OwnedBchObserver>) -> Result<()> {
++    let owned_qt=std::env::var("MONZERO_BCH_NATIVE_OWNED_OBSERVER_QT_PAIRED").as_deref()==Ok("1");
++    ensure!(!owned_qt || observer.is_some(),"owned Qt fixture requires owned observer");
+     if observer.is_some() {
+-        ensure!(["MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE","MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE_SHA256",
+-            "MONZERO_BCH_QT_NATIVE_RELAY_PROBE","MONZERO_BCH_QT_NATIVE_RELAY_PROBE_SHA256"]
+-            .iter().all(|name|std::env::var_os(name).is_none()),"owned observer fixture excludes v1 Qt probes");
++        let pins=["MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE","MONZERO_BCH_QT_NATIVE_PREPARATION_PROBE_SHA256",
++            "MONZERO_BCH_QT_NATIVE_RELAY_PROBE","MONZERO_BCH_QT_NATIVE_RELAY_PROBE_SHA256"];
++        ensure!(pins.iter().all(|name|std::env::var_os(name).is_some()==owned_qt),
++            "owned Qt fixture requires explicit mode and both pinned probes");
+     }
+     let helper=PathBuf::from(std::env::var("MONZERO_BCH_ADMISSION_HELPER")?);
+     let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;

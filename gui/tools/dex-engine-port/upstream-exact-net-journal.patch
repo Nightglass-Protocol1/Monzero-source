@@ -1,0 +1,314 @@
+diff --git a/swap-machine/src/native_funding_rpc.rs b/swap-machine/src/native_funding_rpc.rs
+index 3cb3e5b7c..46d381c28 100644
+--- a/swap-machine/src/native_funding_rpc.rs
++++ b/swap-machine/src/native_funding_rpc.rs
+@@ -1,12 +1,13 @@
+ //! Experimental XMZ funding/wallet-lifecycle RPC bridge for caller-owned loopback
+-//! services. Observation, fee preview and wallet lifecycle here never sign or
+-//! broadcast. `relay` is the sole exception: it is the only submodule capable of
+-//! constructing, signing and broadcasting a real transaction, and it has no
++//! services. Fee previews and preparation may construct/sign with relay disabled;
++//! observation and wallet lifecycle do not broadcast. `relay` is the sole
++//! submodule that broadcasts a real transaction, and it has no
+ //! decode-from-untrusted-bytes entry point -- only swap orchestration code calls
+ //! it directly. Nothing here authorizes live/mainnet execution on its own.
+ //! Credentials are required and intentionally have no Debug or serialization API.
+ pub mod fee_estimation;
+ pub mod full_proceeds;
++pub mod exact_net_journal;
+ pub mod relay;
+ pub mod spendable;
+ pub mod spend_journal;
+diff --git a/swap-machine/src/native_funding_rpc/exact_net_journal.rs b/swap-machine/src/native_funding_rpc/exact_net_journal.rs
+new file mode 100644
+index 000000000..4b42f0fcc
+--- /dev/null
++++ b/swap-machine/src/native_funding_rpc/exact_net_journal.rs
+@@ -0,0 +1,129 @@
++//! Write-once exact-net accounting. No relay authority or secret persistence.
++//! Caller owns the canonical private directory and reserves before construction.
++use anyhow::{ensure, Result};
++use serde_json::{json, Value};
++use std::{fs::File, path::Path};
++#[cfg(unix)]
++use std::io::Write;
++use super::full_proceeds::{ExactNetRequest, PreparedExactNet};
++
++pub struct ExactNetJournal {
++    directory: File,
++    identity: String,
++    intent: Value,
++}
++
++impl ExactNetJournal {
++    #[cfg(unix)]
++    pub fn reserve(directory: &Path, genesis: &str, request: &ExactNetRequest,
++        top_up: &str) -> Result<Self> {
++        super::full_proceeds::exact_net_params(request)?;
++        let source = &request.source;
++        ensure!(top_up.len() == 64 && top_up.bytes().all(|b| b.is_ascii_digit()
++            || (b'a'..=b'f').contains(&b)) && top_up != "0".repeat(64)
++            && top_up != source.lock_txid, "invalid exact-net journal top-up");
++        let wallet = source.wallet.to_string();
++        let intent = json!({"schema":"monzero-exact-net-spend-intent-v1", "genesis":genesis,
++            "wallet":wallet,"lockTxid":source.lock_txid,"topUpTxid":top_up,
++            "totalAtoms":source.locked.atom_string(),"principalAtoms":request.principal.atom_string(),
++            "destination":source.destination.to_string(),
++            "reserveReturnDestination":request.reserve_return.to_string(),
++            "maximumFeeAtoms":source.maximum_fee.atom_string(),"account":source.account,"priority":source.priority});
++        let (directory,identity) = super::spend_journal::reserve_intent(
++            directory,genesis,&wallet,&source.lock_txid,&intent)?;
++        Ok(Self { directory,identity,intent })
++    }
++
++    #[cfg(not(unix))]
++    pub fn reserve(_: &Path, _: &str, _: &ExactNetRequest, _: &str) -> Result<Self> {
++        anyhow::bail!("exact-net journal not implemented on this platform")
++    }
++
++    /// Persist validated public transaction/accounting data before any future
++    /// relay. Missing or torn records do not authorize retry or reconstruction.
++    #[cfg(unix)]
++    pub fn record_prepared(&self, prepared: &PreparedExactNet) -> Result<()> {
++        let terms = prepared.terms();
++        check_terms(&self.intent,terms)?;
++        let mut file = super::spend_journal::create_record(&self.directory,
++            &format!("{}.prepared",self.identity))?;
++        file.write_all(&serde_json::to_vec(terms)?)?;
++        file.sync_all()?;
++        self.directory.sync_all()?;
++        Ok(())
++    }
++
++    #[cfg(not(unix))]
++    pub fn record_prepared(&self, _: &PreparedExactNet) -> Result<()> {
++        anyhow::bail!("exact-net journal not implemented on this platform")
++    }
++}
++
++fn check_terms(intent: &Value, terms: &Value) -> Result<()> {
++    for (field,value) in intent.as_object().expect("internal intent object") {
++        if field != "schema" {
++            ensure!(terms.get(field) == Some(value), "exact-net prepared terms differ from intent");
++        }
++    }
++    Ok(())
++}
++
++#[cfg(all(test,unix))]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::{DirBuilderExt,PermissionsExt};
++    use swap_core::{xmz::XmzAmount,xmz_address::{XmzAddress,XmzNetwork}};
++    struct Directory(std::path::PathBuf);
++    impl Directory {
++        fn new() -> Self {
++            let path=std::env::temp_dir().canonicalize().unwrap()
++                .join(format!("exact-net-journal-{}",uuid::Uuid::new_v4()));
++            std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();Self(path)
++        }
++    }
++    impl Drop for Directory { fn drop(&mut self) { let _=std::fs::remove_dir_all(&self.0); } }
++    fn request() -> ExactNetRequest {
++        let addresses:Vec<_>=include_str!("../../../swap-core/src/xmz_address_vectors.txt").lines()
++            .take(3).map(|s| XmzAddress::parse(XmzNetwork::Mainnet,s).unwrap()).collect();
++        ExactNetRequest { source:super::super::full_proceeds::FullProceedsRequest {
++            wallet:addresses[0].clone(),destination:addresses[1].clone(),lock_txid:"a".repeat(64),
++            locked:XmzAmount::from_atoms(110),maximum_fee:XmzAmount::from_atoms(2),account:0,priority:1 },
++            principal:XmzAmount::from_atoms(100),reserve_return:addresses[2].clone() }
++    }
++    #[test]
++    fn every_reserved_term_is_bound_except_distinct_schema() -> Result<()> {
++        let directory=Directory::new();
++        let journal=ExactNetJournal::reserve(&directory.0,&"b".repeat(64),&request(),&"c".repeat(64))?;
++        let mut terms=journal.intent.clone();terms["schema"]=json!("monzero-exact-net-prepared-accounting-v1");
++        check_terms(&journal.intent,&terms)?;
++        for field in journal.intent.as_object().unwrap().keys().filter(|key| *key != "schema") {
++            let mut altered=terms.clone();altered[field]=json!(null);
++            assert!(check_terms(&journal.intent,&altered).is_err(),"accepted changed {field}");
++            altered.as_object_mut().unwrap().remove(field);
++            assert!(check_terms(&journal.intent,&altered).is_err(),"accepted absent {field}");
++        }
++        Ok(())
++    }
++    #[test]
++    fn malformed_top_up_never_creates_intent() {
++        let directory=Directory::new();let request=request();
++        for top_up in ["".into(),"c".repeat(63),"C".repeat(64),"0".repeat(64),request.source.lock_txid.clone()] {
++            assert!(ExactNetJournal::reserve(&directory.0,&"b".repeat(64),&request,&top_up).is_err());
++            assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(),0);
++        }
++    }
++    #[test]
++    fn private_directory_and_torn_intent_block_retry() -> Result<()> {
++        let directory=Directory::new();let request=request();let genesis="b".repeat(64);let top_up="c".repeat(64);
++        std::fs::set_permissions(&directory.0,std::fs::Permissions::from_mode(0o755))?;
++        assert!(ExactNetJournal::reserve(&directory.0,&genesis,&request,&top_up).is_err());
++        std::fs::set_permissions(&directory.0,std::fs::Permissions::from_mode(0o700))?;
++        let journal=ExactNetJournal::reserve(&directory.0,&genesis,&request,&top_up)?;
++        let path=directory.0.join(format!("{}.intent",journal.identity));
++        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777,0o600);
++        drop(journal);std::fs::write(&path,b"")?;
++        assert!(ExactNetJournal::reserve(&directory.0,&genesis,&request,&top_up).is_err());
++        assert_eq!(std::fs::metadata(path)?.len(),0);
++        Ok(())
++    }
++}
+diff --git a/swap-machine/src/native_funding_rpc/full_proceeds.rs b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+index e1dbd813c..53d93a7f5 100644
+--- a/swap-machine/src/native_funding_rpc/full_proceeds.rs
++++ b/swap-machine/src/native_funding_rpc/full_proceeds.rs
+@@ -188,7 +188,7 @@ fn top_up_inputs(incoming: &Value, request: &ExactNetRequest,
+     Ok(keys)
+ }
+ 
+-fn exact_net_params(request: &ExactNetRequest) -> Result<Value> {
++pub(super) fn exact_net_params(request: &ExactNetRequest) -> Result<Value> {
+     let source = &request.source;
+     let reserve = source.locked.atoms().checked_sub(request.principal.atoms())
+         .context("exact-net principal exceeds lock")?;
+diff --git a/swap-machine/src/native_funding_rpc/spend_journal.rs b/swap-machine/src/native_funding_rpc/spend_journal.rs
+index 3489ca09f..7021b503c 100644
+--- a/swap-machine/src/native_funding_rpc/spend_journal.rs
++++ b/swap-machine/src/native_funding_rpc/spend_journal.rs
+@@ -18,35 +18,14 @@ impl SpendJournal {
+     /// Filename excludes mutable destination, amount and retry UUID deliberately.
+     #[cfg(unix)]
+     pub fn reserve(directory: &Path, genesis: &str, request: &SpendRequest) -> Result<Self> {
+-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+-        ensure!(directory.is_absolute() && directory.canonicalize()? == directory,
+-            "journal directory must be canonical and absolute");
+-        let parent = OpenOptions::new().read(true)
+-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(directory)?;
+-        let metadata = parent.metadata()?;
+-        ensure!(metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() }
+-            && metadata.mode() & 0o077 == 0, "journal directory must be private and owned");
+-        ensure!(canonical_hash(genesis) && canonical_hash(&request.lock_txid), "invalid journal chain or lock");
+         let wallet = request.wallet.to_string();
+-        let mut digest = Sha256::new();
+-        digest.update(b"monzero-native-spend-journal-v1\0");
+-        for field in [genesis, wallet.as_str(), request.lock_txid.as_str()] {
+-            digest.update((field.len() as u64).to_be_bytes());
+-            digest.update(field.as_bytes());
+-        }
+-        let identity = format!("{:x}", digest.finalize());
+         let intent = json!({"schema":"monzero-native-spend-intent-v1", "genesis":genesis,
+             "walletFile":request.id.filename(),
+             "wallet":wallet, "lockTxid":request.lock_txid,
+             "destination":request.destination.to_string(), "amountAtoms":request.amount.atom_string(),
+             "account":request.account, "priority":request.priority,
+             "maximumFeeAtoms":request.maximum_fee.atom_string()});
+-        // O_EXCL is the cross-process reservation. Existing, malformed and
+-        // truncated records all fail closed. Never truncate or remove them.
+-        let mut file = create_record(&parent, &format!("{identity}.intent"))?;
+-        file.write_all(&serde_json::to_vec(&intent)?)?;
+-        file.sync_all()?;
+-        parent.sync_all()?;
++        let (parent, identity) = reserve_intent(directory, genesis, &wallet, &request.lock_txid, &intent)?;
+         Ok(Self { directory: parent, receipt: format!("{identity}.receipt"), intent })
+     }
+ 
+@@ -103,8 +82,37 @@ impl SpendJournal {
+     }
+ }
+ 
++/// Shared identity across fixed-principal and exact-net modes. Changing the
++/// top-up, destination or mode must never obtain another reservation of a lock.
++#[cfg(unix)]
++pub(super) fn reserve_intent(directory: &Path, genesis: &str, wallet: &str,
++    lock: &str, intent: &serde_json::Value) -> Result<(File, String)> {
++    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++    ensure!(directory.is_absolute() && directory.canonicalize()? == directory,
++        "journal directory must be canonical and absolute");
++    let parent = OpenOptions::new().read(true)
++        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(directory)?;
++    let metadata = parent.metadata()?;
++    ensure!(metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() }
++        && metadata.mode() & 0o077 == 0, "journal directory must be private and owned");
++    ensure!(canonical_hash(genesis) && canonical_hash(lock), "invalid journal chain or lock");
++    let mut digest = Sha256::new();
++    digest.update(b"monzero-native-spend-journal-v1\0");
++    for field in [genesis, wallet, lock] {
++        digest.update((field.len() as u64).to_be_bytes());
++        digest.update(field.as_bytes());
++    }
++    let identity = format!("{:x}", digest.finalize());
++    // Existing, malformed and truncated files occupy the identity permanently.
++    let mut file = create_record(&parent, &format!("{identity}.intent"))?;
++    file.write_all(&serde_json::to_vec(intent)?)?;
++    file.sync_all()?;
++    parent.sync_all()?;
++    Ok((parent, identity))
++}
++
+ #[cfg(unix)]
+-fn create_record(directory: &File, name: &str) -> Result<File> {
++pub(super) fn create_record(directory: &File, name: &str) -> Result<File> {
+     use std::os::fd::{AsRawFd, FromRawFd};
+     let name = std::ffi::CString::new(name)?;
+     // Anchor creation to the checked directory descriptor, not a path which
+@@ -192,4 +200,20 @@ mod tests {
+         assert_eq!(value["txid"], transfer.txid);
+         Ok(())
+     }
++
++    #[test]
++    fn spend_modes_share_the_original_lock_reservation() -> Result<()> {
++        let directory=PrivateDirectory::new();
++        let request=request(&directory.0);
++        let genesis="a".repeat(64);
++        let (owner,_)=reserve_intent(&directory.0,&genesis,&request.wallet.to_string(),
++            &request.lock_txid,&json!({"schema":"monzero-exact-net-spend-intent-v1"}))?;
++        drop(owner);
++        assert!(SpendJournal::reserve(&directory.0,&genesis,&request).is_err());
++        let other=PrivateDirectory::new();
++        drop(SpendJournal::reserve(&other.0,&genesis,&request)?);
++        assert!(reserve_intent(&other.0,&genesis,&request.wallet.to_string(),&request.lock_txid,
++            &json!({"schema":"monzero-exact-net-spend-intent-v1"})).is_err());
++        Ok(())
++    }
+ }
+diff --git a/swap-machine/tests/bitcoin_settlement.rs b/swap-machine/tests/bitcoin_settlement.rs
+index bf8b3ed0e..8337d81bf 100644
+--- a/swap-machine/tests/bitcoin_settlement.rs
++++ b/swap-machine/tests/bitcoin_settlement.rs
+@@ -258,6 +258,7 @@ async fn native_recover_confirmed_spend() -> Result<()> {
+     Ok(())
+ }
+ 
++#[cfg(unix)]
+ #[tokio::test]
+ #[ignore = "requires two disposable confirmed XMZ source transactions and an open fixture wallet"]
+ async fn native_exact_net_top_up_preview() -> Result<()> {
+@@ -285,6 +286,9 @@ async fn native_exact_net_top_up_preview() -> Result<()> {
+     anyhow::ensure!(checked.recipient == request.principal
+         && checked.reserve_return.checked_add(checked.network_fee)
+             == Some(XmzAmount::from_atoms(10_000_000_000)), "incorrect two-source accounting");
++    let directory = std::path::PathBuf::from(std::env::var("MONZERO_TEST_TOP_UP_JOURNAL")?);
++    let journal = swap_machine::native_funding_rpc::exact_net_journal::ExactNetJournal::reserve(
++        &directory,genesis,&request,&top_up)?;
+     let prepared = swap_machine::native_funding_rpc::full_proceeds::prepare_exact_net_with_top_up(
+         &client,&request,genesis,&top_up).await?;
+     anyhow::ensure!(prepared.preview().recipient == request.principal
+@@ -293,6 +297,21 @@ async fn native_exact_net_top_up_preview() -> Result<()> {
+         && prepared.terms()["lockTxid"] == request.source.lock_txid
+         && prepared.terms()["topUpTxid"] == top_up
+         && prepared.terms().get("tx_metadata").is_none(), "incorrect prepared two-source accounting");
++    journal.record_prepared(&prepared)?;
++    anyhow::ensure!(journal.record_prepared(&prepared).is_err(), "duplicate preparation record accepted");
++    drop(journal);
++    anyhow::ensure!(swap_machine::native_funding_rpc::exact_net_journal::ExactNetJournal::reserve(
++        &directory,genesis,&request,&top_up).is_err(), "duplicate exact-net reservation accepted");
++    anyhow::ensure!(swap_machine::native_funding_rpc::exact_net_journal::ExactNetJournal::reserve(
++        &directory,genesis,&request,&"f".repeat(64)).is_err(), "replacement top-up reservation accepted");
++    use std::os::unix::fs::DirBuilderExt;
++    let mismatch = directory.join("mismatch");
++    std::fs::DirBuilder::new().mode(0o700).create(&mismatch)?;
++    request.principal = XmzAmount::from_atoms(99_999_999_999);
++    let altered = swap_machine::native_funding_rpc::exact_net_journal::ExactNetJournal::reserve(
++        &mismatch,genesis,&request,&top_up)?;
++    anyhow::ensure!(altered.record_prepared(&prepared).is_err(), "substituted journal principal accepted");
++    request.principal = XmzAmount::from_atoms(100_000_000_000);
+     drop(prepared); // No relay API or metadata export is available.
+     for invalid in [&request.source.lock_txid, &"0".repeat(64)] {
+         anyhow::ensure!(preview_exact_net_with_top_up(&client,&request,genesis,invalid).await.is_err(),

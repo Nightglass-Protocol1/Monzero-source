@@ -1,0 +1,147 @@
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -158,3 +158,5 @@
+ pub(super) mod tests;
+ 
+ pub mod sync;
++
++pub mod history;
+diff --git a/swap-machine/src/litecoin_light/session/history.rs b/swap-machine/src/litecoin_light/session/history.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/history.rs
+@@ -0,0 +1,65 @@
++//! Server-reported script history, used only as discovery hints.
++//! A server can omit transactions or invent entries. Empty history is not
++//! proof that an address was never used, and these entries authorize no spend.
++use super::*;
++use std::collections::BTreeSet;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ReportedPosition {
++    Block(u32),
++    Mempool,
++    MempoolWithUnconfirmedParents,
++}
++
++pub struct ReportedTransaction {
++    txid: Txid,
++    position: ReportedPosition,
++}
++impl ReportedTransaction {
++    pub fn txid(&self) -> Txid { self.txid }
++    pub fn position(&self) -> ReportedPosition { self.position }
++}
++
++impl<S: AsyncRead + AsyncWrite + Unpin> ReadSession<S> {
++    /// Query one script with an explicit entry budget (1..=1000).
++    /// Sends its script hash to the configured peer, disclosing wallet interest.
++    /// No balances, confirmations, completeness or unspentness are inferred.
++    pub async fn reported_history(&mut self, script: &Script, maximum: usize)
++        -> Result<Vec<ReportedTransaction>> {
++        ensure!(!script.is_empty() && script.len() <= 10_000 && (1..=1000).contains(&maximum),
++            "invalid Litecoin script history request");
++        let outcome = self.history_inner(script, maximum).await;
++        if outcome.is_err() { self.usable = false; }
++        outcome
++    }
++
++    async fn history_inner(&mut self, script: &Script, maximum: usize)
++        -> Result<Vec<ReportedTransaction>> {
++        #[derive(Deserialize)]
++        #[serde(deny_unknown_fields)]
++        struct Entry { tx_hash: String, height: i64, fee: Option<u64> }
++        let (_, bytes) = self.exchange("blockchain.scripthash.get_history",
++            json!([script_hash(script)]), maximum * 160 + 1024).await?;
++        let entries: Vec<Entry> = result(&bytes)?;
++        ensure!(entries.len() <= maximum, "Litecoin history exceeds entry budget");
++        let mut seen = BTreeSet::new();
++        let mut history = Vec::with_capacity(entries.len());
++        for entry in entries {
++            let txid: Txid = entry.tx_hash.parse().context("invalid Litecoin history transaction ID")?;
++            ensure!(seen.insert(txid), "duplicate Litecoin history transaction");
++            let position = match entry.height {
++                -1 => ReportedPosition::MempoolWithUnconfirmedParents,
++                0 => ReportedPosition::Mempool,
++                height if height > 0 && height <= u32::MAX as i64 => ReportedPosition::Block(height as u32),
++                _ => anyhow::bail!("invalid Litecoin history height"),
++            };
++            // Fee is checked for integer shape, but remains an unused peer claim.
++            let _ = entry.fee;
++            history.push(ReportedTransaction { txid, position });
++        }
++        Ok(history)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session/history/tests.rs b/swap-machine/src/litecoin_light/session/history/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/history/tests.rs
+@@ -0,0 +1,63 @@
++use super::*;
++use crate::litecoin_light::session::tests::{server, reply, regtest_handshake};
++fn script() -> bitcoin::ScriptBuf { bitcoin::ScriptBuf::from_bytes(vec![0x51]) }
++
++#[tokio::test]
++async fn history_reports_positions_and_queries_exact_script_hash() -> Result<()> {
++    let ids = ["11".repeat(32), "22".repeat(32), "33".repeat(32)];
++    let mut responses = regtest_handshake();
++    responses.push(reply(3, json!([
++        {"tx_hash":ids[0],"height":12},
++        {"tx_hash":ids[1],"height":0,"fee":100},
++        {"tx_hash":ids[2],"height":-1,"fee":200}])));
++    responses.push(reply(4, json!([])));
++    let (stream, task) = server(responses);
++    let mut session = ReadSession::negotiate(stream, LtcNetwork::Regtest).await?;
++    let history = session.reported_history(&script(), 3).await?;
++    assert_eq!(history.iter().map(|entry| entry.txid().to_string()).collect::<Vec<_>>(), ids);
++    assert_eq!(history.iter().map(|entry| entry.position()).collect::<Vec<_>>(),
++        [ReportedPosition::Block(12), ReportedPosition::Mempool, ReportedPosition::MempoolWithUnconfirmedParents]);
++    assert!(session.reported_history(&script(), 1).await?.is_empty());
++    drop(session);
++    let requests = task.await?;
++    assert_eq!(requests[2]["method"], "blockchain.scripthash.get_history");
++    assert_eq!(requests[2]["params"], json!([script_hash(&script())]));
++    Ok(())
++}
++
++#[tokio::test]
++async fn history_invalid_reports_poison_session_without_partial_results() -> Result<()> {
++    let id = "11".repeat(32);
++    for value in [
++        json!([{"tx_hash":id,"height":-2}]),
++        json!([{"tx_hash":id,"height":4294967296u64}]),
++        json!([{"tx_hash":"invalid","height":1}]),
++        json!([{"tx_hash":id,"height":1},{"tx_hash":id,"height":0}]),
++        json!([{"tx_hash":id,"height":0,"fee":-1}]),
++        json!([{"tx_hash":id,"height":1,"extra":true}]),
++        json!([{"tx_hash":id,"height":1.5}]),
++        json!([{"tx_hash":id,"height":1},{"tx_hash":"22".repeat(32),"height":2},{"tx_hash":"33".repeat(32),"height":3}]),
++        json!(null),
++    ] {
++        let mut responses = regtest_handshake(); responses.push(reply(3, value));
++        let (stream, task) = server(responses);
++        let mut session = ReadSession::negotiate(stream, LtcNetwork::Regtest).await?;
++        assert!(session.reported_history(&script(), 2).await.is_err());
++        assert!(session.reported_history(&script(), 2).await.is_err());
++        drop(session); assert_eq!(task.await?.len(), 3);
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn history_local_limits_fail_before_network_io() -> Result<()> {
++    let (stream, task) = server(regtest_handshake());
++    let mut session = ReadSession::negotiate(stream, LtcNetwork::Regtest).await?;
++    for maximum in [0,1001,usize::MAX] {
++        assert!(session.reported_history(&script(), maximum).await.is_err());
++    }
++    assert!(session.reported_history(bitcoin::Script::new(), 1).await.is_err());
++    assert!(session.reported_history(&bitcoin::ScriptBuf::from_bytes(vec![0;10001]), 1).await.is_err());
++    assert!(session.usable);
++    drop(session); assert_eq!(task.await?.len(), 2); Ok(())
++}

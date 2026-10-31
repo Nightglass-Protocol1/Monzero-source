@@ -1,0 +1,25 @@
+diff --git a/swap-machine/src/native_funding_rpc/wallet_session/payout_tests.rs b/swap-machine/src/native_funding_rpc/wallet_session/payout_tests.rs
+--- a/swap-machine/src/native_funding_rpc/wallet_session/payout_tests.rs
++++ b/swap-machine/src/native_funding_rpc/wallet_session/payout_tests.rs
+@@ -16,7 +16,9 @@
+ async fn bch_native_payout_session_rejects_expired_or_wrong_network_before_dispatch() -> Result<()> {
+     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+     let port=listener.local_addr()?.port();
+-    let mut session=NativeWalletSession::new(NativeFundingRpc::new(port,port,"fixture".into(),"fixture".into())?,XmzNetwork::Mainnet);
++        let wallet=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++        let wallet_port=wallet.local_addr()?.port();
++    let mut session=NativeWalletSession::new(NativeFundingRpc::new(port,wallet_port,"fixture".into(),"fixture".into())?,XmzNetwork::Mainnet);
+     let request=request()?;let genesis="aa".repeat(32);
+     let result=session.prepare_lock_payout(&request,&genesis,Instant::now()).await;
+     assert_eq!(result.err().context("accepted expired evidence")?.to_string(),"native payout evidence expired before construction");
+@@ -34,7 +36,9 @@
+     for cancel in [false,true] {
+         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+         let port=listener.local_addr()?.port();
+-        let mut session=NativeWalletSession::new(NativeFundingRpc::new(port,port,"fixture".into(),"fixture".into())?,XmzNetwork::Mainnet);
++        let wallet=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
++        let wallet_port=wallet.local_addr()?.port();
++        let mut session=NativeWalletSession::new(NativeFundingRpc::new(port,wallet_port,"fixture".into(),"fixture".into())?,XmzNetwork::Mainnet);
+         let request=request()?;let genesis="aa".repeat(32);
+         let deadline=Instant::now()+Duration::from_secs(if cancel {30} else {1});
+         {

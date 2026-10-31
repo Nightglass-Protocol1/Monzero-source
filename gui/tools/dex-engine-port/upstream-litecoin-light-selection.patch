@@ -1,0 +1,155 @@
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/tests.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection/tests.rs
+@@ -0,0 +1,63 @@
++use super::*;
++use crate::litecoin_light::MerkleMatch;
++use std::{fs,path::PathBuf,os::unix::fs::DirBuilderExt};
++struct Directory(PathBuf);
++impl Directory {fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("ltc-selection-{}",Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}}
++impl Drop for Directory {fn drop(&mut self) {let _=fs::remove_dir_all(&self.0);}}
++fn fixture()->Result<(SecretSeed,PublicAccount,HeaderSequence,IncludedTransaction,TxOut)> {
++    // Policy-only injected inclusion, not a consensus-valid funding fixture.
++    let (seed,account,mut credit,prevout)=super::super::super::super::tests::fixture()?;
++    let chain=HeaderSequence::new(LtcNetwork::Regtest)?;
++    credit.output=vec![TxOut {value:Amount::from_sat(50000),script_pubkey:prevout.script_pubkey.clone()},
++        TxOut {value:Amount::from_sat(80000),script_pubkey:prevout.script_pubkey}];
++    let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),
++        block_hash:chain.header(0).unwrap().block_hash(),claimed_height:0},&credit)?;
++    let payment=TxOut {value:Amount::from_sat(119000),script_pubkey:account.derive(Branch::Receive,4)?.address().script_pubkey().clone()};
++    Ok((seed,account,chain,included,payment))
++}
++fn policy()->PaymentPolicy {PaymentPolicy {fee:Amount::from_sat(1000),minimum_change:Amount::from_sat(1000),change_index:0,minimum_confirmations:1}}
++#[test]
++fn selected_payment_has_exact_fee_change_and_retained_signatures()->Result<()> {
++    let (seed,account,chain,credit,payment)=fixture()?;
++    let mut inputs=vec![IncludedInput {transaction:&credit,vout:0,branch:Branch::Receive,index:3},IncludedInput {transaction:&credit,vout:1,branch:Branch::Receive,index:3}];
++    let observed=ObservedWallet::reconcile(&chain,&[credit.outputs()[0].script_pubkey.clone()],std::slice::from_ref(&credit))?;
++    let review=ConfirmedSpendReview::select_payment(&chain,&observed,&account,&inputs,&payment,&policy())?;
++    assert_eq!(review.fee().to_sat(),1000);assert_eq!(review.transaction().input[0].previous_output.vout,1);
++    assert_eq!(review.transaction().output[0],payment);assert_eq!(review.transaction().output[1].value.to_sat(),10000);
++    assert_eq!(&review.transaction().output[1].script_pubkey,account.derive(Branch::Change,0)?.address().script_pubkey());
++    inputs.reverse();let reversed=ConfirmedSpendReview::select_payment(&chain,&observed,&account,&inputs,&payment,&policy())?;
++    assert_eq!(review.transaction(),reversed.transaction());
++    let directory=Directory::new()?;let retained=review.retain_observed(&chain,&observed,&directory.0,Uuid::new_v4())?;
++    let signed=retained.approve_and_sign_on(&chain,&observed,&seed,retained.signing_commitment())?;
++    assert!(signed.input.iter().all(|input|input.witness.len()==2));
++    assert_eq!(signed.compute_txid(),reversed.transaction().compute_txid());Ok(())
++}
++#[test]
++fn selection_preserves_exact_fee_and_rejects_tiny_change_overflow_and_wrong_ownership()->Result<()> {
++    let (_,account,chain,credit,mut payment)=fixture()?;
++    let inputs=[IncludedInput {transaction:&credit,vout:0,branch:Branch::Receive,index:3},IncludedInput {transaction:&credit,vout:1,branch:Branch::Receive,index:3}];
++    let observed=ObservedWallet::reconcile(&chain,&[credit.outputs()[0].script_pubkey.clone()],std::slice::from_ref(&credit))?;
++    payment.value=Amount::from_sat(129000);
++    assert_eq!(ConfirmedSpendReview::select_payment(&chain,&observed,&account,&inputs,&payment,&policy())?.transaction().output.len(),1);
++    payment.value=Amount::from_sat(128999);
++    assert!(ConfirmedSpendReview::select_payment(&chain,&observed,&account,&inputs,&payment,&policy()).err().unwrap().to_string().contains("cannot meet"));
++    payment.value=Amount::from_sat(u64::MAX);
++    assert!(ConfirmedSpendReview::select_payment(&chain,&observed,&account,&inputs,&payment,&policy()).err().unwrap().to_string().contains("overflow"));
++    payment.value=Amount::from_sat(79000);
++    let wrong=[IncludedInput {transaction:&credit,vout:1,branch:Branch::Change,index:3}];
++    assert!(ConfirmedSpendReview::select_payment(&chain,&observed,&account,&wrong,&payment,&policy()).err().unwrap().to_string().contains("ownership"));Ok(())
++}
++#[test]
++fn selection_excludes_pending_inputs_and_insufficient_depth_and_rejects_duplicates()->Result<()> {
++    let (_,account,chain,credit,payment)=fixture()?;
++    let inputs=[IncludedInput {transaction:&credit,vout:0,branch:Branch::Receive,index:3},IncludedInput {transaction:&credit,vout:1,branch:Branch::Receive,index:3}];
++    let script=credit.outputs()[0].script_pubkey.clone();
++    let observed=ObservedWallet::reconcile(&chain,&[script.clone()],std::slice::from_ref(&credit))?;
++    let review=ConfirmedSpendReview::select_payment(&chain,&observed,&account,&inputs,&payment,&policy())?;
++    let pending=ObservedWallet::reconcile_with_pending(&chain,&[script],std::slice::from_ref(&credit),&[review.transaction().clone()])?;
++    assert!(ConfirmedSpendReview::select_payment(&chain,&pending,&account,&inputs,&payment,&policy()).is_err());
++    let mut deeper=policy();deeper.minimum_confirmations=2;
++    assert!(ConfirmedSpendReview::select_payment(&chain,&observed,&account,&inputs,&payment,&deeper).is_err());
++    let duplicates=[IncludedInput {transaction:&credit,vout:0,branch:Branch::Receive,index:3},IncludedInput {transaction:&credit,vout:0,branch:Branch::Receive,index:3}];
++    assert!(ConfirmedSpendReview::select_payment(&chain,&observed,&account,&duplicates,&payment,&policy()).err().unwrap().to_string().contains("duplicate"));Ok(())
++}
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/selection.rs
+@@ -0,0 +1,73 @@
++//! Deterministic largest-first selection with explicit absolute fee policy.
++//! No fee estimation, relay-policy assertion, address allocation or broadcasting.
++use super::*;
++use crate::litecoin_light::accounting::ObservedWallet;
++use bitcoin::{absolute,transaction,TxIn,ScriptBuf,Sequence};
++use std::collections::{BTreeMap,BTreeSet};
++
++pub struct PaymentPolicy {
++    pub fee:Amount,
++    /// Caller-selected change threshold, not a hardcoded network dust rule.
++    pub minimum_change:Amount,
++    /// Must already be reserved in the wallet's durable address book.
++    pub change_index:u32,
++    pub minimum_confirmations:u64,
++}
++impl ConfirmedSpendReview {
++    /// Validate candidates, then select largest first with outpoint tie-breaking.
++    /// Does not search every subset, consult other operations' journal claims,
++    /// or establish complete/fresh history. The result still needs retention
++    /// and explicit signing approval. No network calls or writes occur here.
++    pub fn select_payment(chain:&HeaderSequence,observed:&ObservedWallet,account:&PublicAccount,
++        candidates:&[IncludedInput<'_>],payment:&TxOut,policy:&PaymentPolicy)->Result<Self> {
++        ensure!(chain.network()==account.network() && policy.minimum_confirmations>0
++            && policy.minimum_change.to_sat()>0 && !candidates.is_empty() && candidates.len()<=1000,
++            "invalid Litecoin payment selection policy");
++        ensure!(payment.value.to_sat()>0 && !payment.script_pubkey.is_empty() && payment.script_pubkey.len()<=10000,
++            "invalid Litecoin payment");
++        ensure!(observed.height()==chain.height() && chain.contains(observed.height(),observed.tip()),
++            "Litecoin observation tip differs from payment selection");
++        let change_script=account.derive(Branch::Change,policy.change_index)?.address().script_pubkey().clone();
++        let required=payment.value.to_sat().checked_add(policy.fee.to_sat()).context("Litecoin payment plus fee overflow")?;
++        let coins=observed.coins().iter().map(|coin|(coin.outpoint(),coin)).collect::<BTreeMap<_,_>>();
++        let mut seen=BTreeSet::new();let mut eligible=Vec::new();
++        for candidate in candidates {
++            let outpoint=OutPoint {txid:candidate.transaction.txid(),vout:candidate.vout};
++            ensure!(seen.insert(outpoint),"duplicate Litecoin selection candidate");
++            let depth=candidate.transaction.confirmations_on(chain).context("orphaned Litecoin selection candidate")?;
++            let prevout=candidate.transaction.outputs().get(candidate.vout as usize).context("missing Litecoin selection output")?;
++            ensure!(prevout.value.to_sat()>0 && account.matches_script(candidate.branch,candidate.index,&prevout.script_pubkey)?,
++                "Litecoin selection ownership mismatch");
++            let Some(coin)=coins.get(&outpoint) else {continue};
++            ensure!(coin.amount()==prevout.value && coin.confirmations()==depth
++                && coin.is_coinbase()==candidate.transaction.is_coinbase(),"Litecoin selection observation mismatch");
++            if depth>=policy.minimum_confirmations && coin.maturity_satisfied() {
++                eligible.push((prevout.value.to_sat(),outpoint,candidate));
++            }
++        }
++        eligible.sort_by(|a,b|b.0.cmp(&a.0).then_with(||a.1.cmp(&b.1)));
++        let mut selected=Vec::new();let mut total=0u64;let mut change=None;
++        for (value,_,candidate) in eligible {
++            total=total.checked_add(value).context("Litecoin selected amount overflow")?;
++            selected.push(IncludedInput {transaction:candidate.transaction,vout:candidate.vout,
++                branch:candidate.branch,index:candidate.index});
++            if total>=required {
++                let remainder=total-required;
++                if remainder==0 || remainder>=policy.minimum_change.to_sat() {change=Some(remainder);break;}
++            }
++        }
++        let change=change.context("Litecoin candidates cannot meet exact payment, fee and change policy")?;
++        let input=selected.iter().map(|candidate|TxIn {
++            previous_output:OutPoint {txid:candidate.transaction.txid(),vout:candidate.vout},
++            script_sig:ScriptBuf::new(),sequence:Sequence::MAX,witness:Witness::new(),
++        }).collect();
++        let mut output=vec![payment.clone()];
++        if change>0 {output.push(TxOut {value:Amount::from_sat(change),script_pubkey:change_script});}
++        let transaction=Transaction {version:transaction::Version::TWO,lock_time:absolute::LockTime::ZERO,input,output};
++        let review=Self::new(chain,account,transaction,&selected,payment,
++            if change>0 {Some(policy.change_index)}else{None},policy.fee,policy.minimum_confirmations)?;
++        ensure!(review.fee()==policy.fee,"Litecoin selected fee mismatch");Ok(review)
++    }
++}
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed.rs
+@@ -48,3 +48,5 @@
+ mod tests;
+ 
+ pub mod claimed;
++
++pub mod selection;

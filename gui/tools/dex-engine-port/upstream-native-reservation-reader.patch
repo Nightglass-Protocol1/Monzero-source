@@ -1,0 +1,138 @@
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+index e28fc7233..1f6e1ca5c 100644
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -8,6 +8,7 @@ pub mod native_quote_signatures;
+ pub mod native_trade_quote;
+ pub mod native_negotiation;
+ pub mod native_price_band;
++pub mod native_quote_reservation;
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/swap-machine/src/native_quote_reservation.rs b/swap-machine/src/native_quote_reservation.rs
+new file mode 100644
+index 000000000..a12d0124a
+--- /dev/null
++++ b/swap-machine/src/native_quote_reservation.rs
+@@ -0,0 +1,120 @@
++//! Read-only GUI reservation storage boundary. Not durable approval or funding authority.
++use anyhow::{Result, ensure};
++use std::path::Path;
++use uuid::Uuid;
++
++/// The directory and its ancestors must be exclusively controlled by the caller.
++/// Returned bytes still require signature, deployment and freshness validation.
++/// No record is repaired, consumed or removed; a previous failed GUI fsync can
++/// leave readable records, so this cannot prove that approval returned success.
++#[cfg(target_os = "linux")]
++pub fn read_record_bytes(directory: &Path, quote_id: Uuid, swap_id: Uuid) -> Result<Vec<u8>> {
++    use std::{fs::{File, OpenOptions}, io::Read,
++        os::{fd::{AsRawFd, FromRawFd}, unix::fs::{MetadataExt, OpenOptionsExt}}};
++    ensure!(!quote_id.is_nil() && !swap_id.is_nil(), "missing reservation identity");
++    ensure!(directory.is_absolute() && directory.canonicalize()? == directory,
++        "reservation directory must be canonical and absolute");
++    let root = OpenOptions::new().read(true)
++        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(directory)?;
++    let metadata = root.metadata()?;
++    ensure!(metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() }
++        && metadata.mode() & 0o077 == 0, "reservation directory is not private");
++    ensure!(unsafe { libc::flock(root.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0,
++        "reservation directory is busy");
++    let open = |name: String| -> Result<File> {
++        let name = std::ffi::CString::new(name)?;
++        let fd = unsafe { libc::openat(root.as_raw_fd(), name.as_ptr(),
++            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
++        if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
++        Ok(unsafe { File::from_raw_fd(fd) })
++    };
++    let mut record = open(format!("quote-{quote_id}.json"))?;
++    let paired = open(format!("swap-{swap_id}.json"))?;
++    let before = record.metadata()?;
++    let other = paired.metadata()?;
++    ensure!(before.is_file() && before.uid() == unsafe { libc::geteuid() }
++        && before.mode() & 0o077 == 0 && before.nlink() == 2
++        && before.len() > 0 && before.len() <= 16384
++        && other.dev() == before.dev() && other.ino() == before.ino(),
++        "invalid reservation file pair");
++    let mut bytes = Vec::new();
++    (&mut record).take(16385).read_to_end(&mut bytes)?;
++    let after = record.metadata()?;
++    ensure!(bytes.len() as u64 == before.len() && after.len() == before.len()
++        && after.mode() == before.mode() && after.uid() == before.uid() && after.nlink() == 2
++        && after.mtime() == before.mtime() && after.mtime_nsec() == before.mtime_nsec()
++        && after.ctime() == before.ctime() && after.ctime_nsec() == before.ctime_nsec(),
++        "reservation changed while reading");
++    // File descriptors prevent following a substituted path. Check current names
++    // too, under the cooperative directory lock used by the GUI writer.
++    for name in [format!("quote-{quote_id}.json"), format!("swap-{swap_id}.json")] {
++        let current = open(name)?.metadata()?;
++        ensure!(current.dev() == before.dev() && current.ino() == before.ino(),
++            "reservation names changed while reading");
++    }
++    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
++    ensure!(value["terms"]["quoteId"] == quote_id.to_string()
++        && value["terms"]["swapId"] == swap_id.to_string(), "reservation filename identity mismatch");
++    Ok(bytes)
++}
++
++#[cfg(not(target_os = "linux"))]
++pub fn read_record_bytes(_: &Path, _: Uuid, _: Uuid) -> Result<Vec<u8>> {
++    anyhow::bail!("GUI reservation storage is not implemented on this platform")
++}
++
++#[cfg(all(test, target_os = "linux"))]
++mod tests {
++    use super::*;
++    use std::{fs::{self, OpenOptions}, io::Write, os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink}};
++    struct Directory(std::path::PathBuf);
++    impl Drop for Directory {
++        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
++    }
++    #[test]
++    fn reads_only_private_matching_hardlink_pair() -> Result<()> {
++        let directory = Directory(std::env::temp_dir().canonicalize()?.join(format!("xmz-quote-reader-{}", Uuid::new_v4())));
++        fs::DirBuilder::new().mode(0o700).create(&directory.0)?;
++        let quote = Uuid::new_v4(); let swap = Uuid::new_v4();
++        let qpath = directory.0.join(format!("quote-{quote}.json"));
++        let spath = directory.0.join(format!("swap-{swap}.json"));
++        let bytes = serde_json::to_vec(&serde_json::json!({"terms":{"quoteId":quote.to_string(),"swapId":swap.to_string()}}))?;
++        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&qpath)?;
++        file.write_all(&bytes)?; file.sync_all()?;
++        assert!(read_record_bytes(&directory.0, quote, swap).is_err());
++        fs::hard_link(&qpath, &spath)?;
++        assert_eq!(read_record_bytes(&directory.0, quote, swap)?, bytes);
++        fs::set_permissions(&qpath, fs::Permissions::from_mode(0o644))?;
++        assert!(read_record_bytes(&directory.0, quote, swap).is_err());
++        fs::set_permissions(&qpath, fs::Permissions::from_mode(0o600))?;
++        let extra = directory.0.join("extra-link"); fs::hard_link(&qpath, &extra)?;
++        assert!(read_record_bytes(&directory.0, quote, swap).is_err());
++        fs::remove_file(&extra)?;
++        fs::remove_file(&spath)?; symlink(&qpath, &spath)?;
++        assert!(read_record_bytes(&directory.0, quote, swap).is_err());
++        fs::remove_file(&spath)?; fs::copy(&qpath, &spath)?;
++        assert!(read_record_bytes(&directory.0, quote, swap).is_err());
++        fs::remove_file(&spath)?; fs::hard_link(&qpath, &spath)?;
++        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o755))?;
++        assert!(read_record_bytes(&directory.0, quote, swap).is_err());
++        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o700))?;
++        assert_eq!(read_record_bytes(&directory.0, quote, swap)?, bytes);
++        assert!(read_record_bytes(&directory.0, Uuid::nil(), swap).is_err());
++        file.set_len(16385)?;
++        assert!(read_record_bytes(&directory.0, quote, swap).is_err());
++        file.set_len(bytes.len() as u64)?;
++        let other_quote = Uuid::new_v4();
++        let renamed = directory.0.join(format!("quote-{other_quote}.json"));
++        fs::rename(&qpath, &renamed)?;
++        assert!(read_record_bytes(&directory.0, other_quote, swap).is_err());
++        fs::rename(&renamed, &qpath)?;
++        use std::os::fd::AsRawFd;
++        let locked = fs::File::open(&directory.0)?;
++        assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
++        assert!(read_record_bytes(&directory.0, quote, swap).is_err());
++        assert_eq!(unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_UN) }, 0);
++        assert_eq!(read_record_bytes(&directory.0, quote, swap)?, bytes);
++        // Reader deliberately returns raw bytes, not a signed/approved quote.
++        Ok(())
++    }
++}

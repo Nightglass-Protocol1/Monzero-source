@@ -1,0 +1,362 @@
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -10,6 +10,7 @@
+ pub mod native_price_band;
+ pub mod native_quote_reservation;
+ pub mod native_execution_claim;
++pub mod route_approval;
+ 
+ #[cfg(test)]
+ mod tests {
+diff --git a/swap-machine/src/route_approval.rs b/swap-machine/src/route_approval.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/route_approval.rs
+@@ -0,0 +1,199 @@
++//! In-memory consent requests for individual legs of a sequential route.
++//!
++//! This service does not validate quote economics, authorize a transaction, or
++//! persist consent across restart. Callers must invalidate requests when their
++//! reviewed state changes and revalidate that state before acting on a reply.
++//! Dropping the waiter or disconnecting its session revokes unconsumed consent.
++
++use anyhow::{Context, Result, ensure};
++use serde::Serialize;
++use serde_json::Value;
++use sha2::{Digest, Sha256};
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++use tokio::sync::oneshot;
++use tokio::time::Instant;
++use uuid::Uuid;
++
++const MAX_PENDING: usize = 64;
++const MAX_DETAILS_BYTES: usize = 32 * 1024;
++const MAX_LIFETIME: Duration = Duration::from_secs(300);
++
++#[derive(Clone, Copy, Debug, Serialize)]
++#[serde(rename_all = "kebab-case")]
++pub enum ApprovalPurpose {
++    SelectMaker,
++    LockBitcoin,
++}
++
++#[derive(Clone, Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ApprovalContext {
++    pub route_id: Uuid,
++    pub leg_id: Uuid,
++    pub swap_id: Uuid,
++    pub purpose: ApprovalPurpose,
++}
++
++/// Immutable envelope sent to the reviewing client. The commitment covers every
++/// field in the request, including the purpose, details, ID and expiry.
++#[derive(Clone, Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct ApprovalReview {
++    request: ReviewRequest,
++    commitment: String,
++}
++
++#[derive(Clone, Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct ReviewRequest {
++    schema: &'static str,
++    request_id: Uuid,
++    context: ApprovalContext,
++    expires_at_ms: u64,
++    details: Value,
++}
++
++/// One instance belongs to one client connection. On disconnect the transport
++/// must drop this session or call `invalidate_all`. Waiters do not keep the
++/// session alive; reconnecting must create fresh reviews.
++#[derive(Default)]
++pub struct ApprovalSession {
++    pending: Arc<Mutex<HashMap<Uuid, Pending>>>,
++}
++
++struct Pending {
++    review: ApprovalReview,
++    deadline: Instant,
++    responder: Option<oneshot::Sender<bool>>,
++}
++
++#[must_use = "dropping the waiter cancels the approval request"]
++pub struct ApprovalWaiter {
++    pending: Arc<Mutex<HashMap<Uuid, Pending>>>,
++    request_id: Uuid,
++    deadline: Instant,
++    receiver: Option<oneshot::Receiver<bool>>,
++}
++
++impl ApprovalReview {
++    pub fn request_id(&self) -> Uuid {
++        self.request.request_id
++    }
++
++    pub fn commitment(&self) -> &str {
++        &self.commitment
++    }
++}
++
++impl ApprovalSession {
++    /// Register before emitting the review so even an immediate reply can be
++    /// resolved. The caller must drop the waiter if delivery fails.
++    pub fn begin(
++        &self,
++        context: ApprovalContext,
++        details: Value,
++        lifetime: Duration,
++    ) -> Result<(ApprovalReview, ApprovalWaiter)> {
++        ensure!(
++            !context.route_id.is_nil() && !context.leg_id.is_nil() && !context.swap_id.is_nil(),
++            "approval requires route, leg and swap identities"
++        );
++        ensure!(
++            !lifetime.is_zero() && lifetime <= MAX_LIFETIME,
++            "approval lifetime must be positive and at most five minutes"
++        );
++        ensure!(details.is_object(), "approval details must be an object");
++        ensure!(
++            serde_json::to_vec(&details)?.len() <= MAX_DETAILS_BYTES,
++            "approval details exceed size limit"
++        );
++        let expires_at_ms = SystemTime::now()
++            .checked_add(lifetime)
++            .context("approval expiration overflow")?
++            .duration_since(UNIX_EPOCH)?
++            .as_millis()
++            .try_into()?;
++        let deadline = Instant::now() + lifetime;
++        let request_id = Uuid::new_v4();
++        let request = ReviewRequest {
++            schema: "monzero-route-approval-v1",
++            request_id,
++            context,
++            expires_at_ms,
++            details,
++        };
++        let commitment = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
++        let review = ApprovalReview { request, commitment };
++        let (responder, receiver) = oneshot::channel();
++        let mut pending = self.pending.lock().map_err(|_| anyhow::anyhow!("approval lock poisoned"))?;
++        pending.retain(|_, entry| entry.deadline > Instant::now());
++        ensure!(pending.len() < MAX_PENDING, "too many pending approvals");
++        pending.insert(request_id, Pending {
++            review: review.clone(),
++            deadline,
++            responder: Some(responder),
++        });
++        Ok((review, ApprovalWaiter {
++            pending: self.pending.clone(), request_id, deadline, receiver: Some(receiver),
++        }))
++    }
++
++    /// A reply is accepted once, only for the precise envelope still pending.
++    /// It remains revocable until the waiting execution consumes it.
++    pub fn resolve(&self, request_id: Uuid, commitment: &str, approve: bool) -> Result<()> {
++        let mut pending = self.pending.lock().map_err(|_| anyhow::anyhow!("approval lock poisoned"))?;
++        pending.retain(|_, entry| entry.deadline > Instant::now());
++        let entry = pending.get_mut(&request_id).context("approval is no longer pending")?;
++        ensure!(entry.review.commitment == commitment, "approval commitment differs from review");
++        entry.responder.take().context("approval already answered")?
++            .send(approve).map_err(|_| anyhow::anyhow!("approval waiter disconnected"))
++    }
++
++    pub fn pending_reviews(&self) -> Result<Vec<ApprovalReview>> {
++        let mut pending = self.pending.lock().map_err(|_| anyhow::anyhow!("approval lock poisoned"))?;
++        pending.retain(|_, entry| entry.deadline > Instant::now());
++        Ok(pending.values().filter(|entry| entry.responder.is_some())
++            .map(|entry| entry.review.clone()).collect())
++    }
++
++    /// Cancel all unconsumed replies, including replies already queued for a
++    /// waiter. Use on disconnect, quote/balance change or route abandonment.
++    pub fn invalidate_all(&self) -> Result<()> {
++        self.pending.lock().map_err(|_| anyhow::anyhow!("approval lock poisoned"))?.clear();
++        Ok(())
++    }
++}
++
++impl Drop for ApprovalSession {
++    fn drop(&mut self) {
++        if let Ok(mut pending) = self.pending.lock() {
++            pending.clear();
++        }
++    }
++}
++
++impl ApprovalWaiter {
++    pub async fn wait(mut self) -> Result<bool> {
++        let receiver = self.receiver.take().context("approval already awaited")?;
++        let answer = tokio::time::timeout_at(self.deadline, receiver).await
++            .context("approval expired")?.context("approval cancelled")?;
++        let mut pending = self.pending.lock()
++            .map_err(|_| anyhow::anyhow!("approval lock poisoned"))?;
++        let entry = pending.remove(&self.request_id).context("approval invalidated before consumption")?;
++        ensure!(entry.deadline > Instant::now(), "approval expired before consumption");
++        Ok(answer)
++    }
++}
++
++impl Drop for ApprovalWaiter {
++    fn drop(&mut self) {
++        if let Ok(mut pending) = self.pending.lock() {
++            pending.remove(&self.request_id);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/route_approval/tests.rs b/swap-machine/src/route_approval/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/route_approval/tests.rs
+@@ -0,0 +1,142 @@
++use super::*;
++use serde_json::json;
++
++fn context(purpose: ApprovalPurpose) -> ApprovalContext {
++    ApprovalContext { route_id: Uuid::new_v4(), leg_id: Uuid::new_v4(), swap_id: Uuid::new_v4(), purpose }
++}
++
++fn begin(session: &ApprovalSession) -> (ApprovalReview, ApprovalWaiter) {
++    session.begin(context(ApprovalPurpose::SelectMaker), json!({"btcAtoms": "12345"}), Duration::from_secs(30)).unwrap()
++}
++
++#[tokio::test]
++async fn exact_review_required_and_reply_is_single_use() {
++    let session = ApprovalSession::default();
++    let (review, waiter) = begin(&session);
++    assert_eq!(session.pending_reviews().unwrap().len(), 1);
++    assert!(session.resolve(review.request_id(), &"0".repeat(64), true).is_err());
++    session.resolve(review.request_id(), review.commitment(), true).unwrap();
++    assert!(session.pending_reviews().unwrap().is_empty());
++    assert!(session.resolve(review.request_id(), review.commitment(), true).is_err());
++    assert!(waiter.wait().await.unwrap());
++    assert!(session.resolve(review.request_id(), review.commitment(), true).is_err());
++}
++
++#[tokio::test]
++async fn cancellation_revokes_even_an_already_queued_yes() {
++    let session = ApprovalSession::default();
++    let (review, waiter) = begin(&session);
++    session.resolve(review.request_id(), review.commitment(), true).unwrap();
++    session.invalidate_all().unwrap();
++    assert!(waiter.wait().await.is_err());
++    let (replacement, replacement_waiter) = begin(&session);
++    assert!(session.resolve(replacement.request_id(), review.commitment(), true).is_err());
++    session.resolve(replacement.request_id(), replacement.commitment(), false).unwrap();
++    assert!(!replacement_waiter.wait().await.unwrap());
++}
++
++#[tokio::test]
++async fn dropped_waiter_and_disconnected_session_reject_replies() {
++    let session = ApprovalSession::default();
++    let (review, waiter) = begin(&session);
++    drop(waiter);
++    assert!(session.resolve(review.request_id(), review.commitment(), true).is_err());
++    let (review, waiter) = begin(&session);
++    session.invalidate_all().unwrap();
++    assert!(waiter.wait().await.is_err());
++    assert!(session.resolve(review.request_id(), review.commitment(), true).is_err());
++}
++
++#[tokio::test]
++async fn dropping_session_revokes_queued_and_unanswered_requests() {
++    let session = ApprovalSession::default();
++    let (review, answered) = begin(&session);
++    let (_, unanswered) = begin(&session);
++    session.resolve(review.request_id(), review.commitment(), true).unwrap();
++    drop(session);
++    assert!(answered.wait().await.is_err());
++    assert!(unanswered.wait().await.is_err());
++}
++
++#[tokio::test]
++async fn timeout_removes_request_and_late_reply_fails() {
++    let session = ApprovalSession::default();
++    let (review, waiter) = session.begin(context(ApprovalPurpose::LockBitcoin), json!({}), Duration::from_millis(1)).unwrap();
++    assert!(waiter.wait().await.is_err());
++    assert!(session.pending_reviews().unwrap().is_empty());
++    assert!(session.resolve(review.request_id(), review.commitment(), true).is_err());
++}
++
++#[tokio::test]
++async fn expiry_revokes_a_reply_waiting_to_be_consumed() {
++    let session = ApprovalSession::default();
++    let (review, mut waiter) = begin(&session);
++    session.resolve(review.request_id(), review.commitment(), true).unwrap();
++    let expired = Instant::now() - Duration::from_secs(1);
++    session.pending.lock().unwrap().get_mut(&review.request_id()).unwrap().deadline = expired;
++    waiter.deadline = expired;
++    assert!(waiter.wait().await.is_err());
++}
++
++#[tokio::test]
++async fn aborting_waiting_execution_invalidates_its_request() {
++    let session = ApprovalSession::default();
++    let (review, waiter) = begin(&session);
++    let task = tokio::spawn(waiter.wait());
++    tokio::task::yield_now().await;
++    task.abort();
++    assert!(task.await.unwrap_err().is_cancelled());
++    assert!(session.pending_reviews().unwrap().is_empty());
++    assert!(session.resolve(review.request_id(), review.commitment(), true).is_err());
++}
++
++#[tokio::test]
++async fn another_session_cannot_resolve_request() {
++    let session = ApprovalSession::default();
++    let (review, waiter) = begin(&session);
++    assert!(ApprovalSession::default().resolve(review.request_id(), review.commitment(), true).is_err());
++    session.resolve(review.request_id(), review.commitment(), false).unwrap();
++    assert!(!waiter.wait().await.unwrap());
++}
++
++#[test]
++fn commitment_covers_identity_purpose_expiry_and_terms() {
++    let session = ApprovalSession::default();
++    let (review, _waiter) = begin(&session);
++    let changes: [fn(&mut ReviewRequest); 8] = [
++        |request| request.request_id = Uuid::new_v4(),
++        |request| request.context.route_id = Uuid::new_v4(),
++        |request| request.context.leg_id = Uuid::new_v4(),
++        |request| request.context.swap_id = Uuid::new_v4(),
++        |request| request.context.purpose = ApprovalPurpose::LockBitcoin,
++        |request| request.expires_at_ms += 1,
++        |request| request.details["btcAtoms"] = json!("12346"),
++        |request| request.schema = "different-schema",
++    ];
++    for change in changes {
++        let mut altered = review.request.clone();
++        change(&mut altered);
++        let altered_commitment = format!("{:x}", Sha256::digest(serde_json::to_vec(&altered).unwrap()));
++        assert_ne!(review.commitment(), altered_commitment);
++    }
++    assert_eq!(review.commitment(), format!("{:x}", Sha256::digest(serde_json::to_vec(&review.request).unwrap())));
++}
++
++#[test]
++fn requests_are_bounded_and_require_explicit_identity() {
++    let session = ApprovalSession::default();
++    let mut invalid = context(ApprovalPurpose::SelectMaker);
++    invalid.swap_id = Uuid::nil();
++    assert!(session.begin(invalid, json!({}), Duration::from_secs(1)).is_err());
++    for duration in [Duration::ZERO, MAX_LIFETIME + Duration::from_secs(1)] {
++        assert!(session.begin(context(ApprovalPurpose::SelectMaker), json!({}), duration).is_err());
++    }
++    for details in [Value::Null, json!({"large": "x".repeat(MAX_DETAILS_BYTES)})] {
++        assert!(session.begin(context(ApprovalPurpose::SelectMaker), details, Duration::from_secs(1)).is_err());
++    }
++    let mut waiters = Vec::new();
++    for _ in 0..MAX_PENDING { waiters.push(begin(&session).1); }
++    assert!(session.begin(context(ApprovalPurpose::SelectMaker), json!({}), Duration::from_secs(1)).is_err());
++    waiters.pop();
++    let _replacement = begin(&session);
++}

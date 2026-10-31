@@ -1,0 +1,201 @@
+diff --git a/swap-machine/src/litecoin_light.rs b/swap-machine/src/litecoin_light.rs
+--- a/swap-machine/src/litecoin_light.rs
++++ b/swap-machine/src/litecoin_light.rs
+@@ -139,3 +139,6 @@
+ 
+ #[cfg(target_os="linux")]
+ pub mod vault;
++
++#[cfg(all(test,target_os="linux"))]
++mod funding_tests;
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/claims.rs
+@@ -31,6 +31,23 @@
+         // Input claims precede the completed preparation manifest.
+         for (name,bytes) in records.iter().skip(1).chain(records.iter().take(1)) {journal.retain(name,bytes)?;}
+         Ok(Self {journal,review,records})
++    }
++    /// Exact unsigned funding proposal only; never a signing/relay permit.
++    /// Kept behind the observed-spend API so callers must recheck the chain.
++    pub(in crate::litecoin_light::vault::signing::review) fn recovery_psbt(&self,operation:Uuid,expected:sha256::Hash)->Result<bitcoin::psbt::Psbt> {
++        self.check_signing_review(expected)?;self.ensure_not_submitted()?;
++        ensure!(!operation.is_nil() && self.records[0].0==format!("ltc-spend-{operation}.json"),"funding claim belongs to another operation");
++        ensure!(self.review.account.network().script_kind()==crate::litecoin_light::network::ScriptKind::WitnessV0,
++            "pre-signed recovery requires stable SegWit funding inputs");
++        let tx=self.transaction();
++        ensure!(tx.input.iter().all(|i|i.script_sig.is_empty() && i.witness.is_empty() && !i.sequence.is_rbf()),
++            "unstable recovery funding transaction");
++        let mut psbt=bitcoin::psbt::Psbt::from_unsigned_tx(tx.clone())?;
++        for (input,owned) in psbt.inputs.iter_mut().zip(&self.review.inputs) {
++            ensure!(owned.prevout.script_pubkey.is_p2wpkh(),"unsupported recovery funding prevout");
++            input.witness_utxo=Some(owned.prevout.clone());
++        }
++        Ok(psbt)
+     }
+     pub fn transaction(&self)->&Transaction {self.review.transaction()}
+     pub fn fee(&self)->Amount {self.review.fee()}
+diff --git a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+--- a/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
++++ b/swap-machine/src/litecoin_light/vault/signing/review/confirmed/claimed.rs
+@@ -49,6 +49,14 @@
+         require_observed(chain,observed,network,height,tip,&inputs)?;
+         Ok(Self {claimed,network,height,tip,inputs})
+     }
++    /// Export the exact retained unsigned transaction and owned prevouts for a
++    /// swap recovery agreement. The caller still validates quote/contract/fees,
++    /// obtains peer recovery, and requests signing and broadcasting separately.
++    pub fn funding_psbt_on(&self,chain:&HeaderSequence,observed:&ObservedWallet,
++        operation:Uuid,expected:sha256::Hash)->Result<bitcoin::psbt::Psbt> {
++        require_observed(chain,observed,self.network,self.height,self.tip,&self.inputs)?;
++        self.claimed.recovery_psbt(operation,expected)
++    }
+     pub fn transaction(&self)->&Transaction {self.claimed.transaction()}
+     pub fn fee(&self)->Amount {self.claimed.fee()}
+     pub fn signing_commitment(&self)->sha256::Hash {self.claimed.signing_commitment()}
+diff --git a/swap-machine/src/litecoin_negotiation/execution.rs b/swap-machine/src/litecoin_negotiation/execution.rs
+--- a/swap-machine/src/litecoin_negotiation/execution.rs
++++ b/swap-machine/src/litecoin_negotiation/execution.rs
+@@ -414,3 +414,6 @@
+ pub mod lock_approval;
+ 
+ pub mod redeem_approval;
++
++/// Bind local light-wallet funding claims to the negotiated recovery agreement.
++pub mod light_funding;
+diff --git a/swap-machine/src/litecoin_light/funding_tests.rs b/swap-machine/src/litecoin_light/funding_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/funding_tests.rs
+@@ -0,0 +1,95 @@
++use anyhow::Result;
++use crate::litecoin_negotiation::{execution::Execution,LocalRole};
++use crate::litecoin_light::{headers::HeaderSequence,accounting::ObservedWallet};
++use bitcoin::hashes::{Hash,sha256};
++use std::path::Path;
++use crate::litecoin_light::{MerkleMatch,transaction::IncludedTransaction,account::Branch,
++    vault::{SecretSeed,signing::review::confirmed::{ConfirmedSpendReview,IncludedInput}}};
++use bitcoin::{Amount,Transaction,TxIn,TxOut,OutPoint,Txid,Sequence,absolute::LockTime,transaction::Version};
++use ed25519_dalek::{SigningKey,Signer};
++use rand::SeedableRng;
++use std::{fs,path::PathBuf,os::unix::fs::DirBuilderExt};
++struct Root(PathBuf);
++impl Root {
++    fn new()->Result<Self> {let path=std::env::temp_dir().canonicalize()?.join(format!("light-swap-{}",uuid::Uuid::new_v4()));fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(Self(path))}
++    fn child(&self,name:&str)->Result<PathBuf> {let path=self.0.join(name);fs::DirBuilder::new().mode(0o700).create(&path)?;Ok(path)}
++}
++impl Drop for Root {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
++#[test]
++fn light_claims_bind_the_trade_before_recovery_and_never_sign_funding()->Result<()> {
++    let root=Root::new()?;let bm=root.child("bob-meta")?;let bs=root.child("bob-secrets")?;
++    let am=root.child("alice-meta")?;let als=root.child("alice-secrets")?;
++    let (policy,terms)=crate::litecoin_quote::tests::fixture();
++    let quote=crate::litecoin_quote::tests::signed(&terms,&policy,1000)?;
++    let trade=quote.terms()["swapId"].parse()?;
++    let bi=SigningKey::from_bytes(&[1;32]);let ai=SigningKey::from_bytes(&[2;32]);
++    let pins=[bi.verifying_key().to_bytes(),ai.verifying_key().to_bytes()];
++    let mut rng=rand::rngs::StdRng::seed_from_u64(7812);
++    let mut bob=Execution::begin(&bm,&bs,&quote,&policy,LocalRole::LitecoinFunder,quote.commitment(),1000,&mut rng)?;
++    let mut alice=Execution::begin(&am,&als,&quote,&policy,LocalRole::NativeFunder,quote.commitment(),1000,&mut rng)?;
++    let first=bob.outgoing(&bi,1000)?;alice.accept_peer(first.bytes(),first.signature(),1000)?;
++    let second=alice.outgoing(&ai,1001)?;bob.accept_peer(second.bytes(),second.signature(),1001)?;
++    let keys=bob.completed_keys()?;
++    let seed=SecretSeed::from_bytes(zeroize::Zeroizing::new([42;32]));
++    let account=seed.public_account(policy.ltc_network,0)?;let owned=account.derive(Branch::Receive,0)?;
++    let prevout=TxOut {value:Amount::from_sat(100_001_000),script_pubkey:owned.address().script_pubkey().clone()};
++    let chain=HeaderSequence::new(policy.ltc_network)?;
++    let credit=Transaction {version:Version::TWO,lock_time:LockTime::ZERO,
++        input:vec![TxIn {previous_output:OutPoint::new(Txid::from_byte_array([7;32]),0),script_sig:Default::default(),sequence:Sequence::MAX,witness:Default::default()}],output:vec![prevout.clone()]};
++    // Injected genesis inclusion for policy tests, not Merkle/consensus evidence.
++    let included=IncludedTransaction::new(MerkleMatch {txid:credit.compute_txid(),claimed_height:0,
++        block_hash:chain.header(0).unwrap().block_hash()},&credit)?;
++    let payment=TxOut {value:Amount::from_sat(100_000_000),script_pubkey:keys.contract_address().script_pubkey().clone()};
++    let mut transaction=credit.clone();transaction.input[0].previous_output=OutPoint::new(credit.compute_txid(),0);transaction.output=vec![payment.clone()];
++    let inputs=[IncludedInput {transaction:&included,vout:0,branch:Branch::Receive,index:0}];
++    let observed=ObservedWallet::reconcile(&chain,&[prevout.script_pubkey.clone()],std::slice::from_ref(&included))?;
++    let spent=ObservedWallet::reconcile_with_pending(&chain,&[prevout.script_pubkey.clone()],std::slice::from_ref(&included),&[transaction.clone()])?;
++    let prepare=|tx:Transaction,pay:&TxOut,path:&Path,operation| {
++        ConfirmedSpendReview::new(&chain,&account,tx,&inputs,pay,None,Amount::from_sat(1000),1)?
++            .retain_observed(&chain,&observed,path,operation)
++    };
++    let claims=root.child("claims")?;
++    let spend=prepare(transaction.clone(),&payment,&claims,trade)?;let commitment=spend.signing_commitment();
++    let psbt=spend.funding_psbt_on(&chain,&observed,trade,commitment)?;
++    assert_eq!(psbt.unsigned_tx,transaction);assert_eq!(psbt.inputs[0].witness_utxo,Some(prevout));
++    assert!(spend.funding_psbt_on(&chain,&spent,trade,commitment).is_err());
++    assert!(spend.funding_psbt_on(&chain,&observed,uuid::Uuid::new_v4(),commitment).is_err());
++    assert!(bob.light_recovery_signing_frame(&spend,&chain,&observed,sha256::Hash::hash(b"wrong"),1002).is_err());
++    assert!(bob.light_recovery_signing_frame(&spend,&chain,&spent,commitment,1002).is_err());
++    assert!(alice.light_recovery_signing_frame(&spend,&chain,&observed,commitment,1002).is_err());
++    let other=root.child("other-claims")?;let wrong_id=prepare(transaction.clone(),&payment,&other,uuid::Uuid::new_v4())?;
++    assert!(bob.light_recovery_signing_frame(&wrong_id,&chain,&observed,wrong_id.signing_commitment(),1002).is_err());
++    assert!(!bm.join(format!("{trade}.ltc-light-funding")).exists());
++    let mut wrong_tx=transaction.clone();wrong_tx.output[0].script_pubkey=owned.address().script_pubkey().clone();
++    let bad=root.child("wrong-contract")?;let wrong=prepare(wrong_tx.clone(),&wrong_tx.output[0],&bad,trade)?;
++    assert!(bob.light_recovery_signing_frame(&wrong,&chain,&observed,wrong.signing_commitment(),1002).is_err());
++    assert!(!bm.join(format!("{trade}.ltc-light-funding")).exists());
++    let mut replaceable=transaction.clone();replaceable.input[0].sequence=Sequence::ENABLE_RBF_NO_LOCKTIME;
++    let rbf_dir=root.child("replaceable")?;
++    let rbf=prepare(replaceable,&payment,&rbf_dir,trade)?;
++    assert!(rbf.funding_psbt_on(&chain,&observed,trade,rbf.signing_commitment()).is_err());
++    let stale=ObservedWallet::reconcile(&chain,&[payment.script_pubkey.clone()],&[])?;
++    assert!(spend.funding_psbt_on(&chain,&stale,trade,commitment).is_err());
++    let before=fs::read_dir(&claims)?.count();
++    let frame=bob.light_recovery_signing_frame(&spend,&chain,&observed,commitment,1002)?;
++    assert_eq!(fs::read_dir(&claims)?.count(),before);assert!(spend.retained_signed().is_err());
++    let binding=fs::read(bm.join(format!("{trade}.ltc-light-funding")))?;
++    drop(bob);
++    let mut bob=Execution::resume(&bm,&bs,trade,&policy,LocalRole::LitecoinFunder,pins)?;
++    assert_eq!(bob.light_recovery_signing_frame(&spend,&chain,&observed,commitment,1003)?,frame);
++    assert_eq!(fs::read(bm.join(format!("{trade}.ltc-light-funding")))?,binding);
++    let signed=bi.sign(&crate::litecoin_negotiation::recovery::signing_bytes(&frame)?).to_bytes();
++    let bob_message=bob.submit_recovery_signature(&frame,&signed,1003)?;
++    let alice_message=alice.prepare_recovery(&psbt,&ai,1002)?;
++    let recovery=bob.accept_recovery(alice_message.bytes(),alice_message.signature())?;
++    alice.accept_recovery(bob_message.bytes(),bob_message.signature())?;
++    assert_eq!(recovery.cancel.input[0].previous_output.txid,transaction.compute_txid());
++    assert!(recovery.refund.is_some());assert!(spend.retained_signed().is_err());
++    assert_eq!(fs::read_dir(&claims)?.count(),before);
++    // A changed input claim must fail before producing further recovery output.
++    let entry=fs::read_dir(&claims)?.collect::<std::io::Result<Vec<_>>>()?.into_iter()
++        .find(|entry|entry.path().extension().is_some_and(|e|e=="claim")).unwrap();
++    fs::write(entry.path(),b"altered")?;
++    assert!(bob.light_recovery_signing_frame(&spend,&chain,&observed,commitment,1003).is_err());
++    Ok(())
++}
+diff --git a/swap-machine/src/litecoin_negotiation/execution/light_funding.rs b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_negotiation/execution/light_funding.rs
+@@ -0,0 +1,31 @@
++//! Light-wallet input claims enter the existing negotiated recovery protocol.
++//! This prepares recovery signatures, never signs or broadcasts the funding lock.
++use super::*;
++use crate::litecoin_light::{accounting::ObservedWallet,headers::HeaderSequence,
++    network::LightNetwork,vault::signing::review::confirmed::claimed::ObservedClaimedSpend};
++use crate::litecoin_negotiation::recovery::RecoveryPlan;
++use bitcoin::hashes::{Hash,sha256};
++impl Execution {
++    /// Require the wallet's retained operation to be this trade. The shared
++    /// input journal remains leased by `spend` throughout preparation. Quote
++    /// admission and contract/recovery validation precede any binding writes.
++    pub fn light_recovery_signing_frame(&mut self,spend:&ObservedClaimedSpend,
++        chain:&HeaderSequence,observed:&ObservedWallet,approved_claim:sha256::Hash,now:u64)->Result<Vec<u8>> {
++        ensure!(matches!(self.role,LocalRole::LitecoinFunder),"wrong light funding role");
++        ensure!(chain.network()==LightNetwork::from(self.policy.ltc_network),"wrong light funding network");
++        let (head,_,quote,_,exchange)=self.load()?;
++        let keys=exchange.finish()?;
++        let psbt=spend.funding_psbt_on(chain,observed,self.claim.trade,approved_claim)?;
++        RecoveryPlan::new(&quote,&self.policy,now,&keys,psbt.clone())?;
++        let binding=serde_json::to_vec(&serde_json::json!({"schema":"monzero-ltc-light-funding-binding-v1",
++            "trade":self.claim.trade,"quote":self.claim.quote,"checkpoint":head.checkpoint,
++            "claimCommitment":approved_claim,"psbtDigest":sha256::Hash::hash(&psbt.serialize()),
++            "network":chain.network().storage_identity()}))?;
++        let name=format!("{}.ltc-light-funding",self.claim.trade);
++        self.metadata.compatible(&name,&binding)?;
++        let frame=self.recovery_signing_frame(&psbt,now)?;
++        self.metadata.retain(&name,&binding)?;
++        ensure!(self.metadata.read(&name)?==binding,"light funding binding read-back mismatch");
++        Ok(frame)
++    }
++}

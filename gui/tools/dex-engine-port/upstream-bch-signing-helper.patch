@@ -1,0 +1,201 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation.rs
+@@ -91,9 +91,11 @@
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+     let locked=locking::exercise(&program,&path,&server,metadata,snapshots,&response["review"],
+         &rpc_path,&descriptor)?;
++    let signed=signing::exercise(helper,&path,&server,setup,metadata,snapshots,&rpc_path,&descriptor)?;
+     let before=contents(&metadata.0)?;
+     drop(server);std::fs::remove_file(&rpc_path)?;std::fs::remove_file(&cookie)?;
+     assert_eq!(locking::invoke(&program,&path,"lock-status",None,true)?["lockIntent"],locked);
++    assert_eq!(signing::invoke(helper,&path,"signing-status",None,true)?["signedFunding"],signed);
+ 
+     assert_eq!(invoke("preparation-status",true)?["review"],response["review"]);
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
+@@ -101,3 +103,5 @@
+ }
+ 
+ mod locking;
++
++mod signing;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/initial_preparation/signing.rs
+@@ -0,0 +1,71 @@
++use super::*;
++
++pub(super) fn invoke(helper: &std::path::Path,path: &std::path::Path,action: &str,
++    approved: Option<&str>,success: bool) -> Result<Value> {
++    let id=uuid::Uuid::new_v4();
++    let mut request=json!({"schema":format!("monzero-bch-funding-{action}-request-v1"),"requestId":id});
++    if let Some(approved)=approved {request["commitment"]=json!(approved);}
++    let mut child=Command::new(helper).arg(format!("--funding-{action}-stdio-v1")).arg(path)
++        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++    child.stdin.take().context("missing signing stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++    let output=child.wait_with_output()?;
++    assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++    if !success {assert!(output.stdout.is_empty());return Ok(Value::Null)}
++    assert!(output.stderr.is_empty());assert!(output.stdout.len()<=65536);
++    let response: Value=serde_json::from_slice(&output.stdout)?;
++    assert_eq!(response.as_object().unwrap().len(),8);
++    assert_eq!(response["schema"],format!("monzero-bch-funding-{action}-response-v1"));
++    assert_eq!(response["requestId"],id.to_string());assert_eq!(response["executable"],false);
++    assert_eq!(response["chainObserved"],false);
++    Ok(response)
++}
++
++pub(super) fn exercise(helper: &std::path::Path,path: &std::path::Path,server: &Server,
++    setup: &Setup,metadata: &PrivateStore,snapshots: &PrivateStore,rpc_path: &std::path::Path,
++    descriptor: &Value) -> Result<Value> {
++    let before=contents(&metadata.0)?;let secrets=contents(&snapshots.0)?;
++    let status=invoke(helper,path,"signing-status",None,true)?;
++    assert!(status["signingIntent"].is_null() && status["signedFunding"].is_null());
++    let review=invoke(helper,path,"signing-review",None,true)?;
++    assert_eq!(review["review"]["details"]["action"],"sign-only");
++    assert_eq!(review["review"],status["review"]);
++    assert_eq!(review["tradeId"],setup.quote.terms()["swapId"]);
++    let approved=review["review"]["commitment"].as_str().context("missing signing review")?;
++    invoke(helper,path,"signing-submit",None,false)?;
++    let lock=locking::invoke(helper,path,"lock-review",None,true)?;
++    invoke(helper,path,"signing-submit",lock["review"]["commitment"].as_str(),false)?;
++    let mut wrong=descriptor.clone();wrong["wallet"]=json!("other");
++    save(rpc_path,&serde_json::to_vec(&wrong)?)?;
++    invoke(helper,path,"signing-submit",Some(approved),false)?;
++    save(rpc_path,&serde_json::to_vec(descriptor)?)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    assert_eq!(server.state.lock().unwrap().sign_calls,0);
++    let intent_path=metadata.0.join(format!("{}.bch-funding-signing-intent",setup.quote.terms()["swapId"]));
++    {let mut state=server.state.lock().unwrap();state.sign_intent=Some(intent_path);state.sign_mode=4;}
++    invoke(helper,path,"signing-submit",Some(approved),false)?;
++    let uncertain=invoke(helper,path,"signing-status",None,true)?;
++    assert!(uncertain["signingIntent"].is_object());assert!(uncertain["signedFunding"].is_null());
++    assert_eq!(uncertain["review"],review["review"]);
++    let before=contents(&metadata.0)?;
++    invoke(helper,path,"signing-submit",Some(approved),false)?;
++    assert_eq!(contents(&metadata.0)?,before);
++    assert_eq!(server.state.lock().unwrap().sign_calls,1);
++    // Recover the exact bytes produced by the lost reply through the existing
++    // explicit controller. Helper reconciliation will be integrated separately.
++    let raw=server.state.lock().unwrap().signed_candidate.clone();
++    let mut execution=AdmittedExecution::resume(&metadata.0,&snapshots.0,&setup.quote,&setup.policy,Role::BchFunder)?;
++    let recovered=execution.review_bch_signing_reconciliation(&raw)?;
++    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++    let signed=execution.reconcile_bch_signing(&raw,&recovered.commitment,now)?;
++    let expected=json!({"txid":signed.lock_outpoint().txid.to_string(),"contractVout":signed.lock_outpoint().vout});
++    drop(execution);
++    let restored=invoke(helper,path,"signing-status",None,true)?;
++    assert_eq!(restored["signingIntent"],uncertain["signingIntent"]);
++    assert_eq!(restored["signedFunding"],expected);
++    let before=contents(&metadata.0)?;
++    assert_eq!(invoke(helper,path,"signing-submit",Some(approved),true)?["signedFunding"],expected);
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&snapshots.0)?,secrets);
++    {let state=server.state.lock().unwrap();assert_eq!(state.sign_calls,1);
++        assert_eq!(state.preparation_calls,1);assert_eq!(state.relay_calls,0);}
++    Ok(expected)
++}
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -143,10 +143,10 @@
+     fn funding_request(bytes: &[u8], action: &str) -> Result<Request> {
+         ensure!(!bytes.is_empty() && bytes.len() <= 512,"invalid BCH funding request size");
+         let request: Request = serde_json::from_slice(bytes)?;
+-        ensure!(matches!(action,"review"|"submit"|"status"|"observe"|"prepare"|"preparation-status"|"lock-review"|"lock-submit"|"lock-status")
++        ensure!(matches!(action,"review"|"submit"|"status"|"observe"|"prepare"|"preparation-status"|"lock-review"|"lock-submit"|"lock-status"|"signing-review"|"signing-submit"|"signing-status")
+             && request.schema == format!("monzero-bch-funding-{action}-request-v1")
+             && !request.request_id.is_nil(),"invalid BCH funding request");
+-        if matches!(action,"submit"|"lock-submit") {
++        if matches!(action,"submit"|"lock-submit"|"signing-submit") {
+             parse_digest(request.commitment.as_deref().context("missing BCH funding approval")?)?;
+         } else {ensure!(request.commitment.is_none(),"unexpected BCH funding approval");}
+         Ok(request)
+@@ -290,7 +290,7 @@
+         Ok(config)
+     }
+     async fn preparation_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
+-        ensure!(matches!(action,"prepare"|"preparation-status"|"lock-review"|"lock-submit"|"lock-status"),"invalid preparation action");
++        ensure!(matches!(action,"prepare"|"preparation-status"|"lock-review"|"lock-submit"|"lock-status"|"signing-review"|"signing-submit"|"signing-status"),"invalid preparation action");
+         let request=funding_request(bytes,action)?;
+         let (_preparation_lease,bytes)=private_bytes(path)?;
+         let preparation=preparation_config(&bytes)?;
+@@ -307,6 +307,9 @@
+         let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
+             &quote,&config.policy,config.role)?;
+         execution.saved_admission_review(&config.negotiation_pins)?;
++        if matches!(action,"signing-review"|"signing-submit"|"signing-status") {
++            return signing_operation(&mut execution,&preparation,&deployment,&request,config.trade_id,action).await;
++        }
+         if matches!(action,"lock-review"|"lock-submit"|"lock-status") {
+             return wallet_lock_operation(&mut execution,&preparation,&deployment,&request,config.trade_id,action).await;
+         }
+@@ -324,6 +327,38 @@
+         Ok(serde_json::json!({"schema":format!("monzero-bch-funding-{action}-response-v1"),
+             "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
+             "review":{"details":review.details,"commitment":commitment}}))
++    }
++
++    async fn signing_operation(execution: &mut AdmittedExecution<'_>,config: &PreparationConfig,
++        deployment: &[u8;32],request: &Request,trade: uuid::Uuid,action: &str) -> Result<serde_json::Value> {
++        // Revalidate the configured preparation policy even for historical reads.
++        execution.saved_bch_wallet_preparation_review(deployment,&config.policy)?;
++        if action!="signing-status" {
++            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++            let review=execution.review_bch_funding_signing_for_deployment(deployment,now)?;
++            if action=="signing-submit" {
++                let approved=parse_digest(request.commitment.as_deref().context("missing BCH signing approval")?)?;
++                ensure!(approved==review.commitment,"BCH signing approval changed");
++                let (_rpc_lease,bytes)=private_bytes(&config.rpc_file)?;
++                let rpc: FundingRpc=serde_json::from_slice(&bytes)?;
++                let (_cookie_lease,bytes)=private_file(&rpc.cookie_file,true)?;
++                let backend=rpc.backend(&bytes)?;
++                ensure!(&backend.deployment_commitment()?==deployment,"BCH signing backend changed");
++                let dispatch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++                execution.sign_bch_funding(&backend,&approved,dispatch).await?;
++            }
++        }
++        let saved=execution.saved_bch_signing(deployment)?;
++        let intent=saved.intent.map(|intent|serde_json::json!({"commitment":
++            intent.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>(),
++            "approvedAt":intent.approved_at.to_string()}));
++        let signed=saved.signed.map(|signed|serde_json::json!({
++            "txid":signed.lock_outpoint().txid.to_string(),"contractVout":signed.lock_outpoint().vout}));
++        Ok(serde_json::json!({"schema":format!("monzero-bch-funding-{action}-response-v1"),
++            "requestId":request.request_id,"tradeId":trade,"executable":false,"chainObserved":false,
++            "review":{"details":saved.review.details,
++                "commitment":saved.review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()},
++            "signingIntent":intent,"signedFunding":signed}))
+     }
+ 
+     async fn wallet_lock_operation(execution: &mut AdmittedExecution<'_>,config: &PreparationConfig,
+@@ -372,6 +407,9 @@
+         std::io::stdin().take(513).read_to_end(&mut bytes)?;
+         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+         let preparation_action=match action {
++            "--funding-signing-review-stdio-v1"=>Some("signing-review"),
++            "--funding-signing-submit-stdio-v1"=>Some("signing-submit"),
++            "--funding-signing-status-stdio-v1"=>Some("signing-status"),
+             "--funding-lock-review-stdio-v1"=>Some("lock-review"),
+             "--funding-lock-submit-stdio-v1"=>Some("lock-submit"),
+             "--funding-lock-status-stdio-v1"=>Some("lock-status"),
+@@ -407,6 +445,19 @@
+ 
+     #[cfg(test)]
+     mod tests {
++        #[test]
++        fn signing_protocol_requires_separate_submit_approval() -> Result<()> {
++            for action in ["signing-review","signing-status","signing-submit"] {
++                let mut request=serde_json::json!({"schema":format!("monzero-bch-funding-{action}-request-v1"),
++                    "requestId":uuid::Uuid::new_v4()});
++                assert_eq!(funding_request(&serde_json::to_vec(&request)?,action).is_ok(),action!="signing-submit");
++                request["commitment"]=serde_json::json!("11".repeat(32));
++                assert_eq!(funding_request(&serde_json::to_vec(&request)?,action).is_ok(),action=="signing-submit");
++                request["extra"]=serde_json::json!(true);
++                assert!(funding_request(&serde_json::to_vec(&request)?,action).is_err());
++            }
++            Ok(())
++        }
+         #[test]
+         fn wallet_lock_protocol_requires_separate_submit_approval() -> Result<()> {
+             for action in ["lock-review","lock-status","lock-submit"] {

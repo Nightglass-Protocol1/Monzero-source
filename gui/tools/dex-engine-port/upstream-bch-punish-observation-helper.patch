@@ -1,0 +1,119 @@
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -1333,8 +1333,10 @@
+             "--native-proof-context-stdio-v1"=>Some("context"),
+             _=>None,
+         };
+-        let result = if matches!(action,"--punish-review-stdio-v1"|"--punish-status-stdio-v1") {
+-            punishment::operation(Path::new(&args[2]),&bytes,if action=="--punish-review-stdio-v1" {"review"} else {"status"})?
++        let result = if matches!(action,"--punish-review-stdio-v1"|"--punish-status-stdio-v1"|"--punish-observe-stdio-v1") {
++            let operation=if action=="--punish-review-stdio-v1" {"review"} else if action=="--punish-status-stdio-v1" {"status"} else {"observe"};
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(punishment::operation(Path::new(&args[2]),&bytes,operation))?
+         } else if action=="--success-publication-repair-review-stdio-v1" {
+             publication::operation(Path::new(&args[2]),&bytes,false)?
+         } else if action=="--success-publication-repair-submit-stdio-v1" {
+--- a/swap-machine/src/bin/native-bch-admission/punishment.rs
++++ b/swap-machine/src/bin/native-bch-admission/punishment.rs
+@@ -1,19 +1,34 @@
+-// Offline native-funder punishment terms and retained dispatch history only.
++// Native-funder punishment review, retained history and explicit chain confirmation.
+ use super::*;
+ use swap_machine::bch_key_recovery::authenticated::native_wallet::agreement::execution::funding::recovery::punish::observation::relay::PunishRelayState;
+ fn request(bytes:&[u8],action:&str)->Result<Request> {
+-    ensure!(matches!(action,"review"|"status") && !bytes.is_empty() && bytes.len()<=512,"invalid punishment request size or action");
++    ensure!(matches!(action,"review"|"status"|"observe") && !bytes.is_empty() && bytes.len()<=512,"invalid punishment request size or action");
+     let request:Request=serde_json::from_slice(bytes)?;
+     ensure!(!request.request_id.is_nil() && request.schema==format!("monzero-bch-punish-{action}-request-v1")
+-        && request.commitment.is_none(),"invalid offline punishment request");Ok(request)
++        && request.commitment.is_none(),"invalid punishment request");Ok(request)
+ }
+ fn config(bytes:&[u8])->Result<FundingConfig> {
+     let config:FundingConfig=serde_json::from_slice(bytes)?;
+     ensure!(config.schema=="monzero-private-bch-punish-v1" && config.admission_config_file.is_absolute(),
+         "invalid punishment configuration");parse_digest(&config.deployment_commitment)?;Ok(config)
+ }
+-pub(super) fn operation(path:&Path,bytes:&[u8],action:&str)->Result<serde_json::Value> {
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields,rename_all="camelCase")]
++struct ObservationConfig {
++    schema:String,punish_config_file:PathBuf,rpc_file:PathBuf,bch_observer_kind:native_observer::Kind,
++}
++fn observation_config(bytes:&[u8])->Result<ObservationConfig> {
++    let config:ObservationConfig=serde_json::from_slice(bytes)?;
++    ensure!(config.schema=="monzero-private-bch-punish-observation-v1"
++        && config.punish_config_file.is_absolute() && config.rpc_file.is_absolute(),
++        "invalid punishment observation configuration");Ok(config)
++}
++pub(super) async fn operation(path:&Path,bytes:&[u8],action:&str)->Result<serde_json::Value> {
+     let request=request(bytes,action)?;
++    let observation=if action=="observe" {
++        let (lease,bytes)=private_bytes(path)?;Some((lease,observation_config(&bytes)?))
++    } else {None};
++    let path=observation.as_ref().map_or(path,|(_,config)|config.punish_config_file.as_path());
+     let (_wrapper_lease,bytes)=private_bytes(path)?;let wrapper=config(&bytes)?;
+     let deployment=parse_digest(&wrapper.deployment_commitment)?;
+     let (_config_lease,config)=load(&wrapper.admission_config_file)?;
+@@ -31,11 +46,28 @@
+         Some(PunishRelayState::Attempted {txid})=>("attempted",txid.to_string()),
+         Some(PunishRelayState::Acknowledged {txid})=>("acknowledged",txid.to_string()),
+     };
++    let observed=if let Some((_,config))=&observation {
++        let (_rpc_lease,bytes)=private_bytes(&config.rpc_file)?;
++        let descriptor=native_observer::Descriptor::parse(Some(config.bch_observer_kind),&bytes)?;
++        let (_cookie_lease,cookie)=private_file(descriptor.cookie_file(),true)?;
++        let backend=descriptor.backend(&cookie)?;
++        ensure!(backend.deployment_commitment()?==deployment,"punishment observation deployment changed");
++        let observed=match &backend {
++            native_observer::Backend::Node(bch)=>execution.observe_bch_punish(bch,None).await?,
++            native_observer::Backend::Owned(bch)=>execution.observe_light_bch_punish(bch,None).await?,
++        };
++        ensure!(observed.review()==&review.commitment,"punishment confirmation review changed");
++        let confirmed=observed.confirmation();
++        let at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        serde_json::json!({"state":"confirmed","txid":confirmed.transaction().compute_txid().to_string(),
++            "block":confirmed.block().to_string(),"height":confirmed.height().to_string(),
++            "confirmations":confirmed.confirmations().to_string(),"tip":confirmed.tip().to_string(),"observedAt":at.to_string()})
++    } else {serde_json::Value::Null};
+     let commitment=review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>();
+     Ok(serde_json::json!({"schema":format!("monzero-bch-punish-{action}-response-v1"),
+-        "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
++        "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":action=="observe",
+         "review":{"details":review.details,"commitment":commitment},
+-        "relay":{"state":state,"txid":txid,"confirmed":false},"observation":null}))
++        "relay":{"state":state,"txid":txid,"confirmed":false},"observation":observed}))
+ }
+ #[cfg(test)]
+ mod tests {
+@@ -45,11 +77,30 @@
+         let value=serde_json::json!({"schema":"monzero-bch-punish-review-request-v1","requestId":uuid::Uuid::new_v4()});
+         assert!(request(&serde_json::to_vec(&value)?,"review").is_ok());
+         assert!(request(&serde_json::to_vec(&value)?,"status").is_err());
+-        for action in ["submit","observe","window",""] {assert!(request(&serde_json::to_vec(&value)?,action).is_err());}
++        for action in ["submit","window",""] {assert!(request(&serde_json::to_vec(&value)?,action).is_err());}
+         let mut value=value;value["commitment"]="00".repeat(32).into();
+         assert!(request(&serde_json::to_vec(&value)?,"review").is_err());
+         value.as_object_mut().unwrap().remove("commitment");value["requestId"]=uuid::Uuid::nil().to_string().into();
+         assert!(request(&serde_json::to_vec(&value)?,"review").is_err());Ok(())
++    }
++    #[test]
++    fn observation_requires_explicit_backend_and_no_approval()->Result<()> {
++        let base=serde_json::json!({"schema":"monzero-private-bch-punish-observation-v1",
++            "punishConfigFile":"/private/punish","rpcFile":"/private/rpc","bchObserverKind":"owned-node"});
++        assert!(observation_config(&serde_json::to_vec(&base)?).is_ok());
++        for field in ["punishConfigFile","rpcFile","bchObserverKind"] {
++            let mut value=base.clone();value.as_object_mut().unwrap().remove(field);
++            assert!(observation_config(&serde_json::to_vec(&value)?).is_err());
++            let mut value=base.clone();value[field]=serde_json::Value::Null;
++            assert!(observation_config(&serde_json::to_vec(&value)?).is_err());
++        }
++        for field in ["punishConfigFile","rpcFile"] {
++            let mut value=base.clone();value[field]="relative".into();assert!(observation_config(&serde_json::to_vec(&value)?).is_err());
++        }
++        let mut value=base;value["password"]="not-allowed".into();assert!(observation_config(&serde_json::to_vec(&value)?).is_err());
++        let mut value=serde_json::json!({"schema":"monzero-bch-punish-observe-request-v1","requestId":uuid::Uuid::new_v4()});
++        assert!(request(&serde_json::to_vec(&value)?,"observe").is_ok());
++        value["commitment"]="00".repeat(32).into();assert!(request(&serde_json::to_vec(&value)?,"observe").is_err());Ok(())
+     }
+     #[test]
+     fn configuration_has_no_rpc_or_secret_fields()->Result<()> {

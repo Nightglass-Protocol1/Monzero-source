@@ -1,0 +1,30 @@
+[Unit]
+Description=Monzero opt-in public wallet directory
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=monzero-public-wallets
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/monzero-public-wallets
+LoadCredential=proxy-token:/etc/monzero-public-wallets/proxy-token
+Environment=PROFILE_DATABASE=/var/lib/monzero-public-wallets/profiles.sqlite
+Environment=PROFILE_VERIFIER=/opt/monzero-public-wallets/verify
+Environment=PROFILE_PROXY_TOKEN_FILE=/run/credentials/monzero-public-wallets.service/proxy-token
+ExecStart=/usr/bin/python3 /opt/monzero-public-wallets/server.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

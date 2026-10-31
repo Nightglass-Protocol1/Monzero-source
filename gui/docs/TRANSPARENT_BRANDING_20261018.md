@@ -1,0 +1,13 @@
+# Transparent branding and Linux GUI
+
+The shared release GUI uses the website's teal palette on Windows and Linux. Transparent coin artwork now covers the title bar, sidebar, splash, merchant view, mining indicator, application window icon and desktop icon sizes. Merchant mode's remaining hard-coded orange title bar uses the shared dark teal surface. Linux desktop-entry registration installs the bundled transparent PNG in the user's icon theme.
+
+Artwork master: `images/branding/monzero-xmz-coin.png`. Created with the built-in imagegen tool from the supplied `Futuristic_Neon_Cyan_MZ_Coin_Emblem.jpg`; PNG, WebP and ICO size variants preserve alpha. The wide banner retains its intentional dark background.
+
+Prompt: "Use case: background-extraction. Edit target: supplied Monzero coin logo. Remove ONLY the black background outside the circular coin silhouette, replace with genuine transparent alpha. Preserve the entire coin exactly: metallic silver MZ monogram, XMZ lettering, teal cyan lighting, black inner coin surface, all rim details, frontal orientation and proportions. Clean anti-aliased edges, no black rectangle or halo, no shadow outside coin, no checkerboard baked into pixels. Center complete uncropped coin on square transparent PNG canvas. This is a faithful background removal for website and desktop app icons, not a redesign."
+
+Native Linux configuration: `cmake -S . -B build/linux -DCMAKE_BUILD_TYPE=Release -DARCH=x86-64 -DWITH_DEX_PROTOTYPE=OFF -DWITH_UPDATER=OFF -DWITH_SCANNER=OFF`. This is a native development build; distro compatibility must be checked before describing it as a portable release.
+
+Validation evidence is retained under `core/build/transparent-branding-20261018` and `core/build/gui-{linux-teal,transparent-windows}-*.log`. GUI code commit `7bd819c17` built successfully for native Linux and Windows x64. Linux mining and startup suites passed all 27 QML results. Empty mainnet wallets synchronized in native Linux and Windows under Wine; screenshots cover Linux dark/light modes and Windows Receive/mining views. Linux registered desktop icon transparency was checked. No mining or transfers were started. Native Windows validation remains pending; Wine still reports its known ring-database initialization limitation. Native Linux was built on CachyOS and is not a portable distribution package. Both preview processes were stopped after capture. No DEX functionality is enabled by this update.
+
+Software renderer follow-up: `QT_QUICK_BACKEND=software` now selects the same fallback surfaces as `QMLSCENE_DEVICE=softwarecontext`; this fixes white panels behind pale text observed during the native Linux preview.

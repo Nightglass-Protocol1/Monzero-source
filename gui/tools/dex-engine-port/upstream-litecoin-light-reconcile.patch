@@ -1,0 +1,75 @@
+--- a/swap-machine/src/litecoin_light/session/unspent/candidates.rs
++++ b/swap-machine/src/litecoin_light/session/unspent/candidates.rs
+@@ -46,3 +46,5 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++pub mod reconcile;
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/unspent/candidates/reconcile.rs
+@@ -0,0 +1,24 @@
++//! Intersect candidates with a same-tip observation snapshot. Omitted history
++//! remains possible; the result is still not a spending capability.
++use super::*;
++use crate::litecoin_light::accounting::ObservedWallet;
++/// Exclude outputs absent from the observed unspent set (including observed
++/// confirmed/pending spends). A stale snapshot fails; it is never refreshed
++/// implicitly. The caller remains responsible for completeness and freshness.
++pub fn retain_observed_candidates(chain:&HeaderSequence,observed:&ObservedWallet,
++    candidates:Vec<IncludedCandidate>)->Result<Vec<IncludedCandidate>> {
++    ensure!(observed.height()==chain.height() && chain.contains(observed.height(),observed.tip()),
++        "Litecoin observation tip differs from selected chain");
++    ensure!(candidates.len()<=1000,"Litecoin candidate reconciliation limit exceeded");
++    let coins=observed.coins().iter().map(|coin|(coin.outpoint(),coin)).collect::<BTreeMap<_,_>>();
++    let mut seen=BTreeSet::new();let mut retained=Vec::new();
++    for candidate in candidates {
++        ensure!(seen.insert(candidate.outpoint()),"duplicate Litecoin reconciliation candidate");
++        let depth=candidate.transaction().confirmations_on(chain).context("orphaned Litecoin reconciliation candidate")?;
++        let Some(coin)=coins.get(&candidate.outpoint()) else {continue};
++        ensure!(coin.amount()==candidate.value() && coin.confirmations()==depth
++            && coin.is_coinbase()==candidate.transaction().is_coinbase(),"Litecoin candidate observation mismatch");
++        if coin.maturity_satisfied() {retained.push(candidate);}
++    }
++    Ok(retained)
++}
+--- a/swap-machine/src/litecoin_light/session/unspent/candidates/tests.rs
++++ b/swap-machine/src/litecoin_light/session/unspent/candidates/tests.rs
+@@ -44,3 +44,37 @@
+     assert!(session.included_unspent_candidates(&chain,&script,2,1).await?.is_empty());
+     drop(session);assert_eq!(task.await?.len(),3);Ok(())
+ }
++
++async fn candidate_fixture()->Result<(HeaderSequence,bitcoin::ScriptBuf,IncludedCandidate)> {
++    let (chain,block,script)=fixture()?;let mut responses=regtest_handshake();
++    responses.push(reply(3,json!([{"tx_hash":block["txid"],"tx_pos":0,"height":1,"value":100000}])));
++    responses.push(reply(4,block["transaction"].clone()));responses.push(reply(5,json!({"block_height":1,"pos":0,"merkle":[]})));
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let mut candidates=session.included_unspent_candidates(&chain,&script,2,1).await?;
++    drop(session);assert_eq!(task.await?.len(),5);Ok((chain,script,candidates.remove(0)))
++}
++#[tokio::test]
++async fn candidate_reconciliation_excludes_reported_pending_spend()->Result<()> {
++    use crate::litecoin_light::accounting::ObservedWallet;
++    use reconcile::retain_observed_candidates;
++    let fixture:Value=serde_json::from_str(include_str!("../../wallet/fixture.json"))?;
++    let pending:Transaction=deserialize(&Vec::from_hex(fixture["blocks"][1]["transaction"].as_str().unwrap())?)?;
++    for pending_reported in [false,true] {
++        let (chain,script,candidate)=candidate_fixture().await?;
++        let pending=if pending_reported {vec![pending.clone()]}else{vec![]};
++        let observed=ObservedWallet::reconcile_with_pending(&chain,&[script],std::slice::from_ref(candidate.transaction()),&pending)?;
++        let retained=retain_observed_candidates(&chain,&observed,vec![candidate])?;
++        assert_eq!(retained.len(),if pending_reported {0}else{1});
++    }Ok(())
++}
++#[tokio::test]
++async fn candidate_reconciliation_refuses_stale_snapshot_and_duplicate_candidates()->Result<()> {
++    use crate::litecoin_light::accounting::ObservedWallet;
++    use reconcile::retain_observed_candidates;
++    let (chain,script,candidate)=candidate_fixture().await?;
++    let stale=ObservedWallet::reconcile(&HeaderSequence::new(LtcNetwork::Regtest)?,&[script.clone()],&[])?;
++    assert!(retain_observed_candidates(&chain,&stale,vec![candidate]).err().unwrap().to_string().contains("tip differs"));
++    let (chain,_,candidate)=candidate_fixture().await?;let (_,_,duplicate)=candidate_fixture().await?;
++    let observed=ObservedWallet::reconcile(&chain,&[script],std::slice::from_ref(candidate.transaction()))?;
++    assert!(retain_observed_candidates(&chain,&observed,vec![candidate,duplicate]).is_err());Ok(())
++}

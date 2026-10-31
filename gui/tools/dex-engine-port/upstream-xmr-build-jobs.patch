@@ -1,0 +1,61 @@
+diff --git a/monero-sys/build.rs b/monero-sys/build.rs
+index 3938883e8..ca9fe7a95 100644
+--- a/monero-sys/build.rs
++++ b/monero-sys/build.rs
+@@ -113,6 +113,15 @@ fn find_workspace_target_dir() -> std::path::PathBuf {
+ fn main() {
+     let is_github_actions: bool = std::env::var("GITHUB_ACTIONS").is_ok();
+     let is_docker_build: bool = std::env::var("DOCKER_BUILD").is_ok();
++    let native_jobs = if is_github_actions || is_docker_build {
++        1
++    } else {
++        std::env::var("NUM_JOBS")
++            .expect("Cargo to provide NUM_JOBS")
++            .parse::<std::num::NonZeroUsize>()
++            .expect("NUM_JOBS to be a positive integer")
++            .get()
++    };
+ 
+     // Rerun this when the bridge.rs or static_bridge.h file changes.
+     println!("cargo:rerun-if-changed=src/bridge.rs");
+@@ -143,7 +152,7 @@ fn main() {
+         .join(std::env::var("TARGET").expect("TARGET env var to be present"));
+ 
+     let (contrib_depends_dir, target) =
+-        compile_dependencies(contrib_depends_dir, stable_depends_dir);
++        compile_dependencies(contrib_depends_dir, stable_depends_dir, native_jobs);
+ 
+     // Build with the monero library all dependencies required
+     let mut config = Config::new(MONERO_CPP_DIR);
+@@ -196,14 +205,7 @@ fn main() {
+                 .to_string(),
+         ) // This is needed for libsodium.a to be found on mingw-w64
+         .build_arg("-Wno-dev") // Disable warnings we can't fix anyway
+-        .build_arg(format!(
+-            "-j{}",
+-            if is_github_actions || is_docker_build {
+-                1
+-            } else {
+-                num_cpus::get()
+-            }
+-        ))
++        .build_arg(format!("-j{native_jobs}"))
+         .build_arg("-I.")
+         .build();
+ 
+@@ -438,6 +440,7 @@ fn main() {
+ fn compile_dependencies(
+     contrib_depends: std::path::PathBuf,
+     out_dir: std::path::PathBuf,
++    native_jobs: usize,
+ ) -> (std::path::PathBuf, String) {
+     let mut target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+     target = match target.as_str() {
+@@ -490,6 +493,7 @@ fn compile_dependencies(
+     }
+     cmd.arg("make")
+         .arg(format!("HOST={target}"))
++        .arg(format!("NUM_CORES={native_jobs}"))
+         .arg("DEBUG=")
+         .current_dir(&out_dir)
+         .stdout(std::process::Stdio::piped())

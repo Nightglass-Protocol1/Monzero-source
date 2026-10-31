@@ -1,0 +1,257 @@
+diff --git a/swap-machine/src/litecoin_light/session.rs b/swap-machine/src/litecoin_light/session.rs
+--- a/swap-machine/src/litecoin_light/session.rs
++++ b/swap-machine/src/litecoin_light/session.rs
+@@ -156,3 +156,5 @@
+ 
+ #[cfg(test)]
+ mod tests;
++
++pub mod sync;
+diff --git a/swap-machine/src/litecoin_light/session/tests.rs b/swap-machine/src/litecoin_light/session/tests.rs
+--- a/swap-machine/src/litecoin_light/session/tests.rs
++++ b/swap-machine/src/litecoin_light/session/tests.rs
+@@ -2,7 +2,7 @@
+ use tokio::io::{AsyncReadExt, DuplexStream};
+ use tokio::task::JoinHandle;
+ 
+-fn reply(id: u64, result: Value) -> Vec<u8> {
++pub(super) fn reply(id: u64, result: Value) -> Vec<u8> {
+     let mut bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap();
+     bytes.push(b'\n'); bytes
+ }
+@@ -11,7 +11,7 @@
+         "genesis_hash":LtcNetwork::Mainnet.genesis(),"hash_function":"sha256",
+         "server_version":"fixture","protocol_min":"1.4","protocol_max":"1.4.3","hosts":{}}))]
+ }
+-fn server(responses: Vec<Vec<u8>>) -> (DuplexStream, JoinHandle<Vec<Value>>) {
++pub(super) fn server(responses: Vec<Vec<u8>>) -> (DuplexStream, JoinHandle<Vec<Value>>) {
+     let (client, stream) = tokio::io::duplex(256);
+     let task = tokio::spawn(async move {
+         let mut stream = BufReader::new(stream);
+@@ -31,7 +31,7 @@
+     });
+     (client, task)
+ }
+-fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b|format!("{b:02x}")).collect() }
++pub(super) fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b|format!("{b:02x}")).collect() }
+ 
+ #[tokio::test]
+ async fn session_fetches_fragmented_proof_only_after_network_handshake() -> Result<()> {
+@@ -111,7 +111,7 @@
+     Ok(())
+ }
+ 
+-fn regtest_handshake() -> Vec<Vec<u8>> {
++pub(super) fn regtest_handshake() -> Vec<Vec<u8>> {
+     let mut responses=handshake();
+     responses[1]=reply(2,json!({"genesis_hash":LtcNetwork::Regtest.genesis(),"hash_function":"sha256"}));
+     responses
+diff --git a/swap-machine/src/litecoin_light/session/sync.rs b/swap-machine/src/litecoin_light/session/sync.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/sync.rs
+@@ -0,0 +1,94 @@
++//! Bounded fork discovery and incremental candidate download. Selection happens
++//! only after the entire candidate connects to its reported tip. Reaching that
++//! tip does not establish freshness, checkpoints or the network's best chain.
++use super::*;
++use crate::litecoin_light::headers::{HeaderSequence, ChainChange};
++
++/// A peer claim, never a validated chain tip or a spendability capability.
++pub struct ReportedTip { network: LtcNetwork, height: u32, hash: BlockHash }
++impl ReportedTip {
++    pub fn height(&self) -> u32 {self.height}
++    pub fn hash(&self) -> BlockHash {self.hash}
++}
++
++/// The selected chain remains unchanged while this candidate downloads.
++/// Errors/cancellation invalidate this attempt; use a fresh connection and tip.
++pub struct SyncCandidate { chain: HeaderSequence, tip: ReportedTip, usable: bool }
++impl SyncCandidate {
++    pub fn height(&self) -> u32 {self.chain.height()}
++    pub fn target_height(&self) -> u32 {self.tip.height}
++    pub fn complete(&self) -> bool {
++        self.usable && self.height()==self.tip.height && self.chain.contains(self.tip.height,self.tip.hash)
++    }
++    /// At most 2016 headers per call. Empty data before the advertised tip is
++    /// inconsistent, not evidence of completion. No partial candidate is selected.
++    pub async fn advance<S: AsyncRead+AsyncWrite+Unpin>(&mut self,session: &mut ReadSession<S>,
++        count: u32,now: u64) -> Result<u32> {
++        ensure!(self.usable,"Litecoin synchronization candidate is invalid");
++        ensure!(session.network==self.tip.network && (1..=2016).contains(&count),
++            "invalid Litecoin candidate request");
++        if self.complete() {return Ok(0)}
++        let count=count.min(self.tip.height-self.height());
++        self.usable=false;
++        let outcome=async {
++            let received=session.advance(&mut self.chain,count,now).await?;
++            ensure!(received>0,"Electrum stopped before reported tip");
++            if self.height()==self.tip.height {
++                ensure!(self.chain.contains(self.tip.height,self.tip.hash),"Electrum reported tip changed during synchronization");
++            }
++            Ok::<_,anyhow::Error>(received)
++        }.await;
++        if outcome.is_ok() {self.usable=true;} else {session.usable=false;}
++        outcome
++    }
++    /// Even a complete candidate is adopted only if it has more validated work.
++    /// Callers must then invalidate orphaned evidence and persist the selection.
++    pub fn finish(self,selected: &mut HeaderSequence) -> Result<Option<ChainChange>> {
++        ensure!(self.complete(),"Litecoin synchronization candidate is incomplete");
++        selected.adopt(self.chain)
++    }
++}
++
++impl<S: AsyncRead+AsyncWrite+Unpin> ReadSession<S> {
++    /// Consumes this connection: subscription notifications cannot interfere
++    /// with later request/response exchanges. Use a fresh connection to download.
++    pub async fn reported_tip(mut self) -> Result<ReportedTip> {
++        #[derive(Deserialize)]
++        #[serde(deny_unknown_fields)]
++        struct Tip {height:u32,hex:String}
++        let (_,bytes)=self.exchange("blockchain.headers.subscribe",json!([]),1024).await?;
++        let tip: Tip=result(&bytes)?;
++        let raw=decode_hex(&tip.hex,80)?;
++        ensure!(raw.len()==80,"invalid Electrum reported header length");
++        let header: Header=deserialize(&raw)?;
++        Ok(ReportedTip {network:self.network,height:tip.height,hash:header.block_hash()})
++    }
++    /// Binary-search the last shared header in at most 32 bounded requests.
++    /// Peer search replies are only hints: candidate ancestry and work are
++    /// subsequently validated from the retained prefix, ending at the claimed tip.
++    pub async fn begin_sync(&mut self,selected: &HeaderSequence,tip: ReportedTip) -> Result<SyncCandidate> {
++        ensure!(selected.network()==self.network && tip.network==self.network,
++            "Litecoin synchronization network mismatch");
++        let outcome=self.begin_sync_inner(selected,tip).await;
++        if outcome.is_err() {self.usable=false;}
++        outcome
++    }
++    async fn begin_sync_inner(&mut self,selected: &HeaderSequence,tip: ReportedTip) -> Result<SyncCandidate> {
++        ensure!(self.usable,"Electrum session requires a new connection");
++        let mut low=0u32;let mut high=selected.height().min(tip.height);
++        while low<high {
++            let middle=low+((u64::from(high)-u64::from(low)+1)/2) as u32;
++            let (_,bytes)=self.exchange("blockchain.block.header",json!([middle]),1024).await?;
++            let raw=decode_hex(&result::<String>(&bytes)?,80)?;
++            ensure!(raw.len()==80,"invalid Electrum fork header length");
++            let header: Header=deserialize(&raw)?;
++            if selected.contains(middle,header.block_hash()) {low=middle;} else {high=middle-1;}
++        }
++        let chain=selected.fork(low)?;
++        if low==tip.height {ensure!(chain.contains(low,tip.hash),"Electrum reported tip contradicts shared chain");}
++        Ok(SyncCandidate {chain,tip,usable:true})
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/swap-machine/src/litecoin_light/session/sync/tests.rs b/swap-machine/src/litecoin_light/session/sync/tests.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/litecoin_light/session/sync/tests.rs
+@@ -0,0 +1,105 @@
++use super::*;
++use crate::litecoin_light::{headers::tests::child, session::tests::{server,reply,hex,regtest_handshake}};
++fn alternative() -> Header {let mut header=child();header.nonce=0;header}
++fn descendant() -> Header {
++    deserialize(&decode_hex("000000209d08f789f2afaf053878d9b21add2f847fff4a9c32fb58b8c5c79ca166f94a9d111111111111111111111111111111111111111111111111111111111111111106e7494dffff7f2000000000",80).unwrap()).unwrap()
++}
++fn tip(height: u32,header: Header) -> ReportedTip {
++    ReportedTip {network:LtcNetwork::Regtest,height,hash:header.block_hash()}
++}
++fn batch(id: u64,headers: &[Header]) -> Vec<u8> {
++    reply(id,json!({"count":headers.len(),"hex":hex(&headers.iter().flat_map(serialize).collect::<Vec<_>>()),"max":2016}))
++}
++#[tokio::test]
++async fn sync_tip_uses_disposable_subscription_and_strict_shape() -> Result<()> {
++    let mut responses=regtest_handshake();responses.push(reply(3,json!({"height":2,"hex":hex(&serialize(&descendant()))})));
++    let (stream,task)=server(responses);
++    let reported=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?.reported_tip().await?;
++    assert_eq!(reported.height(),2);assert_eq!(reported.hash(),descendant().block_hash());
++    let requests=task.await?;assert_eq!(requests.len(),3);
++    assert_eq!(requests[2]["method"],"blockchain.headers.subscribe");assert_eq!(requests[2]["params"],json!([]));
++    for value in [json!({"height":-1,"hex":hex(&serialize(&child()))}),json!({"height":1,"hex":"00"}),
++        json!({"height":1,"hex":hex(&serialize(&child())),"work":"untrusted"})] {
++        let mut responses=regtest_handshake();responses.push(reply(3,value));let (stream,task)=server(responses);
++        assert!(ReadSession::negotiate(stream,LtcNetwork::Regtest).await?.reported_tip().await.is_err());
++        assert_eq!(task.await?.len(),3);
++    }
++    Ok(())
++}
++#[tokio::test]
++async fn sync_downloads_in_bounded_steps_before_selection() -> Result<()> {
++    let mut responses=regtest_handshake();responses.push(batch(3,&[alternative()]));responses.push(batch(4,&[descendant()]));
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut candidate=session.begin_sync(&selected,tip(2,descendant())).await?;
++    assert_eq!(candidate.height(),0);assert_eq!(candidate.target_height(),2);assert!(!candidate.complete());
++    assert_eq!(candidate.advance(&mut session,1,1296688902).await?,1);
++    assert_eq!(candidate.height(),1);assert!(!candidate.complete());assert_eq!(selected.height(),0);
++    assert_eq!(candidate.advance(&mut session,2016,1296688902).await?,1);assert!(candidate.complete());
++    assert_eq!(candidate.advance(&mut session,1,1296688902).await?,0);
++    assert_eq!(candidate.finish(&mut selected)?.unwrap().new_tip,(2,descendant().block_hash()));
++    drop(session);let requests=task.await?;assert_eq!(requests.len(),4);
++    assert_eq!(requests[2]["params"],json!([1,1]));assert_eq!(requests[3]["params"],json!([2,1]));Ok(())
++}
++#[tokio::test]
++async fn sync_discovers_fork_and_selects_only_more_work() -> Result<()> {
++    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;selected.append(&serialize(&child()),1296688902)?;
++    let mut responses=regtest_handshake();responses.push(reply(3,json!(hex(&serialize(&alternative())))));
++    responses.push(batch(4,&[alternative(),descendant()]));let (stream,task)=server(responses);
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let mut candidate=session.begin_sync(&selected,tip(2,descendant())).await?;assert_eq!(candidate.height(),0);
++    candidate.advance(&mut session,2,1296688902).await?;assert!(selected.contains(1,child().block_hash()));
++    assert_eq!(candidate.finish(&mut selected)?.unwrap().common_ancestor,0);
++    assert!(selected.contains(1,alternative().block_hash()));drop(session);assert_eq!(task.await?.len(),4);
++    // The server can also advertise a shorter competing branch. It cannot replace more work.
++    let mut responses=regtest_handshake();responses.push(reply(3,json!(hex(&serialize(&child())))));responses.push(batch(4,&[child()]));
++    let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let mut candidate=session.begin_sync(&selected,tip(1,child())).await?;
++    candidate.advance(&mut session,1,1296688902).await?;assert!(candidate.finish(&mut selected)?.is_none());
++    assert_eq!(selected.height(),2);drop(session);assert_eq!(task.await?.len(),4);Ok(())
++}
++#[tokio::test]
++async fn sync_matching_tip_requires_no_download_and_never_claims_freshness() -> Result<()> {
++    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;selected.append(&serialize(&child()),1296688902)?;
++    let mut responses=regtest_handshake();responses.push(reply(3,json!(hex(&serialize(&child())))));let (stream,task)=server(responses);
++    let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let candidate=session.begin_sync(&selected,tip(1,child())).await?;
++    assert!(candidate.complete());assert!(candidate.finish(&mut selected)?.is_none());
++    drop(session);assert_eq!(task.await?.len(),3);Ok(())
++}
++#[tokio::test]
++async fn sync_refuses_empty_or_changed_tip_and_keeps_selected_chain() -> Result<()> {
++    for changed in [false,true] {
++        let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;
++        let mut advertised=child();if changed {advertised.nonce=0;}
++        let mut responses=regtest_handshake();responses.push(if changed {batch(3,&[child()])} else {batch(3,&[])});
++        let (stream,task)=server(responses);let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++        let mut candidate=session.begin_sync(&selected,tip(1,advertised)).await?;
++        assert!(candidate.advance(&mut session,1,1296688902).await.is_err());assert!(!candidate.complete());
++        assert!(!session.usable);assert!(candidate.advance(&mut session,1,1296688902).await.is_err());
++        assert!(candidate.finish(&mut selected).is_err());assert_eq!(selected.height(),0);
++        drop(session);assert_eq!(task.await?.len(),3);
++    }
++    Ok(())
++}
++#[tokio::test]
++async fn sync_rejects_network_budget_and_incomplete_selection_without_io() -> Result<()> {
++    let (stream,task)=server(regtest_handshake());let mut session=ReadSession::negotiate(stream,LtcNetwork::Regtest).await?;
++    let other=HeaderSequence::new(LtcNetwork::Mainnet)?;
++    assert!(session.begin_sync(&other,tip(1,child())).await.is_err());
++    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut candidate=session.begin_sync(&selected,tip(1,child())).await?;
++    for count in [0,2017,u32::MAX] {assert!(candidate.advance(&mut session,count,1296688902).await.is_err());}
++    assert!(candidate.finish(&mut selected).is_err());assert_eq!(selected.height(),0);
++    assert!(session.usable);drop(session);assert_eq!(task.await?.len(),2);Ok(())
++}
++#[tokio::test]
++async fn sync_cancelled_candidate_cannot_be_finished_or_reused() -> Result<()> {
++    let (stream,_peer)=tokio::io::duplex(4096);
++    let mut session=ReadSession {stream:BufReader::new(stream),network:LtcNetwork::Regtest,next_id:1,usable:true,timeout:Duration::from_secs(1)};
++    let mut selected=HeaderSequence::new(LtcNetwork::Regtest)?;
++    let mut candidate=session.begin_sync(&selected,tip(1,child())).await?;
++    assert!(tokio::time::timeout(Duration::from_millis(20),candidate.advance(&mut session,1,1296688902)).await.is_err());
++    assert!(!candidate.complete());assert!(candidate.advance(&mut session,1,1296688902).await.is_err());
++    assert!(candidate.finish(&mut selected).is_err());assert_eq!(selected.height(),0);assert!(!session.usable);Ok(())
++}

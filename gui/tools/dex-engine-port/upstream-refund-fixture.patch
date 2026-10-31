@@ -1,0 +1,189 @@
+diff --git a/swap-machine/src/bob/mod.rs b/swap-machine/src/bob/mod.rs
+index ad3fba6..8edcdbf 100644
+--- a/swap-machine/src/bob/mod.rs
++++ b/swap-machine/src/bob/mod.rs
+@@ -1088,11 +1088,17 @@ impl State4 {
+     ) -> Result<Option<State5>> {
+         let tx_redeem =
+             bitcoin::TxRedeem::new(&self.tx_lock, &self.redeem_address, self.tx_redeem_fee);
+-        let tx_redeem_encsig = self.b.encsign(self.S_a_bitcoin, tx_redeem.digest());
+-
+         let tx_redeem_candidate = bitcoin_wallet.get_raw_transaction(tx_redeem.txid()).await?;
++        tx_redeem_candidate.map(|tx| self.recover_from_redeem(tx)).transpose()
++    }
+ 
+-        if let Some(tx_redeem_candidate) = tx_redeem_candidate {
++    pub(crate) fn recover_from_redeem(&self, tx_redeem_candidate: Arc<Transaction>) -> Result<State5> {
++        let tx_redeem =
++            bitcoin::TxRedeem::new(&self.tx_lock, &self.redeem_address, self.tx_redeem_fee);
++        if tx_redeem_candidate.compute_txid() != tx_redeem.txid() {
++            bail!("Wallet returned a different redeem transaction");
++        }
++        let tx_redeem_encsig = self.b.encsign(self.S_a_bitcoin, tx_redeem.digest());
+             let tx_redeem_sig =
+                 tx_redeem.extract_signature_by_key(tx_redeem_candidate, self.b.public())?;
+             let s_a = bitcoin::recover(self.S_a_bitcoin, tx_redeem_sig, tx_redeem_encsig)?;
+@@ -1100,7 +1106,7 @@ impl State4 {
+                 monero::private_key_from_secp256k1_scalar(s_a.into()).into_monero_oxide(),
+             );
+ 
+-            Ok(Some(State5 {
++            Ok(State5 {
+                 s_a,
+                 s_b: self.s_b,
+                 v: self.v,
+@@ -1109,10 +1115,7 @@ impl State4 {
+                 tx_lock: self.tx_lock.clone(),
+                 monero_wallet_restore_blockheight: self.monero_wallet_restore_blockheight,
+                 lock_transfer_proof: self.lock_transfer_proof.clone(),
+-            }))
+-        } else {
+-            Ok(None)
+-        }
++            })
+     }
+ 
+     pub fn tx_redeem_encsig(&self) -> bitcoin::EncryptedSignature {
+diff --git a/swap-machine/src/lib.rs b/swap-machine/src/lib.rs
+index 7d5e667..0e1161d 100644
+--- a/swap-machine/src/lib.rs
++++ b/swap-machine/src/lib.rs
+@@ -17,6 +17,15 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn calculate_transaction_weights() {
++        check_transaction_weights(Amount::from_sat(100_000)).await;
++    }
++
++    #[tokio::test]
++    async fn calculate_full_refund_transaction_weights() {
++        check_transaction_weights(Amount::ZERO).await;
++    }
++
++    async fn check_transaction_weights(btc_amnesty_amount: Amount) {
+         let alice_wallet = TestWalletBuilder::new(Amount::ONE_BTC.to_sat())
+             .build()
+             .await;
+@@ -25,9 +34,11 @@ mod tests {
+             .await;
+         let spending_fee = Amount::from_sat(1_000);
+         let btc_amount = Amount::from_sat(500_000);
+-        let btc_amnesty_amount = Amount::from_sat(100_000);
+         let should_publish_tx_refund = false;
+-        let xmr_amount = swap_core::monero::primitives::Amount::from_pico(10000);
++        // The legacy state stores raw atoms; fixture-only until XMZ protocol
++        // identity and persisted state types are separated from Monero.
++        let xmz_amount: swap_core::xmz::XmzAmount = "2".parse().unwrap();
++        let xmr_amount = swap_core::monero::primitives::Amount::from_pico(xmz_amount.atoms());
+ 
+         let tx_redeem_fee = alice_wallet
+             .estimate_fee(TxRedeem::weight(), Some(btc_amount))
+@@ -108,22 +119,105 @@ mod tests {
+             .into(),
+             None,
+         );
++        #[cfg(unix)]
++        if let Some(path) = std::env::var_os("MONZERO_TEST_LOCK_EXPORT") {
++            use std::io::Write;
++            use std::os::unix::fs::OpenOptionsExt;
++            let request = alice_state3.lock_xmr_transfer_request();
++            let address = swap_core::xmz_address::XmzAddress::new(
++                swap_core::xmz_address::XmzNetwork::Mainnet,
++                monero_address::AddressType::Legacy,
++                request.public_spend_key.decompress(), request.public_view_key.0.decompress(),
++            ).unwrap();
++            let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
++                .mode(0o600).open(path).unwrap();
++            // View key lets the receiver observe funding without the spend key.
++            writeln!(file, "{}\n{}\n{}", address, request.amount.as_pico(), bob_state4.private_view_key()).unwrap();
++            file.sync_all().unwrap();
++            let release = std::path::PathBuf::from(std::env::var_os("MONZERO_TEST_RELEASE").unwrap());
++            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
++            while !release.is_file() {
++                assert!(std::time::Instant::now() < deadline, "Native fixture funding timeout");
++                std::thread::sleep(std::time::Duration::from_millis(20));
++            }
++        }
+         let encrypted_signature = bob_state4.tx_redeem_encsig();
+-        let bob_state6 = bob_state4.cancel();
++        let bob_state6 = bob_state4.clone().cancel();
+ 
+         let cancel_transaction = alice_state3.signed_cancel_transaction().unwrap();
+         let punish_transaction = alice_state3.signed_punish_transaction().unwrap();
+         let redeem_transaction = alice_state3
+             .signed_redeem_transaction(encrypted_signature)
+             .unwrap();
+-        let refund_transaction = bob_state6.signed_full_refund_transaction().unwrap();
++        let redeemed = bob_state4
++            .recover_from_redeem(std::sync::Arc::new(redeem_transaction.clone()))
++            .unwrap();
++        assert_eq!(
++            monero_oxide_ext::PublicKey::from_private_key(&redeemed.xmr_keys().0),
++            alice_state3.lock_xmr_transfer_request().public_spend_key
++        );
++        let mut altered_redeem = redeem_transaction.clone();
++        // Explicit opt-in for the disposable native-wallet interoperability test.
++        // Never export to stdout or overwrite an existing file.
++        #[cfg(unix)]
++        if let Some(path) = std::env::var_os("MONZERO_TEST_RECOVERY_EXPORT") {
++            use std::io::Write;
++            use std::os::unix::fs::OpenOptionsExt;
++            let (spend, view) = redeemed.xmr_keys();
++            let request = alice_state3.lock_xmr_transfer_request();
++            let address = swap_core::xmz_address::XmzAddress::new(
++                swap_core::xmz_address::XmzNetwork::Mainnet,
++                monero_address::AddressType::Legacy,
++                request.public_spend_key.decompress(),
++                request.public_view_key.0.decompress(),
++            ).unwrap();
++            let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
++                .mode(0o600).open(path).unwrap();
++            assert_eq!(request.amount.as_pico(), xmz_amount.atoms());
++            writeln!(file, "{}\n{}\n{}\n{}", address, spend, view, request.amount.as_pico()).unwrap();
++            file.sync_all().unwrap();
++        }
++        altered_redeem.output[0].value += Amount::from_sat(1);
++        assert!(bob_state4.recover_from_redeem(std::sync::Arc::new(altered_redeem)).is_err());
++        let mut unsigned_redeem = redeem_transaction.clone();
++        unsigned_redeem.input[0].witness = Default::default();
++        assert!(bob_state4.recover_from_redeem(std::sync::Arc::new(unsigned_redeem)).is_err());
++        let (refund_transaction, refund_weight) = if btc_amnesty_amount == Amount::ZERO {
++            assert!(bob_state6.signed_partial_refund_transaction().is_err());
++            (bob_state6.signed_full_refund_transaction().unwrap(), TxFullRefund::weight())
++        } else {
++            assert!(bob_state6.signed_full_refund_transaction().is_err());
++            (bob_state6.signed_partial_refund_transaction().unwrap(), TxPartialRefund::weight())
++        };
++
++        let recover_refund = |tx| {
++            if btc_amnesty_amount == Amount::ZERO {
++                alice_state3.extract_monero_private_key_from_refund(std::sync::Arc::new(tx))
++            } else {
++                alice_state3.extract_monero_private_key_from_partial_refund(std::sync::Arc::new(tx))
++            }
++        };
++        let recovered = recover_refund(refund_transaction.clone()).unwrap();
++        assert_eq!(
++            monero_oxide_ext::PublicKey::from_private_key(&recovered),
++            alice_state3.lock_xmr_transfer_request().public_spend_key
++        );
++        let mut altered_refund = refund_transaction.clone();
++        altered_refund.output[0].value += Amount::from_sat(1);
++        // Extraction consumes signature evidence, not confirmation evidence.
++        // A copied valid signature still reveals the same key even if its
++        // surrounding transaction was modified and is no longer valid.
++        assert_eq!(recover_refund(altered_refund).unwrap(), recovered);
++        let mut unsigned_refund = refund_transaction.clone();
++        unsigned_refund.input[0].witness = Default::default();
++        assert!(recover_refund(unsigned_refund).is_err());
+ 
+         assert_weight(redeem_transaction, TxRedeem::weight().to_wu(), "TxRedeem");
+         assert_weight(cancel_transaction, TxCancel::weight().to_wu(), "TxCancel");
+         assert_weight(punish_transaction, TxPunish::weight().to_wu(), "TxPunish");
+         assert_weight(
+             refund_transaction,
+-            TxFullRefund::weight().to_wu(),
++            refund_weight.to_wu(),
+             "TxRefund",
+         );
+ 

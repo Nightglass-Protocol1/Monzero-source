@@ -1,0 +1,85 @@
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval.rs
+new file mode 100644
+--- /dev/null
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation/approval.rs
+@@ -0,0 +1,40 @@
++//! Read-only review of an exact saved native payout. This exposes neither
++//! signing artifacts nor broadcast authority; relay must revalidate separately.
++use super::*;
++use serde_json::json;
++
++const REVIEW: &str="monzero-bch-native-payout-relay-review-v1";
++pub struct NativePayoutRelayReview {pub details: Value,pub commitment: [u8;32]}
++
++impl AdmittedExecution<'_> {
++    fn native_payout_relay_materials(&self) -> Result<(NativePayoutRelayReview,PreparedLockPayout,Intent,[u8;32])> {
++        let (intent,bytes)=self.payout_intent()?.context("missing BCH native payout intent")?;
++        let prepared=self.load_bch_native_payout()?;
++        // Re-encoding a validated canonical checkpoint preserves its exact bytes,
++        // including metadata and proof keys that are never exposed by the review.
++        let binding=hash(INTENT,&bytes);
++        let checkpoint: [u8;32]=Sha256::digest(&*prepared.encode(binding)?).into();
++        let funding=self.prepared_bch_funding()?.context("missing BCH funding preparation")?;
++        let (locked,_)=self.funding_lock_intent(&funding)?;
++        let signed=self.signed_bch_funding()?.context("missing exact BCH funding")?;
++        let details=json!({"schema":REVIEW,"action":"broadcast-bch-native-payout",
++            "swapId":self.quote.terms()["swapId"],"quote":self.quote.commitment(),"admission":intent.admission,
++            "nativeReceipt":intent.native_receipt,"walletIntent":intent.wallet_intent,
++            "payoutIntent":binding,"privateCheckpoint":checkpoint,"preparedAt":intent.at,
++            "redemption":intent.redemption,"bchFundingOutpoint":signed.lock_outpoint(),
++            "bchDeployment":locked.deployment,"bchNetwork":self.quote.terms()["bchNetwork"],
++            "bchGenesis":self.quote.terms()["bchGenesis"],"xmzNetwork":self.quote.terms()["xmzNetwork"],
++            "minimumBchConfirmations":self.policy.bch_confirmations,
++            "minimumXmzConfirmations":self.policy.xmz_confirmations,"payout":prepared.terms()});
++        let commitment=hash(REVIEW,&serde_json::to_vec(&details)?);
++        Ok((NativePayoutRelayReview {details,commitment},prepared,intent,locked.deployment))
++    }
++    /// Review survives commercial expiry but conveys no current chain evidence.
++    /// Any future relay must recompute this commitment before accepting approval.
++    pub fn review_bch_native_payout_relay(&self,bch: &BchRpc,now: u64) -> Result<NativePayoutRelayReview> {
++        let (review,_,intent,deployment)=self.native_payout_relay_materials()?;
++        ensure!(now>=intent.at,"BCH native payout review predates preparation");
++        ensure!(bch.deployment_commitment()?==deployment,"BCH native payout observer changed");
++        Ok(review)
++    }
++}
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/agreement/execution/funding/success/native_claim/wallet/payout/preparation.rs
+@@ -83,3 +83,5 @@
+         Ok(prepared.terms().clone())
+     }
+ }
++
++pub mod approval;
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/signing/relay/message/native/relay/proof/success/receipt/redemption/relay/native_claim/wallet/payout.rs
+@@ -49,10 +49,18 @@
+         let restored=execution.prepare_bch_native_payout(&observer,rpc,redemption,block,2049,&mut restarted,1).await;
+         if let Some(expected)=expected {
+             assert_eq!(restored?,expected);assert_eq!(execution.recover_prepared_bch_native_payout()?,expected);
++            let review=execution.review_bch_native_payout_relay(rpc,2049)?;
++            assert_eq!(review.details["action"],"broadcast-bch-native-payout");
++            assert_eq!(review.details["payout"],expected);
++            assert_eq!(review.details["redemption"],serde_json::to_value(redemption)?);
++            for secret in ["tx_metadata","tx_key","spendKey","viewKey"] {assert!(review.details.get(secret).is_none());}
++            assert!(execution.review_bch_native_payout_relay(rpc,2047).is_err());
++            assert_eq!(execution.review_bch_native_payout_relay(rpc,2050)?.commitment,review.commitment);
+             assert!(execution.prepare_bch_native_payout(&observer,rpc,redemption,block,2049,&mut restarted,2).await.is_err());
+             // Every incomplete/corrupt checkpoint must reject offline recovery.
+             let saved=std::fs::read(&prepared)?;std::fs::write(&prepared,b"{}")?;
+-            assert!(execution.recover_prepared_bch_native_payout().is_err());std::fs::write(&prepared,&saved)?;
++            assert!(execution.recover_prepared_bch_native_payout().is_err());
++            assert!(execution.review_bch_native_payout_relay(rpc,2049).is_err());std::fs::write(&prepared,&saved)?;
+             let held=copied.0.join("held-payout-pin");std::fs::rename(&pin,&held)?;
+             assert!(execution.recover_prepared_bch_native_payout().is_err());std::fs::rename(&held,&pin)?;
+             let held=copied.0.join("held-payout-intent");std::fs::rename(&intent,&held)?;
+@@ -61,6 +69,7 @@
+             assert_eq!(std::fs::read(&prepared)?,saved);
+         } else {
+             assert!(restored.is_err());assert!(execution.recover_prepared_bch_native_payout().is_err());
++            assert!(execution.review_bch_native_payout_relay(rpc,2049).is_err());
+         }
+         assert_eq!(wallet.state.lock().unwrap().calls.len(),calls,"saved or uncertain payout performed another wallet operation");
+         assert_eq!(observer_fixture.calls.lock().unwrap().len(),observations,"offline recovery performed chain observations");

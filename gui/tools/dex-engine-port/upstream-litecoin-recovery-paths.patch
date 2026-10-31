@@ -1,0 +1,178 @@
+--- a/swap-core/src/bitcoin/punish.rs
++++ b/swap-core/src/bitcoin/punish.rs
+@@ -24,8 +24,18 @@
+         punish_timelock: PunishTimelock,
+         spending_fee: Amount,
+     ) -> Self {
++        Self::new_to_script(tx_cancel, &punish_address.script_pubkey(), punish_timelock, spending_fee)
++    }
++
++    /// Caller validates chain, destination and fee policy before construction.
++    pub fn new_to_script(
++        tx_cancel: &TxCancel,
++        punish_script: &ScriptBuf,
++        punish_timelock: PunishTimelock,
++        spending_fee: Amount,
++    ) -> Self {
+         let tx_punish =
+-            tx_cancel.build_spend_transaction(punish_address, Some(punish_timelock), spending_fee);
++            tx_cancel.build_spend_transaction_to_script(punish_script, Some(punish_timelock), spending_fee);
+ 
+         let digest = SighashCache::new(&tx_punish)
+             .p2wsh_signature_hash(
+@@ -43,7 +53,7 @@
+             inner: tx_punish,
+             digest,
+             cancel_output_descriptor: tx_cancel.output_descriptor.clone(),
+-            watch_script: punish_address.script_pubkey(),
++            watch_script: punish_script.clone(),
+         }
+     }
+ 
+--- a/swap-core/src/bitcoin/early_refund.rs
++++ b/swap-core/src/bitcoin/early_refund.rs
+@@ -24,7 +24,12 @@
+ 
+ impl TxEarlyRefund {
+     pub fn new(tx_lock: &TxLock, refund_address: &Address, spending_fee: Amount) -> Self {
+-        let tx = tx_lock.build_spend_transaction(refund_address, None, spending_fee);
++        Self::new_to_script(tx_lock, &refund_address.script_pubkey(), spending_fee)
++    }
++
++    /// Caller validates chain, destination and fee policy before construction.
++    pub fn new_to_script(tx_lock: &TxLock, refund_script: &ScriptBuf, spending_fee: Amount) -> Self {
++        let tx = tx_lock.build_spend_transaction_to_script(refund_script, None, spending_fee);
+ 
+         let digest = SighashCache::new(&tx)
+             .p2wsh_signature_hash(
+@@ -42,7 +47,7 @@
+             inner: tx,
+             digest,
+             lock_output_descriptor: tx_lock.output_descriptor.clone(),
+-            watch_script: refund_address.script_pubkey(),
++            watch_script: refund_script.clone(),
+         }
+     }
+ 
+--- a/swap-core/tests/litecoin_settlement.rs
++++ b/swap-core/tests/litecoin_settlement.rs
+@@ -20,11 +20,12 @@
+ use std::str::FromStr;
+ use std::sync::Arc;
+ use swap_core::bitcoin::{
+-    CancelTimelock, PublicKey, SecretKey, TxCancel, TxFullRefund, TxLock, TxRedeem,
++    CancelTimelock, PunishTimelock, PublicKey, SecretKey, TxCancel, TxFullRefund, TxLock, TxRedeem,
++    TxPunish, TxEarlyRefund,
+     build_shared_output_descriptor, recover,
+ };
+ 
+-const SCHEMA: &str = "monzero-ltc-contract-fixture-v1";
++const SCHEMA: &str = "monzero-ltc-contract-fixture-v2";
+ /// BIP68 relative block locks use the low 16 bits; larger values set type or disable flags.
+ const MAX_CANCEL_BLOCKS: u32 = 0xFFFF;
+ const MAX_REQUEST_BYTES: u64 = 1 << 20;
+@@ -49,6 +50,7 @@
+     refund_script: String,
+     fee_atoms: String,
+     cancel_blocks: u32,
++    punish_blocks: u32,
+ }
+ 
+ /// Public, deterministic test-only keys. Anyone can derive them from this file.
+@@ -101,6 +103,8 @@
+         (1..=MAX_CANCEL_BLOCKS).contains(&request.cancel_blocks),
+         "cancelBlocks must be between 1 and {MAX_CANCEL_BLOCKS}"
+     );
++    ensure!((1..=MAX_CANCEL_BLOCKS).contains(&request.punish_blocks),
++        "punishBlocks must be between 1 and {MAX_CANCEL_BLOCKS}");
+     let redeem_script = destination_script(&request.redeem_script).context("invalid redeemScript")?;
+     let refund_script = destination_script(&request.refund_script).context("invalid refundScript")?;
+ 
+@@ -149,6 +153,13 @@
+         (A, refund_sig_a),
+         (B, keys.b.sign(tx_refund.digest())),
+     );
++    let tx_punish = TxPunish::new_to_script(&tx_cancel, &redeem_script,
++        PunishTimelock::new(request.punish_blocks), fee);
++    let punish_sig_b = keys.b.sign(tx_punish.digest());
++    let punish = tx_punish.complete(punish_sig_b, keys.a.clone(), B)?;
++    let tx_early = TxEarlyRefund::new_to_script(&tx_lock, &refund_script, fee);
++    let early_sig_b = keys.b.sign(tx_early.digest());
++    let early_refund = tx_early.complete(early_sig_b, keys.a.clone(), B)?;
+     let cancel_sig_a = keys.a.sign(tx_cancel.digest());
+     let cancel = tx_cancel.complete_as_bob(A, keys.b.clone(), cancel_sig_a)?;
+     let refund = tx_refund.clone().add_signatures(refund_sigs.0, refund_sigs.1)?;
+@@ -182,6 +193,14 @@
+         "settlement accounting does not match the request"
+     );
+ 
++    ensure!(punish.input[0].previous_output == refund.input[0].previous_output
++        && punish.input[0].sequence.0 == request.punish_blocks
++        && punish.output[0].value.to_sat() == refund_value
++        && punish.output[0].script_pubkey == redeem_script
++        && early_refund.input[0].previous_output == lock_outpoint
++        && early_refund.output[0].value.to_sat() == amount - fee.to_sat()
++        && early_refund.output[0].script_pubkey == refund_script,
++        "recovery path accounting or timelock mismatch");
+     let mut response = contract(keys)?;
+     response["mode"] = json!("build");
+     response["executable"] = json!(false);
+@@ -195,6 +214,9 @@
+     response["cancel"] = settlement_json(&cancel, fee);
+     response["cancel"]["cancelBlocks"] = json!(request.cancel_blocks);
+     response["refund"] = settlement_json(&refund, fee);
++    response["punish"] = settlement_json(&punish, fee);
++    response["punish"]["punishBlocks"] = json!(request.punish_blocks);
++    response["earlyRefund"] = settlement_json(&early_refund, fee);
+     response["adaptorSecretRecovered"] = json!(true);
+     response["refundAdaptorSecretRecovered"] = json!(true);
+     Ok(response)
+@@ -400,6 +422,7 @@
+             "refundScript": p2wpkh(4).to_hex_string(),
+             "feeAtoms": "2000",
+             "cancelBlocks": 12,
++            "punishBlocks": 7,
+         })
+     }
+ 
+@@ -434,6 +457,9 @@
+         assert_eq!(response["cancel"]["amountAtoms"], "898000");
+         assert_eq!(response["cancel"]["cancelBlocks"], 12);
+         assert_eq!(response["refund"]["amountAtoms"], "896000");
++        assert_eq!(response["punish"]["amountAtoms"], "896000");
++        assert_eq!(response["punish"]["punishBlocks"], 7);
++        assert_eq!(response["earlyRefund"]["amountAtoms"], "898000");
+ 
+         let refund: Transaction = bitcoin::consensus::encode::deserialize_hex(
+             response["refund"]["rawHex"].as_str().unwrap(),
+@@ -492,12 +518,30 @@
+                 tx.add_signatures((keys.a.public(), a), (keys.b.public(), b)).unwrap()
+             };
+             assert_eq!(sign(legacy), sign(direct));
++            let legacy = TxEarlyRefund::new(&lock, &address, fee);
++            let direct = TxEarlyRefund::new_to_script(&lock, &script, fee);
++            assert_eq!(legacy.txid(), direct.txid());
++            assert_eq!(legacy.digest(), direct.digest());
++            assert_eq!(legacy.script(), direct.script());
++            let signature = keys.b.sign(direct.digest());
++            assert_eq!(legacy.complete(signature.clone(), keys.a.clone(), keys.b.public()).unwrap(),
++                direct.complete(signature, keys.a.clone(), keys.b.public()).unwrap());
++            let legacy = TxPunish::new(&cancel, &address, PunishTimelock::new(7), fee);
++            let direct = TxPunish::new_to_script(&cancel, &script, PunishTimelock::new(7), fee);
++            assert_eq!(legacy.txid(), direct.txid());
++            assert_eq!(legacy.digest(), direct.digest());
++            assert_eq!(legacy.script(), direct.script());
++            let signature = keys.b.sign(direct.digest());
++            assert_eq!(legacy.complete(signature.clone(), keys.a.clone(), keys.b.public()).unwrap(),
++                direct.complete(signature, keys.a.clone(), keys.b.public()).unwrap());
+         }
+     }
+ 
+     #[test]
+     fn build_rejects_invalid_requests() {
+         let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
++            ("punishBlocks", Box::new(|r: &mut Value| r["punishBlocks"] = json!(0))),
++            ("punishBlocks", Box::new(|r: &mut Value| r["punishBlocks"] = json!(65536))),
+             ("feeAtoms", Box::new(|r: &mut Value| r["feeAtoms"] = json!("0"))),
+             ("feeAtoms", Box::new(|r: &mut Value| r["feeAtoms"] = json!("+5"))),
+             ("amountAtoms", Box::new(|r: &mut Value| r["amountAtoms"] = json!("0900000"))),

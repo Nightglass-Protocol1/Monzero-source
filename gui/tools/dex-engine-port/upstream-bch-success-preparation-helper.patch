@@ -1,0 +1,221 @@
+diff --git a/swap-machine/src/bin/native-bch-admission.rs b/swap-machine/src/bin/native-bch-admission.rs
+--- a/swap-machine/src/bin/native-bch-admission.rs
++++ b/swap-machine/src/bin/native-bch-admission.rs
+@@ -583,6 +583,77 @@
+             "requestId":request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":false,
+             "review":{"details":review.details,
+                 "commitment":review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()}}))
++    }
++
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct SuccessPreparationConfig {
++        schema: String,admission_config_file: PathBuf,deployment_commitment: String,safety_blocks: u32,
++        bch_rpc_file: PathBuf,native_rpc_file: PathBuf,
++    }
++    #[derive(Deserialize)]
++    #[serde(deny_unknown_fields,rename_all="camelCase")]
++    struct SuccessPreparationRequest {schema: String,request_id: uuid::Uuid,commitment: String}
++    fn success_preparation_request(bytes: &[u8]) -> Result<SuccessPreparationRequest> {
++        ensure!(!bytes.is_empty() && bytes.len()<=512,"invalid success preparation request size");
++        let request: SuccessPreparationRequest=serde_json::from_slice(bytes)?;
++        ensure!(request.schema=="monzero-bch-success-preparation-request-v1" && !request.request_id.is_nil(),
++            "invalid success preparation request");
++        parse_digest(&request.commitment)?;Ok(request)
++    }
++    fn success_preparation_config(bytes: &[u8]) -> Result<SuccessPreparationConfig> {
++        let config: SuccessPreparationConfig=serde_json::from_slice(bytes)?;
++        ensure!(config.schema=="monzero-private-bch-success-preparation-v1"
++            && config.admission_config_file.is_absolute() && config.safety_blocks>0
++            && config.bch_rpc_file.is_absolute() && config.native_rpc_file.is_absolute(),
++            "invalid success preparation configuration");
++        parse_digest(&config.deployment_commitment)?;Ok(config)
++    }
++    async fn success_preparation_operation(path: &Path,bytes: &[u8]) -> Result<serde_json::Value> {
++        use swap_machine::native_funding_rpc::NativeFundingRpc;
++        let request=success_preparation_request(bytes)?;
++        let (_wrapper_lease,bytes)=private_bytes(path)?;
++        let wrapper=success_preparation_config(&bytes)?;
++        let (_admission_lease,config)=load(&wrapper.admission_config_file)?;
++        ensure!(matches!(config.role,Role::BchFunder),"success review requires BCH funder");
++        let (_quote_lease,bytes)=private_bytes(&config.quote_file)?;
++        let quote=VerifiedBchQuote::restore_record(&bytes,&config.policy,config.admitted_at,
++            &config.identity_pins[0],&config.identity_pins[1],&parse_digest(&config.quote_commitment)?)?;
++        ensure!(quote.terms()["swapId"].parse::<uuid::Uuid>()?==config.trade_id,"success review trade changed");
++        let mut execution=AdmittedExecution::resume(&config.metadata_directory,&config.snapshot_directory,
++            &quote,&config.policy,config.role)?;
++        execution.saved_admission_review(&config.negotiation_pins)?;
++        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        let deployment=parse_digest(&wrapper.deployment_commitment)?;
++        let approved=parse_digest(&request.commitment)?;
++        let review=execution.review_bch_success_release(&deployment,wrapper.safety_blocks,now)?;
++        ensure!(review.commitment==approved,"BCH success preparation consent changed");
++        // Consent and journal bindings are checked before opening RPC credentials.
++        let (_bch_lease,bytes)=private_bytes(&wrapper.bch_rpc_file)?;
++        let descriptor: FundingRpc=serde_json::from_slice(&bytes)?;
++        let (_cookie_lease,cookie)=private_file(&descriptor.cookie_file,true)?;
++        let bch=descriptor.backend(&cookie)?;
++        ensure!(bch.deployment_commitment()?==deployment,"BCH success preparation deployment changed");
++        let (_native_lease,bytes)=private_bytes(&wrapper.native_rpc_file)?;
++        let native: NativePreparationRpc=serde_json::from_slice(&bytes)?;
++        ensure!(native.schema=="monzero-private-bch-native-rpc-v1" && native.daemon_port>0
++            && native.wallet_port>0 && native.daemon_port!=native.wallet_port
++            && native.login_file.is_absolute(),"invalid native observer descriptor");
++        isolated_native_preparation(native.daemon_port).await?;
++        let (_login_lease,login)=private_file(&native.login_file,true)?;
++        let text=std::str::from_utf8(&login)?;
++        let text=text.strip_suffix('\n').unwrap_or(text);
++        let (user,password)=text.split_once(':').context("invalid native observer credentials")?;
++        ensure!(!user.is_empty() && !password.is_empty() && !text.bytes().any(|b|b.is_ascii_control()),"invalid native observer login");
++        let observer=NativeFundingRpc::new(native.daemon_port,native.wallet_port,user.into(),password.into())?;
++        let checked_at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
++        let frame=execution.prepare_reviewed_bch_success_release(&observer,&bch,wrapper.safety_blocks,checked_at,&approved).await?;
++        // Even unsigned adaptor bytes enable spending: keep them in the private
++        // journal and zeroize the returned buffer without serializing it.
++        drop(frame);
++        Ok(serde_json::json!({"schema":"monzero-bch-success-preparation-response-v1",
++            "requestId":request.request_id,"tradeId":config.trade_id,"executable":false,"chainObserved":true,
++            "state":"prepared","review":{"details":review.details,"commitment":request.commitment}}))
+     }
+ 
+     fn native_proof_operation(path: &Path,bytes: &[u8],action: &str) -> Result<serde_json::Value> {
+@@ -1215,7 +1286,10 @@
+             "--native-proof-context-stdio-v1"=>Some("context"),
+             _=>None,
+         };
+-        let result = if action=="--success-release-review-stdio-v1" {
++        let result = if action=="--success-preparation-stdio-v1" {
++            tokio::runtime::Builder::new_current_thread().enable_all().build()?
++                .block_on(success_preparation_operation(Path::new(&args[2]),&bytes))?
++        } else if action=="--success-release-review-stdio-v1" {
+             success_release_review_operation(Path::new(&args[2]),&bytes)?
+         } else if action=="--native-observation-stdio-v1" {
+             tokio::runtime::Builder::new_current_thread().enable_all().build()?
+@@ -1268,6 +1342,34 @@
+ 
+     #[cfg(test)]
+     mod tests {
++        #[test]
++        fn success_preparation_requires_exact_consent_and_rejects_private_output() -> anyhow::Result<()> {
++            let request=serde_json::json!({"schema":"monzero-bch-success-preparation-request-v1",
++                "requestId":uuid::Uuid::new_v4(),"commitment":"12".repeat(32)});
++            assert!(super::success_preparation_request(&serde_json::to_vec(&request)?).is_ok());
++            for field in ["commitment","requestId","schema"] {
++                let mut invalid=request.clone();invalid.as_object_mut().unwrap().remove(field);
++                assert!(super::success_preparation_request(&serde_json::to_vec(&invalid)?).is_err());
++            }
++            for field in ["frame","signature","outputFile"] {
++                let mut invalid=request.clone();invalid[field]=serde_json::Value::Null;
++                assert!(super::success_preparation_request(&serde_json::to_vec(&invalid)?).is_err());
++            }
++            for value in [serde_json::Value::Null,serde_json::json!("zz".repeat(32)),serde_json::json!("12")] {
++                let mut invalid=request.clone();invalid["commitment"]=value;
++                assert!(super::success_preparation_request(&serde_json::to_vec(&invalid)?).is_err());
++            }
++            let wrapper=serde_json::json!({"schema":"monzero-private-bch-success-preparation-v1",
++                "admissionConfigFile":"/private/admission","deploymentCommitment":"12".repeat(32),
++                "safetyBlocks":5,"bchRpcFile":"/private/bch-rpc","nativeRpcFile":"/private/native-rpc"});
++            assert!(super::success_preparation_config(&serde_json::to_vec(&wrapper)?).is_ok());
++            for (field,value) in [("safetyBlocks",serde_json::json!(0)),("bchRpcFile",serde_json::json!("relative")),
++                ("nativeRpcFile",serde_json::json!("relative")),("outputFile",serde_json::json!("/private/frame"))] {
++                let mut invalid=wrapper.clone();invalid[field]=value;
++                assert!(super::success_preparation_config(&serde_json::to_vec(&invalid)?).is_err());
++            }
++            Ok(())
++        }
+         #[test]
+         fn success_review_cannot_accept_release_or_private_output_fields() -> anyhow::Result<()> {
+             let request=serde_json::json!({"schema":"monzero-bch-success-release-review-request-v1","requestId":uuid::Uuid::new_v4()});
+diff --git a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs
+--- a/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs
++++ b/swap-machine/src/bch_key_recovery/authenticated/native_wallet/tests/wallet_locks/funding_helper/node_executor/success_release_helper.rs
+@@ -6,10 +6,6 @@
+     let digest=std::env::var("MONZERO_BCH_ADMISSION_HELPER_SHA256")?;
+     ensure!(helper.is_absolute() && helper.canonicalize()?==helper
+         && hex(&Sha256::digest(std::fs::read(&helper)?))==digest,"success review helper changed");
+-    let program=PathBuf::from(std::env::var("MONZERO_BCH_QT_SUCCESS_RELEASE_REVIEW_PROBE")?);
+-    let expected=std::env::var("MONZERO_BCH_QT_SUCCESS_RELEASE_REVIEW_PROBE_SHA256")?;
+-    ensure!(program.is_absolute() && program.canonicalize()?==program
+-        && hex(&Sha256::digest(std::fs::read(&program)?))==expected,"Qt success release review probe changed");
+     let metadata=PrivateStore::new()?;let private=PrivateStore::new()?;let config=PrivateStore::new()?;
+     for (name,bytes) in contents(&original.0)? {save(&metadata.0.join(name),&bytes)?;}
+     for (name,bytes) in contents(&snapshots.0)? {save(&private.0.join(name),&bytes)?;}
+@@ -28,12 +24,10 @@
+     let record=json!({"schema":"monzero-private-bch-success-release-review-v1",
+         "admissionConfigFile":admission,"deploymentCommitment":hex(deployment),"safetyBlocks":5});
+     save(&wrapper,&serde_json::to_vec(&record)?)?;
+-    save(&PathBuf::from(format!("{}.public-context.json",wrapper.display())),&serde_json::to_vec(context)?)?;
+-    save(&PathBuf::from(format!("{}.public-proof.json",wrapper.display())),&serde_json::to_vec(proof_review)?)?;
+     let invoke=|success: bool| -> Result<Value> {
+         let id=uuid::Uuid::new_v4();
+         let request=json!({"schema":"monzero-bch-success-release-review-request-v1","requestId":id});
+-        let mut child=Command::new(&program).arg("--success-release-review-stdio-v1").arg(&wrapper)
++        let mut child=Command::new(&helper).arg("--success-release-review-stdio-v1").arg(&wrapper)
+             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+         child.stdin.take().context("success review stdin")?.write_all(&serde_json::to_vec(&request)?)?;
+         let output=child.wait_with_output()?;
+@@ -58,5 +52,64 @@
+     let mut wrong_role=admission_record.clone();wrong_role["role"]=json!("native-funder");
+     save(&admission,&serde_json::to_vec(&wrong_role)?)?;invoke(false)?;
+     assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&private.0)?,secrets);
++    save(&admission,&serde_json::to_vec(&admission_record)?)?;
++    let source=PathBuf::from(std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG")?);
++    let source_bytes=std::fs::read(&source)?;
++    ensure!(source_bytes.len()<16384 && hex(&Sha256::digest(&source_bytes))==std::env::var("MONZERO_BCH_NODE_EXECUTOR_CONFIG_SHA256")?,"preparation fixture context changed");
++    let node: Value=serde_json::from_slice(&source_bytes)?;
++    let cookie=config.0.join("bch.cookie");save(&cookie,node["cookie"].as_str().context("cookie")?.as_bytes())?;
++    let bch=config.0.join("bch.json");
++    save(&bch,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-funding-rpc-v1",
++        "port":node["port"],"wallet":"fixture","anchor":node["anchor"],"anchorScript":node["anchorScript"],
++        "cookieFile":cookie,"checkpointHeight":1,"checkpoint":node["checkpoint"],"subversion":node["subversion"]}))?)?;
++    let n=&node["native"];let login=config.0.join("observer.login");
++    save(&login,format!("{}:{}",n["observerUsername"].as_str().context("observer username")?,
++        n["observerPassword"].as_str().context("observer password")?).as_bytes())?;
++    let native=config.0.join("native.json");
++    save(&native,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-native-rpc-v1",
++        "daemonPort":n["daemonPort"],"walletPort":n["observerPort"],"loginFile":login}))?)?;
++    let preparation=config.0.join("preparation.json");
++    save(&preparation,&serde_json::to_vec(&json!({"schema":"monzero-private-bch-success-preparation-v1",
++        "admissionConfigFile":admission,"deploymentCommitment":hex(deployment),"safetyBlocks":5,
++        "bchRpcFile":bch,"nativeRpcFile":native}))?)?;
++    let program=PathBuf::from(std::env::var("MONZERO_BCH_QT_SUCCESS_PREPARATION_PROBE")?);
++    let expected=std::env::var("MONZERO_BCH_QT_SUCCESS_PREPARATION_PROBE_SHA256")?;
++    ensure!(program.is_absolute() && program.canonicalize()?==program
++        && hex(&Sha256::digest(std::fs::read(&program)?))==expected,"Qt preparation probe changed");
++    save(&PathBuf::from(format!("{}.public-context.json",preparation.display())),&serde_json::to_vec(context)?)?;
++    save(&PathBuf::from(format!("{}.public-proof.json",preparation.display())),&serde_json::to_vec(proof_review)?)?;
++    save(&PathBuf::from(format!("{}.public-review.json",preparation.display())),
++        &serde_json::to_vec(&json!({"details":details,"commitment":hex(commitment)}))?)?;
++    let prepare=|approval: &str,success: bool| -> Result<()> {
++        let id=uuid::Uuid::new_v4();
++        let request=json!({"schema":"monzero-bch-success-preparation-request-v1","requestId":id,"commitment":approval});
++        let mut child=Command::new(&program).arg("--success-preparation-stdio-v1").arg(&preparation)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
++        child.stdin.take().context("preparation stdin")?.write_all(&serde_json::to_vec(&request)?)?;
++        let output=child.wait_with_output()?;
++        assert_eq!(output.status.success(),success,"{}",String::from_utf8_lossy(&output.stderr));
++        if !success {assert!(output.stdout.is_empty());return Ok(())}
++        assert!(output.stderr.is_empty() && output.stdout.len()<=16384);
++        let response: Value=serde_json::from_slice(&output.stdout)?;
++        // Exact public shape prevents accidental adaptor/signature serialization.
++        assert_eq!(response,json!({"schema":"monzero-bch-success-preparation-response-v1",
++            "requestId":id,"tradeId":setup.quote.terms()["swapId"],"executable":false,"chainObserved":true,
++            "state":"prepared","review":{"details":details,"commitment":hex(commitment)}}));
++        Ok(())
++    };
++    prepare(&"00".repeat(32),false)?;
++    assert_eq!(contents(&metadata.0)?,before);assert_eq!(contents(&private.0)?,secrets);
++    prepare(&hex(commitment),true)?;
++    let prepared_metadata=contents(&metadata.0)?;let prepared_private=contents(&private.0)?;
++    assert_ne!(prepared_metadata,before);assert_ne!(prepared_private,secrets);
++    let slot=format!("{}.bch-success-prepared",setup.quote.terms()["swapId"]);
++    assert!(private.0.join(&slot).is_file());assert!(metadata.0.join(format!("{slot}-pin")).is_file());
++    assert!(!private.0.join(format!("{}.bch-success-signed",setup.quote.terms()["swapId"])).exists());
++    // A second process must restore the exact preparation without changing bytes.
++    prepare(&hex(commitment),true)?;
++    assert_eq!(contents(&metadata.0)?,prepared_metadata);assert_eq!(contents(&private.0)?,prepared_private);
++    // Cached private material cannot bypass current observer availability.
++    std::fs::remove_file(&login)?;prepare(&hex(commitment),false)?;
++    assert_eq!(contents(&metadata.0)?,prepared_metadata);assert_eq!(contents(&private.0)?,prepared_private);
+     Ok(())
+ }
