@@ -1,0 +1,57 @@
+{
+  "run": "mainnet-1",
+  "date": "2026-10-31",
+  "network": "BNB Smart Chain mainnet (56) + XMZ mainnet",
+  "note": "Owner's real-funds test between two accounts of one dedicated test phrase. Not a market trade: its price must not be published as a market price.",
+  "contract": "0x9073290952DCDF3225D8f65d787cF9148a490feb",
+  "terms": {
+    "bnb": "0.01",
+    "xmz": "7000",
+    "impliedPrice": "$0.001/XMZ at BNB ~$700"
+  },
+  "buyer": {
+    "account": "0x9C06a3d4f56fFF037C11f24b77B3C0F0eBCd8e0C",
+    "final": "Done(Swapped)",
+    "bnbTxs": {
+      "new_swap": [
+        "0xd5372b90a787fd9f706ce8cb9dec0883a13f54f0c0ca3c598a918c815b41b2e3"
+      ],
+      "set_ready": [
+        "0x421a7eabcc94ee6f3da835a37d2b3c1790ec90a867852f33173ca1ec0fb802ea"
+      ]
+    },
+    "timeline": [
+      "18:20:00 owner -> LockSent",
+      "18:20:17 owner -> Locked",
+      "18:36:31 owner -> ReadySent",
+      "18:36:54 owner -> Sweeping",
+      "19:21:12 owner -> Done(Swapped)"
+    ],
+    "xmzReceived": "6999.9906194 (7000 less 0.0093806 sweep fee)",
+    "xmzSweepTx": "8a9b03d5ff878833abfd9d27d8a14cba8faaa539b92b97da4b5d5f3bf000079b"
+  },
+  "seller": {
+    "account": "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF",
+    "final": "Done(Swapped)",
+    "bnbTxs": {
+      "claim": [
+        "0x299396041212381dbb585c5a057e20b48b1be9b9d67d92bded5006cd1ea4c0e6"
+      ]
+    },
+    "timeline": [
+      "18:19:56 claimer -> WaitingForEvmLock",
+      "18:20:13 claimer -> XmzLockSent",
+      "18:36:27 claimer -> XmzLocked",
+      "18:36:46 claimer -> ClaimSent",
+      "18:37:03 claimer -> Done(Swapped)"
+    ],
+    "xmzLockTx": "ed966cd48d8079ed0bd2f675070e9c21a4ed3f1c9f18c87b1e855cfba4bdab4e",
+    "bnbBalanceAfter": "0.0129977935 (0.003 gas float + 0.01 received - claim gas)"
+  },
+  "contractBalanceAfter": "0",
+  "tickErrors": 0,
+  "durations": {
+    "keysAgreedToSellerPaid": "17 min",
+    "keysAgreedToBuyerDone": "61 min"
+  }
+}
