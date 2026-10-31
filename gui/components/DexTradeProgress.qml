@@ -189,8 +189,9 @@ Rectangle {
                 }
                 MonzeroComponents.StandardButton {
                     objectName: "approveButton"
-                    enabled: card.confirmed && card.t.busy !== true
-                    text: qsTr("Approve trade")
+                    // Allowed while a step runs: the trade job queues the approval and sends it next
+                    enabled: card.confirmed && card.t.approvalPending !== true
+                    text: card.t.approvalPending === true ? qsTr("Approval queued…") : qsTr("Approve trade")
                     onClicked: card.approve(card.t.commitment)
                 }
             }

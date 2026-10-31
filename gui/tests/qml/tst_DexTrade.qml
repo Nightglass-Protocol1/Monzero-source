@@ -102,6 +102,11 @@ Item {
             progress.approve.connect(function(c) { approved = c })
             child(progress, "approvalConfirm").clicked(); verify(approve.enabled)
             approve.clicked(); compare(approved, "0xabc")
+            // While a step is running the approval can still be given (the job queues it)
+            var busy = trade("owner", "Start", true); busy.busy = true; progress.trade = busy; progress.confirmed = true
+            verify(approve.enabled)
+            busy.approvalPending = true; progress.trade = busy; progress.confirmed = true
+            verify(!approve.enabled); compare(approve.text, "Approval queued\u2026")
             verify(child(progress, "tradeRefundTime").text.indexOf("refunded") >= 0)
         }
         function test_sellerAndFinishedStates() {
