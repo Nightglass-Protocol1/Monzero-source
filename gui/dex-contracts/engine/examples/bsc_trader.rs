@@ -1,4 +1,5 @@
-//! One trader of an XMZ <-> BNB swap on BNB testnet, as its own process (one per machine):
+//! One trader of an XMZ <-> BNB swap, as its own process (one per machine). NETWORK=testnet
+//! (default: BNB testnet + XMZ testnet) or NETWORK=mainnet (real BNB + real XMZ; see below):
 //!
 //!   bsc_trader owner new <dir> <listen-port>           writes <dir>/offer.json and peer.txt,
 //!                                                      answers the key exchange, then trades
@@ -12,6 +13,11 @@
 //! and the claimer waits until 30 tXMZ are unlocked there.
 //! The trade is saved in <dir>/journal.json before anything is locked (Driver::start); the
 //! process plays the user and approves it. Prints state names only.
+//!
+//! NETWORK=mainnet moves real funds. It needs deployments/bsc-mainnet.json (scripts/deploy-mainnet.js),
+//! an ACCOUNTS_FILE holding a dedicated test phrase (never a main wallet's), XMZ_NODE (a mainnet
+//! node), and BNB_AMOUNT / XMZ_AMOUNT in whole coins (e.g. 0.01 and 5); BNB_AMOUNT above
+//! MAINNET_MAX_BNB is refused. The claimer waits for XMZ_AMOUNT plus a fee margin in its wallet.
 
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -37,13 +43,52 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-const VALUE_WEI: u64 = 20_000_000_000_000_000; // 0.02 tBNB
-const XMZ_AMOUNT: u64 = 2_000_000_000_000; // 20 tXMZ (11 decimals)
-const FUNDING: u64 = 3_000_000_000_000; // what the claimer waits for
+const VALUE_WEI: u64 = 20_000_000_000_000_000; // testnet: 0.02 tBNB
+const XMZ_AMOUNT: u64 = 2_000_000_000_000; // testnet: 20 tXMZ (11 decimals)
+const MAINNET_MAX_BNB: f64 = 0.1; // the real-funds test stays small
 const TICK: Duration = Duration::from_secs(15);
 
 fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
+}
+
+/// Which chains a run uses: everything that differs between the testnet and mainnet runs.
+struct Net {
+    mainnet: bool,
+    chain: Chain,
+    xmz: XmzNetwork,
+    deployment: &'static str,
+    value_wei: u64,
+    xmz_amount: u64,
+}
+
+impl Net {
+    fn from_env() -> Net {
+        match env("NETWORK", "testnet").as_str() {
+            "testnet" => Net { mainnet: false, chain: Chain::BscTestnet, xmz: XmzNetwork::Testnet, deployment: "bsc-testnet.json", value_wei: VALUE_WEI, xmz_amount: XMZ_AMOUNT },
+            "mainnet" => {
+                let coins = |name: &str, decimals: i32| -> u64 {
+                    let v: f64 = std::env::var(name).unwrap_or_else(|_| panic!("NETWORK=mainnet needs {name}")).parse().expect("a number");
+                    assert!(v > 0.0, "{name} must be positive");
+                    (v * 10f64.powi(decimals)).round() as u64
+                };
+                let bnb: f64 = env("BNB_AMOUNT", "0").parse().unwrap_or(0.0);
+                assert!(bnb <= MAINNET_MAX_BNB, "BNB_AMOUNT {bnb} is above the {MAINNET_MAX_BNB} BNB limit of this test runner");
+                for name in ["ACCOUNTS_FILE", "XMZ_NODE"] {
+                    assert!(std::env::var(name).is_ok(), "NETWORK=mainnet needs {name}");
+                }
+                Net { mainnet: true, chain: Chain::BscMainnet, xmz: XmzNetwork::Mainnet, deployment: "bsc-mainnet.json", value_wei: coins("BNB_AMOUNT", 18), xmz_amount: coins("XMZ_AMOUNT", 11) }
+            }
+            other => panic!("NETWORK must be testnet or mainnet, not {other}"),
+        }
+    }
+    fn evm_rpc(&self) -> String {
+        env("EVM_RPC", if self.mainnet { "https://bsc-rpc.publicnode.com" } else { "https://bsc-testnet-rpc.publicnode.com" })
+    }
+    /// What the claimer waits for before agreeing: the amount plus half again (at least 1 XMZ) for fees
+    fn funding(&self) -> u64 {
+        self.xmz_amount + (self.xmz_amount / 2).max(100_000_000_000)
+    }
 }
 
 fn log(msg: impl std::fmt::Display) {
@@ -92,13 +137,14 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-async fn wallet_rpc(procs: &mut Procs, dir: &Path, name: &str) -> WalletRpc {
+async fn wallet_rpc(procs: &mut Procs, dir: &Path, name: &str, mainnet: bool) -> WalletRpc {
     let port = free_port();
     let wallets = dir.join(name);
     std::fs::create_dir_all(&wallets).unwrap();
     procs.0.push(
         Command::new(env("WALLET_RPC_BIN", "monzero-wallet-rpc"))
-            .args(["--testnet", "--wallet-dir", wallets.to_str().unwrap(), "--daemon-address", &env("XMZ_NODE", "127.0.0.1:16175")])
+            .args(if mainnet { &[][..] } else { &["--testnet"][..] })
+            .args(["--wallet-dir", wallets.to_str().unwrap(), "--daemon-address", &env("XMZ_NODE", "127.0.0.1:16175")])
             .args(["--trusted-daemon", "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", &port.to_string(), "--non-interactive"])
             .args(["--log-file", dir.join(format!("{name}.log")).to_str().unwrap()])
             .current_dir(dir)
@@ -230,7 +276,8 @@ async fn main() {
     let dir = PathBuf::from(args.get(3).expect("run dir"));
     std::fs::create_dir_all(&dir).unwrap();
     let who = if role == Role::Owner { "owner" } else { "claimer" };
-    let evm_rpc = env("EVM_RPC", "https://bsc-testnet-rpc.publicnode.com");
+    let net = Net::from_env();
+    let evm_rpc = net.evm_rpc();
 
     let home = std::env::var("HOME").unwrap();
     let accounts_file = env("ACCOUNTS_FILE", &format!("{home}/.config/monzero-dex/bsc-testnet-accounts.json"));
@@ -248,15 +295,19 @@ async fn main() {
     } else {
         SwapSeed::from_wallet_seed(&[&seed[..], format!("{who} wallet").as_bytes()].concat())
     };
-    let deployment: Value =
-        serde_json::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../deployments/bsc-testnet.json")).unwrap()).unwrap();
+    let deployment_file = format!("{}/../deployments/{}", env!("CARGO_MANIFEST_DIR"), net.deployment);
+    let deployment: Value = serde_json::from_str(
+        &std::fs::read_to_string(&deployment_file).unwrap_or_else(|_| panic!("{deployment_file} missing: deploy the contract first")),
+    )
+    .unwrap();
+    assert_eq!(deployment["chainId"].as_u64(), Some(net.chain.id()), "{deployment_file} is for another chain");
     let contract: Address = deployment["contract"].as_str().unwrap().parse().unwrap();
-    log(format!("{who} {}; account {}; contract {contract}", if new { "new" } else { "resume" }, key.address()));
-    AlloyChain::new(&evm_rpc, Chain::BscTestnet, contract, 0, key.clone()).unwrap().check_logs().await.expect("EVM endpoint serves logs");
+    log(format!("{who} {}; account {}; contract {contract}{}", if new { "new" } else { "resume" }, key.address(), if net.mainnet { " (MAINNET: real funds)" } else { "" }));
+    AlloyChain::new(&evm_rpc, net.chain, contract, 0, key.clone()).unwrap().check_logs().await.expect("EVM endpoint serves logs");
 
     let mut procs = Procs(vec![]);
-    let main_rpc = wallet_rpc(&mut procs, &dir, "main").await;
-    let swap_rpc = wallet_rpc(&mut procs, &dir, "swap").await;
+    let main_rpc = wallet_rpc(&mut procs, &dir, "main", net.mainnet).await;
+    let swap_rpc = wallet_rpc(&mut procs, &dir, "swap", net.mainnet).await;
     let journal_path = dir.join("journal.json");
 
     if new {
@@ -277,16 +328,16 @@ async fn main() {
             rand::thread_rng().fill_bytes(&mut trade_id);
             let offer = Offer {
                 trade_id: B256::from(trade_id),
-                chain_id: Chain::BscTestnet.id(),
+                chain_id: net.chain.id(),
                 contract,
                 owner: owner_address,
                 claimer: claimer_address,
                 asset: Address::ZERO,
-                value: U256::from(VALUE_WEI),
+                value: U256::from(net.value_wei),
                 duration1: 2 * 3600,
                 duration2: 2 * 3600,
-                xmz_amount: XMZ_AMOUNT,
-                xmz_network: XmzNetwork::Testnet,
+                xmz_amount: net.xmz_amount,
+                xmz_network: net.xmz,
                 expires_at: now + 2 * 3600,
             };
             // The offer as the order book would carry it (no secrets)
@@ -298,21 +349,25 @@ async fn main() {
             serve_keys(session, port, dir.clone(), now, Some((tx, now + 1800, from_block, xmz_height().await - 1)));
             let saved = rx.await.unwrap();
             log(format!("keys agreed over libp2p; shared XMZ address {}", saved.agreed(&swap_seed, &key).unwrap().shared.address()));
-            start_trade(saved, &swap_seed, &key, &evm_rpc, contract, &dir, main_rpc.clone(), swap_rpc.clone());
+            start_trade(saved, &swap_seed, &key, &evm_rpc, net.chain, contract, &dir, main_rpc.clone(), swap_rpc.clone());
             None
         } else {
             let offer: Offer = serde_json::from_str(&std::fs::read_to_string(args.get(4).expect("offer.json")).unwrap()).unwrap();
             assert_eq!((offer.claimer, offer.contract), (key.address(), contract), "offer is for us on our contract");
+            assert_eq!((offer.chain_id, offer.xmz_network), (net.chain.id(), net.xmz), "offer is for this network");
+            if net.mainnet {
+                assert!(offer.value <= U256::from((MAINNET_MAX_BNB * 1e18) as u64), "offer above the test runner's BNB limit");
+            }
             // Our XMZ must be spendable before we agree to lock it
             loop {
                 main_rpc.call("refresh", json!({})).await.unwrap();
                 let unlocked = main_rpc.call("get_balance", json!({})).await.unwrap()["unlocked_balance"].as_u64().unwrap();
-                if unlocked >= FUNDING {
+                if unlocked >= net.funding().max(offer.xmz_amount + offer.xmz_amount / 2) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(20)).await;
             }
-            log("our tXMZ is spendable");
+            log("our XMZ is spendable");
             // Our search for the owner's lock starts before our first key request and is kept
             // for retries: the owner may lock as soon as it has answered any of them
             let start = dir.join("start-block.txt");
@@ -326,7 +381,7 @@ async fn main() {
             Some(session.saved(Timing::BSC, now + 1800, from_block, xmz_height().await - 1).unwrap())
         };
         if let Some(saved) = session {
-            start_trade(saved, &swap_seed, &key, &evm_rpc, contract, &dir, main_rpc.clone(), swap_rpc.clone());
+            start_trade(saved, &swap_seed, &key, &evm_rpc, net.chain, contract, &dir, main_rpc.clone(), swap_rpc.clone());
         }
     } else {
         main_rpc.call("open_wallet", json!({"filename": who, "password": ""})).await.unwrap();
@@ -353,7 +408,7 @@ async fn main() {
     }
     let saved: SavedTrade = FileJournal(journal_path.clone()).load().unwrap().trade.expect("saved trade");
     let agreed = saved.agreed(&swap_seed, &key).unwrap();
-    let chain = AlloyChain::new(&evm_rpc, Chain::BscTestnet, contract, saved.evm_from_block, key.clone()).unwrap();
+    let chain = AlloyChain::new(&evm_rpc, net.chain, contract, saved.evm_from_block, key.clone()).unwrap();
     let xmz = WalletRpcXmz::new(config(&saved, &agreed.shared, &dir, &swap_seed), main_rpc, swap_rpc);
     let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, FileJournal(journal_path.clone())).unwrap();
     driver.approve(saved.transcript).unwrap();
@@ -393,9 +448,9 @@ async fn main() {
 
 /// Save the agreed trade in the journal before anything is locked.
 #[allow(clippy::too_many_arguments)]
-fn start_trade(saved: SavedTrade, seed: &SwapSeed, key: &PrivateKeySigner, evm_rpc: &str, contract: Address, dir: &Path, main: WalletRpc, swap: WalletRpc) {
+fn start_trade(saved: SavedTrade, seed: &SwapSeed, key: &PrivateKeySigner, evm_rpc: &str, chain: Chain, contract: Address, dir: &Path, main: WalletRpc, swap: WalletRpc) {
     let agreed = saved.agreed(seed, key).unwrap();
-    let chain = AlloyChain::new(evm_rpc, Chain::BscTestnet, contract, saved.evm_from_block, key.clone()).unwrap();
+    let chain = AlloyChain::new(evm_rpc, chain, contract, saved.evm_from_block, key.clone()).unwrap();
     let xmz = WalletRpcXmz::new(config(&saved, &agreed.shared, dir, seed), main, swap);
     Driver::start(saved, seed, key, chain, xmz, FileJournal(dir.join("journal.json"))).unwrap();
 }
