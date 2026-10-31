@@ -96,7 +96,7 @@ Rectangle {
                 onClicked: card.refresh()
             }
         }
-        MonzeroComponents.TextPlain {
+        MonzeroComponents.TextPlain { themeTransition: false;
             objectName: "tradeSummary"
             Layout.fillWidth: true; wrapMode: Text.Wrap
             color: MonzeroComponents.Style.dimmedFontColor
@@ -126,7 +126,7 @@ Rectangle {
                              : parent.current ? (card.progress.refund ? MonzeroComponents.Style.warningColor : MonzeroComponents.Style.accentMuted)
                              : MonzeroComponents.Style.moneroGrey
                     }
-                    MonzeroComponents.TextPlain {
+                    MonzeroComponents.TextPlain { themeTransition: false;
                         Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 12
                         text: (parent.done ? "✓ " : "") + modelData
                         color: parent.done || parent.current ? MonzeroComponents.Style.defaultFontColor : MonzeroComponents.Style.dimmedFontColor
@@ -135,14 +135,14 @@ Rectangle {
             }
         }
 
-        MonzeroComponents.TextPlain {
+        MonzeroComponents.TextPlain { themeTransition: false;
             objectName: "tradeNow"
             Layout.fillWidth: true; wrapMode: Text.Wrap
             font.pixelSize: 16
             color: card.progress.refund ? MonzeroComponents.Style.warningColor : MonzeroComponents.Style.defaultFontColor
             text: card.progress.now
         }
-        MonzeroComponents.TextPlain {
+        MonzeroComponents.TextPlain { themeTransition: false;
             objectName: "tradeRefundTime"
             Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 13
             color: MonzeroComponents.Style.dimmedFontColor
@@ -167,7 +167,7 @@ Rectangle {
                 id: approvalColumn
                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12
                 spacing: 10
-                MonzeroComponents.TextPlain {
+                MonzeroComponents.TextPlain { themeTransition: false; color: MonzeroComponents.Style.defaultFontColor;
                     Layout.fillWidth: true; wrapMode: Text.Wrap
                     text: qsTr("Approve this trade: %1 goes into the swap and you get %2, or your %1 back after the refund time. After you approve, the app does the remaining steps by itself.")
                         .arg(card.buyer ? card.coinAmount : card.xmzAmount).arg(card.buyer ? card.xmzAmount : card.coinAmount)
@@ -188,7 +188,7 @@ Rectangle {
             }
         }
 
-        MonzeroComponents.TextPlain {
+        MonzeroComponents.TextPlain { themeTransition: false;
             visible: card.errorText !== ""
             Layout.fillWidth: true; wrapMode: Text.Wrap
             color: MonzeroComponents.Style.errorColor

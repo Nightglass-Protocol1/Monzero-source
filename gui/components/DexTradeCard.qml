@@ -109,7 +109,7 @@ Rectangle {
         }
 
         // Coin
-        MonzeroComponents.TextPlain {
+        MonzeroComponents.TextPlain { themeTransition: false;
             text: card.direction === "sell" ? qsTr("Receive") : qsTr("Pay with")
             color: MonzeroComponents.Style.dimmedFontColor; font.pixelSize: 13
         }
@@ -157,7 +157,7 @@ Rectangle {
                 onClicked: amountInput.text = card.trim(card.xmzBalance, 11)
             }
         }
-        MonzeroComponents.TextPlain {
+        MonzeroComponents.TextPlain { themeTransition: false;
             visible: card.direction === "sell" && card.xmzBalance >= 0
             text: card.xmzBalance >= 0 && Number(amountInput.text) > card.xmzBalance
                 ? qsTr("More than your available %1.").arg(card.show(card.xmzBalance, "XMZ"))
@@ -178,7 +178,7 @@ Rectangle {
                 id: quoteColumn
                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12
                 spacing: 6
-                MonzeroComponents.TextPlain {
+                MonzeroComponents.TextPlain { themeTransition: false;
                     objectName: "quoteProblem"
                     visible: !card.quote.ok
                     Layout.fillWidth: true; wrapMode: Text.Wrap
@@ -194,16 +194,16 @@ Rectangle {
                     ] : []
                     delegate: RowLayout {
                         Layout.fillWidth: true
-                        MonzeroComponents.TextPlain { text: modelData.k; color: MonzeroComponents.Style.dimmedFontColor; font.pixelSize: 14 }
+                        MonzeroComponents.TextPlain { themeTransition: false; text: modelData.k; color: MonzeroComponents.Style.dimmedFontColor; font.pixelSize: 14 }
                         Item { Layout.fillWidth: true }
-                        MonzeroComponents.TextPlain {
+                        MonzeroComponents.TextPlain { themeTransition: false; color: MonzeroComponents.Style.defaultFontColor;
                             objectName: "quote_" + index
                             text: modelData.v; font.pixelSize: modelData.strong ? 18 : 14
                             font.family: modelData.strong ? MonzeroComponents.Style.fontBold.name : MonzeroComponents.Style.fontRegular.name
                         }
                     }
                 }
-                MonzeroComponents.TextPlain {
+                MonzeroComponents.TextPlain { themeTransition: false;
                     visible: card.quote.ok === true
                     Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 12
                     color: MonzeroComponents.Style.dimmedFontColor
@@ -225,7 +225,7 @@ Rectangle {
             visible: card.reviewing && card.quote.ok === true
             Layout.fillWidth: true
             spacing: 8
-            MonzeroComponents.TextPlain {
+            MonzeroComponents.TextPlain { themeTransition: false; color: MonzeroComponents.Style.defaultFontColor;
                 Layout.fillWidth: true; wrapMode: Text.Wrap
                 text: qsTr("How this trade stays safe:") + "\n"
                     + qsTr("• It is an atomic swap: either both sides get paid or both get their coins back.") + "\n"
@@ -247,7 +247,7 @@ Rectangle {
                     onClicked: card.reviewing = false
                 }
             }
-            MonzeroComponents.TextPlain {
+            MonzeroComponents.TextPlain { themeTransition: false;
                 objectName: "startBlocked"
                 visible: !card.canStart && card.startBlockedReason !== ""
                 Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 13

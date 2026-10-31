@@ -423,6 +423,21 @@ Rectangle {
             onApprove: root.evmTradeError = root.dex.approveEvmTrade(commitment) ? "" : qsTr("Approval could not start.")
             onRefresh: root.evmTradeError = root.dex.refreshEvmTrade() ? "" : qsTr("Refresh could not start.")
         }
+        M.DexMarketPanel {
+            id: marketPanel
+            objectName: "marketPanel"
+            Layout.fillWidth: true
+            coin: tradeCard.coin
+            coinDecimals: tradeCard.coinDecimals[tradeCard.coin] || 8
+            offers: tradeCard.offers
+            trades: root.marketSnapshot.valid === true ? (root.marketSnapshot.trades || []) : []
+            // A SELL offer sells the coin for XMZ: taking it means selling XMZ; a BUY offer, buying XMZ
+            onOfferPicked: {
+                tradeCard.direction = String(offer.side).toUpperCase() === "SELL" ? "sell" : "buy"
+                var xmz = Number(offer.priceAtomic) / 1e11 * Number(offer.amountAtomic) / Math.pow(10, coinDecimals)
+                tradeCard.amountText = tradeCard.trim(Math.floor(xmz * 1e6) / 1e6, 6)   // down: never more than the offer covers
+            }
+        }
         M.DexTradeCard {
             id: tradeCard
             objectName: "tradeCard"
