@@ -4,13 +4,16 @@
 // Rehearsal on a local node first (key: any funded local account):
 //   npx hardhat node &  npx hardhat run --network localhost scripts/deploy-mainnet.js
 //
-// The key is read from a hidden prompt on the terminal: never from a file, the environment or
-// the command line, and never printed or saved. XmzSwap has no owner, admin or upgrade path, so
+// The key is read from a hidden prompt on the terminal: never from the environment or the command
+// line, and never printed or saved. Or, with DEPLOYER=test-phrase, the real-funds test's buyer
+// account (account 0 of the private test phrase file made by new-test-phrase.js) pays instead,
+// so no key has to be exported from a wallet. XmzSwap has no owner, admin or upgrade path, so
 // the deploying account gets no control over the contract or over anyone's swap.
 const { ethers, artifacts, network } = require("hardhat");
 const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
+const os = require("os");
 
 const CHAINS = { 56n: "bsc-mainnet", 31337n: "local-rehearsal" };
 
@@ -30,10 +33,19 @@ async function main() {
   if (name !== "local-rehearsal" && fs.existsSync(out)) throw new Error(`${out} exists: already deployed`);
 
   console.log(`Network: ${network.name} (chain ${chainId})${chainId === 56n ? "  ** REAL BNB **" : ""}`);
-  let hex = await ask("Deployer private key (hidden; 64 hex, 0x optional): ", true);
-  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(hex)) throw new Error("that is not a 32-byte hex private key");
-  const deployer = new ethers.Wallet(hex.startsWith("0x") ? hex : "0x" + hex, ethers.provider);
-  hex = null;
+  let deployer;
+  if (process.env.DEPLOYER === "test-phrase") {
+    const file = process.env.ACCOUNTS_FILE || path.join(os.homedir(), ".config", "monzero-dex", "bsc-mainnet-accounts.json");
+    if ((fs.statSync(file).mode & 0o077) !== 0) throw new Error(`${file} must be private (chmod 600)`);
+    const { mnemonic } = JSON.parse(fs.readFileSync(file, "utf8"));
+    deployer = ethers.HDNodeWallet.fromPhrase(mnemonic, undefined, "m/44'/60'/0'/0/0").connect(ethers.provider);
+    console.log("Paying with the test phrase's buyer account (account 0)");
+  } else {
+    let hex = await ask("Deployer private key (hidden; 64 hex, 0x optional): ", true);
+    if (!/^(0x)?[0-9a-fA-F]{64}$/.test(hex)) throw new Error("that is not a 32-byte hex private key");
+    deployer = new ethers.Wallet(hex.startsWith("0x") ? hex : "0x" + hex, ethers.provider);
+    hex = null;
+  }
 
   const balance = await ethers.provider.getBalance(deployer.address);
   const factory = await ethers.getContractFactory("XmzSwap", deployer);

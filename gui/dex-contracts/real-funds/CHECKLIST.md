@@ -36,12 +36,15 @@ seller addresses. Back the file up while it holds funds.
 
 ## 2. Deploy the swap contract (once)
 
-From MetaMask, export the private key of the account that pays for the deployment
-(Account details → Show private key). The deployment costs about **0.002 BNB**.
+The deployment costs about **0.0012 BNB**. Easiest: let the test's buyer account pay, so no key
+has to be exported from a wallet. Send the buyer address (step 1) the deployment cost on top of
+its trade funds (step 3), then:
 ```
-npx hardhat run --network bscMainnet scripts/deploy-mainnet.js
+DEPLOYER=test-phrase npx hardhat run --network bscMainnet scripts/deploy-mainnet.js
 ```
-Paste the key at the hidden prompt, check the network (chain 56), balance and estimate, then type
+Or pay from any MetaMask account: without `DEPLOYER=test-phrase` the script asks for that
+account's private key (MetaMask: account ⋮ → Account details → Private key) at a hidden prompt.
+Then check the network (chain 56), balance and estimate, then type
 `DEPLOY`. The script waits 15 confirmations, checks the code on chain is exactly the compiled
 contract and saves `deployments/bsc-mainnet.json`; it should print `Same code as testnet: yes`.
 The contract has no owner or admin: the deploying account gets no control over it.
