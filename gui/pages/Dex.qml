@@ -405,9 +405,11 @@ Rectangle {
             M.Label { fontSize: 25; text: qsTr("Trade") + translationManager.emptyString }
             Item { Layout.fillWidth: true }
             Rectangle {
-                Layout.preferredWidth: 160; Layout.preferredHeight: 32; radius: 16
-                color: "#40202a"; border.width: 1; border.color: "#b84b6b"
-                M.TextPlain { anchors.centerIn: parent; color: "#ffb4c8"; font.bold: true; font.pixelSize: 12; text: (root.hasMarketData ? qsTr("VERIFIED OFFERS") : qsTr("NO OFFERS LOADED")) + translationManager.emptyString }
+                Layout.preferredWidth: offersBadge.implicitWidth + 28; Layout.preferredHeight: 30; radius: 15
+                color: "transparent"; border.width: 1; border.color: root.hasMarketData ? M.Style.accent : M.Style.accentMuted
+                M.TextPlain { id: offersBadge; themeTransition: false; anchors.centerIn: parent; font.pixelSize: 12
+                    color: root.hasMarketData ? M.Style.accent : M.Style.dimmedFontColor
+                    text: (root.hasMarketData ? qsTr("Verified offers") : qsTr("No offers yet")) + translationManager.emptyString }
             }
         }
 
@@ -423,29 +425,51 @@ Rectangle {
             onApprove: root.evmTradeError = root.dex.approveEvmTrade(commitment) ? "" : qsTr("Approval could not start.")
             onRefresh: root.evmTradeError = root.dex.refreshEvmTrade() ? "" : qsTr("Refresh could not start.")
         }
-        M.DexMarketPanel {
-            id: marketPanel
-            objectName: "marketPanel"
+        // Pair tabs, as on an exchange: each shows its last price and 24 h change from completed trades
+        M.DexPairTabs {
+            objectName: "pairTabs"
             Layout.fillWidth: true
+            coins: tradeCard.coins
             coin: tradeCard.coin
-            coinDecimals: tradeCard.coinDecimals[tradeCard.coin] || 8
-            offers: tradeCard.offers
-            trades: root.marketSnapshot.valid === true ? (root.marketSnapshot.trades || []) : []
-            // A SELL offer sells the coin for XMZ: taking it means selling XMZ; a BUY offer, buying XMZ
-            onOfferPicked: {
-                tradeCard.direction = String(offer.side).toUpperCase() === "SELL" ? "sell" : "buy"
-                var xmz = Number(offer.priceAtomic) / 1e11 * Number(offer.amountAtomic) / Math.pow(10, coinDecimals)
-                tradeCard.amountText = tradeCard.trim(Math.floor(xmz * 1e6) / 1e6, 6)   // down: never more than the offer covers
-            }
+            market: marketPanel
+            coinDecimals: tradeCard.coinDecimals
+            onPicked: { tradeCard.coin = coin; tradeCard.reviewing = false }
         }
-        M.DexTradeCard {
-            id: tradeCard
-            objectName: "tradeCard"
+
+        // Wide windows: market on the left, the trade form beside it; narrow: one column
+        GridLayout {
+            id: tradeArea
             Layout.fillWidth: true
-            offers: root.marketSnapshot.valid === true ? (root.marketSnapshot.offers || []) : []
-            xmzBalance: appWindow.currentWallet ? Number(walletManager.displayAmount(appWindow.currentWallet.unlockedBalanceAll())) : -1
-            canStart: false
-            startBlockedReason: qsTr("Testnet preview: taking an offer from the app comes next. Testnet trades are started with the trade kit for now.")
+            columns: root.width > 1100 ? 2 : 1
+            columnSpacing: 12; rowSpacing: 12
+            M.DexMarketPanel {
+                id: marketPanel
+                objectName: "marketPanel"
+                Layout.fillWidth: true
+                Layout.alignment: Qt.AlignTop
+                coin: tradeCard.coin
+                coinDecimals: tradeCard.coinDecimals[tradeCard.coin] || 8
+                offers: tradeCard.offers
+                trades: root.marketSnapshot.valid === true ? (root.marketSnapshot.trades || []) : []
+                // A SELL offer sells the coin for XMZ: taking it means selling XMZ; a BUY offer, buying XMZ
+                onOfferPicked: {
+                    tradeCard.direction = String(offer.side).toUpperCase() === "SELL" ? "sell" : "buy"
+                    var xmz = Number(offer.priceAtomic) / 1e11 * Number(offer.amountAtomic) / Math.pow(10, coinDecimals)
+                    tradeCard.amountText = tradeCard.trim(Math.floor(xmz * 1e6) / 1e6, 6)   // down: never more than the offer covers
+                }
+            }
+            M.DexTradeCard {
+                id: tradeCard
+                objectName: "tradeCard"
+                Layout.fillWidth: tradeArea.columns === 1
+                Layout.preferredWidth: tradeArea.columns === 1 ? -1 : 380
+                showCoinPicker: false
+                Layout.alignment: Qt.AlignTop
+                offers: root.marketSnapshot.valid === true ? (root.marketSnapshot.offers || []) : []
+                xmzBalance: appWindow.currentWallet ? Number(walletManager.displayAmount(appWindow.currentWallet.unlockedBalanceAll())) : -1
+                canStart: false
+                startBlockedReason: qsTr("Testnet preview: taking an offer from the app comes next. Testnet trades are started with the trade kit for now.")
+            }
         }
 
         // ---- Everything else: wallets, recovery and the testnet lab, closed by default

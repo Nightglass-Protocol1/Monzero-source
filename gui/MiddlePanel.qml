@@ -65,7 +65,8 @@ Rectangle {
     property Assets assetsView: Assets { }
     // The DEX page exists only when the private DEX prototype is enabled; release builds have no
     // dexEngine and never create it (main.qml refuses to switch to the Dex state without it).
-    Component { id: dexComponent; Dex { } }
+    // Created hidden: like the other pages it only appears once the stack view shows it.
+    Component { id: dexComponent; Dex { visible: false } }
     property Item dexView: dexPrototypeEnabled ? dexComponent.createObject(root) : null
 
     signal paymentClicked(var recipients, string paymentId, int mixinCount, int priority, string description)

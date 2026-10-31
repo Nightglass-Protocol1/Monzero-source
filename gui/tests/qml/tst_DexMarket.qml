@@ -3,7 +3,7 @@ import QtTest 1.2
 import "../../components" as M
 Item {
     id: root
-    width: 980; height: 2000
+    width: 1400; height: 1100
     property var appWindow: app
     property var translationManager: translations
     QtObject { id: app; property bool themeTransition: false }
@@ -23,27 +23,45 @@ Item {
         offer("BUY", 74700000, 0.0018), offer("BUY", 73500000, 0.0025), offer("BUY", 72000000, 0.0010),
         { pair: "LTC/XMZ", side: "SELL", priceAtomic: "90000000000000", amountAtomic: "100000000" }
     ]
-    // SAMPLE completed trades (a deterministic wander), one every 2 hours
-    property var sampleTrades: {
-        var out = [], p = 75000000, t = 1900000000
-        for (var i = 0; i < 48; ++i) {
-            p += Math.sin(i * 0.7) * 500000 + Math.cos(i * 0.31) * 380000 + 60000
-            out.push({ time: t + i * 7200, priceAtomic: String(Math.round(p * 1e11)) })
+    readonly property real sampleNow: 1900000000 + 5 * 86400
+    // SAMPLE completed trades: a deterministic wander every 20 minutes over 5 days per pair, with
+    // levels near $0.001 per XMZ (BTC ~$77k, LTC ~$90, BCH ~$480, BNB ~$700).
+    // The wander ends at `level` (the pair's order-book mid) and `phase` makes each pair move differently.
+    function sampleTradesFor(pair, level, coinDecimals, size, phase) {
+        var prices = [], p = 1
+        for (var i = 0; i < 360; ++i) {
+            var k = i + phase
+            p *= 1 + Math.sin(k * 0.37) * 0.004 + Math.cos(k * 0.113) * 0.003 + Math.sin(k * 1.9) * 0.002 + Math.sin(k * 0.021) * 0.0015
+            prices.push(p)
+        }
+        var out = [], t0 = 1900000000, scale = level / prices[prices.length - 1]
+        for (var j = 0; j < prices.length; ++j) {
+            var amount = size * (0.4 + (Math.sin((j + phase) * 2.3) + 1) * 0.8) * (1 + Math.abs(Math.sin(j * 0.05)))
+            out.push({ pair: pair, time: t0 + j * 1200, priceAtomic: String(Math.round(prices[j] * scale * 1e11)),
+                       amountAtomic: String(Math.round(amount * Math.pow(10, coinDecimals))) })
         }
         return out
     }
+    property var sampleTrades: sampleTradesFor("BTC/XMZ", 77000000, 8, 0.0006, 0)
+        .concat(sampleTradesFor("LTC/XMZ", 90000, 8, 0.4, 40))
+        .concat(sampleTradesFor("BCH/XMZ", 480000, 8, 0.08, 95))
+        .concat(sampleTradesFor("BNB/XMZ", 700000, 18, 0.05, 160))
 
-    // The trade area as the page lays it out, on the app's background
+    // The trade area as the page lays it out on a wide window, on the app's background
     Rectangle {
         id: shot
-        width: 700; height: area.implicitHeight + 40
+        width: 1300; height: area.implicitHeight + 40
         color: "#0B1D21"
         Column {
             id: area
-            x: 20; y: 20; width: 660; spacing: 12
+            x: 20; y: 20; width: 1260; spacing: 12
             M.DexTradeProgress { id: progress; width: parent.width; visible: false; coin: "BNB" }
-            M.DexMarketPanel { id: market; width: parent.width; coin: card.coin; offers: root.sampleOffers }
-            M.DexTradeCard { id: card; width: parent.width; offers: root.sampleOffers; xmzBalance: 250000 }
+            M.DexPairTabs { id: tabs; width: parent.width; coins: card.coins; coin: card.coin; market: market; coinDecimals: card.coinDecimals; onPicked: card.coin = coin }
+            Row {
+                spacing: 12
+                M.DexMarketPanel { id: market; width: 868; height: implicitHeight; coin: card.coin; coinDecimals: card.coinDecimals[card.coin]; offers: root.sampleOffers; now: root.sampleNow }
+                M.DexTradeCard { id: card; width: 380; height: implicitHeight; offers: root.sampleOffers; xmzBalance: 250000; showCoinPicker: false }
+            }
         }
     }
 
@@ -56,7 +74,7 @@ Item {
             tryVerify(function () { return done }, 5000)
         }
         function init() {
-            market.chartMode = "depth"; market.trades = []; card.direction = "sell"; card.coin = "BTC"
+            market.chartMode = "candles"; market.candleSeconds = 3600; market.trades = []; card.direction = "buy"; card.coin = "BTC"
             card.amountText = ""; card.reviewing = false; progress.visible = false
         }
 
@@ -67,15 +85,42 @@ Item {
             fuzzyCompare(b.asks[5].total, 0.0067, 1e-9)
             fuzzyCompare(b.bids[0].xmz, 76600000 * 0.0005, 1e-6)
             compare(child(market, "bestAsk").text, "77,400,000")
-            verify(child(market, "spread").text.indexOf("%") > 0)
-            verify(!child(market, "chartEmpty").visible)
+            verify(child(market, "midPrice").text.indexOf("%") > 0)
+        }
+        function test_candlesFromTrades() {
+            var t0 = 1900000000 - 1900000000 % 3600
+            var trades = [
+                { pair: "BTC/XMZ", time: t0 + 10, priceAtomic: "10000000000000", amountAtomic: "100000" },
+                { pair: "BTC/XMZ", time: t0 + 20, priceAtomic: "12000000000000", amountAtomic: "200000" },
+                { pair: "BTC/XMZ", time: t0 + 30, priceAtomic: "9000000000000", amountAtomic: "100000" },
+                { pair: "BTC/XMZ", time: t0 + 40, priceAtomic: "11000000000000", amountAtomic: "100000" },
+                { pair: "BTC/XMZ", time: t0 + 7300, priceAtomic: "11500000000000" },           // gap hour left out
+                { pair: "LTC/XMZ", time: t0 + 50, priceAtomic: "1" }
+            ]
+            var c = market.buildCandles(market.tradesFor(trades, "BTC"), 3600, 8)
+            compare(c.length, 2)
+            compare([c[0].o, c[0].h, c[0].l, c[0].c], [100, 120, 90, 110])
+            fuzzyCompare(c[0].v, 0.005, 1e-12)
+            compare(c[1].t, t0 + 7200); compare(c[1].v, 0)
+            var s = market.dayStats(market.tradesFor(trades, "BTC"), t0 + 7300, 8)
+            compare(s.last, 115); compare(s.high, 120); compare(s.low, 90)
+            fuzzyCompare(s.change, 15, 1e-9)
         }
         function test_emptyStatesAreHonest() {
-            market.chartMode = "price"
-            verify(child(market, "chartEmpty").visible)                     // no trades: no line
+            verify(child(market, "chartEmpty").visible)                     // no trades: no candles
+            compare(child(market, "lastPrice").text, "—"); compare(child(market, "change24h").text, "—")
             card.coin = "BCH"; market.chartMode = "depth"
             verify(child(market, "chartEmpty").visible)
             compare(child(market, "bestAsk").text, "—")
+        }
+        function test_pairTabsChooseTheMarket() {
+            mouseClick(child(tabs, "pairTab_LTC"))
+            compare(card.coin, "LTC"); compare(market.coin, "LTC")
+            compare(market.book.asks.length, 1)
+        }
+        function test_buySellTabs() {
+            mouseClick(child(card, "direction_sell")); compare(card.direction, "sell")
+            mouseClick(child(card, "direction_buy")); compare(card.direction, "buy")
         }
         function test_pickingAnOfferFillsTheCard() {
             var picked = null
@@ -86,25 +131,21 @@ Item {
             verify(picked !== null); compare(picked.side, "SELL")
         }
 
-        // Screenshots of the trade area with the SAMPLE book (file names say so)
+        // Screenshots of the trade area with SAMPLE offers and trades (file names say so)
         function test_zz_screenshots() {
-            card.amountText = "50000"; wait(200)
-            save(shot, "sample-1-depth-chart-order-book-and-sell-quote.png")
-            market.chartMode = "price"; market.trades = root.sampleTrades; wait(200)
-            save(shot, "sample-2-price-chart.png")
+            market.trades = root.sampleTrades; card.direction = "buy"; card.amountText = "40000"; wait(250)
+            save(shot, "sample-1-exchange-candles-1h-buy.png")
+            market.candleSeconds = 14400; card.direction = "sell"; card.amountText = "50000"; wait(250)
+            save(shot, "sample-2-exchange-candles-4h-sell.png")
             market.chartMode = "depth"; card.direction = "buy"; card.amountText = "40000"; wait(100)
-            child(card, "reviewButton").clicked(); card.startBlockedReason = "Testnet preview: taking an offer from the app comes next."; wait(200)
-            save(shot, "sample-3-buy-review.png")
-            card.reviewing = false; card.amountText = ""
+            mouseClick(child(card, "reviewButton")); card.startBlockedReason = "Testnet preview: taking an offer from the app comes next."; wait(250)
+            save(shot, "sample-3-exchange-depth-buy-review.png")
+            card.reviewing = false; card.amountText = ""; market.chartMode = "candles"; market.candleSeconds = 3600
             progress.trade = { configured: true, state: "ok", canApprove: true, commitment: "0xabc",
                 snapshot: { role: "owner", stage: "Start", offer: { value: "10000000000000000", xmzAmount: "700000000000000" },
                             deadlines: { timeout1: "1900000000", timeout2: "1900003600" } } }
-            progress.visible = true; wait(200)
-            save(shot, "sample-4-active-trade-approval.png")
-            progress.trade = { configured: true, state: "ok", snapshot: { role: "claimer", stage: "XmzLocked",
-                offer: { value: "10000000000000000", xmzAmount: "700000000000000" }, deadlines: { timeout1: "1900000000", timeout2: "1900003600" } } }
-            wait(200)
-            save(shot, "sample-5-active-trade-in-progress.png")
+            progress.visible = true; wait(250)
+            save(shot, "sample-4-exchange-active-trade-approval.png")
         }
     }
 }

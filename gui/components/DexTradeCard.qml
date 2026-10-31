@@ -25,6 +25,8 @@ Rectangle {
     property string coin: coins.length ? coins[0] : ""
     property alias amountText: amountInput.text
     property bool reviewing: false
+    // On the exchange screen the pair tabs choose the coin; the card then hides its own picker
+    property bool showCoinPicker: true
     readonly property var quote: quoteFor(direction, coin, Number(amountInput.text), offers, coinDecimals[coin], feePercent)
 
     signal startRequested(var quote)
@@ -90,25 +92,23 @@ Rectangle {
         anchors.margins: 20
         spacing: 14
 
-        MonzeroComponents.Label {
-            fontSize: 20
-            text: card.direction === "sell" ? qsTr("Sell XMZ") : qsTr("Buy XMZ")
-        }
-
-        // Direction
+        // Direction: Buy / Sell tabs, green and red as on an exchange
         RowLayout {
-            spacing: 8
+            Layout.fillWidth: true
+            spacing: 0
             Repeater {
-                model: [ { k: "sell", t: qsTr("Sell XMZ") }, { k: "buy", t: qsTr("Buy XMZ") } ]
+                model: [ { k: "buy", t: qsTr("Buy XMZ"), c: MonzeroComponents.Style.green }, { k: "sell", t: qsTr("Sell XMZ"), c: "#E5677A" } ]
                 delegate: Rectangle {
                     objectName: "direction_" + modelData.k
                     property bool active: card.direction === modelData.k
-                    implicitWidth: dirLabel.implicitWidth + 32; implicitHeight: 36; radius: 18
-                    color: active ? MonzeroComponents.Style.accent : "transparent"
-                    border.color: MonzeroComponents.Style.accentMuted
+                    Layout.fillWidth: true; Layout.preferredWidth: 1
+                    implicitHeight: 40
+                    radius: 6
+                    color: active ? modelData.c : "transparent"
+                    border.color: active ? modelData.c : MonzeroComponents.Style.accentMuted
                     Text {
                         id: dirLabel; anchors.centerIn: parent; text: modelData.t
-                        font.family: MonzeroComponents.Style.fontMedium.name; font.pixelSize: 14
+                        font.family: MonzeroComponents.Style.fontBold.name; font.pixelSize: 15
                         color: parent.active ? "#062224" : MonzeroComponents.Style.defaultFontColor
                     }
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { card.direction = modelData.k; card.reviewing = false } }
@@ -118,10 +118,12 @@ Rectangle {
 
         // Coin
         MonzeroComponents.TextPlain { themeTransition: false;
+            visible: card.showCoinPicker
             text: card.direction === "sell" ? qsTr("Receive") : qsTr("Pay with")
             color: MonzeroComponents.Style.dimmedFontColor; font.pixelSize: 13
         }
         Flow {
+            visible: card.showCoinPicker
             Layout.fillWidth: true
             spacing: 8
             Repeater {
