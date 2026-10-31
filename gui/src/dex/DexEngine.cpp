@@ -726,6 +726,12 @@ QVariantMap DexEngine::evmTradeStatus() const {
 }
 bool DexEngine::refreshEvmTrade() {return m_evmTrade->refresh();}
 bool DexEngine::approveEvmTrade(const QString &commitment) {return m_evmTrade->approve(commitment);}
+bool DexEngine::payoutEvmTrade(const QString &address) {
+    if (m_evmSeedFile.isEmpty() || m_evmTrade->status().value("busy").toBool()) return false;
+    QByteArray hex=LitecoinJournalProtocol::privateConfig(m_evmSeedFile,256).trimmed();
+    QByteArray seed=QByteArray::fromHex(hex);hex.fill('\0');
+    return m_evmTrade->payout(seed,address);
+}
 void DexEngine::stepEvmTrade() {
     const auto s=m_evmTrade->status();
     if (s.value("snapshot").toMap().value("done").toBool()) {m_evmTicker->stop();emit evmTradeChanged();return;}

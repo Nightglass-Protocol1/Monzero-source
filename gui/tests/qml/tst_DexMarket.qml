@@ -60,7 +60,11 @@ Item {
             Row {
                 spacing: 12
                 M.DexMarketPanel { id: market; width: 868; height: implicitHeight; coin: card.coin; coinDecimals: card.coinDecimals[card.coin]; offers: root.sampleOffers; now: root.sampleNow }
-                M.DexTradeCard { id: card; width: 380; height: implicitHeight; offers: root.sampleOffers; xmzBalance: 250000; showCoinPicker: false }
+                Column {
+                    spacing: 12
+                    M.DexTradeCard { id: card; width: 380; height: implicitHeight; offers: root.sampleOffers; xmzBalance: 250000; showCoinPicker: false }
+                    M.DexExternalWallet { id: mm; width: 380; height: implicitHeight }
+                }
             }
         }
     }
@@ -146,6 +150,16 @@ Item {
                             deadlines: { timeout1: "1900000000", timeout2: "1900003600" } } }
             progress.visible = true; wait(250)
             save(shot, "sample-4-exchange-active-trade-approval.png")
+            // MetaMask connected; the trade's own account waits for its BNB (sample addresses)
+            mm.address = "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"
+            progress.externalWallet = mm.address
+            progress.trade = { configured: true, state: "ok", canApprove: false, commitment: "0xabc", account: "0x9C06a3d4f56fFF037C11f24b77B3C0F0eBCd8e0C",
+                awaitingFunding: { neededWei: "10050000000000000", haveWei: "0", missingWei: "10050000000000000" },
+                snapshot: { role: "owner", stage: "Start", offer: { chainId: 56, value: "10000000000000000", xmzAmount: "700000000000000" },
+                            deadlines: { timeout1: "1900000000", timeout2: "1900003600" } } }
+            wait(400)
+            save(shot, "sample-5-exchange-metamask-funding.png")
+            mm.address = ""; progress.externalWallet = ""
         }
     }
 }

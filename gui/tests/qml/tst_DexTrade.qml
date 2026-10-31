@@ -2,7 +2,7 @@ import QtQuick 2.9
 import QtTest 1.2
 import "../../components" as M
 Item {
-    width: 1000; height: 1400
+    width: 1000; height: 1800
     property var appWindow: app
     property var translationManager: translations
     QtObject { id: app; property bool themeTransition: false }
@@ -24,6 +24,7 @@ Item {
 
     M.DexTradeCard { id: card; width: 900; offers: book; xmzBalance: 1000 }
     M.DexTradeProgress { id: progress; width: 900; y: 900; coin: "BNB" }
+    M.DexExternalWallet { id: wallet; width: 380; y: 1500 }
 
     TestCase {
         name: "DexTrade"; when: windowShown
@@ -86,7 +87,7 @@ Item {
 
         function trade(role, stage, canApprove) {
             return { configured: true, state: "ok", canApprove: canApprove === true, commitment: "0xabc",
-                     snapshot: { role: role, stage: stage, offer: { value: "20000000000000000", xmzAmount: "2000000000000" },
+                     snapshot: { role: role, stage: stage, offer: { chainId: 97, value: "20000000000000000", xmzAmount: "2000000000000" },
                                  deadlines: { timeout1: "1900000000", timeout2: "1900003600" } } }
         }
         function test_buyerStepsAndApproval() {
@@ -114,6 +115,58 @@ Item {
             progress.trade = trade("owner", "Done(Refunded)")
             verify(progress.progress.refund); verify(!child(progress, "step_3").done)
             verify(!child(progress, "tradeRefundTime").visible)
+        }
+        function test_fundingRequestShowsAmountAccountAndQr() {
+            var t = trade("owner", "Start")
+            t.account = "0x9C06a3d4f56fFF037C11f24b77B3C0F0eBCd8e0C"
+            t.awaitingFunding = { neededWei: "10050000000000000", haveWei: "50000000000000", missingWei: "10000000000000000" }
+            progress.externalWallet = "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"
+            progress.trade = t
+            verify(child(progress, "fundingBox").visible)
+            compare(child(progress, "fundingAmount").text, "Fund this trade: send 0.01 BNB")
+            compare(child(progress, "fundingAccount").text, t.account)
+            verify(child(progress, "tradeNow").text.indexOf("Waiting for the BNB to arrive") >= 0)
+            compare(child(progress, "fundingQr").source.toString(),
+                    "image://qrcode/ethereum:0x9C06a3d4f56fFF037C11f24b77B3C0F0eBCd8e0C@97?value=10000000000000000")
+            var plain = trade("owner", "Start")
+            plain.account = t.account
+            progress.trade = plain
+            verify(!child(progress, "fundingBox").visible)
+            progress.externalWallet = ""
+        }
+        function test_payoutOnlyForFinishedTradesWithAConnectedWallet() {
+            var asked = 0
+            progress.payoutRequested.connect(function () { asked++ })
+            progress.trade = trade("claimer", "XmzLocked")
+            progress.externalWallet = "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"
+            verify(!child(progress, "payoutRow").visible)
+            var done = trade("claimer", "Done(Swapped)")
+            progress.trade = done
+            verify(child(progress, "payoutRow").visible)
+            child(progress, "payoutButton").clicked(); compare(asked, 1)
+            var paid = trade("claimer", "Done(Swapped)")
+            paid.payout = { to: progress.externalWallet, tx: "0x" + Array(65).join("a"), amountWei: "9990000000000000" }
+            progress.trade = paid
+            verify(child(progress, "payoutResult").text.indexOf("Sent 0.00999 BNB") === 0)
+            progress.externalWallet = ""
+            verify(!child(progress, "payoutRow").visible)
+        }
+        function test_externalWalletConnectsOnlyValidAddresses() {
+            var connected = ""
+            wallet.connectRequested.connect(function (a) { connected = a })
+            wallet.address = ""
+            child(wallet, "walletConnect").clicked()
+            verify(wallet.editing)
+            var input = child(wallet, "walletInput")
+            input.text = "0x1234"; verify(!child(wallet, "walletSave").enabled)
+            input.text = " 0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF "; verify(child(wallet, "walletSave").enabled)
+            child(wallet, "walletSave").clicked()
+            compare(connected, "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"); verify(!wallet.editing)
+            wallet.address = connected
+            compare(child(wallet, "walletAddress").text, "0x4b7c\u20268FAF")
+            var dropped = false
+            wallet.disconnectRequested.connect(function () { dropped = true })
+            child(wallet, "walletDisconnect").clicked(); verify(dropped)
         }
         function test_unknownStageIsShownNotHidden() {
             progress.trade = trade("owner", "SomethingNew")

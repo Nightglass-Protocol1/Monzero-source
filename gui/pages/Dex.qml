@@ -424,6 +424,8 @@ Rectangle {
             errorText: root.evmTradeError
             onApprove: root.evmTradeError = root.dex.approveEvmTrade(commitment) ? "" : qsTr("Approval could not start.")
             onRefresh: root.evmTradeError = root.dex.refreshEvmTrade() ? "" : qsTr("Refresh could not start.")
+            externalWallet: persistentSettings.dexExternalWallet
+            onPayoutRequested: root.evmTradeError = root.dex.payoutEvmTrade(persistentSettings.dexExternalWallet) ? "" : qsTr("The payout could not start.")
         }
         // Pair tabs, as on an exchange: each shows its last price and 24 h change from completed trades
         M.DexPairTabs {
@@ -458,17 +460,28 @@ Rectangle {
                     tradeCard.amountText = tradeCard.trim(Math.floor(xmz * 1e6) / 1e6, 6)   // down: never more than the offer covers
                 }
             }
-            M.DexTradeCard {
-                id: tradeCard
-                objectName: "tradeCard"
+            ColumnLayout {
                 Layout.fillWidth: tradeArea.columns === 1
                 Layout.preferredWidth: tradeArea.columns === 1 ? -1 : 380
-                showCoinPicker: false
                 Layout.alignment: Qt.AlignTop
-                offers: root.marketSnapshot.valid === true ? (root.marketSnapshot.offers || []) : []
-                xmzBalance: appWindow.currentWallet ? Number(walletManager.displayAmount(appWindow.currentWallet.unlockedBalanceAll())) : -1
-                canStart: false
-                startBlockedReason: qsTr("Testnet preview: taking an offer from the app comes next. Testnet trades are started with the trade kit for now.")
+                spacing: 12
+                M.DexTradeCard {
+                    id: tradeCard
+                    objectName: "tradeCard"
+                    Layout.fillWidth: true
+                    showCoinPicker: false
+                    offers: root.marketSnapshot.valid === true ? (root.marketSnapshot.offers || []) : []
+                    xmzBalance: appWindow.currentWallet ? Number(walletManager.displayAmount(appWindow.currentWallet.unlockedBalanceAll())) : -1
+                    canStart: false
+                    startBlockedReason: qsTr("Testnet preview: taking an offer from the app comes next. Testnet trades are started with the trade kit for now.")
+                }
+                M.DexExternalWallet {
+                    objectName: "externalWallet"
+                    Layout.fillWidth: true
+                    address: persistentSettings.dexExternalWallet
+                    onConnectRequested: persistentSettings.dexExternalWallet = address
+                    onDisconnectRequested: persistentSettings.dexExternalWallet = ""
+                }
             }
         }
 

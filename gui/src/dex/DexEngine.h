@@ -231,6 +231,8 @@ public:
     QVariantMap evmTradeStatus() const;
     Q_INVOKABLE bool refreshEvmTrade();
     Q_INVOKABLE bool approveEvmTrade(const QString &commitment);
+    // After the trade: pay what its account holds to the user's own wallet (e.g. MetaMask)
+    Q_INVOKABLE bool payoutEvmTrade(const QString &address);
     Q_INVOKABLE bool requestBchNativeObservation();
     bool configureBchPublicationRepair(const QString &path);
     QVariantMap bchPublicationRepairStatus() const;

@@ -20,8 +20,11 @@ Rectangle {
     readonly property var progress: stepFor(snapshot.role, snapshot.stage) || ({ step: 0, refund: false, now: "" })
     property bool confirmed: false
 
+    // The user's own wallet (MetaMask), optional: shown as the place to fund from and pay out to
+    property string externalWallet: ""
     signal approve(string commitment)
     signal refresh()
+    signal payoutRequested()
 
     color: MonzeroComponents.Style.surfaceRaised
     radius: 8
@@ -145,7 +148,7 @@ Rectangle {
             Layout.fillWidth: true; wrapMode: Text.Wrap
             font.pixelSize: 16
             color: card.progress.refund ? MonzeroComponents.Style.warningColor : MonzeroComponents.Style.defaultFontColor
-            text: card.progress.now
+            text: card.t.awaitingFunding && card.t.awaitingFunding.missingWei ? qsTr("Approved. Waiting for the %1 to arrive in this trade's account; then the app locks it.").arg(card.coin) : card.progress.now
         }
         MonzeroComponents.TextPlain { themeTransition: false;
             objectName: "tradeRefundTime"
@@ -189,6 +192,78 @@ Rectangle {
                     enabled: card.confirmed && card.t.busy !== true
                     text: qsTr("Approve trade")
                     onClicked: card.approve(card.t.commitment)
+                }
+            }
+        }
+
+        // Funding: the trade's own account needs more before it can lock (e.g. from MetaMask)
+        Rectangle {
+            id: fundingBox
+            objectName: "fundingBox"
+            readonly property var need: card.t.awaitingFunding || ({})
+            readonly property string missing: need.missingWei ? card.atomic(need.missingWei, card.coinDecimals) : ""
+            readonly property string account: card.t.account || ""
+            readonly property int chainId: card.snapshot.offer ? Number(card.snapshot.offer.chainId) : 0
+            Layout.fillWidth: true
+            visible: missing !== "" && account !== "" && chainId > 0   // never a payment request for an unknown network
+            color: "transparent"; radius: 6
+            border.color: MonzeroComponents.Style.warningColor
+            implicitHeight: fundingRow.implicitHeight + 24
+            RowLayout {
+                id: fundingRow
+                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12
+                spacing: 14
+                Image {
+                    objectName: "fundingQr"
+                    Layout.preferredWidth: 132; Layout.preferredHeight: 132
+                    smooth: false; fillMode: Image.PreserveAspectFit
+                    // EIP-681 payment request: MetaMask mobile fills in the address, network and amount
+                    source: fundingBox.visible ? "image://qrcode/ethereum:" + fundingBox.account + "@" + fundingBox.chainId + "?value=" + fundingBox.need.missingWei : ""
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    MonzeroComponents.TextPlain { themeTransition: false; color: MonzeroComponents.Style.defaultFontColor
+                        objectName: "fundingAmount"
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 15
+                        text: qsTr("Fund this trade: send %1 %2").arg(fundingBox.missing).arg(card.coin)
+                    }
+                    MonzeroComponents.TextPlain { themeTransition: false; color: MonzeroComponents.Style.dimmedFontColor
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 12
+                        text: (card.externalWallet ? qsTr("From your MetaMask (%1): scan the code with MetaMask mobile, or send to this address from MetaMask on BNB Smart Chain.").arg(card.externalWallet.slice(0, 6) + "…" + card.externalWallet.slice(-4))
+                                                   : qsTr("Scan the code with MetaMask mobile, or send to this address from any wallet on BNB Smart Chain."))
+                              + " " + qsTr("This is the trade's own account in this app; it covers the swap and its network fees. Nothing is locked until it arrives.")
+                    }
+                    MonzeroComponents.LineEdit {
+                        objectName: "fundingAccount"
+                        Layout.fillWidth: true
+                        readOnly: true; copyButton: true; fontSize: 13
+                        text: fundingBox.account
+                    }
+                }
+            }
+        }
+
+        // Payout: after the trade, send what its account holds to the connected wallet
+        RowLayout {
+            objectName: "payoutRow"
+            Layout.fillWidth: true
+            visible: card.progress.finished === true && card.externalWallet !== ""
+            MonzeroComponents.StandardButton {
+                objectName: "payoutButton"
+                small: true
+                enabled: card.t.busy !== true
+                text: qsTr("Send to MetaMask (%1)").arg(card.externalWallet.slice(0, 6) + "…" + card.externalWallet.slice(-4))
+                onClicked: card.payoutRequested()
+            }
+            MonzeroComponents.TextPlain { themeTransition: false; color: MonzeroComponents.Style.dimmedFontColor
+                objectName: "payoutResult"
+                Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 12
+                text: {
+                    var p = card.t.payout || ({})
+                    if (p.tx) return qsTr("Sent %1 %2 · transaction %3").arg(card.atomic(p.amountWei, card.coinDecimals)).arg(card.coin).arg(String(p.tx).slice(0, 12) + "…")
+                    if (p.sent === false) return qsTr("Nothing more to send (or a payment is still on its way).")
+                    return qsTr("Sends the %1 in this trade's account to your MetaMask, less the network fee.").arg(card.coin)
                 }
             }
         }
