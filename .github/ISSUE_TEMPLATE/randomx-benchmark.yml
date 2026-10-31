@@ -1,0 +1,98 @@
+name: RandomX CPU benchmark
+description: Submit measured CPU performance with evidence for review.
+title: '[Benchmark]: '
+body:
+- type: markdown
+  attributes:
+    value: Submit a measured RandomX CPU result for maintainer review. This is a public
+      GitHub issue associated with your GitHub account. Remove wallet addresses, worker
+      names, hostnames, IP addresses, usernames, paths, pool account details and other
+      personal details from evidence. Never submit seeds or private keys. Do not report
+      security vulnerabilities here; use the repository security policy. Submission
+      publishes an issue, but does not add a result to the catalog or verify it. Sanitize
+      before posting; copies may remain accessible after editing or deletion.
+- type: input
+  id: cpu
+  attributes:
+    label: CPU manufacturer and exact model
+    description: Include the CPU model, not the computer serial number.
+  validations:
+    required: true
+- type: input
+  id: cores
+  attributes:
+    label: Physical cores and logical threads
+    description: State both counts and the number of mining threads actually used.
+  validations:
+    required: true
+- type: input
+  id: hashrate
+  attributes:
+    label: Average RandomX hashrate in H/s
+    description: Use a measured average, not a peak or manufacturer estimate. Explain
+      the interval below.
+  validations:
+    required: true
+- type: dropdown
+  id: power_basis
+  attributes:
+    label: Power measurement basis
+    options:
+    - wall — whole system at socket
+    - cpu-package — CPU package only
+    - unknown — no power measurement
+  validations:
+    required: true
+- type: input
+  id: power
+  attributes:
+    label: Measured power in watts, or unknown
+    description: Enter unknown when the measurement basis is unknown; otherwise enter
+      positive measured watts. Only wall measurements qualify for efficiency ranking;
+      do not substitute TDP.
+  validations:
+    required: true
+- type: input
+  id: software
+  attributes:
+    label: Operating system, miner and miner version
+    description: Include all three; specify RandomX mode and relevant flags in methodology.
+  validations:
+    required: true
+- type: input
+  id: date
+  attributes:
+    label: Measurement date (YYYY-MM-DD)
+    description: Use the actual date of measurement, not the submission date.
+  validations:
+    required: true
+- type: textarea
+  id: methodology
+  attributes:
+    label: Measurement method and settings
+    description: Include averaging duration, warm-up, memory configuration, mining
+      threads, tuning, thermal conditions, RandomX mode and power meter/method. Remove
+      identifying paths and worker names.
+  validations:
+    required: true
+- type: textarea
+  id: evidence
+  attributes:
+    label: Public HTTPS evidence URL
+    description: Link to sanitized public HTTPS evidence you are permitted to share,
+      or attach a sanitized report here. No credentials or private share tokens.
+  validations:
+    required: true
+- type: checkboxes
+  id: acknowledgements
+  attributes:
+    label: Before submitting
+    options:
+    - label: I checked the evidence for secrets and identifying details and understand
+        that this issue and its attachments are public.
+      required: true
+    - label: This is a measured result, and I have permission to share the evidence.
+      required: true
+    - label: I understand that maintainers must review this submission; only a separate
+        documented reproduction can mark a result verified.
+      required: true

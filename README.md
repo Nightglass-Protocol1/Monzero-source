@@ -81,9 +81,13 @@ Each component keeps its upstream licence: `core/LICENSE` and `gui/LICENSE` (BSD
 
 Signed release files, checksums and verification steps are at <https://monzero.org/download/>. The release signing key fingerprint is `4C37 C618 789F 86D8 1FEF 28DF 390A EFB7 35F2 70D6`.
 
+## Issues and benchmarks
+
+Bugs: open an issue with the **Bug report** form. RandomX CPU results for the website's benchmark catalog: use the **RandomX CPU benchmark** form (results are reviewed before they are added).
+
 ## Security
 
-Report vulnerabilities privately as described in [`core/SECURITY.md`](core/SECURITY.md), not in public issues. Never paste wallet seeds, keys or passwords into issues or pull requests.
+Report vulnerabilities privately as described in the [security policy](.github/SECURITY.md) (also [`core/SECURITY.md`](core/SECURITY.md)), not in public issues. Never paste wallet seeds, keys or passwords into issues or pull requests.
 
 ## Not in this repository
 

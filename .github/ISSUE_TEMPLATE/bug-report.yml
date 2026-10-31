@@ -1,0 +1,38 @@
+name: Bug report
+description: Something in the node, wallets, desktop app, Android apps or DEX does not work as expected.
+title: '[Bug]: '
+body:
+- type: markdown
+  attributes:
+    value: This is a public issue. Never post recovery words, seeds, private keys, passwords or
+      wallet files. Remove addresses, IP addresses and other personal details from logs.
+      Report security vulnerabilities privately (see the security policy), not here.
+- type: dropdown
+  id: component
+  attributes:
+    label: Component
+    options: [Node (monzerod), CLI or RPC wallet, Desktop GUI, Android Wallet, Android Miner, DEX / Trade screen, Other]
+  validations:
+    required: true
+- type: input
+  id: version
+  attributes:
+    label: Version and platform
+    description: e.g. GUI 1.0.0 on Windows 11, Android Wallet 1.0.1 on Android 14
+  validations:
+    required: true
+- type: textarea
+  id: what
+  attributes:
+    label: What happened, and what you expected
+  validations:
+    required: true
+- type: textarea
+  id: steps
+  attributes:
+    label: Steps to reproduce
+- type: textarea
+  id: logs
+  attributes:
+    label: Logs (sanitised)
+    render: text

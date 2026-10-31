@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability (privately)
+    url: mailto:security@monzero.org
+    about: Please do not open public issues for vulnerabilities.
+  - name: Community chat (Telegram)
+    url: https://t.me/MonzeroOfficial
+    about: Questions and general help.
