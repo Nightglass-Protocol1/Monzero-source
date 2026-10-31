@@ -4,8 +4,24 @@ The owner's own test of the swap with real coins, between two accounts of one de
 phrase: the **buyer** (account 0) pays BNB and receives XMZ, the **seller** (account 1) sells XMZ
 and receives BNB. Everything runs on one PC, in two terminals.
 
-Keep it small: the runner refuses more than **0.1 BNB** per trade. Never use a main wallet's
-recovery phrase; the test phrase is created fresh in step 1.
+Keep it small: the runner refuses more than **0.1 BNB** per trade.
+
+**Amounts.** The starting point chosen on 2026-10-31 is **$0.001 per XMZ**. With BNB at about
+$700 that is about **700,000 XMZ per BNB**, so:
+
+| BNB_AMOUNT | ≈ USD | XMZ_AMOUNT | Seller needs (amount + half) |
+| --- | --- | --- | --- |
+| 0.002 | $1.40 | 1400 | 2,100 XMZ |
+| 0.01 | $7 | 7000 | 10,500 XMZ |
+| 0.05 | $35 | 35000 | 52,500 XMZ |
+
+Check the BNB price on the day and adjust XMZ_AMOUNT = BNB_AMOUNT × (BNB price in $) ÷ 0.001.
+
+**This is a test between your own two accounts, not a market trade.** Don't publish its price or
+add it to any public price history: a trade between one person's own wallets would be a
+self-made price.
+
+Never use a main wallet's recovery phrase; the test phrase is created fresh in step 1.
 
 Commands run from `gui/dex-contracts`. Needed: Node.js (`npm ci` once), the synced mainnet node
 (`monzerod`, RPC 127.0.0.1:6175), `monzero-wallet-rpc` v1.0.0.
@@ -40,16 +56,16 @@ From MetaMask, on BNB Smart Chain:
 
 ## 4. Run the trade
 
-Pick the amounts, e.g. 0.01 BNB for 5 XMZ. Terminal 1, the buyer:
+Pick the amounts from the table above, e.g. 0.01 BNB for 7000 XMZ. Terminal 1, the buyer:
 ```
-BNB_AMOUNT=0.01 XMZ_AMOUNT=5 real-funds/run-trader.sh buyer ~/dex-real/buyer-1
+BNB_AMOUNT=0.01 XMZ_AMOUNT=7000 real-funds/run-trader.sh buyer ~/dex-real/buyer-1
 ```
 Terminal 2, the seller, once the buyer prints "answering key requests":
 ```
-BNB_AMOUNT=0.01 XMZ_AMOUNT=5 real-funds/run-trader.sh seller ~/dex-real/seller-1 ~/dex-real/buyer-1
+BNB_AMOUNT=0.01 XMZ_AMOUNT=7000 real-funds/run-trader.sh seller ~/dex-real/seller-1 ~/dex-real/buyer-1
 ```
 The seller prints its XMZ wallet address (also in `~/dex-real/seller-1/xmz-address.txt`) and waits.
-**Send it the XMZ amount plus half again** (7.5 XMZ for a 5 XMZ trade) from your XMZ wallet, then
+**Send it the XMZ amount plus half again** (10,500 XMZ for a 7000 XMZ trade) from your XMZ wallet, then
 wait for it to unlock (10 blocks).
 
 Then both run on their own. Expected states:
@@ -61,7 +77,7 @@ The buyer's offer is valid for 2 hours; the whole trade takes about 30–60 minu
 
 **If anything stops** (crash, reboot, Ctrl-C): start that side again with `resume`:
 ```
-BNB_AMOUNT=0.01 XMZ_AMOUNT=5 real-funds/run-trader.sh buyer ~/dex-real/buyer-1 resume
+BNB_AMOUNT=0.01 XMZ_AMOUNT=7000 real-funds/run-trader.sh buyer ~/dex-real/buyer-1 resume
 ```
 Nothing is lost: the trade is saved before anything is locked, and refunds are automatic.
 

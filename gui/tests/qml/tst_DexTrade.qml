@@ -57,7 +57,7 @@ Item {
             verify(card.quoteFor("sell", "BTC", 0, book, 8, 1).empty)
             verify(card.quoteFor("sell", "BCH", 1, book, 8, 1).noOffers)
             var big = card.quoteFor("sell", "BTC", 5000, book, 8, 1)
-            verify(!big.ok); verify(big.reason.indexOf("2000") >= 0)   // largest: 0.01 BTC x 200k
+            verify(!big.ok); verify(big.reason.indexOf("2,000") >= 0)   // largest: 0.01 BTC x 200k, shown with separators
             verify(!card.quoteFor("sell", "BTC", 1, book, undefined, 1).ok)
         }
         function test_cardShowsQuoteAndBlocksUnavailableStart() {

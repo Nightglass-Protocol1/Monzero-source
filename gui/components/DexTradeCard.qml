@@ -58,7 +58,7 @@ Rectangle {
             if (!best || (dir === "sell" ? price < best.price : price > best.price)) best = { offer: o, price: price }
         }
         if (!count) return { ok: false, reason: qsTr("No offers for %1 right now.").arg(coinCode), noOffers: true }
-        if (!best) return { ok: false, reason: qsTr("No single offer is that large. The largest covers %1 XMZ.").arg(trim(largest, 4)) }
+        if (!best) return { ok: false, reason: qsTr("No single offer is that large. The largest covers %1 XMZ.").arg(group(trim(largest, 4))) }
         var gross = xmz / best.price
         var projectFee = gross * fee / 100
         return {
@@ -74,7 +74,15 @@ Rectangle {
         var s = Number(n).toFixed(places)
         return s.indexOf(".") < 0 ? s : s.replace(/0+$/, "").replace(/\.$/, "")
     }
-    function show(n, code) { return trim(n, code === "XMZ" ? 6 : 8) + " " + code }
+    // Thousands separators for display only (never for text the user edits)
+    function group(text) {
+        var parts = String(text).split(".")
+        var whole = parts[0], out = ""
+        while (whole.length > 3) { out = "," + whole.slice(-3) + out; whole = whole.slice(0, -3) }
+        parts[0] = whole + out
+        return parts.join(".")
+    }
+    function show(n, code) { return group(trim(n, code === "XMZ" ? 6 : 8)) + " " + code }
 
     ColumnLayout {
         id: column
@@ -189,7 +197,7 @@ Rectangle {
                     model: card.quote.ok ? [
                         { k: qsTr("You send"), v: card.show(card.quote.send, card.direction === "sell" ? "XMZ" : card.coin), strong: false },
                         { k: qsTr("You receive"), v: card.show(card.quote.receive, card.direction === "sell" ? card.coin : "XMZ"), strong: true },
-                        { k: qsTr("Rate"), v: qsTr("1 %1 = %2 XMZ").arg(card.coin).arg(card.trim(card.quote.price, 4)), strong: false },
+                        { k: qsTr("Rate"), v: qsTr("1 %1 = %2 XMZ").arg(card.coin).arg(card.group(card.trim(card.quote.price, 4))), strong: false },
                         { k: qsTr("Project fee (%1%)").arg(card.feePercent), v: card.show(card.quote.fee, card.coin), strong: false }
                     ] : []
                     delegate: RowLayout {

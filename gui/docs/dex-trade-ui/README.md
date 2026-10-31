@@ -10,6 +10,8 @@
 | `sample-5-active-trade-in-progress.png` | An active trade part-way through (seller's view) |
 
 **`sample-*` pictures use a made-up order book and trade history** (in `tests/qml/tst_DexMarket.qml`)
-so the chart and book have something to show; they are not market prices. They are rendered by
+so the chart and book have something to show; they are not market prices. The sample levels sit
+around the starting point chosen on 2026-10-31, **$0.001 per XMZ**: with BTC at about $77,000 that
+is about 77,000,000 XMZ per BTC (and with BNB at about $700, 700,000 XMZ per BNB). They are rendered by
 the app's own components. Regenerate them with the QML tests (`--test-qml`), which save them to
 `build/dex-trade-ui/`.

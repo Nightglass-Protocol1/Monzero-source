@@ -57,10 +57,18 @@ Rectangle {
         return { asks: asks, bids: bids }
     }
 
+    // Thousands separators for display only (never for text the user edits)
+    function group(text) {
+        var parts = String(text).split(".")
+        var whole = parts[0], out = ""
+        while (whole.length > 3) { out = "," + whole.slice(-3) + out; whole = whole.slice(0, -3) }
+        parts[0] = whole + out
+        return parts.join(".")
+    }
     function fmt(n, places) {
         if (!(n > 0)) return "—"
         var s = Number(n).toFixed(places)
-        return s.indexOf(".") < 0 ? s : s.replace(/0+$/, "").replace(/\.$/, "")
+        return group(s.indexOf(".") < 0 ? s : s.replace(/0+$/, "").replace(/\.$/, ""))
     }
     function priceText(p) { return fmt(p, p >= 100 ? 2 : 6) }
 

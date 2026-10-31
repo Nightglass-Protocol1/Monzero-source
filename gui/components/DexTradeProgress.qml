@@ -64,7 +64,12 @@ Rectangle {
         var n = Number(text) / Math.pow(10, decimals)
         if (!isFinite(n)) return "?"
         var s = n.toFixed(Math.min(decimals, 8))
-        return s.indexOf(".") < 0 ? s : s.replace(/0+$/, "").replace(/\.$/, "")
+        s = s.indexOf(".") < 0 ? s : s.replace(/0+$/, "").replace(/\.$/, "")
+        var parts = s.split(".")
+        var whole = parts[0], out = ""
+        while (whole.length > 3) { out = "," + whole.slice(-3) + out; whole = whole.slice(0, -3) }
+        parts[0] = whole + out
+        return parts.join(".")
     }
     function when(seconds) {
         var t = Number(seconds)

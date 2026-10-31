@@ -16,7 +16,7 @@
 //!
 //! NETWORK=mainnet moves real funds. It needs deployments/bsc-mainnet.json (scripts/deploy-mainnet.js),
 //! an ACCOUNTS_FILE holding a dedicated test phrase (never a main wallet's), XMZ_NODE (a mainnet
-//! node), and BNB_AMOUNT / XMZ_AMOUNT in whole coins (e.g. 0.01 and 5); BNB_AMOUNT above
+//! node), and BNB_AMOUNT / XMZ_AMOUNT in whole coins (e.g. 0.01 and 7000); BNB_AMOUNT above
 //! MAINNET_MAX_BNB is refused. The claimer waits for XMZ_AMOUNT plus a fee margin in its wallet.
 
 use alloy::primitives::{keccak256, Address, B256, U256};

@@ -4,12 +4,12 @@
 #   run-trader.sh buyer  <run-dir>                       # pays BNB, receives XMZ (account 0)
 #   run-trader.sh seller <run-dir> <buyer-run-dir>       # sells XMZ, receives BNB (account 1)
 #   run-trader.sh <buyer|seller> <run-dir> resume        # after a crash, reboot or Ctrl-C
-# Needs BNB_AMOUNT and XMZ_AMOUNT (whole coins), e.g. BNB_AMOUNT=0.01 XMZ_AMOUNT=5.
+# Needs BNB_AMOUNT and XMZ_AMOUNT (whole coins), e.g. BNB_AMOUNT=0.01 XMZ_AMOUNT=7000 ($0.001 per XMZ with BNB at about $700).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ENGINE=$HERE/../engine
 ROLE=${1:?buyer or seller}; DIR=${2:?run directory}; ARG3=${3:-}
-: "${BNB_AMOUNT:?set BNB_AMOUNT, e.g. 0.01}" "${XMZ_AMOUNT:?set XMZ_AMOUNT, e.g. 5}"
+: "${BNB_AMOUNT:?set BNB_AMOUNT, e.g. 0.01}" "${XMZ_AMOUNT:?set XMZ_AMOUNT, e.g. 7000}"
 export NETWORK=mainnet BNB_AMOUNT XMZ_AMOUNT
 export ACCOUNTS_FILE=${ACCOUNTS_FILE:-$HOME/.config/monzero-dex/bsc-mainnet-accounts.json}
 export XMZ_NODE=${XMZ_NODE:-127.0.0.1:6175}
