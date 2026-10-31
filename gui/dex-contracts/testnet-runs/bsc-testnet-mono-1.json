@@ -1,0 +1,45 @@
+{
+  "run": "mono-1",
+  "date": "2026-10-31",
+  "purpose": "testnet trade with the runner after the NETWORK=mainnet change (default NETWORK=testnet path), built from the monorepo",
+  "chain": "BNB testnet (97)",
+  "contract": "0xf7c19f735C3494b356091eFBeFf3ab53617190b7",
+  "bnb": "0.02",
+  "xmz": "20 (XMZ testnet)",
+  "tradeId": "0x0eef8cf7dc3e3491906fea19adce1c1c92123e52d1ff113acd28cb76f1cf3b00",
+  "owner": {
+    "final": "Done(Swapped)",
+    "states": [
+      "LockSent",
+      "Locked",
+      "ReadySent",
+      "Sweeping",
+      "Done(Swapped)"
+    ],
+    "bnbTxs": {
+      "new_swap": [
+        "0xc62fb896c4c67cd50ea3767e4bf137a344611ce1f4ccab8c01b089ebc73c2525"
+      ],
+      "set_ready": [
+        "0x4bf8bde3487af72b52de23e7f0433c2f253ff92ef5b1e7277ec4c26471e2d78c"
+      ]
+    }
+  },
+  "claimer": {
+    "final": "Done(Swapped)",
+    "states": [
+      "WaitingForEvmLock",
+      "XmzLockSent",
+      "XmzLocked",
+      "ClaimSent",
+      "Done(Swapped)"
+    ],
+    "bnbTxs": {
+      "claim": [
+        "0x1d38f3414f524fa2dc33ed99d2f3159006f61ce4b837d37efb3902b8d6858f63"
+      ]
+    }
+  },
+  "tickErrors": 0,
+  "timeline": "keys agreed 16:34:51, BNB locked 16:35:32, XMZ confirmed (ReadySent) 16:55:38, claimed, buyer Done 17:15:19 UTC"
+}
