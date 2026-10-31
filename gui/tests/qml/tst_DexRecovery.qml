@@ -7,7 +7,7 @@ TestCase {
     name: "DexRecoveryPresentation"
     // The page reads the engine only when the DEX prototype is enabled
     property bool dexPrototypeEnabled: true
-    property QtObject persistentSettings: QtObject { property string dexExternalWallet: "" }
+    property QtObject persistentSettings: QtObject { property string dexExternalWallet: ""; property string dexExternalWallets: "{}" }
     when: windowShown
     visible: true
     width: 1280

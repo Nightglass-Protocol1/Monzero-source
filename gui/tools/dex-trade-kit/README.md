@@ -115,3 +115,12 @@ complete destination is preserved. Inspect the exact reported paths; do not
 delete other attempts' staging folders or overwrite an existing destination.
 These checks establish publication integrity, not complete policy/service
 validation or active-trade backup restoration.
+
+## Your own wallet as the destination
+
+`ltcPayout`, `ltcRefund` (and `btcPayout` / `btcRefund` on a Bitcoin stage) can be any address of
+the trader's own wallet, not only the app's light wallet: the seller of XMZ puts the address where
+it wants the coin it receives (`…Payout`), the buyer of XMZ the address where its coin goes back if
+the trade is refunded (`…Refund`). The Trade screen keeps these under "Your wallets (optional)".
+Litecoin destinations must be native SegWit (`ltc1…`). The engine checks each destination against
+the trade's network before anything is funded.

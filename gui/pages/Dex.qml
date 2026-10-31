@@ -177,6 +177,19 @@ Rectangle {
     property var evmTrade: root.dex.evmTradeStatus || ({})
     // The lab panels are for testers; traders see the trade card first.
     property bool showAdvanced: false
+    // The user's own wallets (optional), per coin; BNB keeps its earlier MetaMask setting
+    property var externalWallets: {
+        var m = {}
+        try { m = JSON.parse(persistentSettings.dexExternalWallets || "{}") || {} } catch (e) { m = {} }
+        if (!m.BNB && persistentSettings.dexExternalWallet) m.BNB = persistentSettings.dexExternalWallet
+        return m
+    }
+    function setExternalWallet(coin, address) {
+        var m = JSON.parse(JSON.stringify(root.externalWallets))
+        if (address) m[coin] = address; else delete m[coin]
+        persistentSettings.dexExternalWallets = JSON.stringify(m)
+        if (coin === "BNB") persistentSettings.dexExternalWallet = address || ""
+    }
     property string evmTradeError: ""
     function evmStageText(role, stage) {
         var owner = {
@@ -424,8 +437,8 @@ Rectangle {
             errorText: root.evmTradeError
             onApprove: root.evmTradeError = root.dex.approveEvmTrade(commitment) ? "" : qsTr("Approval could not start.")
             onRefresh: root.evmTradeError = root.dex.refreshEvmTrade() ? "" : qsTr("Refresh could not start.")
-            externalWallet: persistentSettings.dexExternalWallet
-            onPayoutRequested: root.evmTradeError = root.dex.payoutEvmTrade(persistentSettings.dexExternalWallet) ? "" : qsTr("The payout could not start.")
+            externalWallet: root.externalWallets.BNB || ""
+            onPayoutRequested: root.evmTradeError = root.dex.payoutEvmTrade(root.externalWallets.BNB || "") ? "" : qsTr("The payout could not start.")
         }
         // Pair tabs, as on an exchange: each shows its last price and 24 h change from completed trades
         M.DexPairTabs {
@@ -470,17 +483,28 @@ Rectangle {
                     objectName: "tradeCard"
                     Layout.fillWidth: true
                     showCoinPicker: false
+                wallets: root.externalWallets
                     offers: root.marketSnapshot.valid === true ? (root.marketSnapshot.offers || []) : []
                     xmzBalance: appWindow.currentWallet ? Number(walletManager.displayAmount(appWindow.currentWallet.unlockedBalanceAll())) : -1
                     canStart: false
                     startBlockedReason: qsTr("Testnet preview: taking an offer from the app comes next. Testnet trades are started with the trade kit for now.")
                 }
-                M.DexExternalWallet {
-                    objectName: "externalWallet"
-                    Layout.fillWidth: true
-                    address: persistentSettings.dexExternalWallet
-                    onConnectRequested: persistentSettings.dexExternalWallet = address
-                    onDisconnectRequested: persistentSettings.dexExternalWallet = ""
+                M.TextPlain {
+                    themeTransition: false; color: M.Style.defaultFontColor; font.pixelSize: 15
+                    Layout.topMargin: 4
+                    text: qsTr("Your wallets (optional)")
+                }
+                Repeater {
+                    // The selected market's coin first
+                    model: [tradeCard.coin].concat(tradeCard.coins.filter(function (c) { return c !== tradeCard.coin }))
+                    delegate: M.DexExternalWallet {
+                        objectName: "externalWallet_" + modelData
+                        Layout.fillWidth: true
+                        coin: modelData
+                        address: root.externalWallets[modelData] || ""
+                        onConnectRequested: root.setExternalWallet(modelData, address)
+                        onDisconnectRequested: root.setExternalWallet(modelData, "")
+                    }
                 }
             }
         }

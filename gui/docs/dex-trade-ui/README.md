@@ -7,7 +7,7 @@
 | `sample-2-exchange-candles-4h-sell.png` | 4-hour candles and the Sell form |
 | `sample-3-exchange-depth-buy-review.png` | Depth chart and the Buy review step |
 | `sample-4-exchange-active-trade-approval.png` | An active trade waiting for its one approval, above the market |
-| `sample-5-exchange-metamask-funding.png` | MetaMask connected (optional) and an approved BNB trade waiting for its BNB: amount, the trade's account and a payment QR code for MetaMask mobile (the QR is drawn by the app; this test rendering leaves its square empty) |
+| `sample-5-exchange-metamask-funding.png` | "Your wallets (optional)": MetaMask (BNB) and a Bitcoin wallet connected, Litecoin and Bitcoin Cash ready to connect; an approved BNB trade waiting for its BNB with the amount, the trade's account and a payment QR for MetaMask mobile (the QR is drawn by the app; this test rendering leaves its square empty). Sample addresses. |
 
 **`sample-*` pictures use a made-up order book and trade history** (in `tests/qml/tst_DexMarket.qml`)
 so the candles, chart and book have something to show; they are not market prices. The sample levels sit

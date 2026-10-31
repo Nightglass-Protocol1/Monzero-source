@@ -27,6 +27,8 @@ Rectangle {
     property bool reviewing: false
     // On the exchange screen the pair tabs choose the coin; the card then hides its own picker
     property bool showCoinPicker: true
+    // The user's own wallets per coin (optional): shown as where coins are paid or refunded to
+    property var wallets: ({})
     readonly property var quote: quoteFor(direction, coin, Number(amountInput.text), offers, coinDecimals[coin], feePercent)
 
     signal startRequested(var quote)
@@ -72,6 +74,13 @@ Rectangle {
         }
     }
 
+    // Where this trade's coin goes: the connected wallet when there is one, else the app's own
+    function destinationText() {
+        var a = card.wallets && card.wallets[card.coin] ? String(card.wallets[card.coin]) : ""
+        if (!a) return qsTr("this app's %1 wallet").arg(card.coin)
+        var plain = a.indexOf(":") >= 0 ? a.slice(a.indexOf(":") + 1) : a
+        return qsTr("your wallet %1").arg(plain.length > 14 ? plain.slice(0, 7) + "…" + plain.slice(-5) : plain)
+    }
     function trim(n, places) {
         var s = Number(n).toFixed(places)
         return s.indexOf(".") < 0 ? s : s.replace(/0+$/, "").replace(/\.$/, "")
@@ -200,7 +209,9 @@ Rectangle {
                         { k: qsTr("You send"), v: card.show(card.quote.send, card.direction === "sell" ? "XMZ" : card.coin), strong: false },
                         { k: qsTr("You receive"), v: card.show(card.quote.receive, card.direction === "sell" ? card.coin : "XMZ"), strong: true },
                         { k: qsTr("Rate"), v: qsTr("1 %1 = %2 XMZ").arg(card.coin).arg(card.group(card.trim(card.quote.price, 4))), strong: false },
-                        { k: qsTr("Project fee (%1%)").arg(card.feePercent), v: card.show(card.quote.fee, card.coin), strong: false }
+                        { k: qsTr("Project fee (%1%)").arg(card.feePercent), v: card.show(card.quote.fee, card.coin), strong: false },
+                        { k: card.direction === "sell" ? qsTr("%1 paid to").arg(card.coin) : qsTr("Refunds to"),
+                          v: card.destinationText(), strong: false }
                     ] : []
                     delegate: RowLayout {
                         Layout.fillWidth: true

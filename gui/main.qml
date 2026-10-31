@@ -1606,6 +1606,8 @@ ApplicationWindow {
         property string bootstrapNodeAddress: ""
         // DEX: the user's own EVM wallet (e.g. MetaMask) that funds BNB trades and receives payouts. Optional.
         property string dexExternalWallet: ""
+        // DEX: the user's own wallets per coin, as JSON {"BTC": "bc1…", "LTC": "ltc1…", …}. Optional.
+        property string dexExternalWallets: "{}"
         property bool segregatePreForkOutputs: true
         property bool keyReuseMitigation2: true
         property int segregationHeight: 0

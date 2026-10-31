@@ -163,10 +163,34 @@ Item {
             child(wallet, "walletSave").clicked()
             compare(connected, "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"); verify(!wallet.editing)
             wallet.address = connected
-            compare(child(wallet, "walletAddress").text, "0x4b7c\u20268FAF")
+            compare(child(wallet, "walletAddress").text, "0x4b7c0\u202628FAF")
             var dropped = false
             wallet.disconnectRequested.connect(function () { dropped = true })
             child(wallet, "walletDisconnect").clicked(); verify(dropped)
+        }
+        function test_walletAddressFormatsPerCoin() {
+            var ok = [["BNB", "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"],
+                      ["BTC", "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"], ["BTC", "tb1qlz6s22qckk7ty9gqf76stee8pwrzk8uc5d7q5x"],
+                      ["BTC", "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"], ["BTC", "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"],
+                      ["LTC", "ltc1qg42tkwuuxefutzxezdkdel39gfstuap288mfea"], ["LTC", "tltc1qg42tkwuuxefutzxezdkdel39gfstuap2xxxxxx"],
+                      ["BCH", "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a"], ["BCH", "qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a"]]
+            var bad = [["BNB", "0x1234"], ["BTC", "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"],
+                       ["LTC", "LVg2kJoFNg45Nbpy53h7Fe1wKyeXVRhMH9"],                 // legacy Litecoin: not a swap destination
+                       ["LTC", "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"], ["BCH", "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"],
+                       ["BTC", "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdb"]]        // 'b' is not a bech32 character
+            for (var i = 0; i < ok.length; ++i) verify(wallet.validAddress(ok[i][0], ok[i][1]), "accepted " + ok[i].join(" "))
+            for (var j = 0; j < bad.length; ++j) verify(!wallet.validAddress(bad[j][0], bad[j][1]), "refused " + bad[j].join(" "))
+            compare(wallet.shortAddress("bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a"), "qpm2qsz\u2026gdx6a")
+        }
+        function test_quoteSaysWhereTheCoinsGo() {
+            card.amountText = "100"
+            compare(child(card, "quote_4").text, "this app's BTC wallet")
+            card.wallets = { BTC: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" }
+            compare(child(card, "quote_4").text, "your wallet bc1qar0\u2026f5mdq")
+            card.direction = "buy"
+            verify(card.quote.ok)
+            compare(child(card, "quote_4").text, "your wallet bc1qar0\u2026f5mdq")
+            card.wallets = ({})
         }
         function test_unknownStageIsShownNotHidden() {
             progress.trade = trade("owner", "SomethingNew")
