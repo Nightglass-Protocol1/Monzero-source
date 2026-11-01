@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Verify the Monzero Web Wallet</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="bar"><div class="brand">Monzero <span>Web Wallet</span> <span class="net">@@NETBADGE@@</span></div><a class="link" href="./">Open the wallet</a></header>
+<main>
+<h1>Verify this release</h1>
+<p class="lead">The web wallet is a fixed set of files. Before you trust it with real XMZ, you can check that the files this site serves are exactly the ones the Monzero project released and signed.</p>
+
+<h2>This release</h2>
+<p>Release <strong>@@RELEASE@@</strong> · @@NETWORK@@ · built @@BUILT@@</p>
+<p class="small">Source: <code>web-wallet/</code> at commit <code>@@RELEASE@@</code> in github.com/Nightglass-Protocol1/Monzero-source</p>
+<pre class="address">@@SUMS@@</pre>
+<p><a href="SHA256SUMS">SHA256SUMS</a> · <a href="SHA256SUMS.asc">SHA256SUMS.asc</a> (signature)</p>
+
+<h2>1. Check the signature</h2>
+<p class="small">The hash list is signed with the Monzero release key. Its fingerprint, also published at monzero.org/download:</p>
+<pre class="address">4C37 C618 789F 86D8 1FEF  28DF 390A EFB7 35F2 70D6</pre>
+<pre class="address">gpg --verify SHA256SUMS.asc SHA256SUMS</pre>
+<p class="small">Look for "Good signature" and that exact fingerprint. If you have not imported the key yet, get it from monzero.org/download first.</p>
+
+<h2>2. Check the files</h2>
+<p class="small">Download the files this site serves and compare them with the signed list:</p>
+<pre class="address">for f in index.html style.css app.js app.js.LICENSE.txt monero.worker.js; do curl -sO @@ORIGIN@@/$f; done
+sha256sum -c SHA256SUMS</pre>
+<p class="small">Every line must say OK. Anything else means the files differ from the release: do not enter your recovery words, and tell the Monzero team.</p>
+
+<h2>3. Build it yourself (optional)</h2>
+<p class="small">The wallet can be rebuilt from the source with <code>web-wallet/build.sh</code> and <code>web-wallet/app/build.sh</code>; compare the result with the signed list above. (Byte-for-byte reproducible builds are being checked; until that is confirmed, rely on the signature.)</p>
+
+<h2>Staying safe</h2>
+<ul class="small">
+<li>Only use the wallet at <strong>@@ORIGIN@@</strong>.</li>
+<li>Never type your 25 recovery words into any other website, chat or email. Nobody from Monzero will ever ask for them.</li>
+<li>For large amounts, use the desktop or Android wallet.</li>
+</ul>
+</main>
+</body>
+</html>
