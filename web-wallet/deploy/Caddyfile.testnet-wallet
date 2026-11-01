@@ -22,6 +22,10 @@ testnet-wallet.monzero.org {
 		reverse_proxy 127.0.0.1:16175 {
 			header_up -Cookie
 			header_up -Authorization
+			# The node refuses requests with an Origin it does not know; the page and this gateway
+			# are the same site, so the browser's Origin/Referer are dropped here
+			header_up -Origin
+			header_up -Referer
 			header_down -Server
 		}
 	}

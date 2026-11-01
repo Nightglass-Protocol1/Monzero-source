@@ -33,6 +33,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if length > 1_000_000:
             self.send_error(413); return
         body = self.rfile.read(length) if length else None
+        # Like the live gateway: only the content type is passed on (no Origin, Referer, cookies or auth)
         req = urllib.request.Request(NODE + path, data=body, method=method,
                                      headers={"Content-Type": self.headers.get("Content-Type", "application/json")})
         try:
