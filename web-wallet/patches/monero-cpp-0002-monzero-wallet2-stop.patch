@@ -1,0 +1,13 @@
+diff --git a/src/wallet/monero_wallet_full.cpp b/src/wallet/monero_wallet_full.cpp
+index 1ea97ba..bb4424a 100644
+--- a/src/wallet/monero_wallet_full.cpp
++++ b/src/wallet/monero_wallet_full.cpp
+@@ -3640,7 +3640,7 @@ namespace monero {
+   void monero_wallet_full::request_shutdown() {
+     if (m_is_closed) return;
+     stop_syncing();
+-    m_w2->shutdown(); // abort daemon I/O before waiting for active calls or saving
++    m_w2->stop(); // Monzero wallet2 has no shutdown(): stop refreshing; an in-flight daemon call finishes first
+     boost::lock_guard<boost::mutex> lock(m_syncing_mutex);
+     m_sync_cv.notify_one(); // synchronize with the idle sync loop so the wake cannot be missed
+   }

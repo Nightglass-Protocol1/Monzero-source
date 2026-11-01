@@ -24,9 +24,13 @@ prepare() {
   [ "$(git -C "$ts/external/monero-cpp" rev-parse HEAD)" = "$MONERO_CPP_COMMIT" ] || { echo "monero-cpp is not the pinned commit"; exit 1; }
   # Monzero changes to the wrappers, each reviewable in web-wallet/patches
   git -C "$ts/external/monero-cpp" checkout -q -- src
-  git -C "$ts" checkout -q -- src
+  git -C "$ts" checkout -q -- src CMakeLists.txt
   git -C "$ts/external/monero-cpp" apply "$HERE/patches/monero-cpp-0001-monzero-amounts-and-uri.patch"
+  git -C "$ts/external/monero-cpp" apply "$HERE/patches/monero-cpp-0002-monzero-wallet2-stop.patch"
   git -C "$ts" apply "$HERE/patches/monero-ts-0001-monzero-amounts.patch"
+  git -C "$ts" apply "$HERE/patches/monero-ts-0002-monzero-wallet-sources.patch"
+  # Declarations Monzero's sources include but the browser never uses (see shims/)
+  rm -rf "$ts/monzero-shims"; cp -r "$HERE/shims" "$ts/monzero-shims"
   # Monzero's own core replaces Monero's source: addresses, networks, forks and amounts come from it
   local project="$ts/external/monero-cpp/external/monero-project"
   rm -rf "$project"

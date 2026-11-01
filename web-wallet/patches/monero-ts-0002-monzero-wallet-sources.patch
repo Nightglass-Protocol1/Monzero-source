@@ -1,0 +1,33 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1f1387d..905b428 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -63,6 +63,7 @@ include_directories("${MONERO_PROJECT}/external/")
+ include_directories("${MONERO_PROJECT}/external/easylogging++")
+ include_directories("${MONERO_PROJECT}/external/rapidjson/include")
+ include_directories("${MONERO_PROJECT}/external/unbound/libunbound")
++include_directories("${CMAKE_SOURCE_DIR}/monzero-shims")  # Monzero: unbound.h declarations only (no DNS in the browser)
+ include_directories("${MONERO_PROJECT}/external/db_drivers/liblmdb")
+ include_directories("${MONERO_PROJECT}/contrib/epee/include")
+ include_directories("${MONERO_PROJECT}/contrib/epee/include/net")
+@@ -257,7 +258,6 @@ set(
+     ${MONERO_PROJECT_SRC}/wallet/message_store.cpp
+     ${MONERO_PROJECT_SRC}/wallet/message_transporter.cpp
+     ${MONERO_PROJECT_SRC}/wallet/node_rpc_proxy.cpp
+-    ${MONERO_PROJECT_SRC}/wallet/pending_tx_validation.cpp
+     ${MONERO_PROJECT_SRC}/wallet/wallet_rpc_payments.cpp
+     #${MONERO_PROJECT_SRC}/blockchain_db/lmdb/db_lmdb.cpp
+     ${MONERO_PROJECT_SRC}/cryptonote_core/cryptonote_tx_utils.cpp
+diff --git a/src/main/cpp/http_client_wasm.h b/src/main/cpp/http_client_wasm.h
+index 605d4b5..41e1513 100644
+--- a/src/main/cpp/http_client_wasm.h
++++ b/src/main/cpp/http_client_wasm.h
+@@ -31,7 +31,7 @@ namespace epee
+         void set_auto_connect(bool auto_connect) override;
+         bool connect(std::chrono::milliseconds timeout) override;
+         bool disconnect() override;
+-        bool shutdown() override;
++        bool shutdown();  // Monzero: not in epee::net_utils::http::abstract_http_client
+         bool is_connected(bool *ssl = NULL) override;
+         bool invoke(const boost::string_ref uri, const boost::string_ref method, const boost::string_ref body, std::chrono::milliseconds timeout, const http_response_info** ppresponse_info = NULL, const fields_list& additional_params = fields_list()) override;
+         bool invoke_get(const boost::string_ref uri, std::chrono::milliseconds timeout, const string& body = string(), const http_response_info** ppresponse_info = NULL, const fields_list& additional_params = fields_list()) override;
