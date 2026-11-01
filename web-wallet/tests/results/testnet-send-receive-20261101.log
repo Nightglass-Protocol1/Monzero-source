@@ -1,0 +1,19 @@
+12:17:17 web wallet KgCzNriBuUVY…
+ok   node is Monzero testnet
+12:17:17 funding tx 28c8065624cc6db54058c30d13214c46c525391db6994d17e0a9ae25ea09370f
+12:17:17 height 2955 balance 5 unlocked 0
+12:19:47 height 2957 balance 5 unlocked 0
+12:22:17 height 2958 balance 5 unlocked 0
+12:24:47 height 2958 balance 5 unlocked 0
+12:27:18 height 2960 balance 5 unlocked 0
+12:29:48 height 2962 balance 5 unlocked 0
+12:32:18 height 2963 balance 5 unlocked 0
+12:34:48 height 2963 balance 5 unlocked 0
+ok   received exactly 5 tXMZ and it unlocked
+ok   the funding transaction is in the web wallet's history
+12:35:34 sent 1 tXMZ, tx 69666b1afbcbd121e9afd48b9311856a492dc13ab92d28926ce8b0ce269f9fc8, fee 0.0096896 tXMZ
+ok   fee is positive and well under 1 XMZ
+ok   Monzero's own wallet sees exactly 1 tXMZ from the web wallet
+FAIL payment link monzero:KgCzNriBuUVY…?tx_amount=2.5
+FAILED (1)
+Note: the one FAIL was the test's expected link format (2.5); the wallet's link monzero:<address>?tx_amount=2.50000000000 matches Monzero's 11-decimal format; expectation fixed.
