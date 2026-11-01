@@ -1,0 +1,47 @@
+# wallet.monzero.org on monzero-eu: the web wallet's static files and a node gateway limited to
+# the calls a wallet needs. Appended to /etc/caddy/Caddyfile; pool.monzero.org is unchanged.
+wallet.monzero.org {
+	encode gzip
+
+	# Node gateway (same origin as the wallet): only these paths reach the local node, which runs
+	# restricted RPC. JSON-RPC methods are limited by the node's restricted mode.
+	@node_allowed {
+		method GET POST
+		path /node/json_rpc /node/get_info /node/getinfo /node/get_height /node/getheight
+		path /node/getblocks.bin /node/get_blocks.bin /node/gethashes.bin /node/get_hashes.bin
+		path /node/get_o_indexes.bin /node/get_outs.bin /node/get_transaction_pool_hashes.bin
+		path /node/gettransactions /node/get_transactions /node/get_transaction_pool
+		path /node/sendrawtransaction /node/send_raw_transaction
+	}
+	handle @node_allowed {
+		request_body {
+			max_size 1MB
+		}
+		uri strip_prefix /node
+		reverse_proxy 127.0.0.1:6175 {
+			header_up -Cookie
+			header_up -Authorization
+			header_down -Server
+		}
+	}
+	handle /node/* {
+		respond "Forbidden" 403
+	}
+
+	# The wallet: static files only
+	handle {
+		root * /srv/monzero-wallet
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		Content-Security-Policy "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self'; img-src 'self' data: blob:; style-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		X-Frame-Options "DENY"
+		-Server
+	}
+}
