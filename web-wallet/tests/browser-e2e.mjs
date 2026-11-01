@@ -2,12 +2,15 @@
 // recovery words, receive tXMZ, send some back through the confirmation screen, lock and unlock from
 // the browser's encrypted storage. Fails on any Content-Security-Policy violation or page error.
 //   node web-wallet/tests/browser-e2e.mjs <page url> <funding wallet rpc url>
+//   node web-wallet/tests/browser-e2e.mjs <page url> --smoke mainnet|testnet   (no funds: create,
+//     network checks, sync, refusal of the other network's address, lock/unlock)
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const [pageUrl, fundingUrl] = process.argv.slice(2);
+const [pageUrl, fundingUrl, smokeNet] = process.argv.slice(2);
+const SMOKE = fundingUrl === "--smoke";
 const PORT = 9333, PASSWORD = "correct horse battery 42";
 const log = (m) => console.log(new Date().toISOString().slice(11, 19), m);
 let failures = 0;
@@ -56,7 +59,8 @@ try {
   await cdp("Runtime.enable"); await cdp("Log.enable"); await cdp("Page.enable");
   await cdp("Page.navigate", { url: pageUrl });
   await waitFor(visible("s-start"), "start screen");
-  check(await text("net") === "TESTNET", "testnet badge shown");
+  if (SMOKE && smokeNet === "mainnet") check(await js(`document.getElementById('net').hidden`), "no testnet badge on mainnet");
+  else check(await text("net") === "TESTNET", "testnet badge shown");
 
   // Create: password, recovery words, check three of them
   await click("goCreate");
@@ -77,11 +81,27 @@ try {
   await click("verifyNext");
   await waitFor(visible("s-wallet"), "wallet screen", 180);
   const address = await text("address");
-  check(address.startsWith("K") && address.length > 90, `testnet address shown (${address.slice(0, 8)}…)`);
+  const prefix = SMOKE && smokeNet === "mainnet" ? "F" : "K";
+  check(address.startsWith(prefix) && address.length > 90, `${prefix === "F" ? "mainnet" : "testnet"} address shown (${address.slice(0, 8)}…)`);
   check(await js(`document.getElementById('qr').src.startsWith('data:image/gif')`), "receive QR drawn");
   check((await text("qrText")) === "monzero:" + address, "QR holds monzero:<address>");
   await waitFor(`document.getElementById('syncState').textContent==='Up to date'`, "sync", 300);
 
+  if (SMOKE) {
+    await js(`document.querySelector('[data-tab=send]').click()`);
+    // A testnet address on mainnet (and the reverse) is refused before anything is built
+    // A real, valid address of the other network (passed in), so the refusal is about the network
+    const other = process.env.OTHER_NETWORK_ADDRESS;
+    if (!other) throw new Error("set OTHER_NETWORK_ADDRESS to a valid address of the other network");
+    await set("sendTo", other); await set("sendAmount", "1"); await click("sendReview");
+    await waitFor(`document.getElementById('sendToError').textContent.length>0`, "other-network address refused", 30);
+    check(true, "an address of the other network is refused");
+    await click("lockBtn"); await waitFor(visible("s-start"), "locked");
+    await click("goOpen"); await set("unlockPw", PASSWORD); await click("unlockBtn");
+    await waitFor(visible("s-wallet"), "unlocked", 180);
+    check((await text("address")) === address, "lock and unlock keep the same wallet");
+    throw { smokeDone: true };
+  }
   // Receive 3 tXMZ
   const fund = await funding("transfer", { destinations: [{ amount: 3 * 100000000000, address }], priority: 0 });
   log("funded: " + fund.tx_hash);
@@ -135,7 +155,7 @@ try {
   const stored = await js(`new Promise(r=>{const q=indexedDB.open('monzero-web-wallet');q.onsuccess=()=>{const t=q.result.transaction('wallets').objectStore('wallets').get('testnet');t.onsuccess=()=>{const v=t.result;const keys=new TextDecoder('latin1').decode(v.keys);r({hasKeys:v.keys.length>0,plainWords:${JSON.stringify(words.slice(0, 3).join(" "))}&&keys.includes(${JSON.stringify(words[0] + " " + words[1])}),plainPassword:keys.includes(${JSON.stringify(PASSWORD)})})}}})`);
   check(stored.hasKeys && !stored.plainWords && !stored.plainPassword, "stored keys are encrypted (no recovery words or password in clear)");
 } catch (e) {
-  check(false, "stopped: " + e.message);
+  if (!e.smokeDone) check(false, "stopped: " + e.message);
 } finally {
   check(problems.length === 0, problems.length ? "page problems:\n  " + problems.slice(0, 10).join("\n  ") : "no CSP violations or page errors");
   ws.close(); chrome.kill(); await sleep(1000); rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
