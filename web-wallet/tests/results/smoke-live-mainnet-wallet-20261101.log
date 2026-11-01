@@ -1,0 +1,13 @@
+ok   no testnet badge on mainnet
+ok   a short password is refused
+ok   25 recovery words shown
+ok   Continue is disabled until 'I wrote them down' is ticked
+ok   the words are removed from the page while checking
+ok   wrong words are refused
+ok   mainnet address shown (FS2SSpTy…)
+ok   receive QR drawn
+ok   QR holds monzero:<address>
+ok   an address of the other network is refused
+ok   lock and unlock keep the same wallet
+ok   no CSP violations or page errors
+ALL PASSED
