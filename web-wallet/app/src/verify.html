@@ -23,7 +23,8 @@
 <p class="small">The hash list is signed with the Monzero release key. Its fingerprint, also published at monzero.org/download:</p>
 <pre class="address">4C37 C618 789F 86D8 1FEF  28DF 390A EFB7 35F2 70D6</pre>
 <pre class="address">gpg --verify SHA256SUMS.asc SHA256SUMS</pre>
-<p class="small">Look for "Good signature" and that exact fingerprint. If you have not imported the key yet, get it from monzero.org/download first.</p>
+<p class="small">First import the public key once: <code>curl -s https://monzero.org/releases/monzero-release-public.asc | gpg --import</code></p>
+<p class="small">You should see <strong>Good signature from "Monzero Release &lt;security@monzero.org&gt;"</strong> and <strong>Primary key fingerprint: 4C37 C618 789F 86D8 1FEF 28DF 390A EFB7 35F2 70D6</strong>. gpg also names the key that made the signature, <code>562B A9C3 A713 E4E0 5A1B 24F2 5794 0142 228A 8336</code>: that is the signing subkey of the same release key. The warning "This key is not certified with a trusted signature" is normal for a key you have not personally certified; what matters is the primary fingerprint above.</p>
 
 <h2>2. Check the files</h2>
 <p class="small">Download the files this site serves and compare them with the signed list:</p>

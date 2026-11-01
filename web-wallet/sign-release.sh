@@ -5,6 +5,8 @@ set -euo pipefail
 NET=${1:?testnet or mainnet}
 DIR=$(cd "$(dirname "$0")" && pwd)/app/dist/$NET
 FPR=4C37C618789F86D81FEF28DF390AEFB735F270D6
+# The release key lives in its own keyring on the key holder's machine
+export GNUPGHOME=${GNUPGHOME:-$HOME/monzero-release-keyring}
 [ -f "$DIR/SHA256SUMS" ] || { echo "build first: web-wallet/app/build.sh $NET"; exit 1; }
 (cd "$DIR" && sha256sum -c --quiet SHA256SUMS) || { echo "files do not match SHA256SUMS"; exit 1; }
 rm -f "$DIR/SHA256SUMS.asc"
