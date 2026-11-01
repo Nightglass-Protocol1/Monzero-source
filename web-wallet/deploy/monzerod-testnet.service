@@ -1,0 +1,42 @@
+[Unit]
+Description=Monzero testnet node (for the testnet web wallet)
+Documentation=https://monzero.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monzero
+Group=monzero
+StateDirectory=monzero-testnet
+LogsDirectory=monzero
+UMask=0077
+ExecStart=/usr/bin/monzerod --testnet --data-dir /var/lib/monzero-testnet --log-file /var/log/monzero/monzerod-testnet.log --non-interactive --rpc-bind-ip 127.0.0.1 --rpc-bind-port 16175 --restricted-rpc --p2p-bind-port 16174 --no-igd --no-zmq --disable-dns-checkpoints --out-peers 4 --in-peers 16 --max-connections-per-ip 4
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=120s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/var/lib/monzero-testnet /var/log/monzero
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=true
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target
