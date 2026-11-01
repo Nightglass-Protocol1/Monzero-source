@@ -1,0 +1,9 @@
+{
+  "name": "monzero-web-wallet",
+  "private": true,
+  "license": "BSD-3-Clause",
+  "description": "Monzero web wallet page (static files; see ../DESIGN.md)",
+  "dependencies": {
+    "qrcode-generator": "2.0.4"
+  }
+}

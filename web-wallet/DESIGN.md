@@ -58,10 +58,17 @@ receive on testnet, refusal of a Monero address, refusal of an amount with 12 de
 | Supply chain (npm dependencies) | Lockfile with integrity hashes, minimal runtime dependencies, dependencies audited at each release, no CDN at runtime |
 | Analytics / tracking | None. No cookies, no analytics, no external requests except the node gateway |
 
-## Node gateway (on monzero-eu, needs the owner's approval)
+## Page dependencies
 
-HTTPS endpoint, e.g. `https://node.monzero.org`, in front of `monzerod --restricted-rpc` (RPC bound to
-localhost). Allowed paths only:
+The page itself has one runtime dependency: `qrcode-generator` 2.0.4 (MIT, no dependencies), pinned
+with its integrity hash in `app/package-lock.json`, installed with scripts disabled. Reviewed
+2026-11-01: no network access, eval, storage or timers; it only builds QR images. A `monzero:`
+payment link encoded with it decodes back exactly (zbar).
+
+## Node gateway (on monzero-eu; applied 2026-11-01)
+
+Same origin as the wallet: `https://wallet.monzero.org/node/…`, in front of the node's restricted RPC
+(Caddy, `deploy/Caddyfile.wallet`). Allowed paths only:
 
 - JSON-RPC methods: `get_info`, `get_last_block_header`, `get_block_header_by_height`,
   `get_block_headers_range`, `get_fee_estimate`, `get_version`, `hard_fork_info`
@@ -69,8 +76,10 @@ localhost). Allowed paths only:
   `/get_transaction_pool_hashes.bin`, `/gettransactions`, `/get_transaction_pool`,
   `/sendrawtransaction`, `/get_height`, `/getinfo`, `/get_info`
 
-Everything else returns 403. CORS allows only `https://wallet.monzero.org`. Rate limits per IP
-(burst-limited), maximum request body 1 MB (a transaction is far smaller). Logs keep no request bodies.
+Everything else returns 403 (checked: start_mining, stop_daemon, get_peer_list). Same origin, so no CORS
+is needed and the page's CSP allows `connect-src 'self'` only. Maximum request body 1 MB. Per-IP limits:
+for now the node's own (100 connections per IP); a proper rate limit (Caddy plugin or firewall) must be
+added before the mainnet wallet goes live.
 
 ## Release process
 
