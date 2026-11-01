@@ -532,7 +532,7 @@ Rectangle {
                 visible: appWindow.walletMode >= 2
                 anchors.left: parent.left
                 anchors.right: parent.right
-                text: qsTr("Mining / tools") + translationManager.emptyString
+                text: (miningEnabled ? qsTr("Mining / tools") : qsTr("Tools")) + translationManager.emptyString
                 symbol: (isMac ? "⌃" : qsTr("Ctrl+")) + "D" + translationManager.emptyString
                 onClicked: {
                     parent.previousButton.checked = false

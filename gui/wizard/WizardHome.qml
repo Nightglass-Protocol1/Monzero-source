@@ -79,7 +79,8 @@ Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: width / 3
                 Layout.bottomMargin: 12
-                source: "qrc:///images/branding/monzero-banner.jpg"
+                // The wallet edition (no mining, e.g. Microsoft Store) uses a banner without "CPU mining"
+                source: miningEnabled ? "qrc:///images/branding/monzero-banner.jpg" : "qrc:///images/branding/monzero-banner-wallet.jpg"
                 fillMode: Image.PreserveAspectFit
                 smooth: true
                 mipmap: true
