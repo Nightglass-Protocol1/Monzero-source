@@ -154,11 +154,14 @@ $("unlockPw").addEventListener("keydown", (e) => { if (e.key === "Enter") $("unl
 
 // ---------- the open wallet ----------
 async function persist() {
-  if (!wallet) return;
+  const w = wallet;
+  if (!w) return;
   saving = saving.then(async () => {
-    const [keys, cache] = await wallet.getData();
+    if (wallet !== w) return;            // locked meanwhile: lock() saves the wallet itself
+    const [keys, cache] = await w.getData();
+    if (wallet !== w) return;
     await saveWallet(NETWORK, keys, cache);
-  }).catch((e) => notice("Could not save the wallet in this browser: " + (e.message || e)));
+  }).catch((e) => { if (wallet === w) notice("Could not save the wallet in this browser: " + (e.message || e)); });
   return saving;
 }
 
@@ -197,11 +200,17 @@ async function syncLoop(w) {
   }
 }
 
+// Each refresh works on the wallet that was open when it started and stops if it was locked meanwhile
 async function refresh() {
-  if (!wallet) return;
-  $("balance").textContent = formatXmz(await wallet.getBalance());
-  $("unlocked").textContent = formatXmz(await wallet.getUnlockedBalance());
-  history();
+  const w = wallet;
+  if (!w) return;
+  try {
+    const balance = await w.getBalance(); if (wallet !== w) return;
+    const unlocked = await w.getUnlockedBalance(); if (wallet !== w) return;
+    $("balance").textContent = formatXmz(balance);
+    $("unlocked").textContent = formatXmz(unlocked);
+    await history(w);
+  } catch (e) { if (wallet === w) throw e; }
 }
 
 // Tabs
@@ -273,9 +282,10 @@ $("sendGo").onclick = async () => {
 };
 
 // History
-async function history() {
+async function history(w) {
   const list = $("history");
-  const transfers = (await wallet.getTransfers({ accountIndex: 0 })).slice(-50).reverse();
+  const transfers = (await w.getTransfers({ accountIndex: 0 })).slice(-50).reverse();
+  if (wallet !== w) return;
   list.textContent = "";
   $("historyEmpty").hidden = transfers.length > 0;
   for (const t of transfers) {
