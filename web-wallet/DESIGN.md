@@ -67,7 +67,8 @@ payment link encoded with it decodes back exactly (zbar).
 
 ## Node gateway (on monzero-eu; applied 2026-11-01)
 
-Same origin as the wallet: `https://wallet.monzero.org/node/…`, in front of the node's restricted RPC
+Same origin as the wallet, at the site root (`https://wallet.monzero.org/json_rpc`, `/getblocks.bin`, …;
+Monzero's wallet code cannot reach a node behind a path prefix such as `/node/`), in front of the node's restricted RPC
 (Caddy, `deploy/Caddyfile.wallet`). Allowed paths only:
 
 - JSON-RPC methods: `get_info`, `get_last_block_header`, `get_block_header_by_height`,

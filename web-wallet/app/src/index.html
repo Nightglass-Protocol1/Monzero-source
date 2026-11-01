@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Monzero Web Wallet</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">Monzero <span>Web Wallet</span> <span class="net" id="net"></span></div>
+  <button class="link" id="lockBtn" hidden>Lock</button>
+</header>
+
+<main>
+  <p class="notice" id="notice" hidden></p>
+
+  <!-- Start: create, restore or open -->
+  <section id="s-start" hidden>
+    <h1>Your XMZ, in your browser</h1>
+    <p class="lead">This wallet runs entirely on your device. Your keys and recovery words never leave this browser and are never sent to Monzero or anyone else.</p>
+    <div class="choices">
+      <button id="goOpen" hidden>Open my wallet</button>
+      <button id="goCreate">Create a new wallet</button>
+      <button class="secondary" id="goRestore">Restore from recovery words</button>
+    </div>
+    <p class="small">For large amounts, use the desktop or Android wallet. Only use this wallet at <strong>wallet.monzero.org</strong>.</p>
+  </section>
+
+  <!-- Password for a new or restored wallet -->
+  <section id="s-password" hidden>
+    <h1 id="pwTitle">Choose a password</h1>
+    <p class="lead">It encrypts the wallet stored in this browser. It cannot be recovered: if you forget it, restore from your recovery words.</p>
+    <label>Password <input type="password" id="pw1" autocomplete="new-password" minlength="10"></label>
+    <label>Repeat password <input type="password" id="pw2" autocomplete="new-password"></label>
+    <div id="restoreFields" hidden>
+      <label>Recovery words (25 words)<textarea id="restoreWords" rows="4" autocomplete="off" spellcheck="false"></textarea></label>
+      <label>Restore from block height (optional, faster) <input id="restoreHeight" inputmode="numeric" placeholder="0"></label>
+    </div>
+    <p class="error" id="pwError"></p>
+    <div class="row"><button id="pwNext">Continue</button><button class="secondary" id="pwBack">Back</button></div>
+  </section>
+
+  <!-- Show the recovery words once -->
+  <section id="s-words" hidden>
+    <h1>Write down your recovery words</h1>
+    <p class="lead">These 25 words are the only way to recover your XMZ. Write them on paper, in order. Never type them into any other website, chat or email; nobody from Monzero will ever ask for them.</p>
+    <ol class="words" id="wordList"></ol>
+    <label class="check"><input type="checkbox" id="wroteDown"> I wrote all 25 words down, in order</label>
+    <button id="wordsNext" disabled>Continue</button>
+  </section>
+
+  <!-- Check three of the words -->
+  <section id="s-verify" hidden>
+    <h1>Check your recovery words</h1>
+    <p class="lead">Enter these words from your list.</p>
+    <div id="verifyFields"></div>
+    <p class="error" id="verifyError"></p>
+    <div class="row"><button id="verifyNext">Check</button><button class="secondary" id="verifyBack">Show the words again</button></div>
+  </section>
+
+  <!-- Unlock a saved wallet -->
+  <section id="s-unlock" hidden>
+    <h1>Unlock your wallet</h1>
+    <label>Password <input type="password" id="unlockPw" autocomplete="current-password"></label>
+    <p class="error" id="unlockError"></p>
+    <div class="row"><button id="unlockBtn">Unlock</button><button class="secondary" id="unlockBack">Back</button></div>
+  </section>
+
+  <!-- Working -->
+  <section id="s-busy" hidden>
+    <div class="spinner"></div>
+    <p class="lead" id="busyText">Working…</p>
+  </section>
+
+  <!-- The wallet -->
+  <section id="s-wallet" hidden>
+    <div class="balance">
+      <div><span class="label">Balance</span><span class="amount" id="balance">0</span> XMZ</div>
+      <div class="small"><span id="unlocked">0</span> XMZ available now · <span id="syncState">Connecting…</span></div>
+      <div class="progress"><div id="syncBar"></div></div>
+    </div>
+    <nav class="tabs">
+      <button data-tab="receive" class="active">Receive</button>
+      <button data-tab="send">Send</button>
+      <button data-tab="history">History</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+
+    <div class="tab" id="t-receive">
+      <p class="label">Your address</p>
+      <p class="address" id="address"></p>
+      <div class="row"><button class="secondary" id="copyAddress">Copy address</button><button class="secondary" id="newSub">New address</button></div>
+      <label>Request an amount (optional) <input id="reqAmount" inputmode="decimal" placeholder="0.0"></label>
+      <img class="qr" id="qr" alt="QR code of your address">
+      <p class="small" id="qrText"></p>
+    </div>
+
+    <div class="tab" id="t-send" hidden>
+      <label>Recipient address <input id="sendTo" autocomplete="off" spellcheck="false"></label>
+      <p class="error" id="sendToError"></p>
+      <label>Amount (XMZ) <input id="sendAmount" inputmode="decimal" placeholder="0.0"></label>
+      <div class="row"><button class="secondary" id="sendMax">Send all</button></div>
+      <p class="error" id="sendError"></p>
+      <button id="sendReview">Review</button>
+      <div class="confirm" id="sendConfirm" hidden>
+        <h2>Check before sending</h2>
+        <p>To <span class="address" id="cTo"></span></p>
+        <p>Amount <strong id="cAmount"></strong> XMZ · Network fee <strong id="cFee"></strong> XMZ</p>
+        <p>Total <strong id="cTotal"></strong> XMZ</p>
+        <p class="small">Compare the first and last characters of the address with the one you were given. Sent XMZ cannot be recalled.</p>
+        <div class="row"><button id="sendGo">Send</button><button class="secondary" id="sendCancel">Cancel</button></div>
+      </div>
+      <p class="ok" id="sendResult"></p>
+    </div>
+
+    <div class="tab" id="t-history" hidden>
+      <ul class="history" id="history"></ul>
+      <p class="small" id="historyEmpty">No transactions yet.</p>
+    </div>
+
+    <div class="tab" id="t-settings" hidden>
+      <h2>Recovery words</h2>
+      <label>Enter your password to show them <input type="password" id="revealPw" autocomplete="current-password"></label>
+      <button class="secondary" id="revealBtn">Show recovery words</button>
+      <p class="error" id="revealError"></p>
+      <ol class="words" id="revealList" hidden></ol>
+      <h2>Lock</h2>
+      <p class="small">The wallet locks itself after <span id="lockMinutes">10</span> minutes without use.</p>
+      <h2>Remove from this browser</h2>
+      <p class="small">Deletes the encrypted wallet stored in this browser. Your XMZ stays on the blockchain; you can restore it with your recovery words.</p>
+      <button class="danger" id="removeBtn">Remove wallet from this browser</button>
+      <h2>About this release</h2>
+      <p class="small" id="about"></p>
+    </div>
+  </section>
+</main>
+</body>
+</html>

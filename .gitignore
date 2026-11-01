@@ -10,3 +10,4 @@ gui/dex-contracts/cache/
 .env
 .env.*
 !core/tests/data/*.keys
+web-wallet/app/dist/
