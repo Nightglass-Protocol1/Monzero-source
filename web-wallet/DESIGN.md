@@ -78,9 +78,9 @@ Monzero's wallet code cannot reach a node behind a path prefix such as `/node/`)
   `/sendrawtransaction`, `/get_height`, `/getinfo`, `/get_info`
 
 Everything else returns 403 (checked: start_mining, stop_daemon, get_peer_list). Same origin, so no CORS
-is needed and the page's CSP allows `connect-src 'self'` only. Maximum request body 1 MB. Per-IP limits:
-for now the node's own (100 connections per IP); a proper rate limit (Caddy plugin or firewall) must be
-added before the mainnet wallet goes live.
+is needed and the page's CSP allows `connect-src 'self'` only. Maximum request body 1 MB. Per-visitor limit:
+120 node requests per 10 seconds per IP (caddy-ratelimit plugin, `deploy/install-caddy-ratelimit.sh`). Behind
+the gateway all wallet users reach the node from 127.0.0.1, so the node's own per-IP cap cannot do this.
 
 ## Release process
 
