@@ -37,8 +37,14 @@ ws.onmessage = (m) => {
 };
 const cdp = (method, params = {}) => new Promise((resolve) => { const id = nextId++; waiting.set(id, resolve); ws.send(JSON.stringify({ id, method, params })); });
 const js = async (expr) => (await cdp("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true })).result?.result?.value;
+// Long waits act like a user who is still there: a key press every minute (the wallet locks itself
+// after 10 minutes without use, which earlier runs of this test ran into)
 const waitFor = async (expr, what, seconds = 120) => {
-  for (let i = 0; i < seconds * 2; i++) { if (await js(expr)) return true; await sleep(500); }
+  for (let i = 0; i < seconds * 2; i++) {
+    if (await js(expr)) return true;
+    if (i % 120 === 119) await js(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Shift' }))`);
+    await sleep(500);
+  }
   check(false, "timed out waiting for: " + what); throw new Error(what);
 };
 const visible = (id) => `!document.getElementById(${JSON.stringify(id)}).hidden`;
@@ -95,7 +101,8 @@ try {
   await waitFor(`document.getElementById('sendError').textContent.length>0`, "12 decimals refused", 30);
   check(true, "an amount with 12 decimals is refused");
   await set("sendAmount", "1"); await click("sendReview");
-  await waitFor(visible("sendConfirm"), "confirmation screen", 120);
+  await waitFor(`!document.getElementById('sendConfirm').hidden || document.getElementById('sendError').textContent.length > 0`, "confirmation screen", 180);
+  check(!(await text("sendError")), "the transaction was built: " + ((await text("sendError")) || "ok"));
   const fee = await text("cFee");
   check((await text("cAmount")) === "1" && Number(fee) > 0 && Number(fee) < 0.1, `confirmation shows 1 XMZ and a fee of ${fee}`);
   check((await text("cTo")) === back, "confirmation shows the recipient address");

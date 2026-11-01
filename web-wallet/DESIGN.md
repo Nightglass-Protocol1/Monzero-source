@@ -73,7 +73,7 @@ Monzero's wallet code cannot reach a node behind a path prefix such as `/node/`)
 
 - JSON-RPC methods: `get_info`, `get_last_block_header`, `get_block_header_by_height`,
   `get_block_headers_range`, `get_fee_estimate`, `get_version`, `hard_fork_info`
-- Binary/other: `/getblocks.bin`, `/gethashes.bin`, `/get_o_indexes.bin`, `/get_outs.bin`,
+- Binary/other: `/getblocks.bin`, `/gethashes.bin`, `/get_o_indexes.bin`, `/get_outs.bin`, `/get_output_distribution.bin` (decoy selection when sending),
   `/get_transaction_pool_hashes.bin`, `/gettransactions`, `/get_transaction_pool`,
   `/sendrawtransaction`, `/get_height`, `/getinfo`, `/get_info`
 

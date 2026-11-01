@@ -8,7 +8,7 @@ import http.server, sys, urllib.request, os
 DIST, NODE = os.path.abspath(sys.argv[1]), sys.argv[2].rstrip("/")
 PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8099
 ALLOWED = {"/json_rpc", "/get_info", "/getinfo", "/get_height", "/getheight", "/getblocks.bin", "/get_blocks.bin",
-           "/gethashes.bin", "/get_hashes.bin", "/get_o_indexes.bin", "/get_outs.bin", "/get_transaction_pool_hashes.bin",
+           "/gethashes.bin", "/get_hashes.bin", "/get_o_indexes.bin", "/get_outs.bin", "/get_output_distribution.bin", "/get_transaction_pool_hashes.bin",
            "/gettransactions", "/get_transactions", "/get_transaction_pool", "/sendrawtransaction", "/send_raw_transaction"}
 HEADERS = {
     "Content-Security-Policy": "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self'; img-src 'self' data: blob:; style-src 'self'; font-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
@@ -27,6 +27,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def node(self, method):
         path = self.path.split("?")[0]
+        if os.environ.get("LOG_NODE"):
+            import time; sys.stderr.write(time.strftime("%H:%M:%S ") + method + " " + path + "\n"); sys.stderr.flush()
         length = int(self.headers.get("Content-Length") or 0)
         if length > 1_000_000:
             self.send_error(413); return
@@ -47,7 +49,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return self.node("GET") if self.path.split("?")[0] in ALLOWED else super().do_GET()
 
     def do_POST(self):
-        return self.node("POST") if self.path.split("?")[0] in ALLOWED else self.send_error(403)
+        if self.path.split("?")[0] in ALLOWED:
+            return self.node("POST")
+        sys.stderr.write("refused POST " + self.path + "\n"); sys.stderr.flush()
+        return self.send_error(403)
 
     def log_message(self, *a):
         pass

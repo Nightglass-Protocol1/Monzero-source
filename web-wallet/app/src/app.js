@@ -175,8 +175,26 @@ async function openWallet() {
     async onBalancesChanged() { refresh(); persist(); }
   })());
   refresh();
-  try { await wallet.startSyncing(10000); } catch (e) { $("syncState").textContent = "Cannot reach the node: " + (e.message || e); }
+  syncLoop(wallet);
   armLock();
+}
+
+// Sync every 15 s, then show balances and history and save: the page updates from what the wallet
+// reports after each sync, not only from events
+async function syncLoop(w) {
+  while (wallet === w) {
+    try {
+      await w.sync();
+      if (wallet !== w) return;
+      $("syncBar").style.width = "100%";
+      $("syncState").textContent = "Up to date";
+      await refresh(); await persist();
+    } catch (e) {
+      if (wallet !== w) return;
+      $("syncState").textContent = "Cannot reach the node, retrying… (" + (e.message || e) + ")";
+    }
+    await new Promise((r) => setTimeout(r, 15000));
+  }
 }
 
 async function refresh() {
@@ -202,7 +220,10 @@ async function receive(address) {
 async function drawQr() {
   const amount = $("reqAmount").value.trim();
   const atomic = amount ? parseXmz(amount) : null;
-  const uri = await wallet.getPaymentUri(new moneroTs.MoneroTxConfig(atomic ? { address: currentAddress, amount: atomic } : { address: currentAddress }));
+  // With an amount: Monzero's wallet code builds the link (11-decimal format). Without one, the link
+  // is just monzero:<address>, as Monzero's wallets make it (the library refuses an empty amount).
+  const uri = atomic ? await wallet.getPaymentUri(new moneroTs.MoneroTxConfig({ address: currentAddress, amount: atomic }))
+                     : "monzero:" + currentAddress;
   const qr = qrcode(0, "M"); qr.addData(uri); qr.make();
   $("qr").src = qr.createDataURL(6, 2);
   $("qrText").textContent = amount && !atomic ? "Enter an amount with at most 11 decimals." : uri;

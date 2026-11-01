@@ -11,7 +11,7 @@ wallet.monzero.org {
 		method GET POST
 		path /json_rpc /get_info /getinfo /get_height /getheight
 		path /getblocks.bin /get_blocks.bin /gethashes.bin /get_hashes.bin
-		path /get_o_indexes.bin /get_outs.bin /get_transaction_pool_hashes.bin
+		path /get_o_indexes.bin /get_outs.bin /get_output_distribution.bin /get_transaction_pool_hashes.bin
 		path /gettransactions /get_transactions /get_transaction_pool
 		path /sendrawtransaction /send_raw_transaction
 	}
