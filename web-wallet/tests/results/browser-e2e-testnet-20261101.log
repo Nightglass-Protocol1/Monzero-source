@@ -1,0 +1,27 @@
+ok   testnet badge shown
+ok   a short password is refused
+ok   25 recovery words shown
+ok   Continue is disabled until 'I wrote them down' is ticked
+ok   the words are removed from the page while checking
+ok   wrong words are refused
+ok   testnet address shown (Kb1rLCeX…)
+ok   receive QR drawn
+ok   QR holds monzero:<address>
+15:18:53 funded: 1bc05b8eb4c91ce8167f7f6e18384e81ee4f890baffa391ffae6b073c55c4ae2
+ok   received 3 tXMZ and it unlocked
+ok   the incoming transaction is in History
+ok   a Monero address is refused
+ok   an amount with 12 decimals is refused
+ok   the transaction was built: ok
+ok   confirmation shows 1 XMZ and a fee of 0.0096896
+ok   confirmation shows the recipient address
+15:41:35 sent: c86c2e328aa899ed479595dce29ccb8053d2094b516b47697ed8e9b1f9485a49
+ok   Monzero's own wallet receives exactly 1 tXMZ from the page
+ok   the saved wallet is offered after locking
+ok   the address and balance are cleared when locked
+ok   a wrong password does not open the wallet
+ok   unlocked wallet has the same address
+ok   history survives lock and unlock (stored encrypted in the browser)
+ok   stored keys are encrypted (no recovery words or password in clear)
+ok   no CSP violations or page errors
+ALL PASSED
