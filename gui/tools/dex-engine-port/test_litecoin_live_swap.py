@@ -241,7 +241,7 @@ def light_helper_call(args, configuration, mode, **fields):
     request = dict(schema=f"monzero-{args.chain}-light-{mode}-request-v1", requestId=str(uuid.uuid4()), **fields)
     result = subprocess.run([str(args.light_helper), "--"+mode+"-stdio-v1", str(configuration)],
         input=json.dumps(request).encode(), capture_output=True, timeout=600,
-        env=dict(os.environ, SSL_CERT_FILE=str(args.light_wallet_tls/"root.pem")))
+        env=dict(os.environ, SSL_CERT_FILE=str(args.light_wallet_tls/"root.pem")) if args.light_wallet_tls else dict(os.environ))
     require(result.returncode == 0, "Light wallet helper failed: "+mode)
     response = json.loads(result.stdout)
     require(response["requestId"] == request["requestId"] and response["executable"] is False,
@@ -373,6 +373,23 @@ def recovered_native_balance(wallet, vm_native, role):
     return wallet("get_balance", claim=True)["balance"]
 
 
+class PublicServer:
+    """A public Electrum server named in a light configuration (mainnet stage). The driver
+    cannot see its traffic, so it records none; the cleanup interface matches LiveElectrumPeer."""
+    def __init__(self, host, port):
+        self.host, self.port, self.errors, self.requests = host, port, [], []
+        self.stop, self.release_broadcast_reply = threading.Event(), threading.Event()
+        self.listener = self.thread = self
+    def __enter__(self):
+        return self
+    def __exit__(self, *_):
+        return False
+    def close(self):
+        pass
+    def join(self, *_):
+        pass
+
+
 def run(args):
     if args.remote_host:
         from vm_lab_lease import LabVmLease
@@ -384,17 +401,32 @@ def run(args):
 def _run(args, vm_lease=None):
     require(not args.report.exists(), "Report already exists")
     testnet = args.stage == "testnet"
+    mainnet = args.stage == "mainnet"
+    live = testnet or mainnet  # a real network the driver does not control
+    if mainnet:
+        # Real funds: no node, no throwaway keys, no test certificates (BUYER_LIGHT_AND_MAINNET.md).
+        require(args.chain == "btc" and args.mode == "success" and args.quote_kit and args.light_helper
+            and args.light_seller and args.light_funder and not args.light_wallet_tls and not args.kit_config
+            and not args.remote_host and not args.hand_over_gui and not args.split_processes and not args.control_seed_file,
+            "Mainnet stage: --chain btc --mode success --quote-kit --light-helper --light-seller --light-funder, "
+            "no --light-wallet-tls, kit config, VM, hand-over, split processes or control seed")
+        require(args.xmz_daemon_port and args.xmz_funder_wallet_port and args.btc_payout_address
+            and args.control_file and args.control_public_key and len(set(args.electrum_server)) >= 4,
+            "Mainnet stage needs --xmz-daemon-port, --xmz-funder-wallet-port, --btc-payout-address, --control-file, "
+            "--control-public-key and at least four distinct --electrum-server")
     require(args.btc_test_network == "testnet4" or (args.chain == "btc" and args.stage == "testnet"),
         "--btc-test-network applies to the Bitcoin testnet stage only")
     chain = chain_profile(args.chain, "signet" if args.btc_test_network == "signet" else args.stage)
-    if testnet:
+    if mainnet:
+        pass  # checked above
+    elif testnet:
         require(args.ltc_rpc_port and args.ltc_cookie and args.xmz_daemon_port and args.xmz_funder_wallet_port,
             "Testnet stage needs the caller-run node ports and cookie")
     else:
         require(args.litecoind and args.daemon, "Regtest stage needs the owned node binaries (--litecoind or --bitcoind)")
-    require(not args.light_helper or args.light_wallet_tls, "Light wallet funding needs --light-wallet-tls")
-    require(not args.light_seller or args.light_wallet_tls, "A light-wallet seller needs --light-wallet-tls")
-    require(not args.light_funder or (args.light_helper and args.light_wallet_tls and not args.kit_config and not args.remote_host),
+    require(mainnet or not args.light_helper or args.light_wallet_tls, "Light wallet funding needs --light-wallet-tls")
+    require(mainnet or not args.light_seller or args.light_wallet_tls, "A light-wallet seller needs --light-wallet-tls")
+    require(not args.light_funder or (args.light_helper and (mainnet or args.light_wallet_tls) and not args.kit_config and not args.remote_host),
         "A light-server funder needs --light-helper and --light-wallet-tls (no --kit-config or VM trader yet)")
     if args.light_wallet_tls:
         # The fixture's server certificate lasts 7 days (generate_litecoin_tls_fixture.py);
@@ -460,7 +492,14 @@ def _run(args, vm_lease=None):
                 args.light_wallet_tls, chain["light"], coin=args.chain)
             vm_light.install()  # verify CPU/loader and digest before chain funding
         # ---- Litecoin service ----
-        if testnet:
+        if mainnet:
+            from electrum_node import ElectrumNode
+            servers = [(h, int(p)) for h, _, p in (item.rpartition(":") for item in args.electrum_server)]
+            ltc = ElectrumNode(servers[:2])  # the driver's own cross-checked view; never the traders'
+            require(ltc("getblockhash", 0) == chain["genesis"], "Electrum servers are not on Bitcoin mainnet")
+            ltc_cookie = None
+            evidence.update(electrumServers=args.electrum_server, driverObserver="two public Electrum servers, answers cross-checked")
+        elif testnet:
             ltc = LtcRpc(args.ltc_rpc_port, args.ltc_cookie)
             ltc_cookie = pathlib.Path(args.ltc_cookie)
             info = ltc("getblockchaininfo")
@@ -480,28 +519,37 @@ def _run(args, vm_lease=None):
             ltc = LtcRpc(owned_ltc.port, ltc_cookie)
             ltc("createwallet", "fixture")
         ltc_port = ltc.port
-        anchor = ltc("getnewaddress", "", "bech32", wallet="fixture")
-        if not testnet:
+        if mainnet:
+            # No node wallet: the seller is paid to the owner's own address; the buyer's refund
+            # address is its light wallet's, set below.
+            anchor = ltc_refund = None
+            ltc_payout = args.btc_payout_address
+            ltc("validateaddress", ltc_payout)  # checksum and mainnet prefix, or stop
+        else:
+            anchor = ltc("getnewaddress", "", "bech32", wallet="fixture")
+        if not live:
             ltc("generatetoaddress", 440, anchor)  # Setup coins only; the trade waits on the clock.
-        ltc_payout = ltc("getnewaddress", "", "bech32", wallet="fixture")
-        ltc_refund = ltc("getnewaddress", "", "bech32", wallet="fixture")
+        if not mainnet:
+            ltc_payout = ltc("getnewaddress", "", "bech32", wallet="fixture")
+            ltc_refund = ltc("getnewaddress", "", "bech32", wallet="fixture")
         ltc_atoms = args.ltc_atoms
-        spendable = atoms(ltc("getbalance", wallet="fixture"))
+        spendable = None if mainnet else atoms(ltc("getbalance", wallet="fixture"))
         need = ltc_atoms + (args.light_funding_margin + 20000 if args.light_helper else 100000)
         if args.light_helper:
             # Light selection takes no change or change >= minimum_ltc_output (100000) after the 1000 lock fee.
             change = args.light_funding_margin - 1000
             require(change == 0 or change >= 100000,
                 f"--light-funding-margin {args.light_funding_margin} leaves {change} change; use 1000 or >= 101000")
-        require(spendable >= need, f"{chain['coin']} fixture wallet holds {spendable} atoms; needs {need}")
+        require(mainnet or spendable >= need, f"{chain['coin']} fixture wallet holds {spendable} atoms; needs {need}")
         note("litecoin-ready", height=ltc("getblockcount"), spendableAtoms=str(spendable))
 
         # ---- XMZ service and wallets ----
         source_port, claim_port, observer_port = port(), port(), port()
-        if testnet:
+        if live:
             daemon_port = args.xmz_daemon_port
             info = rpc(daemon_port, "get_info")
-            require(info["nettype"] == "testnet" and info["synchronized"], "XMZ daemon is not a synchronized testnet")
+            require(info["nettype"] == ("mainnet" if mainnet else "testnet") and info["synchronized"],
+                "XMZ daemon is not a synchronized " + ("mainnet" if mainnet else "testnet"))
             xmz_genesis = rpc(daemon_port, "get_block_header_by_height", {"height":0})["block_header"]["hash"]
         else:
             daemon_port, p2p_port = port(), port()
@@ -548,8 +596,10 @@ def _run(args, vm_lease=None):
             addresses[name] = wallet("get_address")["address"]
             wallet("close_wallet")
         wallet("open_wallet", {"filename":"source","password":""})
-        xmz_atoms = 200000000000
-        if testnet:
+        xmz_atoms = args.xmz_atoms
+        if mainnet:
+            require(xmz_genesis == "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4", "XMZ daemon is not on mainnet")
+        if live:
             funder = lambda method, params=None: rpc(args.xmz_funder_wallet_port, method, params)
             funder("refresh")
             sent = funder("transfer", {"destinations":[{"amount":2*xmz_atoms,"address":addresses["source"]}],"priority":1})
@@ -575,7 +625,7 @@ def _run(args, vm_lease=None):
                 require(time.monotonic() < deadline, "Timed out waiting for "+label)
                 if time.monotonic()-last >= KEEPALIVE_SECONDS:
                     keepalive(); last = time.monotonic()
-                time.sleep(5 if testnet else 1)
+                time.sleep(5 if live else 1)
 
         def ltc_depth(txid):
             try:
@@ -603,7 +653,7 @@ def _run(args, vm_lease=None):
             note("app-confirmed", label=label, attempts=len(attempts))
             return value
 
-        if not testnet:
+        if not live:
             clock = BlockClock(ltc, anchor, daemon_port, addresses["mining"], args.ltc_block_seconds, args.xmz_block_seconds)
             clock.start()
         def source_ready():
@@ -618,12 +668,32 @@ def _run(args, vm_lease=None):
             from litecoin_app_light_fixture import create_light_wallet
             light_funding_atoms = ltc_atoms+args.light_funding_margin
             def fund(address):
+                if mainnet:
+                    # The owner pays this address from their own wallet; the driver only watches.
+                    from electrum_node import scripthash
+                    request_file = root/"FUND-THIS-ADDRESS.txt"
+                    request_file.write_text(f"Send exactly {decimal.Decimal(light_funding_atoms)/100000000} BTC "
+                        f"({light_funding_atoms} sats) to\n{address}\n")
+                    note("light-wallet-awaiting-owner-funding", address=address, atoms=str(light_funding_atoms), file=str(request_file))
+                    script = ltc("validateaddress", address)["scriptPubKey"]
+                    def paid():
+                        rows = ltc._agreed("blockchain.scripthash.listunspent", scripthash(script),
+                            key=lambda r: sorted((x["tx_hash"], x["tx_pos"], x["value"], x["height"]) for x in r))
+                        confirmed = [r for r in rows if r["height"] > 0 and r["value"] == light_funding_atoms]
+                        return confirmed[0]["tx_hash"] if len(rows) == 1 and confirmed else None
+                    txid = wait_until("owner funding of the light wallet (exact amount, 1 confirmation)", paid, args.ltc_wait)
+                    note("light-wallet-funded", address=address, txid=txid, atoms=str(light_funding_atoms), source="owner")
+                    evidence.update(lightWalletFundingTxid=txid, lightWalletFundingAtoms=str(light_funding_atoms))
+                    return
                 txid = ltc("sendtoaddress", address, str(decimal.Decimal(light_funding_atoms)/100000000), wallet="fixture")
                 note("light-wallet-funded", address=address, txid=txid, atoms=str(light_funding_atoms))
                 wait_until("light wallet funding confirmation", lambda: ltc_depth(txid) >= 1, args.ltc_wait)
                 evidence.update(lightWalletFundingTxid=txid, lightWalletFundingAtoms=str(light_funding_atoms))
-            (root/"light-electrum").mkdir(mode=0o700)
-            peer = LiveElectrumPeer(ltc, args.light_wallet_tls, root/"light-electrum", ltc("getblockcount"))
+            if mainnet:
+                peer = PublicServer(*servers[0])
+            else:
+                (root/"light-electrum").mkdir(mode=0o700)
+                peer = LiveElectrumPeer(ltc, args.light_wallet_tls, root/"light-electrum", ltc("getblockcount"))
             if vm_light:
                 light_peer = peer.__enter__()
                 remote.forward([light_peer.port])
@@ -659,8 +729,8 @@ def _run(args, vm_lease=None):
             "xmzClaimFeeMaxAtoms":"10000000000","xmzRefundFeeMaxAtoms":"10000000000",
             "ltcPayout":ltc_payout,"ltcRefund":ltc_refund,"xmzPayout":addresses["payout"],"xmzRefund":addresses["reserve"],
             "ltcFundingFeeMaxAtoms":"100000","xmzNativeFeeMaxAtoms":"10000000000",
-            "ltcCancelFeeAtoms":"10000","ltcRefundFeeAtoms":"10000","ltcRedeemFeeAtoms":"10000",
-            "ltcPunishFeeAtoms":"10000","ltcEarlyRefundFeeAtoms":"10000","ltcConfirmations":str(args.ltc_confirmations),"xmzConfirmations":"10",
+            "ltcCancelFeeAtoms":str(args.ltc_fee_atoms),"ltcRefundFeeAtoms":str(args.ltc_fee_atoms),"ltcRedeemFeeAtoms":str(args.ltc_fee_atoms),
+            "ltcPunishFeeAtoms":str(args.ltc_fee_atoms),"ltcEarlyRefundFeeAtoms":str(args.ltc_fee_atoms),"ltcConfirmations":str(args.ltc_confirmations),"xmzConfirmations":"10",
             "cancelBlocks":str(args.cancel_blocks),"punishBlocks":"10","expiresAt":"0","appFeeXmzAtoms":"0",
             "ltcMinimumOutputAtoms":"100000","ltcMinimumRelayFeeAtomsPerKb":"1000"}
         request = {"policy":policy,"terms":terms,"ltc_port":ltc_port,"native_port":daemon_port,
@@ -668,6 +738,9 @@ def _run(args, vm_lease=None):
             "anchor":anchor,"native_source":addresses["source"],"password":secrets.token_hex(16)}
         if testnet:
             request["ltc_cookie"] = str(ltc_cookie)
+        if mainnet:
+            require(args.light_funding_margin >= 3*args.ltc_fee_atoms or args.light_funding_margin == 1000,
+                "Light funding margin must cover the lock fee")
 
         def invoke(action):
             request["action"] = action
@@ -850,9 +923,14 @@ def _run(args, vm_lease=None):
         # ---- One app setup holding every phase (as test_litecoin_paired_chain prepare_app_setup) ----
         app_directory = root/"app-setup"; app_directory.mkdir(mode=0o700)
         app_request = dict(session_request, appDirectory=str(app_directory))
-        ltc_service = {"ltcPort":ltc_port,"ltcWallet":"fixture","ltcAnchor":anchor,"ltcCookieFile":str(ltc_cookie)}
+        ltc_service = None if mainnet else {"ltcPort":ltc_port,"ltcWallet":"fixture","ltcAnchor":anchor,"ltcCookieFile":str(ltc_cookie)}
         seller_service = ltc_service
-        if args.light_seller:
+        if args.light_seller and mainnet:
+            seller_peers.extend(PublicServer(h, p) for h, p in servers[:2])
+            seller_service = {"ltcLight":{"servers":[{"host":peer.host,"port":peer.port} for peer in seller_peers],
+                "maximumTipAge":args.light_seller_tip_age}}
+            note("light-seller-servers", servers=[f"{peer.host}:{peer.port}" for peer in seller_peers])
+        elif args.light_seller:
             # The XMZ seller reaches the chain only through two Electrum servers
             # (SELLER_LIGHT_REDEEM.md). Both read the same node here, so this
             # proves the plumbing and rules, not server independence.
@@ -864,7 +942,13 @@ def _run(args, vm_lease=None):
                 "maximumTipAge":args.light_seller_tip_age}}
             note("light-seller-servers", ports=[peer.port for peer in seller_peers], startHeight=start)
         funder_service = ltc_service
-        if args.light_funder:
+        if args.light_funder and mainnet:
+            # A different pair from the seller's: neither trader depends on the other's servers.
+            funder_peers.extend(PublicServer(h, p) for h, p in servers[2:4])
+            funder_service = {"ltcLight":{"servers":[{"host":peer.host,"port":peer.port} for peer in funder_peers],
+                "maximumTipAge":args.light_seller_tip_age}}
+            note("light-funder-servers", servers=[f"{peer.host}:{peer.port}" for peer in funder_peers])
+        elif args.light_funder:
             # The Bitcoin/Litecoin funder reaches the chain only through two Electrum servers
             # for everything after its light-wallet lock funding (BUYER_LIGHT_AND_MAINNET.md).
             # Like the seller's, both read the same node here: rules and plumbing, not independence.
@@ -920,7 +1004,19 @@ def _run(args, vm_lease=None):
 
         resident_directory = root/"resident-app"; resident_directory.mkdir(mode=0o700)
         startup_request = dict(app_request, initialStartup=True, residentDirectory=str(resident_directory))
-        if testnet:
+        if mainnet:
+            # The owner's signed btc-mainnet document and pinned key; the driver holds no signing key.
+            control_file = root/"control.json"
+            control_file.write_bytes(args.control_file.read_bytes()); control_file.chmod(0o600)
+            payload = json.loads(json.loads(control_file.read_text())["payload"])
+            require(payload["network"] == "btc-mainnet" and payload["newTradesEnabled"] is True
+                and payload["expiresAt"] > time.time()+args.trade_timeout
+                and int(payload["maxLtcAtomsPerTrade"]) >= ltc_atoms and int(payload["maxXmzAtomsPerTrade"]) >= xmz_atoms,
+                "The owner's control document does not enable this trade (network, expiry or limits)")
+            startup_request.update(ltcNetwork=chain["app_stage"], controlPublicKey=args.control_public_key,
+                controlFile=str(control_file))
+            evidence.update(controlDocument=payload)
+        elif testnet:
             # Throwaway testnet-only operator key, created and kept inside this trade workspace.
             # Throwaway per-run key, or the prototype key a hand-over app was built with.
             control_key = SigningKey(bytes.fromhex(args.control_seed_file.read_text().strip())) \
@@ -940,7 +1036,7 @@ def _run(args, vm_lease=None):
             startup_request.update(ltcNetwork=chain["app_stage"])  # the app defaults to Litecoin regtest
         if args.listen_address or args.peer_address:
             startup_request.update(listenAddress=args.listen_address or "127.0.0.1", peerAddress=args.peer_address or "127.0.0.1")
-        tls_root = args.light_wallet_tls/"root.pem" if args.light_helper or args.light_seller or args.light_funder else None
+        tls_root = args.light_wallet_tls/"root.pem" if args.light_wallet_tls and (args.light_helper or args.light_seller or args.light_funder) else None
         if args.kit_config:
             probe = socket.socket(); probe.bind(("127.0.0.1", 0)); kit_port = probe.getsockname()[1]; probe.close()
             if remote:
@@ -1028,7 +1124,7 @@ def _run(args, vm_lease=None):
             ledger_dirs = [resident_directory]
         require(resident.start() == {"schema":"monzero-ltc-resident-startup-fixture-v1",
             "startedAfterApproval":True,"executable":False}, "Resident startup evidence differs")
-        if testnet:
+        if live:
             if remote:
                 (directories["bob"]/"bob-started-trades.json").write_bytes(remote.read("resident/bob-started-trades.json"))
             ledgers = [p for d in ledger_dirs for p in d.glob("*-started-trades.json")]
@@ -1292,13 +1388,13 @@ def _run(args, vm_lease=None):
             evidence.update(remoteNativeWallets=True, remoteNativePayoutAddress=addresses["payout"])
         evidence.update(schema="monzero-ltc-xmz-live-swap-v1", chain=args.chain, swapId=terms["swapId"], policy=policy,
             residentAppSettlement=True, fullCrossChainSettlement=True,
-            killSwitchGatedStart=testnet, chainControlledByDriver=not testnet,
-            chainAdvanceMode="caller-run-testnet" if testnet else "owned-block-clock",
+            killSwitchGatedStart=live, chainControlledByDriver=not live,
+            chainAdvanceMode="bitcoin-mainnet" if mainnet else "caller-run-testnet" if testnet else "owned-block-clock",
             durationSeconds=round(time.monotonic()-started), executable=False)
         # Both seller servers must have carried real work: lock checks and the spend.
-        require(all("blockchain.scripthash.get_history" in peer.requests for peer in seller_peers),
+        require(mainnet or all("blockchain.scripthash.get_history" in peer.requests for peer in seller_peers),
             "A light-seller server was never asked about the contract")
-        require(all("blockchain.scripthash.get_history" in peer.requests for peer in funder_peers),
+        require(mainnet or all("blockchain.scripthash.get_history" in peer.requests for peer in funder_peers),
             "A light-funder server was never asked about the contract")
         passed = True
     finally:
@@ -1339,7 +1435,7 @@ def _run(args, vm_lease=None):
                 raise RuntimeError("Swap settled but process cleanup could not be verified")
         if not passed:
             write_private(pathlib.Path(str(args.report)+".failed.json"), evidence)
-        if passed and not testnet and not args.keep:
+        if passed and not live and not args.keep:
             shutil.rmtree(root)
         if handed_over:
             write_private(args.report, evidence)  # after cleanup, so the report records it
@@ -1350,7 +1446,8 @@ def _run(args, vm_lease=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     path = lambda value: pathlib.Path(value).resolve()
-    parser.add_argument("--stage", choices=("regtest","testnet"), required=True)
+    parser.add_argument("--stage", choices=("regtest","testnet","mainnet"), required=True,
+        help="mainnet: Bitcoin mainnet + XMZ mainnet, light wallets and public Electrum servers only, owner-funded")
     parser.add_argument("--chain", choices=("ltc","btc"), default="ltc", help="UTXO chain traded against XMZ")
     parser.add_argument("--btc-test-network", choices=("testnet4","signet"), default="testnet4",
         help="Bitcoin public test network for the testnet stage")
@@ -1397,6 +1494,13 @@ if __name__ == "__main__":
     parser.add_argument("--listen-address", help="address the native-funder app listens on (testnet allows non-loopback)")
     parser.add_argument("--peer-address", help="address the Litecoin-funder app connects to")
     parser.add_argument("--hand-over-gui", type=path, help="open the real app for each trader and let a person run the trade (needs --kit-config --split-processes)")
+    parser.add_argument("--electrum-server", action="append", default=[], metavar="HOST:PORT",
+        help="mainnet: public Electrum server with CA-valid TLS and verbose transactions (give at least four)")
+    parser.add_argument("--btc-payout-address", help="mainnet: where the seller's Bitcoin is paid (the owner's own bc1 address)")
+    parser.add_argument("--control-file", type=path, help="mainnet: the owner-signed btc-mainnet control document")
+    parser.add_argument("--control-public-key", help="mainnet: the owner's control public key (hex), pinned in the app build")
+    parser.add_argument("--ltc-fee-atoms", type=int, default=10000, help="fee for each contract spend (cancel, refund, redeem, punish)")
+    parser.add_argument("--xmz-atoms", type=int, default=200000000000, help="XMZ locked by the seller (atomic units)")
     parser.add_argument("--control-seed-file", type=path, help="testnet control key seed (hex) matching the app build's pinned control key")
     parser.add_argument("--keep", action="store_true", help="keep the regtest workspace after success")
     parsed = parser.parse_args()
