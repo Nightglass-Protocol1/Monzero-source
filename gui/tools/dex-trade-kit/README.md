@@ -71,13 +71,15 @@ pays XMZ and receives Litecoin.
    The source wallet is only needed by the XMZ funder, the observer wallet only
    by the LTC funder.
 
-   The XMZ funder may skip its Bitcoin/Litecoin node and use Electrum servers
+   Either trader may skip its Bitcoin/Litecoin node and use Electrum servers
    instead: replace the `litecoin` object with
    `{"light": {"servers": [{"host": "a.example", "port": 50002}, {"host": "b.example", "port": 50002}], "maximumTipAge": 5400}}`.
    Use 2–8 independently operated servers; every one must agree before the app
    releases anything, and the best header must be newer than `maximumTipAge`
    seconds (600–10800). See `tools/dex-engine-port/SELLER_LIGHT_REDEEM.md` for
-   the rules and the remaining risk. The LTC funder still needs its node.
+   the rules and the remaining risk. A Bitcoin/Litecoin funder on light servers
+   funds its lock from the app's light wallet; the servers are then used to approve
+   the redeem, cancel, refund and claim its XMZ (`BUYER_LIGHT_AND_MAINNET.md`).
 
    The command verifies both signatures over the canonical
    quote terms and checks that the quote names both parties' keys before
