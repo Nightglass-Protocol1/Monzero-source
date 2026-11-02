@@ -86,10 +86,42 @@ private slots:
         QVERIFY(!job.configure(path,helper,digest));
         DexDeployment::resetForTesting();
     }
+    void bitcoinMainnetStageUsesRealIdentitiesAndNeverMixesNetworks() {
+        DexDeployment::resetForTesting();
+        const auto realXmz=DexDeployment::xmzMainnetGenesis();const auto otherXmz=QString(64,'a');
+        // Local regtest keeps its private XMZ chain (which reports mainnet); empty values never pass.
+        QVERIFY(!DexDeployment::mainnetStage());
+        QVERIFY(DexDeployment::xmzNetworkAllowed("xmz-mainnet",otherXmz));QVERIFY(DexDeployment::xmzNetworkAllowed("xmz-fakechain",otherXmz));
+        QVERIFY(!DexDeployment::xmzNetworkAllowed("",otherXmz));QVERIFY(!DexDeployment::xmzNetworkAllowed("xmz-mainnet",""));
+        // Public test networks never take real XMZ, by name or by genesis.
+        QVERIFY(DexDeployment::selectLitecoinStage("btc-signet"));
+        QVERIFY(DexDeployment::xmzNetworkAllowed("xmz-testnet",otherXmz));
+        QVERIFY(!DexDeployment::xmzNetworkAllowed("xmz-mainnet",otherXmz));QVERIFY(!DexDeployment::xmzNetworkAllowed("xmz-testnet",realXmz));
+        DexDeployment::resetForTesting();
+        QVERIFY(DexDeployment::selectLitecoinStage("btc-mainnet"));
+        QVERIFY(DexDeployment::mainnetStage());QVERIFY(DexDeployment::bitcoinStage());QVERIFY(!DexDeployment::publicTestStage());
+        QCOMPARE(DexDeployment::litecoinNetwork(),QString("btc-mainnet"));QCOMPARE(DexDeployment::litecoinLightNetwork(),QString("main"));
+        QCOMPARE(DexDeployment::litecoinLightCoin(),QString("btc"));QCOMPARE(DexDeployment::swapCoinName(),QString("Bitcoin"));
+        QCOMPARE(DexDeployment::litecoinGenesis(),QString("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"));
+        QVERIFY(DexDeployment::litecoinNetworkAllowed("btc-mainnet"));
+        for (const auto &other:{"btc-signet","btc-testnet4","btc-regtest","ltc-testnet","ltc-regtest"}) QVERIFY(!DexDeployment::litecoinNetworkAllowed(other));
+        QVERIFY(DexDeployment::xmzNetworkAllowed("xmz-mainnet",realXmz));
+        QVERIFY(!DexDeployment::xmzNetworkAllowed("xmz-mainnet",otherXmz));
+        for (const auto &other:{"xmz-testnet","xmz-stagenet","xmz-fakechain",""}) QVERIFY(!DexDeployment::xmzNetworkAllowed(other,realXmz));
+        QVERIFY(!DexDeployment::selectLitecoinStage("btc-signet"));
+        QCOMPARE(LitecoinJournalProtocol::bech32Prefix("btc-mainnet"),QString("bc1"));
+        QVERIFY(LightWalletProfile::networkAllowed("btc","main"));QCOMPARE(LightWalletProfile::witnessPrefix("btc","main"),QString("bc"));
+        QCOMPARE(LightWalletProfile::receivePath("btc","main",0),QString("84'/0'/0'/0/"));
+        // Mainnet always needs a signed control document before a new trade starts.
+        DexRiskControl control;control.setNetwork("btc-mainnet");
+        QVERIFY(control.status().value("controlRequired").toBool());
+        QVERIFY(!control.refusal(QUuid::createUuid().toString(QUuid::WithoutBraces),1,1).isEmpty());
+        DexDeployment::resetForTesting();
+    }
     void bitcoinDeploymentStagesUseBitcoinIdentities() {
         DexDeployment::resetForTesting();
         QCOMPARE(DexDeployment::litecoinLightCoin(),QString("ltc"));QVERIFY(!DexDeployment::bitcoinStage());
-        for (const auto &bad:{"btc-testnet","btc-mainnet","bitcoin","BTC-REGTEST","btc-testnet3"}) QVERIFY(!DexDeployment::selectLitecoinStage(bad));
+        for (const auto &bad:{"btc-testnet","bitcoin","BTC-REGTEST","btc-testnet3","btc-main","ltc-mainnet","mainnet"}) QVERIFY(!DexDeployment::selectLitecoinStage(bad));
         QVERIFY(DexDeployment::selectLitecoinStage("btc-regtest"));
         QVERIFY(DexDeployment::bitcoinStage());QVERIFY(!DexDeployment::publicTestStage());
         QCOMPARE(DexDeployment::litecoinNetwork(),QString("btc-regtest"));QCOMPARE(DexDeployment::litecoinLightNetwork(),QString("regtest"));
@@ -3386,9 +3418,9 @@ sys.stdout.write(json.dumps(response,sort_keys=True,separators=(',',':')))
     }
     void multiCoinPreviewsAndExecutionGates() {
         DexEngine engine;
-        QCOMPARE(engine.supportedPairs().size(), 7);
+        QCOMPARE(engine.supportedPairs().size(), 8);
         const QMap<QString, int> coins{{"BTC",8},{"LTC",8},{"BCH",8},
-            {"XMR",12},{"DOGE",8},{"ETH",18},{"RUNE",8}};
+            {"XMR",12},{"DOGE",8},{"ETH",18},{"BNB",18},{"RUNE",8}};
         for (auto it = coins.begin(); it != coins.end(); ++it) {
             const QString pair = it.key() + " / XMZ";
             const auto info = engine.marketInfo(pair);

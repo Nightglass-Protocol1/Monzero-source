@@ -441,7 +441,7 @@ int main(int argc, char *argv[])
     QCommandLineOption dexLtcReservationOption("dex-ltc-reservation", "Configure isolated Litecoin input reservation and recovery exchange; no funding broadcast.", "config");
     dexLtcReservationOption.setFlags(QCommandLineOption::HiddenFromHelp);
     parser.addOption(dexLtcReservationOption);
-    QCommandLineOption dexLtcNetworkOption("dex-ltc-network", "Swap chain network: regtest (default) or testnet for Litecoin, btc-regtest, btc-testnet4 or btc-signet for Bitcoin. Mainnet is not available.", "network");
+    QCommandLineOption dexLtcNetworkOption("dex-ltc-network", "Swap chain network: regtest (default) or testnet for Litecoin, btc-regtest, btc-testnet4 or btc-signet for Bitcoin, or btc-mainnet (real funds; needs MONZERO_DEX_MAINNET=I_ACCEPT_REAL_FUNDS_RISK and a signed control document).", "network");
     dexLtcNetworkOption.setFlags(QCommandLineOption::HiddenFromHelp);
     parser.addOption(dexLtcNetworkOption);
     QCommandLineOption dexControlFileOption("dex-control-file", "Signed operator control document (kill switch and trade limits) from a private local file.", "file");
@@ -660,8 +660,12 @@ int main(int argc, char *argv[])
     engine.rootContext()->setContextProperty("dexPrototypeEnabled", dexPrototypeEnabled);
 #ifdef WITH_DEX_PROTOTYPE
     if (parser.isSet(dexLtcNetworkOption)) {
-        if (!dexPrototypeEnabled || !DexDeployment::selectLitecoinStage(parser.value(dexLtcNetworkOption))) {
-            qCritical("Swap network rejected; only regtest, testnet, btc-regtest, btc-testnet4 or btc-signet is available");return 1;
+        const QString swapNetwork=parser.value(dexLtcNetworkOption);
+        if (swapNetwork=="btc-mainnet" && qgetenv("MONZERO_DEX_MAINNET")!="I_ACCEPT_REAL_FUNDS_RISK") {
+            qCritical("Bitcoin mainnet swaps use real funds; set MONZERO_DEX_MAINNET=I_ACCEPT_REAL_FUNDS_RISK to opt in");return 1;
+        }
+        if (!dexPrototypeEnabled || !DexDeployment::selectLitecoinStage(swapNetwork)) {
+            qCritical("Swap network rejected; only regtest, testnet, btc-regtest, btc-testnet4, btc-signet or btc-mainnet is available");return 1;
         }
     }
     DexDeployment::lockLitecoinStage();
