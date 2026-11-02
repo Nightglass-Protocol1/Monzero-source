@@ -68,6 +68,7 @@ def scripthash(script_hex):
 class _Session:
     def __init__(self, host, port, timeout):
         context = ssl.create_default_context()  # certificate authorities only
+        self.name = f"{host}:{port}"
         self.socket = context.wrap_socket(socket.create_connection((host, port), timeout=timeout), server_hostname=host)
         self.file = self.socket.makefile("rwb")
         self.next_id = 0
@@ -85,7 +86,11 @@ class _Session:
             reply = json.loads(line)
             if reply.get("error"):
                 raise ElectrumError(str(reply["error"]))
-            return reply.get("result")
+            if reply.get("result") is None:
+                # None of the calls used here can legitimately answer null (seen once on
+                # mainnet for listunspent): treat it as a failed answer, never as "nothing".
+                raise ElectrumError(f"{self.name} answered null to {method}")
+            return reply["result"]
 
     def close(self):
         try:
