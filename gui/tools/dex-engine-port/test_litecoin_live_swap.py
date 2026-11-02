@@ -394,6 +394,8 @@ def _run(args, vm_lease=None):
         require(args.litecoind and args.daemon, "Regtest stage needs the owned node binaries (--litecoind or --bitcoind)")
     require(not args.light_helper or args.light_wallet_tls, "Light wallet funding needs --light-wallet-tls")
     require(not args.light_seller or args.light_wallet_tls, "A light-wallet seller needs --light-wallet-tls")
+    require(not args.light_funder or (args.light_helper and args.light_wallet_tls and not args.kit_config and not args.remote_host),
+        "A light-server funder needs --light-helper and --light-wallet-tls (no --kit-config or VM trader yet)")
     if args.light_wallet_tls:
         # The fixture's server certificate lasts 7 days (generate_litecoin_tls_fixture.py);
         # an expired one otherwise shows up only as a stalled light-wallet step.
@@ -422,9 +424,9 @@ def _run(args, vm_lease=None):
     root = pathlib.Path(tempfile.mkdtemp(prefix=f"ltc-xmz-live-{args.stage}-", dir=args.temp_parent)).resolve()
     print("Trade workspace: "+str(root), flush=True)
     processes, owned_ltc, clock, resident, light_peer = [], None, None, None, None
-    seller_peers = []
+    seller_peers, funder_peers = [], []
     remote = vm_native = vm_light = None
-    evidence = {"stage":args.stage,"mode":args.mode,"workspace":str(root),"timeline":[],"lightSeller":args.light_seller}
+    evidence = {"stage":args.stage,"mode":args.mode,"workspace":str(root),"timeline":[],"lightSeller":args.light_seller,"lightFunder":args.light_funder}
     started = time.monotonic()
 
     def note(event, **fields):
@@ -861,6 +863,18 @@ def _run(args, vm_lease=None):
             seller_service = {"ltcLight":{"servers":[{"host":"localhost","port":peer.port} for peer in seller_peers],
                 "maximumTipAge":args.light_seller_tip_age}}
             note("light-seller-servers", ports=[peer.port for peer in seller_peers], startHeight=start)
+        funder_service = ltc_service
+        if args.light_funder:
+            # The Bitcoin/Litecoin funder reaches the chain only through two Electrum servers
+            # for everything after its light-wallet lock funding (BUYER_LIGHT_AND_MAINNET.md).
+            # Like the seller's, both read the same node here: rules and plumbing, not independence.
+            start = ltc("getblockcount")
+            for index in range(2):
+                directory = root/f"funder-electrum-{index}"; directory.mkdir(mode=0o700)
+                funder_peers.append(LiveElectrumPeer(ltc, args.light_wallet_tls, directory, start).__enter__())
+            funder_service = {"ltcLight":{"servers":[{"host":"localhost","port":peer.port} for peer in funder_peers],
+                "maximumTipAge":args.light_seller_tip_age}}
+            note("light-funder-servers", ports=[peer.port for peer in funder_peers], startHeight=start)
         funding_rpc = root/"app-funding-rpc.json"
         write_private(funding_rpc, dict(seller_service, schema="monzero-private-ltc-funding-rpc-v2",
             nativeDaemonPort=daemon_port, nativeWalletPort=source_port,
@@ -871,7 +885,7 @@ def _run(args, vm_lease=None):
         funding_path = root/"app-funding.json"; write_private(funding_path, json.loads(json.dumps(funding, sort_keys=True)))
         app_request["aliceSettlementConfig"] = str(funding_path)
         reservation_rpc = root/"app-reservation-rpc.json"
-        write_private(reservation_rpc, dict(ltc_service, schema="monzero-private-ltc-reservation-rpc-v1",
+        write_private(reservation_rpc, dict(funder_service, schema="monzero-private-ltc-reservation-rpc-v1",
             reservationDirectory=str(root/"reservations"), feeRateAtomsPerKb=1000))
         reservation = root/"app-reservation.json"
         write_private(reservation, {"journalConfigFile":str(startup_configs["litecoin-funder"][2]),
@@ -883,7 +897,7 @@ def _run(args, vm_lease=None):
                 out.write(request["password"].encode())
             observer = source_port if purpose == "refund" else observer_port
             rpc_path = root/("app-"+label+"-payment-rpc.json")
-            write_private(rpc_path, dict(seller_service if purpose == "refund" else ltc_service,
+            write_private(rpc_path, dict(seller_service if purpose == "refund" else funder_service,
                 schema="monzero-private-ltc-"+purpose+"-rpc-v4",
                 nativeDaemonPort=daemon_port, nativeWalletPort=claim_port,
                 nativeLoginFile=str(root/f"monzero-wallet-rpc.{claim_port}.login"),
@@ -896,7 +910,7 @@ def _run(args, vm_lease=None):
             write_private(payment_path, json.loads(json.dumps(config, sort_keys=True)))
             app_request[label+"PaymentConfig"] = str(payment_path)
         redeem_rpc = root/"app-redeem-rpc.json"
-        write_private(redeem_rpc, dict(ltc_service, schema="monzero-private-ltc-redeem-rpc-v1",
+        write_private(redeem_rpc, dict(funder_service, schema="monzero-private-ltc-redeem-rpc-v1",
             nativeDaemonPort=daemon_port, observerWalletPort=observer_port,
             observerLoginFile=str(root/f"monzero-wallet-rpc.{observer_port}.login"), safetyBlocks=2))
         wrapper = root/"app-redeem.json"
@@ -926,7 +940,7 @@ def _run(args, vm_lease=None):
             startup_request.update(ltcNetwork=chain["app_stage"])  # the app defaults to Litecoin regtest
         if args.listen_address or args.peer_address:
             startup_request.update(listenAddress=args.listen_address or "127.0.0.1", peerAddress=args.peer_address or "127.0.0.1")
-        tls_root = args.light_wallet_tls/"root.pem" if args.light_helper or args.light_seller else None
+        tls_root = args.light_wallet_tls/"root.pem" if args.light_helper or args.light_seller or args.light_funder else None
         if args.kit_config:
             probe = socket.socket(); probe.bind(("127.0.0.1", 0)); kit_port = probe.getsockname()[1]; probe.close()
             if remote:
@@ -1284,6 +1298,8 @@ def _run(args, vm_lease=None):
         # Both seller servers must have carried real work: lock checks and the spend.
         require(all("blockchain.scripthash.get_history" in peer.requests for peer in seller_peers),
             "A light-seller server was never asked about the contract")
+        require(all("blockchain.scripthash.get_history" in peer.requests for peer in funder_peers),
+            "A light-funder server was never asked about the contract")
         passed = True
     finally:
         if clock:
@@ -1308,6 +1324,13 @@ def _run(args, vm_lease=None):
                 evidence[f"sellerElectrum{index}Requests"] = len(peer.requests)
             except Exception as error:
                 cleanup_errors.append("SellerPeer:" + type(error).__name__)
+        for index, peer in enumerate(funder_peers):
+            try:
+                peer.stop.set(); peer.listener.close(); peer.thread.join(10)
+                evidence[f"funderElectrum{index}Errors"] = peer.errors
+                evidence[f"funderElectrum{index}Requests"] = len(peer.requests)
+            except Exception as error:
+                cleanup_errors.append("FunderPeer:" + type(error).__name__)
         evidence["cleanupVerified"] = not cleanup_errors
         if cleanup_errors:
             evidence["cleanupErrors"] = cleanup_errors
@@ -1345,6 +1368,8 @@ if __name__ == "__main__":
     parser.add_argument("--light-helper", type=path, help="fund the Litecoin lock from a disposable local light wallet")
     parser.add_argument("--light-wallet-tls", type=path, help="Electrum TLS fixture directory (server.der, server-key.der, root.pem)")
     parser.add_argument("--light-seller", action="store_true", help="the XMZ seller uses two Electrum servers instead of the node")
+    parser.add_argument("--light-funder", action="store_true", help="the Bitcoin/Litecoin funder uses two Electrum servers for "
+        "redeem approval, cancel, refund and payout instead of the node (needs --light-helper for its lock funding)")
     parser.add_argument("--light-seller-tip-age", type=int, default=5400, help="seconds the seller accepts its best header being old")
     parser.add_argument("--ltc-atoms", type=int, default=100000000)
     parser.add_argument("--ltc-confirmations", type=int, default=2, help="lock confirmations bound into the quote")
