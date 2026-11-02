@@ -634,6 +634,11 @@ def _run(args, vm_lease=None):
                 return int(ltc("getrawtransaction", txid, True).get("confirmations", 0))
             except RpcError:
                 return 0
+            except Exception as error:
+                # Mainnet: a transaction the servers do not know yet, or a server briefly away.
+                if mainnet and type(error).__name__ == "ElectrumError":
+                    return 0
+                raise
 
         def xmz_depth(txid):
             found = xmz_transaction(daemon_port, txid)
@@ -678,9 +683,14 @@ def _run(args, vm_lease=None):
                         f"({light_funding_atoms} sats) to\n{address}\n")
                     note("light-wallet-awaiting-owner-funding", address=address, atoms=str(light_funding_atoms), file=str(request_file))
                     script = ltc("validateaddress", address)["scriptPubKey"]
+                    from electrum_node import ElectrumError
                     def paid():
-                        rows = ltc._agreed("blockchain.scripthash.listunspent", scripthash(script),
-                            key=lambda r: sorted((x["tx_hash"], x["tx_pos"], x["value"], x["height"]) for x in r))
+                        try:
+                            rows = ltc._agreed("blockchain.scripthash.listunspent", scripthash(script),
+                                key=lambda r: sorted((x["tx_hash"], x["tx_pos"], x["value"], x["height"]) for x in r))
+                        except ElectrumError as error:
+                            note("electrum-retry", reason=str(error)[:120])  # wait again; never treat as paid
+                            return None
                         confirmed = [r for r in rows if r["height"] > 0 and r["value"] == light_funding_atoms]
                         return confirmed[0]["tx_hash"] if len(rows) == 1 and confirmed else None
                     txid = wait_until("owner funding of the light wallet (exact amount, 1 confirmation)", paid, args.ltc_wait)

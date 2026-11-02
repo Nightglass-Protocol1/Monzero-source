@@ -124,15 +124,25 @@ class ElectrumNode:
             self.sessions[server] = _Session(*server, self.timeout)
         return self.sessions[server]
 
-    def _all(self, method, *params):
-        answers = []
-        for server in self.servers:
+    def _ask(self, server, method, *params):
+        """Public servers drop idle connections; a broken connection is retried once on a
+        fresh one. A server's own error reply is never retried."""
+        for attempt in (1, 2):
             try:
-                answers.append(self._session(server).call(method, *params))
-            except (OSError, ElectrumError):
-                self.sessions.pop(server, None)
-                raise
-        return answers
+                return self._session(server).call(method, *params)
+            except (OSError, ConnectionError, ValueError) as error:
+                broken = error
+            except ElectrumError as error:
+                if str(error) != "server closed the connection":
+                    raise
+                broken = error
+            stale = self.sessions.pop(server, None)
+            if stale:
+                stale.close()
+        raise ElectrumError(f"{server[0]}:{server[1]} unreachable: {broken}")
+
+    def _all(self, method, *params):
+        return [self._ask(server, method, *params) for server in self.servers]
 
     def _agreed(self, method, *params, key=lambda a: a):
         answers = self._all(method, *params)
