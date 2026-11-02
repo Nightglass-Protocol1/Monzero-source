@@ -602,8 +602,10 @@ def _run(args, vm_lease=None):
         if live:
             funder = lambda method, params=None: rpc(args.xmz_funder_wallet_port, method, params)
             funder("refresh")
-            sent = funder("transfer", {"destinations":[{"amount":2*xmz_atoms,"address":addresses["source"]}],"priority":1})
-            note("xmz-source-funded", txid=sent["tx_hash"], atoms=str(2*xmz_atoms))
+            # Enough for the lock plus its fees, whatever the lock size (source_ready wants +0.1 XMZ).
+            source_atoms = max(2*xmz_atoms, xmz_atoms+20000000000)
+            sent = funder("transfer", {"destinations":[{"amount":source_atoms,"address":addresses["source"]}],"priority":1})
+            note("xmz-source-funded", txid=sent["tx_hash"], atoms=str(source_atoms))
         else:
             rpc(daemon_port, "generateblocks", {"wallet_address":addresses["source"],"amount_of_blocks":131})
 
