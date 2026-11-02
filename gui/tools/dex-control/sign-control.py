@@ -10,7 +10,7 @@ so a replayed "enabled" document cannot undo a later stop. Validity is at most
 30 days; on testnet/mainnet an expired document pauses new trades.
 """
 import argparse, json, time
-import nacl.signing
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 def main():
     p = argparse.ArgumentParser()
@@ -35,8 +35,8 @@ def main():
     }
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     with open(a.keyfile) as f:
-        key = nacl.signing.SigningKey(bytes.fromhex(f.read().strip()))
-    signature = key.sign(b"monzero-dex-control-v1\0" + body.encode()).signature.hex()
+        key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(f.read().strip()))
+    signature = key.sign(b"monzero-dex-control-v1\0" + body.encode()).hex()
     print(json.dumps({"payload": body, "signature": signature}, sort_keys=True, separators=(",", ":")), end="")
 
 if __name__ == "__main__":
