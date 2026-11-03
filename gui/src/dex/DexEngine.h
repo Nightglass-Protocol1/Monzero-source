@@ -346,6 +346,9 @@ public:
     Q_INVOKABLE bool submitLitecoinStart(const QString &commitment);
     // Operator kill switch and caps; consulted only before starting a new trade.
     DexRiskControl *riskControl() const {return m_riskControl;}
+    DexRiskControl *evmRiskControl() const {return m_evmRiskControl;}
+    // The signed control document for the EVM network is loaded when the trade binds its chain.
+    void setEvmControlFile(const QString &path) {m_evmControlFile=path;}
     QVariantMap dexRiskStatus() const;
     // Empty when the configured Litecoin start may proceed; otherwise a user-facing reason.
     QString litecoinStartRefusal() const;
@@ -480,7 +483,7 @@ private:
     BchNativeObservationJob *m_bchNativeObservation;
     EvmTradeJob *m_evmTrade;
     QTimer *m_evmTicker;
-    QString m_evmSeedFile;
+    QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();
     BchSuccessReleaseReviewJob *m_bchSuccessReleaseReview;
     BchSuccessReleaseReviewJob *m_bchSuccessSignedReleaseReview;
@@ -494,7 +497,7 @@ private:
     BchRefundWalletJob *m_bchRefundWallet;
     QPointer<SwapWalletRpcProcess> m_bchRefundWalletOwner;
     QPointer<SwapWalletRpcProcess> m_bchRefundWalletService;
-    DexRiskControl *m_riskControl;
+    DexRiskControl *m_riskControl,*m_evmRiskControl;
     QString m_tradeRoot,m_loadedTradeId;
     QVariantList m_tradeFolders;
     QVariantMap m_ltcSetupReview;

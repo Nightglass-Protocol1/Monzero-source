@@ -16,7 +16,7 @@ runtime env `MONZERO_ENABLE_PRIVATE_DEX`). No shipped build enables DEX trading 
   for an EVM-configured app defaults to the unused `ltc-regtest` (needs no document). So in a
   build where EVM trades were enabled, the owner's kill switch and caps would not cover them.
 
-## Requirement 1 — the kill switch and caps must cover EVM trades
+## Requirement 1 — the kill switch and caps must cover EVM trades  [DONE 2026-11-03]
 Before a public build enables BNB/ETH trading, an EVM trade's first fund-committing step must
 pass `DexRiskControl::refusal(tradeId, nonXmzAtoms, xmzAtoms)` and be recorded with
 `recordStart` (count before dispatch, as the UTXO path does: a crash after recording only makes
@@ -29,7 +29,14 @@ The control document is per-network and the owner signs it. Options:
    `btc-mainnet` is today (sign-control.py already generalised to Bitcoin networks; extend to
    the EVM names). An EVM-configured app sets the risk-control network accordingly.
 2. One document that carries caps for several networks at once (schema change; one signature).
-Recommendation: option 1 — smallest change, one network per app instance, consistent with the
+DECISION (owner): option 1, per EVM network (bnb-mainnet). IMPLEMENTED: DexEngine::approveEvmTrade
+now gates the first approval through a second DexRiskControl (m_evmRiskControl, own ledger), bound to
+the trade's chain via the offer chainId (56->bnb-mainnet, 1->eth-mainnet, test/local->evm-regtest, no
+doc). Document loaded from --dex-evm-control-file. sign-control.py accepts bnb-mainnet/bnb-testnet/
+eth-mainnet. Test: evmNetworkControlDocument (dex_tests 84/0/21). Note: BNB caps are wei in quint64
+(fine below ~18 BNB; raise to 128-bit if larger caps are ever needed).
+
+(Original recommendation: option 1 — smallest change, one network per app instance, consistent with the
 current per-stage model. It needs the EVM network name wired into DexRiskControl::setNetwork for
 EVM-configured apps, and sign-control.py to accept the EVM network names.
 
@@ -63,5 +70,6 @@ safety gate above.
 2. Wire EVM trades through DexRiskControl (Requirement 1) with tests.
 3. In-app offer taking (Requirement 4).
 4. 1% fee (Requirement 3) once addresses exist.
+4b. (done) EVM gating.
 5. Build the public/dev edition split (Requirement 2); fail-closed verified on both sides.
 6. Community pentest round against the public beta.

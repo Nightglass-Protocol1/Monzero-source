@@ -22,6 +22,9 @@ public:
     // After the trade: send what its account holds to the user's own wallet (e.g. MetaMask)
     bool payout(QByteArray &walletSeed,const QString &address);
     QVariantMap status() const;
+    // For the operator kill switch / caps gate (DexEngine): the pinned trade and its offer.
+    QString tradeId() const {return m_trade;}
+    QJsonObject offer() const {return m_snapshot.value("offer").toObject();}
 signals:
     void changed();
 private:
