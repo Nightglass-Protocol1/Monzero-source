@@ -80,10 +80,17 @@ class _Session:
             self.next_id += 1
             self.file.write((json.dumps({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": list(params)}) + "\n").encode())
             self.file.flush()
-            line = self.file.readline()
-            if not line:
-                raise ElectrumError("server closed the connection")
-            reply = json.loads(line)
+            while True:
+                line = self.file.readline()
+                if not line:
+                    raise ElectrumError("server closed the connection")
+                reply = json.loads(line)
+                # After blockchain.headers.subscribe the server pushes a notification for every
+                # new block (no id); it is not the reply to this request.
+                if reply.get("id") == self.next_id:
+                    break
+                if "id" in reply and reply["id"] is not None:
+                    raise ElectrumError(f"{self.name} replied out of order")
             if reply.get("error"):
                 raise ElectrumError(str(reply["error"]))
             if reply.get("result") is None:
