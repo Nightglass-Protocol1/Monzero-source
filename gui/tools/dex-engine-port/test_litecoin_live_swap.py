@@ -698,7 +698,13 @@ def _run(args, vm_lease=None):
                     note("light-wallet-funded", address=address, txid=txid, atoms=str(light_funding_atoms), source="owner")
                     evidence.update(lightWalletFundingTxid=txid, lightWalletFundingAtoms=str(light_funding_atoms))
                     return
-                txid = ltc("sendtoaddress", address, str(decimal.Decimal(light_funding_atoms)/100000000), wallet="fixture")
+                amount = str(decimal.Decimal(light_funding_atoms)/100000000)
+                if args.ltc_funding_fee_rate:
+                    # Test networks' fee estimates can spike absurdly (signet, 3 Nov 2026); pay a fixed rate.
+                    txid = ltc("sendtoaddress", address, amount, "", "", False, True, None, "unset", None,
+                        args.ltc_funding_fee_rate, wallet="fixture")
+                else:
+                    txid = ltc("sendtoaddress", address, amount, wallet="fixture")
                 note("light-wallet-funded", address=address, txid=txid, atoms=str(light_funding_atoms))
                 wait_until("light wallet funding confirmation", lambda: ltc_depth(txid) >= 1, args.ltc_wait)
                 evidence.update(lightWalletFundingTxid=txid, lightWalletFundingAtoms=str(light_funding_atoms))
@@ -1547,6 +1553,7 @@ if __name__ == "__main__":
     parser.add_argument("--btc-payout-address", help="mainnet: where the seller's Bitcoin is paid (the owner's own bc1 address)")
     parser.add_argument("--control-file", type=path, help="mainnet: the owner-signed btc-mainnet control document")
     parser.add_argument("--control-public-key", help="mainnet: the owner's control public key (hex), pinned in the app build")
+    parser.add_argument("--ltc-funding-fee-rate", type=float, help="test networks: sat/vB for the fixture wallet's payments")
     parser.add_argument("--ltc-fee-atoms", type=int, default=10000, help="fee for each contract spend (cancel, refund, redeem, punish)")
     parser.add_argument("--xmz-atoms", type=int, default=200000000000, help="XMZ locked by the seller (atomic units)")
     parser.add_argument("--control-seed-file", type=path, help="testnet control key seed (hex) matching the app build's pinned control key")
