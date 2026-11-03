@@ -414,6 +414,7 @@ def _run(args, vm_lease=None):
             and args.control_file and args.control_public_key and len(set(args.electrum_server)) >= 4,
             "Mainnet stage needs --xmz-daemon-port, --xmz-funder-wallet-port, --btc-payout-address, --control-file, "
             "--control-public-key and at least four distinct --electrum-server")
+    require(not args.existing_light_wallet or mainnet, "--existing-light-wallet is for the mainnet stage")
     require(args.btc_test_network == "testnet4" or (args.chain == "btc" and args.stage == "testnet"),
         "--btc-test-network applies to the Bitcoin testnet stage only")
     chain = chain_profile(args.chain, "signet" if args.btc_test_network == "signet" else args.stage)
@@ -706,7 +707,31 @@ def _run(args, vm_lease=None):
             else:
                 (root/"light-electrum").mkdir(mode=0o700)
                 peer = LiveElectrumPeer(ltc, args.light_wallet_tls, root/"light-electrum", ltc("getblockcount"))
-            if vm_light:
+            if args.existing_light_wallet:
+                # Mainnet: reuse a light wallet the owner already funded in an earlier run that stopped
+                # before any trade was signed. Its keys stay where they are; only this run uses it.
+                old = args.existing_light_wallet
+                (root/"local-light-wallet").symlink_to(old/"local-light-wallet")
+                args.light_helper = args.gui_light_recovery_helper = old/"light-helper"
+                digest = hashlib.sha256(args.light_helper.read_bytes()).hexdigest()
+                address = (old/"FUND-THIS-ADDRESS.txt").read_text().split()[-1]
+                config = old/"local-light-wallet/setupDirectory/litecoin-wallet.json"
+                from electrum_node import scripthash
+                rows = ltc._agreed("blockchain.scripthash.listunspent", scripthash(ltc("validateaddress", address)["scriptPubKey"]),
+                    key=lambda r: sorted((x["tx_hash"], x["tx_pos"], x["value"], x["height"]) for x in r))
+                require(len(rows) == 1 and rows[0]["height"] > 0 and rows[0]["value"] == light_funding_atoms,
+                    f"The reused light wallet must hold exactly one confirmed {light_funding_atoms}-sat output")
+                launcher = old/"local-light-wallet/launcher.json"
+                if not launcher.exists():
+                    write_private(launcher, dict(sorted(dict(schema=f"monzero-private-{args.chain}-light-launcher-v1",
+                        configFile=str(config), helper=str(args.light_helper), helperDigest=digest).items())))
+                light_peer = peer
+                light_setup = dict(helperSha256=digest, seedEncoding="bip39-english-v1", address=address,
+                    configurationFile=str(config), launcher=str(launcher))
+                note("light-wallet-reused", address=address, fundingTxid=rows[0]["tx_hash"], atoms=str(light_funding_atoms), source=str(old))
+                evidence.update(lightWalletFundingTxid=rows[0]["tx_hash"], lightWalletFundingAtoms=str(light_funding_atoms),
+                    lightWalletReusedFrom=str(old))
+            elif vm_light:
                 light_peer = peer.__enter__()
                 remote.forward([light_peer.port])
                 light_setup = vm_light.create(light_peer.port)
@@ -1508,6 +1533,8 @@ if __name__ == "__main__":
     parser.add_argument("--hand-over-gui", type=path, help="open the real app for each trader and let a person run the trade (needs --kit-config --split-processes)")
     parser.add_argument("--electrum-server", action="append", default=[], metavar="HOST:PORT",
         help="mainnet: public Electrum server with CA-valid TLS and verbose transactions (give at least four)")
+    parser.add_argument("--existing-light-wallet", type=path,
+        help="mainnet: workspace of an earlier run whose light wallet the owner already funded (no trade signed there)")
     parser.add_argument("--btc-payout-address", help="mainnet: where the seller's Bitcoin is paid (the owner's own bc1 address)")
     parser.add_argument("--control-file", type=path, help="mainnet: the owner-signed btc-mainnet control document")
     parser.add_argument("--control-public-key", help="mainnet: the owner's control public key (hex), pinned in the app build")
