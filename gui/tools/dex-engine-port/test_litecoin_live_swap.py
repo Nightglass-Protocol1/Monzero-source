@@ -920,8 +920,17 @@ def _run(args, vm_lease=None):
                 sent = read_light_funding(resident, "observe")["result"]
             else:
                 sent = send_retained_light_funding(resident, txid, send_review, note)
-            require(sent["txid"] == txid and ltc("getrawtransaction", txid, True)["txid"] == txid,
-                "Local funding not accepted by the node")
+            require(sent["txid"] == txid, "Local funding reported a different transaction")
+            # Public servers learn a broadcast seconds apart: wait until the driver's own view
+            # has it instead of demanding it at once (found in the first real mainnet swap).
+            def known():
+                try:
+                    return ltc("getrawtransaction", txid, True)["txid"] == txid
+                except Exception as error:
+                    if type(error).__name__ in ("RpcError", "ElectrumError"):
+                        return False
+                    raise
+            wait_until("lock transaction visible to the driver", known, 600)
             note("ltc-lock-sent", txid=txid, source="light-wallet")
             call("send", accepted=False, commitment=send)
             call("retry", accepted=False, commitment=send)
