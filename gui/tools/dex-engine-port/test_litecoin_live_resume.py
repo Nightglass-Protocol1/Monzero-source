@@ -24,10 +24,24 @@ from litecoin_app_fixture import LitecoinAppFixture
 
 def run(args):
     root = pathlib.Path(args.workspace).resolve()
-    request = json.loads((root/"request.json").read_text())
-    terms, policy = request["terms"], request["policy"]
+    if (root/"request.json").exists():
+        request = json.loads((root/"request.json").read_text())
+        terms, policy = request["terms"], request["policy"]
+    else:
+        # Trade-kit runs (--quote-kit) keep the agreed terms and each side's policy instead.
+        terms = json.loads((root/"kit-terms.json").read_text())
+        policy = json.loads((root/"start-bob-config.json").read_text())["policy"]
     cancel_blocks = int(policy["cancel_blocks"])
-    ltc = LtcRpc(args.ltc_rpc_port, args.ltc_cookie)
+    mainnet = policy["ltc_network"] == "btc-mainnet"
+    if mainnet:
+        # No node: the driver's checks come from two public Electrum servers, cross-checked
+        # (electrum_node.py). The traders use their own light servers from the saved configuration.
+        from electrum_node import ElectrumNode
+        require(len(set(args.electrum_server)) >= 2, "Mainnet resume needs at least two --electrum-server")
+        ltc = ElectrumNode([(h, int(p)) for h, _, p in (item.rpartition(":") for item in args.electrum_server)][:2])
+    else:
+        require(args.ltc_rpc_port and args.ltc_cookie, "Test-network resume needs --ltc-rpc-port and --ltc-cookie")
+        ltc = LtcRpc(args.ltc_rpc_port, args.ltc_cookie)
     processes, resident, evidence = [], None, {"schema":"monzero-ltc-live-resume-evidence-v1",
         "workspace":str(root), "swapId":terms["swapId"], "ltcLockTxid":args.lock_txid, "cancelBlocks":cancel_blocks}
     started = time.monotonic()
@@ -41,6 +55,10 @@ def run(args):
             return int(ltc("getrawtransaction", txid, True).get("confirmations", 0))
         except RpcError:
             return 0
+        except Exception as error:
+            if mainnet and type(error).__name__ == "ElectrumError":
+                return 0  # not known to a server yet, or a server briefly away
+            raise
 
     def wait_until(label, predicate, timeout):
         deadline, last = time.monotonic()+timeout, time.monotonic()
@@ -70,7 +88,7 @@ def run(args):
             login = root/f"monzero-wallet-rpc.{rpc_port}.login"
             if login.exists():
                 login.unlink()
-            command = [str(args.wallet_rpc), "--testnet", "--wallet-dir", str(root/name),
+            command = [str(args.wallet_rpc)] + ([] if mainnet else ["--testnet"]) + ["--wallet-dir", str(root/name),
                 "--daemon-address", f"127.0.0.1:{args.xmz_daemon_port}", "--trusted-daemon",
                 "--allow-mismatched-daemon-version", "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", str(rpc_port),
                 "--non-interactive", "--max-concurrency", "2", "--log-file", str(root/(name+"-resume.log"))]
@@ -152,8 +170,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--lock-txid", required=True)
-    parser.add_argument("--ltc-rpc-port", type=int, required=True)
-    parser.add_argument("--ltc-cookie", required=True)
+    parser.add_argument("--ltc-rpc-port", type=int, help="test networks: the Bitcoin/Litecoin node")
+    parser.add_argument("--ltc-cookie", help="test networks: the node's cookie")
+    parser.add_argument("--electrum-server", action="append", default=[], metavar="HOST:PORT",
+        help="Bitcoin mainnet: public Electrum servers for the driver's own checks (at least two)")
     parser.add_argument("--xmz-daemon-port", type=int, required=True)
     parser.add_argument("--wallet-rpc", type=pathlib.Path, required=True)
     parser.add_argument("--gui-test-binary", type=pathlib.Path, required=True)
