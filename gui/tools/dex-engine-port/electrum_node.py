@@ -10,6 +10,7 @@ driver check and record what happened, so it trusts nothing it cannot cross-chec
     node = ElectrumNode([("electrum.acinq.co", 50002), ("electrum2.bluewallet.io", 443)])
     node("getrawtransaction", txid, True)   # Core-style verbose dict
 """
+import decimal
 import hashlib
 import json
 import socket
@@ -84,7 +85,7 @@ class _Session:
                 line = self.file.readline()
                 if not line:
                     raise ElectrumError("server closed the connection")
-                reply = json.loads(line)
+                reply = json.loads(line, parse_float=decimal.Decimal)  # exact amounts, as Core RPC callers expect
                 # After blockchain.headers.subscribe the server pushes a notification for every
                 # new block (no id); it is not the reply to this request.
                 if reply.get("id") == self.next_id:
