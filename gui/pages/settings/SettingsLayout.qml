@@ -185,8 +185,9 @@ Rectangle {
             text: qsTr("Ask to stop local node during program exit") + translationManager.emptyString
         }
 
-        //! Manage pricing
+        //! Manage pricing — fiat hidden for now (priced in BTC/crypto only)
         RowLayout {
+            visible: false
             MonzeroComponents.CheckBox {
                 id: enableConvertCurrency
                 text: qsTr("Enable displaying balance in other currencies") + translationManager.emptyString
@@ -201,7 +202,7 @@ Rectangle {
         }
 
         GridLayout {
-            visible: enableConvertCurrency.checked
+            visible: false
             columns: 2
             Layout.fillWidth: true
             Layout.leftMargin: 36
@@ -243,7 +244,7 @@ Rectangle {
 
         ColumnLayout {
             // Feature needs to be double enabled for security purposes (miss-clicks)
-            visible: enableConvertCurrency.checked && !persistentSettings.fiatPriceEnabled
+            visible: false
             spacing: 0
             Layout.topMargin: 5
             Layout.leftMargin: 36
