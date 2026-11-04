@@ -54,3 +54,30 @@ contract address for the chain.
   surface it in the trade UI + the website pairs.
 - Keep mainnet trading behind the signed operator control document / kill switch, as on
   the Bitcoin side.
+
+## Gas & minimum trade size (measured)
+From `test/gas.test.js` (native-coin ops, gas units):
+
+| op | gas |
+|----|-----|
+| deploy (one-time per chain) | ~1,141,500 |
+| newSwap (lock) | ~51,400 |
+| setReady | ~32,000 |
+| claim | ~44,000 |
+| refund | ~43,900 |
+| **maker per-swap** (newSwap+setReady) | **~83,400** |
+| full happy path (newSwap+setReady+claim) | ~127,400 |
+
+Rough per-swap maker gas **cost** (83,400 gas) at representative prices:
+
+| chain | gas price | native $ | per-swap cost | viable trade size |
+|-------|-----------|----------|---------------|-------------------|
+| Base / Arbitrum | ~0.03 gwei | ETH ~$3,500 | **< $0.02** | any |
+| Polygon | ~40 gwei | POL ~$0.40 | **< $0.01** | any |
+| BNB | ~1 gwei | BNB ~$600 | **~$0.05** | any |
+| Ethereum | ~15 gwei | ETH ~$3,500 | **~$4–5** | **≥ ~$1,000** to keep gas < 0.5% |
+
+Takeaway: on **L2s, Polygon and BNB** gas is negligible — no practical minimum. On
+**Ethereum** set a minimum trade size (~$1,000) so the maker spread clears gas, the
+same size-aware logic as the BTC fee curve. (Prices move; re-run the table from the
+measured gas when deploying.)
