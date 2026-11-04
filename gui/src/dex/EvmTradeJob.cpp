@@ -34,10 +34,24 @@ bool configValid(const QJsonObject &c) {
 // What the app may show: the journal view, nothing that could carry a secret.
 bool snapshotValid(const QJsonObject &r) {
     static const QRegularExpression hash("\\A0x[0-9a-f]{64}\\z"),stage("\\A[A-Za-z]{1,32}(\\([A-Za-z]{1,16}\\))?\\z");
+    static const QRegularExpression address("\\A0x[0-9a-fA-F]{40}\\z"),wei("\\A[0-9]{1,78}\\z");
     static const QSet<QString> allowed{"schema","ok","role","stage","done","approved","commitment","offer","deadlines",
-        "evmTxs","xmzLock","xmzSweeps","awaitingApproval"};
+        "evmTxs","xmzLock","xmzSweeps","awaitingApproval","account","awaitingFunding","payout"};
     for (auto i=r.begin();i!=r.end();++i) if (!allowed.contains(i.key())) return false;
     const auto offer=r.value("offer").toObject();
+    if (r.contains("account") && !address.match(r.value("account").toString()).hasMatch()) return false;
+    if (r.contains("awaitingFunding") && !r.value("awaitingFunding").isNull()) {
+        const auto f=r.value("awaitingFunding").toObject();
+        if (f.size()!=3) return false;
+        for (const auto &k:{"neededWei","haveWei","missingWei"}) if (!wei.match(f.value(k).toString()).hasMatch()) return false;
+    }
+    if (r.contains("payout")) {
+        const auto p=r.value("payout").toObject();
+        if (!address.match(p.value("to").toString()).hasMatch()) return false;
+        const bool sent=p.contains("tx");
+        if (sent ? !(hash.match(p.value("tx").toString()).hasMatch() && wei.match(p.value("amountWei").toString()).hasMatch() && p.size()==3)
+                 : !(p.value("sent")==false && p.value("reason").isString() && p.size()==3)) return false;
+    }
     return (r.value("role")=="owner" || r.value("role")=="claimer") && stage.match(r.value("stage").toString()).hasMatch()
         && r.value("done").isBool() && r.value("approved").isBool() && hash.match(r.value("commitment").toString()).hasMatch()
         && r.value("offer").isObject() && hash.match(offer.value("tradeId").toString()).hasMatch()
@@ -84,7 +98,8 @@ QVariantMap EvmTradeJob::status() const {
     return {{"configured",!m_path.isEmpty()},{"busy",m_busy},{"state",m_state},{"error",m_error},{"tradeId",m_trade},
         {"commitment",m_commitment},{"awaitingApproval",m_awaitingApproval},{"snapshot",m_snapshot.toVariantMap()},
         {"approvalPending",!m_pendingApproval.isEmpty()},{"stepError",m_stepError},
-        {"canApprove",!m_commitment.isEmpty() && !m_snapshot.value("approved").toBool() && m_pendingApproval.isEmpty()}};
+        {"canApprove",!m_commitment.isEmpty() && !m_snapshot.value("approved").toBool() && m_pendingApproval.isEmpty()},
+        {"account",m_snapshot.value("account").toString()},{"awaitingFunding",m_funding},{"payout",m_payout}};
 }
 bool EvmTradeJob::refresh() {
     return run({{"schema",RequestSchema},{"command","status"},{"tradeDir",m_tradeDir}});
@@ -97,6 +112,19 @@ bool EvmTradeJob::approve(const QString &commitment) {
     return run({{"schema",RequestSchema},{"command","approve"},{"tradeDir",m_tradeDir},{"commitment",commitment}});
 }
 bool EvmTradeJob::tick(QByteArray &walletSeed) {
+    QJsonObject t;
+    if (!tickConfig(walletSeed,&t)) return false;
+    return run({{"schema",RequestSchema},{"command","tick"},{"tradeDir",m_tradeDir},{"tick",t}});
+}
+bool EvmTradeJob::payout(QByteArray &walletSeed,const QString &address) {
+    // Only a finished trade, to an address the user entered (the helper checks its checksum)
+    static const QRegularExpression format("\\A0x[0-9a-fA-F]{40}\\z");
+    if (!m_snapshot.value("done").toBool() || !format.match(address).hasMatch()) {walletSeed.fill('\0');walletSeed.clear();return false;}
+    QJsonObject t;
+    if (!tickConfig(walletSeed,&t)) return false;
+    return run({{"schema",RequestSchema},{"command","payout"},{"tradeDir",m_tradeDir},{"tick",t},{"payoutAddress",address}});
+}
+bool EvmTradeJob::tickConfig(QByteArray &walletSeed,QJsonObject *out) const {
     const bool valid=walletSeed.size()>=16 && walletSeed.size()<=64;
     QByteArray seedHex=walletSeed.toHex();walletSeed.fill('\0');walletSeed.clear();
     if (!valid) {seedHex.fill('\0');return false;}
@@ -104,7 +132,7 @@ bool EvmTradeJob::tick(QByteArray &walletSeed) {
         {"accountIndex",m_config.value("accountIndex")},{"mainWallet",m_config.value("mainWallet")},{"swapWallet",m_config.value("swapWallet")}};
     seedHex.fill('\0');
     if (m_config.contains("evmLogChunk")) t.insert("evmLogChunk",m_config.value("evmLogChunk"));
-    return run({{"schema",RequestSchema},{"command","tick"},{"tradeDir",m_tradeDir},{"tick",t}});
+    *out=t;return true;
 }
 bool EvmTradeJob::run(const QJsonObject &request) {
     if (m_busy || m_path.isEmpty() || m_process.state()!=QProcess::NotRunning) return false;
@@ -147,6 +175,9 @@ void EvmTradeJob::finish(bool success) {
     }
     m_trade=trade;m_commitment=commitment;m_snapshot=r;
     m_awaitingApproval=m_command=="tick" && r.value("awaitingApproval").toBool();
+    // What still has to reach the trade's account before it can lock (tick answers only)
+    if (m_command=="tick") m_funding=r.value("awaitingFunding").isObject() ? r.value("awaitingFunding").toObject().toVariantMap() : QVariantMap{};
+    if (m_command=="payout") m_payout=r.value("payout").toObject().toVariantMap();
     if (m_command=="tick") m_stepError.clear();
     m_state="ok";emit changed();
     if (!m_pendingApproval.isEmpty()) {

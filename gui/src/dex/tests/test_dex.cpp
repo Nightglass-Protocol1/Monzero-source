@@ -86,10 +86,42 @@ private slots:
         QVERIFY(!job.configure(path,helper,digest));
         DexDeployment::resetForTesting();
     }
+    void bitcoinMainnetStageUsesRealIdentitiesAndNeverMixesNetworks() {
+        DexDeployment::resetForTesting();
+        const auto realXmz=DexDeployment::xmzMainnetGenesis();const auto otherXmz=QString(64,'a');
+        // Local regtest keeps its private XMZ chain (which reports mainnet); empty values never pass.
+        QVERIFY(!DexDeployment::mainnetStage());
+        QVERIFY(DexDeployment::xmzNetworkAllowed("xmz-mainnet",otherXmz));QVERIFY(DexDeployment::xmzNetworkAllowed("xmz-fakechain",otherXmz));
+        QVERIFY(!DexDeployment::xmzNetworkAllowed("",otherXmz));QVERIFY(!DexDeployment::xmzNetworkAllowed("xmz-mainnet",""));
+        // Public test networks never take real XMZ, by name or by genesis.
+        QVERIFY(DexDeployment::selectLitecoinStage("btc-signet"));
+        QVERIFY(DexDeployment::xmzNetworkAllowed("xmz-testnet",otherXmz));
+        QVERIFY(!DexDeployment::xmzNetworkAllowed("xmz-mainnet",otherXmz));QVERIFY(!DexDeployment::xmzNetworkAllowed("xmz-testnet",realXmz));
+        DexDeployment::resetForTesting();
+        QVERIFY(DexDeployment::selectLitecoinStage("btc-mainnet"));
+        QVERIFY(DexDeployment::mainnetStage());QVERIFY(DexDeployment::bitcoinStage());QVERIFY(!DexDeployment::publicTestStage());
+        QCOMPARE(DexDeployment::litecoinNetwork(),QString("btc-mainnet"));QCOMPARE(DexDeployment::litecoinLightNetwork(),QString("main"));
+        QCOMPARE(DexDeployment::litecoinLightCoin(),QString("btc"));QCOMPARE(DexDeployment::swapCoinName(),QString("Bitcoin"));
+        QCOMPARE(DexDeployment::litecoinGenesis(),QString("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"));
+        QVERIFY(DexDeployment::litecoinNetworkAllowed("btc-mainnet"));
+        for (const auto &other:{"btc-signet","btc-testnet4","btc-regtest","ltc-testnet","ltc-regtest"}) QVERIFY(!DexDeployment::litecoinNetworkAllowed(other));
+        QVERIFY(DexDeployment::xmzNetworkAllowed("xmz-mainnet",realXmz));
+        QVERIFY(!DexDeployment::xmzNetworkAllowed("xmz-mainnet",otherXmz));
+        for (const auto &other:{"xmz-testnet","xmz-stagenet","xmz-fakechain",""}) QVERIFY(!DexDeployment::xmzNetworkAllowed(other,realXmz));
+        QVERIFY(!DexDeployment::selectLitecoinStage("btc-signet"));
+        QCOMPARE(LitecoinJournalProtocol::bech32Prefix("btc-mainnet"),QString("bc1"));
+        QVERIFY(LightWalletProfile::networkAllowed("btc","main"));QCOMPARE(LightWalletProfile::witnessPrefix("btc","main"),QString("bc"));
+        QCOMPARE(LightWalletProfile::receivePath("btc","main",0),QString("84'/0'/0'/0/"));
+        // Mainnet always needs a signed control document before a new trade starts.
+        DexRiskControl control;control.setNetwork("btc-mainnet");
+        QVERIFY(control.status().value("controlRequired").toBool());
+        QVERIFY(!control.refusal(QUuid::createUuid().toString(QUuid::WithoutBraces),1,1).isEmpty());
+        DexDeployment::resetForTesting();
+    }
     void bitcoinDeploymentStagesUseBitcoinIdentities() {
         DexDeployment::resetForTesting();
         QCOMPARE(DexDeployment::litecoinLightCoin(),QString("ltc"));QVERIFY(!DexDeployment::bitcoinStage());
-        for (const auto &bad:{"btc-testnet","btc-mainnet","bitcoin","BTC-REGTEST","btc-testnet3"}) QVERIFY(!DexDeployment::selectLitecoinStage(bad));
+        for (const auto &bad:{"btc-testnet","bitcoin","BTC-REGTEST","btc-testnet3","btc-main","ltc-mainnet","mainnet"}) QVERIFY(!DexDeployment::selectLitecoinStage(bad));
         QVERIFY(DexDeployment::selectLitecoinStage("btc-regtest"));
         QVERIFY(DexDeployment::bitcoinStage());QVERIFY(!DexDeployment::publicTestStage());
         QCOMPARE(DexDeployment::litecoinNetwork(),QString("btc-regtest"));QCOMPARE(DexDeployment::litecoinLightNetwork(),QString("regtest"));
@@ -213,6 +245,47 @@ private slots:
         QVERIFY(!control.refusal(t3,1,1,now).isEmpty());QVERIFY(!control.recordStart(t3,1,now));
         QCOMPARE(read(root.filePath("ledger.json")),QByteArray("{broken"));
         sodium_memzero(sk,sizeof sk);sodium_memzero(otherSk,sizeof otherSk);
+    }
+    // The EVM kill switch / caps (DexEngine::approveEvmTrade) use a DexRiskControl on a
+    // bnb-mainnet document. Confirm the control mechanism works on an EVM network: a signed
+    // document enforces caps, an in-flight trade is never blocked after a stop, and error text
+    // names the right coin.
+    void evmNetworkControlDocument() {
+        QVERIFY(sodium_init()>=0);
+        unsigned char pk[crypto_sign_PUBLICKEYBYTES],sk[crypto_sign_SECRETKEYBYTES];crypto_sign_keypair(pk,sk);
+        const qint64 now=1800000000;
+        auto doc=[&](QJsonObject over){
+            QJsonObject payload{{"schema","monzero-dex-control-v1"},{"network","bnb-mainnet"},{"sequence",1},{"issuedAt",double(now-60)},
+                {"expiresAt",double(now+86400)},{"newTradesEnabled",true},{"maxLtcAtomsPerTrade","100000000000000000"}, // 0.1 BNB in wei
+                {"maxXmzAtomsPerTrade","500000000000"},{"maxLtcAtomsPerDay","200000000000000000"}}; // 5 XMZ; 0.2 BNB/day
+            for (auto it=over.begin();it!=over.end();++it) payload[it.key()]=it.value();
+            const auto body=QJsonDocument(payload).toJson(QJsonDocument::Compact);
+            QByteArray m("monzero-dex-control-v1");m.append('\0');m+=body;
+            QByteArray sig(crypto_sign_BYTES,'\0');
+            crypto_sign_detached(reinterpret_cast<unsigned char *>(sig.data()),nullptr,reinterpret_cast<const unsigned char *>(m.constData()),m.size(),sk);
+            return QJsonDocument(QJsonObject{{"payload",QString::fromUtf8(body)},{"signature",QString::fromLatin1(sig.toHex())}}).toJson(QJsonDocument::Compact);
+        };
+        const QString t1="aaaaaaaa-1111-4111-8111-111111111111",t2="bbbbbbbb-2222-4222-8222-222222222222";
+        QTemporaryDir root;QVERIFY(root.isValid());
+        DexRiskControl evm;evm.setNetwork("bnb-mainnet");
+        QCOMPARE(evm.status().value("controlRequired").toBool(),true);
+        QVERIFY(evm.setLedgerFile(root.filePath("evm.json")));
+        QVERIFY(evm.setPublicKey(QString::fromLatin1(QByteArray(reinterpret_cast<const char *>(pk),32).toHex())));
+        QVERIFY(!evm.refusal(t1,1,1,now).isEmpty()); // fail closed before any document
+        QVERIFY(evm.acceptControlDocument(doc({}),now));
+        const quint64 bnbCap=100000000000000000ULL; // 0.1 BNB
+        QVERIFY(evm.refusal(t1,bnbCap,500000000000ULL,now).isEmpty());       // at the caps
+        QVERIFY(!evm.refusal(t1,bnbCap+1,1,now).isEmpty());                  // over BNB per-trade
+        QVERIFY(!evm.refusal(t1,1,500000000001ULL,now).isEmpty());          // over XMZ per-trade
+        QVERIFY(evm.recordStart(t1,bnbCap,now));
+        // Operator stops new trades (higher sequence). The started trade t1 must still pass.
+        QVERIFY(evm.acceptControlDocument(doc({{"sequence",2},{"newTradesEnabled",false}}),now));
+        QVERIFY(evm.refusal(t1,bnbCap,500000000000ULL,now).isEmpty());      // in-flight: never blocked
+        QVERIFY(!evm.refusal(t2,1,1,now).isEmpty());                        // a NEW trade is blocked
+        // Error text names BNB, not Litecoin.
+        QVERIFY(evm.acceptControlDocument(doc({{"sequence",3}}),now));
+        QVERIFY(evm.refusal(t2,bnbCap+1,1,now).contains("BNB"));
+        sodium_memzero(sk,sizeof sk);
     }
     void tradeFoldersDiscoverOneActiveTrade() {
         DexDeployment::resetForTesting();DexDeployment::lockLitecoinStage(); // ltc-regtest
@@ -3386,9 +3459,9 @@ sys.stdout.write(json.dumps(response,sort_keys=True,separators=(',',':')))
     }
     void multiCoinPreviewsAndExecutionGates() {
         DexEngine engine;
-        QCOMPARE(engine.supportedPairs().size(), 7);
+        QCOMPARE(engine.supportedPairs().size(), 8);
         const QMap<QString, int> coins{{"BTC",8},{"LTC",8},{"BCH",8},
-            {"XMR",12},{"DOGE",8},{"ETH",18},{"RUNE",8}};
+            {"XMR",12},{"DOGE",8},{"ETH",18},{"BNB",18},{"RUNE",8}};
         for (auto it = coins.begin(); it != coins.end(); ++it) {
             const QString pair = it.key() + " / XMZ";
             const auto info = engine.marketInfo(pair);

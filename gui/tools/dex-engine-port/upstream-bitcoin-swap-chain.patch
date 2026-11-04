@@ -188,11 +188,148 @@ index a65fd420c..4ee9a2fb0 100644
      #[test]
      fn rejects_bad_checksum_wrong_chain_noncanonical_and_unsupported_programs() {
          let network = LtcNetwork::Regtest;
+diff --git a/swap-machine/Cargo.toml b/swap-machine/Cargo.toml
+index 0a61b7682..368835d17 100644
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -41,6 +41,11 @@ thiserror = { workspace = true }
+ tracing = { workspace = true }
+ uuid = { workspace = true, features = ["serde"] }
+ 
++[features]
++# Accept Bitcoin mainnet against the real XMZ mainnet (Policy::accepted_deployment).
++# Off by default: release helpers for public builds are built without it.
++btc-mainnet = []
++
+ [dev-dependencies]
+ bdk = { workspace = true }
+ bitcoin-harness = { git = "https://github.com/eigenwallet/bitcoin-harness-rs", branch = "master" }
 diff --git a/swap-machine/src/bin/native-ltc-journal.rs b/swap-machine/src/bin/native-ltc-journal.rs
-index 19e61b9d6..35e99a544 100644
+index 19e61b9d6..13bf7be74 100644
 --- a/swap-machine/src/bin/native-ltc-journal.rs
 +++ b/swap-machine/src/bin/native-ltc-journal.rs
-@@ -434,11 +434,11 @@ mod linux {
+@@ -246,8 +246,19 @@ mod linux {
+     struct ReservationConfig {schema:String,journal_config_file:PathBuf,rpc_file:PathBuf}
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+-    struct ReservationRpc {schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,
+-        ltc_cookie_file:PathBuf,reservation_directory:PathBuf,fee_rate_atoms_per_kb:u64}
++    struct ReservationRpc {schema:String,#[serde(default)] ltc_port:Option<u16>,#[serde(default)] ltc_wallet:Option<String>,
++        #[serde(default)] ltc_anchor:Option<String>,#[serde(default)] ltc_cookie_file:Option<PathBuf>,
++        #[serde(default)] ltc_light:Option<LightChainConfig>,reservation_directory:PathBuf,fee_rate_atoms_per_kb:u64}
++    impl ReservationRpc {
++        /// Lock reservation and node-wallet funding need the node; cancel and refund
++        /// (recovery) may use light servers instead. Exactly one of the two.
++        fn valid(&self,recovery:bool)->bool {
++            self.schema=="monzero-private-ltc-reservation-rpc-v1" && self.fee_rate_atoms_per_kb>0
++                && (recovery || self.ltc_light.is_none())
++                && ltc_access_valid(self.ltc_port,self.ltc_wallet.as_ref(),self.ltc_anchor.as_ref(),self.ltc_cookie_file.as_ref(),
++                    self.ltc_light.as_ref(),&[])
++        }
++    }
+     async fn reserve_litecoin(path:&Path,input:&[u8],mode:&str)->Result<serde_json::Value> {
+         use swap_machine::{litecoin_quote::VerifiedLtcQuote,litecoin_rpc::LitecoinRpc};
+         use swap_core::litecoin_address::LtcSegwitAddress;
+@@ -276,23 +287,21 @@ mod linux {
+             && staged(&config.policy),"reservation requires isolated Litecoin funder startup configuration");
+         let (_rpc,bytes)=private_bytes(&wrapper.rpc_file,false)?;
+         let rpc:ReservationRpc=serde_json::from_slice(&bytes)?;
+-        ensure!(rpc.schema=="monzero-private-ltc-reservation-rpc-v1" && rpc.ltc_port>0
+-            && rpc.fee_rate_atoms_per_kb>0,"invalid reservation RPC configuration");
++        ensure!(rpc.valid(recovery.is_some()),"invalid reservation RPC configuration");
+         let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+         let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
+             config.trade_id,&config.policy,LocalRole::LitecoinFunder,config.pins)?;
+-        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let adapter=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet.clone(),
+-            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
+         if let Some((kind,operation,name))=recovery {
++            let (_cookie,chain)=seller_chain(config.policy.ltc_network,rpc.ltc_port,rpc.ltc_wallet.clone(),rpc.ltc_anchor.clone(),
++                rpc.ltc_cookie_file.as_deref(),rpc.ltc_light.as_ref())?;
+             if operation=="check" {
+-                let observation=execution.check_recovery_spend(&adapter,kind).await?;
++                let observation=execution.check_recovery_spend(&chain,kind).await?;
+                 return Ok(serde_json::json!({"schema":format!("monzero-ltc-recovery-{name}-check-response-v1"),
+                     "requestId":request.request_id,"snapshot":execution.saved_status()?,"observation":observation}));
+             }
+             if operation=="submit" {
+                 let approved=parse_commitment(request.commitment.as_deref().context("missing recovery approval")?)?;
+-                let outcome=execution.submit_reviewed_recovery_spend(&adapter,kind,approved).await?;
++                let outcome=execution.submit_reviewed_recovery_spend(&chain,kind,approved).await?;
+                 return Ok(serde_json::json!({"schema":format!("monzero-ltc-recovery-{name}-submit-response-v1"),
+                     "requestId":request.request_id,"snapshot":execution.saved_status()?,"outcome":outcome}));
+             }
+@@ -301,6 +310,11 @@ mod linux {
+                 "requestId":request.request_id,"snapshot":execution.saved_status()?,"review":{"details":review.details,
+                     "commitment":review.commitment.iter().map(|b|format!("{b:02x}")).collect::<String>()}}));
+         }
++        let (_cookie,user,password)=credentials(rpc.ltc_cookie_file.as_deref().context("missing Litecoin node cookie")?)?;
++        let ltc_wallet=rpc.ltc_wallet.clone().context("missing Litecoin wallet")?;
++        let ltc_anchor=rpc.ltc_anchor.clone().context("missing Litecoin anchor")?;
++        let adapter=LitecoinRpc::new(rpc.ltc_port.context("missing Litecoin node port")?,user,password,config.policy.ltc_network,
++            ltc_wallet.clone(),LtcSegwitAddress::parse(config.policy.ltc_network,&ltc_anchor)?)?;
+         if review {
+             let review=execution.review_litecoin_funding(&adapter,&rpc.reservation_directory)?;
+             return Ok(serde_json::json!({"schema":"monzero-ltc-lock-funding-review-response-v1","requestId":request.request_id,
+@@ -328,15 +342,27 @@ mod linux {
+             "snapshot":snapshot,"reservation":{"psbt":saved.psbt().to_string(),"txid":saved.psbt().unsigned_tx.compute_txid(),
+                 "contract":keys.contract_address().to_string(),"amountAtoms":amount.to_sat().to_string(),
+                 "feeAtoms":saved.fee().to_sat().to_string(),"maximumFeeAtoms":maximum_fee.to_sat().to_string(),
+-                "wallet":rpc.ltc_wallet,"anchor":rpc.ltc_anchor,"reserved":true,"signed":false,"broadcast":false}}))
++                "wallet":ltc_wallet,"anchor":ltc_anchor,"reserved":true,"signed":false,"broadcast":false}}))
+     }
+ 
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct RedeemRpc {
+-        schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
++        schema:String,#[serde(default)] ltc_port:Option<u16>,#[serde(default)] ltc_wallet:Option<String>,
++        #[serde(default)] ltc_anchor:Option<String>,#[serde(default)] ltc_cookie_file:Option<PathBuf>,
++        #[serde(default)] ltc_light:Option<LightChainConfig>,
+         native_daemon_port:u16,observer_wallet_port:u16,observer_login_file:PathBuf,safety_blocks:u32,
+     }
++    impl RedeemRpc {
++        /// The funder releases its redeem signature only after checking the lock on
++        /// exactly one of its node or two or more light servers.
++        fn valid(&self)->bool {
++            self.schema=="monzero-private-ltc-redeem-rpc-v1" && self.native_daemon_port>0 && self.observer_wallet_port>0
++                && self.safety_blocks>0 && self.observer_wallet_port!=self.native_daemon_port
++                && ltc_access_valid(self.ltc_port,self.ltc_wallet.as_ref(),self.ltc_anchor.as_ref(),self.ltc_cookie_file.as_ref(),
++                    self.ltc_light.as_ref(),&[self.native_daemon_port,self.observer_wallet_port])
++        }
++    }
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct FundingProofRequest {schema:String,request_id:uuid::Uuid,proof_hex:String}
+@@ -368,8 +394,7 @@ mod linux {
+         NativeWalletSession::new(observer()?,network).restore_view(&id,view.to_string(),0,secret.to_string(),&address).await
+     }
+     async fn release_litecoin(path:&Path,input:&[u8],mode:&str)->Result<serde_json::Value> {
+-        use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::NativeFundingRpc};
+-        use swap_core::litecoin_address::LtcSegwitAddress;
++        use swap_machine::native_funding_rpc::NativeFundingRpc;
+         let reviewing=mode=="--redeem-review-stdio-v1";
+         let (request_id,incoming,proof)=if mode=="--funding-proof-accept-stdio-v1" {
+             let request:FundingProofRequest=serde_json::from_slice(input)?;
+@@ -399,14 +424,11 @@ mod linux {
+             && staged(&config.policy),"redeem release requires isolated Litecoin funder startup configuration");
+         let (_rpc,bytes)=private_bytes(&wrapper.rpc_file,false)?;
+         let rpc:RedeemRpc=serde_json::from_slice(&bytes)?;
+-        ensure!(rpc.schema=="monzero-private-ltc-redeem-rpc-v1" && rpc.ltc_port>0 && rpc.native_daemon_port>0
+-            && rpc.observer_wallet_port>0 && rpc.safety_blocks>0 && rpc.ltc_port!=rpc.native_daemon_port
+-            && rpc.observer_wallet_port!=rpc.native_daemon_port && rpc.observer_wallet_port!=rpc.ltc_port,"invalid redeem RPC configuration");
++        ensure!(rpc.valid(),"invalid redeem RPC configuration");
+         let mut execution=Execution::resume(&config.metadata_directory,&config.snapshot_directory,
+             config.trade_id,&config.policy,LocalRole::LitecoinFunder,config.pins)?;
+-        let (_cookie,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet,
+-            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
++        let (_cookie,ltc)=seller_chain(config.policy.ltc_network,rpc.ltc_port,rpc.ltc_wallet.clone(),rpc.ltc_anchor.clone(),
++            rpc.ltc_cookie_file.as_deref(),rpc.ltc_light.as_ref())?;
+         let (_login,user,password)=credentials(&rpc.observer_login_file)?;
+         let native=NativeFundingRpc::new(rpc.native_daemon_port,rpc.observer_wallet_port,user,password)?;
+         if let Some(proof)=proof {
+@@ -434,11 +456,11 @@ mod linux {
      #[serde(deny_unknown_fields,rename_all="camelCase")]
      struct PreparationObserver {wallet_port:u16,login_file:PathBuf}
      fn preparation_config_valid(schema:&str,prefix:&str,observer:Option<&PreparationObserver>,
@@ -207,7 +344,7 @@ index 19e61b9d6..35e99a544 100644
      }
      fn payment_location_valid(schema:&str,prefix:&str,block:Option<bitcoin::BlockHash>,password:bool)->bool {
          match schema.strip_prefix(prefix) {
-@@ -451,7 +451,8 @@ mod linux {
+@@ -451,7 +473,8 @@ mod linux {
      #[derive(Deserialize)]
      #[serde(deny_unknown_fields,rename_all="camelCase")]
      struct RefundRpc {
@@ -217,7 +354,18 @@ index 19e61b9d6..35e99a544 100644
          native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,#[serde(default)] ltc_refund_block:Option<bitcoin::BlockHash>,
          #[serde(default)] preparation_observer:Option<PreparationObserver>,
          #[serde(default)] wallet_password_file:Option<PathBuf>,
-@@ -467,7 +468,8 @@ mod linux {
+@@ -459,7 +482,9 @@ mod linux {
+     #[derive(Deserialize)]
+     #[serde(deny_unknown_fields,rename_all="camelCase")]
+     struct PayoutRpc {
+-        schema:String,ltc_port:u16,ltc_wallet:String,ltc_anchor:String,ltc_cookie_file:PathBuf,
++        schema:String,#[serde(default)] ltc_port:Option<u16>,#[serde(default)] ltc_wallet:Option<String>,
++        #[serde(default)] ltc_anchor:Option<String>,#[serde(default)] ltc_cookie_file:Option<PathBuf>,
++        #[serde(default)] ltc_light:Option<LightChainConfig>,
+         native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,#[serde(default)] ltc_redeem_block:Option<bitcoin::BlockHash>,
+         #[serde(default)] preparation_observer:Option<PreparationObserver>,
+         #[serde(default)] wallet_password_file:Option<PathBuf>,
+@@ -467,7 +492,8 @@ mod linux {
      #[derive(Deserialize)]
      #[serde(deny_unknown_fields,rename_all="camelCase")]
      struct FundingRpc {
@@ -227,7 +375,7 @@ index 19e61b9d6..35e99a544 100644
          native_daemon_port:u16,native_wallet_port:u16,native_login_file:PathBuf,
          #[serde(default)] source:Option<FundingSource>,
      }
-@@ -482,9 +484,9 @@ mod linux {
+@@ -482,9 +508,9 @@ mod linux {
                      !s.wallet.is_empty() && (1..=4).contains(&s.priority)),
                  _=>false,
              };
@@ -240,7 +388,7 @@ index 19e61b9d6..35e99a544 100644
          }
          fn matches_source(&self,review:&serde_json::Value)->bool {
              self.source.as_ref().is_none_or(|s|review["wallet"]==s.wallet
-@@ -494,6 +496,46 @@ mod linux {
+@@ -494,6 +520,46 @@ mod linux {
      }
      enum FundingOperation {Prepare,Submit,Check,Proof}
  
@@ -287,7 +435,7 @@ index 19e61b9d6..35e99a544 100644
      fn credentials(path:&Path)->Result<(File,String,String)> {
          let (lease,bytes)=private_bytes(path,true)?;
          ensure!(bytes.len()<=1024,"oversized RPC credentials");
-@@ -507,13 +549,11 @@ mod linux {
+@@ -507,13 +573,11 @@ mod linux {
          for (i,byte) in result.iter_mut().enumerate() {*byte=u8::from_str_radix(&text[2*i..2*i+2],16)?;}
          Ok(result)
      }
@@ -301,11 +449,11 @@ index 19e61b9d6..35e99a544 100644
 -        use swap_core::{litecoin_address::LtcNetwork,xmz_address::XmzNetwork};
 -        matches!((policy.ltc_network,policy.xmz_network),
 -            (LtcNetwork::Regtest,XmzNetwork::Mainnet)|(LtcNetwork::Testnet,XmzNetwork::Testnet))
-+        policy.ltc_network.is_staged_test_pair(policy.xmz_network)
++        policy.accepted_deployment()
      }
      async fn isolated_native(port:u16,policy:&Policy)->Result<()> {
          ensure!(staged(policy),"native settlement outside an accepted test deployment");
-@@ -527,7 +567,7 @@ mod linux {
+@@ -527,13 +591,17 @@ mod linux {
          let envelope:serde_json::Value=serde_json::from_slice(&bytes)?;
          ensure!(envelope["id"]=="isolated-refund-check" && envelope.get("error").is_none(),"invalid isolation response");
          let info=&envelope["result"];
@@ -314,7 +462,18 @@ index 19e61b9d6..35e99a544 100644
              ensure!(info["nettype"]=="fakechain" && info["offline"]==true
                  && info["incoming_connections_count"].as_u64()==Some(0)
                  && info["outgoing_connections_count"].as_u64()==Some(0),"refund GUI requires offline native fakechain");
-@@ -545,29 +585,29 @@ mod linux {
+             return Ok(());
+         }
+-        ensure!(info["nettype"]=="testnet" && info["synchronized"]==true,"native settlement requires a synchronized XMZ testnet daemon");
++        if policy.is_btc_mainnet_deployment() {
++            ensure!(info["nettype"]=="mainnet" && info["synchronized"]==true,"native settlement requires a synchronized XMZ mainnet daemon");
++        } else {
++            ensure!(info["nettype"]=="testnet" && info["synchronized"]==true,"native settlement requires a synchronized XMZ testnet daemon");
++        }
+         let mut response=client.post(format!("http://127.0.0.1:{port}/json_rpc"))
+             .json(&serde_json::json!({"jsonrpc":"2.0","id":"native-genesis-check","method":"get_block_header_by_height","params":{"height":0}})).send().await?;
+         ensure!(response.status().is_success(),"native genesis check failed");
+@@ -545,29 +613,29 @@ mod linux {
          Ok(())
      }
      async fn recovered_wallet(config:&Config,execution:&mut Execution,request:&Request,payout:bool,operation:&str)->Result<serde_json::Value> {
@@ -332,7 +491,7 @@ index 19e61b9d6..35e99a544 100644
 +        let (schema,port,wallet,anchor,cookie,light,daemon,wallet_port,login,block,observer,password_file)=if payout {
              let r:PayoutRpc=serde_json::from_slice(&bytes)?;
 -            (r.schema,r.ltc_port,r.ltc_wallet,r.ltc_anchor,r.ltc_cookie_file,r.native_daemon_port,r.native_wallet_port,
-+            (r.schema,Some(r.ltc_port),Some(r.ltc_wallet),Some(r.ltc_anchor),Some(r.ltc_cookie_file),None,r.native_daemon_port,r.native_wallet_port,
++            (r.schema,r.ltc_port,r.ltc_wallet,r.ltc_anchor,r.ltc_cookie_file,r.ltc_light,r.native_daemon_port,r.native_wallet_port,
                  r.native_login_file,r.ltc_redeem_block,r.preparation_observer,r.wallet_password_file)
          } else {
              let r:RefundRpc=serde_json::from_slice(&bytes)?;
@@ -350,7 +509,7 @@ index 19e61b9d6..35e99a544 100644
              "wallet recovery requires explicit observer and password configuration");
          let password_file=password_file.context("missing recovered wallet password file")?;
          let observer=observer.context("missing recovered wallet observer")?;
-@@ -579,8 +619,7 @@ mod linux {
+@@ -579,8 +647,7 @@ mod linux {
              Some(zeroize::Zeroizing::new(std::str::from_utf8(&bytes)?.to_owned()))
          };
          isolated_native(daemon,&config.policy).await?;
@@ -360,7 +519,7 @@ index 19e61b9d6..35e99a544 100644
          let block=match block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
          let (_observer_lease,user,secret)=credentials(&observer.login_file)?;
          let observer=NativeFundingRpc::new(daemon,observer.wallet_port,user,secret)?;
-@@ -613,9 +652,8 @@ mod linux {
+@@ -613,9 +680,8 @@ mod linux {
      async fn refund_rpc(config:&Config,execution:&mut Execution,request:&Request,operation:PaymentOperation)->Result<serde_json::Value> {
          let checking=matches!(operation,PaymentOperation::Check);
          let preparing=matches!(operation,PaymentOperation::Prepare);
@@ -371,7 +530,7 @@ index 19e61b9d6..35e99a544 100644
          ensure!(config.role=="native-funder" && staged(&config.policy),
              "refund GUI submission is limited to isolated-chain development");
          let approval=if preparing {
-@@ -632,11 +670,12 @@ mod linux {
+@@ -632,11 +698,12 @@ mod linux {
          let rpc:RefundRpc=serde_json::from_slice(&bytes)?;
          ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-refund-rpc",rpc.preparation_observer.as_ref(),
              rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
@@ -387,16 +546,38 @@ index 19e61b9d6..35e99a544 100644
          let block=match rpc.ltc_refund_block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
          let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
          if preparing {
-@@ -691,7 +730,7 @@ mod linux {
+@@ -673,9 +740,8 @@ mod linux {
+     async fn payout_rpc(config:&Config,execution:&mut Execution,request:&Request,operation:PaymentOperation)->Result<serde_json::Value> {
+         let checking=matches!(operation,PaymentOperation::Check);
+         let preparing=matches!(operation,PaymentOperation::Prepare);
+-        use swap_machine::{litecoin_rpc::LitecoinRpc,native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
++        use swap_machine::{native_funding_rpc::{NativeFundingRpc,relay::NativeTransferRelay},
+             litecoin_negotiation::execution::payout_approval::PayoutAction};
+-        use swap_core::litecoin_address::LtcSegwitAddress;
+         ensure!(config.role=="litecoin-funder" && staged(&config.policy),
+             "payout GUI submission is limited to isolated-chain development");
+         let approval=if preparing {
+@@ -690,13 +756,16 @@ mod linux {
+         };
          let (_rpc_lease,bytes)=private_bytes(config.payout_rpc_file.as_deref().context("payout execution not configured")?,false)?;
          let rpc:PayoutRpc=serde_json::from_slice(&bytes)?;
++        let native_ports:Vec<u16>=[rpc.native_daemon_port,rpc.native_wallet_port].into_iter()
++            .chain(rpc.preparation_observer.as_ref().map(|o|o.wallet_port)).collect();
          ensure!(preparation_config_valid(&rpc.schema,"monzero-private-ltc-payout-rpc",rpc.preparation_observer.as_ref(),
--            rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
-+            Some(rpc.ltc_port),rpc.native_daemon_port,rpc.native_wallet_port)
+             rpc.ltc_port,rpc.native_daemon_port,rpc.native_wallet_port)
++            && ltc_access_valid(rpc.ltc_port,rpc.ltc_wallet.as_ref(),rpc.ltc_anchor.as_ref(),rpc.ltc_cookie_file.as_ref(),
++                rpc.ltc_light.as_ref(),&native_ports)
              && payment_location_valid(&rpc.schema,"monzero-private-ltc-payout-rpc",rpc.ltc_redeem_block,rpc.wallet_password_file.is_some()),"invalid payout RPC configuration");
          isolated_native(rpc.native_daemon_port,&config.policy).await?;
-         let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
-@@ -734,9 +773,8 @@ mod linux {
+-        let (_ltc_file,user,password)=credentials(&rpc.ltc_cookie_file)?;
+-        let ltc=LitecoinRpc::new(rpc.ltc_port,user,password,config.policy.ltc_network,rpc.ltc_wallet,
+-            LtcSegwitAddress::parse(config.policy.ltc_network,&rpc.ltc_anchor)?)?;
++        let (_ltc_file,ltc)=seller_chain(config.policy.ltc_network,rpc.ltc_port,rpc.ltc_wallet.clone(),rpc.ltc_anchor.clone(),
++            rpc.ltc_cookie_file.as_deref(),rpc.ltc_light.as_ref())?;
+         let block=match rpc.ltc_redeem_block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
+         let (_native_file,user,password)=credentials(&rpc.native_login_file)?;
+         if preparing {
+@@ -734,9 +803,8 @@ mod linux {
          let exporting=matches!(operation,FundingOperation::Proof);
          let checking=matches!(operation,FundingOperation::Check|FundingOperation::Proof);
          let preparing=matches!(operation,FundingOperation::Prepare);
@@ -407,7 +588,7 @@ index 19e61b9d6..35e99a544 100644
          ensure!(config.role=="native-funder" && staged(&config.policy),
              "funding GUI submission is limited to isolated-chain development");
          let safety=request.safety_blocks.context("missing funding safety blocks")?;
-@@ -791,9 +829,8 @@ mod linux {
+@@ -791,9 +859,8 @@ mod linux {
                      "confirmations":depth.to_string(),"chainObserved":true,"executable":false},
                  "review":{"details":review.details,"commitment":commitment}}));
          }
@@ -419,7 +600,7 @@ index 19e61b9d6..35e99a544 100644
          if preparing {
              let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
              let payment=execution.prepare_native_lock(&mut native,&ltc,source.context("missing preparation source")?,safety,now).await?;
-@@ -810,9 +847,8 @@ mod linux {
+@@ -810,9 +877,8 @@ mod linux {
                  "feeAtoms":payment.fee.atom_string(),"chainObserved":false,"executable":false}}))
      }
      async fn redemption_rpc(config:&Config,execution:&mut Execution,request:&Request,mode:&str)->Result<serde_json::Value> {
@@ -430,7 +611,7 @@ index 19e61b9d6..35e99a544 100644
          ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder"
              && staged(&config.policy),"redemption requires isolated native funder funding configuration");
          if mode=="--redemption-review-stdio-v1" {
-@@ -829,9 +865,8 @@ mod linux {
+@@ -829,9 +895,8 @@ mod linux {
          };
          let (_rpc,bytes)=private_bytes(config.funding_rpc_file.as_deref().context("missing redemption RPC configuration")?,false)?;
          let rpc:FundingRpc=serde_json::from_slice(&bytes)?;ensure!(rpc.valid(),"invalid redemption RPC configuration");
@@ -442,7 +623,7 @@ index 19e61b9d6..35e99a544 100644
          if checking {
              let observation=execution.check_completed_redeem(&ltc).await?;
              return Ok(serde_json::json!({"schema":"monzero-ltc-redemption-check-response-v1","requestId":request.request_id,
-@@ -864,8 +899,6 @@ mod linux {
+@@ -864,8 +929,6 @@ mod linux {
      // An unavailable native wallet or expired commercial quote must not prevent
      // cancellation or the agreed punishment path. No new funding is authorized.
      async fn native_recovery_rpc(config:&Config,execution:&mut Execution,request:&Request,mode:&str)->Result<serde_json::Value> {
@@ -451,7 +632,7 @@ index 19e61b9d6..35e99a544 100644
          ensure!(valid_request(request,mode),"invalid native-funder recovery request");
          let (kind,name,operation)=native_recovery_mode(mode).context("invalid native-funder recovery mode")?;
          ensure!(config.schema=="monzero-private-ltc-journal-v4" && config.role=="native-funder"
-@@ -885,9 +918,8 @@ mod linux {
+@@ -885,9 +948,8 @@ mod linux {
          let (_rpc,bytes)=private_bytes(config.funding_rpc_file.as_deref().context("missing recovery RPC configuration")?,false)?;
          let rpc:FundingRpc=serde_json::from_slice(&bytes)?;
          ensure!(rpc.valid(),"invalid native-funder recovery RPC configuration");
@@ -463,7 +644,7 @@ index 19e61b9d6..35e99a544 100644
          if operation=="check" {
              let observation=execution.check_recovery_spend(&ltc,kind).await?;
              return Ok(serde_json::json!({"schema":schema,"requestId":request.request_id,
-@@ -914,8 +946,33 @@ mod linux {
+@@ -914,8 +976,91 @@ mod linux {
                          match version {1|2=>located && !password,3=>located && password,4=>!located && password,_=>false});
                  }}}
                  let observer=PreparationObserver {wallet_port:4,login_file:PathBuf::from("/observer")};
@@ -472,6 +653,64 @@ index 19e61b9d6..35e99a544 100644
 +                assert!(preparation_config_valid(&format!("{prefix}-v4"),&prefix,Some(&observer),Some(1),2,3));
 +                assert!(!preparation_config_valid(&format!("{prefix}-v4"),&prefix,None,Some(1),2,3));
 +            }
++            Ok(())
++        }
++        #[test]
++        fn funder_recovery_and_payout_accept_light_servers()->Result<()> {
++            let servers=serde_json::json!([{"host":"one.example","port":50002},{"host":"two.example","port":50002}]);
++            let light=serde_json::json!({"servers":servers,"maximumTipAge":5400});
++            // Reservation: node for lock preparation/funding; light only for cancel and refund.
++            let node=serde_json::json!({"schema":"monzero-private-ltc-reservation-rpc-v1","ltcPort":1,"ltcWallet":"w","ltcAnchor":"a",
++                "ltcCookieFile":"/cookie","reservationDirectory":"/r","feeRateAtomsPerKb":1000});
++            let mut light_reservation=node.clone();
++            for key in ["ltcPort","ltcWallet","ltcAnchor","ltcCookieFile"] {light_reservation.as_object_mut().unwrap().remove(key);}
++            light_reservation["ltcLight"]=light.clone();
++            let reservation=|value:&serde_json::Value,recovery:bool|serde_json::from_value::<ReservationRpc>(value.clone())
++                .map(|r|r.valid(recovery)).unwrap_or(false);
++            assert!(reservation(&node,false) && reservation(&node,true));
++            assert!(reservation(&light_reservation,true),"light cancel/refund refused");
++            assert!(!reservation(&light_reservation,false),"light lock funding accepted");
++            let mut both=node.clone();both["ltcLight"]=light.clone();
++            assert!(!reservation(&both,true) && !reservation(&both,false));
++            let mut one=light_reservation.clone();one["ltcLight"]["servers"]=serde_json::json!([servers[0]]);
++            assert!(!reservation(&one,true));
++            let mut free=node.clone();free["feeRateAtomsPerKb"]=serde_json::json!(0);
++            assert!(!reservation(&free,false));
++            // Payout: exactly one of node or light, light ports never clash.
++            let payout=serde_json::json!({"schema":"monzero-private-ltc-payout-rpc-v4","ltcPort":1,"ltcWallet":"w","ltcAnchor":"a",
++                "ltcCookieFile":"/cookie","nativeDaemonPort":2,"nativeWalletPort":3,"nativeLoginFile":"/login",
++                "preparationObserver":{"walletPort":4,"loginFile":"/observer"},"walletPasswordFile":"/password"});
++            let mut light_payout=payout.clone();
++            for key in ["ltcPort","ltcWallet","ltcAnchor","ltcCookieFile"] {light_payout.as_object_mut().unwrap().remove(key);}
++            light_payout["ltcLight"]=light.clone();
++            let parsed=|value:&serde_json::Value|serde_json::from_value::<PayoutRpc>(value.clone()).ok();
++            let valid=|value:&serde_json::Value|parsed(value).is_some_and(|r|{
++                let ports:Vec<u16>=[r.native_daemon_port,r.native_wallet_port].into_iter()
++                    .chain(r.preparation_observer.as_ref().map(|o|o.wallet_port)).collect();
++                preparation_config_valid(&r.schema,"monzero-private-ltc-payout-rpc",r.preparation_observer.as_ref(),
++                    r.ltc_port,r.native_daemon_port,r.native_wallet_port)
++                    && ltc_access_valid(r.ltc_port,r.ltc_wallet.as_ref(),r.ltc_anchor.as_ref(),r.ltc_cookie_file.as_ref(),r.ltc_light.as_ref(),&ports)
++                    && payment_location_valid(&r.schema,"monzero-private-ltc-payout-rpc",r.ltc_redeem_block,r.wallet_password_file.is_some())});
++            assert!(valid(&payout) && valid(&light_payout));
++            let mut both=payout.clone();both["ltcLight"]=light.clone();
++            let mut neither=light_payout.clone();neither.as_object_mut().unwrap().remove("ltcLight");
++            let mut clash=payout.clone();clash["ltcPort"]=serde_json::json!(4);
++            for (case,value) in [("both",both),("neither",neither),("observer port clash",clash)] {assert!(!valid(&value),"{case} accepted");}
++            // Redeem approval: exactly one of node or light; observer and daemon never share a port.
++            let redeem=serde_json::json!({"schema":"monzero-private-ltc-redeem-rpc-v1","ltcPort":1,"ltcWallet":"w","ltcAnchor":"a",
++                "ltcCookieFile":"/cookie","nativeDaemonPort":2,"observerWalletPort":3,"observerLoginFile":"/observer","safetyBlocks":2});
++            let mut light_redeem=redeem.clone();
++            for key in ["ltcPort","ltcWallet","ltcAnchor","ltcCookieFile"] {light_redeem.as_object_mut().unwrap().remove(key);}
++            light_redeem["ltcLight"]=light.clone();
++            let valid=|value:&serde_json::Value|serde_json::from_value::<RedeemRpc>(value.clone()).map(|r|r.valid()).unwrap_or(false);
++            assert!(valid(&redeem) && valid(&light_redeem));
++            let mut both=redeem.clone();both["ltcLight"]=light.clone();
++            let mut neither=light_redeem.clone();neither.as_object_mut().unwrap().remove("ltcLight");
++            let mut clash=redeem.clone();clash["ltcPort"]=serde_json::json!(3);
++            let mut unsafe_margin=light_redeem.clone();unsafe_margin["safetyBlocks"]=serde_json::json!(0);
++            let mut shared=light_redeem.clone();shared["observerWalletPort"]=serde_json::json!(2);
++            for (case,value) in [("both",both),("neither",neither),("ltc/observer clash",clash),("no safety margin",unsafe_margin),
++                    ("observer on daemon port",shared)] {assert!(!valid(&value),"redeem {case} accepted");}
 +            Ok(())
 +        }
 +        #[test]
@@ -499,7 +738,7 @@ index 19e61b9d6..35e99a544 100644
              }
              Ok(())
          }
-@@ -1086,10 +1143,10 @@ mod linux {
+@@ -1086,10 +1231,10 @@ mod linux {
                  let observer=PreparationObserver {wallet_port:port,login_file:"/owned/login".into()};
                  for name in ["refund","payout"] {
                      let prefix=format!("monzero-private-ltc-{name}-rpc");
@@ -514,6 +753,31 @@ index 19e61b9d6..35e99a544 100644
                  }
              }
          }
+@@ -1316,6 +1461,24 @@ mod linux {
+                 assert!(!staged(&policy(ltc,xmz)),"{ltc}/{xmz} must be refused");
+             }
+         }
++        fn with_genesis(ltc:&str,xmz:&str,genesis:&str)->Policy {let mut p=policy(ltc,xmz);p.xmz_genesis=genesis.into();p}
++        #[test]
++        fn bitcoin_mainnet_needs_the_feature_and_the_real_xmz_mainnet() {
++            use swap_machine::litecoin_quote::XMZ_MAINNET_GENESIS as REAL;
++            let mainnet=with_genesis("btc-mainnet","xmz-mainnet",REAL);
++            // Accepted only in a btc-mainnet build.
++            assert_eq!(staged(&mainnet),cfg!(feature="btc-mainnet"));
++            assert_eq!(mainnet.is_btc_mainnet_deployment(),cfg!(feature="btc-mainnet"));
++            // Never with another XMZ chain, another genesis, Litecoin mainnet, or a Bitcoin test chain.
++            for refused in [with_genesis("btc-mainnet","xmz-mainnet",&"ab".repeat(32)),with_genesis("btc-mainnet","xmz-testnet",REAL),
++                    with_genesis("btc-mainnet","xmz-stagenet",REAL),with_genesis("ltc-mainnet","xmz-mainnet",REAL),
++                    with_genesis("btc-signet","xmz-mainnet",REAL),with_genesis("btc-testnet4","xmz-mainnet",REAL)] {
++                assert!(!staged(&refused) && !refused.is_btc_mainnet_deployment(),
++                    "{:?}/{:?} must be refused",refused.ltc_network,refused.xmz_network);
++            }
++            // Test pairs are unchanged by the feature.
++            assert!(staged(&policy("btc-signet","xmz-testnet")) && !policy("btc-signet","xmz-testnet").is_btc_mainnet_deployment());
++        }
+     }
+ }
+ fn main() {
 diff --git a/swap-machine/src/bin/native-ltc-light.rs b/swap-machine/src/bin/native-ltc-light.rs
 index 306e0c040..de7bb06b2 100644
 --- a/swap-machine/src/bin/native-ltc-light.rs
@@ -528,16 +792,19 @@ index 306e0c040..de7bb06b2 100644
              ("doge","main")=>DogeNetwork::Mainnet.into(),("doge","test")=>DogeNetwork::Testnet.into(),("doge","regtest")=>DogeNetwork::Regtest.into(),
              _=>anyhow::bail!("unsupported light-chain network"),
 diff --git a/swap-machine/src/bin/native-ltc-light/dex.rs b/swap-machine/src/bin/native-ltc-light/dex.rs
-index 08f9bb357..2930f5f79 100644
+index 08f9bb357..00587bc06 100644
 --- a/swap-machine/src/bin/native-ltc-light/dex.rs
 +++ b/swap-machine/src/bin/native-ltc-light/dex.rs
-@@ -48,14 +48,12 @@ fn public_review(review:swap_machine::litecoin_negotiation::execution::lock_appr
+@@ -47,15 +47,14 @@ fn context_digest(dex:&[u8],wallet:&[u8])->Result<sha256::Hash> {
+ fn public_review(review:swap_machine::litecoin_negotiation::execution::lock_approval::LockFundingReview)->Value {
      json!({"details":review.details,"commitment":sha256::Hash::from_byte_array(review.commitment).to_string()})
  }
- /// The only deployments light DEX funding accepts: isolated regtest paired with
+-/// The only deployments light DEX funding accepts: isolated regtest paired with
 -/// the XMZ fakechain, or Litecoin testnet paired with XMZ testnet. Never mainnet.
-+/// the XMZ fakechain, or Litecoin testnet / Bitcoin testnet4 paired with XMZ
-+/// testnet. Never mainnet. The wallet's chain tag must match the swap chain.
++/// The deployments light DEX funding accepts (`Policy::accepted_deployment`):
++/// isolated regtest with the XMZ fakechain, a public test chain with XMZ testnet,
++/// or, only in a `btc-mainnet` build, Bitcoin mainnet with the real XMZ mainnet.
++/// The wallet's chain tag must match the swap chain.
  fn staged_network(policy:&Policy)->Result<LtcNetwork> {
 -    use swap_core::xmz_address::XmzNetwork;
 -    match (policy.ltc_network,policy.xmz_network) {
@@ -545,13 +812,13 @@ index 08f9bb357..2930f5f79 100644
 -        (LtcNetwork::Testnet,XmzNetwork::Testnet) => Ok(LtcNetwork::Testnet),
 -        _ => anyhow::bail!("light DEX funding is limited to Litecoin regtest or testnet test deployments"),
 -    }
-+    ensure!(policy.ltc_network.is_staged_test_pair(policy.xmz_network),
-+        "light DEX funding is limited to regtest or public test-network deployments");
++    ensure!(policy.accepted_deployment(),
++        "light DEX funding is limited to regtest, public test-network or enabled Bitcoin mainnet deployments");
 +    Ok(policy.ltc_network)
  }
  pub(super) fn run(path:&Path,mode:&str)->Result<()> {
      let mut input=Zeroizing::new(Vec::new());std::io::stdin().take(8193).read_to_end(&mut input)?;
-@@ -68,8 +66,8 @@ pub(super) fn run(path:&Path,mode:&str)->Result<()> {
+@@ -68,8 +67,8 @@ pub(super) fn run(path:&Path,mode:&str)->Result<()> {
      let (_wallet_lease,wallet_bytes)=private_config(&dex.wallet_config_file)?;
      let expected=context_digest(&bytes,&wallet_bytes)?;
      ensure!(expected==digest(&request.approved_config_digest)?,"light DEX configuration changed");
@@ -562,7 +829,7 @@ index 08f9bb357..2930f5f79 100644
      ensure!(network==LightNetwork::from(staged),"wrong light DEX wallet network");
      let mut execution=Execution::resume(&dex.metadata_directory,&dex.snapshot_directory,dex.trade_id,
          &dex.policy,LocalRole::LitecoinFunder,dex.pins)?;
-@@ -103,8 +101,8 @@ fn terms(path:&Path,input:&[u8])->Result<()> {
+@@ -103,8 +102,8 @@ fn terms(path:&Path,input:&[u8])->Result<()> {
      let (_wallet_lease,wallet_bytes)=private_config(&dex.wallet_config_file)?;
      let expected=context_digest(&bytes,&wallet_bytes)?;
      ensure!(expected==digest(&request.approved_config_digest)?,"light DEX configuration changed");
@@ -1693,10 +1960,36 @@ index 7e7cd80e4..4f606f3e1 100644
      }
      let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
 diff --git a/swap-machine/src/litecoin_quote.rs b/swap-machine/src/litecoin_quote.rs
-index 3c77bfb87..44d1f7990 100644
+index 3c77bfb87..0f882d985 100644
 --- a/swap-machine/src/litecoin_quote.rs
 +++ b/swap-machine/src/litecoin_quote.rs
-@@ -108,7 +108,7 @@ impl VerifiedLtcQuote {
+@@ -33,6 +33,25 @@ pub struct Policy {
+     pub minimum_ltc_output: u64, pub minimum_relay_fee_atoms_per_kb: u64,
+ }
+ 
++/// Block 0 hash of the real XMZ mainnet.
++pub const XMZ_MAINNET_GENESIS: &str = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
++
++impl Policy {
++    /// Deployments the DEX helpers accept: every staged test pair
++    /// (`LtcNetwork::is_staged_test_pair`) and, only in helpers built with the
++    /// `btc-mainnet` feature, Bitcoin mainnet against the real XMZ mainnet by
++    /// name and genesis. Litecoin mainnet is never accepted.
++    pub fn accepted_deployment(&self) -> bool {
++        self.ltc_network.is_staged_test_pair(self.xmz_network) || self.is_btc_mainnet_deployment()
++    }
++
++    /// Real funds: Bitcoin mainnet with XMZ mainnet, in a `btc-mainnet` build only.
++    pub fn is_btc_mainnet_deployment(&self) -> bool {
++        cfg!(feature = "btc-mainnet") && self.ltc_network == LtcNetwork::BitcoinMainnet
++            && self.xmz_network == XmzNetwork::Mainnet && self.xmz_genesis == XMZ_MAINNET_GENESIS
++    }
++}
++
+ pub struct Destinations {
+     pub ltc_payout: LtcSegwitAddress, pub ltc_refund: LtcSegwitAddress,
+     pub xmz_payout: XmzAddress, pub xmz_refund: XmzAddress,
+@@ -108,7 +127,7 @@ impl VerifiedLtcQuote {
      }
  
      pub fn check_policy(&self, policy: &Policy, now: u64) -> Result<()> {
@@ -1705,7 +1998,7 @@ index 3c77bfb87..44d1f7990 100644
          let xmz = match policy.xmz_network { XmzNetwork::Mainnet => "xmz-mainnet", XmzNetwork::Testnet => "xmz-testnet", XmzNetwork::Stagenet => "xmz-stagenet" };
          ensure!(hash(&policy.xmz_genesis) && self.terms["ltcGenesis"] == policy.ltc_network.genesis()
              && self.terms["xmzGenesis"] == policy.xmz_genesis && self.terms["ltcGenesis"] != self.terms["xmzGenesis"]
-@@ -122,7 +122,7 @@ impl VerifiedLtcQuote {
+@@ -122,7 +141,7 @@ impl VerifiedLtcQuote {
                  && payout.refund_fee_max_atoms()<=policy.maximum_xmz_fee,"native settlement fee exceeds policy");
          }
          let principal = n("ltcAtoms")?;
@@ -1714,7 +2007,7 @@ index 3c77bfb87..44d1f7990 100644
              && n("xmzAtoms")? <= policy.maximum_xmz_atoms, "Litecoin quote principal exceeds policy");
          ensure!(n("ltcFundingFeeMaxAtoms")? <= policy.maximum_ltc_funding_fee
              && n("ltcFundingFeeMaxAtoms")? < principal && n("xmzNativeFeeMaxAtoms")? <= policy.maximum_xmz_fee,
-@@ -212,13 +212,11 @@ mod policy_ltc_network {
+@@ -212,13 +231,11 @@ mod policy_ltc_network {
      use super::LtcNetwork;
      use serde::{Deserialize,Serializer,Deserializer};
      pub fn serialize<S: Serializer>(value: &LtcNetwork,s: S)->Result<S::Ok,S::Error> {

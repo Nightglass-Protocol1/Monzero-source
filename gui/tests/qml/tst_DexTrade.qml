@@ -1,0 +1,210 @@
+import QtQuick 2.9
+import QtTest 1.2
+import "../../components" as M
+Item {
+    width: 1000; height: 1800
+    property var appWindow: app
+    property var translationManager: translations
+    QtObject { id: app; property bool themeTransition: false }
+    QtObject { id: translations; property string emptyString: "" }
+    function releaseFocus() {}
+
+    // Offers: price is XMZ per coin (11 decimals); amount is coin atoms.
+    function offer(pair, side, xmzPerCoin, coinAmount, decimals) {
+        return { pair: pair, side: side, priceAtomic: String(Math.round(xmzPerCoin * 1e11)),
+                 amountAtomic: String(Math.round(coinAmount * Math.pow(10, decimals))) }
+    }
+    property var book: [
+        offer("BTC/XMZ", "SELL", 200000, 0.01, 8),   // sells 0.01 BTC at 200k XMZ/BTC
+        offer("BTC/XMZ", "SELL", 190000, 0.001, 8),  // cheaper, but small
+        offer("BTC/XMZ", "BUY", 180000, 0.02, 8),    // buys up to 0.02 BTC with XMZ
+        offer("BTC / XMZ", "BUY", 185000, 0.005, 8),
+        offer("LTC/XMZ", "SELL", 900, 1, 8)
+    ]
+
+    M.DexTradeCard { id: card; width: 900; offers: book; xmzBalance: 1000 }
+    M.DexTradeProgress { id: progress; width: 900; y: 900; coin: "BNB" }
+    M.DexExternalWallet { id: wallet; width: 380; y: 1500 }
+
+    TestCase {
+        name: "DexTrade"; when: windowShown
+        function child(parent, name) { return findChild(parent, name) }
+        function init() {
+            card.direction = "sell"; card.coin = "BTC"; card.amountText = ""; card.reviewing = false
+            card.canStart = false; card.startBlockedReason = ""
+            progress.trade = ({}); progress.confirmed = false
+        }
+
+        function test_sellPicksTheBestOfferThatFills() {
+            // 100 XMZ needs 0.0005263 BTC at 190k (fits the small offer) and is the most BTC
+            var q = card.quoteFor("sell", "BTC", 100, book, 8, 1)
+            verify(q.ok); compare(q.price, 190000)
+            fuzzyCompare(q.gross, 100 / 190000, 1e-12)
+            fuzzyCompare(q.fee, q.gross * 0.01, 1e-12)
+            fuzzyCompare(q.receive, q.gross * 0.99, 1e-12)
+            compare(q.send, 100)
+            // 1000 XMZ is too big for the 190k offer: the 200k one fills it
+            compare(card.quoteFor("sell", "BTC", 1000, book, 8, 1).price, 200000)
+        }
+        function test_buyPicksTheCheapestOfferThatFills() {
+            var q = card.quoteFor("buy", "BTC", 500, book, 8, 1)
+            verify(q.ok); compare(q.price, 185000)     // most XMZ per BTC; pair spacing ignored
+            fuzzyCompare(q.send, 500 / 185000 * 1.01, 1e-12)
+            compare(q.receive, 500)
+            // Too big for the 185k offer (0.005 BTC = 925 XMZ): the 180k one
+            compare(card.quoteFor("buy", "BTC", 1000, book, 8, 1).price, 180000)
+        }
+        function test_problemsAreExplained() {
+            verify(card.quoteFor("sell", "BTC", 0, book, 8, 1).empty)
+            verify(card.quoteFor("sell", "BCH", 1, book, 8, 1).noOffers)
+            var big = card.quoteFor("sell", "BTC", 5000, book, 8, 1)
+            verify(!big.ok); verify(big.reason.indexOf("2,000") >= 0)   // largest: 0.01 BTC x 200k, shown with separators
+            verify(!card.quoteFor("sell", "BTC", 1, book, undefined, 1).ok)
+        }
+        function test_cardShowsQuoteAndBlocksUnavailableStart() {
+            card.amountText = "100"
+            verify(child(card, "quoteBox").visible)
+            compare(child(card, "quote_1").text, card.show(card.quote.receive, "BTC"))
+            var review = child(card, "reviewButton")
+            verify(review.enabled); review.clicked()
+            verify(child(card, "reviewPanel").visible)
+            verify(!child(card, "startButton").enabled)
+            card.startBlockedReason = "not yet"
+            verify(child(card, "startBlocked").visible)
+            card.amountText = "101"; verify(!card.reviewing)          // editing goes back to the form
+        }
+        function test_cannotSellMoreThanTheBalance() {
+            card.amountText = "1500"
+            verify(!child(card, "reviewButton").enabled)
+        }
+        function test_startSendsTheQuote() {
+            var sent = null
+            card.startRequested.connect(function(q) { sent = q })
+            card.canStart = true; card.amountText = "100"
+            child(card, "reviewButton").clicked(); child(card, "startButton").clicked()
+            verify(sent !== null); compare(sent.xmz, 100); compare(sent.coin, "BTC")
+        }
+
+        function trade(role, stage, canApprove) {
+            return { configured: true, state: "ok", canApprove: canApprove === true, commitment: "0xabc",
+                     snapshot: { role: role, stage: stage, offer: { chainId: 97, value: "20000000000000000", xmzAmount: "2000000000000" },
+                                 deadlines: { timeout1: "1900000000", timeout2: "1900003600" } } }
+        }
+        function test_buyerStepsAndApproval() {
+            progress.trade = trade("owner", "Start", true)
+            compare(child(progress, "tradeTitle").text, "Buying 20 XMZ")
+            compare(child(progress, "tradeSummary").text, "You pay 0.02 BNB and receive 20 XMZ.")
+            verify(child(progress, "step_1").current)
+            verify(child(progress, "approvalBox").visible)
+            var approve = child(progress, "approveButton")
+            verify(!approve.enabled)                                  // amounts not confirmed yet
+            var approved = ""
+            progress.approve.connect(function(c) { approved = c })
+            child(progress, "approvalConfirm").clicked(); verify(approve.enabled)
+            approve.clicked(); compare(approved, "0xabc")
+            // While a step is running the approval can still be given (the job queues it)
+            var busy = trade("owner", "Start", true); busy.busy = true; progress.trade = busy; progress.confirmed = true
+            verify(approve.enabled)
+            busy.approvalPending = true; progress.trade = busy; progress.confirmed = true
+            verify(!approve.enabled); compare(approve.text, "Approval queued\u2026")
+            verify(child(progress, "tradeRefundTime").text.indexOf("refunded") >= 0)
+        }
+        function test_sellerAndFinishedStates() {
+            progress.trade = trade("claimer", "XmzLocked")
+            verify(child(progress, "step_0").done); verify(child(progress, "step_2").current)
+            verify(!child(progress, "approvalBox").visible)
+            progress.trade = trade("claimer", "Done(Swapped)")
+            verify(child(progress, "step_3").done)
+            compare(child(progress, "tradeTitle").text, "Sold 20 XMZ")
+            compare(child(progress, "tradeNow").text, "Done. The BNB is in your account.")
+            progress.trade = trade("owner", "Done(Refunded)")
+            verify(progress.progress.refund); verify(!child(progress, "step_3").done)
+            verify(!child(progress, "tradeRefundTime").visible)
+        }
+        function test_fundingRequestShowsAmountAccountAndQr() {
+            var t = trade("owner", "Start")
+            t.account = "0x9C06a3d4f56fFF037C11f24b77B3C0F0eBCd8e0C"
+            t.awaitingFunding = { neededWei: "10050000000000000", haveWei: "50000000000000", missingWei: "10000000000000000" }
+            progress.externalWallet = "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"
+            progress.trade = t
+            verify(child(progress, "fundingBox").visible)
+            compare(child(progress, "fundingAmount").text, "Fund this trade: send 0.01 BNB")
+            compare(child(progress, "fundingAccount").text, t.account)
+            verify(child(progress, "tradeNow").text.indexOf("Waiting for the BNB to arrive") >= 0)
+            compare(child(progress, "fundingQr").source.toString(),
+                    "image://qrcode/ethereum:0x9C06a3d4f56fFF037C11f24b77B3C0F0eBCd8e0C@97?value=10000000000000000")
+            var plain = trade("owner", "Start")
+            plain.account = t.account
+            progress.trade = plain
+            verify(!child(progress, "fundingBox").visible)
+            progress.externalWallet = ""
+        }
+        function test_payoutOnlyForFinishedTradesWithAConnectedWallet() {
+            var asked = 0
+            progress.payoutRequested.connect(function () { asked++ })
+            progress.trade = trade("claimer", "XmzLocked")
+            progress.externalWallet = "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"
+            verify(!child(progress, "payoutRow").visible)
+            var done = trade("claimer", "Done(Swapped)")
+            progress.trade = done
+            verify(child(progress, "payoutRow").visible)
+            child(progress, "payoutButton").clicked(); compare(asked, 1)
+            var paid = trade("claimer", "Done(Swapped)")
+            paid.payout = { to: progress.externalWallet, tx: "0x" + Array(65).join("a"), amountWei: "9990000000000000" }
+            progress.trade = paid
+            verify(child(progress, "payoutResult").text.indexOf("Sent 0.00999 BNB") === 0)
+            progress.externalWallet = ""
+            verify(!child(progress, "payoutRow").visible)
+        }
+        function test_externalWalletConnectsOnlyValidAddresses() {
+            var connected = ""
+            wallet.connectRequested.connect(function (a) { connected = a })
+            wallet.address = ""
+            child(wallet, "walletConnect").clicked()
+            verify(wallet.editing)
+            var input = child(wallet, "walletInput")
+            input.text = "0x1234"; verify(!child(wallet, "walletSave").enabled)
+            input.text = " 0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF "; verify(child(wallet, "walletSave").enabled)
+            child(wallet, "walletSave").clicked()
+            compare(connected, "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"); verify(!wallet.editing)
+            wallet.address = connected
+            compare(child(wallet, "walletAddress").text, "0x4b7c0\u202628FAF")
+            var dropped = false
+            wallet.disconnectRequested.connect(function () { dropped = true })
+            child(wallet, "walletDisconnect").clicked(); verify(dropped)
+        }
+        function test_walletAddressFormatsPerCoin() {
+            var ok = [["BNB", "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"],
+                      ["BTC", "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"], ["BTC", "tb1qlz6s22qckk7ty9gqf76stee8pwrzk8uc5d7q5x"],
+                      ["BTC", "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"], ["BTC", "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"],
+                      ["LTC", "ltc1qg42tkwuuxefutzxezdkdel39gfstuap288mfea"], ["LTC", "tltc1qg42tkwuuxefutzxezdkdel39gfstuap2xxxxxx"],
+                      ["BCH", "bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a"], ["BCH", "qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a"]]
+            var bad = [["BNB", "0x1234"], ["BTC", "0x4b7c0a922d663ec68Bc6d5D5f9fa77E420C28FAF"],
+                       ["LTC", "LVg2kJoFNg45Nbpy53h7Fe1wKyeXVRhMH9"],                 // legacy Litecoin: not a swap destination
+                       ["LTC", "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"], ["BCH", "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"],
+                       ["BTC", "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdb"]]        // 'b' is not a bech32 character
+            for (var i = 0; i < ok.length; ++i) verify(wallet.validAddress(ok[i][0], ok[i][1]), "accepted " + ok[i].join(" "))
+            for (var j = 0; j < bad.length; ++j) verify(!wallet.validAddress(bad[j][0], bad[j][1]), "refused " + bad[j].join(" "))
+            compare(wallet.shortAddress("bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a"), "qpm2qsz\u2026gdx6a")
+        }
+        function test_quoteSaysWhereTheCoinsGo() {
+            card.amountText = "100"
+            compare(child(card, "quote_4").text, "this app's BTC wallet")
+            card.wallets = { BTC: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" }
+            compare(child(card, "quote_4").text, "your wallet bc1qar0\u2026f5mdq")
+            card.direction = "buy"
+            verify(card.quote.ok)
+            compare(child(card, "quote_4").text, "your wallet bc1qar0\u2026f5mdq")
+            card.wallets = ({})
+        }
+        function test_unknownStageIsShownNotHidden() {
+            progress.trade = trade("owner", "SomethingNew")
+            compare(child(progress, "tradeNow").text, "Working on it (SomethingNew).")
+        }
+        function test_approvalTickResetsWhenApprovalNoLongerNeeded() {
+            progress.trade = trade("owner", "Start", true); progress.confirmed = true
+            progress.trade = trade("owner", "LockSent", false)
+            verify(!progress.confirmed)
+        }
+    }
+}

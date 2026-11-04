@@ -29,6 +29,10 @@ PROFILES = {
     ("btc", "signet"): dict(tag="btc", coin="Bitcoin", quote="btc-signet", app_stage="btc-signet",
         core_chain="signet", light="signet", cookie_dir="signet", hrp="tb1",
         genesis="00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"),
+    # Real funds: light wallets and public Electrum servers only, no node (BUYER_LIGHT_AND_MAINNET.md).
+    ("btc", "mainnet"): dict(tag="btc", coin="Bitcoin", quote="btc-mainnet", app_stage="btc-mainnet",
+        core_chain="main", light="main", cookie_dir=None, hrp="bc1",
+        genesis="000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"),
 }
 
 

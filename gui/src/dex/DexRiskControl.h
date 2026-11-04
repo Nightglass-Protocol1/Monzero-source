@@ -44,7 +44,13 @@ signals:
 private:
     void fetch();
     QJsonObject ledger() const;
-    QString coinName() const {return m_network.startsWith("btc-")?QStringLiteral("Bitcoin"):QStringLiteral("Litecoin");}
+    QString coinName() const {
+        if (m_network.startsWith("btc-")) return QStringLiteral("Bitcoin");
+        if (m_network.startsWith("bnb-")) return QStringLiteral("BNB");
+        if (m_network.startsWith("eth-")) return QStringLiteral("ETH");
+        if (m_network.startsWith("evm-")) return QStringLiteral("EVM");
+        return QStringLiteral("Litecoin");
+    }
     QString m_network="ltc-regtest",m_ledgerPath,m_url;
     QByteArray m_publicKey;
     QJsonObject m_control;

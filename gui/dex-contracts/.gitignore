@@ -2,3 +2,4 @@ node_modules/
 artifacts/
 cache/
 evm-keys/target/
+deployments/local-rehearsal.json

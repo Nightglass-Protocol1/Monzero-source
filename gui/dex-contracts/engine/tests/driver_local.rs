@@ -301,6 +301,73 @@ async fn swap_from_saved_trades_with_the_owner_resumed_every_tick() {
     let _ = (std::fs::remove_file(owner_path), std::fs::remove_file(claimer_path));
 }
 
+async fn set_balance(url: &str, who: Address, wei: U256) {
+    let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+    let _: serde_json::Value = provider.raw_request("hardhat_setBalance".into(), (who, wei)).await.unwrap();
+}
+
+/// Funding from outside (e.g. MetaMask): nothing is locked until each account can pay for its
+/// lock and for the transactions that protect it; then the swap goes ahead as usual.
+#[tokio::test]
+async fn nothing_is_locked_until_each_account_is_funded() {
+    let Some(url) = std::env::var("MONZERO_EVM_RPC").ok() else { return };
+    let _chain = CHAIN.lock().await;
+    let w = world(url).await;
+    let rich = U256::from(10_000u64) * U256::from(10u64.pow(18));
+    let (owner_addr, claimer_addr) = (w.trade.terms.owner, w.trade.terms.claimer);
+    // The buyer holds half its trade value, the seller nothing at all
+    set_balance(&w.url, owner_addr, w.trade.terms.value / U256::from(2)).await;
+    set_balance(&w.url, claimer_addr, U256::ZERO).await;
+    let mut owner = w.owner(MemoryJournal(Record::new(RoleState::Owner(OwnerState::Start))));
+    let mut claimer = w.claimer();
+
+    match owner.tick().await {
+        Err(DriverError::AwaitingFunding { needed, have }) => {
+            assert_eq!(have, w.trade.terms.value / U256::from(2));
+            assert!(needed > w.trade.terms.value, "the lock plus gas for the later steps");
+        }
+        other => panic!("expected AwaitingFunding, got {other:?}"),
+    }
+    assert!(owner.journal().load().unwrap().retained.is_empty(), "nothing signed");
+    assert_eq!(owner.journal().load().unwrap().state, RoleState::Owner(OwnerState::Start));
+
+    // Funded (as a MetaMask payment would): the buyer locks
+    set_balance(&w.url, owner_addr, rich).await;
+    owner.tick().await.unwrap();
+    assert!(matches!(owner.tick().await.unwrap(), RoleState::Owner(OwnerState::Locked { .. })));
+
+    // The seller sees the lock but must not lock XMZ without gas to collect afterwards
+    match claimer.tick().await {
+        Err(DriverError::AwaitingFunding { have, .. }) => assert_eq!(have, U256::ZERO),
+        other => panic!("expected AwaitingFunding, got {other:?}"),
+    }
+    assert_eq!(w.ledger.lock().unwrap().lock_sends, 0, "no XMZ locked");
+
+    set_balance(&w.url, claimer_addr, rich).await;
+    let (mut o, mut c) = (None, None);
+    for _ in 0..20 {
+        o = Some(owner.tick().await.unwrap());
+        c = Some(claimer.tick().await.unwrap());
+        w.xmz("chain").mine(5);
+        if o.as_ref().unwrap().is_done() && c.as_ref().unwrap().is_done() {
+            break;
+        }
+    }
+    assert_eq!(o, Some(RoleState::Owner(OwnerState::Done(Outcome::Swapped))));
+    assert_eq!(c, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
+
+    // Afterwards the seller's account pays everything it holds to the user's own wallet
+    let metamask: Address = "0x00000000000000000000000000000000000Ad0E5".parse().unwrap();
+    let before = balance(&w.url, metamask).await;
+    let held = balance(&w.url, claimer_addr).await;
+    let (_, amount) = w.chain(CLAIMER_KEY).pay_out(metamask).await.unwrap().expect("a payout");
+    assert_eq!(balance(&w.url, metamask).await - before, amount);
+    assert!(amount < held && held - amount < U256::from(10u64.pow(16)), "only the transfer fee stays behind");
+    assert!(balance(&w.url, claimer_addr).await < U256::from(10u64.pow(15)));
+    assert_eq!(w.chain(CLAIMER_KEY).pay_out(metamask).await.unwrap(), None, "nothing left: repeating sends nothing");
+    set_balance(&w.url, claimer_addr, rich).await;
+}
+
 #[tokio::test]
 async fn owner_refunds_early_when_no_xmz_arrives() {
     let Some(url) = std::env::var("MONZERO_EVM_RPC").ok() else { return };

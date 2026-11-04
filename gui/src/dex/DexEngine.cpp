@@ -93,6 +93,10 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     m_researchWatcher(new QFutureWatcher<QVariantMap>(this))
 {
     m_riskControl=new DexRiskControl(this);m_riskControl->setNetwork(DexDeployment::litecoinNetwork());
+    // A second kill switch / caps control for XMZ<->EVM trades. Its network is bound to the
+    // trade's chain when the EVM trade is configured (evmControlNetwork), with its own ledger.
+    m_evmRiskControl=new DexRiskControl(this);
+    connect(m_evmRiskControl,&DexRiskControl::changed,this,&DexEngine::dexRiskChanged);
     connect(m_riskControl,&DexRiskControl::changed,this,&DexEngine::dexRiskChanged);
     connect(m_ltcJournal,&LitecoinJournalJob::changed,this,&DexEngine::dexRiskChanged);
     connect(m_ltcLight,&LitecoinLightJob::changed,this,&DexEngine::litecoinLightChanged);
@@ -717,15 +721,62 @@ QVariantMap DexEngine::bchNativeProofStatus() const {
 bool DexEngine::requestBchNativeProofReview() {return bchOperationIdle() && m_bchNativeProof->review();}
 bool DexEngine::submitBchNativeProof(const QString &commitment) {return bchOperationIdle() && m_bchNativeProof->submit(commitment);}
 bool DexEngine::requestBchNativeProofCheck() {return bchOperationIdle() && m_bchNativeProof->refresh();}
+namespace {
+// EVM chainId -> operator control-document network. "-mainnet" names carry real funds and need a
+// signed document (the owner signs e.g. bnb-mainnet, like btc-mainnet); test/local chains map to
+// "evm-regtest", which DexRiskControl treats as needing no document (nothing to cap). An unknown
+// chain returns empty, which fails the gate closed.
+QString evmControlNetwork(qint64 chainId) {
+    switch (chainId) {
+    case 56: return QStringLiteral("bnb-mainnet");
+    case 1:  return QStringLiteral("eth-mainnet");
+    case 97: case 11155111: case 1337: case 31337: return QStringLiteral("evm-regtest");
+    default: return {};
+    }
+}
+}
+
 bool DexEngine::configureEvmTrade(const QString &config,const QString &seedFile) {
     if (!QDir::isAbsolutePath(seedFile) || QDir::cleanPath(seedFile)!=seedFile || !m_evmTrade->configure(config)) return false;
     m_evmSeedFile=seedFile;m_evmTrade->refresh();m_evmTicker->start();return true;
 }
 QVariantMap DexEngine::evmTradeStatus() const {
-    auto s=m_evmTrade->status();s.insert("stepping",m_evmTicker->isActive());return s;
+    auto s=m_evmTrade->status();s.insert("stepping",m_evmTicker->isActive());s.insert("startRefusal",m_evmStartRefusal);return s;
 }
 bool DexEngine::refreshEvmTrade() {return m_evmTrade->refresh();}
-bool DexEngine::approveEvmTrade(const QString &commitment) {return m_evmTrade->approve(commitment);}
+bool DexEngine::approveEvmTrade(const QString &commitment) {
+    // The operator kill switch and caps gate the START of a new EVM trade, exactly as for UTXO
+    // swaps. refusal() returns empty for a trade already in the ledger, so later approvals of an
+    // in-flight trade are never blocked (nothing is stranded); only the first is enforced.
+    const auto offer=m_evmTrade->offer();const auto trade=m_evmTrade->tradeId();
+    if (offer.isEmpty() || trade.isEmpty()) return false;
+    const auto network=evmControlNetwork(qint64(offer.value("chainId").toDouble()));
+    const auto refuse=[this](const QString &why){m_evmStartRefusal=why;emit evmTradeChanged();return false;};
+    if (network.isEmpty()) return refuse(tr("This EVM chain is not supported for trading."));
+    bool valueOk=false,xmzOk=false;
+    const auto valueHex=offer.value("value").toString();
+    const quint64 valueWei=valueHex.startsWith("0x")?valueHex.mid(2).toULongLong(&valueOk,16):0;
+    const auto xmzValue=offer.value("xmzAmount");
+    const quint64 xmzAtoms=xmzValue.isString()?xmzValue.toString().toULongLong(&xmzOk)
+        :(xmzOk=(xmzValue.isDouble() && xmzValue.toDouble()>=0 && xmzValue.toDouble()<9.007199254740992e15),quint64(xmzValue.toDouble()));
+    if (!valueOk || !xmzOk) return refuse(tr("The trade amount could not be read."));
+    if (m_evmBoundNetwork!=network) {
+        // Bind the EVM risk control to this trade's chain and load its signed control document once.
+        m_evmRiskControl->setNetwork(network);m_evmBoundNetwork=network;
+        if (!m_evmControlFile.isEmpty()) m_evmRiskControl->loadControlFile(m_evmControlFile);
+    }
+    const auto refusal=m_evmRiskControl->refusal(trade,valueWei,xmzAtoms);
+    if (!refusal.isEmpty()) return refuse(refusal);
+    if (!m_evmRiskControl->recordStart(trade,valueWei)) return refuse(tr("The trade could not be recorded; not started."));
+    m_evmStartRefusal.clear();
+    return m_evmTrade->approve(commitment);
+}
+bool DexEngine::payoutEvmTrade(const QString &address) {
+    if (m_evmSeedFile.isEmpty() || m_evmTrade->status().value("busy").toBool()) return false;
+    QByteArray hex=LitecoinJournalProtocol::privateConfig(m_evmSeedFile,256).trimmed();
+    QByteArray seed=QByteArray::fromHex(hex);hex.fill('\0');
+    return m_evmTrade->payout(seed,address);
+}
 void DexEngine::stepEvmTrade() {
     const auto s=m_evmTrade->status();
     if (s.value("snapshot").toMap().value("done").toBool()) {m_evmTicker->stop();emit evmTradeChanged();return;}

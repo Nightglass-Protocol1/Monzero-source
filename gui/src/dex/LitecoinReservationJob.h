@@ -46,5 +46,6 @@ private:
     QByteArray m_output,m_input;
     qint64 m_errors=0;
     bool m_busy=false;
+    bool m_lightChain=false; // funder reaches the chain through light servers (recovery only)
 };
 #endif

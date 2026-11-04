@@ -1,0 +1,55 @@
+{
+  "run": "gui-metamask-1",
+  "date": "2026-10-31",
+  "chain": "BNB testnet (97)",
+  "contract": "0xf7c19f735C3494b356091eFBeFf3ab53617190b7",
+  "purpose": "The Monzero app as buyer on an EMPTY trade account (#6), funded from an outside wallet standing in for MetaMask (#0) via the app's payment request, then paying the leftover back to it with 'Send to MetaMask'; the seller (#7, runner) also started empty.",
+  "terms": {
+    "bnb": "0.02",
+    "xmz": "20 (XMZ testnet)"
+  },
+  "tradeId": "0x807175c75f4840087522e2f470964b223bed568b62393995c7d578f0c3cf45b1",
+  "steps": [
+    "20:21:52 keys agreed over libp2p; trade saved for the app",
+    "app: user ticked 'I checked the amounts' and pressed Approve (queued while a step ran)",
+    "app: 'Fund this trade: send 0.02015 BNB' with the trade account 0xBD309F054099947Dbcf2b79439Ed174816B1671E; QR decoded to ethereum:0xBD309F054099947Dbcf2b79439Ed174816B1671E@97?value=20150000000000000",
+    "20:30:07 outside wallet paid 0.02015 tBNB, tx 0x9b6187764a30b532163ce960d7f6d4d351da7bfa7f5c20fb682eace33bf05401; the app then locked its BNB by itself",
+    "seller refused to lock XMZ without gas: 20:30:53 claimer tick error (1): waiting for funding: the account holds 0 wei and needs 50000000000000 wei",
+    "seller given 0.0001 tBNB; 20:31:28 XmzLockSent",
+    "both Done(Swapped) by 21:15 UTC",
+    "Send to MetaMask: 139009554500000 wei to 0xf5A188d1B75FBeF37B7f8BC49eEdd6274693073B, tx 0xdf9970733f178324b1377f4e7cdf4d0d5daf87058301dbd92d13293352c8b6ec; trade account left at 0; a second press sent nothing ('Nothing more to send')"
+  ],
+  "owner": {
+    "final": "Done(Swapped)",
+    "retained": [
+      "new_swap",
+      "set_ready"
+    ]
+  },
+  "claimer": {
+    "final": "Done(Swapped)",
+    "states": [
+      "WaitingForEvmLock",
+      "XmzLockSent",
+      "XmzLocked",
+      "ClaimSent",
+      "Done(Swapped)"
+    ],
+    "bnbTxs": {
+      "claim": [
+        "0xab5501c03f1e084262ef28a0c3ca36657b6258cf858963bef0a1354efb7b1c70"
+      ]
+    }
+  },
+  "payout": {
+    "amountWei": "139009554500000",
+    "to": "0xf5A188d1B75FBeF37B7f8BC49eEdd6274693073B",
+    "tx": "0xdf9970733f178324b1377f4e7cdf4d0d5daf87058301dbd92d13293352c8b6ec"
+  },
+  "found": "Approve button was disabled while the app's 20-second trade check ran (fixed: approval queues, commit 8bd615c)",
+  "screenshots": [
+    "bsc-testnet-gui-metamask-1-funding.png",
+    "bsc-testnet-gui-metamask-1-done.png",
+    "bsc-testnet-gui-metamask-1-payout.png"
+  ]
+}

@@ -175,6 +175,21 @@ Rectangle {
     }
     property var bchNativeObservation: root.dex.bchNativeObservationStatus || ({})
     property var evmTrade: root.dex.evmTradeStatus || ({})
+    // The lab panels are for testers; traders see the trade card first.
+    property bool showAdvanced: false
+    // The user's own wallets (optional), per coin; BNB keeps its earlier MetaMask setting
+    property var externalWallets: {
+        var m = {}
+        try { m = JSON.parse(persistentSettings.dexExternalWallets || "{}") || {} } catch (e) { m = {} }
+        if (!m.BNB && persistentSettings.dexExternalWallet) m.BNB = persistentSettings.dexExternalWallet
+        return m
+    }
+    function setExternalWallet(coin, address) {
+        var m = JSON.parse(JSON.stringify(root.externalWallets))
+        if (address) m[coin] = address; else delete m[coin]
+        persistentSettings.dexExternalWallets = JSON.stringify(m)
+        if (coin === "BNB") persistentSettings.dexExternalWallet = address || ""
+    }
     property string evmTradeError: ""
     function evmStageText(role, stage) {
         var owner = {
@@ -400,14 +415,117 @@ Rectangle {
 
         RowLayout {
             Layout.fillWidth: true
-            M.Label { fontSize: 25; text: qsTr("Monzero Spot Exchange") + translationManager.emptyString }
+            M.Label { fontSize: 25; text: qsTr("Trade") + translationManager.emptyString }
             Item { Layout.fillWidth: true }
             Rectangle {
-                Layout.preferredWidth: 160; Layout.preferredHeight: 32; radius: 16
-                color: "#40202a"; border.width: 1; border.color: "#b84b6b"
-                M.TextPlain { anchors.centerIn: parent; color: "#ffb4c8"; font.bold: true; font.pixelSize: 12; text: (root.hasMarketData ? qsTr("VERIFIED OFFERS") : qsTr("NO OFFERS LOADED")) + translationManager.emptyString }
+                Layout.preferredWidth: offersBadge.implicitWidth + 28; Layout.preferredHeight: 30; radius: 15
+                color: "transparent"; border.width: 1; border.color: root.hasMarketData ? M.Style.accent : M.Style.accentMuted
+                M.TextPlain { id: offersBadge; themeTransition: false; anchors.centerIn: parent; font.pixelSize: 12
+                    color: root.hasMarketData ? M.Style.accent : M.Style.dimmedFontColor
+                    text: (root.hasMarketData ? qsTr("Verified offers") : qsTr("No offers yet")) + translationManager.emptyString }
             }
         }
+
+        // ---- The simple way to trade: one active trade, then a new trade card
+        M.DexTradeProgress {
+            id: tradeProgress
+            objectName: "tradeProgress"
+            Layout.fillWidth: true
+            visible: root.evmTrade.configured === true
+            trade: root.evmTrade
+            coin: "BNB"
+            errorText: root.evmTradeError
+            onApprove: root.evmTradeError = root.dex.approveEvmTrade(commitment) ? "" : qsTr("Approval could not start.")
+            onRefresh: root.evmTradeError = root.dex.refreshEvmTrade() ? "" : qsTr("Refresh could not start.")
+            externalWallet: root.externalWallets.BNB || ""
+            onPayoutRequested: root.evmTradeError = root.dex.payoutEvmTrade(root.externalWallets.BNB || "") ? "" : qsTr("The payout could not start.")
+        }
+        // Pair tabs, as on an exchange: each shows its last price and 24 h change from completed trades
+        M.DexPairTabs {
+            objectName: "pairTabs"
+            Layout.fillWidth: true
+            coins: tradeCard.coins
+            coin: tradeCard.coin
+            market: marketPanel
+            coinDecimals: tradeCard.coinDecimals
+            onPicked: { tradeCard.coin = coin; tradeCard.reviewing = false }
+        }
+
+        // Wide windows: market on the left, the trade form beside it; narrow: one column
+        GridLayout {
+            id: tradeArea
+            Layout.fillWidth: true
+            columns: root.width > 1100 ? 2 : 1
+            columnSpacing: 12; rowSpacing: 12
+            M.DexMarketPanel {
+                id: marketPanel
+                objectName: "marketPanel"
+                Layout.fillWidth: true
+                Layout.alignment: Qt.AlignTop
+                coin: tradeCard.coin
+                coinDecimals: tradeCard.coinDecimals[tradeCard.coin] || 8
+                offers: tradeCard.offers
+                trades: root.marketSnapshot.valid === true ? (root.marketSnapshot.trades || []) : []
+                // A SELL offer sells the coin for XMZ: taking it means selling XMZ; a BUY offer, buying XMZ
+                onOfferPicked: {
+                    tradeCard.direction = String(offer.side).toUpperCase() === "SELL" ? "sell" : "buy"
+                    var xmz = Number(offer.priceAtomic) / 1e11 * Number(offer.amountAtomic) / Math.pow(10, coinDecimals)
+                    tradeCard.amountText = tradeCard.trim(Math.floor(xmz * 1e6) / 1e6, 6)   // down: never more than the offer covers
+                }
+            }
+            ColumnLayout {
+                Layout.fillWidth: tradeArea.columns === 1
+                Layout.preferredWidth: tradeArea.columns === 1 ? -1 : 380
+                Layout.alignment: Qt.AlignTop
+                spacing: 12
+                M.DexTradeCard {
+                    id: tradeCard
+                    objectName: "tradeCard"
+                    Layout.fillWidth: true
+                    showCoinPicker: false
+                wallets: root.externalWallets
+                    offers: root.marketSnapshot.valid === true ? (root.marketSnapshot.offers || []) : []
+                    xmzBalance: appWindow.currentWallet ? Number(walletManager.displayAmount(appWindow.currentWallet.unlockedBalanceAll())) : -1
+                    canStart: false
+                    startBlockedReason: qsTr("Testnet preview: taking an offer from the app comes next. Testnet trades are started with the trade kit for now.")
+                }
+                M.TextPlain {
+                    themeTransition: false; color: M.Style.defaultFontColor; font.pixelSize: 15
+                    Layout.topMargin: 4
+                    text: qsTr("Your wallets (optional)")
+                }
+                Repeater {
+                    // The selected market's coin first
+                    model: [tradeCard.coin].concat(tradeCard.coins.filter(function (c) { return c !== tradeCard.coin }))
+                    delegate: M.DexExternalWallet {
+                        objectName: "externalWallet_" + modelData
+                        Layout.fillWidth: true
+                        coin: modelData
+                        address: root.externalWallets[modelData] || ""
+                        onConnectRequested: root.setExternalWallet(modelData, address)
+                        onDisconnectRequested: root.setExternalWallet(modelData, "")
+                    }
+                }
+            }
+        }
+
+        // ---- Everything else: wallets, recovery and the testnet lab, closed by default
+        Rectangle {
+            objectName: "advancedToggle"
+            Layout.fillWidth: true; implicitHeight: 44; radius: 8
+            color: "transparent"; border.color: M.Style.accentMuted
+            M.TextPlain {
+                anchors.left: parent.left; anchors.leftMargin: 16; anchors.verticalCenter: parent.verticalCenter
+                text: (root.showAdvanced ? "▾ " : "▸ ") + qsTr("Advanced: coin wallets, recovery and testnet lab")
+            }
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.showAdvanced = !root.showAdvanced }
+        }
+        ColumnLayout {
+            id: advancedTools
+            objectName: "advancedTools"
+            Layout.fillWidth: true
+            visible: root.showAdvanced
+            spacing: 12
         Rectangle {
             objectName: "litecoinWalletOverview"
             // Litecoin wallet card; on a Bitcoin stage the BTC wallet panel below takes its place.
@@ -3957,6 +4075,7 @@ Later addresses may be missing from this backup. Payment and active swap recover
                     RowLayout { anchors.fill:parent;anchors.margins:10;M.TextPlain { color:sideText==="BUY"?"#49c991":"#ef6575";font.bold:true;text:sideText+" "+root.baseCoin } M.TextPlain { Layout.fillWidth:true;color:M.Style.defaultFontColor;text:amountText+" @ "+priceText } M.TextPlain { color:"#d5a6ff";text:settlementLabel+": "+settlementText+" XMZ · fees "+feeText+" XMZ · "+qsTr("external fee: ")+minerFeeText } M.InlineButton { text:qsTr("Cancel");onClicked:{ root.dex.cancelLocalOffer(offerId); root.refreshOffers() } } }
                 } }
             }
+        }
         }
     }
 }

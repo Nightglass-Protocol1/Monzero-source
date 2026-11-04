@@ -224,10 +224,12 @@ def read_json(path, what):
         fail(f"cannot read the {what} {path}: {error}")
 
 
-def light_seller(local, role):
-    """The XMZ seller may reach Bitcoin/Litecoin through Electrum servers instead of a node."""
+def light_chain(local):
+    """Either trader may reach Bitcoin/Litecoin through Electrum servers instead of a node. The
+    Bitcoin/Litecoin funder then funds its lock from the app's light wallet and uses the servers
+    to approve the redeem, cancel, refund and claim its XMZ (BUYER_LIGHT_AND_MAINNET.md)."""
     ltc = local.get("litecoin") if isinstance(local, dict) else None
-    return role == "xmz" and isinstance(ltc, dict) and "light" in ltc
+    return isinstance(ltc, dict) and "light" in ltc
 
 
 def check_light(light):
@@ -249,9 +251,7 @@ def check_light(light):
 
 def check_local(local, role):
     """Every LOCAL.json value the layout uses must be present before anything is written."""
-    light = light_seller(local, role)
-    if isinstance(local, dict) and isinstance(local.get("litecoin"), dict) and "light" in local["litecoin"] and not light:
-        fail("only the XMZ seller can use light servers; the Bitcoin/Litecoin funder needs its node")
+    light = light_chain(local)
     for where, keys in LOCAL_KEYS.items():
         value = local if where == "local settings" else local[where]  # the top level was checked first
         if not isinstance(value, dict):
@@ -312,7 +312,7 @@ def app_layout(final, role, terms, quote, identity_dir, own_certificate, peer, p
     journal_path = write_config("journal.json", journal)
     phase = {k: v for k, v in journal.items() if k != "startQuoteFile"}
     ltc, xmz = local["litecoin"], local["xmz"]
-    ltc_service = ({"ltcLight": ltc["light"]} if light_seller(local, role) else
+    ltc_service = ({"ltcLight": ltc["light"]} if light_chain(local) else
         {"ltcPort": ltc["rpcPort"], "ltcWallet": ltc["wallet"], "ltcAnchor": ltc["anchor"], "ltcCookieFile": ltc["cookieFile"]})
     native = {"nativeDaemonPort": xmz["daemonPort"], "nativeWalletPort": xmz["claimWalletPort"], "nativeLoginFile": xmz["claimLoginFile"]}
     observer = ({"walletPort": xmz["sourceWalletPort"], "loginFile": xmz["sourceLoginFile"]} if role == "xmz"

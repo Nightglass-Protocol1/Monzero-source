@@ -3,7 +3,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-// BNB testnet only. The test accounts' phrase stays outside the repository (mode 600).
+// BNB testnet: the test accounts' phrase stays outside the repository (mode 600).
 const TESTNET_ACCOUNTS = path.join(os.homedir(), ".config", "monzero-dex", "bsc-testnet-accounts.json");
 const networks = {};
 if (fs.existsSync(TESTNET_ACCOUNTS)) {
@@ -14,6 +14,9 @@ if (fs.existsSync(TESTNET_ACCOUNTS)) {
     accounts: { mnemonic, count: 2 },
   };
 }
+
+// BNB mainnet: no accounts here. scripts/deploy-mainnet.js asks for the key on the terminal.
+networks.bscMainnet = { url: process.env.BSC_MAINNET_RPC || "https://bsc-rpc.publicnode.com", chainId: 56 };
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {

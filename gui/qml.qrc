@@ -11,6 +11,11 @@
         <file>components/LightWalletBackupRestorePanel.qml</file>
         <file>components/LightWalletSetupPanel.qml</file>
         <file>components/LitecoinTradeSetupPanel.qml</file>
+        <file>components/DexExternalWallet.qml</file>
+        <file>components/DexMarketPanel.qml</file>
+        <file>components/DexPairTabs.qml</file>
+        <file>components/DexTradeCard.qml</file>
+        <file>components/DexTradeProgress.qml</file>
         <file>components/LightWalletImportPanel.qml</file>
         <file>components/LightWalletDiscoveryPanel.qml</file>
         <file>components/LightWalletImportRecoveryPanel.qml</file>

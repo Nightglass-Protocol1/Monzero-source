@@ -5,6 +5,9 @@ import "../../pages" as Pages
 TestCase {
     id: test
     name: "DexRecoveryPresentation"
+    // The page reads the engine only when the DEX prototype is enabled
+    property bool dexPrototypeEnabled: true
+    property QtObject persistentSettings: QtObject { property string dexExternalWallet: ""; property string dexExternalWallets: "{}" }
     when: windowShown
     visible: true
     width: 1280
@@ -388,7 +391,7 @@ TestCase {
                 executable:false,settlementStatus:"unimplemented",settlementBlocker:symbol + " settlement unavailable"};
         }
     }
-    Pages.Dex { id: page; width: test.width; height: test.height }
+    Pages.Dex { id: page; width: test.width; height: test.height; showAdvanced: true }
     function test_litecoinOverviewRejectsIncompleteObservations() {
         page.selectPair("LTC / XMZ")
         var balance=findChild(page,"litecoinWalletOverviewBalance"),address=findChild(page,"litecoinOverviewAddress")

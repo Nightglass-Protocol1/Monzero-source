@@ -2,6 +2,7 @@
 #define MONZERO_LITECOIN_JOURNAL_PROTOCOL_H
 #include "BackendExecutable.h"
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QRegularExpression>
 namespace LitecoinJournalProtocol {
@@ -76,6 +77,21 @@ inline bool snapshotValid(const QJsonObject &s,const QString &trade,const QStrin
         const auto item=recovery.value(key).toObject();
         if (item.size()!=2 || !item.value("attempted").isBool() || !item.value("acknowledged").isBool()
             || (item.value("acknowledged").toBool() && !item.value("attempted").toBool())) return false;
+    }
+    return true;
+}
+// A chain-access file that names light Electrum servers instead of a node
+// (BUYER_LIGHT_AND_MAINNET.md, SELLER_LIGHT_REDEEM.md). The helper re-checks every
+// rule; this is the shape: no node fields, 2-8 servers, tip age 600-10800 s.
+inline bool lightChainAccessValid(const QJsonObject &rpc) {
+    for (const auto key:{"ltcPort","ltcWallet","ltcAnchor","ltcCookieFile"}) if (rpc.contains(key)) return false;
+    const auto light=rpc.value("ltcLight").toObject();const auto servers=light.value("servers").toArray();
+    const auto age=light.value("maximumTipAge").toDouble(-1);
+    if (light.size()!=2 || servers.size()<2 || servers.size()>8 || age<600 || age>10800 || age!=int(age)) return false;
+    for (const auto &value:servers) {
+        const auto server=value.toObject();const auto port=server.value("port").toDouble(-1);
+        if (server.size()!=2 || !server.value("host").isString() || server.value("host").toString().isEmpty()
+            || port<1 || port>65535 || port!=int(port)) return false;
     }
     return true;
 }

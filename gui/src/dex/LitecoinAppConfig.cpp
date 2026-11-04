@@ -89,6 +89,7 @@ QVariantMap LitecoinAppConfig::review(const QString &path) {
     if (!doc.isObject() || doc.toJson(QJsonDocument::Compact)!=payload || terms.size()!=fields.size()
         || terms.value("schema")!="monzero-native-ltc-xmz-quote-v2"
         || !DexDeployment::litecoinNetworkAllowed(terms.value("ltcNetwork").toString())
+        || !DexDeployment::xmzNetworkAllowed(terms.value("xmzNetwork").toString(),terms.value("xmzGenesis").toString())
         || terms.value("ltcGenesis")!=DexDeployment::litecoinGenesis()) return {};
     static const QRegularExpression number("\\A(?:0|[1-9][0-9]{0,19})\\z");
     for (const auto &field:fields) {

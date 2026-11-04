@@ -71,13 +71,15 @@ pays XMZ and receives Litecoin.
    The source wallet is only needed by the XMZ funder, the observer wallet only
    by the LTC funder.
 
-   The XMZ funder may skip its Bitcoin/Litecoin node and use Electrum servers
+   Either trader may skip its Bitcoin/Litecoin node and use Electrum servers
    instead: replace the `litecoin` object with
    `{"light": {"servers": [{"host": "a.example", "port": 50002}, {"host": "b.example", "port": 50002}], "maximumTipAge": 5400}}`.
    Use 2–8 independently operated servers; every one must agree before the app
    releases anything, and the best header must be newer than `maximumTipAge`
    seconds (600–10800). See `tools/dex-engine-port/SELLER_LIGHT_REDEEM.md` for
-   the rules and the remaining risk. The LTC funder still needs its node.
+   the rules and the remaining risk. A Bitcoin/Litecoin funder on light servers
+   funds its lock from the app's light wallet; the servers are then used to approve
+   the redeem, cancel, refund and claim its XMZ (`BUYER_LIGHT_AND_MAINNET.md`).
 
    The command verifies both signatures over the canonical
    quote terms and checks that the quote names both parties' keys before
@@ -115,3 +117,12 @@ complete destination is preserved. Inspect the exact reported paths; do not
 delete other attempts' staging folders or overwrite an existing destination.
 These checks establish publication integrity, not complete policy/service
 validation or active-trade backup restoration.
+
+## Your own wallet as the destination
+
+`ltcPayout`, `ltcRefund` (and `btcPayout` / `btcRefund` on a Bitcoin stage) can be any address of
+the trader's own wallet, not only the app's light wallet: the seller of XMZ puts the address where
+it wants the coin it receives (`…Payout`), the buyer of XMZ the address where its coin goes back if
+the trade is refunded (`…Refund`). The Trade screen keeps these under "Your wallets (optional)".
+Litecoin destinations must be native SegWit (`ltc1…`). The engine checks each destination against
+the trade's network before anything is funded.

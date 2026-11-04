@@ -20,7 +20,7 @@ use crate::secret::{combined_spend_key, SecretShare};
 use crate::swap_seed::SwapSeed;
 use alloy::signers::local::PrivateKeySigner;
 use crate::{check_lock, swap_id, AgreedTerms, ObservedLock, Revealed, Stage, Swap};
-use alloy::primitives::{Bytes, B256, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -39,8 +39,33 @@ pub enum DriverError {
     /// The next step would lock our funds and the user has not approved this trade yet
     #[error("waiting for the user to approve locking funds for this trade")]
     AwaitingApproval,
+    /// The next step would lock funds, but our EVM account cannot yet pay for it and for the
+    /// later transactions that protect those funds (wei). Nothing was locked; send at least
+    /// `needed - have` to the account (e.g. from MetaMask) and step again.
+    #[error("waiting for funding: the account holds {have} wei and needs {needed} wei")]
+    AwaitingFunding { needed: U256, have: U256 },
     #[error(transparent)]
     Swap(#[from] crate::Error),
+}
+
+/// What our EVM account holds and what gas costs now (wei).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Funds {
+    pub balance: U256,
+    pub fee_per_gas: U256,
+}
+
+/// Generous gas per contract call (newSwap, setReady, claim, refund each use well under this);
+/// the reserve also doubles it for fee bumps on stuck transactions.
+pub const GAS_PER_CALL: u64 = 250_000;
+
+/// What our account must hold before a step that locks funds: the owner's own BNB/ETH lock
+/// (native asset) plus gas for newSwap, setReady and a refund; the claimer, gas for its claim,
+/// checked before it locks XMZ so it can always collect what it is owed.
+pub fn funding_needed(terms: &AgreedTerms, owner: bool, fee_per_gas: U256) -> U256 {
+    let calls: u64 = if owner { 3 } else { 1 };
+    let gas = U256::from(GAS_PER_CALL * calls * 2) * fee_per_gas;
+    if owner && terms.asset == Address::ZERO { terms.value + gas } else { gas }
 }
 
 /// A contract call the driver asks the chain to sign.
@@ -72,6 +97,8 @@ pub trait EvmChain {
     async fn replacement(&self, raw: &Bytes) -> Result<Option<Bytes>, DriverError>;
     /// Broadcast a signed transaction; already known or mined is not an error.
     async fn broadcast(&self, raw: &Bytes) -> Result<(), DriverError>;
+    /// Our account's balance and the current maximum fee per gas (wei)
+    async fn funds(&self) -> Result<Funds, DriverError>;
 }
 
 /// The XMZ wallet side of the swap.
@@ -283,6 +310,15 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         let locks = actions.iter().any(|a| matches!(a, Action::SendNewSwap | Action::LockXmz { .. }));
         if locks && record.trade.as_ref().is_some_and(|t| record.approved != Some(t.transcript)) {
             return Err(DriverError::AwaitingApproval);
+        }
+        // Nothing is locked until our account can pay for the lock and for what protects it
+        if locks {
+            let funds = self.chain.funds().await?;
+            let owner = matches!(record.state, RoleState::Owner(_));
+            let needed = funding_needed(&self.trade.terms, owner, funds.fee_per_gas);
+            if funds.balance < needed {
+                return Err(DriverError::AwaitingFunding { needed, have: funds.balance });
+            }
         }
         record.state = next.clone();
         self.journal.save(&record)?;

@@ -51,7 +51,11 @@ bool LitecoinReservationJob::configure(const QString &path,const QString &journa
     const auto rpcPath=wrapper.value(native?"fundingRpcFile":"rpcFile").toString();
     const auto quote=LitecoinJournalProtocol::privateConfig(quotePath),rpc=LitecoinJournalProtocol::privateConfig(rpcPath);
     const auto r=QJsonDocument::fromJson(rpc).object();
-    if (quote.isEmpty() || rpc.isEmpty() || (!native && (r.size()!=7 || r.value("schema")!="monzero-private-ltc-reservation-rpc-v1"))) return false;
+    // The funder's node settings, or light servers for cancel and refund only
+    // (its lock is then funded by the light wallet, not by a node wallet).
+    const bool light=!native && r.contains("ltcLight");
+    if (quote.isEmpty() || rpc.isEmpty() || (!native && (r.value("schema")!="monzero-private-ltc-reservation-rpc-v1"
+        || r.size()!=(light?4:7) || (light && !LitecoinJournalProtocol::lightChainAccessValid(r))))) return false;
     const auto payload=QJsonDocument::fromJson(quote).object().value("payload").toString().toUtf8();
     m_terms=QJsonDocument::fromJson(payload).object();
     m_requiredConfirmations=qMax(m_terms.value("ltcConfirmations").toString().toULongLong(),
@@ -60,6 +64,7 @@ bool LitecoinReservationJob::configure(const QString &path,const QString &journa
     QByteArray binding=m_terms.value("schema").toString().toUtf8();binding.append('\0');binding+=payload;
     m_quoteCommitment=QString::fromLatin1(QCryptographicHash::hash(binding,QCryptographicHash::Sha256).toHex());
     m_sources={{path,bytes},{journalPath,journal},{quotePath,quote},{rpcPath,rpc}};
+    m_lightChain=light;
     m_rpc=r;m_trade=c.value("tradeId").toString();m_program=c.value("helper").toString();m_digest=c.value("helperDigest").toString();
     m_role=role;m_path=path;m_state="ready";emit changed();return true;
 }
@@ -69,12 +74,12 @@ bool LitecoinReservationJob::sourcesMatch() const {
     return true;
 }
 QVariantMap LitecoinReservationJob::status() const {
-    return {{"role",m_role},{"reservationConfigured",!m_path.isEmpty() && m_role=="litecoin-funder"},
+    return {{"role",m_role},{"reservationConfigured",!m_path.isEmpty() && m_role=="litecoin-funder" && !m_lightChain},{"lightChain",m_lightChain},
         {"recoveryCheckState",m_recoveryCheckState},{"recoveryObservation",m_recoveryObservation},
         {"recoveryCheckAvailable",!m_path.isEmpty() && !m_busy},{"recoveryState",m_recoveryState},{"recoveryReview",m_recoveryReview},{"recoverySubmission",m_recoverySubmission},
         {"recoveryReviewAvailable",!m_path.isEmpty() && !m_busy},{"recoverySubmissionAvailable",!m_busy && !m_recoveryReview.isEmpty()},
         {"fundingState",m_fundingState},{"fundingReview",m_fundingReview},{"fundingSubmission",m_fundingSubmission},
-        {"fundingReviewAvailable",!m_path.isEmpty() && m_role=="litecoin-funder" && !m_busy},{"fundingSubmissionAvailable",!m_busy && !m_fundingReview.isEmpty()},
+        {"fundingReviewAvailable",!m_path.isEmpty() && m_role=="litecoin-funder" && !m_lightChain && !m_busy},{"fundingSubmissionAvailable",!m_busy && !m_fundingReview.isEmpty()},
         {"tradeId",m_trade},{"quoteCommitment",m_quoteCommitment},{"configured",!m_path.isEmpty()},{"busy",m_busy},{"state",m_state},{"review",m_review},{"executable",false}};
 }
 bool LitecoinReservationJob::recoveryAllowed(const QString &operation) const {
@@ -105,7 +110,8 @@ bool LitecoinReservationJob::run(const QString &operation,const QString &commitm
     if (operation.startsWith("recovery-")) {
         if (!recoveryAllowed(operation.section('-',1,1))
             || !QStringList{"review","submit","check"}.contains(operation.section('-',2,2))) return false;
-    } else if (m_role!="litecoin-funder" || !QStringList{"reservation-prepare","lock-funding-review","lock-funding-submit"}.contains(operation)) return false;
+    } else if (m_role!="litecoin-funder" || m_lightChain
+        || !QStringList{"reservation-prepare","lock-funding-review","lock-funding-submit"}.contains(operation)) return false;
     const QString wireOperation=m_role=="native-funder"?"native-"+operation:operation;
     m_recoveryObservation.clear();m_recoveryCheckState="not-checked";
     m_operation=operation;m_fundingReview.clear();m_fundingSubmission.clear();m_recoveryReview.clear();m_recoverySubmission.clear();

@@ -16,20 +16,6 @@
 #include <QRegularExpression>
 
 namespace {
-// The XMZ seller may replace its node fields with light Electrum servers
-// (SELLER_LIGHT_REDEEM.md). The helper re-checks every rule; this is the shape.
-bool lightSellerValid(const QJsonObject &rpc) {
-    for (const auto key:{"ltcPort","ltcWallet","ltcAnchor","ltcCookieFile"}) if (rpc.contains(key)) return false;
-    const auto light=rpc.value("ltcLight").toObject();const auto servers=light.value("servers").toArray();
-    const auto age=light.value("maximumTipAge").toDouble(-1);
-    if (light.size()!=2 || servers.size()<2 || servers.size()>8 || age<600 || age>10800 || age!=int(age)) return false;
-    for (const auto &value:servers) {
-        const auto server=value.toObject();const auto port=server.value("port").toDouble(-1);
-        if (server.size()!=2 || !server.value("host").isString() || server.value("host").toString().isEmpty()
-            || port<1 || port>65535 || port!=int(port)) return false;
-    }
-    return true;
-}
 using LitecoinJournalProtocol::privateConfig;
 using LitecoinJournalProtocol::snapshotValid;
 bool refundReviewValid(const QJsonObject &review,const QJsonObject &snapshot,const QString &action) {
@@ -270,7 +256,9 @@ bool LitecoinJournalJob::configure(const QString &path) {
             const bool indexed=rpc.value("schema")==prefix+"-v4";
             const bool recovery=indexed || rpc.value("schema")==prefix+"-v3";
             const bool light=rpc.contains("ltcLight");
-            if (light && (payoutExecution || !lightSellerValid(rpc))) return false;
+            // Either trader may name light servers instead of a node: the seller to redeem
+            // or refund, the Bitcoin funder to claim its XMZ.
+            if (light && !LitecoinJournalProtocol::lightChainAccessValid(rpc)) return false;
             if ((indexed && (rpc.contains("ltcRedeemBlock") || rpc.contains("ltcRefundBlock")))
                 || rpc.size()!=(recovery && !indexed?7:6)+(light?1:4) || observer.size()!=2 || port<1 || port>65535 || port!=int(port)
                 || !observer.value("loginFile").isString() || observer.value("loginFile").toString().isEmpty()) return false;

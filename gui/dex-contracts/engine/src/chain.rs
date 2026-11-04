@@ -120,6 +120,41 @@ impl AlloyChain {
     }
 }
 
+impl AlloyChain {
+    /// After a trade: send everything our account holds, less the fee of this transfer, to
+    /// `to` (the user's own wallet, e.g. MetaMask). Returns the transaction and the amount, or
+    /// None when a payout is still pending or nothing is left to send. Repeating it is safe.
+    pub async fn pay_out(&self, to: Address) -> Result<Option<(B256, U256)>, DriverError> {
+        let latest = self.reader.get_transaction_count(self.from).block_id(BlockId::latest()).await.map_err(chain_err)?;
+        let pending = self.reader.get_transaction_count(self.from).pending().await.map_err(chain_err)?;
+        if pending > latest {
+            return Ok(None);
+        }
+        let balance = self.reader.get_balance(self.from).await.map_err(chain_err)?;
+        let fees = self.reader.estimate_eip1559_fees().await.map_err(chain_err)?;
+        let gas: u64 = 21_000;
+        // Pay the full max fee up front so the amount plus fee never exceeds the balance
+        let fee = U256::from(gas) * U256::from(fees.max_fee_per_gas);
+        if balance <= fee {
+            return Ok(None);
+        }
+        let amount = balance - fee;
+        let tx = TransactionRequest::default()
+            .with_from(self.from)
+            .with_to(to)
+            .with_value(amount)
+            .with_nonce(latest)
+            .with_chain_id(self.reader.get_chain_id().await.map_err(chain_err)?)
+            .with_gas_limit(gas)
+            .with_max_fee_per_gas(fees.max_fee_per_gas)
+            .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas.min(fees.max_fee_per_gas));
+        let envelope = tx.build(&self.wallet).await.map_err(chain_err)?;
+        let raw = Bytes::from(envelope.encoded_2718());
+        self.broadcast(&raw).await?;
+        Ok(Some((*envelope.tx_hash(), amount)))
+    }
+}
+
 impl EvmChain for AlloyChain {
     async fn now(&self) -> Result<u64, DriverError> {
         let head = self.reader.get_block_number().await.map_err(chain_err)?;
@@ -207,6 +242,12 @@ impl EvmChain for AlloyChain {
 
     async fn head(&self) -> Result<u64, DriverError> {
         self.reader.get_block_number().await.map_err(chain_err)
+    }
+
+    async fn funds(&self) -> Result<crate::driver::Funds, DriverError> {
+        let balance = self.reader.get_balance(self.from).await.map_err(chain_err)?;
+        let fees = self.reader.estimate_eip1559_fees().await.map_err(chain_err)?;
+        Ok(crate::driver::Funds { balance, fee_per_gas: U256::from(fees.max_fee_per_gas) })
     }
 
     async fn replacement(&self, raw: &Bytes) -> Result<Option<Bytes>, DriverError> {

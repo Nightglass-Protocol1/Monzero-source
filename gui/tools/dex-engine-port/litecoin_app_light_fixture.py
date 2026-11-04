@@ -2,10 +2,19 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import uuid
 import test_light_wallet_chain as chain
 from test_litecoin_settlement import Node, require, write_private
+
+
+def helper_environment(args):
+    """Test runs trust the disposable TLS fixture; the mainnet stage keeps the system's
+    certificate authorities (public Electrum servers)."""
+    if getattr(args, 'light_wallet_tls', None):
+        return dict(os.environ, SSL_CERT_FILE=str(args.light_wallet_tls/'root.pem'))
+    return dict(os.environ)
 
 
 def create_light_wallet(args, root, node, anchor, network='regtest', maximum_height=10000, peer=None, fund=None, tag='ltc'):
@@ -32,7 +41,7 @@ def create_light_wallet(args, root, node, anchor, network='regtest', maximum_hei
             os.fsync(secret.fileno())
         settings = dict(schema=f'monzero-private-{tag}-setup-v1', network=network,
             walletId=str(uuid.uuid4()), accountIndex=0, maximumHeight=maximum_height,
-            seedEncoding='bip39-english-v1', endpoint=dict(host='localhost', port=peer.port))
+            seedEncoding='bip39-english-v1', endpoint=dict(host=getattr(peer, 'host', 'localhost'), port=peer.port))
         for key in ('setupDirectory', 'vaultDirectory', 'addressBookDirectory',
                     'backupDirectory', 'spendDirectory', 'cacheDirectory'):
             folder = directory / key
@@ -46,7 +55,7 @@ def create_light_wallet(args, root, node, anchor, network='regtest', maximum_hei
                 requestId=str(uuid.uuid4()), **fields)
             result = subprocess.run([str(helper), '--'+mode+'-stdio-v1', str(config)],
                 input=json.dumps(request).encode(), capture_output=True, timeout=240,
-                env=dict(os.environ, SSL_CERT_FILE=str(args.light_wallet_tls/'root.pem')))
+                env=helper_environment(args))
             require(password.encode() not in result.stdout+result.stderr, 'Secret in helper output')
             require(result.returncode == 0, 'Disposable light wallet setup failed: '+mode)
             return json.loads(result.stdout)['wallet']
@@ -72,7 +81,8 @@ def create_light_wallet(args, root, node, anchor, network='regtest', maximum_hei
 
 def attach_light_wallet(args, root, resident, setup):
     source=root/'local-light-wallet'/'light-password'
-    source.rename(resident.directory/'light-password')
+    dest=resident.directory/'light-password'
+    shutil.copy(source, dest); os.chmod(dest, 0o600)  # copy, not move: a reused wallet keeps its password for repeat runs
     resident.call('bob', 'light-configure', helper=str(args.gui_light_recovery_helper),
         digest=setup['helperSha256'], launcher=setup['launcher'])
     resident.call('bob', 'light-select')
@@ -87,7 +97,7 @@ def verify_light_refund(args, node, setup, refund_txid):
         request=dict(schema=f'monzero-ltc-light-{mode}-request-v1',requestId=identity,**fields)
         result=subprocess.run([str(args.gui_light_recovery_helper),'--'+mode+'-stdio-v1',setup['configurationFile']],
             input=json.dumps(request).encode(),capture_output=True,timeout=240,
-            env=dict(os.environ,SSL_CERT_FILE=str(args.light_wallet_tls/'root.pem')))
+            env=helper_environment(args))
         require(result.returncode==0, 'Local refund observation failed: '+mode)
         response=json.loads(result.stdout)
         require(response['requestId']==identity and response['schema']==request['schema'].replace('-request-','-response-')

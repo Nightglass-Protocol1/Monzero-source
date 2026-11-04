@@ -95,11 +95,25 @@ class ConfigureQuoteTests(ConfigureFixture, unittest.TestCase):
             self.assertEqual(config["ltcLight"], light)
             self.assertFalse({"ltcPort", "ltcWallet", "ltcAnchor", "ltcCookieFile"} & set(config))
 
+    def test_bitcoin_funder_may_use_light_servers_instead_of_a_node(self):
+        light = dict(servers=[dict(host="one.example", port=50002), dict(host="two.example", port=50002)],
+                     maximumTipAge=5400)
+        self.write_local(dict(light=light))
+        self.configure(self.envelope, "ltc")
+        for name in ("reservation-rpc.json", "payment-rpc.json", "redeem-rpc.json"):
+            config = json.loads((self.root / "app" / name).read_text())
+            self.assertEqual(config["ltcLight"], light)
+            self.assertFalse({"ltcPort", "ltcWallet", "ltcAnchor", "ltcCookieFile"} & set(config))
+        # The app's shape for a light reservation file: schema, servers, directory, fee rate.
+        reservation = json.loads((self.root / "app" / "reservation-rpc.json").read_text())
+        self.assertEqual(set(reservation), {"schema", "ltcLight", "reservationDirectory", "feeRateAtomsPerKb"})
+
     def test_light_servers_are_refused_unless_exactly_and_safely_configured(self):
         good = dict(servers=[dict(host="one.example", port=50002), dict(host="two.example", port=50002)],
                     maximumTipAge=5400)
-        cases = {"buyer": ("ltc", dict(light=good)),
-                 "node and light": ("xmz", dict(self.local["litecoin"], light=good)),
+        cases = {"node and light": ("xmz", dict(self.local["litecoin"], light=good)),
+                 "buyer node and light": ("ltc", dict(self.local["litecoin"], light=good)),
+                 "buyer one server": ("ltc", dict(light=dict(good, servers=good["servers"][:1]))),
                  "one server": ("xmz", dict(light=dict(good, servers=good["servers"][:1]))),
                  "same server twice": ("xmz", dict(light=dict(good, servers=[good["servers"][0]] * 2))),
                  "tip age unbounded": ("xmz", dict(light=dict(good, maximumTipAge=86400))),
