@@ -74,7 +74,8 @@
           "symbol": "USDT",
           "address": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
           "decimals": 6,
-          "verified": false
+          "verified": false,
+          "note": "on-chain symbol is USD₮0 (Tether omnichain USDT0); address is canonical Arbitrum USDT, decimals 6 — confirm this is the intended USDT before verifying"
         }
       ]
     },
@@ -93,7 +94,8 @@
           "symbol": "USDT",
           "address": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
           "decimals": 6,
-          "verified": false
+          "verified": false,
+          "note": "on-chain symbol is USDT0 (Tether omnichain); address is canonical Polygon USDT, decimals 6 — confirm before verifying"
         }
       ]
     }
