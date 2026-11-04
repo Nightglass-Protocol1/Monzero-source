@@ -44,3 +44,24 @@ await client.confirm(swap);                         // once the XMZ side is lock
   until it's time to claim/refund.
 - For ERC-20s, `approve` the contract for `value` first; the contract rejects
   fee-on-transfer tokens.
+
+## ERC-20 (stablecoin) swaps
+For a token swap, approve the contract first, then lock with the token as `asset`:
+```js
+await client.approveToken(USDC_ADDRESS, amount);
+await client.lock({ claimer, claimCommitment, refundCommitment,
+  duration1: 3*3600, duration2: 6*3600, asset: USDC_ADDRESS, value: amount, nonce });
+```
+
+## Gasless claims (relayer)
+The claimer signs a claim naming a relayer; the relayer submits it and keeps `fee` for
+gas, so the claimer needs no native coin to receive funds:
+```js
+// claimer's client:
+const signed = await claimerClient.signRelayClaim({ id, fee, relayer: relayerAddress });
+// relayer's client (anyone named as `relayer`):
+await relayerClient.claimRelayer(swap, claimSecret, signed);
+```
+Naming the relayer prevents front-running; the contract enforces `fee <= value` and
+low-s signatures. All four flows (native, token, refund, relayed) are covered in
+`test/connector.test.js`.

@@ -46,6 +46,30 @@ class XmzSwapClient {
   // Owner refunds (early while pending, or after timeout2) by revealing the refund secret.
   async refund(swap, refundSecret) { return (await (await this.contract.refund(this._tuple(swap), refundSecret)).wait()).hash; }
 
+  // Approve an ERC-20 for a token swap (call before lock() with a token asset).
+  async approveToken(tokenAddress, amount) {
+    const erc20 = new ethers.Contract(tokenAddress, ["function approve(address,uint256) returns (bool)"], this.contract.runner);
+    return (await (await erc20.approve(this.address, amount)).wait()).hash;
+  }
+
+  // Claimer signs a GASLESS claim: a relayer can then submit it and take `fee` for the
+  // gas. Naming the relayer stops a front-runner from stealing the fee. (this client must
+  // be bound to the CLAIMER's signer.)
+  async signRelayClaim({ id, fee, relayer }) {
+    const net = await this.contract.runner.provider.getNetwork();
+    const inner = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+      ["string", "uint256", "address", "bytes32", "uint256", "address"],
+      ["XMZ-SWAP-RELAY-V1", net.chainId, this.address, id, fee, relayer]));
+    const sig = ethers.Signature.from(await this.contract.runner.signMessage(ethers.getBytes(inner)));
+    return { fee, relayer, v: sig.v, r: sig.r, s: sig.s };
+  }
+
+  // Relayer submits the claimer's signed claim, revealing `secret`; gets `fee`, the
+  // claimer gets the rest. (this client must be bound to the RELAYER's signer.)
+  async claimRelayer(swap, secret, rc) {
+    return (await (await this.contract.claimRelayer(this._tuple(swap), secret, rc.fee, rc.v, rc.r, rc.s)).wait()).hash;
+  }
+
   // Stage: 0 INVALID, 1 PENDING, 2 READY, 3 COMPLETED.
   async stage(swap) { return Number(await this.contract.swaps(await this.contract.swapId(this._tuple(swap)))); }
 }
