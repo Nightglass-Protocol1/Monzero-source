@@ -17,9 +17,9 @@ struct Market {
     const char *blocker;
 };
 
-inline const std::array<Market, 8> &markets()
+inline const std::array<Market, 10> &markets()
 {
-    static const std::array<Market, 8> entries{{
+    static const std::array<Market, 10> entries{{
         {"BTC", 8, 64, "bitcoin", "isolated-fixtures",
             "BTC settlement has isolated test fixtures; live trading remains unavailable."},
         {"LTC", 8, 64, "litecoin", "isolated-fixtures",
@@ -31,9 +31,13 @@ inline const std::array<Market, 8> &markets()
         {"DOGE", 8, 64, "dogecoin", "protocol-research",
             "DOGE requires its own lock and refund protocol; settlement is unavailable."},
         {"ETH", 18, 256, "ethereum", "unimplemented",
-            "ETH uses the same swap contract as BNB; it is not deployed on an Ethereum network yet. Settlement is unavailable."},
+            "ETH uses the same swap contract as BNB, on Ethereum, Base or Arbitrum; it is not deployed on any of them yet. Settlement is unavailable."},
         {"BNB", 18, 256, "evm", "isolated-fixtures",
             "BNB/XMZ swap, refund, two-machine and power-cut runs pass on BNB testnet through the swap contract; app screens are a prototype and live trading is unavailable."},
+        {"USDC", 6, 256, "evm", "unimplemented",
+            "USDC trades through the same swap contract as BNB (BNB/Base/Arbitrum/Polygon/Ethereum); not deployed on any EVM network yet. Settlement is unavailable."},
+        {"USDT", 6, 256, "evm", "unimplemented",
+            "USDT trades through the same swap contract as BNB (BNB/Base/Arbitrum/Polygon/Ethereum); not deployed on any EVM network yet. Settlement is unavailable."},
         {"RUNE", 8, 64, "thorchain-native", "protocol-research",
             "Native THORChain RUNE settlement is not implemented."}
     }};
