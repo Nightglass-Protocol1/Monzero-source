@@ -1,0 +1,101 @@
+{
+  "_comment": "Tradeable assets per EVM chain for the Monzero DEX. native uses address(0); tokens are ERC-20 addresses passed to XmzSwap.newSwap(asset,...). EVERY token address is `verified: false` until independently confirmed against the token's OFFICIAL source AND checked in the community pentest. The validator (test/assets.test.js) enforces EIP-55 checksums and that chainIds match hardhat.config.js, but it cannot confirm an address is the RIGHT token — a wrong-but-valid address would route funds to the wrong asset. Do not set verified:true or trade on mainnet until each is confirmed.",
+  "native": "0x0000000000000000000000000000000000000000",
+  "chains": {
+    "bsc": {
+      "chainId": 56,
+      "nativeSymbol": "BNB",
+      "nativeDecimals": 18,
+      "tokens": [
+        {
+          "symbol": "USDT",
+          "address": "0x55d398326f99059fF775485246999027B3197955",
+          "decimals": 18,
+          "verified": false
+        },
+        {
+          "symbol": "USDC",
+          "address": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+          "decimals": 18,
+          "verified": false
+        }
+      ]
+    },
+    "ethereum": {
+      "chainId": 1,
+      "nativeSymbol": "ETH",
+      "nativeDecimals": 18,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+          "decimals": 6,
+          "verified": false
+        },
+        {
+          "symbol": "USDT",
+          "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+          "decimals": 6,
+          "verified": false
+        },
+        {
+          "symbol": "DAI",
+          "address": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+          "decimals": 18,
+          "verified": false
+        }
+      ]
+    },
+    "base": {
+      "chainId": 8453,
+      "nativeSymbol": "ETH",
+      "nativeDecimals": 18,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "decimals": 6,
+          "verified": false
+        }
+      ]
+    },
+    "arbitrum": {
+      "chainId": 42161,
+      "nativeSymbol": "ETH",
+      "nativeDecimals": 18,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+          "decimals": 6,
+          "verified": false
+        },
+        {
+          "symbol": "USDT",
+          "address": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+          "decimals": 6,
+          "verified": false
+        }
+      ]
+    },
+    "polygon": {
+      "chainId": 137,
+      "nativeSymbol": "POL",
+      "nativeDecimals": 18,
+      "tokens": [
+        {
+          "symbol": "USDC",
+          "address": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+          "decimals": 6,
+          "verified": false
+        },
+        {
+          "symbol": "USDT",
+          "address": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
+          "decimals": 6,
+          "verified": false
+        }
+      ]
+    }
+  }
+}
