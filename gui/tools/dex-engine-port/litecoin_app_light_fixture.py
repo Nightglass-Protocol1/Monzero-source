@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import uuid
 import test_light_wallet_chain as chain
@@ -80,7 +81,8 @@ def create_light_wallet(args, root, node, anchor, network='regtest', maximum_hei
 
 def attach_light_wallet(args, root, resident, setup):
     source=root/'local-light-wallet'/'light-password'
-    source.rename(resident.directory/'light-password')
+    dest=resident.directory/'light-password'
+    shutil.copy(source, dest); os.chmod(dest, 0o600)  # copy, not move: a reused wallet keeps its password for repeat runs
     resident.call('bob', 'light-configure', helper=str(args.gui_light_recovery_helper),
         digest=setup['helperSha256'], launcher=setup['launcher'])
     resident.call('bob', 'light-select')
