@@ -70,6 +70,16 @@ class XmzSwapClient {
     return (await (await this.contract.claimRelayer(this._tuple(swap), secret, rc.fee, rc.v, rc.r, rc.s)).wait()).hash;
   }
 
+  // Read the secret revealed on-chain when a swap settled (Claimed or Refunded). This is
+  // how the counterparty learns the secret needed to complete/settle their own side.
+  async revealedSecret(swapId) {
+    const claimed = await this.contract.queryFilter(this.contract.filters.Claimed(swapId));
+    if (claimed.length) return { event: "Claimed", secret: claimed[claimed.length - 1].args.secret };
+    const refunded = await this.contract.queryFilter(this.contract.filters.Refunded(swapId));
+    if (refunded.length) return { event: "Refunded", secret: refunded[refunded.length - 1].args.secret };
+    return null;
+  }
+
   // Stage: 0 INVALID, 1 PENDING, 2 READY, 3 COMPLETED.
   async stage(swap) { return Number(await this.contract.swaps(await this.contract.swapId(this._tuple(swap)))); }
 }

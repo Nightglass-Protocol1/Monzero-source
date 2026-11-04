@@ -92,4 +92,21 @@ describe("XmzSwapClient (wallet-agnostic connector)", function () {
     expect((await ethers.provider.getBalance(await relayer.getAddress())) > relayerBefore).to.equal(true);
     expect(await ownerClient.stage(sw)).to.equal(3);
   });
+
+
+  it("reads the revealed secret from a settled swap", async function () {
+    const addr = await swap.getAddress();
+    const ownerClient = new XmzSwapClient(addr, owner);
+    const claimerClient = new XmzSwapClient(addr, claimer);
+    const c = makeSecret(), r = makeSecret();
+    const { swap: sw, id } = await ownerClient.lock({
+      claimer: await claimer.getAddress(), claimCommitment: c.commitment, refundCommitment: r.commitment,
+      duration1: 3 * 3600, duration2: 6 * 3600, asset: ZERO, value: ethers.parseEther("1"), nonce: 4n,
+    });
+    await ownerClient.confirm(sw);
+    await claimerClient.claim(sw, c.secret);
+    const revealed = await ownerClient.revealedSecret(id);
+    expect(revealed.event).to.equal("Claimed");
+    expect(revealed.secret.toLowerCase()).to.equal(c.secret.toLowerCase());
+  });
 });
