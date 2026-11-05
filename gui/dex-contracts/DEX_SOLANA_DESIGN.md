@@ -80,11 +80,15 @@ Implemented and tested (native SOL):
   after-timeout2 refund, early-cancel-while-pending. Option (A), ed25519, confirmed working.
 - **SPL tokens (USDC/USDT)** — `NewSpl/ClaimSpl/RefundSpl` with a PDA-owned token vault +
   `transfer_checked`; 3 more LiteSVM tests (SPL claim 18111 CU).
-- **`connectors/SolSwapClient.js`** — wallet-agnostic client (native + SPL); 9 tests assert
-  it reproduces the program's PDA / vault / instruction bytes / commitment byte-for-byte.
+- **Gasless relayed claim** — `ClaimRelayed`: claimer signs `(prefix, swap, fee, relayer)`
+  as an Ed25519 instruction, program introspects the instructions sysvar to confirm it,
+  pays claimer `amount−fee` + relayer `fee`; 3 LiteSVM tests (incl. fee-tamper + missing-auth).
+- **`connectors/SolSwapClient.js`** — wallet-agnostic client (native + SPL + relay); 12 tests
+  assert it reproduces the program's PDA / vault / instruction bytes / commitment / relay
+  message byte-for-byte.
 
-Still to do: **relayed (gasless) claim**, the engine orchestration that **binds the secret
-to the XMZ side**, the app/GUI wiring, and a mainnet deploy.
+Still to do: the engine orchestration that **binds the secret to the XMZ side**, the
+app/GUI wiring, and a mainnet deploy.
 
 ## Gates
 - New **audit surface**: the Solana program must be in the audit/pentest, same as the EVM

@@ -8,11 +8,13 @@
 // Correctness is fund-critical: a mis-encoded instruction or wrong PDA would strand the
 // escrow. The encoding + PDA derivation + commit() are cross-checked byte-for-byte against
 // the on-chain Rust program's reference vectors (see test/sol-connector.test.js).
-const { PublicKey, SystemProgram, TransactionInstruction } = require('@solana/web3.js');
+const { PublicKey, SystemProgram, TransactionInstruction, Ed25519Program,
+  SYSVAR_INSTRUCTIONS_PUBKEY } = require('@solana/web3.js');
 const { ed25519 } = require('@noble/curves/ed25519');
 
 const SEED = Buffer.from('swap');
 const VAULT_SEED = Buffer.from('vault');
+const RELAY_PREFIX = Buffer.from('monzero-sol-relay-v1');
 // classic SPL token program (USDC/USDT are classic mints)
 const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 
@@ -133,6 +135,31 @@ class SolSwapClient {
       { pubkey: new PublicKey(vault), isSigner: false, isWritable: true },
       { pubkey: new PublicKey(mint), isSigner: false, isWritable: false },
       { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }]});
+  }
+
+  // --- gasless relayed claim (native SOL) -------------------------------------------------
+  /** The exact bytes the claimer signs to authorize `(swap, fee, relayer)`. */
+  relayMessage(swap, fee, relayer) {
+    return Buffer.concat([RELAY_PREFIX, new PublicKey(swap).toBuffer(), u64le(fee), new PublicKey(relayer).toBuffer()]);
+  }
+
+  /** The Ed25519 program instruction proving the claimer signed `relayMessage(...)`. Place
+   *  it immediately before claimRelayed in the transaction. `signature` is 64 bytes. */
+  static ed25519AuthIx({ claimer, message, signature }) {
+    return Ed25519Program.createInstructionWithPublicKey({
+      publicKey: new PublicKey(claimer).toBytes(), message, signature });
+  }
+
+  /** The relayed claim itself: relayer is the fee payer/signer and takes `fee`; the claimer
+   *  receives amount-fee without needing any SOL. Submit [ed25519AuthIx, claimRelayed]. */
+  claimRelayed({ relayer, swap, claimer, owner, secret, fee }) {
+    const data = Buffer.concat([Buffer.from([7]), buf32(secret), u64le(fee)]);
+    return new TransactionInstruction({ programId: this.programId, data, keys: [
+      { pubkey: new PublicKey(relayer), isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(swap), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(claimer), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(owner), isSigner: false, isWritable: true },
+      { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false }]});
   }
 }
 

@@ -11,8 +11,8 @@ logic). Design rationale: [`../DEX_SOLANA_DESIGN.md`](../DEX_SOLANA_DESIGN.md).
 |-----|------|--------|
 | `swap-logic/` | funds-critical core: stage machine + timelock rules + ed25519 commit reference | host unit tests (7) |
 | `program/` | the on-chain program: PDA escrow, **native SOL + SPL token** lock/claim/refund, syscall secret verify | builds to BPF |
-| `program-tests/` | LiteSVM integration tests: runs the compiled `.so` on-chain | 8 passing (5 native + 3 SPL) |
-| `../connectors/SolSwapClient.js` | wallet-agnostic client (native + SPL) | 9 cross-language tests |
+| `program-tests/` | LiteSVM integration tests: runs the compiled `.so` on-chain | 13 passing (5 native + 3 SPL + 3 relay + 2 vectors) |
+| `../connectors/SolSwapClient.js` | wallet-agnostic client (native + SPL + relay) | 12 cross-language tests |
 
 ## Why ed25519 + the curve25519 syscall
 A secret `s` is an ed25519 scalar; its commitment is `A = s·B` — the **same group as the
@@ -47,9 +47,17 @@ authority is the swap PDA; `ClaimSpl`/`RefundSpl` move the vault out with `trans
 (signed by the swap PDA) and close both the vault and the state. Classic SPL token program
 only (USDC/USDT are classic mints); `set_ready` is shared with the native path.
 
+## Gasless relayed claim
+`ClaimRelayed` lets a claimer with **no SOL** be paid: the claimer signs
+`"monzero-sol-relay-v1" || swap_pda || fee_le || relayer` as an **Ed25519 program
+instruction**, a relayer submits `[ed25519, claim_relayed]` and pays the tx fee, and the
+program (via **instructions-sysvar introspection**) confirms that signed authorization
+before paying the claimer `amount − fee` and the relayer `fee`. Fee tampering and a missing
+Ed25519 instruction are both rejected (tested). Native SOL; a relayer can run it as a
+service. Client: `relayMessage`, `ed25519AuthIx`, `claimRelayed`.
+
 ## Status & gates
-- **Native SOL and SPL tokens** implemented + tested.
-- **Relayed (gasless) claim** (`claim_relayed`) is designed but not yet implemented here.
+- **Native SOL + SPL tokens + gasless relayed claim** implemented + tested.
 - **Not audited.** A Solana program is a new audit surface and must be in the community
   pentest before any mainnet deploy, exactly like the EVM contract.
 - The cross-chain **secret binding to the XMZ side** (so revealing `s` on Solana is what the

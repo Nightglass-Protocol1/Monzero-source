@@ -20,6 +20,16 @@ fn reference_vector() {
     let (vault, vbump) = Pubkey::find_program_address(&[b"vault", pda.as_ref()], &pid);
     println!("VECTOR vault={vault} vbump={vbump}");
     println!("VECTOR new_data_hex={}", data.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+
+    // Relayed-claim authorization message the claimer signs.
+    let relayer = Pubkey::new_from_array([4u8; 32]);
+    let fee: u64 = 20_000;
+    let mut m = b"monzero-sol-relay-v1".to_vec();
+    m.extend_from_slice(pda.as_ref());
+    m.extend_from_slice(&fee.to_le_bytes());
+    m.extend_from_slice(relayer.as_ref());
+    println!("VECTOR relayer={relayer}");
+    println!("VECTOR relay_msg_hex={}", m.iter().map(|b| format!("{:02x}", b)).collect::<String>());
 }
 
 #[test]

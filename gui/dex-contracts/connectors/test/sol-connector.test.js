@@ -5,6 +5,7 @@
 // valid-looking one against the wrong PDA — so these are fund-safety tests.
 const assert = require('assert');
 const { PublicKey } = require('@solana/web3.js');
+const { ed25519 } = require('@noble/curves/ed25519');
 const { SolSwapClient } = require('../SolSwapClient');
 
 const bytes = (v) => Buffer.from(new Array(32).fill(v));
@@ -108,5 +109,39 @@ describe('SolSwapClient cross-language vectors', () => {
     const refund = c.refundSpl({ owner: OWNER, swap: pda, ownerToken: TOK, vault, mint: MINT, secret: bytes(7) });
     assert.strictEqual(refund.data[0], 6);
     assert.strictEqual(refund.keys.length, 6);
+  });
+
+  it('relay message matches the Rust vector', () => {
+    const [pda] = c.swapPda(OWNER, CLAIMER, CC, RC, AMOUNT, NONCE);
+    const relayer = new PublicKey(bytes(4));
+    assert.strictEqual(relayer.toBase58(), 'GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq');
+    const msg = c.relayMessage(pda, 20000n, relayer);
+    assert.strictEqual(msg.toString('hex'),
+      '6d6f6e7a65726f2d736f6c2d72656c61792d7631f700f429e6386c8a396fa96f7d18a5304482bdaed1ab14faa43c4038463b8b6a204e0000000000000404040404040404040404040404040404040404040404040404040404040404');
+  });
+
+  it('encodes claimRelayed (opcode 7) + fee + account flags', () => {
+    const [pda] = c.swapPda(OWNER, CLAIMER, CC, RC, AMOUNT, NONCE);
+    const relayer = new PublicKey(bytes(4));
+    const ix = c.claimRelayed({ relayer, swap: pda, claimer: CLAIMER, owner: OWNER, secret: bytes(7), fee: 20000n });
+    assert.strictEqual(ix.data[0], 7);
+    assert.strictEqual(ix.data.length, 1 + 32 + 8);
+    assert.strictEqual(ix.data.readBigUInt64LE(33), 20000n);
+    assert.strictEqual(ix.keys.length, 5);
+    assert.deepStrictEqual(ix.keys.map(k => [k.isSigner, k.isWritable]),
+      [[true, true], [false, true], [false, true], [false, true], [false, false]]);
+  });
+
+  it('ed25519AuthIx builds a real Ed25519-program instruction over the message', () => {
+    const sk = Buffer.alloc(32, 9);
+    const pk = Buffer.from(ed25519.getPublicKey(sk));
+    const [pda] = c.swapPda(OWNER, CLAIMER, CC, RC, AMOUNT, NONCE);
+    const relayer = new PublicKey(bytes(4));
+    const msg = c.relayMessage(pda, 20000n, relayer);
+    const sig = Buffer.from(ed25519.sign(msg, sk));
+    const ix = SolSwapClient.ed25519AuthIx({ claimer: pk, message: msg, signature: sig });
+    assert.strictEqual(ix.programId.toBase58(), 'Ed25519SigVerify111111111111111111111111111');
+    assert.ok(Buffer.from(ix.data).includes(pk), 'pubkey embedded');
+    assert.ok(Buffer.from(ix.data).includes(msg), 'message embedded');
   });
 });

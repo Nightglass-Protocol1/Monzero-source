@@ -77,6 +77,9 @@ pub enum Instruction {
     NewSpl { claim_commitment: [u8; 32], refund_commitment: [u8; 32], duration1: u64, duration2: u64, amount: u64, nonce: u64 },
     ClaimSpl { secret: [u8; 32] },
     RefundSpl { secret: [u8; 32] },
+    /// Gasless claim: a relayer submits it and takes `fee`; the claimer authorized
+    /// (swap, fee, relayer) via an Ed25519 instruction earlier in the same tx.
+    ClaimRelayed { secret: [u8; 32], fee: u64 },
 }
 
 entrypoint!(process);
@@ -91,7 +94,77 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             spl::new_spl(program_id, accounts, claim_commitment, refund_commitment, duration1, duration2, amount, nonce),
         Instruction::ClaimSpl { secret } => spl::claim_spl(program_id, accounts, secret),
         Instruction::RefundSpl { secret } => spl::refund_spl(program_id, accounts, secret),
+        Instruction::ClaimRelayed { secret, fee } => claim_relayed(program_id, accounts, secret, fee),
     }
+}
+
+/// Domain tag for the relayer authorization the claimer signs (prevents cross-protocol reuse).
+const RELAY_PREFIX: &[u8] = b"monzero-sol-relay-v1";
+
+/// Gasless native-SOL claim. A relayer is the fee payer + signer; the claimer is NOT a
+/// signer here — instead they authorized (swap, fee, relayer) with an Ed25519 instruction
+/// placed just before this one, which the Ed25519 native program already verified. We
+/// introspect it to confirm the pubkey + message, then pay claimer (amount-fee) and relayer fee.
+fn claim_relayed(program_id: &Pubkey, accounts: &[AccountInfo], secret: [u8; 32], fee: u64) -> ProgramResult {
+    use solana_program::sysvar::instructions as ixs;
+    let it = &mut accounts.iter();
+    let relayer = next_account_info(it)?;     // signer, fee payer, receives `fee`
+    let swap_ai = next_account_info(it)?;
+    let claimer = next_account_info(it)?;     // receives amount - fee (NOT a signer)
+    let owner = next_account_info(it)?;       // rent refund
+    let instructions_ai = next_account_info(it)?;
+    let swap = load(program_id, swap_ai)?;
+    if !relayer.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    if swap.kind != 0 { return Err(ProgramError::InvalidAccountData); } // native SOL only
+    if &swap.claimer != claimer.key || &swap.owner != owner.key { return Err(ProgramError::InvalidAccountData); }
+    if instructions_ai.key != &ixs::ID { return Err(ProgramError::InvalidArgument); }
+
+    let now = Clock::get()?.unix_timestamp as u64;
+    let ok = verify_secret(&secret, &swap.claim_commitment);
+    logic::check_claim(stage_from_u8(swap.stage), now, swap.timeout1, swap.timeout2, ok).map_err(map_err)?;
+    logic::check_relay_fee(fee, swap.amount).map_err(map_err)?;
+    verify_relay_auth(instructions_ai, swap_ai.key, &swap.claimer, fee, relayer.key)?;
+
+    let to_claimer = swap.amount.checked_sub(fee).ok_or(ProgramError::InsufficientFunds)?;
+    let total = **swap_ai.lamports.borrow();
+    let rent = total.checked_sub(swap.amount).ok_or(ProgramError::InsufficientFunds)?;
+    **swap_ai.lamports.borrow_mut() = 0;
+    **claimer.lamports.borrow_mut() = claimer.lamports().checked_add(to_claimer).ok_or(ProgramError::ArithmeticOverflow)?;
+    if fee > 0 {
+        **relayer.lamports.borrow_mut() = relayer.lamports().checked_add(fee).ok_or(ProgramError::ArithmeticOverflow)?;
+    }
+    if rent > 0 {
+        **owner.lamports.borrow_mut() = owner.lamports().checked_add(rent).ok_or(ProgramError::ArithmeticOverflow)?;
+    }
+    for b in swap_ai.data.borrow_mut().iter_mut() { *b = 0; }
+    msg!("monzero-sol: relayed claim, fee {}", fee);
+    solana_program::log::sol_log_data(&[b"claim_secret", &secret]);
+    Ok(())
+}
+
+/// Confirm the Ed25519 instruction just before this one proves the claimer signed exactly
+/// `RELAY_PREFIX || swap_pda || fee_le || relayer`. The Ed25519 program already checked the
+/// signature (an invalid one fails the whole tx), so we only match pubkey + message.
+fn verify_relay_auth(instructions_ai: &AccountInfo, swap_pda: &Pubkey, claimer: &Pubkey,
+    fee: u64, relayer: &Pubkey) -> ProgramResult {
+    use solana_program::sysvar::instructions as ixs;
+    let cur = ixs::load_current_index_checked(instructions_ai)?;
+    if cur == 0 { return Err(ProgramError::InvalidArgument); }
+    let ed = ixs::load_instruction_at_checked((cur - 1) as usize, instructions_ai)?;
+    if ed.program_id != solana_program::ed25519_program::ID { return Err(ProgramError::InvalidArgument); }
+    let d = &ed.data;
+    if d.len() < 16 || d[0] != 1 { return Err(ProgramError::InvalidArgument); }
+    let rd16 = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]) as usize;
+    let (pk_off, msg_off, msg_size) = (rd16(6), rd16(10), rd16(12));
+    if pk_off + 32 > d.len() || msg_off + msg_size > d.len() { return Err(ProgramError::InvalidArgument); }
+    if &d[pk_off..pk_off + 32] != claimer.as_ref() { return Err(ProgramError::InvalidArgument); }
+    let mut expected = Vec::with_capacity(RELAY_PREFIX.len() + 72);
+    expected.extend_from_slice(RELAY_PREFIX);
+    expected.extend_from_slice(swap_pda.as_ref());
+    expected.extend_from_slice(&fee.to_le_bytes());
+    expected.extend_from_slice(relayer.as_ref());
+    if &d[msg_off..msg_off + msg_size] != expected.as_slice() { return Err(ProgramError::InvalidArgument); }
+    Ok(())
 }
 
 fn pda_seeds<'a>(owner: &'a Pubkey, claimer: &'a Pubkey, cc: &'a [u8; 32], rc: &'a [u8; 32],
