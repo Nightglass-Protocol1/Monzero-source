@@ -69,10 +69,24 @@ protocol binding is cleaner.
    talk to it the same way.
 4. Wallet support: Phantom / Solflare / **Ledger (Solana app)** for signing + receiving.
 
-## Honest status / gates
-- Not started in code — this is the design. Implementing is comparable in size to the
-  whole EVM contract (which took careful work + 27 tests + review).
-- New **audit surface**: a Solana program must be in the audit/pentest, same as the EVM
+## Status (built — see `solana/`)
+Implemented and tested (native SOL):
+- **`solana/swap-logic`** — stage machine + timelock rules + ed25519 commit reference; 7
+  host unit tests.
+- **`solana/program`** — the on-chain program (PDA escrow, new/set_ready/claim/refund,
+  secret verified via the curve25519 **syscall**, not in-BPF dalek); builds to BPF.
+- **`solana/program-tests`** — 5 LiteSVM tests run the compiled `.so` on-chain: happy-path
+  claim (**3988 CU**), wrong-secret reject, claim timelock, ready-state refund reject +
+  after-timeout2 refund, early-cancel-while-pending. Option (A), ed25519, confirmed working.
+- **`connectors/SolSwapClient.js`** — wallet-agnostic client; 6 tests assert it reproduces
+  the program's PDA / instruction bytes / commitment byte-for-byte.
+
+Still to do: **SPL-token (USDC/USDT)** layer, **relayed (gasless) claim**, the engine
+orchestration that **binds the secret to the XMZ side**, the app/GUI wiring, and a mainnet
+deploy.
+
+## Gates
+- New **audit surface**: the Solana program must be in the audit/pentest, same as the EVM
   contract — do not ship it to mainnet unaudited.
-- Decision for the owner: is Solana/stablecoin liquidity worth the added surface now, or
-  after BTC/LTC/EVM are live?
+- Decision for the owner: ship Solana/stablecoin liquidity now, or after BTC/LTC/EVM are
+  live? The SOL side is now at parity with the EVM side (built + tested, pending audit + GUI).
