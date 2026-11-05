@@ -1,0 +1,7 @@
+[package]
+name = "monzero-sol-route"
+version = "0.1.0"
+edition = "2021"
+description = "XMZ<->Solana swap coordinator state machine (taker/Bob side): enforces the safe ordering that binds the Solana leg to the XMZ leg. Pure logic; the driver supplies chain actions. See ../DEX_SOLANA_ORCHESTRATION.md."
+
+[dependencies]
