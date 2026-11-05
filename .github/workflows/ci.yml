@@ -62,5 +62,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: npm, cache-dependency-path: gui/dex-contracts/package-lock.json }
-      - working-directory: gui/dex-contracts
-        run: npm ci && npx hardhat test
+      - name: EVM contract + Solana client tests
+        working-directory: gui/dex-contracts
+        run: npm ci && npx hardhat test && npx mocha connectors/test/sol-connector.test.js
+
+  dex-solana:
+    name: 'DEX Solana (host logic + route)'
+    runs-on: ubuntu-22.04
+    # Host-testable crates only. The on-chain program + LiteSVM tests need the Anza SBF
+    # toolchain (cargo-build-sbf) and are run from solana/build-and-test.sh, not here.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: swap-logic + route host tests
+        run: |
+          cargo test --manifest-path gui/dex-contracts/solana/swap-logic/Cargo.toml
+          cargo test --manifest-path gui/dex-contracts/solana/route/Cargo.toml
