@@ -1,35 +1,17 @@
 //! Core logic for the XMZ<->Solana atomic swap, factored out so it is host-testable
 //! without the Solana BPF toolchain. The on-chain program is a thin wrapper that adds
-//! account handling + token transfers around these checks. Mirrors the proven EVM/BTC
-//! design (lock -> set_ready -> claim / refund, secret-reveal, two timelocks).
+//! account handling + token transfers around these checks, and does the ed25519 secret
+//! verification with Solana's curve25519 syscall (dalek's basepoint tables overflow the
+//! BPF 4KB stack). So the stage/timelock checks here take an already-computed `secret_ok`
+//! bool; `verify_secret`/`commit` below are the host/client reference for producing it.
+//! Mirrors the proven EVM/BTC design (lock -> set_ready -> claim / refund, two timelocks).
 #![forbid(unsafe_code)]
-use curve25519_dalek::edwards::EdwardsPoint;
-use curve25519_dalek::scalar::Scalar;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage { Invalid = 0, Pending = 1, Ready = 2, Completed = 3 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwapError { WrongStage, InvalidSecret, TooEarly, TooLate, NotTimeToRefund, FeeTooHigh, BadTimeline, ZeroValue }
-
-/// A secret `s` is an ed25519 scalar; its commitment is the compressed point `s*B`.
-/// This is the SAME group as the XMZ side (ed25519), so no cross-curve proof is needed.
-pub fn verify_secret(secret: &[u8; 32], commitment: &[u8; 32]) -> bool {
-    // Reject non-canonical / zero scalars.
-    let s = match Scalar::from_canonical_bytes(*secret).into_option() {
-        Some(s) if s != Scalar::ZERO => s,
-        _ => return false,
-    };
-    let point = EdwardsPoint::mul_base(&s).compress();
-    point.as_bytes() == commitment
-}
-
-/// Derive the public commitment for a secret (used by the client to build a swap).
-pub fn commit(secret: &[u8; 32]) -> Option<[u8; 32]> {
-    let s = Scalar::from_canonical_bytes(*secret).into_option()?;
-    if s == Scalar::ZERO { return None; }
-    Some(EdwardsPoint::mul_base(&s).compress().to_bytes())
-}
 
 pub fn check_new(value: u64, dur1: u64, dur2: u64) -> Result<(), SwapError> {
     if value == 0 { return Err(SwapError::ZeroValue); }
@@ -44,25 +26,23 @@ pub fn check_set_ready(stage: Stage, now: u64, timeout1: u64) -> Result<(), Swap
     Ok(())
 }
 
-/// claim: claimer reveals the claim secret. Allowed while READY, or (if the owner never
-/// set ready) once timeout1 passes, and never at/after timeout2.
-pub fn check_claim(stage: Stage, now: u64, timeout1: u64, timeout2: u64,
-    secret: &[u8; 32], claim_commitment: &[u8; 32]) -> Result<(), SwapError> {
+/// claim: allowed while READY, or (if the owner never set ready) once timeout1 passes, and
+/// never at/after timeout2. `secret_ok` = the claim secret verified against its commitment.
+pub fn check_claim(stage: Stage, now: u64, timeout1: u64, timeout2: u64, secret_ok: bool) -> Result<(), SwapError> {
     if stage != Stage::Pending && stage != Stage::Ready { return Err(SwapError::WrongStage); }
     if now < timeout1 && stage != Stage::Ready { return Err(SwapError::TooEarly); }
     if now >= timeout2 { return Err(SwapError::TooLate); }
-    if !verify_secret(secret, claim_commitment) { return Err(SwapError::InvalidSecret); }
+    if !secret_ok { return Err(SwapError::InvalidSecret); }
     Ok(())
 }
 
-/// refund: owner reveals the refund secret. Early while PENDING (before timeout1), or
-/// from timeout2 on (ready or not). Never between the timeouts once READY.
-pub fn check_refund(stage: Stage, now: u64, timeout1: u64, timeout2: u64,
-    secret: &[u8; 32], refund_commitment: &[u8; 32]) -> Result<(), SwapError> {
+/// refund: owner reveals the refund secret. Early while PENDING (before timeout1), or from
+/// timeout2 on. `secret_ok` = the refund secret verified against its commitment.
+pub fn check_refund(stage: Stage, now: u64, timeout1: u64, timeout2: u64, secret_ok: bool) -> Result<(), SwapError> {
     if stage != Stage::Pending && stage != Stage::Ready { return Err(SwapError::WrongStage); }
     let early = now < timeout1 && stage == Stage::Pending;
     if !early && now < timeout2 { return Err(SwapError::NotTimeToRefund); }
-    if !verify_secret(secret, refund_commitment) { return Err(SwapError::InvalidSecret); }
+    if !secret_ok { return Err(SwapError::InvalidSecret); }
     Ok(())
 }
 
@@ -71,6 +51,35 @@ pub fn check_relay_fee(fee: u64, value: u64) -> Result<(), SwapError> {
     if fee > value { return Err(SwapError::FeeTooHigh); }
     Ok(())
 }
+
+// --- Host/client reference ed25519 commitment (NOT compiled for the Solana target) ------
+// A secret `s` is an ed25519 scalar; its commitment is the compressed point `s*B`, the
+// SAME group as the XMZ side. On-chain the program computes the equivalent with the
+// curve25519 syscall; both must agree (checked by the LiteSVM integration tests).
+#[cfg(not(target_os = "solana"))]
+mod reference {
+    use curve25519_dalek::edwards::EdwardsPoint;
+    use curve25519_dalek::scalar::Scalar;
+
+    pub fn verify_secret(secret: &[u8; 32], commitment: &[u8; 32]) -> bool {
+        let s = match Scalar::from_canonical_bytes(*secret).into_option() {
+            Some(s) if s != Scalar::ZERO => s,
+            _ => return false,
+        };
+        EdwardsPoint::mul_base(&s).compress().as_bytes() == commitment
+    }
+    pub fn commit(secret: &[u8; 32]) -> Option<[u8; 32]> {
+        let s = Scalar::from_canonical_bytes(*secret).into_option()?;
+        if s == Scalar::ZERO { return None; }
+        Some(EdwardsPoint::mul_base(&s).compress().to_bytes())
+    }
+    /// The compressed ed25519 basepoint — the point the on-chain syscall multiplies by.
+    pub const BASEPOINT_COMPRESSED: [u8; 32] = {
+        let mut b = [0x66u8; 32]; b[0] = 0x58; b
+    };
+}
+#[cfg(not(target_os = "solana"))]
+pub use reference::{commit, verify_secret, BASEPOINT_COMPRESSED};
 
 #[cfg(test)]
 mod tests {
@@ -85,7 +94,11 @@ mod tests {
     #[test] fn rejects_zero_and_noncanonical() {
         assert!(commit(&[0u8; 32]).is_none());
         assert!(!verify_secret(&[0u8; 32], &[0u8; 32]));
-        assert!(!verify_secret(&[0xff; 32], &[0u8; 32])); // > group order
+        assert!(!verify_secret(&[0xff; 32], &[0u8; 32]));
+    }
+    #[test] fn basepoint_matches_dalek() {
+        // commit(1) must equal the basepoint we feed the on-chain syscall.
+        assert_eq!(commit(&sec(1)).unwrap(), BASEPOINT_COMPRESSED);
     }
     #[test] fn set_ready_rules() {
         assert_eq!(check_set_ready(Stage::Pending, 100, 200), Ok(()));
@@ -93,20 +106,18 @@ mod tests {
         assert_eq!(check_set_ready(Stage::Pending, 200, 200), Err(SwapError::TooLate));
     }
     #[test] fn claim_rules() {
-        let s = sec(7); let c = commit(&s).unwrap();
-        assert_eq!(check_claim(Stage::Ready, 150, 200, 400, &s, &c), Ok(()));
-        assert_eq!(check_claim(Stage::Pending, 150, 200, 400, &s, &c), Err(SwapError::TooEarly));
-        assert_eq!(check_claim(Stage::Pending, 250, 200, 400, &s, &c), Ok(()));
-        assert_eq!(check_claim(Stage::Ready, 400, 200, 400, &s, &c), Err(SwapError::TooLate));
-        assert_eq!(check_claim(Stage::Ready, 150, 200, 400, &sec(8), &c), Err(SwapError::InvalidSecret));
-        assert_eq!(check_claim(Stage::Completed, 150, 200, 400, &s, &c), Err(SwapError::WrongStage));
+        assert_eq!(check_claim(Stage::Ready, 150, 200, 400, true), Ok(()));
+        assert_eq!(check_claim(Stage::Pending, 150, 200, 400, true), Err(SwapError::TooEarly));
+        assert_eq!(check_claim(Stage::Pending, 250, 200, 400, true), Ok(()));
+        assert_eq!(check_claim(Stage::Ready, 400, 200, 400, true), Err(SwapError::TooLate));
+        assert_eq!(check_claim(Stage::Ready, 150, 200, 400, false), Err(SwapError::InvalidSecret));
+        assert_eq!(check_claim(Stage::Completed, 150, 200, 400, true), Err(SwapError::WrongStage));
     }
     #[test] fn refund_rules() {
-        let s = sec(9); let c = commit(&s).unwrap();
-        assert_eq!(check_refund(Stage::Pending, 100, 200, 400, &s, &c), Ok(()));      // early
-        assert_eq!(check_refund(Stage::Ready, 300, 200, 400, &s, &c), Err(SwapError::NotTimeToRefund));
-        assert_eq!(check_refund(Stage::Ready, 400, 200, 400, &s, &c), Ok(()));        // after t2
-        assert_eq!(check_refund(Stage::Pending, 100, 200, 400, &sec(10), &c), Err(SwapError::InvalidSecret));
+        assert_eq!(check_refund(Stage::Pending, 100, 200, 400, true), Ok(()));
+        assert_eq!(check_refund(Stage::Ready, 300, 200, 400, true), Err(SwapError::NotTimeToRefund));
+        assert_eq!(check_refund(Stage::Ready, 400, 200, 400, true), Ok(()));
+        assert_eq!(check_refund(Stage::Pending, 100, 200, 400, false), Err(SwapError::InvalidSecret));
     }
     #[test] fn fee_and_new() {
         assert_eq!(check_relay_fee(5, 10), Ok(()));

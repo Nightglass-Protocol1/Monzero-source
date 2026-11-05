@@ -1,0 +1,11 @@
+[package]
+name = "monzero-sol-swap-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[dev-dependencies]
+litesvm = "=0.6.1"
+solana-sdk = "=2.2.1"
+curve25519-dalek = "4.1.3"

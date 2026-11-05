@@ -2,8 +2,9 @@
 name = "monzero-sol-swap-logic"
 version = "0.1.0"
 edition = "2021"
-description = "Funds-critical core for the XMZ<->Solana atomic swap: ed25519 secret commitments, stage machine, timelocks. Host-testable; the Solana program wraps this."
+description = "Funds-critical core for the XMZ<->Solana atomic swap: the stage machine + timelock rules (always), and an ed25519 secret commit/verify reference for the host/client. On-chain secret verification uses Solana's curve25519 syscall, so dalek is excluded from the Solana target."
 
-[dependencies]
+# dalek is only for host builds (reference verify + the client's commitment); the on-chain
+# program verifies via Solana's curve25519 syscall, which has no 4KB-stack problem.
+[target.'cfg(not(target_os = "solana"))'.dependencies]
 curve25519-dalek = "4.1.3"
-
