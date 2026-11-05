@@ -9,5 +9,6 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 solana-program = "2.1"
 solana-curve25519 = "2.1"
+spl-token = { version = "6", features = ["no-entrypoint"] }
 borsh = { version = "1.5", features = ["derive"] }
 monzero-sol-swap-logic = { path = "../swap-logic" }

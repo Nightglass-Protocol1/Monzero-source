@@ -8,4 +8,6 @@ edition = "2021"
 [dev-dependencies]
 litesvm = "=0.6.1"
 solana-sdk = "=2.2.1"
+solana-program = "=2.2.1"
+spl-token = "6"
 curve25519-dalek = "4.1.3"

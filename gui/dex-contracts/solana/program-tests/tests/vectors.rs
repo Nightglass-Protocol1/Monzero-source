@@ -17,6 +17,8 @@ fn reference_vector() {
     data.extend_from_slice(&amount.to_le_bytes()); data.extend_from_slice(&nonce.to_le_bytes());
     println!("VECTOR pid={pid} owner={owner} claimer={claimer}");
     println!("VECTOR pda={pda} bump={bump}");
+    let (vault, vbump) = Pubkey::find_program_address(&[b"vault", pda.as_ref()], &pid);
+    println!("VECTOR vault={vault} vbump={vbump}");
     println!("VECTOR new_data_hex={}", data.iter().map(|b| format!("{:02x}", b)).collect::<String>());
 }
 

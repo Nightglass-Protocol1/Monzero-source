@@ -12,6 +12,9 @@ const { PublicKey, SystemProgram, TransactionInstruction } = require('@solana/we
 const { ed25519 } = require('@noble/curves/ed25519');
 
 const SEED = Buffer.from('swap');
+const VAULT_SEED = Buffer.from('vault');
+// classic SPL token program (USDC/USDT are classic mints)
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 
 function u64le(n) { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; }
 function buf32(x) {
@@ -80,6 +83,56 @@ class SolSwapClient {
     return new TransactionInstruction({ programId: this.programId, data, keys: [
       { pubkey: new PublicKey(owner), isSigner: true, isWritable: true },
       { pubkey: new PublicKey(pda), isSigner: false, isWritable: true }]});
+  }
+
+  // --- SPL-token swaps (USDC/USDT) --------------------------------------------------------
+  /** The PDA-owned token vault holding the escrowed SPL tokens for a given swap PDA. */
+  vaultPda(swapPda) {
+    return PublicKey.findProgramAddressSync([VAULT_SEED, new PublicKey(swapPda).toBuffer()], this.programId);
+  }
+
+  /** Lock `amount` base units of `mint` from `ownerToken` into the swap's PDA vault. */
+  newSpl({ owner, claimer, claimCommit, refundCommit, duration1, duration2, amount, nonce, mint, ownerToken }) {
+    const [pda, bump] = this.swapPda(owner, claimer, claimCommit, refundCommit, amount, nonce);
+    const [vault, vaultBump] = this.vaultPda(pda);
+    const data = Buffer.concat([
+      Buffer.from([4]), buf32(claimCommit), buf32(refundCommit),
+      u64le(duration1), u64le(duration2), u64le(amount), u64le(nonce)]);
+    const ix = new TransactionInstruction({ programId: this.programId, data, keys: [
+      { pubkey: new PublicKey(owner), isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(claimer), isSigner: false, isWritable: false },
+      { pubkey: pda, isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(mint), isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(ownerToken), isSigner: false, isWritable: true },
+      { pubkey: vault, isSigner: false, isWritable: true },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }]});
+    return { ix, pda, bump, vault, vaultBump };
+  }
+
+  /** Claimer reveals the claim secret; the vault pays out tokens to `claimerToken` + closes. */
+  claimSpl({ claimer, swap, claimerToken, vault, owner, mint, secret }) {
+    const data = Buffer.concat([Buffer.from([5]), buf32(secret)]);
+    return new TransactionInstruction({ programId: this.programId, data, keys: [
+      { pubkey: new PublicKey(claimer), isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(swap), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(claimerToken), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(vault), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(owner), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(mint), isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }]});
+  }
+
+  /** Owner reveals the refund secret; the vault returns tokens to `ownerToken` + closes. */
+  refundSpl({ owner, swap, ownerToken, vault, mint, secret }) {
+    const data = Buffer.concat([Buffer.from([6]), buf32(secret)]);
+    return new TransactionInstruction({ programId: this.programId, data, keys: [
+      { pubkey: new PublicKey(owner), isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(swap), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(ownerToken), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(vault), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(mint), isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }]});
   }
 }
 

@@ -10,8 +10,9 @@ logic). Design rationale: [`../DEX_SOLANA_DESIGN.md`](../DEX_SOLANA_DESIGN.md).
 | dir | what | tested |
 |-----|------|--------|
 | `swap-logic/` | funds-critical core: stage machine + timelock rules + ed25519 commit reference | host unit tests (7) |
-| `program/` | the on-chain program: PDA escrow, native-SOL lock/claim/refund, syscall secret verify | builds to BPF |
-| `program-tests/` | LiteSVM integration tests: runs the compiled `.so` on-chain | 5 passing |
+| `program/` | the on-chain program: PDA escrow, **native SOL + SPL token** lock/claim/refund, syscall secret verify | builds to BPF |
+| `program-tests/` | LiteSVM integration tests: runs the compiled `.so` on-chain | 8 passing (5 native + 3 SPL) |
+| `../connectors/SolSwapClient.js` | wallet-agnostic client (native + SPL) | 9 cross-language tests |
 
 ## Why ed25519 + the curve25519 syscall
 A secret `s` is an ed25519 scalar; its commitment is `A = s·B` — the **same group as the
@@ -36,10 +37,18 @@ Test coverage (`program-tests/tests/swap.rs`):
 - `claim_too_early_then_allowed_after_t1` — timelock: no claim before timeout1 (unless Ready).
 - `refund_after_timeout2` — no refund while Ready before timeout2; allowed after.
 - `early_cancel_while_pending` — owner can cancel an un-readied lock; wrong refund secret refused.
+- `spl_happy_path` / `spl_wrong_secret_rejected` / `spl_refund_after_timeout2` — the same flow
+  over an SPL mint: a PDA-owned token vault, `transfer_checked` in/out, vault+state closed on
+  settle. SPL claim measured at **18111 CU**.
+
+## SPL tokens (USDC/USDT)
+`NewSpl` escrows tokens into a **vault token account** (PDA `["vault", swap_pda]`) whose
+authority is the swap PDA; `ClaimSpl`/`RefundSpl` move the vault out with `transfer_checked`
+(signed by the swap PDA) and close both the vault and the state. Classic SPL token program
+only (USDC/USDT are classic mints); `set_ready` is shared with the native path.
 
 ## Status & gates
-- **Native SOL only** so far. **SPL-token (USDC/USDT) support** is the next layer (token
-  account owned by the PDA, `transfer_checked`, fee-on-transfer rejection) — see the design.
+- **Native SOL and SPL tokens** implemented + tested.
 - **Relayed (gasless) claim** (`claim_relayed`) is designed but not yet implemented here.
 - **Not audited.** A Solana program is a new audit surface and must be in the community
   pentest before any mainnet deploy, exactly like the EVM contract.

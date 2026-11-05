@@ -78,12 +78,13 @@ Implemented and tested (native SOL):
 - **`solana/program-tests`** — 5 LiteSVM tests run the compiled `.so` on-chain: happy-path
   claim (**3988 CU**), wrong-secret reject, claim timelock, ready-state refund reject +
   after-timeout2 refund, early-cancel-while-pending. Option (A), ed25519, confirmed working.
-- **`connectors/SolSwapClient.js`** — wallet-agnostic client; 6 tests assert it reproduces
-  the program's PDA / instruction bytes / commitment byte-for-byte.
+- **SPL tokens (USDC/USDT)** — `NewSpl/ClaimSpl/RefundSpl` with a PDA-owned token vault +
+  `transfer_checked`; 3 more LiteSVM tests (SPL claim 18111 CU).
+- **`connectors/SolSwapClient.js`** — wallet-agnostic client (native + SPL); 9 tests assert
+  it reproduces the program's PDA / vault / instruction bytes / commitment byte-for-byte.
 
-Still to do: **SPL-token (USDC/USDT)** layer, **relayed (gasless) claim**, the engine
-orchestration that **binds the secret to the XMZ side**, the app/GUI wiring, and a mainnet
-deploy.
+Still to do: **relayed (gasless) claim**, the engine orchestration that **binds the secret
+to the XMZ side**, the app/GUI wiring, and a mainnet deploy.
 
 ## Gates
 - New **audit surface**: the Solana program must be in the audit/pentest, same as the EVM

@@ -72,4 +72,41 @@ describe('SolSwapClient cross-language vectors', () => {
     assert.throws(() => SolSwapClient.commit(Buffer.alloc(32)), /non-zero/);
     assert.throws(() => c.swapPda(OWNER, CLAIMER, Buffer.alloc(31), RC, AMOUNT, NONCE), /32 bytes/);
   });
+
+  it('derives the SPL vault PDA like the program', () => {
+    const [pda] = c.swapPda(OWNER, CLAIMER, CC, RC, AMOUNT, NONCE);
+    const [vault, vbump] = c.vaultPda(pda);
+    assert.strictEqual(vault.toBase58(), '8Eb7FLSiT39Q4S6qdMa3bbszgqzi4PSqn1mLmk9DW5Lr');
+    assert.strictEqual(vbump, 254);
+  });
+
+  it('encodes NewSpl (opcode 4) + account order', () => {
+    const MINT = new PublicKey(bytes(5));
+    const OWNER_TOK = new PublicKey(bytes(6));
+    const { ix, pda, vault } = c.newSpl({
+      owner: OWNER, claimer: CLAIMER, claimCommit: CC, refundCommit: RC,
+      duration1: 100, duration2: 100, amount: AMOUNT, nonce: NONCE, mint: MINT, ownerToken: OWNER_TOK });
+    const expected =
+      '04' + '11'.repeat(32) + '22'.repeat(32) +
+      '6400000000000000' + '6400000000000000' + '0094357700000000' + '0100000000000000';
+    assert.strictEqual(ix.data.toString('hex'), expected);
+    assert.strictEqual(pda.toBase58(), 'HdCYbuvmah5qx9mwxJYLhwyQaCAJ52aYwV292Q4Suor9');
+    assert.strictEqual(vault.toBase58(), '8Eb7FLSiT39Q4S6qdMa3bbszgqzi4PSqn1mLmk9DW5Lr');
+    assert.strictEqual(ix.keys.length, 8);
+    assert.deepStrictEqual(ix.keys.map(k => [k.isSigner, k.isWritable]),
+      [[true, true], [false, false], [false, true], [false, false], [false, true], [false, true], [false, false], [false, false]]);
+  });
+
+  it('claimSpl / refundSpl opcodes + account counts', () => {
+    const [pda] = c.swapPda(OWNER, CLAIMER, CC, RC, AMOUNT, NONCE);
+    const [vault] = c.vaultPda(pda);
+    const MINT = new PublicKey(bytes(5));
+    const TOK = new PublicKey(bytes(6));
+    const claim = c.claimSpl({ claimer: CLAIMER, swap: pda, claimerToken: TOK, vault, owner: OWNER, mint: MINT, secret: bytes(7) });
+    assert.strictEqual(claim.data[0], 5);
+    assert.strictEqual(claim.keys.length, 7);
+    const refund = c.refundSpl({ owner: OWNER, swap: pda, ownerToken: TOK, vault, mint: MINT, secret: bytes(7) });
+    assert.strictEqual(refund.data[0], 6);
+    assert.strictEqual(refund.keys.length, 6);
+  });
 });
