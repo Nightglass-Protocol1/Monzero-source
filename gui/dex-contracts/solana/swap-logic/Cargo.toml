@@ -1,0 +1,9 @@
+[package]
+name = "monzero-sol-swap-logic"
+version = "0.1.0"
+edition = "2021"
+description = "Funds-critical core for the XMZ<->Solana atomic swap: ed25519 secret commitments, stage machine, timelocks. Host-testable; the Solana program wraps this."
+
+[dependencies]
+curve25519-dalek = "4.1.3"
+
