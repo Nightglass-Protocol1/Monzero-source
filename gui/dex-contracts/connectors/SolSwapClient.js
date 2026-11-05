@@ -1,0 +1,86 @@
+'use strict';
+// SolSwapClient — wallet-agnostic client for the Monzero XMZ<->Solana swap program, the
+// Solana counterpart of XmzSwapClient.js. Builds the on-chain instructions (new / set_ready
+// / claim / refund), derives the escrow PDA, and computes ed25519 secret commitments in the
+// SAME group as the XMZ side. It holds no keys and signs nothing: the caller signs with any
+// Solana wallet (Phantom, Solflare, a Ledger Solana app, or a Keypair) and submits.
+//
+// Correctness is fund-critical: a mis-encoded instruction or wrong PDA would strand the
+// escrow. The encoding + PDA derivation + commit() are cross-checked byte-for-byte against
+// the on-chain Rust program's reference vectors (see test/sol-connector.test.js).
+const { PublicKey, SystemProgram, TransactionInstruction } = require('@solana/web3.js');
+const { ed25519 } = require('@noble/curves/ed25519');
+
+const SEED = Buffer.from('swap');
+
+function u64le(n) { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; }
+function buf32(x) {
+  const b = Buffer.isBuffer(x) ? x : Buffer.from(x);
+  if (b.length !== 32) throw new Error(`expected 32 bytes, got ${b.length}`);
+  return b;
+}
+function bytesToNumberLE(bytes) {
+  let n = 0n;
+  for (let i = bytes.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(bytes[i]);
+  return n;
+}
+
+class SolSwapClient {
+  /** @param {string|PublicKey} programId deployed swap program id (pinned in the app build) */
+  constructor(programId) { this.programId = new PublicKey(programId); }
+
+  /** Compressed ed25519 commitment A = s*B for a 32-byte secret (same group as XMZ). */
+  static commit(secret32) {
+    const s = bytesToNumberLE(buf32(secret32));
+    if (s === 0n) throw new Error('secret must be non-zero');
+    return Buffer.from(ed25519.ExtendedPoint.BASE.multiply(s).toRawBytes());
+  }
+
+  /** Deterministic escrow address; identical inputs => identical PDA (replay-safe). */
+  swapPda(owner, claimer, claimCommit, refundCommit, amount, nonce) {
+    return PublicKey.findProgramAddressSync([
+      SEED, new PublicKey(owner).toBuffer(), new PublicKey(claimer).toBuffer(),
+      buf32(claimCommit), buf32(refundCommit), u64le(amount), u64le(nonce),
+    ], this.programId);
+  }
+
+  /** Lock: owner escrows `amount` lamports; timeouts are now+d1 and now+d1+d2 on-chain. */
+  newSwap({ owner, claimer, claimCommit, refundCommit, duration1, duration2, amount, nonce }) {
+    const [pda, bump] = this.swapPda(owner, claimer, claimCommit, refundCommit, amount, nonce);
+    const data = Buffer.concat([
+      Buffer.from([0]), buf32(claimCommit), buf32(refundCommit),
+      u64le(duration1), u64le(duration2), u64le(amount), u64le(nonce)]);
+    const ix = new TransactionInstruction({ programId: this.programId, data, keys: [
+      { pubkey: new PublicKey(owner), isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(claimer), isSigner: false, isWritable: false },
+      { pubkey: pda, isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }]});
+    return { ix, pda, bump };
+  }
+
+  /** Owner confirms the XMZ lock (only before timeout1). */
+  setReady({ owner, pda }) {
+    return new TransactionInstruction({ programId: this.programId, data: Buffer.from([1]), keys: [
+      { pubkey: new PublicKey(owner), isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(pda), isSigner: false, isWritable: true }]});
+  }
+
+  /** Claimer reveals the claim secret; the escrow pays out and closes (rent back to owner). */
+  claim({ claimer, pda, owner, secret }) {
+    const data = Buffer.concat([Buffer.from([2]), buf32(secret)]);
+    return new TransactionInstruction({ programId: this.programId, data, keys: [
+      { pubkey: new PublicKey(claimer), isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(pda), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(owner), isSigner: false, isWritable: true }]});
+  }
+
+  /** Owner reveals the refund secret (early while Pending, or after timeout2); escrow closes. */
+  refund({ owner, pda, secret }) {
+    const data = Buffer.concat([Buffer.from([3]), buf32(secret)]);
+    return new TransactionInstruction({ programId: this.programId, data, keys: [
+      { pubkey: new PublicKey(owner), isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(pda), isSigner: false, isWritable: true }]});
+  }
+}
+
+module.exports = { SolSwapClient };
