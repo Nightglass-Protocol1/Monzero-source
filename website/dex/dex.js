@@ -10,15 +10,16 @@
     LTC: { name: "Litecoin", usd: 75, dp: 6 },
     BNB: { name: "BNB", usd: 600, dp: 6 },
     ETH: { name: "Ethereum", usd: 3500, dp: 6 },
+    SOL: { name: "Solana", usd: 190, dp: 6 },
     USDC: { name: "USD Coin", usd: 1, dp: 2 },
     USDT: { name: "Tether", usd: 1, dp: 2 }
   };
-  var COUNTERS = ["BTC", "LTC", "BNB", "ETH", "USDC", "USDT"];
-  var STATUS = { BTC: "beta", LTC: "soon", BNB: "soon", ETH: "soon", USDC: "soon", USDT: "soon" };
+  var COUNTERS = ["BTC", "LTC", "BNB", "ETH", "SOL", "USDC", "USDT"];
+  var STATUS = { BTC: "beta", LTC: "soon", BNB: "soon", ETH: "soon", SOL: "soon", USDC: "soon", USDT: "soon" };
   // Project fee per pair: BTC dynamic 0.1%–0.5% (floor used for indicative math),
-  // LTC free; EVM (BNB/ETH) fee to be decided. See dex-mainnet/go-live for the live policy.
-  var FEES = { BTC: 0.001, LTC: 0, BNB: 0, ETH: 0, USDC: 0, USDT: 0 };
-  var FEE_LABEL = { BTC: "0.1%–0.5%", LTC: "Free", BNB: "TBD", ETH: "TBD", USDC: "TBD", USDT: "TBD" };
+  // SOL likewise 0.1%–0.5%; LTC free; EVM (BNB/ETH) fee to be decided. See dex-mainnet/go-live for the live policy.
+  var FEES = { BTC: 0.001, LTC: 0, BNB: 0, ETH: 0, SOL: 0.001, USDC: 0, USDT: 0 };
+  var FEE_LABEL = { BTC: "0.1%–0.5%", LTC: "Free", BNB: "TBD", ETH: "TBD", SOL: "0.1%–0.5%", USDC: "TBD", USDT: "TBD" };
 
   var state = { dir: "xmz-to-coin", coin: "BTC" }; // dir: which way XMZ flows
   var $ = function (id) { return document.getElementById(id); };
@@ -154,9 +155,9 @@
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   if (!$("mode-pro")) return;
-  var COINS = { XMZ: { usd: 0.015, dp: 4 }, BTC: { usd: 68000, dp: 8 }, LTC: { usd: 75, dp: 6 }, BNB: { usd: 600, dp: 6 }, ETH: { usd: 3500, dp: 6 } };
-  var NAME = { BTC: "Bitcoin", LTC: "Litecoin", BNB: "BNB", ETH: "Ethereum" };
-  var COUNTERS = ["BTC", "LTC", "BNB", "ETH"];
+  var COINS = { XMZ: { usd: 0.015, dp: 4 }, BTC: { usd: 68000, dp: 8 }, LTC: { usd: 75, dp: 6 }, BNB: { usd: 600, dp: 6 }, ETH: { usd: 3500, dp: 6 }, SOL: { usd: 190, dp: 6 } };
+  var NAME = { BTC: "Bitcoin", LTC: "Litecoin", BNB: "BNB", ETH: "Ethereum", SOL: "Solana" };
+  var COUNTERS = ["BTC", "LTC", "BNB", "ETH", "SOL"];
   var TF = { "1m": { vol: 0.45, tpc: 3 }, "5m": { vol: 1, tpc: 5 }, "15m": { vol: 1.9, tpc: 8 }, "1h": { vol: 3.2, tpc: 12 }, "4h": { vol: 5.5, tpc: 18 }, "1D": { vol: 9, tpc: 26 } };
   var pro = { coin: "BTC", side: "buy", tf: "5m", rendered: false, mid: null, chg24: 0, vol: 0, trades: [], timer: null, candles: [], formTicks: 0, orders: [], orderId: 0, lastBook: null };
   var lastShown = 0;
@@ -432,7 +433,7 @@
       clearInterval(timer);
       el.classList.add("live");
       el.innerHTML = '<span class="dc-live">🟢 Monzero DEX is live</span>';
-      if (notice) notice.innerHTML = '<strong>Live.</strong> Trade XMZ for BTC (0.1%–0.5%) or Litecoin &amp; Bitcoin Cash (free) from your own wallet in the Monzero app. <a href="/dex/recovery/">How to recover your funds →</a>';
+      if (notice) notice.innerHTML = '<strong>Live.</strong> Trade XMZ for BTC or SOL (0.1%–0.5%) or Litecoin (free) from your own wallet in the Monzero app. <a href="/dex/recovery/">How to recover your funds →</a>';
       return;
     }
     el.classList.remove("live");
