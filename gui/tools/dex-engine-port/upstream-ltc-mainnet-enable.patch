@@ -1,0 +1,204 @@
+LTC mainnet enablement — engine changes. Apply LAST in the chain, after
+upstream-bitcoin-swap-chain.patch. Adds the `ltc-mainnet` Cargo feature,
+Policy::is_ltc_mainnet_deployment() + its gate test, and the rustls certificate-pinning
+verifier for self-signed LTC Electrum servers (MONZERO_ELECTRUM_PINS). Generated 2026-11-06;
+verified to reverse-apply exactly against the built engine tree.
+
+--- a/swap-machine/Cargo.toml
++++ b/swap-machine/Cargo.toml
+@@ -45,6 +45,9 @@
+ # Accept Bitcoin mainnet against the real XMZ mainnet (Policy::accepted_deployment).
+ # Off by default: release helpers for public builds are built without it.
+ btc-mainnet = []
++# Accept Litecoin mainnet against the real XMZ mainnet (Policy::accepted_deployment).
++# Off by default, same as btc-mainnet: public release helpers omit it.
++ltc-mainnet = []
+ 
+ [dev-dependencies]
+ bdk = { workspace = true }
+--- a/swap-machine/src/litecoin_quote.rs
++++ b/swap-machine/src/litecoin_quote.rs
+@@ -39,15 +39,23 @@
+ impl Policy {
+     /// Deployments the DEX helpers accept: every staged test pair
+     /// (`LtcNetwork::is_staged_test_pair`) and, only in helpers built with the
+-    /// `btc-mainnet` feature, Bitcoin mainnet against the real XMZ mainnet by
+-    /// name and genesis. Litecoin mainnet is never accepted.
++    /// matching mainnet feature, Bitcoin mainnet (`btc-mainnet`) or Litecoin
++    /// mainnet (`ltc-mainnet`) against the real XMZ mainnet by name and genesis.
+     pub fn accepted_deployment(&self) -> bool {
+-        self.ltc_network.is_staged_test_pair(self.xmz_network) || self.is_btc_mainnet_deployment()
++        self.ltc_network.is_staged_test_pair(self.xmz_network)
++            || self.is_btc_mainnet_deployment()
++            || self.is_ltc_mainnet_deployment()
+     }
+ 
+     /// Real funds: Bitcoin mainnet with XMZ mainnet, in a `btc-mainnet` build only.
+     pub fn is_btc_mainnet_deployment(&self) -> bool {
+         cfg!(feature = "btc-mainnet") && self.ltc_network == LtcNetwork::BitcoinMainnet
++            && self.xmz_network == XmzNetwork::Mainnet && self.xmz_genesis == XMZ_MAINNET_GENESIS
++    }
++
++    /// Real funds: Litecoin mainnet with XMZ mainnet, in an `ltc-mainnet` build only.
++    pub fn is_ltc_mainnet_deployment(&self) -> bool {
++        cfg!(feature = "ltc-mainnet") && self.ltc_network == LtcNetwork::Mainnet
+             && self.xmz_network == XmzNetwork::Mainnet && self.xmz_genesis == XMZ_MAINNET_GENESIS
+     }
+ }
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -1469,15 +1469,36 @@
+             // Accepted only in a btc-mainnet build.
+             assert_eq!(staged(&mainnet),cfg!(feature="btc-mainnet"));
+             assert_eq!(mainnet.is_btc_mainnet_deployment(),cfg!(feature="btc-mainnet"));
+-            // Never with another XMZ chain, another genesis, Litecoin mainnet, or a Bitcoin test chain.
++            // Never with another XMZ chain, another genesis, or a Bitcoin test chain.
+             for refused in [with_genesis("btc-mainnet","xmz-mainnet",&"ab".repeat(32)),with_genesis("btc-mainnet","xmz-testnet",REAL),
+-                    with_genesis("btc-mainnet","xmz-stagenet",REAL),with_genesis("ltc-mainnet","xmz-mainnet",REAL),
++                    with_genesis("btc-mainnet","xmz-stagenet",REAL),
+                     with_genesis("btc-signet","xmz-mainnet",REAL),with_genesis("btc-testnet4","xmz-mainnet",REAL)] {
+                 assert!(!staged(&refused) && !refused.is_btc_mainnet_deployment(),
+                     "{:?}/{:?} must be refused",refused.ltc_network,refused.xmz_network);
+             }
++            // A Litecoin mainnet policy is never a Bitcoin mainnet deployment.
++            assert!(!with_genesis("ltc-mainnet","xmz-mainnet",REAL).is_btc_mainnet_deployment());
+             // Test pairs are unchanged by the feature.
+             assert!(staged(&policy("btc-signet","xmz-testnet")) && !policy("btc-signet","xmz-testnet").is_btc_mainnet_deployment());
++        }
++
++        #[test]
++        fn litecoin_mainnet_needs_the_feature_and_the_real_xmz_mainnet() {
++            use swap_machine::litecoin_quote::XMZ_MAINNET_GENESIS as REAL;
++            let mainnet=with_genesis("ltc-mainnet","xmz-mainnet",REAL);
++            // Accepted only in an ltc-mainnet build.
++            assert_eq!(staged(&mainnet),cfg!(feature="ltc-mainnet"));
++            assert_eq!(mainnet.is_ltc_mainnet_deployment(),cfg!(feature="ltc-mainnet"));
++            // Never with another XMZ chain, another genesis, or a Litecoin test chain.
++            for refused in [with_genesis("ltc-mainnet","xmz-mainnet",&"ab".repeat(32)),with_genesis("ltc-mainnet","xmz-testnet",REAL),
++                    with_genesis("ltc-mainnet","xmz-stagenet",REAL),with_genesis("ltc-testnet","xmz-mainnet",REAL)] {
++                assert!(!staged(&refused) && !refused.is_ltc_mainnet_deployment(),
++                    "{:?}/{:?} must be refused",refused.ltc_network,refused.xmz_network);
++            }
++            // A Bitcoin mainnet policy is never a Litecoin mainnet deployment.
++            assert!(!with_genesis("btc-mainnet","xmz-mainnet",REAL).is_ltc_mainnet_deployment());
++            // Test pairs are unchanged by the feature.
++            assert!(staged(&policy("ltc-testnet","xmz-testnet")) && !policy("ltc-testnet","xmz-testnet").is_ltc_mainnet_deployment());
+         }
+     }
+ }
+--- a/swap-machine/src/litecoin_light/tls.rs
++++ b/swap-machine/src/litecoin_light/tls.rs
+@@ -1,16 +1,23 @@
+ //! Authenticated TLS connector with separate read and explicit send operations.
+ //! Trust roots follow the platform store (including its configured certificate
+-//! environment). There is no plaintext fallback or certificate-verification bypass.
++//! environment). There is no plaintext fallback. When MONZERO_ELECTRUM_PINS pins a
++//! host, the server certificate is verified by SHA256 fingerprint instead of the CA
++//! store (Electrum's standard model, for self-signed servers that lack a SAN); the
++//! TLS handshake signature is still verified, so the server must hold the pinned key.
+ use super::session::ReadSession;
+ use anyhow::{Context, Result, ensure};
+ use std::{net::IpAddr, sync::Arc, time::Duration};
+ use crate::litecoin_light::network::LightNetwork;
++use sha2::{Digest, Sha256};
+ #[cfg(test)]
+ #[allow(unused_imports)]
+ use swap_core::litecoin_address::LtcNetwork;
+ use tokio::net::TcpStream;
+-use tokio_rustls::{TlsConnector, client::TlsStream, rustls::{ClientConfig, RootCertStore,
+-    crypto::ring, pki_types::ServerName}};
++use tokio_rustls::{TlsConnector, client::TlsStream, rustls::{self, ClientConfig, RootCertStore,
++    DigitallySignedStruct, SignatureScheme,
++    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
++    crypto::{ring, CryptoProvider},
++    pki_types::{CertificateDer, ServerName, UnixTime}}};
+ 
+ pub struct TlsEndpoint {
+     host: String,
+@@ -54,8 +61,53 @@
+     /// The certificate authenticates this host, not the truth of its chain data.
+     /// Litecoin header validation and independent chain selection remain required.
+     pub async fn connect(&self) -> Result<ReadSession<TlsStream<TcpStream>>> {
++        if let Some(pin) = self.pinned_cert()? {
++            return self.connect_pinned(pin, Duration::from_secs(30)).await;
++        }
+         let roots = tokio::task::spawn_blocking(system_roots).await.context("TLS trust-store loader failed")??;
+         self.connect_with_roots(roots, Duration::from_secs(30)).await
++    }
++
++    /// MONZERO_ELECTRUM_PINS = "host:port=<64-hex sha256>,...": the recorded SHA256 (DER) of the
++    /// server certificate to pin for this endpoint, or None to use the platform CA trust store.
++    fn pinned_cert(&self) -> Result<Option<[u8; 32]>> {
++        let key = format!("{}:{}", self.host, self.port);
++        let raw = match std::env::var("MONZERO_ELECTRUM_PINS") { Ok(value) => value, Err(_) => return Ok(None) };
++        for item in raw.split(',') {
++            if let Some((hostport, sha)) = item.trim().rsplit_once('=') {
++                if hostport.trim() == key {
++                    let sha = sha.trim();
++                    ensure!(sha.len() == 64, "Electrum pin must be 32-byte hex");
++                    let mut pin = [0u8; 32];
++                    for (i, byte) in pin.iter_mut().enumerate() {
++                        *byte = u8::from_str_radix(&sha[i * 2..i * 2 + 2], 16).context("invalid Electrum pin hex")?;
++                    }
++                    return Ok(Some(pin));
++                }
++            }
++        }
++        Ok(None)
++    }
++
++    /// Certificate-pinned connect: no CA/hostname check, but the server certificate must match the
++    /// pinned SHA256 and the handshake signature must verify under the default crypto provider.
++    async fn connect_pinned(&self, pin: [u8; 32], deadline: Duration)
++        -> Result<ReadSession<TlsStream<TcpStream>>> {
++        let provider = Arc::new(ring::default_provider());
++        let config = ClientConfig::builder_with_provider(provider.clone())
++            .with_safe_default_protocol_versions()?
++            .dangerous()
++            .with_custom_certificate_verifier(Arc::new(PinnedVerifier { pin, provider }))
++            .with_no_client_auth();
++        let connector = TlsConnector::from(Arc::new(config));
++        let name = ServerName::try_from(self.host.clone()).context("invalid Electrum TLS server name")?;
++        tokio::time::timeout(deadline, async {
++            let socket = TcpStream::connect((self.host.as_str(), self.port)).await
++                .context("Electrum TCP connection failed")?;
++            socket.set_nodelay(true)?;
++            let tls = connector.connect(name, socket).await.context("Electrum TLS authentication failed")?;
++            ReadSession::negotiate(tls, self.network).await
++        }).await.context("Electrum connection deadline exceeded")?
+     }
+ 
+     async fn connect_with_roots(&self, roots: RootCertStore, deadline: Duration)
+@@ -83,5 +135,32 @@
+     Ok(roots)
+ }
+ 
++/// Verifies the server certificate by pinned SHA256 (DER) rather than a CA chain, for self-signed
++/// Electrum servers without a usable SAN. The handshake signature is still checked under the
++/// provider, so the peer must hold the private key of the pinned certificate.
++#[derive(Debug)]
++struct PinnedVerifier { pin: [u8; 32], provider: Arc<CryptoProvider> }
++impl ServerCertVerifier for PinnedVerifier {
++    fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
++        _server_name: &ServerName<'_>, _ocsp: &[u8], _now: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
++        if Sha256::digest(end_entity.as_ref()).as_slice() == self.pin.as_slice() {
++            Ok(ServerCertVerified::assertion())
++        } else {
++            Err(rustls::Error::General("Electrum certificate pin mismatch".into()))
++        }
++    }
++    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct)
++        -> Result<HandshakeSignatureValid, rustls::Error> {
++        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
++    }
++    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct)
++        -> Result<HandshakeSignatureValid, rustls::Error> {
++        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
++    }
++    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
++        self.provider.signature_verification_algorithms.supported_schemes()
++    }
++}
++
+ #[cfg(test)]
+ mod tests;

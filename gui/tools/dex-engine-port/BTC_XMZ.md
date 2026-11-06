@@ -3,7 +3,9 @@
 Bitcoin trades against XMZ through the same contract, journal and light-wallet
 funding paths as LTC/XMZ. Bitcoin and Litecoin share SegWit v0 scripts, CSV
 timelocks and BIP143 signing, so only chain identities differ. The engine patch
-is `upstream-bitcoin-swap-chain.patch`, the last patch in the chain.
+is `upstream-bitcoin-swap-chain.patch`, followed by `upstream-ltc-mainnet-enable.patch`
+(the LTC-mainnet enablement: `ltc-mainnet` feature, `is_ltc_mainnet_deployment`, and the
+rustls Electrum cert-pinning verifier) as the last patch in the chain.
 
 ## Roles
 
