@@ -47,16 +47,25 @@ Add a Solana path to the DEX trade screen, mirroring the EVM path:
 Build-gated: needs the Qt/core build (unavailable here). The Solana instruction layer it
 calls (`SolSwapClient`) is done + tested.
 
-## #6 — Mainnet program deploy (owner-gated: funds + audit)
-Staged, **not executed** (spends real SOL; wait for the audit, #7).
-1. Build for the mainnet loader: `cargo-build-sbf --arch v3` (mainnet uses the newer loader;
-   our tests use `--arch v1` to match the pinned LiteSVM).
-2. Generate a program keypair **outside the repo**, back it up.
-3. Fund a deployer, then: `solana program deploy --program-id <keypair> target/deploy/monzero_sol_swap.so`.
-4. Record the program id in `deployments/solana-mainnet.json` (the app pins it in the build,
-   never fetches it from the website — same trust model as the EVM contracts).
-5. Verify the on-chain program hash equals the built `.so`.
-See `tools/deploy-solana.sh` (gated behind `MONZERO_SOL_MAINNET=I_ACCEPT_REAL_FUNDS_RISK`).
+## #6 — Mainnet program deploy — DONE (owner controlled real-funds test, 2026-11-06)
+Deployed to **mainnet-beta** as the project's own controlled real-funds test (the step your
+release policy runs before any public trading). **This is NOT public go-live** — the DEX
+bootstrap stays `live:false` and the `XMZ/SOL` pair stays `soon`; see #8.
+
+- **Program id:** `B2oh6NHndUYAKj9Rpq8Aww3HZ8fVTT3g7nsh4eAtqpCb`  (record: `deployments/solana-mainnet-beta.json`)
+- Built for the mainnet loader (`cargo-build-sbf --arch v3`); on-chain program hash **verified
+  equal** to the built `.so` (`0008fca9…`), i.e. identical to the devnet binary.
+- Upgrade authority: the deployer keypair `BRo1QVgQ…` (saved at
+  `~/.config/monzero-dex/solana-deployer-mainnet.json`; the owner controls it). Program keypair
+  at `~/.config/monzero-dex/solana-program-mainnet.json`.
+- Cost: ~0.64 SOL held as ProgramData rent (recoverable by closing the program).
+- **Verified with a live mainnet swap:** lock → set_ready → claim confirmed on-chain, claimer
+  paid, escrow closed (claim tx `SrJVUpTP…`); test funds swept back to the deployer.
+
+The app pins this program id in the build (never fetched from the website — same trust model
+as the EVM contracts). `tools/deploy-solana.sh` stays gated behind
+`MONZERO_SOL_MAINNET=I_ACCEPT_REAL_FUNDS_RISK` so a mainnet deploy is always a deliberate act.
+A third-party audit (#7) still gates **public** go-live (#8), not this owner test.
 
 ## #8 — DEX go-live for the SOL pair (owner-signed)
 Staged. The pair is added to the website bootstrap as **`soon`** (display only — the DEX
