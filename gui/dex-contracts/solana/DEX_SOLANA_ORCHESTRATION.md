@@ -67,10 +67,21 @@ so Alice always has time to claim before Bob can refund, exactly as the BTC leg 
   instructions (`New`/`SetReady`/`Claim`/`Refund`), and a coordinator state machine
   (`route/`) with the mapping above. The leg driver uses `SolSwapClient`.
 
+## What is built (`route/`)
+- The **coordinator state machine** (the table above), enforcing the safe ordering.
+- A **`LegDriver` trait + drive loop** (`driver.rs`) — the coordinator drives it to a
+  terminal `Outcome`; a mock proves a full success, a timeout refund, an early cancel, and
+  rejection of a protocol-violating maker. The real driver maps the actions to
+  `SolSwapClient` (Solana) + the eigenwallet engine (XMZ).
+- The **secret binding** (`secret.rs`) — extracts the revealed `s_a`/`s_b` from a settling
+  Solana instruction and verifies it against the commitment (`s*B == A`), i.e. confirms it
+  is the Monero key share that unlocks the XMZ side.
+
 ## Honest gaps / risks (before this is a live trade)
-1. **Not implemented against the Monero side yet** — this is the protocol + a tested
-   coordinator state machine (`route/`). Wiring it to the real eigenwallet Monero flow is
-   the next build, and it is **build-gated** by the engine's `monero-sys` dependency.
+1. **The real `LegDriver` is not wired yet** — the coordinator, driver interface and secret
+   binding are built + tested with a mock, but the concrete driver (`SolSwapClient` calls on
+   the Solana side, the eigenwallet 2-of-2 lock / sweep / reclaim on the XMZ side) is the
+   next build, and it is **build-gated** by the engine's `monero-sys` dependency.
 2. **Security review required.** Removing the adaptor/DLEQ layer is a real simplification,
    but the binding (`claim_commitment = S_a`, `refund_commitment = S_b`) and the timelock
    ordering must be audited — a mistake strands or leaks funds. Do not ship unaudited.

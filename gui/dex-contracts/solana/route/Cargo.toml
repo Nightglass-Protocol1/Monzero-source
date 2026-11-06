@@ -2,6 +2,7 @@
 name = "monzero-sol-route"
 version = "0.1.0"
 edition = "2021"
-description = "XMZ<->Solana swap coordinator state machine (taker/Bob side): enforces the safe ordering that binds the Solana leg to the XMZ leg. Pure logic; the driver supplies chain actions. See ../DEX_SOLANA_ORCHESTRATION.md."
+description = "XMZ<->Solana swap coordinator (taker/Bob): state machine + driver interface + secret binding that ties the Solana claim reveal to the XMZ sweep. Pure logic; the real driver wires SolSwapClient + the eigenwallet Monero engine. See ../DEX_SOLANA_ORCHESTRATION.md."
 
 [dependencies]
+monzero-sol-swap-logic = { path = "../swap-logic" }

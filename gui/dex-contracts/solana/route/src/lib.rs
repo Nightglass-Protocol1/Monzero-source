@@ -15,6 +15,9 @@
 //!  * Bob only sweeps XMZ **after** observing Alice's Solana claim (which reveals `s_a`).
 #![forbid(unsafe_code)]
 
+pub mod driver;
+pub mod secret;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     /// Keys + commitments agreed; nothing locked yet.
