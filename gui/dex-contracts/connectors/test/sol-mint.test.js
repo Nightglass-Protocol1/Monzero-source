@@ -31,6 +31,17 @@ describe('SolMintClient — Studio asset creation', () => {
     assert.strictEqual(instructions.length, 4);
   });
 
+  it('buildCreateToken attaches Metaplex metadata when a name is given', () => {
+    const r = SolMint.buildCreateToken({ payer: PAYER, decimals: 9, supply: 1000n, rentLamports: RENT,
+      name: 'Monzero Token', symbol: 'MZT', uri: 'https://x/t.json' });
+    assert.strictEqual(r.instructions.length, 6, 'create+init+ATA+mintTo+metadata+lock');
+    const meta = r.instructions[4];
+    assert.ok(meta.programId.equals(SolMint.METADATA_PROGRAM_ID), 'metadata ix');
+    assert.strictEqual(meta.data[0], 33, 'CreateMetadataAccountV3');
+    assert.ok(Buffer.from(meta.data).includes(Buffer.from('Monzero Token', 'utf8')), 'name embedded');
+    assert.ok(r.metadata.equals(SolMint.metadataPda(r.mint.publicKey)), 'metadata PDA returned');
+  });
+
   it('buildCreateNft makes a 1/1 mint with on-chain Metaplex metadata', () => {
     const name = 'Monzero Genesis #1';
     const { mint, metadata, instructions, signers } = SolMint.buildCreateNft({

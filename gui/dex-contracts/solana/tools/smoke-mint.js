@@ -74,18 +74,21 @@ async function send(conn, payer, built, label) {
   console.log('payer: ', payer.publicKey.toBase58(), `(${bal / 1e9} SOL)`);
   const rent = await conn.getMinimumBalanceForRentExemption(spl.MINT_SIZE);
 
-  console.log('\n[1/2] fixed-supply SPL token');
-  let b = SolMint.buildCreateToken({ payer: payer.publicKey, decimals: 6, supply: 1_000_000_000n, rentLamports: rent });
-  await send(conn, payer, b, 'token');
-  let m = await spl.getMint(conn, b.mint.publicKey);
-  assert(m.decimals === 6, 'token decimals');
-  assert(m.supply === 1_000_000_000n, 'token supply');
-  assert(m.mintAuthority === null, 'token authority dropped (fixed supply)');
-  console.log('  ✓ token', b.mint.publicKey.toBase58(), '— supply', m.supply.toString(), 'locked');
-
-  console.log('\n[2/2] 1/1 NFT + Metaplex metadata');
+  // Both token + NFT now attach Metaplex metadata, so the program must be present.
   const mpl = await conn.getAccountInfo(SolMint.METADATA_PROGRAM_ID);
   assert(mpl && mpl.executable, 'Metaplex Token Metadata program is not on this cluster (clone it on a local validator)');
+
+  console.log('\n[1/2] fixed-supply SPL token (+ metadata)');
+  let b = SolMint.buildCreateToken({ payer: payer.publicKey, decimals: 6, supply: 1_000_000_000n, rentLamports: rent,
+    name: 'Monzero Smoke Token', symbol: 'MST', uri: 'https://monzero.org/app/creators/materials/metadata-example.json' });
+  await send(conn, payer, b, 'token');
+  let m = await spl.getMint(conn, b.mint.publicKey);
+  assert(m.decimals === 6 && m.supply === 1_000_000_000n && m.mintAuthority === null, 'token: 6dp, fixed supply, locked');
+  let tmeta = await conn.getAccountInfo(b.metadata);
+  assert(tmeta && tmeta.owner.equals(SolMint.METADATA_PROGRAM_ID), 'token has Metaplex metadata');
+  console.log('  ✓ token', b.mint.publicKey.toBase58(), '— supply locked + on-chain metadata');
+
+  console.log('\n[2/2] 1/1 NFT + Metaplex metadata');
   b = SolMint.buildCreateNft({ payer: payer.publicKey, name: 'Monzero Smoke NFT', symbol: 'MZS',
     uri: 'https://monzero.org/app/creators/materials/metadata-example.json', rentLamports: rent });
   await send(conn, payer, b, 'nft');

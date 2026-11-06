@@ -29,7 +29,7 @@
   async function ensureLibs() {
     if (loaded) return;
     await loadScript('/app/solana-web3.iife.min.js'); // -> window.solanaWeb3
-    await loadScript('/app/sol-mint.bundle.js?v=2');   // -> window.SolMintClient (self-contained: web3 aliased to the global, Buffer polyfilled in)
+    await loadScript('/app/sol-mint.bundle.js?v=3');   // -> window.SolMintClient (self-contained: web3 aliased to the global, Buffer polyfilled in)
     if (!window.solanaWeb3 || !window.SolMintClient) throw new Error('Solana libraries did not load');
     loaded = true;
   }
@@ -121,7 +121,8 @@
           const decimals = Math.max(0, Math.min(9, parseInt(field('decimals') || '0', 10)));
           const supply = atomic(field('supply') || '0', decimals);
           if (supply <= 0n) return say('Enter a positive supply.', true);
-          built = SM.buildCreateToken({ payer: pub, decimals, supply, rentLamports: rent });
+          built = SM.buildCreateToken({ payer: pub, decimals, supply, rentLamports: rent,
+            name, symbol: field('symbol'), uri: field('metadata_uri') });
           what = 'token';
         } else {
           const uri = field('metadata_uri');

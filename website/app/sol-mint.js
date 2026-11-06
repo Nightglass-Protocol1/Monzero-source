@@ -65,8 +65,10 @@
   }
 
   /** Fixed-supply fungible token: create the mint, mint the full supply to the creator,
-   *  then (by default) drop the mint authority so the supply can never grow. */
-  function buildCreateToken({ payer, decimals, supply, rentLamports, fixedSupply = true, freezeAuthority = null }) {
+   *  attach on-chain Metaplex metadata (name/symbol/logo, so wallets show it), then (by
+   *  default) drop the mint authority so the supply can never grow. */
+  function buildCreateToken({ payer, decimals, supply, rentLamports, fixedSupply = true,
+    freezeAuthority = null, name = '', symbol = '', uri = '' }) {
     const payerPk = new PublicKey(payer);
     const mint = Keypair.generate();
     if (!Number.isInteger(decimals) || decimals < 0 || decimals > 9) throw new Error('decimals must be 0..9');
@@ -80,10 +82,15 @@
       spl.createAssociatedTokenAccountInstruction(payerPk, ata, payerPk, mint.publicKey),
       spl.createMintToInstruction(mint.publicKey, ata, payerPk, amount),
     ];
+    // Metaplex metadata (needs the mint authority as signer, so add it before any drop).
+    if (name) {
+      instructions.push(createMetadataV3Ix({ mint: mint.publicKey, mintAuthority: payerPk,
+        payer: payerPk, updateAuthority: payerPk, name, symbol, uri, sellerFeeBasisPoints: 0 }));
+    }
     if (fixedSupply) {
       instructions.push(spl.createSetAuthorityInstruction(mint.publicKey, payerPk, spl.AuthorityType.MintTokens, null));
     }
-    return { mint, ata, instructions, signers: [mint] };
+    return { mint, ata, metadata: name ? metadataPda(mint.publicKey) : null, instructions, signers: [mint] };
   }
 
   /** A 1/1 NFT: a 0-decimal mint with exactly one unit, on-chain Metaplex metadata, and the
