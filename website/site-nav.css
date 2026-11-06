@@ -1,0 +1,93 @@
+/* One shared header: the homepage navigation on every public page. */
+.site-header { position: relative !important; display: flex !important; align-items: center !important; justify-content: space-between !important; flex-wrap: nowrap !important; gap: 24px; height: 84px !important; min-height: 84px; width: min(1280px, 100% - 96px) !important; max-width: none !important; margin-inline: auto !important; padding: 0 !important; border-bottom: 1px solid var(--line); background: var(--bg) !important; backdrop-filter: none; z-index: 40; }
+.site-header .brand { display: flex !important; align-items: center !important; gap: 12px !important; margin: 0 !important; padding: 0 !important; font: 750 13px/1.7 var(--sans) !important; letter-spacing: 2px !important; text-transform: none !important; color: var(--ink) !important; text-decoration: none !important; flex-shrink: 0; }
+.site-header .brand span { display: block !important; font: inherit !important; letter-spacing: inherit !important; color: inherit !important; }
+.brand .brand-coin { display: block; width: 32px; height: 32px; flex: 0 0 32px; object-fit: contain; border: 0; border-radius: 50%; background: transparent; }
+.site-header nav { display: flex; gap: 18px !important; margin-inline: auto !important; align-items: center !important; justify-content: center !important; flex-wrap: nowrap !important; width: auto !important; padding: 0 !important; }
+.site-header nav a { display: block !important; margin: 0 !important; padding: 0 !important; border: 0 !important; color: var(--muted) !important; font: 400 13px/1.6 var(--sans) !important; letter-spacing: normal !important; text-transform: none !important; text-decoration: none; white-space: nowrap; }
+.site-header nav a:hover, .site-header nav a[aria-current="page"], .site-header .nav-group.current > a { color: var(--ink) !important; }
+.site-header .header-cta { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; min-height: 44px !important; padding: 9px 17px !important; border: 1px solid var(--accent) !important; border-radius: 30px !important; background: var(--accent) !important; color: #092820 !important; font: 500 12px/1.7 var(--sans) !important; letter-spacing: normal !important; white-space: nowrap; text-decoration: none !important; }
+.site-header .header-cta:hover { background: var(--mint) !important; }
+.site-header .menu-toggle { display: none; min-height: 44px !important; margin: 0 0 0 auto !important; padding: 8px 14px !important; border: 1px solid var(--line) !important; border-radius: 8px !important; background: transparent !important; color: var(--ink) !important; font: 500 14px/1.2 var(--sans) !important; cursor: pointer; box-shadow: none !important; }
+.site-header .visually-hidden { position: absolute !important; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.site-header .nav-group { position: relative; display: flex; align-items: center; gap: 2px; }
+.site-header .nav-sub-toggle { display: inline-flex; align-items: center; justify-content: center; min-width: 28px; width: 28px; min-height: 32px; height: 32px; margin: 0; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; font: inherit; }
+.site-header .nav-sub-toggle::before { content: ""; width: 6px; height: 6px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-2px) rotate(45deg); transition: transform .15s ease; }
+.site-header .nav-sub-toggle[aria-expanded="true"]::before { transform: translateY(1px) rotate(-135deg); }
+.site-header .nav-sub-toggle:hover, .site-header .nav-sub-toggle:focus-visible { color: var(--ink); }
+.site-header .nav-sub { display: none; }
+@media (min-width: 1340px) {
+  .site-header .menu-toggle { display: none !important; }
+  .site-header .nav-sub { position: absolute; top: 100%; left: -14px; z-index: 50; min-width: 200px; padding: 14px 0 0; }
+  .site-header .nav-sub::before { content: ""; position: absolute; inset: 14px 0 0; z-index: -1; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 12px 28px #0005; }
+  .site-header .nav-group:hover > .nav-sub, .site-header .nav-group:focus-within > .nav-sub, .site-header .nav-group.open > .nav-sub { display: block; }
+  .site-header .nav-group.dismissed > .nav-sub { display: none; }
+  .site-header nav .nav-sub a { padding: 8px 16px !important; line-height: 1.5 !important; }
+  .site-header nav .nav-sub a:first-child { margin-top: 6px !important; }
+  .site-header nav .nav-sub a:last-child { margin-bottom: 6px !important; }
+  .site-header nav .nav-sub a:hover, .site-header nav .nav-sub a:focus-visible { color: var(--ink) !important; background: var(--surface-raised); }
+}
+@media (max-width: 1339px) {
+  .site-header { width: calc(100% - 32px) !important; gap: 16px; }
+  .site-header .menu-toggle { display: block; }
+  .site-header nav { display: none !important; position: absolute !important; top: 100%; left: 0; right: 0; z-index: 40; max-height: 75vh; overflow-y: auto; margin: 0 !important; padding: 16px 20px !important; flex-direction: column !important; align-items: stretch !important; gap: 4px !important; background: var(--surface) !important; border: 1px solid var(--line) !important; border-radius: 0 0 12px 12px; }
+  .site-header nav.open { display: flex !important; }
+  .site-header nav a { padding: 10px 4px !important; min-height: 44px; font-size: 15px !important; line-height: 1.4 !important; }
+  .site-header .nav-group { flex-wrap: wrap; justify-content: space-between; }
+  .site-header .nav-group > a { flex: 1; }
+  .site-header .nav-sub-toggle { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }
+  .site-header .nav-sub { flex-basis: 100%; padding: 0 0 6px 14px; border-left: 1px solid var(--line); margin-left: 4px; }
+  .site-header .nav-group.open > .nav-sub, .site-header nav:not(.nav-js) .nav-sub { display: block; }
+  .site-header nav:not(.nav-js) .nav-sub-toggle { display: none; }
+  .site-header nav .nav-sub a { padding: 8px 4px !important; font-size: 14px !important; }
+}
+@media (max-width: 600px) {
+  .site-header { gap: 8px; }
+  .site-header .brand { gap: 6px !important; letter-spacing: 1px !important; }
+  .site-header .header-cta { padding: 9px 10px !important; }
+  .site-header .menu-toggle { padding: 9px !important; }
+}
+@media print { .site-header { position: relative !important; } }
+@media (prefers-reduced-motion: reduce) { .site-header .nav-sub-toggle::before { transition: none; } }
+.chainquiry-badge { display: inline-block; max-width: 100%; line-height: 0; margin-top: 22px; }
+.chainquiry-badge img { display: block; max-width: 100%; height: auto; border: 0; }
+.brand-banner { margin: 0; padding: 8px var(--gutter) 0; }
+.brand-banner img { display: block; width: 100%; height: auto; border-radius: var(--radius, 12px); border: 1px solid var(--line); }
+
+/* Scrolling headline banner above the header on every page (site-nav.js). Pauses on hover, focus or the
+   pause button; with reduced motion it does not move and scrolls by hand instead. */
+.news-ticker { display: flex; align-items: stretch; gap: 0; min-height: 40px; background: var(--surface, #101a24); border-bottom: 1px solid var(--line, #293b49); font-size: 14px; }
+.news-ticker[hidden] { display: none; }
+.ticker-label { flex: 0 0 auto; display: flex; align-items: center; padding: 0 14px; background: var(--accent, #29caba); color: #04201d; font-weight: 700; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; text-decoration: none; }
+.ticker-label:focus-visible { outline: 2px solid var(--ink, #edf3f7); outline-offset: -4px; }
+.ticker-viewport { position: relative; flex: 1 1 auto; overflow: hidden; display: flex; align-items: center; }
+.ticker-viewport::before, .ticker-viewport::after { content: ""; position: absolute; top: 0; bottom: 0; width: 28px; z-index: 1; pointer-events: none; }
+.ticker-viewport::before { left: 0; background: linear-gradient(90deg, var(--surface, #101a24), transparent); }
+.ticker-viewport::after { right: 0; background: linear-gradient(270deg, var(--surface, #101a24), transparent); }
+.ticker-track { display: flex; flex: 0 0 auto; gap: 0; margin: 0; padding: 0; list-style: none; white-space: nowrap; animation: ticker-scroll var(--ticker-duration, 120s) linear infinite; }
+.ticker-track li { display: flex; align-items: center; padding: 0 22px; }
+.ticker-track li + li::before { content: "•"; margin: 0 22px 0 -22px; color: var(--accent, #29caba); }
+.ticker-track a { color: var(--ink, #edf3f7); text-decoration: none; }
+.ticker-track a:hover, .ticker-track a:focus-visible { text-decoration: underline; }
+.ticker-track small { margin-left: 8px; color: var(--muted, #a8bac8); font-size: 12px; }
+.news-ticker:hover .ticker-track, .news-ticker:focus-within .ticker-track, .news-ticker.paused .ticker-track { animation-play-state: paused; }
+.ticker-pause { flex: 0 0 auto; width: 40px; border: 0; border-left: 1px solid var(--line, #293b49); background: transparent; color: var(--muted, #a8bac8); cursor: pointer; font: inherit; }
+.ticker-pause::before { content: "❚❚"; font-size: 11px; letter-spacing: -2px; }
+.news-ticker.paused .ticker-pause::before { content: "▶"; letter-spacing: 0; }
+.ticker-pause:hover, .ticker-pause:focus-visible { color: var(--ink, #edf3f7); }
+@keyframes ticker-scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+@media (prefers-reduced-motion: reduce) {
+  .ticker-track { animation: none; }
+  .ticker-viewport { overflow-x: auto; }
+  .ticker-track li[aria-hidden="true"] { display: none; }
+  .ticker-pause { display: none; }
+}
+
+/* v1.0.0 upgrade banner (site-nav.js), above the news banner until a day after block 21,000. */
+.upgrade-banner { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #3a2c0e; border-bottom: 1px solid #edbc64; color: #fbe9c4; font-size: 14px; line-height: 1.45; }
+.upgrade-banner.active { background: #0e3a34; border-color: #29caba; color: #d6f7f2; }
+.upgrade-banner p { flex: 1 1 auto; margin: 0; color: inherit; }
+.upgrade-banner strong { color: #fff; }
+.upgrade-banner a { color: #fff; font-weight: 600; text-decoration: underline; }
+.upgrade-hide { flex: 0 0 auto; padding: 6px 12px; border: 1px solid currentColor; border-radius: 6px; background: transparent; color: inherit; font: inherit; font-size: 13px; cursor: pointer; }
+.upgrade-hide:hover, .upgrade-hide:focus-visible { background: rgba(255, 255, 255, .1); }

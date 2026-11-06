@@ -1,0 +1,13 @@
+{
+  "schema": "monzero-fund-goals-v1",
+  "updated_at": "2026-10-28",
+  "records": [
+    {
+      "id": "bug-bounties",
+      "title": "Bug bounties",
+      "description": "Rewards for security problems reported privately to security@monzero.org, paid according to published rules.",
+      "target_usd": "5000",
+      "status": "open"
+    }
+  ]
+}

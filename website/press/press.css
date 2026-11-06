@@ -1,0 +1,11 @@
+.logos{display:flex;flex-wrap:wrap;gap:20px;margin:12px 0}
+.logos figure{margin:0;padding:16px;border:1px solid var(--line);border-radius:10px;background:#f4f6f8;max-width:280px}
+.logos figure.dark{background:#0b1116}
+.logos img{display:block;width:200px;height:200px;object-fit:contain}
+.logos figcaption{margin-top:10px;font-size:13px;color:#33424f}
+.logos figure.dark figcaption{color:var(--muted)}
+.logos figcaption a{color:inherit}
+th[scope="row"]{color:var(--ink);font-weight:600;width:32%}
+.hash{word-break:break-all}
+main li code,main p code{overflow-wrap:anywhere}
+.logos figure.wide{max-width:520px}.logos figure.wide img{width:100%;height:auto;max-width:488px}

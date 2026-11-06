@@ -1,0 +1,18 @@
+[DRAFT — for use only after asset activation. Replace every placeholder.]
+
+Introducing [work or collection name] by [creator].
+[One short sentence about the artwork or the purpose of the token.]
+Kind: [NFT / Edition / Collection / Token]
+Edition size or fixed supply and decimals, if relevant: [details]
+Licence: [licence]
+Asset ID: [asset ID after issuance]
+Collection ID, if relevant: [collection ID]
+Image address: [image address]
+Metadata address: [metadata address]
+Metadata SHA-256: [64-character metadata hash]
+
+Verify the metadata and image at https://monzero.org/app/#verify before trusting the files.
+The Monzero team never DMs first and never asks for seed phrases or passwords.
+
+Before activation: assets are not active. Nothing can be minted, bought or sold today.
+Anyone selling Monzero NFTs or tokens, “pre-mints”, “whitelist spots” or “listing” now is a scammer.

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Report Monzero security vulnerabilities privately and responsibly.">
+  <title>Security · Monzero</title><!-- seo:begin --><link rel="canonical" href="https://monzero.org/security/"><meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/security/"><meta property="og:title" content="Security · Monzero"><meta property="og:description" content="Report Monzero security vulnerabilities privately and responsibly."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="Monzero MZ emblem and wordmark: Join the Monzero community. Privacy focused, independent blockchain, CPU mineable."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="Security · Monzero"><meta name="twitter:description" content="Report Monzero security vulnerabilities privately and responsibly."><meta name="twitter:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><!-- seo:end -->
+  <link rel="icon" href="../assets/monzero-emblem-20261026-96.webp" type="image/webp">
+  <link rel="stylesheet" href="../styles.css?v=20261026-brand">
+  <link rel="stylesheet" href="../theme.css?v=20261026-brand">
+  <link rel="stylesheet" href="../site-nav.css?v=20261026-brand">
+<link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261026-brand"></noscript></head>
+<body data-page="security" class="site-shell">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><a class="brand" href="/" aria-label="Monzero home"><img class="brand-mark brand-coin" src="/assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"><span>MONZERO</span></a><button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button><nav id="site-nav" aria-label="Primary navigation"><a href="/">Home</a><div class="nav-group"><a href="/#about">About</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-about"><span class="visually-hidden">About pages</span></button><div class="nav-sub" id="nav-sub-about"><a href="/#about">About Monzero</a><a href="/roadmap/">Roadmap</a><a href="/objectives/">Project objectives</a><a href="/founder/">Founder</a></div></div><div class="nav-group"><a href="/ecosystem/">Ecosystem</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-ecosystem"><span class="visually-hidden">Ecosystem pages</span></button><div class="nav-sub" id="nav-sub-ecosystem"><a href="/ecosystem/">Ecosystem directory</a><a href="/dex/">Atomic swap DEX</a><a href="/app/">Monzero Studio</a><a href="/app/creators/">Creator hub</a><a href="/wallets/">Public wallets</a><a href="/payments/request/">Payment request</a><a href="/exchanges/">Exchanges</a><a href="/markets/">Markets</a></div></div><div class="nav-group"><a href="/mining/">Mining</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-mining"><span class="visually-hidden">Mining pages</span></button><div class="nav-sub" id="nav-sub-mining"><a href="/mining/">How to mine</a><a href="/mining/calculator/">Mining calculator</a><a href="/mining/dashboard/">Your mining</a><a href="/mining/benchmarks/">CPU benchmarks</a><a href="/mining/leaderboard/">Mining leaderboard</a><a href="/faucet/">Faucet</a><a href="https://pool.monzero.org/">Mining pool</a></div></div><div class="nav-group"><a href="/explorer/">Network</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-network"><span class="visually-hidden">Network pages</span></button><div class="nav-sub" id="nav-sub-network"><a href="/explorer/">Block explorer</a><a href="/network/">Network history</a><a href="/network/nodes/">Node map</a><a href="/stats/">Network stats</a><a href="/status/">Service status</a></div></div><div class="nav-group"><a href="/download/">Downloads</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-downloads"><span class="visually-hidden">Downloads pages</span></button><div class="nav-sub" id="nav-sub-downloads"><a href="/download/">Downloads &amp; verification</a><a href="/upgrade/">Upgrade guide</a></div></div><div class="nav-group current"><a href="/developers/">Documentation</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-documentation"><span class="visually-hidden">Documentation pages</span></button><div class="nav-sub" id="nav-sub-documentation"><a href="/developers/">Developer portal</a><a href="/WHITEPAPER.md?rev=1.5-20261017">Whitepaper</a><a href="/developers/api/">API v1</a><a href="/developers/payments/">Accept XMZ</a><a href="/security/" aria-current="page">Security</a><a href="/privacy/">Privacy Policy</a><a href="/terms/">Website Terms</a></div></div><div class="nav-group"><a href="/community/">Community</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-community"><span class="visually-hidden">Community pages</span></button><div class="nav-sub" id="nav-sub-community"><a href="/airdrop/">Airdrop</a><a href="/community/">Community hub</a><a href="/community/board/">Discussion board</a><a href="/community/voting/">Voting</a><a href="/community/bounties/">Bounties</a><a href="/fund/">Fundraising</a><a href="/news/">News</a><a href="/press/">Press kit</a><a href="/marketing/">Marketing kit</a></div></div></nav><a class="header-cta" href="/#get-started">Get started</a></header>
+
+  <main id="main" tabindex="-1">
+    <section class="section">
+      <div class="section-heading compact">
+        <p class="eyebrow">Security research</p>
+        <h1>Test responsibly. Report privately.</h1>
+        <p>Email <a href="mailto:security@monzero.org">security@monzero.org</a>. Do not open a public issue before the report has been assessed and a coordinated disclosure date has been agreed.</p>
+        <p>Using the atomic-swap DEX? See <a href="/dex/recovery/">how to recover a swap</a> — including with no Monzero app.</p>
+      </div>
+      <div class="download-card">
+        <div>
+          <h2>What to include</h2>
+          <p>Provide the affected commit or release, operating system, impact, reproduction steps, and the smallest safe proof of concept needed to demonstrate the issue.</p>
+          <div class="warning"><strong>Never send secrets.</strong> Do not include wallet seeds, private keys, passwords, personal data, or live funds. Email is not end-to-end encrypted until a dedicated security OpenPGP key is published.</div>
+        </div>
+        <div>
+          <h2>Response targets</h2>
+          <p>We aim to acknowledge reports within seven calendar days and provide a status update within fourteen days. The default coordinated-disclosure target is 90 days, adjusted by agreement for active exploitation or complex consensus fixes.</p>
+          <p>Good-faith reporters will be credited unless they request anonymity.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-heading compact">
+        <p class="eyebrow">Scope</p>
+        <h2>Official Monzero surfaces.</h2>
+        <p>Consensus, networking, wallets, release packages, the website, explorer, and official deployment configuration are in scope. Third-party exchanges, pools, providers, upstream Monero services, and user-operated infrastructure should be reported to their respective operators.</p>
+        <p>Monzero v1.0.0 is the project's first stable release. It has not received a published independent security audit. See <a href="/download/">downloads and release verification</a> for the packages and their checksums. A stable version label and a vulnerability-disclosure programme do not replace an independent audit.</p>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-heading compact">
+        <p class="eyebrow">Testing rules</p>
+        <h2>Protect users and the public chain.</h2>
+        <p>Use a private test network for disruptive, high-volume, denial-of-service, or consensus-fork testing. Public-network testing is allowed only with systems and accounts you own, when it cannot degrade service, reorganize the chain, expose another person's information, or affect another person's funds.</p>
+      </div>
+      <div class="download-card">
+        <div>
+          <h2>Not authorized</h2>
+          <p>Do not flood services, exhaust resources, steal or double-spend funds, create unauthorized supply, reorganize the public chain, deanonymize users, phish, collect credentials, establish persistence, or test third-party providers without their permission.</p>
+          <p>Stop immediately if testing causes unexpected degradation or affects another user. If sensitive data is encountered, do not retain it and report only what is needed to locate the exposure.</p>
+        </div>
+        <div>
+          <h2>Rewards and safe harbor</h2>
+          <p>This is currently a coordinated vulnerability-disclosure program. No payment is guaranteed until the project publishes a funded reward schedule or confirms eligibility and amount in writing.</p>
+          <p>The project will not initiate legal action for good-faith research that follows these rules. This cannot authorize testing of third-party systems or override applicable law.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a class="brand" href="../"><img class="brand-mark brand-coin" src="../assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"><span>MONZERO</span></a>
+    <p>Experimental software. Verify everything.</p>
+    <p><a href="mailto:security@monzero.org">security@monzero.org</a></p>
+    <p><a href="/privacy/">Privacy Policy</a> · <a href="/terms/">Website Terms</a></p>
+  </footer>
+  <script src="../site-nav.js?v=20261026-brand" defer></script>
+</body>
+</html>

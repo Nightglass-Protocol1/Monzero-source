@@ -1,0 +1,45 @@
+[data-page="fund"] .download-card { align-items: start; }
+.download-card > div { min-width: 0; }
+.draft-banner { margin: 48px 0 1.5rem; padding: 0.8rem 1rem; border: 1px dashed var(--warning, #edc48d); color: var(--warning, #edc48d); font-size: 14px; line-height: 1.5; }
+.goals { display: grid; gap: 1rem; margin: 0; padding: 0; list-style: none; }
+.goals li { padding: 1.1rem 1.2rem; border: 1px solid var(--line, #293b49); }
+.goals h3 { margin: 0 0 0.35rem; font-size: 18px; }
+.goals p { margin: 0 0 0.75rem; color: var(--muted, #a8bac8); line-height: 1.55; }
+.goal-figures { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.5rem; font-variant-numeric: tabular-nums; font-size: 14px; }
+.bar { height: 6px; margin-top: 0.5rem; background: var(--line, #293b49); overflow: hidden; }
+.bar span { display: block; height: 100%; width: 0; background: var(--accent, #6fd6c1); }
+.wallets { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
+.wallet { padding: 1.1rem 1.2rem; border: 1px solid var(--line, #293b49); min-width: 0; }
+.wallet h3 { margin: 0 0 0.25rem; font-size: 17px; }
+.wallet .wallet-note { margin: 0 0 0.6rem; color: var(--muted, #a8bac8); font-size: 13px; }
+.address { overflow-wrap: anywhere; word-break: break-all; font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.9em; }
+.pending { color: var(--warning, #edc48d); }
+.figures { width: 100%; border-collapse: collapse; margin: 0 0 1rem; font-variant-numeric: tabular-nums; }
+.figures th, .figures td { text-align: left; padding: 0.6rem 0.4rem; border-bottom: 1px solid var(--line, #293b49); font: 400 15px/1.5 var(--sans, inherit); letter-spacing: normal; text-transform: none; }
+.figures thead th { color: var(--muted, #a8bac8); font-size: 13px; }
+.figures td.num, .figures th.num { text-align: right; white-space: nowrap; }
+.table-scroll { overflow-x: auto; }
+.commitments { display: grid; gap: 0.75rem; padding-left: 1.25rem; }
+.commitments li { line-height: 1.55; }
+.live-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin: 0 0 1rem; }
+.live-totals > div { padding: 1rem 1.2rem; border: 1px solid var(--line, #293b49); }
+.live-label { display: block; color: var(--muted, #a8bac8); font-size: 13px; }
+.live-totals strong { display: block; margin-top: 0.25rem; font-size: 28px; font-variant-numeric: tabular-nums; }
+.live-status { color: var(--muted, #a8bac8); font-size: 14px; }
+.recent-title { margin: 1.5rem 0 0.5rem; font-size: 18px; }
+.recent { margin: 0; padding: 0; list-style: none; }
+.recent li { padding: 0.55rem 0; border-bottom: 1px solid var(--line, #293b49); font-size: 15px; overflow-wrap: anywhere; }
+.recent .recent-empty { color: var(--muted, #a8bac8); }
+.bar span { transition: width 0.6s ease; }
+.wallet-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin: 0.6rem 0 0; font-size: 14px; }
+.copy { padding: 0.35rem 0.75rem; border: 1px solid var(--accent, #6fd6c1); background: transparent; color: var(--accent, #6fd6c1); font: inherit; cursor: pointer; }
+.copy:hover, .copy:focus-visible { background: var(--accent, #6fd6c1); color: var(--bg, #0b1118); }
+.goal-percent { font-weight: 600; color: var(--accent, #6fd6c1); }
+.overall { margin: 0 0 1.25rem; padding: 1rem 1.2rem; border: 1px solid var(--line, #293b49); }
+.overall .goal-figures { font-size: 15px; }
+.overall strong { font-size: 18px; color: var(--accent, #6fd6c1); }
+.bar-large { height: 10px; }
+.qr { margin-top: 0.6rem; font-size: 14px; }
+.qr summary { cursor: pointer; color: var(--accent, #6fd6c1); }
+.qr img { display: block; width: 200px; max-width: 100%; height: auto; margin-top: 0.6rem; padding: 8px; background: #fff; border-radius: 4px; }
+[data-page="fund"] .site-header { position: relative; padding-block: 20px; gap: 20px; }

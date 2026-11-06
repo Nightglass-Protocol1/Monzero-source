@@ -1,0 +1,81 @@
+AddType text/javascript .mjs
+Options -Indexes
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  # Never serve leftover copies: dot-folders and dotfiles (except /.well-known/), files named
+  # "*.backup-…", "*.before-…", "*.bak…" or "*.rollback…", and the nginx sample configuration.
+  RewriteCond %{REQUEST_URI} (^|/)\.(?!well-known(/|$)) [OR]
+  RewriteCond %{REQUEST_URI} \.(backup|before|bak|rollback)(-|$) [OR]
+  RewriteCond %{REQUEST_URI} ^/nginx-monzero\.conf$
+  RewriteRule ^ - [F]
+  RewriteCond %{SERVER_PORT} !=443
+  RewriteRule ^ https://monzero.org%{REQUEST_URI} [R=301,L,NE]
+</IfModule>
+
+<IfModule mod_headers.c>
+  Header always unset X-Powered-By
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header always set X-Frame-Options "DENY"
+  Header always set Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://chainquiry.com; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+  # The faucet loads Cloudflare Turnstile (bot check): allow only its script and frame there.
+  <If "%{REQUEST_URI} =~ m#^/faucet(/|$)#">
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data: https://chainquiry.com; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+  </If>
+  # The community forum shows https images that a reader chooses to show (click to load).
+  <If "%{REQUEST_URI} =~ m#^/community/board(/|$)#">
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+  </If>
+  # Registration shares the forum shell and needs the same Turnstile policy as the faucet.
+  <If "%{REQUEST_URI} =~ m#^/community/board(/|$)# && %{QUERY_STRING} =~ m#(^|&)(view|do)=signup(&|$)#">
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data: https:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+  </If>
+  # Studio previews local blobs; explicit hosting checks contact public HTTPS hosts.
+  <If "%{REQUEST_URI} =~ m#^/app(/|$)#">
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob: https://chainquiry.com; connect-src 'self' https:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+  </If>
+  Header always set Permissions-Policy "camera=(), geolocation=(), microphone=()"
+  Header always set Strict-Transport-Security "max-age=86400"
+</IfModule>
+
+<FilesMatch "\.(?:css|js|png|ico|svg|sha256)$">
+  <IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresDefault "access plus 7 days"
+  </IfModule>
+</FilesMatch>
+
+<FilesMatch "\.tar\.gz$">
+  ForceType application/gzip
+</FilesMatch>
+
+<FilesMatch "\.zip$">
+  ForceType application/zip
+</FilesMatch>
+
+# Checksum files are named after their archive (for example .tar.gz.sha256).
+# Without this, Apache takes the type from the .gz/.zip part of the name and
+# nosniff then makes browsers treat the checksum as a binary download.
+<FilesMatch "\.sha256$">
+  ForceType "text/plain; charset=utf-8"
+</FilesMatch>
+
+<FilesMatch "\.ps1$">
+  ForceType text/plain
+  <IfModule mod_headers.c>
+    Header set Content-Disposition "attachment"
+  </IfModule>
+</FilesMatch>
+
+# Module filenames are stable across releases; revalidate rather than use
+# a heuristic browser cache lifetime for imports and entry modules.
+<FilesMatch "(?:\.mjs$|^catalog\.json$)">
+  <IfModule mod_expires.c>
+    ExpiresActive Off
+  </IfModule>
+  <IfModule mod_headers.c>
+    Header unset Cache-Control
+    Header always set Cache-Control "no-cache"
+  </IfModule>
+</FilesMatch>

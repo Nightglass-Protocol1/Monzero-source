@@ -1,0 +1,21 @@
+Monzero v1.0.0 Windows GUI stable update — 18 October 2026
+
+Published as a stable GUI update with project-owner approval. Native Windows validation remains pending; see the validation section below.
+Open start-wallet-gui.bat. In local-node mode, the wallet checks for an existing node and starts it automatically when needed. Wait for synchronization.
+Open Mining / tools, select CPU threads, then Start mining. Stop mining explicitly when finished: a local node can continue mining after the GUI closes. Solo rewards require finding a block and unlock after 60 blocks. The page reports the actual reward address and live hashrate.
+
+Changes: teal theme and supplied XMZ artwork; bounded local-node startup checks; explicit asynchronous mining controls; mining-status refresh across pages; bundled outline fonts.
+
+Validation: QML behavior tests and Windows GUI execution under Wine with an isolated native testnet daemon. Native Windows 10/11 validation is still required. Wine could not initialize the Windows daemon/shared ring database.
+The core executables are unchanged files from the verified v1.0.0 archive. No DEX development code is included.
+
+Transparent branding follow-up: transparent coin icons, teal merchant title bar, and correct fallback surfaces with QT_QUICK_BACKEND=software. Native Linux mainnet GUI preview and 27 QML results passed. The Windows GUI was rebuilt and inspected under Wine on mainnet. Previous mining integration evidence applies to the preceding usability update; no mainnet mining was performed for this graphics follow-up. Native Windows testing remains pending.
+
+Public wallet profiles: private by default; optional creation preference and signed manual publication from Settings > Wallet > Public wallet profile. Share address or address plus a wallet-reported balance snapshot. Stop sharing requires server acknowledgement. Published copies cannot be erased. The searchable directory is https://monzero.org/wallets/. GenesisWallet1 is permanently listed using the existing historical founder disclosure, not a live verified balance. No private keys are uploaded and no funds are moved. All 44 native QML results and 13 server tests passed; native Linux and Windows-under-Wine publication/removal were checked with disposable mainnet wallets. Native Windows validation remains pending.
+
+GUI commit: 4b0cc9e163044282222d2d2845fab1803c6533b5
+Archive: monzero-v1.0.0-windows-gui-profiles-20261018-x64.zip
+SHA-256: 91dacd571e14f974fe52ee378ded3f39019c2ea5254d988abc3f40513afcf2c2
+Source: monzero-gui-profiles-20261018-source.tar.gz
+SHA-256: 22640117e4b189b6e85c983ce98950a5ba3f9e76f6cd827968a52475622d8760
+This unsigned public-profile update has a separate manifest; original signed v1.0.0 downloads remain unchanged.

@@ -1,0 +1,1 @@
+pre{padding:20px;background:var(--surface);border:1px solid var(--line);border-radius:8px;overflow:auto}code{overflow-wrap:anywhere}.table-scroll{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:14px;text-align:left;border-bottom:1px solid var(--line);min-width:150px}caption{text-align:left;padding:12px 0}section p{max-width:85ch}

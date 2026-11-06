@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="How to recover your funds from a Monzero atomic swap — resume, force a refund, or recover manually even without the Monzero app.">
+<title>Recover your swap · Monzero</title>
+<link rel="canonical" href="https://monzero.org/dex/recovery/">
+<meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/dex/recovery/"><meta property="og:title" content="Recover your swap · Monzero"><meta property="og:description" content="Non-custodial means recovery is in your hands. Resume, refund, or recover a Monzero atomic swap — even with no Monzero app."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/assets/monzero-emblem-20261026-96.webp" type="image/webp">
+<link rel="stylesheet" href="/styles.css?v=20261026-brand">
+<link rel="stylesheet" href="/theme.css?v=20261026-brand">
+<link rel="stylesheet" href="/site-nav.css?v=20261026-brand">
+<link rel="stylesheet" href="/dex/recovery.css?v=20261104">
+<link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261026-brand"></noscript>
+</head>
+<body data-page="dex" class="site-shell">
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="Monzero home"><img class="brand-mark brand-coin" src="/assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"><span>MONZERO</span></a><button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button><nav id="site-nav" aria-label="Primary navigation"><a href="/">Home</a><div class="nav-group"><a href="/#about">About</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-about"><span class="visually-hidden">About pages</span></button><div class="nav-sub" id="nav-sub-about"><a href="/#about">About Monzero</a><a href="/roadmap/">Roadmap</a><a href="/objectives/">Project objectives</a><a href="/founder/">Founder</a></div></div><div class="nav-group"><a href="/ecosystem/">Ecosystem</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-ecosystem"><span class="visually-hidden">Ecosystem pages</span></button><div class="nav-sub" id="nav-sub-ecosystem"><a href="/ecosystem/">Ecosystem directory</a><a href="/dex/">Atomic swap DEX</a><a href="/app/">Monzero Studio</a><a href="/app/creators/">Creator hub</a><a href="/wallets/">Public wallets</a><a href="/payments/request/">Payment request</a><a href="/exchanges/">Exchanges</a><a href="/markets/">Markets</a></div></div><div class="nav-group"><a href="/mining/">Mining</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-mining"><span class="visually-hidden">Mining pages</span></button><div class="nav-sub" id="nav-sub-mining"><a href="/mining/">How to mine</a><a href="/mining/calculator/">Mining calculator</a><a href="/mining/dashboard/">Your mining</a><a href="/mining/benchmarks/">CPU benchmarks</a><a href="/mining/leaderboard/">Mining leaderboard</a><a href="/faucet/">Faucet</a><a href="https://pool.monzero.org/">Mining pool</a></div></div><div class="nav-group"><a href="/explorer/">Network</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-network"><span class="visually-hidden">Network pages</span></button><div class="nav-sub" id="nav-sub-network"><a href="/explorer/">Block explorer</a><a href="/network/">Network history</a><a href="/network/nodes/">Node map</a><a href="/stats/">Network stats</a><a href="/status/">Service status</a></div></div><div class="nav-group"><a href="/download/">Downloads</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-downloads"><span class="visually-hidden">Downloads pages</span></button><div class="nav-sub" id="nav-sub-downloads"><a href="/download/">Downloads &amp; verification</a><a href="/upgrade/">Upgrade guide</a></div></div><div class="nav-group"><a href="/developers/">Documentation</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-documentation"><span class="visually-hidden">Documentation pages</span></button><div class="nav-sub" id="nav-sub-documentation"><a href="/developers/">Developer portal</a><a href="/WHITEPAPER.md?rev=1.5-20261017">Whitepaper</a><a href="/developers/api/">API v1</a><a href="/developers/payments/">Accept XMZ</a><a href="/security/">Security</a><a href="/privacy/">Privacy Policy</a><a href="/terms/">Website Terms</a></div></div><div class="nav-group"><a href="/community/">Community</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-community"><span class="visually-hidden">Community pages</span></button><div class="nav-sub" id="nav-sub-community"><a href="/airdrop/">Airdrop</a><a href="/community/">Community hub</a><a href="/community/board/">Discussion board</a><a href="/community/voting/">Voting</a><a href="/community/bounties/">Bounties</a><a href="/fund/">Fundraising</a><a href="/news/">News</a><a href="/press/">Press kit</a><a href="/marketing/">Marketing kit</a></div></div></nav><a class="header-cta" href="/#get-started">Get started</a></header>
+<main id="main" tabindex="-1">
+<div class="rec-wrap">
+  <div class="rec-intro">
+    <span class="rec-eyebrow">Monzero DEX · self-custody</span>
+    <h1>Recover your swap from <span class="z">zero</span>.</h1>
+    <p class="rec-lede">A Monzero atomic swap is non-custodial: no one — not Monzero, not the trader on the other side — can move your coins. That also means recovery is in your hands. This guide shows how to get your funds back if a swap stalls, your app crashes, or your device is lost, from the easiest case to the most technical.</p>
+  </div>
+
+  <div class="rec-card rec-note">
+    <span class="tag">Read first</span>
+    <p>A swap is short-lived — it completes or refunds within its timelock window (hours; see section 6). The entire risk is losing your swap data <strong>while a trade is in flight</strong>. Back it up (section 1) and nothing else here is ever needed.</p>
+  </div>
+
+  <nav class="rec-toc" aria-label="Contents">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#backup">Back up your swap data</a></li>
+      <li><a href="#resume">The quick fix: resume</a></li>
+      <li><a href="#move">Lost the device, kept the data</a></li>
+      <li><a href="#refund">Force a refund (expert)</a></li>
+      <li><a href="#manual">No Monzero app at all (advanced)</a></li>
+      <li><a href="#timelocks">Timelock reference</a></li>
+      <li><a href="#rules">What can and can't happen to your funds</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="backup"><span class="num">1</span>Back up your swap data</h2>
+  <p>Everything needed to recover a swap — your keys, the <strong>pre-signed refund transactions</strong>, and your XMZ key share — lives in one folder on your device: the swap data directory. Copy it somewhere safe (an encrypted USB stick, for example) whenever you have a trade running.</p>
+  <table class="rec-table">
+    <tr><th>System</th><th>Default location</th></tr>
+    <tr><td>Linux</td><td><code>~/.local/share/xmr-btc-swap/</code></td></tr>
+    <tr><td>macOS</td><td><code>~/Library/Application Support/xmr-btc-swap/</code></td></tr>
+    <tr><td>Windows</td><td><code>%APPDATA%\xmr-btc-swap\</code></td></tr>
+  </table>
+  <p>The exact folder name depends on your build — the Monzero app shows its data directory in <strong>Settings</strong>, and the swap CLI prints it on start-up (or you set it with <code>--data-base-dir</code>). Inside are the swap database (SQLite) and the Bitcoin and XMZ wallet files. Treat this folder like a seed backup: it can spend your in-flight swap, so keep it private and encrypted.</p>
+
+  <h2 id="resume"><span class="num">2</span>The quick fix: resume</h2>
+  <p>If the app closed, crashed, or lost power mid-swap, you almost never need anything fancy — just reopen it. Monzero <strong>resumes unfinished swaps automatically</strong>, watches both chains, and takes the correct timelock path (including an automatic refund) without you doing anything.</p>
+  <p>On the command line that is:</p>
+  <pre><code>swap history               # find your swap id
+swap resume --swap-id &lt;id&gt;</code></pre>
+  <p>Leave it running until the swap reaches a final state — <em>completed</em>, <em>refunded</em>, or <em>cancelled</em>. As long as you resume before the refund window closes (section 6), your Bitcoin is safe.</p>
+
+  <h2 id="move"><span class="num">3</span>Lost the device, kept the data</h2>
+  <p>The data directory is portable. If your computer died but you kept the backup from section 1:</p>
+  <ol>
+    <li>Install the Monzero app (or the open-source swap CLI) on any machine.</li>
+    <li>Restore your backed-up folder to the data-directory path for that system (section 1), or point to it with <code>--data-base-dir /path/to/backup</code>.</li>
+    <li>Run <code>swap resume</code> (or simply open the app). It picks up exactly where the swap left off.</li>
+  </ol>
+  <p>Nothing secret ever left your device, so a fresh install plus your folder is a complete recovery.</p>
+
+  <h2 id="refund"><span class="num">4</span>Force a refund (expert)</h2>
+  <p>If the other side vanished and you would rather actively reclaim your Bitcoin than wait for the automatic path, the CLI exposes the two refund-path transactions directly:</p>
+  <pre><code>swap cancel --swap-id &lt;id&gt;    # publish the cancel tx (after the cancel timelock)
+swap refund --swap-id &lt;id&gt;    # reclaim your BTC (after cancel confirms)</code></pre>
+  <p>These simply broadcast transactions that were <strong>already signed before your coins were ever locked</strong>, so they cannot be blocked or redirected. Order and timing matter — see the timelock reference below. (They are marked "expert users only" because running them out of order just wastes fees; they cannot lose funds.)</p>
+
+  <h2 id="manual"><span class="num">5</span>No Monzero app at all (advanced)</h2>
+  <p>Even with no Monzero software, your funds are recoverable, because the protocol and transaction formats are fully open source — the engine is a port of <a href="https://github.com/eigenwallet/core" rel="noopener">eigenwallet/core</a> (the maintained successor to COMIT's <code>xmr-btc-swap</code>). The recovery data is standard:</p>
+  <ul>
+    <li><strong>Bitcoin side:</strong> your pre-signed cancel and refund transactions are stored in the swap database. Once a refund transaction's timelock matures, <em>any</em> Bitcoin node or block-explorer broadcast tool will relay it — no special software required.</li>
+    <li><strong>XMZ side:</strong> the XMZ sits in a 2-of-2 shared key; your key share is in the same swap data and can be imported to reconstruct the wallet.</li>
+  </ul>
+  <div class="rec-card rec-warn">
+    <span class="tag">Honest limitation</span>
+    <p>This last-resort path is real but <strong>not yet a one-click, non-technical procedure</strong> — extracting the raw transactions from the database and broadcasting them by hand takes some technical comfort. We are writing a step-by-step extractor guide; until it lands, if you are ever in this situation, email <a href="mailto:security@monzero.org">security@monzero.org</a> and we will walk you through it. We can help you recover <em>your</em> funds; we cannot take them — there is no key on our side that can.</p>
+  </div>
+
+  <h2 id="timelocks"><span class="num">6</span>Timelock reference</h2>
+  <p>Timelocks are measured in Bitcoin blocks, relative to when the reference transaction confirms (BIP68). On <strong>mainnet</strong>:</p>
+  <table class="rec-table">
+    <tr><th>Window</th><th>Opens</th><th>Who</th><th>Action</th></tr>
+    <tr><td>Redeem (happy path)</td><td>immediately, before cancel</td><td>maker</td><td>settles the swap; you receive your coins</td></tr>
+    <tr><td>Cancel</td><td><strong>24 blocks</strong> (~4 h) after the lock confirms</td><td>either party</td><td>moves the lock to the cancel output</td></tr>
+    <tr><td>Refund</td><td>after cancel confirms</td><td>the Bitcoin funder</td><td>reclaims the locked BTC</td></tr>
+    <tr><td>Punish</td><td><strong>144 blocks</strong> (~24 h) after cancel</td><td>maker</td><td>only if the funder never refunded</td></tr>
+  </table>
+  <p>The 24-hour gap between cancel and punish is your safety margin: you have a full day after a cancellation to refund, far more than any normal confirmation delay. <strong>Refund within that window</strong> and your Bitcoin is never at risk. (Testnet uses shorter values; your app shows the exact numbers for your swap.)</p>
+
+  <h2 id="rules"><span class="num">7</span>What can and can't happen to your funds</h2>
+  <ul>
+    <li><strong>Your keys never leave your device.</strong> Monzero holds no copy and has no admin key. We cannot freeze, move, or seize a swap — in flight or settled.</li>
+    <li><strong>The blockchains enforce the outcome.</strong> Either both sides get paid, or both get refunded. There is no third outcome where one side keeps everything.</li>
+    <li><strong>The app's job is timing, not custody.</strong> You need it (or a resume) online within the refund window to act — but it cannot be made to lose your funds, and the servers it talks to can stall your view at worst, never steal.</li>
+    <li><strong>The only way to lose access is to lose your swap data with a trade in flight.</strong> That is exactly what section 1 prevents.</li>
+  </ul>
+  <div class="rec-card rec-note">
+    <p>Questions, or stuck mid-swap? <a href="mailto:security@monzero.org">security@monzero.org</a>, or the <a href="https://t.me/MonzeroOfficial" rel="noopener">Monzero Telegram</a>. The source for everything above is open: <a href="https://github.com/eigenwallet/core" rel="noopener">eigenwallet/core</a>.</p>
+  </div>
+
+</div>
+</main>
+
+<footer>
+    <a class="brand" href="/"><img class="brand-mark brand-coin" src="/assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"><span>MONZERO</span></a>
+    <p>Experimental software. Verify everything.</p>
+    <p><a href="mailto:security@monzero.org">security@monzero.org</a></p>
+    <p><a href="/privacy/">Privacy Policy</a> · <a href="/terms/">Website Terms</a></p>
+  </footer>
+  <script src="/site-nav.js?v=20261026-brand" defer></script>
+</body>
+</html>

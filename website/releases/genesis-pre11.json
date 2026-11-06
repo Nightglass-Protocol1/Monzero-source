@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "project": "Monzero",
+  "release": "Genesis pre11",
+  "channel": "prerelease",
+  "production_ready": false,
+  "source_commit": "a99f85b357ee687b524bb06ea3cc933b8047a4a0",
+  "gui_source_commit": "94ec2a7c36efcd265956253a771ce9a6dbd9d1ab",
+  "network_uuid": "94834264-d0b2-41dd-b0f2-0ada675c7710",
+  "genesis_nonce": 2271206363,
+  "genesis_hash": "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4",
+  "published_at": "2026-08-26T17:55:23Z",
+  "security_audit": "not_completed",
+  "signing": "unsigned",
+  "independent_reproducibility": "unverified",
+  "release_tests": "launcher_changes_built_archive_verification_passed",
+  "migration": "same_chain_as_genesis_pre10",
+  "source": {
+    "filename": "monzero-genesis-pre11-source.tar.gz",
+    "size_bytes": 193718572,
+    "sha256": "467255c6d72e6ee92bc33f899c235f8f9afbbd7090621599d20fac8d0f04a648"
+  },
+  "gui_source": {
+    "filename": "monzero-genesis-pre11-gui-source.tar.gz",
+    "size_bytes": 209543265,
+    "sha256": "8505792782310a792798f57efef09855e5433b858ab2663ff789436373f21f99",
+    "gui_source_commit": "94ec2a7c36efcd265956253a771ce9a6dbd9d1ab",
+    "core_source_commit": "a99f85b357ee687b524bb06ea3cc933b8047a4a0",
+    "recursive_submodules_included": true
+  },
+  "artifacts": [
+    {
+      "platform": "linux-x86_64",
+      "filename": "monzero-genesis-pre11-linux-x86_64.tar.gz",
+      "size_bytes": 17378736,
+      "sha256": "b789df327c27457b5e1e0194d678bd21f0315da13483fd69ce349c5c15aa3246",
+      "minimum_glibc": "2.42",
+      "tests": "package_verified_local_daemon_smoke_passed"
+    },
+    {
+      "platform": "windows-x64",
+      "filename": "monzero-genesis-pre11-windows-x64.zip",
+      "size_bytes": 25767592,
+      "sha256": "a9d13c3cca63b7d7a8fd3a00aee3f10aac2d2f379598ebebc585b840b69d2889",
+      "tests": "structure_verified_native_execution_pending"
+    },
+    {
+      "platform": "windows-gui-x64",
+      "filename": "monzero-genesis-pre11-windows-gui-x64.zip",
+      "size_bytes": 65219723,
+      "sha256": "e1950bfebb52833747ea3d5100e56b9b97989bc757f2adfb17672724960ac6cc",
+      "tests": "internal_manifest_verified_native_execution_pending"
+    }
+  ]
+}

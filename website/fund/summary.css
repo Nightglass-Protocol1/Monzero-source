@@ -1,0 +1,16 @@
+/* Homepage "Support the project" panel: live totals from /api/donations/. */
+.support { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: clamp(32px, 6vw, 88px); align-items: center; }
+.support-copy > p { color: var(--muted, #a8bac8); }
+.support-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; margin-top: 24px; }
+.support-link { color: var(--accent, #3fdfe8); }
+.support-card { padding: 24px; border: 1px solid var(--line, #293b49); border-radius: var(--radius, 12px); background: var(--surface, #101a24); }
+.support-figures { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+.support-figures span, .support-goal-top { color: var(--muted, #a8bac8); font-size: 13px; }
+.support-figures strong { display: block; margin-top: 4px; font-size: 30px; font-variant-numeric: tabular-nums; color: var(--ink, #e8eef3); }
+.support-goal { margin-top: 16px; }
+.support-goal-top { display: flex; justify-content: space-between; gap: 12px; }
+.support-goal-top strong { color: var(--accent, #3fdfe8); }
+.support-bar { height: 8px; margin-top: 8px; background: var(--line, #293b49); border-radius: 4px; overflow: hidden; }
+.support-bar span { display: block; height: 100%; width: 0; background: var(--accent, #3fdfe8); transition: width 0.6s ease; }
+.support-note { margin: 18px 0 0; color: var(--muted, #a8bac8); font-size: 13px; }
+@media (max-width: 900px) { .support { grid-template-columns: 1fr; } }

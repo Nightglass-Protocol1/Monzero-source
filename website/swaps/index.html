@@ -1,0 +1,208 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>How BTC/XMZ swaps work · Monzero</title><!-- seo:begin --><link rel="canonical" href="https://monzero.org/swaps/"><meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/swaps/"><meta property="og:title" content="How BTC/XMZ swaps work · Monzero"><meta property="og:description" content="How a Monzero BTC/XMZ atomic swap works, step by step: locks, claims, refunds and crash safety. Test networks only."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="Monzero MZ emblem and wordmark: Join the Monzero community. Privacy focused, independent blockchain, CPU mineable."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="How BTC/XMZ swaps work · Monzero"><meta name="twitter:description" content="How a Monzero BTC/XMZ atomic swap works, step by step: locks, claims, refunds and crash safety. Test networks only."><meta name="twitter:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><!-- seo:end --><meta name="description" content="How a Monzero BTC/XMZ atomic swap works, step by step: locks, claims, refunds and crash safety. Test networks only."><link rel="stylesheet" href="/styles.css?v=20261026-brand"><link rel="stylesheet" href="/theme.css?v=20261026-brand"><link rel="stylesheet" href="/site-nav.css?v=20261026-brand"><link rel="stylesheet" href="/swaps/swaps.css?v=20261026-brand"><link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261026-brand"></noscript></head><body class="site-shell"><a class="skip-link" href="#main">Skip to content</a><header class="site-header"><a class="brand" href="/" aria-label="Monzero home"><img class="brand-mark brand-coin" src="/assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"><span>MONZERO</span></a><button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button><nav id="site-nav" aria-label="Primary navigation"><a href="/">Home</a><div class="nav-group"><a href="/#about">About</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-about"><span class="visually-hidden">About pages</span></button><div class="nav-sub" id="nav-sub-about"><a href="/#about">About Monzero</a><a href="/roadmap/">Roadmap</a><a href="/objectives/">Project objectives</a><a href="/founder/">Founder</a></div></div><div class="nav-group"><a href="/ecosystem/">Ecosystem</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-ecosystem"><span class="visually-hidden">Ecosystem pages</span></button><div class="nav-sub" id="nav-sub-ecosystem"><a href="/ecosystem/">Ecosystem directory</a><a href="/dex/">Atomic swap DEX</a><a href="/app/">Monzero Studio</a><a href="/app/creators/">Creator hub</a><a href="/wallets/">Public wallets</a><a href="/payments/request/">Payment request</a><a href="/exchanges/">Exchanges</a><a href="/markets/">Markets</a></div></div><div class="nav-group"><a href="/mining/">Mining</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-mining"><span class="visually-hidden">Mining pages</span></button><div class="nav-sub" id="nav-sub-mining"><a href="/mining/">How to mine</a><a href="/mining/calculator/">Mining calculator</a><a href="/mining/dashboard/">Your mining</a><a href="/mining/benchmarks/">CPU benchmarks</a><a href="/mining/leaderboard/">Mining leaderboard</a><a href="/faucet/">Faucet</a><a href="https://pool.monzero.org/">Mining pool</a></div></div><div class="nav-group"><a href="/explorer/">Network</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-network"><span class="visually-hidden">Network pages</span></button><div class="nav-sub" id="nav-sub-network"><a href="/explorer/">Block explorer</a><a href="/network/">Network history</a><a href="/network/nodes/">Node map</a><a href="/stats/">Network stats</a><a href="/status/">Service status</a></div></div><div class="nav-group"><a href="/download/">Downloads</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-downloads"><span class="visually-hidden">Downloads pages</span></button><div class="nav-sub" id="nav-sub-downloads"><a href="/download/">Downloads &amp; verification</a><a href="/upgrade/">Upgrade guide</a></div></div><div class="nav-group"><a href="/developers/">Documentation</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-documentation"><span class="visually-hidden">Documentation pages</span></button><div class="nav-sub" id="nav-sub-documentation"><a href="/developers/">Developer portal</a><a href="/WHITEPAPER.md?rev=1.5-20261017">Whitepaper</a><a href="/developers/api/">API v1</a><a href="/developers/payments/">Accept XMZ</a><a href="/security/">Security</a><a href="/privacy/">Privacy Policy</a><a href="/terms/">Website Terms</a></div></div><div class="nav-group"><a href="/community/">Community</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-community"><span class="visually-hidden">Community pages</span></button><div class="nav-sub" id="nav-sub-community"><a href="/airdrop/">Airdrop</a><a href="/community/">Community hub</a><a href="/community/board/">Discussion board</a><a href="/community/voting/">Voting</a><a href="/community/bounties/">Bounties</a><a href="/fund/">Fundraising</a><a href="/news/">News</a><a href="/press/">Press kit</a><a href="/marketing/">Marketing kit</a></div></div></nav><a class="header-cta" href="/#get-started">Get started</a></header><main tabindex="-1" id="main"><div class="sw-wrap sw-page">
+  <div class="sw-intro">
+    <span class="sw-eyebrow">Monzero DEX · atomic swap</span>
+    <h1>How a <span class="sw-b">BTC</span> / <span class="sw-x">XMZ</span> swap works</h1>
+    <p class="sw-lede">Two strangers trade Bitcoin for Monzero without an exchange, an escrow agent or trusting each other. The two blockchains enforce every step: either both sides get paid, or both get their coins back.</p>
+    <p class="sw-notice"><strong>Test networks only.</strong> These swaps run on Bitcoin signet and the Monzero test network. Mainnet trading is switched off in the code.</p>
+  </div>
+
+  <section aria-labelledby="cast-h">
+    <h2 id="cast-h">The two traders</h2>
+    <div class="sw-cast">
+      <div class="sw-person sw-bob">
+        <span class="sw-role">Bob · buying XMZ</span>
+        <h3>Pays with Bitcoin</h3>
+        <p>Uses the Bitcoin light wallet built into the Monzero app, so he doesn't need to run a Bitcoin node.</p>
+      </div>
+      <div class="sw-person sw-alice">
+        <span class="sw-role">Alice · selling XMZ</span>
+        <h3>Gets paid in Bitcoin</h3>
+        <p>Uses her Monzero wallet. For now her app also needs a Bitcoin node to check the chain; a light-wallet option for sellers is being designed.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="flow-h">
+    <div class="sw-head">
+      <h2 id="flow-h">Step by step</h2>
+      <p class="sw-sub">Amounts are from the signet test swap on 25 October: 0.002 BTC for 1 XMZ, with a 36-block safety timelock.</p>
+    </div>
+    <div class="sw-tabs" role="tablist" aria-label="Swap outcome">
+      <button id="tab-swap" role="tab" aria-selected="true" aria-controls="swap">The swap completes</button>
+      <button id="tab-refund" role="tab" aria-selected="false" aria-controls="refund">Something goes wrong</button>
+    </div>
+
+    <div id="swap" class="sw-panel" role="tabpanel" aria-labelledby="tab-swap">
+      <div class="sw-lanes-head" aria-hidden="true"><span>Bob · BTC</span><span>On-chain</span><span>Alice · XMZ</span></div>
+      <div class="sw-flow">
+        <div class="sw-step">
+          <div class="sw-card sw-both">
+            <span class="sw-n">STEP 1 · AGREE</span>
+            <h3>Both apps sign the deal before any money moves</h3>
+            <p>Bob accepts Alice's signed quote. The apps exchange identities, keys and proofs, then each saves <strong>pre-signed cancel and refund transactions</strong>. From here, either side can always get their coins back.</p>
+          </div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-card sw-bob">
+            <span class="sw-n">STEP 2 · BOB LOCKS BTC</span>
+            <h3>0.002 BTC goes into a shared contract</h3>
+            <p>Bob approves the payment in his app. The coins sit in a <strong>2-of-2 contract</strong>: spending them needs both traders' keys, or the timelock to pass.</p>
+          </div>
+          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-btc">Bitcoin</span><span>lock confirms</span></div>
+          <div class="sw-empty"></div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-empty"></div>
+          <div class="sw-chain"><span class="sw-pill sw-xmz">Monzero</span><span class="sw-arrow sw-xmz">←</span><span>10 confirmations</span></div>
+          <div class="sw-card sw-alice">
+            <span class="sw-n">STEP 3 · ALICE LOCKS XMZ</span>
+            <h3>1 XMZ goes to a shared address</h3>
+            <p>Alice's app checks Bob's lock first. Then she sends <strong>1 XMZ plus a small fee reserve</strong> to an address that can only be spent with both traders' key shares.</p>
+          </div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-card sw-bob">
+            <span class="sw-n">STEP 4 · BOB HANDS OVER A LOCKED SIGNATURE</span>
+            <h3>A signature with a catch</h3>
+            <p>Bob checks the XMZ lock, then gives Alice an <strong>adaptor signature</strong> for claiming the BTC. To use it, Alice has to reveal her XMZ key share.</p>
+          </div>
+          <div class="sw-chain"><span class="sw-arrow sw-mut">→</span><span>sent app to app</span></div>
+          <div class="sw-empty"></div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-empty"></div>
+          <div class="sw-chain"><span class="sw-pill sw-btc">Bitcoin</span><span class="sw-arrow sw-btc">←</span><span>redeem published</span></div>
+          <div class="sw-card sw-alice">
+            <span class="sw-n">STEP 5 · ALICE CLAIMS THE BTC</span>
+            <h3>0.0019 BTC to Alice</h3>
+            <p>While the timelock is still safely far away, Alice completes the signature and broadcasts it. 0.0001 BTC goes on the network fee. <strong>Publishing it puts her XMZ key share on the Bitcoin chain.</strong></p>
+          </div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-card sw-bob">
+            <span class="sw-n">STEP 6 · BOB CLAIMS THE XMZ</span>
+            <h3>Exactly 1 XMZ to Bob</h3>
+            <p>Bob's app reads Alice's redeem from the Bitcoin chain, recovers her key share and sweeps the 1 XMZ to his wallet. The unused fee reserve goes back to Alice.</p>
+          </div>
+          <div class="sw-chain"><span class="sw-arrow sw-xmz">←</span><span class="sw-pill sw-done">swap done</span></div>
+          <div class="sw-empty"></div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-key">
+            <h3>Why neither side can cheat</h3>
+            <p>Alice can only take the Bitcoin by publishing the very thing Bob needs to take the XMZ. If she never claims, the timelock runs out and Bob gets his Bitcoin back.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="refund" class="sw-panel" role="tabpanel" aria-labelledby="tab-refund" hidden>
+      <div class="sw-lanes-head" aria-hidden="true"><span>Bob · BTC</span><span>On-chain</span><span>Alice · XMZ</span></div>
+      <div class="sw-flow">
+        <div class="sw-step">
+          <div class="sw-card sw-both">
+            <span class="sw-n">THE TRIGGER</span>
+            <h3>Alice never locks her XMZ, or never claims before the timelock</h3>
+            <p>Bob's 0.002 BTC is sitting in the contract. Nobody can take it alone, and the 36-block timelock is counting down.</p>
+          </div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-card sw-bob">
+            <span class="sw-n">AFTER 36 BLOCKS · CANCEL</span>
+            <h3>Bob broadcasts the pre-signed cancel</h3>
+            <p>This moves the coins out of the swap contract into a refund contract. It was signed by both apps back in step 1, so Alice's help isn't needed.</p>
+          </div>
+          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-btc">Bitcoin</span><span>cancel confirms</span></div>
+          <div class="sw-empty"></div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-card sw-bob">
+            <span class="sw-n">REFUND</span>
+            <h3>0.0018 BTC back in Bob's light wallet</h3>
+            <p>Bob's app sends the refund. The 0.0002 BTC difference is the two network fees. Tested on testnet4 and on signet.</p>
+          </div>
+          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-done">BTC refunded</span></div>
+          <div class="sw-empty"></div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-empty"></div>
+          <div class="sw-chain"><span class="sw-pill sw-xmz">Monzero</span><span class="sw-arrow sw-xmz">←</span><span>XMZ refunded</span></div>
+          <div class="sw-card sw-alice">
+            <span class="sw-n">ALICE'S XMZ</span>
+            <h3>Bob's refund unlocks Alice's XMZ</h3>
+            <p>If Alice did lock XMZ, Bob's refund transaction reveals his key share, so Alice's app can sweep her XMZ back.</p>
+          </div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-empty"></div>
+          <div class="sw-chain"><span class="sw-pill sw-btc">Bitcoin</span><span class="sw-arrow sw-btc">←</span><span class="sw-pill sw-bad">punish</span></div>
+          <div class="sw-card sw-alice">
+            <span class="sw-n">IF BOB VANISHES AFTER CANCEL</span>
+            <h3>Alice can take the BTC</h3>
+            <p>If Bob cancels but never refunds, after 10 more blocks Alice can punish and take the Bitcoin. Otherwise her XMZ would stay stuck, so this keeps both sides honest.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="sw-clock">
+        <h3>The clock, in Bitcoin blocks</h3>
+        <div class="sw-timeline-wrap" tabindex="0" aria-label="Timelock timeline">
+          <div class="sw-timeline">
+            <div class="sw-bar">
+              <div class="sw-w1">Swap window · Alice may claim</div>
+              <div class="sw-w2">Bob refunds</div>
+              <div class="sw-w3">Alice may punish</div>
+            </div>
+            <div class="sw-ticks"><span>block 0 · BTC lock confirms</span><span>36 · cancel</span><span>+10 · punish</span></div>
+          </div>
+        </div>
+        <p class="sw-sub">Alice's app refuses to claim when the timelock is close; it keeps a safety margin of several blocks. On Bitcoin, 36 blocks is about six hours.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="crash-h">
+    <h2 id="crash-h">What if an app crashes mid-trade?</h2>
+    <div class="sw-facts">
+      <div class="sw-fact">
+        <h3>Everything is saved before it is sent</h3>
+        <p>Each signed transaction is written to disk before broadcast. A reopened app sends the <em>same</em> bytes again: no double payment, and nothing is signed twice.</p>
+      </div>
+      <div class="sw-fact">
+        <h3>Tested with the power pulled</h3>
+        <p>On 25 October the buyer's machine was switched off mid-swap without shutting down. After reboot its wallet and trade files were intact and the swap finished with exact amounts.</p>
+      </div>
+      <div class="sw-fact">
+        <h3>Approvals don't carry over</h3>
+        <p>After a restart, any approval that hadn't been used is cleared. You review and approve again with fresh chain data.</p>
+      </div>
+      <div class="sw-fact">
+        <h3>Each app checks the chain itself</h3>
+        <p>Neither app takes the other trader's word for a payment. Bob's light wallet verifies Bitcoin block headers and proofs; Alice's app checks with her own node.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="evidence-h">
+    <h2 id="evidence-h">Test runs so far</h2>
+    <div class="sw-table-wrap">
+      <table>
+        <thead><tr><th>Run</th><th>Network</th><th>Result</th><th>Time</th></tr></thead>
+        <tbody>
+          <tr><td>Complete swap</td><td>Bitcoin signet</td><td>1 XMZ to buyer, 0.0019 BTC to seller</td><td class="sw-num">≈ 1 h 45 m</td></tr>
+          <tr><td>Refund after timelock</td><td>Bitcoin signet</td><td>0.0018 BTC back to buyer, XMZ back to seller</td><td class="sw-num">≈ 4 h 24 m</td></tr>
+          <tr><td>Refund after restart</td><td>Bitcoin testnet4</td><td>Reopened app cancelled and refunded</td><td class="sw-num">≈ 2 days*</td></tr>
+          <tr><td>Two separate machines</td><td>Bitcoin signet</td><td>Swap completed, exact amounts</td><td class="sw-num">≈ 2 h 01 m</td></tr>
+          <tr><td>Buyer app stopped after signing</td><td>Bitcoin signet</td><td>Reopened, resent same lock, completed</td><td class="sw-num">≈ 1 h 12 m</td></tr>
+          <tr><td>Buyer machine powered off</td><td>Bitcoin signet</td><td>Rebooted, files intact, completed</td><td class="sw-num">≈ 1 h 39 m</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="sw-sub sw-evidence-note">* Testnet4 mined only empty blocks for about two days, so the cancel waited in the mempool.</p>
+  </section>
+
+  <div class="sw-outro">
+    <p><strong>Still to come before mainnet:</strong> a light-wallet option for sellers, independent review, and release validation.</p>
+    <p>Follow progress on the <a href="/roadmap/">Monzero roadmap</a>.</p>
+  </div>
+</div></main><footer><a href="/roadmap/">Monzero roadmap</a></footer><script src="/swaps/swaps.js?v=20261025-swaps" defer></script><script src="/site-nav.js?v=20261026-brand" defer></script></body></html>

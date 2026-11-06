@@ -1,0 +1,20 @@
+{
+  "channel": "stable",
+  "date": "2026-10-18",
+  "guiCommit": "5b45b03670db266152a762b1b5a6ee8b40646d94",
+  "coreCommit": "c4165784db57d8ae410fc8af58861e4178ee1a42",
+  "nativeWindowsTested": false,
+  "signed": false,
+  "artifacts": [
+    {
+      "filename": "monzero-v1.0.0-windows-gui-update-20261018-x64.zip",
+      "sha256": "5a65b46ea1bf9bac0782614ca2e4762fdc65984121485af0d22fddd830bc9b0a",
+      "bytes": 61261320
+    },
+    {
+      "filename": "monzero-gui-update-20261018-source.tar.gz",
+      "sha256": "834337d66b4e66562790d80eff072eb9dad953f9dec92ff91247302e74a46667",
+      "bytes": 32349784
+    }
+  ]
+}

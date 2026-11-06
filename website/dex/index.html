@@ -1,0 +1,176 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Atomic swap DEX · Monzero</title><!-- seo:begin --><link rel="canonical" href="https://monzero.org/dex/"><meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/dex/"><meta property="og:title" content="Atomic swap DEX · Monzero"><meta property="og:description" content="Swap XMZ for Bitcoin, Litecoin, Bitcoin Cash or BNB from your own wallet. No account, no deposit, no custodian — atomic swaps settle on-chain or refund."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta name="twitter:card" content="summary_large_image"><!-- seo:end --><meta name="description" content="Monzero's non-custodial atomic swap DEX: trade XMZ for BTC, LTC, BCH or BNB from your own wallet. Both sides get paid, or both get refunded."><link rel="stylesheet" href="/styles.css?v=20261026-brand"><link rel="stylesheet" href="/theme.css?v=20261026-brand"><link rel="stylesheet" href="/site-nav.css?v=20261026-brand"><link rel="stylesheet" href="/dex/dex.css?v=20261026-brand"><link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261026-brand"></noscript></head><body class="site-shell" data-page="dex"><a class="skip-link" href="#main">Skip to content</a><header class="site-header"><a class="brand" href="/" aria-label="Monzero home"><img class="brand-mark brand-coin" src="/assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"><span>MONZERO</span></a><button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button><nav id="site-nav" aria-label="Primary navigation"><a href="/">Home</a><div class="nav-group"><a href="/#about">About</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-about"><span class="visually-hidden">About pages</span></button><div class="nav-sub" id="nav-sub-about"><a href="/#about">About Monzero</a><a href="/roadmap/">Roadmap</a><a href="/objectives/">Project objectives</a><a href="/founder/">Founder</a></div></div><div class="nav-group current"><a href="/ecosystem/">Ecosystem</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-ecosystem"><span class="visually-hidden">Ecosystem pages</span></button><div class="nav-sub" id="nav-sub-ecosystem"><a href="/ecosystem/">Ecosystem directory</a><a href="/dex/" aria-current="page">Atomic swap DEX</a><a href="/app/">Monzero Studio</a><a href="/app/creators/">Creator hub</a><a href="/wallets/">Public wallets</a><a href="/payments/request/">Payment request</a><a href="/exchanges/">Exchanges</a><a href="/markets/">Markets</a></div></div><div class="nav-group"><a href="/mining/">Mining</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-mining"><span class="visually-hidden">Mining pages</span></button><div class="nav-sub" id="nav-sub-mining"><a href="/mining/">How to mine</a><a href="/mining/calculator/">Mining calculator</a><a href="/mining/dashboard/">Your mining</a><a href="/mining/benchmarks/">CPU benchmarks</a><a href="/mining/leaderboard/">Mining leaderboard</a><a href="/faucet/">Faucet</a><a href="https://pool.monzero.org/">Mining pool</a></div></div><div class="nav-group"><a href="/explorer/">Network</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-network"><span class="visually-hidden">Network pages</span></button><div class="nav-sub" id="nav-sub-network"><a href="/explorer/">Block explorer</a><a href="/network/">Network history</a><a href="/network/nodes/">Node map</a><a href="/stats/">Network stats</a><a href="/status/">Service status</a></div></div><div class="nav-group"><a href="/download/">Downloads</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-downloads"><span class="visually-hidden">Downloads pages</span></button><div class="nav-sub" id="nav-sub-downloads"><a href="/download/">Downloads &amp; verification</a><a href="/upgrade/">Upgrade guide</a></div></div><div class="nav-group"><a href="/developers/">Documentation</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-documentation"><span class="visually-hidden">Documentation pages</span></button><div class="nav-sub" id="nav-sub-documentation"><a href="/developers/">Developer portal</a><a href="/WHITEPAPER.md?rev=1.5-20261017">Whitepaper</a><a href="/developers/api/">API v1</a><a href="/developers/payments/">Accept XMZ</a><a href="/security/">Security</a><a href="/privacy/">Privacy Policy</a><a href="/terms/">Website Terms</a></div></div><div class="nav-group"><a href="/community/">Community</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-community"><span class="visually-hidden">Community pages</span></button><div class="nav-sub" id="nav-sub-community"><a href="/airdrop/">Airdrop</a><a href="/community/">Community hub</a><a href="/community/board/">Discussion board</a><a href="/community/voting/">Voting</a><a href="/community/bounties/">Bounties</a><a href="/fund/">Fundraising</a><a href="/news/">News</a><a href="/press/">Press kit</a><a href="/marketing/">Marketing kit</a></div></div></nav><a class="header-cta" href="/#get-started">Get started</a></header><main tabindex="-1" id="main">
+<div class="dex-wrap">
+
+  <section class="dex-intro">
+    <span class="dex-eyebrow">Monzero DEX · atomic swap</span>
+    <h1>Swap from <span class="dex-zero">zero</span> trust.</h1>
+    <p class="dex-lede">Trade XMZ for Bitcoin, Litecoin, Bitcoin Cash or BNB straight from your own wallet. No account, no deposit, no custodian — the two blockchains enforce the trade: either both sides get paid, or both get refunded.</p>
+    <div class="dex-countdown" id="dex-countdown" data-launch="2026-12-04T00:00:00Z" hidden><span class="dc-label">Coming soon · opens in</span><span class="dc-clock"><b id="dc-d">30</b><i>d</i> <b id="dc-h">00</b><i>h</i> <b id="dc-m">00</b><i>m</i> <b id="dc-s">00</b><i>s</i></span></div><p class="dex-notice"><strong>Gated beta.</strong> Swaps run inside the Monzero app and open in stages with small limits. Live trading is off by default in public builds. This page shows how it looks and works; rates below are indicative. <strong>Fees: 0.1%–0.5% on Bitcoin, free on Litecoin</strong> (plus the on-chain network fee). <a href="/dex/recovery/">How to recover your funds &rarr;</a></p>
+  </section>
+
+  <div class="dex-modes" role="tablist" aria-label="Swap mode">
+    <button id="mode-simple" class="dex-mode on" type="button" role="tab" aria-selected="true">Simple swap</button>
+    <button id="mode-pro" class="dex-mode" type="button" role="tab" aria-selected="false">Pro · order book</button>
+  </div>
+
+  <section class="dex-stage" id="view-simple" aria-label="Swap">
+    <div class="swapcard" id="swapcard">
+      <div class="swap-head"><h2>Exchange</h2><span class="swap-mode"><span class="dot"></span>Atomic · no custody</span></div>
+
+      <div class="swap-panel">
+        <div class="swap-labels"><label for="send-amount">You send</label><span class="swap-bal" id="send-note">Pay with your own coins</span></div>
+        <div class="swap-field">
+          <input id="send-amount" inputmode="decimal" autocomplete="off" spellcheck="false" value="100" aria-label="Amount to send">
+          <button class="coin-pick" id="send-coin" type="button" aria-haspopup="listbox" aria-expanded="false"></button>
+        </div>
+      </div>
+
+      <button class="swap-flip" id="swap-flip" type="button" aria-label="Swap direction"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4v13m0 0-3-3m3 3 3-3M17 20V7m0 0-3 3m3-3 3 3"/></svg></button>
+
+      <div class="swap-panel">
+        <div class="swap-labels"><label for="recv-amount">You receive</label><span class="swap-bal" id="recv-note">Settles to your address</span></div>
+        <div class="swap-field">
+          <input id="recv-amount" readonly tabindex="-1" aria-label="Amount to receive">
+          <button class="coin-pick" id="recv-coin" type="button" aria-haspopup="listbox" aria-expanded="false"></button>
+        </div>
+      </div>
+
+      <dl class="swap-details">
+        <div><dt>Rate</dt><dd id="d-rate">—</dd></div>
+        <div><dt>Project fee</dt><dd id="d-projfee">0.1%–0.5%</dd></div>
+        <div><dt>Network fee</dt><dd id="d-fee">paid on-chain</dd></div>
+        <div><dt>Est. time</dt><dd id="d-time">~20–40 min</dd></div>
+      </dl>
+
+      <button class="swap-go" id="swap-go" type="button">Start atomic swap</button>
+      <p class="swap-foot">Runs in the Monzero app · your keys never leave your device</p>
+
+      <div class="swap-reveal" id="swap-reveal" hidden>
+        <h3>How to start this swap</h3>
+        <ol>
+          <li>Open the <strong>Monzero app</strong> (desktop or Android) and go to <em>DEX</em>.</li>
+          <li>Pick the <span id="reveal-pair">XMZ / BTC</span> pair and the amount.</li>
+          <li>Take a live offer. Your app and the counterparty's lock on each chain; when the secrets are revealed, both sides are paid. If anything stalls, both sides refund automatically.</li>
+        </ol>
+        <div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the app</a><a class="button secondary" href="/swaps/">How swaps work</a></div>
+      </div>
+    </div>
+
+    <aside class="dex-side">
+      <div class="side-card">
+        <h2>Pairs</h2>
+        <ul class="pairs" id="pairs"></ul>
+      </div>
+      <div class="side-card">
+        <h2>No custody, by design</h2>
+        <ul class="assure">
+          <li><span class="ax">1</span><div><strong>Both sides lock</strong><p>You and the counterparty each lock funds on your own chains.</p></div></li>
+          <li><span class="ax">2</span><div><strong>Secrets reveal</strong><p>Claiming one side reveals the key that releases the other.</p></div></li>
+          <li><span class="ax">3</span><div><strong>Paid or refunded</strong><p>Both get paid, or after a timeout both refund. No bridge, no wrapped token, no one holds your coins.</p></div></li>
+        </ul>
+      </div>
+    </aside>
+  </section>
+
+  <section class="dex-pro" id="view-pro" aria-label="Order book" hidden>
+    <div class="pro-top">
+      <button class="pro-pair coin-pick" id="pro-pair" type="button" aria-haspopup="listbox" aria-expanded="false"></button>
+      <div class="pro-ticker">
+        <div><span>Last price</span><strong id="pro-last">—</strong></div>
+        <div><span>24h change</span><strong id="pro-chg">—</strong></div>
+        <div><span>24h volume</span><strong id="pro-vol">—</strong></div>
+      </div>
+      <span class="pro-note">Preview · indicative orders</span>
+    </div>
+
+    <div class="chart-card side-card">
+      <div class="chart-head">
+        <div class="chart-head-l"><h2>Price</h2>
+          <div class="tf-group" id="tf-group" role="group" aria-label="Chart timeframe">
+            <button type="button" data-tf="1m">1m</button>
+            <button type="button" data-tf="5m" class="on">5m</button>
+            <button type="button" data-tf="15m">15m</button>
+            <button type="button" data-tf="1h">1h</button>
+            <button type="button" data-tf="4h">4h</button>
+            <button type="button" data-tf="1D">1D</button>
+          </div>
+        </div>
+        <span class="chart-sub" id="chart-sub">XMZ / BTC · indicative</span>
+      </div>
+      <div class="chart-plot">
+        <svg class="price-svg" id="price-svg" viewBox="0 0 1000 300" preserveAspectRatio="none" role="img" aria-label="Price candlestick chart">
+          <g id="grid"></g>
+          <g id="candles"></g>
+          <line class="price-last-line" id="price-last-line" x1="0" y1="150" x2="1000" y2="150"></line>
+        </svg>
+        <div class="chart-yaxis" id="chart-yaxis" aria-hidden="true"></div>
+        <span class="price-tag" id="price-tag"></span>
+      </div>
+    </div>
+
+    <div class="depth-card side-card">
+      <div class="depth-head"><h2>Market depth</h2><span class="depth-legend"><em class="bidleg">Bids</em><em class="askleg">Asks</em></span></div>
+      <svg class="depth-svg" id="depth-svg" viewBox="0 0 1000 220" preserveAspectRatio="none" role="img" aria-label="Order book depth chart">
+        <path class="depth-area bid" id="d-bid-area" d=""></path>
+        <path class="depth-area ask" id="d-ask-area" d=""></path>
+        <path class="depth-line bid" id="d-bid-line" d=""></path>
+        <path class="depth-line ask" id="d-ask-line" d=""></path>
+        <line class="depth-mid" id="d-mid" x1="500" y1="0" x2="500" y2="220"></line>
+      </svg>
+      <div class="depth-axis"><span id="d-xmin">—</span><span id="d-xmid">—</span><span id="d-xmax">—</span></div>
+    </div>
+
+    <div class="pro-grid">
+      <div class="pro-book side-card">
+        <div class="book-head"><span>Price</span><span class="num">Amount · XMZ</span><span class="num">Total</span></div>
+        <div class="book-rows asks" id="book-asks"></div>
+        <div class="book-spread"><span id="book-mid">—</span><em>spread <span id="book-spread-v">—</span></em></div>
+        <div class="book-rows bids" id="book-bids"></div>
+      </div>
+
+      <div class="pro-order side-card">
+        <div class="order-tabs"><button id="ot-buy" class="on" type="button">Buy XMZ</button><button id="ot-sell" type="button">Sell XMZ</button></div>
+        <label class="ofield"><span class="olab">Price</span><input id="o-price" inputmode="decimal" autocomplete="off"><span class="ounit" id="o-price-unit">BTC</span></label>
+        <label class="ofield"><span class="olab">Amount</span><input id="o-amount" inputmode="decimal" autocomplete="off" value="100"><span class="ounit">XMZ</span></label>
+        <label class="ofield"><span class="olab">Total</span><input id="o-total" readonly tabindex="-1"><span class="ounit" id="o-total-unit">BTC</span></label>
+        <button class="swap-go" id="o-place" type="button">Place buy order</button>
+        <p class="swap-foot">Orders are taken in the Monzero app · no custody</p>
+        <div class="swap-reveal" id="pro-reveal" hidden>
+          <h3>Orders live in the app</h3>
+          <p>The order book you see here is a preview. In the Monzero app you post or take a signed offer; the two chains then settle the atomic swap, or both sides refund. No order is ever held by an exchange.</p>
+          <div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the app</a><a class="button secondary" href="/swaps/">How swaps work</a></div>
+        </div>
+      </div>
+
+      <div class="pro-trades side-card">
+        <h2>Recent trades</h2>
+        <div class="trade-head"><span>Price</span><span class="num">Amount</span><span class="num">Time</span></div>
+        <div class="trade-rows" id="trades"></div>
+      </div>
+    </div>
+
+    <div class="orders-card side-card" id="orders-card">
+      <div class="orders-head"><h2>Open orders <span class="orders-count" id="orders-count"></span></h2><span class="orders-note">Preview · orders are placed &amp; matched in the <a href="/download/">Monzero app</a></span></div>
+      <div class="orders-table">
+        <div class="orders-row orders-th"><span>Side</span><span>Pair</span><span class="num">Price</span><span class="num">Amount · XMZ</span><span class="num">Total</span><span class="num">Action</span></div>
+        <div id="orders-body"></div>
+        <p class="orders-empty" id="orders-empty">No open orders yet. Set a price and amount above, then <strong>Place order</strong> to add one here.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="dex-how" aria-label="How swapping works"><h2>How swapping works</h2><p class="dex-how-lede">There’s no “connect your wallet to a website.” Swaps happen inside the <strong>Monzero app</strong>, and your keys never leave it — no account, no sign-up.</p><ol class="dex-steps"><li><b>Open the Monzero app.</b> It’s already your XMZ wallet — nothing to connect.</li><li><b>Choose a swap</b> (say XMZ → Bitcoin). The XMZ side is ready; for the other coin, use the app’s built-in wallet or link your own — e.g. MetaMask for Ethereum-family coins.</li><li><b>Confirm.</b> The app performs the swap automatically across both chains.</li><li><b>Done.</b> The other coin lands in your wallet. If a trade can’t complete you’re <a href="/dex/recovery/">automatically refunded</a> — it can never run off with your coins.</li></ol><p class="dex-wallets"><b>Works with:</b> your Monzero wallet — plus <strong>MetaMask</strong>, <strong>Ledger</strong> or <strong>WalletConnect</strong> for Ethereum-family coins (ETH, BNB, USDC, USDT). Receive to any address, including a Ledger.</p><p class="dex-how-foot">No custody, no KYC, and no “connect wallet” button on a web page — everything happens in the app and your keys stay with you.</p></section>
+
+  <section class="dex-strip" aria-label="Why">
+    <article><h3>Your keys, your coins</h3><p>Trades settle wallet-to-wallet. Monzero never takes custody and can't freeze or seize a trade.</p></article>
+    <article><h3>Private by default</h3><p>The XMZ side keeps Monero-style privacy. No KYC, no account, no order tied to your identity.</p></article>
+    <article><h3>Open &amp; verifiable</h3><p>The swap contracts and engine are open source. Read the code, run the test kit, break it: <a href="/security/">security</a>.</p></article>
+  </section>
+
+  <section class="dex-faq" aria-label="Common questions"><h2>Common questions</h2><details><summary>How do I connect a wallet?</summary><p>You don’t connect to a website. Swapping is built into the Monzero app — your XMZ wallet is already there, and for the other coin you use the app’s built-in wallet or link your own (e.g. MetaMask). Your keys never leave your device.</p></details><details><summary>Can I use a Ledger or MetaMask?</summary><p>For Ethereum-family coins (ETH, BNB, USDC, USDT) you can sign with <strong>MetaMask, Ledger or WalletConnect</strong>. On any coin you can receive the result straight to a Ledger address. On Bitcoin/Litecoin/XMZ a small in-app wallet does the live signing — hardware wallets can’t make the special swap signatures — so you keep the bulk cold on your Ledger.</p></details><details><summary>What does it cost?</summary><p><strong>0.1%–0.5% on Bitcoin</strong> (smaller trades a little more), <strong>free on Litecoin</strong>, plus the normal on-chain network fee each chain charges. EVM pair pricing is announced per chain.</p></details><details><summary>Can Monzero take or freeze my coins?</summary><p>No — it’s non-custodial. No company ever holds your funds and there’s no account. Trades are atomic: either both sides get paid, or both get <a href="/dex/recovery/">refunded</a>. There is no third outcome where someone keeps everything.</p></details><details><summary>Which coins can I swap?</summary><p>XMZ to Bitcoin, Litecoin, BNB, Ethereum, and the USDC / USDT stablecoins — with more EVM chains over time. Monero via a Bitcoin route is planned.</p></details><details><summary>What if a swap is interrupted?</summary><p>Reopen the app and it resumes, or refunds you automatically within the timelock. See the <a href="/dex/recovery/">recovery guide</a> — you can even recover without our app if you keep the swap data.</p></details></section>
+
+  <template id="coin-menu-tpl">
+    <div class="coin-menu" role="listbox"></div>
+  </template>
+</div>
+</main><footer><a href="/roadmap/">Monzero roadmap</a></footer><script src="/dex/dex.js?v=20261103" defer></script><script src="/site-nav.js?v=20261026-brand" defer></script></body></html>

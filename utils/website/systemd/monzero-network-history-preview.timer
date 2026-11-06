@@ -1,0 +1,11 @@
+[Unit]
+Description=Sample Monzero network history once per minute for local preview
+
+[Timer]
+OnBootSec=30
+OnUnitInactiveSec=60
+AccuracySec=1
+Unit=monzero-network-history-preview.service
+
+[Install]
+WantedBy=timers.target

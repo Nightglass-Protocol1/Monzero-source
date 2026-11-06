@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Monzero backup to the USB drives
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=10min
+# Runs at the next start if the PC was off at 03:30.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

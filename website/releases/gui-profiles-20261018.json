@@ -1,0 +1,20 @@
+{
+  "channel": "stable",
+  "date": "2026-10-18",
+  "guiCommit": "4b0cc9e163044282222d2d2845fab1803c6533b5",
+  "coreCommit": "c4165784db57d8ae410fc8af58861e4178ee1a42",
+  "nativeWindowsTested": false,
+  "signed": false,
+  "artifacts": [
+    {
+      "filename": "monzero-v1.0.0-windows-gui-profiles-20261018-x64.zip",
+      "sha256": "91dacd571e14f974fe52ee378ded3f39019c2ea5254d988abc3f40513afcf2c2",
+      "bytes": 61021914
+    },
+    {
+      "filename": "monzero-gui-profiles-20261018-source.tar.gz",
+      "sha256": "22640117e4b189b6e85c983ce98950a5ba3f9e76f6cd827968a52475622d8760",
+      "bytes": 34145423
+    }
+  ]
+}

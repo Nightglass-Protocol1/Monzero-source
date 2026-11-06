@@ -1,0 +1,18 @@
+MONZERO STUDIO — LAUNCH CHECKLIST
+
+Assets are not active yet. Prepare now; issue only after hard fork 17, following a public testnet and independent review.
+
+[ ] Confirm I made the artwork or have permission to use it.
+[ ] Export the final artwork, remove location data and keep it under 25 MB.
+[ ] Review names, descriptions, traits and the licence.
+[ ] Check the kind, edition size or fixed token supply and decimals.
+[ ] If grouping NFTs, check each member’s 64-hex-character collection ID after the collection is issued.
+[ ] Host the final image and metadata; arrange pinning or ongoing hosting.
+[ ] Verify the exact hosted metadata and image against their expected hashes.
+[ ] Keep backups of artwork, metadata, hashes and project backups outside the browser.
+[ ] Wait for hard fork 17 after the public testnet and independent review before issuing.
+[ ] After activation, share the asset ID, metadata hash and Verify link. Never share seeds or passwords.
+
+Studio: https://monzero.org/app/
+Verify: https://monzero.org/app/#verify
+The team never asks for seed phrases or passwords.

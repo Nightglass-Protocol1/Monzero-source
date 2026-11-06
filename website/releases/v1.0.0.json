@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "project": "Monzero",
+  "release": "Monzero v1.0.0",
+  "version": "1.0.0",
+  "channel": "stable",
+  "source_commit": "c4165784db57d8ae410fc8af58861e4178ee1a42",
+  "gui_source_commit": "44eef24d48ebbcf02a2781a56ae2e56f96037052",
+  "network_uuid": "94834264-d0b2-41dd-b0f2-0ada675c7710",
+  "genesis_nonce": 2271206363,
+  "genesis_hash": "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4",
+  "published_at": null,
+  "hard_fork": {
+    "version": 17,
+    "mainnet_height": 21000,
+    "change": "LWMA-1 difficulty over 60 blocks; future timestamp limit 360 s",
+    "action_required": "node operators upgrade before block 21000; wallets and pool miners need nothing"
+  },
+  "migration": "same_chain_as_genesis_pre10_through_pre16_no_reset",
+  "security_audit": "not_completed",
+  "independent_reproducibility": "unverified",
+  "signing": "detached_openpgp_signature_of_this_file",
+  "source": {
+    "filename": "monzero-v1.0.0-source.tar.gz",
+    "size_bytes": 21323077,
+    "sha256": "b238a2a16242e453b69dc21d95e344798f38c9ebce572cd30eb30df85052a404"
+  },
+  "gui_source": {
+    "filename": "monzero-v1.0.0-gui-source.tar.gz",
+    "size_bytes": 35973400,
+    "sha256": "73c3c382e3037a85d98882de66aa4a8840e7fa1ac245b930d7d7db6e07024622",
+    "core_source_commit": "c4165784db57d8ae410fc8af58861e4178ee1a42",
+    "recursive_submodules_included": true
+  },
+  "artifacts": [
+    {
+      "filename": "monzero-v1.0.0-linux-x86_64.tar.gz",
+      "size_bytes": 26864499,
+      "sha256": "5931364f536b654553b8e72d550ceec63c8c99ffe4d94c4e28f6a3cccdd3cece",
+      "platform": "linux-x86_64",
+      "minimum_glibc": "2.35"
+    },
+    {
+      "filename": "monzero-v1.0.0-windows-x64.zip",
+      "size_bytes": 23836334,
+      "sha256": "bcdd7005e1368916635b2c6611c02c8194a95aa951a066fc3d8d119f73e3acd5",
+      "platform": "windows-x64"
+    },
+    {
+      "filename": "monzero-v1.0.0-windows-gui-x64.zip",
+      "size_bytes": 55638184,
+      "sha256": "6be94574fd731e7c58fa40fcb22a3202db9a38f2a38b6801ae6929b44c204ad2",
+      "platform": "windows-x64-gui"
+    }
+  ],
+  "notes": "https://monzero.org/releases/v1.0.0-notes.txt"
+}

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="260" height="44" viewBox="0 0 260 44" role="img" aria-labelledby="title">
+  <title id="title">Made with Monzero Studio</title>
+  <rect x=".5" y=".5" width="259" height="43" rx="8" fill="#10242d" stroke="#28444d"/>
+  <circle cx="22" cy="22" r="7" fill="#69d5c2"/>
+  <text x="40" y="27" fill="#edf3f7" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="14" font-weight="600">Made with Monzero Studio</text>
+</svg>

@@ -1,0 +1,75 @@
+@import url('/assets/luxe-home/fonts.css');
+/* Shared visual system. Load last on every page; tool-specific layouts stay in
+   their own stylesheets. Navigation is maintained in site-nav.css. */
+:root, .site-shell {
+  color-scheme: dark;
+  --bg: #0b1720;
+  --surface: #10242d;
+  --surface-raised: #142d35;
+  --input: #0d1e27;
+  --line: #28444d;
+  --ink: #edf3f7;
+  --text: var(--ink);
+  --muted: #a9c0c5;
+  --dim: #9eb6bd;
+  --accent: #3fdfe8;
+  --mint: #a6f3f7;
+  --bright: var(--mint);
+  --accent-muted: #2a8a92;
+  --success: #93d9b6;
+  --warning: #edc48d;
+  --danger: #ff8a9f;
+  --panel: var(--surface);
+  --panel2: var(--surface-raised);
+  --raised: var(--surface-raised);
+  --lime: var(--accent);
+  --green: var(--accent);
+  --amber: var(--warning);
+  --orange: var(--warning);
+  --copper: var(--warning);
+  --radius: 12px;
+  --sans: "DM Sans", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --display: "Space Grotesk", "DM Sans", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", "Roboto Mono", "SFMono-Regular", Consolas, monospace;
+  --page-width: 1280px;
+  --page-inset: 96px;
+}
+.site-shell { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.7 var(--sans); -webkit-font-smoothing: antialiased; overflow-x: visible; }
+.site-shell::before { display: none; }
+.site-shell *, .site-shell *::before, .site-shell *::after { box-sizing: border-box; }
+.site-shell [hidden] { display: none !important; }
+.site-shell :is(a, button, input, select, textarea, summary):focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+.site-shell :is(.skip, .skip-link) { position: fixed; top: -100px; left: 16px; z-index: 100; background: var(--accent); color: #092820; padding: 12px 18px; }
+.site-shell :is(.skip, .skip-link):focus { top: 16px; }
+.site-shell:not([data-page="home"]) > main { width: min(var(--page-width), 100% - var(--page-inset)); max-width: none; margin: 0 auto; padding: 48px 0; }
+.site-shell.legal-page { --page-width: 920px; }
+.site-shell:not([data-page="home"]) main h1 { font-size: clamp(32px, 5vw, 52px); font-weight: 650; line-height: 1.08; letter-spacing: -.045em; }
+.site-shell:not([data-page="home"]) main h2 { font-weight: 600; line-height: 1.2; letter-spacing: -.025em; }
+.site-shell main .eyebrow { color: var(--accent); font: 600 11px/1.7 var(--sans); letter-spacing: 1.2px; }
+.site-shell:not([data-page="home"]) main > .section { padding-inline: 0; }
+.site-shell:not([data-page="home"]) main > .section:first-child { padding-top: 0; }
+.site-shell main :is(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]), textarea, select) { background-color: var(--input); color: var(--ink); border-color: var(--line); border-radius: 8px; }
+.site-shell main :is(input, textarea)::placeholder { color: var(--dim); }
+.site-shell main :is(button, input, textarea, select) { max-width: 100%; }
+.site-shell .button { border-radius: 8px; }
+.site-shell .button.primary { background: var(--accent); color: #092820; box-shadow: none; }
+.site-shell .button.primary:hover { background: var(--mint); }
+.site-shell .button.secondary { background: var(--surface); border-color: var(--line); color: var(--ink); }
+.site-shell:not([data-page="home"]) > footer { width: min(1280px, 100% - var(--page-inset)); max-width: none; margin: 0 auto; padding: 32px 0; border-top: 1px solid var(--line); color: var(--muted); font: 13px/1.8 var(--sans); flex-wrap: wrap; gap: 12px 24px; }
+.site-shell > footer a:hover { color: var(--accent); }
+/* The explorer's table and charts retain their own scrolling containers. */
+.site-shell[data-page="explorer"] main > :is(.hero, .overview, .content) { padding-inline: 0; }
+.site-shell[data-page="explorer"] main > .hero { padding-top: 0; }
+.site-shell[data-page="roadmap"] { --green: var(--success); }
+.site-shell[data-page="roadmap"] main > .wrap { width: 100%; max-width: none; }
+.site-shell[data-page="roadmap"] .hero { padding-top: 0; }
+.site-shell[data-page="roadmap"] .hero::before { inset: 0; }
+@media (max-width: 900px) { .site-shell { --page-inset: 48px; } }
+@media (max-width: 600px) {
+  .site-shell { --page-inset: 32px; }
+  .site-shell:not([data-page="home"]) > main { padding-block: 32px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .site-shell *, .site-shell *::before, .site-shell *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}

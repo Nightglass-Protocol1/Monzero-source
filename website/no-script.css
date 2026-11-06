@@ -1,0 +1,8 @@
+/* Loaded through <noscript>: avoid expanding then collapsing the mobile menu
+   while JavaScript downloads, but retain every navigation link without it. */
+@media (max-width: 1339px) {
+ .site-shell .site-header { flex-wrap: wrap !important; height: auto !important; }
+ .site-shell .site-header nav { display: flex !important; position: static !important; flex-basis: 100%; max-height: none; }
+ .site-shell .site-header .menu-toggle { display: none; }
+ .site-shell .site-header nav { order: 3; }
+}

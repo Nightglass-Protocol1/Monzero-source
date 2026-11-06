@@ -1,0 +1,11 @@
+main{max-width:1140px;margin:auto;padding:40px 20px}main>p{max-width:75ch}
+.card{margin:24px 0;padding:24px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
+.count{font-size:28px;font-weight:700;color:var(--ink);margin:4px 0}
+.count.active{color:#29caba}
+.table-scroll{overflow:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line);vertical-align:top}
+.button{display:inline-block;padding:12px 18px;border:1px solid var(--accent,#29caba);border-radius:8px;color:var(--ink);text-decoration:none;font-weight:600}
+.button:hover,.button:focus-visible{background:var(--accent,#29caba);color:#04201d}
+.fpr{word-break:break-all}
+.warn{padding:12px 14px;border-left:3px solid #edbc64;background:rgba(237,188,100,.08);color:var(--ink)}
+main p,main li,main td{color:var(--muted)}main strong{color:var(--ink)}
+@media(max-width:500px){.card{padding:16px}main{padding:24px 12px}.count{font-size:22px}}

@@ -1,0 +1,220 @@
+{
+ "links": [
+  [
+   "/",
+   "Home"
+  ],
+  [
+   "/#about",
+   "About"
+  ],
+  [
+   "/ecosystem/",
+   "Ecosystem"
+  ],
+  [
+   "/mining/",
+   "Mining"
+  ],
+  [
+   "/explorer/",
+   "Network"
+  ],
+  [
+   "/download/",
+   "Downloads"
+  ],
+  [
+   "/developers/",
+   "Documentation"
+  ],
+  [
+   "/community/",
+   "Community"
+  ]
+ ],
+ "submenus": {
+  "About": [
+   [
+    "/#about",
+    "About Monzero"
+   ],
+   [
+    "/roadmap/",
+    "Roadmap"
+   ],
+   [
+    "/objectives/",
+    "Project objectives"
+   ],
+   [
+    "/founder/",
+    "Founder"
+   ]
+  ],
+  "Ecosystem": [
+   [
+    "/ecosystem/",
+    "Ecosystem directory"
+   ],
+   [
+    "/dex/",
+    "Atomic swap DEX"
+   ],
+   [
+    "/app/",
+    "Monzero Studio"
+   ],
+   [
+    "/app/creators/",
+    "Creator hub"
+   ],
+   [
+    "/wallets/",
+    "Public wallets"
+   ],
+   [
+    "/payments/request/",
+    "Payment request"
+   ],
+   [
+    "/exchanges/",
+    "Exchanges"
+   ],
+   [
+    "/markets/",
+    "Markets"
+   ]
+  ],
+  "Mining": [
+   [
+    "/mining/",
+    "How to mine"
+   ],
+   [
+    "/mining/calculator/",
+    "Mining calculator"
+   ],
+   [
+    "/mining/dashboard/",
+    "Your mining"
+   ],
+   [
+    "/mining/benchmarks/",
+    "CPU benchmarks"
+   ],
+   [
+    "/mining/leaderboard/",
+    "Mining leaderboard"
+   ],
+   [
+    "/faucet/",
+    "Faucet"
+   ],
+   [
+    "https://pool.monzero.org/",
+    "Mining pool"
+   ]
+  ],
+  "Network": [
+   [
+    "/explorer/",
+    "Block explorer"
+   ],
+   [
+    "/network/",
+    "Network history"
+   ],
+   [
+    "/network/nodes/",
+    "Node map"
+   ],
+   [
+    "/stats/",
+    "Network stats"
+   ],
+   [
+    "/status/",
+    "Service status"
+   ]
+  ],
+  "Downloads": [
+   [
+    "/download/",
+    "Downloads & verification"
+   ],
+   [
+    "/upgrade/",
+    "Upgrade guide"
+   ]
+  ],
+  "Documentation": [
+   [
+    "/developers/",
+    "Developer portal"
+   ],
+   [
+    "/WHITEPAPER.md?rev=1.5-20261017",
+    "Whitepaper"
+   ],
+   [
+    "/developers/api/",
+    "API v1"
+   ],
+   [
+    "/developers/payments/",
+    "Accept XMZ"
+   ],
+   [
+    "/security/",
+    "Security"
+   ],
+   [
+    "/privacy/",
+    "Privacy Policy"
+   ],
+   [
+    "/terms/",
+    "Website Terms"
+   ]
+  ],
+  "Community": [
+   [
+    "/airdrop/",
+    "Airdrop"
+   ],
+   [
+    "/community/",
+    "Community hub"
+   ],
+   [
+    "/community/board/",
+    "Discussion board"
+   ],
+   [
+    "/community/voting/",
+    "Voting"
+   ],
+   [
+    "/community/bounties/",
+    "Bounties"
+   ],
+   [
+    "/fund/",
+    "Fundraising"
+   ],
+   [
+    "/news/",
+    "News"
+   ],
+   [
+    "/press/",
+    "Press kit"
+   ],
+   [
+    "/marketing/",
+    "Marketing kit"
+   ]
+  ]
+ }
+}

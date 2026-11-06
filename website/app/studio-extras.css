@@ -1,0 +1,55 @@
+/* Monzero Studio extras: start paths, sample artwork, card image, batch builder and guided tour.
+   Loaded after studio-20261025.css. */
+/* ways to start */
+.st-paths { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: -40px 0 96px; }
+.st-path { display: grid; gap: 4px; align-content: start; text-align: left; padding: 18px 20px; border-radius: var(--r); border: 1px solid var(--edge); background: var(--panel); color: var(--ink); font: inherit; text-decoration: none; cursor: pointer; transition: border-color .15s, transform .15s; }
+.st-path:hover { border-color: var(--accent); transform: translateY(-2px); }
+.st-path small { color: var(--accent); font: 600 .66rem var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+.st-path strong { font-size: 1.02rem; }
+.st-path span { color: var(--muted); font-size: .85rem; line-height: 1.45; }
+
+.st-sample { margin: 0; }
+.st-sample .st-link { font-size: inherit; }
+#share-card { width: 100%; }
+#bulk-csv { padding: 9px; font-size: .85rem; color: var(--muted); }
+
+/* batch builder */
+.st-batch-out { position: sticky; top: 24px; display: grid; gap: 18px; align-content: start; }
+.st-batch-items { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); max-height: 820px; overflow: auto; padding-right: 4px; }
+.st-batch-items .st-mini-body code { font-size: .72rem; }
+.st-batch-items .st-mini-body span { word-break: normal; overflow-wrap: anywhere; }
+.st-batch-items:empty::before { content: "Your numbered pieces appear here."; grid-column: 1 / -1; padding: 28px; border: 1px dashed var(--edge); border-radius: var(--r); color: var(--muted); text-align: center; }
+.st-rarity:empty { display: none; }
+.st-rarity { display: grid; gap: 14px; padding: 18px 20px; border: 1px solid var(--edge); border-radius: var(--r); background: var(--panel); }
+.st-rarity h3 { margin: 0; font-size: 1rem; }
+.st-rarity-group { display: grid; gap: 6px; }
+.st-rarity-group strong { font-size: .82rem; color: var(--accent); }
+.st-rarity-row { display: grid; grid-template-columns: minmax(0, 1fr) 2fr auto; gap: 10px; align-items: center; font-size: .82rem; }
+.st-rarity-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-rarity-row i { height: 8px; border-radius: 4px; background: linear-gradient(90deg, var(--accent) var(--w), var(--input) var(--w)); }
+.st-rarity-row small { color: var(--muted); font: .72rem var(--mono); }
+
+/* guided tour */
+.st-tour-spot { position: fixed; z-index: 60; border-radius: 14px; pointer-events: none; box-shadow: 0 0 0 3px var(--accent), 0 0 0 9999px #050b10b8; transition: top .25s, left .25s, width .25s, height .25s; }
+.st-tour-pop { position: fixed; z-index: 61; width: min(400px, calc(100% - 24px)); padding: 20px 22px; border-radius: 14px; border: 1px solid var(--accent-muted, #2a8a92); background: var(--surface-raised); box-shadow: 0 30px 80px -20px #000; color: var(--ink); }
+.st-tour-pop.center { top: 50% !important; left: 50% !important; transform: translate(-50%, -50%); }
+.st-tour-pop h2 { margin: 10px 0 6px; font-size: 1.15rem; outline: none; }
+.st-tour-pop p { margin: 0; color: var(--muted); font-size: .92rem; line-height: 1.55; }
+.st-tour-progress { display: flex; align-items: center; gap: 12px; color: var(--accent); font: 600 .68rem var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+.st-tour-bar { flex: 1; height: 4px; border-radius: 2px; background: var(--input); overflow: hidden; }
+.st-tour-bar i { display: block; height: 100%; background: var(--accent); transition: width .25s; }
+.st-tour-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+.st-tour-actions > span { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.st-tour-actions .st-btn { min-height: 38px; padding: 0 14px; }
+
+@media (max-width: 1100px) {
+  .st-paths { grid-template-columns: 1fr 1fr; }
+  .st-batch-out { position: static; }
+}
+@media (max-width: 700px) {
+  .st-tour-pop:not(.center) { top: auto !important; left: 12px !important; right: 12px; bottom: 12px; width: auto; }
+}
+@media (max-width: 600px) {
+  .st-paths { grid-template-columns: 1fr; margin: -24px 0 64px; }
+}
+@media (prefers-reduced-motion: reduce) { .st-path, .st-tour-spot, .st-tour-bar i { transition: none; } }

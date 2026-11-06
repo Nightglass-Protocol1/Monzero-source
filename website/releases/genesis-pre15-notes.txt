@@ -1,0 +1,81 @@
+MONZERO GENESIS PRE15
+=====================
+
+Genesis pre15 is experimental, unsigned, and independently unaudited
+prerelease software. It is not a production release.
+
+Core source: 85d922cb09a5731712f69f799a8bd8004ff00a35
+GUI source:  0018a58f2aeb1670ca6ab7c61b7c0de7d07ff9f8
+Network UUID: 94834264-d0b2-41dd-b0f2-0ada675c7710
+Genesis hash: 84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4
+Native currency: XMZ
+
+PACKAGE SHA-256
+
+Linux x86-64 CLI (glibc 2.35 or newer)
+  3ec46a0ec9e109368417b6ab7069cfe424f84bd8e9f62e280bdd722dffa881db
+Windows x64 CLI
+  d4b0521e172e08a8bf36d334c5a094c29591482f4b2eac08fa3dc46cd0c4b4c5
+Windows x64 graphical wallet
+  1c53188f26a23ed09605d0ed8f1350da5f1f8671a1db1897529f364236e5674b
+Complete core source
+  ccf724ab267cc7b4cb406d625e0d2622545317b1d9f9c62171097308646de38c
+Graphical-wallet source
+  7eb869871955fc42adac83ca35e9f836d1884449faa2e6b2d71b831bee413ed1
+
+CHANGES SINCE PRE14
+
+- Wallets open only Monzero wallet files. Monero and other CryptoNote
+  wallet files are refused with "this wallet file was not created by
+  Monzero and cannot be opened" and are not modified. Wallets from earlier
+  Genesis prereleases open normally.
+- Amounts are always XMZ with 11 decimal places. A wallet file could
+  previously switch amount parsing to 12 decimals, so that entering 1 sent
+  10 XMZ while the confirmation showed 1. The mXMZ, uXMZ, nXMZ, and
+  atomic-XMZ display units are removed.
+- Wallets created before their node was reachable now find their funds.
+  Such wallets started scanning at a height near 14.9 million on a chain of
+  about 1,000 blocks and never showed incoming XMZ; the graphical wallet,
+  which creates wallets while its node is still starting, was affected on
+  first run. Affected wallets repair themselves the first time they
+  refresh with this release.
+- The Linux package is built in the pinned build environment and depends
+  only on the system C library. The pre14 Linux package required glibc
+  2.38 and did not start on Ubuntu 24.04.
+- stop-mining.bat and stop-monzero-miner.sh no longer report a false
+  failure when mining is stopped shortly after the node starts.
+- The wallet RPC rejects relay_tx when pending inputs no longer match the
+  open wallet, and writes "monzero" as its generated login username.
+- Consensus identity and chain rules are unchanged from pre10 through pre14.
+
+KNOWN LIMITATIONS
+
+- A prerelease wallet that had selected the atomic-XMZ display unit cannot
+  be opened; restore it from its recovery seed.
+- The wallet file check cannot detect a Monero seed or private keys typed
+  into Monzero's restore options. Never reuse them.
+- The graphical wallet is built from GUI commit 0018a58f, the newest GUI
+  commit compatible with this core. Real-money DEX trading, cross-chain
+  settlement, and native asset transfer/burn are unavailable.
+
+TEST STATUS
+
+All 23 ctest suites passed, including the full consensus replay and the
+RPC functional tests; 1,318 unit tests passed. The Linux package passed
+strict package checks (except the independent-reproduction attestation),
+the digest-pinned container smoke test, and node, mining, and wallet tests
+on Ubuntu 24.04. The Windows command-line package passed the native
+smoke, network/launcher/mining, and wallet-lifecycle tests on Windows 11.
+The graphical wallet was launched on Windows 11, created and reopened
+wallets, repaired a wallet affected by the height bug, and refused a
+Monero wallet file.
+
+A second, from-scratch build of the same commit in the pinned build
+environment reproduced the Linux and Windows command-line packages and the
+Windows graphical wallet's executables byte for byte. This is a
+same-machine check; reproduction by an independent builder is still
+required.
+
+Independent binary reproduction, release signing, code signing, and an
+independent security review remain outstanding. Keep the prior verified
+installation available for rollback.

@@ -1,0 +1,7 @@
+.table-scroll { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; }
+th, td { padding:10px 12px; text-align:left; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; white-space:nowrap; }
+td:first-child, th:first-child { width:4em; }
+.controls{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:12px 0}
+.controls select{font:inherit;padding:10px 12px;min-height:44px;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:8px}
+#history-title~h3{margin:24px 0 8px;font-size:17px}

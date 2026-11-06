@@ -1,0 +1,59 @@
+MONZERO GENESIS PRE10
+=====================
+
+Genesis pre10 is experimental, unsigned, and unaudited prerelease software.
+It is not a production release.
+
+Core source: 519654692657855445c0ab490380dd2465ea5c91
+GUI source:  7244605d0b11ee68c3f077aba792355b58bf94b0
+Network UUID: 94834264-d0b2-41dd-b0f2-0ada675c7710
+Genesis nonce: 2271206363
+Genesis hash: 84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4
+Native currency: XMZ
+Asset hard fork: inactive; no public activation is scheduled
+
+PACKAGES
+
+Linux x86-64 CLI
+  SHA-256: 7eb3d2d0c527b58e2dc3854317d2abcf49bc42222206d522d36994007e7fbb2b
+
+Windows x64 CLI
+  SHA-256: 3e50890ab6b44eec27aac1fc73e5bc9101ad841499e50941f90a45c3f61662f2
+
+Windows x64 graphical wallet
+  SHA-256: 04a8e59c9603d9e1c849e905eb6f9ed39f03787123ff742fb150af54b6aad659
+
+Complete core source
+  SHA-256: 97215f624eac4edae9b6ec33bf320fe71370e43a2fc6c6633335c818f3282d9e
+
+Graphical-wallet source
+  SHA-256: dcb281e2d52dd11b6274a189b2b84a2920375fed9ee65f2c7618e06df1e2e063
+
+CHANGES SINCE PRE9
+
+- Establishes a fresh mainnet identity with a new network UUID, genesis nonce,
+  and derived genesis block hash.
+- Includes the branded GUI artwork and the GUI issuance workflow developed
+  after pre9.
+- Retains the existing ports, address prefixes, premine-free genesis
+  transaction, XMZ currency rules, and inactive public asset hard fork.
+
+MIGRATION
+
+Pre10 is intentionally incompatible with pre9 chain data. Stop pre9 before
+installing pre10 and move the old mainnet blockchain directory aside. Do not
+copy an LMDB database from pre9 into a pre10 data directory. Wallet keys and
+seeds do not need conversion, but creating a fresh Monzero-only wallet is
+recommended for the new network. Never reuse a Monero or other CryptoNote seed.
+
+TEST STATUS AND LIMITATIONS
+
+The pre10 core source passed 1,298 unit tests, 18 RPC functional tests, and the
+complete 175-test core replay with no failures. Release checksum and structural
+verification passed for the Linux, Windows CLI, core source, and GUI source
+archives; the GUI archive's internal checksum manifest also passes. The
+Linux requires GLIBC 2.42 or newer. The artifacts are unsigned and have not
+been independently reproduced or audited.
+Native Windows execution, sustained sanitizer fuzzing, and broader independent
+network testing remain outstanding. Windows may show an unknown-publisher
+warning.

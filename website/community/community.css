@@ -1,0 +1,14 @@
+main{max-width:1140px;margin:auto;padding:40px 20px}h1{max-width:20ch}.intro{max-width:65ch}section{margin:36px 0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:20px}article{padding:24px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}article h3{margin-top:0}.note{font-size:.85rem;color:var(--muted)}a{overflow-wrap:anywhere}li{margin:14px 0}footer{padding:24px;text-align:center;border-top:1px solid var(--line)}:focus-visible{outline:3px solid var(--accent);outline-offset:4px}@media(max-width:500px){main{padding:28px 16px}h1{font-size:2.4rem}}
+
+/* Body copy matches the original pages: muted text, links inherit and stay underlined. */
+main p, main li, main dd, main td, main figcaption { color: var(--muted); }
+main p a, main li a, main dd a { color: inherit; }
+
+/* Dated posts edited from /admin. */
+.posts{list-style:none;margin:16px 0 0;padding:0;display:grid;gap:18px}
+.posts li{padding-bottom:18px;border-bottom:1px solid var(--line)}
+.posts li:last-child{border-bottom:0;padding-bottom:0}
+.posts time{font-size:13px;color:var(--muted)}
+.posts h3{margin:4px 0 8px;font-size:18px}
+.posts p{margin:0 0 8px}
+.community-banner{margin:0 0 32px}.community-banner img{display:block;width:100%;height:auto;border:1px solid var(--line);border-radius:12px;box-shadow:0 0 48px rgba(63,223,232,.12)}

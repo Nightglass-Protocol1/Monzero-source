@@ -1,0 +1,10 @@
+.overall{margin:0 0 6px;font-size:20px;font-weight:600;color:var(--ink)}
+.overall.ok::before,.overall.warn::before,.overall.down::before,.check .state::before{content:"";display:inline-block;width:10px;height:10px;margin-right:10px;border-radius:50%;vertical-align:middle;background:var(--muted)}
+.overall.ok::before,.check.ok .state::before{background:#29caba}
+.overall.warn::before,.check.warn .state::before{background:#edbc64}
+.overall.down::before,.check.down .state::before{background:#ef6b6b}
+.checks{list-style:none;margin:20px 0 0;padding:0;display:grid;gap:12px}
+.check{padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+.check>div{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;color:var(--ink)}
+.check .state{font-size:14px;color:var(--muted)}
+.check p{margin:6px 0 0;font-size:14px}

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en-GB"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/><title>Mining &amp; node setup | Monzero (XMZ)</title><!-- seo:begin --><link rel="canonical" href="https://monzero.org/mining/"><meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/mining/"><meta property="og:title" content="Mining &amp; node setup | Monzero (XMZ)"><meta property="og:description" content="Mining &amp; node setup: official Monzero software, instructions and verification information."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="Monzero MZ emblem and wordmark: Join the Monzero community. Privacy focused, independent blockchain, CPU mineable."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="Mining &amp; node setup | Monzero (XMZ)"><meta name="twitter:description" content="Mining &amp; node setup: official Monzero software, instructions and verification information."><meta name="twitter:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><!-- seo:end -->
+<meta content="Mining &amp; node setup: official Monzero software, instructions and verification information." name="description"/>
+<link href="/styles.css?v=20261026-brand" rel="stylesheet"/>
+<link href="/theme.css?v=20261026-brand" rel="stylesheet"/>
+<link href="/homepage.css?v=20261026-brand" rel="stylesheet"/><link href="/site-nav.css?v=20261026-brand" rel="stylesheet"/><link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261026-brand"></noscript></head><body class="guide-page site-shell" data-news-ticker="off"><a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header"><a class="brand" href="/" aria-label="Monzero home"><img class="brand-mark brand-coin" src="/assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"><span>MONZERO</span></a><button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button><nav id="site-nav" aria-label="Primary navigation"><a href="/">Home</a><div class="nav-group"><a href="/#about">About</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-about"><span class="visually-hidden">About pages</span></button><div class="nav-sub" id="nav-sub-about"><a href="/#about">About Monzero</a><a href="/roadmap/">Roadmap</a><a href="/objectives/">Project objectives</a><a href="/founder/">Founder</a></div></div><div class="nav-group"><a href="/ecosystem/">Ecosystem</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-ecosystem"><span class="visually-hidden">Ecosystem pages</span></button><div class="nav-sub" id="nav-sub-ecosystem"><a href="/ecosystem/">Ecosystem directory</a><a href="/dex/">Atomic swap DEX</a><a href="/app/">Monzero Studio</a><a href="/app/creators/">Creator hub</a><a href="/wallets/">Public wallets</a><a href="/payments/request/">Payment request</a><a href="/exchanges/">Exchanges</a><a href="/markets/">Markets</a></div></div><div class="nav-group current"><a href="/mining/" aria-current="page">Mining</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-mining"><span class="visually-hidden">Mining pages</span></button><div class="nav-sub" id="nav-sub-mining"><a href="/mining/">How to mine</a><a href="/mining/calculator/">Mining calculator</a><a href="/mining/dashboard/">Your mining</a><a href="/mining/benchmarks/">CPU benchmarks</a><a href="/mining/leaderboard/">Mining leaderboard</a><a href="/faucet/">Faucet</a><a href="https://pool.monzero.org/">Mining pool</a></div></div><div class="nav-group"><a href="/explorer/">Network</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-network"><span class="visually-hidden">Network pages</span></button><div class="nav-sub" id="nav-sub-network"><a href="/explorer/">Block explorer</a><a href="/network/">Network history</a><a href="/network/nodes/">Node map</a><a href="/stats/">Network stats</a><a href="/status/">Service status</a></div></div><div class="nav-group"><a href="/download/">Downloads</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-downloads"><span class="visually-hidden">Downloads pages</span></button><div class="nav-sub" id="nav-sub-downloads"><a href="/download/">Downloads &amp; verification</a><a href="/upgrade/">Upgrade guide</a></div></div><div class="nav-group"><a href="/developers/">Documentation</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-documentation"><span class="visually-hidden">Documentation pages</span></button><div class="nav-sub" id="nav-sub-documentation"><a href="/developers/">Developer portal</a><a href="/WHITEPAPER.md?rev=1.5-20261017">Whitepaper</a><a href="/developers/api/">API v1</a><a href="/developers/payments/">Accept XMZ</a><a href="/security/">Security</a><a href="/privacy/">Privacy Policy</a><a href="/terms/">Website Terms</a></div></div><div class="nav-group"><a href="/community/">Community</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-community"><span class="visually-hidden">Community pages</span></button><div class="nav-sub" id="nav-sub-community"><a href="/airdrop/">Airdrop</a><a href="/community/">Community hub</a><a href="/community/board/">Discussion board</a><a href="/community/voting/">Voting</a><a href="/community/bounties/">Bounties</a><a href="/fund/">Fundraising</a><a href="/news/">News</a><a href="/press/">Press kit</a><a href="/marketing/">Marketing kit</a></div></div></nav><a class="header-cta" href="/#get-started">Get started</a></header>
+<main id="main" tabindex="-1">
+<p class="eyebrow"><a href="/">Monzero</a> / Network participation</p><h1>Mining &amp; node setup</h1><p class="guide-intro">Start with a fresh Monzero wallet. Mining rewards depend on hardware, electricity costs and network conditions; they are not guaranteed.</p><nav aria-label="On this page" class="document-nav"><a href="#mine">Solo &amp; pool mining</a><a href="#windows-mining">Windows setup</a><a href="#nodes">Public nodes</a><a href="#faq">Questions</a></nav> <section class="mine section" id="mine">
+<div class="mine-copy">
+<p class="eyebrow">Join the network</p>
+<h2>Turn spare CPU time into network security.</h2>
+<p>Run your own daemon, create a fresh Monzero wallet, and mine directly to an address you control. Solo mining rewards the machine that finds a block; rewards unlock after 60 blocks.</p>
+<div class="warning"><strong>Keep it separate.</strong> Never reuse a Monero seed, keys, or wallet file with Monzero.</div>
+<p><a class="button secondary" href="/mining/calculator/">Estimate mining rewards and electricity costs</a> <a class="button secondary" href="/mining/dashboard/">View your pool activity</a> <a class="button secondary" href="/mining/benchmarks/">Compare CPU benchmarks</a></p>
+<h3 id="pool">Mining pool</h3>
+<p>Prefer sharing block rewards? Mine with others at <a href="https://pool.monzero.org/">pool.monzero.org</a>: the pool reported PPLNS, a 1% fee, payouts from 1 XMZ and 60 confirmations when checked on 19 October 2026. Check the pool for current terms and payout status. Point XMRig at port <code>3333</code> (CPUs and laptops) or <code>5555</code> (servers and rigs), with your Monzero address as the login:</p>
+<p><code>xmrig -o pool.monzero.org:3333 -u YOUR_MONZERO_ADDRESS -p rig1 -a rx/0</code></p>
+</div>
+<ol class="steps">
+<li><span>1</span>
+<div><strong>Start the node</strong><code>./start-monzerod.sh</code>
+</div></li>
+<li><span>2</span>
+<div><strong>Start the separate miner</strong><code>./start-monzero-miner.sh YOUR_ADDRESS 1</code>
+</div></li>
+<li><span>3</span>
+<div><strong>Open the wallet when needed</strong><code>./start-monzero-wallet-cli.sh</code>
+</div></li>
+</ol>
+</section> <section class="windows-guide section" id="windows-mining">
+<div class="section-heading compact">
+<p class="eyebrow">Windows mining</p>
+<h2>Mine XMZ on Windows.</h2>
+<p>Use the <a href="/download/">Windows command-line package</a>. Extract the complete ZIP before running anything; do not launch files from inside the ZIP.</p>
+</div>
+<ol class="windows-steps">
+<li><span>1</span>
+<div><strong>Start and synchronise the node</strong>
+<p>Double-click <code>start-node.bat</code>, allow the Windows Firewall prompt, and leave the window open. The launcher connects to <code>node.monzero.org:6174</code> and the local RPC listens on <code>127.0.0.1:6175</code>.</p>
+</div></li>
+<li><span>2</span>
+<div><strong>Create a fresh wallet</strong>
+<p>Run <code>start-wallet-cli.bat</code>, create a Monzero-only wallet, and record its recovery seed offline. Never reuse a Monero wallet or seed.</p>
+</div></li>
+<li><span>3</span>
+<div><strong>Start CPU mining</strong>
+<p>Open Command Prompt in the extracted folder and run <code>start-mining.bat YOUR_MONZERO_ADDRESS 2</code>. Replace the address and choose the number of CPU threads you want to use.</p>
+</div></li>
+<li><span>4</span>
+<div><strong>Check rewards and stop</strong>
+<p>Run <code>balance</code> in the wallet to see mined rewards; they unlock after 60 blocks. Run <code>stop-mining.bat</code> when you want to stop mining.</p>
+</div></li>
+</ol>
+</section> <section class="faq section" id="faq">
+<div class="section-heading compact">
+<p class="eyebrow">Questions</p>
+<h2>Before you begin.</h2>
+</div>
+<div class="faq-list">
+<details><summary>Why is my mining balance still zero?</summary>
+<p>With solo mining, you receive a reward only when your machine finds a block. A found reward remains locked for 60 blocks. Pool mining shares rewards between participants, subject to the pool’s payout rules and network conditions.</p></details>
+<details><summary>Is Monzero the same network as Monero?</summary>
+<p>No. Monzero is an independent experimental chain with a different genesis block, network ID, ports, address prefixes, ticker, and monetary policy.</p></details>
+<details><summary>Can I reuse my existing seed?</summary>
+<p>No. Create a new wallet and seed exclusively for Monzero. Reusing keys across forks can seriously damage privacy.</p></details>
+<details><summary>Is this a stable release?</summary>
+<p>Yes. Monzero v1.0.0 is the first stable release. It continues the pre10–pre16 chain (no reset) and switches difficulty to LWMA at block 21,000, so anyone running their own node must upgrade before then. It has not yet been independently audited; report problems to security@monzero.org.</p></details>
+</div>
+</section>
+<section class="section" id="nodes">
+<h2>Public node connection details</h2> <div class="status-panel">
+<div class="status-topline"><strong>Public nodes</strong><span>Add one to your wallet or miner</span>
+</div>
+<div class="node-addresses">
+<p><span>Primary P2P · EU</span><code>node.monzero.org:6174</code><button class="copy" data-copy="node.monzero.org:6174">Copy</button></p>
+<p><span>Secondary P2P · US</span><code>node2.monzero.org:6174</code><button class="copy" data-copy="node2.monzero.org:6174">Copy</button></p>
+<p><span>Restricted RPC</span><code>node.monzero.org:6175</code><button class="copy" data-copy="node.monzero.org:6175">Copy</button></p>
+</div>
+</div>
+</section>
+<div data-upgrade-slot><p><a href="/upgrade/">Node operators: check the network upgrade guidance</a></p></div>
+</main>
+<footer><p><a href="/">Monzero home</a> · <a href="/security/">Security and limitations</a> · <a href="/privacy/">Privacy Policy</a> · <a href="/terms/">Website Terms</a></p></footer>
+<div class="toast" role="status">Copied to clipboard</div>
+<script defer="" src="/guide.js"></script>
+<script defer="" src="/site-nav.js?v=20261026-brand"></script></body></html>

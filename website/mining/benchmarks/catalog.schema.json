@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Monzero RandomX benchmark catalog",
+  "description": "Structural submission schema. catalog.mjs additionally enforces unique IDs, valid calendar dates, measurement date <= catalog date, threads >= cores, credential-free URLs and separate verification URL. Neither validator verifies evidence. Runtime also rejects Unicode control/format/surrogate characters and compares normalized evidence URLs. CLI rejects future catalog dates.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "updated_at",
+    "records"
+  ],
+  "properties": {
+    "schema": {
+      "const": "monzero-randomx-benchmarks-v1"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "records": {
+      "type": "array",
+      "maxItems": 5000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "manufacturer",
+          "model",
+          "os",
+          "miner",
+          "miner_version",
+          "methodology",
+          "id",
+          "cores",
+          "threads",
+          "hashrate_hps",
+          "power_watts",
+          "power_basis",
+          "date",
+          "status",
+          "source_url",
+          "verification_url",
+          "verified_by"
+        ],
+        "properties": {
+          "manufacturer": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f\\u202a-\\u202e\\u2066-\\u2069]+$"
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f\\u202a-\\u202e\\u2066-\\u2069]+$"
+          },
+          "os": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f\\u202a-\\u202e\\u2066-\\u2069]+$"
+          },
+          "miner": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f\\u202a-\\u202e\\u2066-\\u2069]+$"
+          },
+          "miner_version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f\\u202a-\\u202e\\u2066-\\u2069]+$"
+          },
+          "methodology": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f\\u202a-\\u202e\\u2066-\\u2069]+$"
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,79}$"
+          },
+          "cores": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096
+          },
+          "threads": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 16384
+          },
+          "hashrate_hps": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "power_watts": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          },
+          "power_basis": {
+            "enum": [
+              "wall",
+              "cpu-package",
+              "unknown"
+            ]
+          },
+          "date": {
+            "type": "string",
+            "format": "date",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+          },
+          "status": {
+            "enum": [
+              "community",
+              "verified"
+            ]
+          },
+          "source_url": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://[^/@\\s\\\\]+(?:[/?#][^\\s\\\\]*)?$",
+            "maxLength": 2048
+          },
+          "verification_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https://[^/@\\s\\\\]+(?:[/?#][^\\s\\\\]*)?$",
+                "maxLength": 2048
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verified_by": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f\\u202a-\\u202e\\u2066-\\u2069]+$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "power_basis": {
+                  "const": "unknown"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "power_watts": {
+                  "type": "null"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "power_watts": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "community"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "verified_by": {
+                  "type": "null"
+                },
+                "verification_url": {
+                  "type": "null"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "verified_by": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f\\u202a-\\u202e\\u2066-\\u2069]+$"
+                },
+                "verification_url": {
+                  "type": "string",
+                  "format": "uri",
+                  "pattern": "^https://[^/@\\s\\\\]+(?:[/?#][^\\s\\\\]*)?$",
+                  "maxLength": 2048
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

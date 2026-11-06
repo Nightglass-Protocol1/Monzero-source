@@ -1,0 +1,31 @@
+.obj { --accent-soft: rgba(63,223,232,.12); --warn: var(--warning); --warn-soft: rgba(237,196,141,.12);
+  --done: var(--success); --done-soft: rgba(147,217,182,.13); --now: #8fd3ff; --now-soft: rgba(143,211,255,.13);
+  --later: #c7b8ff; --later-soft: rgba(199,184,255,.13); max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+.obj-footnote { margin-top: 40px; color: var(--muted); font-size: .9rem; }
+
+.obj h1 { font-size: 1.9rem; margin: 0 0 6px; letter-spacing: -0.01em; }
+.obj h2 { font-size: 1.3rem; margin: 40px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+.obj h3 { font-size: 1.05rem; margin: 22px 0 8px; }
+.obj p { margin: 8px 0; }
+.obj .lead { color: var(--muted); font-size: 1.05rem; }
+.obj .note { background: var(--warn-soft); color: var(--text); border-left: 4px solid var(--warn); padding: 10px 14px; border-radius: 6px; margin: 16px 0; }
+.obj nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 4px; }
+.obj nav a { color: var(--accent); background: var(--accent-soft); text-decoration: none; padding: 4px 10px; border-radius: 999px; font-size: .9rem; }
+.obj .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.obj .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.obj .card h3 { margin-top: 0; }
+.obj ul { padding-left: 20px; margin: 6px 0; }
+.obj li { margin: 4px 0; }
+.obj .tag { display: inline-block; font-size: .75rem; font-weight: 600; padding: 1px 8px; border-radius: 999px; margin-right: 6px; vertical-align: 1px; }
+.obj .done { background: var(--done-soft); color: var(--done); }
+.obj .now { background: var(--now-soft); color: var(--now); }
+.obj .next { background: var(--accent-soft); color: var(--accent); }
+.obj .later { background: var(--later-soft); color: var(--later); }
+.obj .decide { background: var(--warn-soft); color: var(--warn); }
+.obj .table-wrap { overflow-x: auto; }
+.obj table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.obj th, .obj td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: .95rem; }
+.obj th { background: var(--accent-soft); font-weight: 600; }
+.obj tr:last-child td { border-bottom: 0; }
+.obj .muted { color: var(--muted); }
+.obj footer { margin-top: 40px; color: var(--muted); font-size: .9rem; }

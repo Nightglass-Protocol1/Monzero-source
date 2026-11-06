@@ -1,0 +1,13 @@
+#inputs { border:0; padding:0; margin:0; min-width:0; }
+.wide { grid-column:1/-1; }
+textarea { font:inherit; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:14px; padding:12px; color:var(--ink); background:var(--input); border:1px solid var(--line); border-radius:8px; resize:vertical; width:100%; overflow-wrap:anywhere; }
+#address-status, #error { margin:0; }
+#address-status[data-state="ok"] { color:var(--accent); } #address-status[data-state="bad"], #error { color:var(--warning); }
+.qr-wrap { display:flex; justify-content:center; margin:8px 0 24px; }
+#qr { width:min(320px,100%); aspect-ratio:1; background:#fff; border-radius:8px; }
+#qr svg { display:block; width:100%; height:100%; }
+#summary { display:grid; grid-template-columns:minmax(120px,1fr) 3fr; gap:8px 16px; }
+#summary dt, #summary dd { font-size:16px; } #summary dd { margin:0; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+.actions { display:flex; flex-wrap:wrap; gap:12px; margin-top:16px; }
+[hidden] { display:none!important; }
+@media(max-width:500px) { #summary { grid-template-columns:1fr; } #summary dd { margin-bottom:8px; } .actions button { flex:1 1 100%; } }

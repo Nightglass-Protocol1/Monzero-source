@@ -1,0 +1,10 @@
+[Unit]
+Description=Monzero encrypted backup to the USB drives (utils/website/backup-to-usb.sh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash %h/projects/Monzero-App/core-wt-website-ecosystem/utils/website/backup-to-usb.sh
+TimeoutStartSec=30min
+Nice=10

@@ -1,0 +1,21 @@
+Monzero v1.0.0 Windows GUI stable update — 18 October 2026
+
+Published as a stable GUI update with project-owner approval. Native Windows validation remains pending; see the validation section below.
+Open start-wallet-gui.bat. In local-node mode, the wallet checks for an existing node and starts it automatically when needed. Wait for synchronization.
+Open Mining / tools, select CPU threads, then Start mining. Stop mining explicitly when finished: a local node can continue mining after the GUI closes. Solo rewards require finding a block and unlock after 60 blocks. The page reports the actual reward address and live hashrate.
+
+Changes: teal theme and supplied XMZ artwork; bounded local-node startup checks; explicit asynchronous mining controls; mining-status refresh across pages; bundled outline fonts.
+
+Validation: QML behavior tests and Windows GUI execution under Wine with an isolated native testnet daemon. Native Windows 10/11 validation is still required. Wine could not initialize the Windows daemon/shared ring database.
+The core executables are unchanged files from the verified v1.0.0 archive. No DEX development code is included.
+
+Archive: monzero-v1.0.0-windows-gui-update-20261018-x64.zip
+SHA-256: 5a65b46ea1bf9bac0782614ca2e4762fdc65984121485af0d22fddd830bc9b0a
+GUI source: 5b45b03670db266152a762b1b5a6ee8b40646d94
+Core source: c4165784db57d8ae410fc8af58861e4178ee1a42
+Matching source: /downloads/monzero-gui-update-20261018-source.tar.gz
+Source SHA-256: 834337d66b4e66562790d80eff072eb9dad953f9dec92ff91247302e74a46667
+
+This update is unsigned and is not covered by the original signed v1.0.0 manifest. The original stable packages and manifest remain unchanged. TEST-RESULTS.json records the pre-publication verification state.
+
+Extract the entire ZIP into a new folder. Back up your wallet before upgrading. Report the displayed wallet version, Windows version, local/remote node choice, connection status and mining hashrate. Never share seed words or private keys.

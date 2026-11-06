@@ -1,0 +1,35 @@
+/* Homepage discovery sections reuse the established palette and typography. */
+.ecosystem { border-top:1px solid var(--line); }
+.ecosystem-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:20px; }
+.ecosystem-grid article { min-width:0; padding:24px; border:1px solid var(--line); border-radius:12px; background:var(--surface); }
+.ecosystem-grid h3 { margin:0 0 12px; font-size:1.25rem; line-height:1.3; }
+.ecosystem-grid p,.ecosystem-note { color:var(--muted); line-height:1.65; }
+.ecosystem-grid a { display:block; padding:10px 0; min-height:44px; box-sizing:border-box; color:var(--accent); text-underline-offset:4px; overflow-wrap:anywhere; }
+.ecosystem-grid a:focus-visible { outline:2px solid var(--accent); outline-offset:3px; border-radius:3px; }
+.ecosystem-note { margin:24px 0 0; }
+@media(max-width:1000px) { .ecosystem-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media(max-width:620px) { .ecosystem-grid { grid-template-columns:1fr; } .ecosystem-grid article { padding:20px; } }
+
+/* Live tiles under "Connect": node census, faucet and service status. */
+.live-tiles { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+#network { row-gap: 40px; }  /* the section had one row before the tiles; its column gap is unchanged */
+.live-tile { display: flex; flex-direction: column; gap: 6px; padding: 20px 22px; border: 1px solid var(--line); border-radius: var(--radius, 12px); background: var(--surface, #101a24); color: inherit; text-decoration: none; transition: border-color .15s ease; }
+.live-tile:hover, .live-tile:focus-visible { border-color: var(--accent, #3fdfe8); }
+.live-tile .tile-label { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.live-tile strong { font-size: 22px; font-weight: 600; color: var(--ink); }
+.live-tile small { font-size: 13px; color: var(--muted); }
+.live-tile strong.warn { color: #edbc64; } .live-tile strong.down { color: #ef6b6b; }
+@media (max-width: 760px) { .live-tiles { grid-template-columns: 1fr; } }
+@media (prefers-reduced-motion: reduce) { .live-tile { transition: none; } }
+
+/* Homepage "Top crypto news today" strip (from news/data/latest.json). */
+.news-strip { grid-column: 1 / -1; padding: 18px 22px; border: 1px solid var(--line); border-radius: var(--radius, 12px); background: var(--surface, #101a24); }
+.news-strip-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.news-strip-head strong { color: var(--ink); font-size: 15px; }
+.news-strip-head a { font-size: 14px; }
+.news-strip ol { list-style: none; margin: 0; padding: 0; }
+.news-strip li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 8px 0; border-top: 1px solid var(--line); }
+.news-strip li:first-child { border-top: 0; }
+.news-strip li a { color: var(--ink); text-decoration: none; font-weight: 500; }
+.news-strip li a:hover, .news-strip li a:focus-visible { text-decoration: underline; }
+.news-strip li small { color: var(--muted); font-size: 13px; }

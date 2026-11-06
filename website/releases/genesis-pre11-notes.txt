@@ -1,0 +1,59 @@
+MONZERO GENESIS PRE11
+=====================
+
+Genesis pre11 is experimental, unsigned, and unaudited prerelease software.
+It is not a production release.
+
+Core source: a99f85b357ee687b524bb06ea3cc933b8047a4a0
+GUI source:  94ec2a7c36efcd265956253a771ce9a6dbd9d1ab
+Network UUID: 94834264-d0b2-41dd-b0f2-0ada675c7710
+Genesis nonce: 2271206363
+Genesis hash: 84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4
+Native currency: XMZ
+Asset hard fork: inactive; no public activation is scheduled
+
+PACKAGES
+
+Linux x86-64 CLI
+  SHA-256: b789df327c27457b5e1e0194d678bd21f0315da13483fd69ce349c5c15aa3246
+
+Windows x64 CLI
+  SHA-256: a9d13c3cca63b7d7a8fd3a00aee3f10aac2d2f379598ebebc585b840b69d2889
+
+Windows x64 graphical wallet
+  SHA-256: e1950bfebb52833747ea3d5100e56b9b97989bc757f2adfb17672724960ac6cc
+
+Complete core source
+  SHA-256: 467255c6d72e6ee92bc33f899c235f8f9afbbd7090621599d20fac8d0f04a648
+
+Graphical-wallet source
+  SHA-256: 8505792782310a792798f57efef09855e5433b858ab2663ff789436373f21f99
+
+CHANGES SINCE PRE10
+
+- Desktop node launchers now keep both public P2P nodes as priority peers.
+- Local desktop daemons disable RPC-triggered peer banning so repeated GUI
+  polling cannot ban loopback and strand the embedded wallet.
+- The GUI embedded-daemon path uses the same dual-node and RPC-ban settings.
+- Consensus identity, ports, address prefixes, supply rules, and the public
+  asset hard-fork schedule are unchanged from Genesis pre10.
+
+UPGRADE
+
+Pre11 uses the same chain as pre10. Stop the wallet, miner, and daemon cleanly,
+verify the new archive checksum, and extract it into a new directory. Existing
+pre10 blockchain and wallet data do not require migration. Keep the previous
+verified binaries until the updated client has synchronized and remained
+healthy. Never reuse a Monero or other CryptoNote seed with Monzero.
+
+TEST STATUS AND LIMITATIONS
+
+The focused Linux and Windows CLI targets and native/Windows GUI targets built
+successfully. Linux daemon RPC responsiveness and synchronization were checked
+after launching with the new settings. The Linux, Windows CLI, and core source
+archives passed their release verifiers; the Windows GUI ZIP passed compressed-
+data, PE subsystem/import, embedded-version, and internal-manifest checks.
+Pre10's broader source-suite results are not attributed to the new binaries.
+The Linux package requires GLIBC 2.42 or newer. Native Windows execution,
+independent reproduction, code signing, sustained fuzzing, and an external
+audit remain outstanding. Windows may show an unknown-publisher warning.

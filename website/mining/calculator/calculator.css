@@ -1,0 +1,26 @@
+main { max-width:1140px; margin:auto; padding:40px 20px; }
+main > p { max-width:75ch; } .card { margin:24px 0; padding:24px; border:1px solid var(--line); border-radius:12px; background:var(--surface); }
+.fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr)); gap:20px; }
+label { display:flex; flex-direction:column; gap:8px; color:var(--ink); }
+input,select,button { font:inherit; padding:12px; color:var(--ink); background:var(--input); border:1px solid var(--line); border-radius:8px; min-height:44px; }
+button { cursor:pointer; background:var(--accent); color:#092820; font-weight:600; } button:disabled { opacity:.6; cursor:wait; }
+select:focus-visible { outline:3px solid var(--accent); outline-offset:4px; }
+#results { display:grid; grid-template-columns:1fr 1fr; gap:12px; } #results dd { margin:0; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+#error { color:var(--warning); }
+@media(max-width:500px) { .card {padding:16px;} #results {grid-template-columns:1fr;} #results dd {margin-bottom:12px;} }
+@media(prefers-reduced-motion:reduce) { *,*::before,*::after {animation:none!important;transition:none!important;scroll-behavior:auto!important;} }
+.skip-link:not(:focus) { transform:translateY(-200vh); }
+.skip-link:focus { top:16px; transform:none; }
+
+#calculator-inputs { border:0; padding:0; margin:0; min-width:0; }
+#results dt, #results dd { font-size:16px; line-height:1.6; }
+
+#payments a { overflow-wrap:anywhere; }
+#session-history { color:var(--accent); }
+#session-history p, #session-history table, #session-history summary { color:var(--ink); }
+#session-history details { overflow-x:auto; }
+#session-history td, #session-history th { padding:8px; text-align:left; }
+
+/* Body copy matches the original pages: muted text, links inherit and stay underlined. */
+main p, main li, main dd, main td, main figcaption { color: var(--muted); }
+main p a, main li a, main dd a { color: inherit; }

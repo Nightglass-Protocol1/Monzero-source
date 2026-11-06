@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Monzero blockchain explorer">
+  <meta name="theme-color" content="#0b1118">
+  <title>Monzero Explorer</title><!-- seo:begin --><link rel="canonical" href="https://monzero.org/explorer/"><meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/explorer/"><meta property="og:title" content="Monzero Explorer"><meta property="og:description" content="Monzero blockchain explorer"><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="Monzero MZ emblem and wordmark: Join the Monzero community. Privacy focused, independent blockchain, CPU mineable."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="Monzero Explorer"><meta name="twitter:description" content="Monzero blockchain explorer"><meta name="twitter:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><!-- seo:end -->
+  <link rel="icon" href="../assets/monzero-emblem-20261026-96.webp" type="image/webp">
+  <link rel="stylesheet" href="styles.css?v=20261026-brand">
+  <link rel="stylesheet" href="../theme.css?v=20261026-brand">
+  <link rel="stylesheet" href="../site-nav.css?v=20261026-brand">
+<link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261026-brand"></noscript></head>
+<body data-page="explorer" class="site-shell">
+  <a class="skip-link" href="#main">Skip to explorer</a>
+  <header class="site-header"><a class="brand" href="/" aria-label="Monzero home"><img class="brand-mark brand-coin" src="/assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"><span>MONZERO</span></a><button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button><nav id="site-nav" aria-label="Primary navigation"><a href="/">Home</a><div class="nav-group"><a href="/#about">About</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-about"><span class="visually-hidden">About pages</span></button><div class="nav-sub" id="nav-sub-about"><a href="/#about">About Monzero</a><a href="/roadmap/">Roadmap</a><a href="/objectives/">Project objectives</a><a href="/founder/">Founder</a></div></div><div class="nav-group"><a href="/ecosystem/">Ecosystem</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-ecosystem"><span class="visually-hidden">Ecosystem pages</span></button><div class="nav-sub" id="nav-sub-ecosystem"><a href="/ecosystem/">Ecosystem directory</a><a href="/dex/">Atomic swap DEX</a><a href="/app/">Monzero Studio</a><a href="/app/creators/">Creator hub</a><a href="/wallets/">Public wallets</a><a href="/payments/request/">Payment request</a><a href="/exchanges/">Exchanges</a><a href="/markets/">Markets</a></div></div><div class="nav-group"><a href="/mining/">Mining</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-mining"><span class="visually-hidden">Mining pages</span></button><div class="nav-sub" id="nav-sub-mining"><a href="/mining/">How to mine</a><a href="/mining/calculator/">Mining calculator</a><a href="/mining/dashboard/">Your mining</a><a href="/mining/benchmarks/">CPU benchmarks</a><a href="/mining/leaderboard/">Mining leaderboard</a><a href="/faucet/">Faucet</a><a href="https://pool.monzero.org/">Mining pool</a></div></div><div class="nav-group current"><a href="/explorer/" aria-current="page">Network</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-network"><span class="visually-hidden">Network pages</span></button><div class="nav-sub" id="nav-sub-network"><a href="/explorer/">Block explorer</a><a href="/network/">Network history</a><a href="/network/nodes/">Node map</a><a href="/stats/">Network stats</a><a href="/status/">Service status</a></div></div><div class="nav-group"><a href="/download/">Downloads</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-downloads"><span class="visually-hidden">Downloads pages</span></button><div class="nav-sub" id="nav-sub-downloads"><a href="/download/">Downloads &amp; verification</a><a href="/upgrade/">Upgrade guide</a></div></div><div class="nav-group"><a href="/developers/">Documentation</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-documentation"><span class="visually-hidden">Documentation pages</span></button><div class="nav-sub" id="nav-sub-documentation"><a href="/developers/">Developer portal</a><a href="/WHITEPAPER.md?rev=1.5-20261017">Whitepaper</a><a href="/developers/api/">API v1</a><a href="/developers/payments/">Accept XMZ</a><a href="/security/">Security</a><a href="/privacy/">Privacy Policy</a><a href="/terms/">Website Terms</a></div></div><div class="nav-group"><a href="/community/">Community</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-community"><span class="visually-hidden">Community pages</span></button><div class="nav-sub" id="nav-sub-community"><a href="/airdrop/">Airdrop</a><a href="/community/">Community hub</a><a href="/community/board/">Discussion board</a><a href="/community/voting/">Voting</a><a href="/community/bounties/">Bounties</a><a href="/fund/">Fundraising</a><a href="/news/">News</a><a href="/press/">Press kit</a><a href="/marketing/">Marketing kit</a></div></div></nav><a class="header-cta" href="/#get-started">Get started</a></header>
+
+  <main tabindex="-1" id="main">
+    <section class="hero">
+      <div class="explorer-status"><div class="node-pill"><span id="node-dot"></span><span id="node-label">Connecting</span></div><a class="site-link" href="#/assets">Assets &amp; NFTs</a></div>
+      <p class="eyebrow">Independent chain · XMZ</p>
+      <h1>Verify the chain.<br><em>Block by block.</em></h1>
+      <form id="search-form" class="search">
+        <label class="sr-only" for="search-input">Search the blockchain</label>
+        <input id="search-input" autocomplete="off" spellcheck="false" placeholder="Block height, block hash, transaction hash, or asset ID">
+        <button type="submit">Search <span>↗</span></button>
+      </form>
+      <p class="search-hint">Try a block height such as <button type="button" id="latest-search">latest</button> or paste a 64-character hash.</p>
+    </section>
+
+    <section id="overview" class="overview" aria-label="Network overview">
+      <article><span>Chain height</span><strong id="stat-height">—</strong><small>Mainnet</small></article>
+      <article><span>Difficulty</span><strong id="stat-difficulty">—</strong><small id="stat-hashrate">— H/s estimated</small></article>
+      <article><span>Transactions</span><strong id="stat-transactions">—</strong><small>Confirmed on-chain</small></article>
+      <article><span>Connections</span><strong id="stat-connections">—</strong><small>Hidden on restricted RPC</small></article>
+    </section>
+
+    <section id="content" class="content" aria-live="polite">
+      <div class="section-title">
+        <div><p class="eyebrow">Live ledger</p><h2>Recent blocks</h2></div>
+        <button id="refresh" class="ghost" type="button">Refresh</button>
+      </div>
+      <div id="view"><div class="loading"><span></span>Loading chain data…</div></div>
+    </section>
+  </main>
+
+  <footer>
+    <span>Monzero Genesis network</span>
+    <span>Node: <code>node.monzero.org:6175</code></span>
+    <span>Read-only explorer · <a href="https://monzero.org">monzero.org</a></span>
+  </footer>
+
+  <template id="error-template">
+    <div class="empty"><strong>Nothing found</strong><p>The value could not be resolved on the current Monzero chain.</p><a href="#/">Return to recent blocks</a></div>
+  </template>
+  <script src="app.js?v=20261019-asset-outage"></script>
+  <script src="../site-nav.js?v=20261026-brand" defer></script>
+</body>
+</html>
