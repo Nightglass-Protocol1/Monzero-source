@@ -67,7 +67,7 @@ jobs:
         run: |
           npm ci
           npx hardhat test
-          NODE_PATH="$PWD/node_modules" npx mocha connectors/test/sol-connector.test.js connectors/test/sol-mint.test.js
+          NODE_PATH="$PWD/node_modules" npx mocha connectors/test/sol-connector.test.js connectors/test/sol-mint.test.js connectors/test/sol-quote.test.js
 
   dex-solana:
     name: 'DEX Solana (host logic + route)'
