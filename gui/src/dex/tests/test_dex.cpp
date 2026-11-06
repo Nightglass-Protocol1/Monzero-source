@@ -118,10 +118,32 @@ private slots:
         QVERIFY(!control.refusal(QUuid::createUuid().toString(QUuid::WithoutBraces),1,1).isEmpty());
         DexDeployment::resetForTesting();
     }
+    void litecoinMainnetStageUsesRealIdentities() {
+        DexDeployment::resetForTesting();
+        const auto realXmz=DexDeployment::xmzMainnetGenesis();const auto otherXmz=QString(64,'a');
+        QVERIFY(DexDeployment::selectLitecoinStage("ltc-mainnet"));
+        QVERIFY(DexDeployment::mainnetStage());QVERIFY(!DexDeployment::bitcoinStage());QVERIFY(!DexDeployment::publicTestStage());
+        QCOMPARE(DexDeployment::litecoinNetwork(),QString("ltc-mainnet"));QCOMPARE(DexDeployment::litecoinLightNetwork(),QString("main"));
+        QCOMPARE(DexDeployment::litecoinLightCoin(),QString("ltc"));QCOMPARE(DexDeployment::swapCoinName(),QString("Litecoin"));
+        QCOMPARE(DexDeployment::litecoinGenesis(),QString("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2"));
+        QVERIFY(DexDeployment::litecoinNetworkAllowed("ltc-mainnet"));
+        for (const auto &other:{"btc-mainnet","ltc-testnet","ltc-regtest","btc-signet"}) QVERIFY(!DexDeployment::litecoinNetworkAllowed(other));
+        QVERIFY(DexDeployment::xmzNetworkAllowed("xmz-mainnet",realXmz));
+        QVERIFY(!DexDeployment::xmzNetworkAllowed("xmz-mainnet",otherXmz));
+        for (const auto &other:{"xmz-testnet","xmz-stagenet","xmz-fakechain",""}) QVERIFY(!DexDeployment::xmzNetworkAllowed(other,realXmz));
+        QCOMPARE(LitecoinJournalProtocol::bech32Prefix("ltc-mainnet"),QString("ltc1"));
+        QVERIFY(LightWalletProfile::networkAllowed("ltc","main"));QCOMPARE(LightWalletProfile::witnessPrefix("ltc","main"),QString("ltc"));
+        QCOMPARE(LightWalletProfile::receivePath("ltc","main",0),QString("84'/2'/0'/0/"));
+        // Litecoin mainnet, like Bitcoin mainnet, always needs a signed control document before a new trade.
+        DexRiskControl control;control.setNetwork("ltc-mainnet");
+        QVERIFY(control.status().value("controlRequired").toBool());
+        QVERIFY(!control.refusal(QUuid::createUuid().toString(QUuid::WithoutBraces),1,1).isEmpty());
+        DexDeployment::resetForTesting();
+    }
     void bitcoinDeploymentStagesUseBitcoinIdentities() {
         DexDeployment::resetForTesting();
         QCOMPARE(DexDeployment::litecoinLightCoin(),QString("ltc"));QVERIFY(!DexDeployment::bitcoinStage());
-        for (const auto &bad:{"btc-testnet","bitcoin","BTC-REGTEST","btc-testnet3","btc-main","ltc-mainnet","mainnet"}) QVERIFY(!DexDeployment::selectLitecoinStage(bad));
+        for (const auto &bad:{"btc-testnet","bitcoin","BTC-REGTEST","btc-testnet3","btc-main","mainnet"}) QVERIFY(!DexDeployment::selectLitecoinStage(bad));
         QVERIFY(DexDeployment::selectLitecoinStage("btc-regtest"));
         QVERIFY(DexDeployment::bitcoinStage());QVERIFY(!DexDeployment::publicTestStage());
         QCOMPARE(DexDeployment::litecoinNetwork(),QString("btc-regtest"));QCOMPARE(DexDeployment::litecoinLightNetwork(),QString("regtest"));

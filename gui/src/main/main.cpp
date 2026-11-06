@@ -664,11 +664,11 @@ int main(int argc, char *argv[])
 #ifdef WITH_DEX_PROTOTYPE
     if (parser.isSet(dexLtcNetworkOption)) {
         const QString swapNetwork=parser.value(dexLtcNetworkOption);
-        if (swapNetwork=="btc-mainnet" && qgetenv("MONZERO_DEX_MAINNET")!="I_ACCEPT_REAL_FUNDS_RISK") {
-            qCritical("Bitcoin mainnet swaps use real funds; set MONZERO_DEX_MAINNET=I_ACCEPT_REAL_FUNDS_RISK to opt in");return 1;
+        if ((swapNetwork=="btc-mainnet" || swapNetwork=="ltc-mainnet") && qgetenv("MONZERO_DEX_MAINNET")!="I_ACCEPT_REAL_FUNDS_RISK") {
+            qCritical("Mainnet swaps use real funds; set MONZERO_DEX_MAINNET=I_ACCEPT_REAL_FUNDS_RISK to opt in");return 1;
         }
         if (!dexPrototypeEnabled || !DexDeployment::selectLitecoinStage(swapNetwork)) {
-            qCritical("Swap network rejected; only regtest, testnet, btc-regtest, btc-testnet4, btc-signet or btc-mainnet is available");return 1;
+            qCritical("Swap network rejected; only regtest, testnet, btc-regtest, btc-testnet4, btc-signet, btc-mainnet or ltc-mainnet is available");return 1;
         }
     }
     DexDeployment::lockLitecoinStage();

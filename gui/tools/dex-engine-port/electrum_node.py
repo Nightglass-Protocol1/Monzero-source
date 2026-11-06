@@ -13,6 +13,7 @@ driver check and record what happened, so it trusts nothing it cannot cross-chec
 import decimal
 import hashlib
 import json
+import os
 import socket
 import ssl
 import threading
@@ -66,11 +67,36 @@ def scripthash(script_hex):
     return hashlib.sha256(bytes.fromhex(script_hex)).digest()[::-1].hex()
 
 
+def _electrum_pins():
+    # host:port -> sha256(DER) from MONZERO_ELECTRUM_PINS ("host:port=hex,host:port=hex").
+    pins = {}
+    for item in os.environ.get("MONZERO_ELECTRUM_PINS", "").split(","):
+        hostport, sep, sha = item.strip().rpartition("=")
+        if sep and len(sha.strip()) == 64:
+            pins[hostport.strip()] = sha.strip().lower()
+    return pins
+
+
 class _Session:
     def __init__(self, host, port, timeout):
-        context = ssl.create_default_context()  # certificate authorities only
         self.name = f"{host}:{port}"
-        self.socket = context.wrap_socket(socket.create_connection((host, port), timeout=timeout), server_hostname=host)
+        pin = _electrum_pins().get(self.name)
+        if pin:
+            # Electrum-style certificate pinning. The chosen LTC-mainnet servers are self-signed
+            # with CN but no SAN, so CA+hostname TLS is impossible; we instead require the server
+            # cert to match its recorded SHA256. Atomic-swap safety means a wrong/hostile server
+            # can only cause a failed/refunded swap, never theft.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            self.socket = context.wrap_socket(socket.create_connection((host, port), timeout=timeout))
+            got = hashlib.sha256(self.socket.getpeercert(binary_form=True)).hexdigest()
+            if got != pin:
+                self.socket.close()
+                raise ElectrumError(f"{self.name} certificate pin mismatch: expected {pin}, got {got}")
+        else:
+            context = ssl.create_default_context()  # certificate authorities only
+            self.socket = context.wrap_socket(socket.create_connection((host, port), timeout=timeout), server_hostname=host)
         self.file = self.socket.makefile("rwb")
         self.next_id = 0
         self.lock = threading.Lock()

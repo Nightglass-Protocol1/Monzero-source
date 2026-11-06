@@ -405,10 +405,10 @@ def _run(args, vm_lease=None):
     live = testnet or mainnet  # a real network the driver does not control
     if mainnet:
         # Real funds: no node, no throwaway keys, no test certificates (BUYER_LIGHT_AND_MAINNET.md).
-        require(args.chain == "btc" and args.mode == "success" and args.quote_kit and args.light_helper
+        require(args.chain in ("btc","ltc") and args.mode == "success" and args.quote_kit and args.light_helper
             and args.light_seller and args.light_funder and not args.light_wallet_tls and not args.kit_config
             and not args.remote_host and not args.hand_over_gui and not args.split_processes and not args.control_seed_file,
-            "Mainnet stage: --chain btc --mode success --quote-kit --light-helper --light-seller --light-funder, "
+            "Mainnet stage: --chain btc|ltc --mode success --quote-kit --light-helper --light-seller --light-funder, "
             "no --light-wallet-tls, kit config, VM, hand-over, split processes or control seed")
         require(args.xmz_daemon_port and args.xmz_funder_wallet_port and args.btc_payout_address
             and args.control_file and args.control_public_key and len(set(args.electrum_server)) >= 4,
@@ -496,8 +496,8 @@ def _run(args, vm_lease=None):
         if mainnet:
             from electrum_node import ElectrumNode
             servers = [(h, int(p)) for h, _, p in (item.rpartition(":") for item in args.electrum_server)]
-            ltc = ElectrumNode(servers[:2])  # the driver's own cross-checked view; never the traders'
-            require(ltc("getblockhash", 0) == chain["genesis"], "Electrum servers are not on Bitcoin mainnet")
+            ltc = ElectrumNode(servers[:2], hrp=chain["hrp"][:-1])  # the driver's own cross-checked view; never the traders'
+            require(ltc("getblockhash", 0) == chain["genesis"], "Electrum servers are not on " + chain["coin"] + " mainnet")
             ltc_cookie = None
             evidence.update(electrumServers=args.electrum_server, driverObserver="two public Electrum servers, answers cross-checked")
         elif testnet:
@@ -1057,11 +1057,11 @@ def _run(args, vm_lease=None):
         resident_directory = root/"resident-app"; resident_directory.mkdir(mode=0o700)
         startup_request = dict(app_request, initialStartup=True, residentDirectory=str(resident_directory))
         if mainnet:
-            # The owner's signed btc-mainnet document and pinned key; the driver holds no signing key.
+            # The owner's signed <chain>-mainnet document and pinned key; the driver holds no signing key.
             control_file = root/"control.json"
             control_file.write_bytes(args.control_file.read_bytes()); control_file.chmod(0o600)
             payload = json.loads(json.loads(control_file.read_text())["payload"])
-            require(payload["network"] == "btc-mainnet" and payload["newTradesEnabled"] is True
+            require(payload["network"] == f"{args.chain}-mainnet" and payload["newTradesEnabled"] is True
                 and payload["expiresAt"] > time.time()+args.trade_timeout
                 and int(payload["maxLtcAtomsPerTrade"]) >= ltc_atoms and int(payload["maxXmzAtomsPerTrade"]) >= xmz_atoms,
                 "The owner's control document does not enable this trade (network, expiry or limits)")
