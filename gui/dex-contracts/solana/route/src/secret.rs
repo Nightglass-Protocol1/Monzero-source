@@ -33,6 +33,12 @@ pub fn binds_to_commitment(secret: &[u8; 32], commitment: &[u8; 32]) -> bool {
     logic::verify_secret(secret, commitment)
 }
 
+/// Reconstruct the full Monero spend scalar `s = revealed + own_share` so Bob can sweep the
+/// XMZ 2-of-2 once he has read `s_a` off Alice's Solana claim (he already holds `s_b`).
+pub fn reconstruct_spend_key(revealed: &[u8; 32], own_share: &[u8; 32]) -> Option<[u8; 32]> {
+    logic::combine_shares(revealed, own_share)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +85,17 @@ mod tests {
         // a different secret must not bind
         let other = { let mut b = [10u8; 32]; b[31] = 0; b };
         assert!(!binds_to_commitment(&other, &commitment));
+    }
+
+    #[test]
+    fn reconstructs_the_spend_key_from_a_claim() {
+        // Bob holds s_b; Alice's claim reveals s_a. He extracts it and combines to get s.
+        let s_a = { let mut b = [5u8; 32]; b[31] = 0; b };
+        let s_b = { let mut b = [11u8; 32]; b[31] = 0; b };
+        let claim = claim_ix(&s_a);
+        let revealed = extract_revealed_secret(&claim).unwrap();
+        let s = reconstruct_spend_key(&revealed, &s_b).unwrap();
+        assert_eq!(s, logic::combine_shares(&s_a, &s_b).unwrap());
+        assert_ne!(s, s_a, "the full spend key is not just one share");
     }
 }

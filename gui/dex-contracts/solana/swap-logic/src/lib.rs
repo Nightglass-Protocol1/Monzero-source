@@ -73,13 +73,21 @@ mod reference {
         if s == Scalar::ZERO { return None; }
         Some(EdwardsPoint::mul_base(&s).compress().to_bytes())
     }
+    /// Combine two ed25519 key shares into the full Monero spend scalar `s = s_a + s_b`.
+    /// The counterpart of the point sum `S_a + S_b`: once Bob learns the revealed `s_a` he
+    /// combines it with his `s_b` here to sweep the XMZ 2-of-2.
+    pub fn combine_shares(a: &[u8; 32], b: &[u8; 32]) -> Option<[u8; 32]> {
+        let sa = Scalar::from_canonical_bytes(*a).into_option()?;
+        let sb = Scalar::from_canonical_bytes(*b).into_option()?;
+        Some((sa + sb).to_bytes())
+    }
     /// The compressed ed25519 basepoint — the point the on-chain syscall multiplies by.
     pub const BASEPOINT_COMPRESSED: [u8; 32] = {
         let mut b = [0x66u8; 32]; b[0] = 0x58; b
     };
 }
 #[cfg(not(target_os = "solana"))]
-pub use reference::{commit, verify_secret, BASEPOINT_COMPRESSED};
+pub use reference::{combine_shares, commit, verify_secret, BASEPOINT_COMPRESSED};
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +107,17 @@ mod tests {
     #[test] fn basepoint_matches_dalek() {
         // commit(1) must equal the basepoint we feed the on-chain syscall.
         assert_eq!(commit(&sec(1)).unwrap(), BASEPOINT_COMPRESSED);
+    }
+    #[test] fn combine_shares_is_point_additive() {
+        // (s_a + s_b)*B == S_a + S_b : combining the private shares matches summing the
+        // public shares, which is why revealing s_a lets Bob reconstruct the spend key.
+        use curve25519_dalek::edwards::CompressedEdwardsY;
+        let (a, b) = (sec(5), sec(11));
+        let s = combine_shares(&a, &b).unwrap();
+        let pa = CompressedEdwardsY(commit(&a).unwrap()).decompress().unwrap();
+        let pb = CompressedEdwardsY(commit(&b).unwrap()).decompress().unwrap();
+        assert_eq!(commit(&s).unwrap(), (pa + pb).compress().to_bytes());
+        assert!(combine_shares(&[0xff; 32], &b).is_none(), "rejects a non-canonical share");
     }
     #[test] fn set_ready_rules() {
         assert_eq!(check_set_ready(Stage::Pending, 100, 200), Ok(()));
