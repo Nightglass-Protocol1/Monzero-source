@@ -1,0 +1,35 @@
+{
+  "run": "btc-mainnet-real-6-20261104",
+  "date": "2026-11-04",
+  "network": "btc-mainnet",
+  "outcome": "passed",
+  "note": "Owner real-funds test: full XMZ<->BTC atomic swap on Bitcoin mainnet. Buyer funds BTC via the light wallet; seller locks XMZ and redeems BTC; seller pays XMZ out. Earlier attempts real-2..real-5 were cleanly refunded (real-4 refund returned 115000 sats, passed) before this clean success. A self-test between the project's own accounts; not a market price.",
+  "txids": {
+    "lightWalletFundingTxid": "efbb675a3e50de3ef01944ccc3f7f8b8b74bf60077e61dc1bacb0359fb607ad4",
+    "ltcLockTxid": "064966dd1980da2253d21227983f6e73a3c358a2582c07cd67f768cf9fea53e3",
+    "nativeLockTxid": "3c61b8fa0797685b1d6be8691af323027452f0907943c0c10d4e57614eb2aeb4",
+    "ltcRedeemTxid": "ef8ae008ddbed7f8f5cd9a576f4f91a491975ab4b22b0da42cc9224b8114ea01",
+    "nativePayoutTxid": "e2d92a8edc99115cd9f444865271263be12b6e2c7ca08b02d2454f188ad41c3f"
+  },
+  "btcRedeemSats": "112000",
+  "lockObservedBlock": "00000000000000000000ebe02f2caa953de58738ddc6596b814419a00297de27",
+  "policy": {
+    "ltc_network": "btc-mainnet",
+    "xmz_network": "xmz-mainnet",
+    "xmz_genesis": "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4",
+    "ltc_confirmations": 1,
+    "xmz_confirmations": 10,
+    "cancel_blocks": 36,
+    "punish_blocks": 10,
+    "maximum_ltc_atoms": 1000000000,
+    "maximum_xmz_atoms": 200000000000,
+    "maximum_ltc_funding_fee": 100000,
+    "maximum_ltc_recovery_fee": 20000,
+    "maximum_xmz_fee": 10000000000,
+    "minimum_ltc_output": 100000,
+    "minimum_relay_fee_atoms_per_kb": 1000
+  },
+  "explorers": {
+    "btcRedeem": "https://mempool.space/tx/ef8ae008ddbed7f8f5cd9a576f4f91a491975ab4b22b0da42cc9224b8114ea01"
+  }
+}
