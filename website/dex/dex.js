@@ -10,16 +10,14 @@
     LTC: { name: "Litecoin", usd: 75, dp: 6 },
     BNB: { name: "BNB", usd: 600, dp: 6 },
     ETH: { name: "Ethereum", usd: 3500, dp: 6 },
-    SOL: { name: "Solana", usd: 190, dp: 6 },
-    USDC: { name: "USD Coin", usd: 1, dp: 2 },
-    USDT: { name: "Tether", usd: 1, dp: 2 }
+    SOL: { name: "Solana", usd: 190, dp: 6 }
   };
-  var COUNTERS = ["BTC", "LTC", "BNB", "ETH", "SOL", "USDC", "USDT"];
-  var STATUS = { BTC: "beta", LTC: "soon", BNB: "soon", ETH: "soon", SOL: "soon", USDC: "soon", USDT: "soon" };
+  var COUNTERS = ["BTC", "LTC", "BNB", "ETH", "SOL"];
+  var STATUS = { BTC: "beta", LTC: "soon", BNB: "soon", ETH: "soon", SOL: "soon" };
   // Project fee per pair: BTC dynamic 0.1%–0.5% (floor used for indicative math),
   // SOL likewise 0.1%–0.5%; LTC free; EVM (BNB/ETH) fee to be decided. See dex-mainnet/go-live for the live policy.
-  var FEES = { BTC: 0.001, LTC: 0, BNB: 0, ETH: 0, SOL: 0.001, USDC: 0, USDT: 0 };
-  var FEE_LABEL = { BTC: "0.1%–0.5%", LTC: "Free", BNB: "TBD", ETH: "TBD", SOL: "0.1%–0.5%", USDC: "TBD", USDT: "TBD" };
+  var FEES = { BTC: 0.001, LTC: 0, BNB: 0, ETH: 0, SOL: 0.001 };
+  var FEE_LABEL = { BTC: "0.1%–0.5%", LTC: "Free", BNB: "TBD", ETH: "TBD", SOL: "0.1%–0.5%" };
 
   var state = { dir: "xmz-to-coin", coin: "BTC" }; // dir: which way XMZ flows
   var $ = function (id) { return document.getElementById(id); };

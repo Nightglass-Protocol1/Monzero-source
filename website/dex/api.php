@@ -37,8 +37,6 @@ $cfg = [
         ['pair' => 'XMZ/BNB',  'status' => 'soon', 'fee' => 'tbd'],
         ['pair' => 'XMZ/ETH',  'status' => 'soon', 'fee' => 'tbd'],
         ['pair' => 'XMZ/SOL',  'status' => 'soon', 'fee' => '0.1%-0.5%'],
-        ['pair' => 'XMZ/USDC', 'status' => 'soon', 'fee' => 'tbd'],
-        ['pair' => 'XMZ/USDT', 'status' => 'soon', 'fee' => 'tbd'],
     ],
 ];
 
