@@ -34,9 +34,10 @@
     loaded = true;
   }
   function wallet() {
-    const w = (window.phantom && window.phantom.solana) || window.solana;
-    if (!w || !w.isPhantom && !w.isSolflare && !w.connect) return null;
-    return w;
+    // Phantom injects window.phantom.solana (and window.solana); Solflare injects
+    // window.solflare (and sometimes window.solana). Accept any provider with connect().
+    const w = (window.phantom && window.phantom.solana) || window.solflare || window.solana;
+    return (w && typeof w.connect === 'function') ? w : null;
   }
   function field(name) {
     const el = document.querySelector('#create [name="' + name + '"]');
