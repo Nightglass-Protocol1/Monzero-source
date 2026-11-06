@@ -5,7 +5,8 @@
   "license": "BSD-3-Clause",
   "scripts": {
     "build": "hardhat compile",
-    "test": "hardhat test"
+    "test": "hardhat test",
+    "smoke:solana": "node solana/tools/smoke-mint.js"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-ethers": "3.0.8",
