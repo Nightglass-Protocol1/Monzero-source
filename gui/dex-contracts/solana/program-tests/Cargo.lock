@@ -1756,11 +1756,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "monzero-sol-route"
+version = "0.1.0"
+dependencies = [
+ "monzero-sol-swap-logic",
+]
+
+[[package]]
+name = "monzero-sol-swap-logic"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+]
+
+[[package]]
 name = "monzero-sol-swap-tests"
 version = "0.1.0"
 dependencies = [
  "curve25519-dalek 4.1.3",
  "litesvm",
+ "monzero-sol-route",
  "solana-program",
  "solana-sdk",
  "spl-token",
