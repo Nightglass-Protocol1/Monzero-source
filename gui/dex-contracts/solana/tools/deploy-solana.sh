@@ -35,7 +35,8 @@ solana program deploy --url "$CLUSTER" --program-id "$KEYPAIR" "$SO"
 PID="$(solana address -k "$KEYPAIR")"
 
 mkdir -p "$PROG/deployments"
+SAFE="$(printf '%s' "$CLUSTER" | tr -c 'A-Za-z0-9.-' '_')"   # cluster may be a URL; keep the filename valid
 printf '{"cluster":"%s","program":"%s","so_sha256":"%s"}\n' \
-  "$CLUSTER" "$PID" "$(sha256sum "$SO" | cut -d' ' -f1)" > "$PROG/deployments/solana-$CLUSTER.json"
+  "$CLUSTER" "$PID" "$(sha256sum "$SO" | cut -d' ' -f1)" > "$PROG/deployments/solana-$SAFE.json"
 echo "deployed program id: $PID"
 echo "recorded deployments/solana-$CLUSTER.json — PIN this program id in the app build (never fetch it from the website)."
