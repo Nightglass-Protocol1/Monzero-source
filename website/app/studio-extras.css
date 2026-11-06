@@ -53,3 +53,9 @@
   .st-paths { grid-template-columns: 1fr; margin: -24px 0 64px; }
 }
 @media (prefers-reduced-motion: reduce) { .st-path, .st-tour-spot, .st-tour-bar i { transition: none; } }
+
+/* Solana create panel (sol-studio.js) */
+#sol-create .st-sol-row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: end; margin-top: 1rem; }
+#sol-create .st-sol-row label { display: flex; flex-direction: column; gap: .25rem; font-size: .85rem; }
+#sol-create .st-sol-status { margin-top: .75rem; font-size: .9rem; min-height: 1.2em; }
+#sol-create .st-sol-status code { word-break: break-all; }
