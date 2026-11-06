@@ -132,6 +132,17 @@ describe('SolSwapClient cross-language vectors', () => {
       [[true, true], [false, true], [false, true], [false, true], [false, false]]);
   });
 
+  it('encodes claimRelayedSpl (opcode 8) + 9 accounts', () => {
+    const [pda] = c.swapPda(OWNER, CLAIMER, CC, RC, AMOUNT, NONCE);
+    const [vault] = c.vaultPda(pda);
+    const ix = c.claimRelayedSpl({ relayer: new PublicKey(bytes(4)), swap: pda, claimerToken: new PublicKey(bytes(6)),
+      relayerToken: new PublicKey(bytes(7)), vault, owner: OWNER, mint: new PublicKey(bytes(5)), secret: bytes(7), fee: 20000n });
+    assert.strictEqual(ix.data[0], 8);
+    assert.strictEqual(ix.data.readBigUInt64LE(33), 20000n);
+    assert.strictEqual(ix.keys.length, 9);
+    assert.strictEqual(ix.keys[0].isSigner, true);
+  });
+
   it('ed25519AuthIx builds a real Ed25519-program instruction over the message', () => {
     const sk = Buffer.alloc(32, 9);
     const pk = Buffer.from(ed25519.getPublicKey(sk));

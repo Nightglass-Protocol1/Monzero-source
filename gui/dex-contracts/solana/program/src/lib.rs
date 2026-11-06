@@ -80,6 +80,9 @@ pub enum Instruction {
     /// Gasless claim: a relayer submits it and takes `fee`; the claimer authorized
     /// (swap, fee, relayer) via an Ed25519 instruction earlier in the same tx.
     ClaimRelayed { secret: [u8; 32], fee: u64 },
+    /// Gasless SPL claim: same as ClaimRelayed, but the fee is paid to the relayer in the
+    /// swapped token and the claimer receives `amount - fee` tokens.
+    ClaimRelayedSpl { secret: [u8; 32], fee: u64 },
 }
 
 entrypoint!(process);
@@ -95,6 +98,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         Instruction::ClaimSpl { secret } => spl::claim_spl(program_id, accounts, secret),
         Instruction::RefundSpl { secret } => spl::refund_spl(program_id, accounts, secret),
         Instruction::ClaimRelayed { secret, fee } => claim_relayed(program_id, accounts, secret, fee),
+        Instruction::ClaimRelayedSpl { secret, fee } => spl::claim_relayed_spl(program_id, accounts, secret, fee),
     }
 }
 
@@ -432,6 +436,63 @@ mod spl {
         **swap_ai.lamports.borrow_mut() = 0;
         **rent_to.lamports.borrow_mut() = rent_to.lamports().checked_add(lamports).ok_or(ProgramError::ArithmeticOverflow)?;
         for b in swap_ai.data.borrow_mut().iter_mut() { *b = 0; }
+        Ok(())
+    }
+
+    /// Gasless SPL claim: a relayer submits + pays the SOL fee; the claimer authorized
+    /// (swap, fee, relayer) via an Ed25519 instruction. The claimer receives `amount - fee`
+    /// of the token and the relayer `fee`, both from the vault; the swap closes.
+    pub fn claim_relayed_spl(program_id: &Pubkey, accounts: &[AccountInfo], secret: [u8; 32], fee: u64) -> ProgramResult {
+        use solana_program::sysvar::instructions as ixs;
+        let it = &mut accounts.iter();
+        let relayer = next_account_info(it)?;       // signer, fee payer
+        let swap_ai = next_account_info(it)?;
+        let claimer_token = next_account_info(it)?; // destination for amount-fee (writable)
+        let relayer_token = next_account_info(it)?; // destination for fee (writable)
+        let vault_ai = next_account_info(it)?;
+        let owner = next_account_info(it)?;         // rent refund
+        let mint_ai = next_account_info(it)?;
+        let token_prog = next_account_info(it)?;
+        let instructions_ai = next_account_info(it)?;
+        let swap = load(program_id, swap_ai)?;
+        if !relayer.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+        if token_prog.key != &spl_token::ID { return Err(ProgramError::IncorrectProgramId); }
+        if swap.kind != 1 { return Err(ProgramError::InvalidAccountData); }
+        if &swap.owner != owner.key || &swap.mint != mint_ai.key { return Err(ProgramError::InvalidAccountData); }
+        if instructions_ai.key != &ixs::ID { return Err(ProgramError::InvalidArgument); }
+        // Bind the payout destination to the authorized claimer (the relayer can't redirect it).
+        let dest = TokenAccount::unpack(&claimer_token.data.borrow()).map_err(|_| ProgramError::InvalidAccountData)?;
+        if dest.owner != swap.claimer { return Err(ProgramError::InvalidAccountData); }
+
+        let now = Clock::get()?.unix_timestamp as u64;
+        let ok = verify_secret(&secret, &swap.claim_commitment);
+        logic::check_claim(stage_from_u8(swap.stage), now, swap.timeout1, swap.timeout2, ok).map_err(map_err)?;
+        logic::check_relay_fee(fee, swap.amount).map_err(map_err)?;
+        verify_relay_auth(instructions_ai, swap_ai.key, &swap.claimer, fee, relayer.key)?;
+
+        let to_claimer = swap.amount.checked_sub(fee).ok_or(ProgramError::InsufficientFunds)?;
+        let amount_le = swap.amount.to_le_bytes();
+        let nonce_le = swap.nonce.to_le_bytes();
+        let bump_arr = [swap.bump];
+        let signer: [&[u8]; 8] = [b"swap", swap.owner.as_ref(), swap.claimer.as_ref(),
+            &swap.claim_commitment, &swap.refund_commitment, &amount_le, &nonce_le, &bump_arr];
+        let decimals = mint_decimals(mint_ai)?;
+        if to_claimer > 0 {
+            invoke_signed(&spl_token::instruction::transfer_checked(&spl_token::ID, vault_ai.key, mint_ai.key, claimer_token.key, swap_ai.key, &[], to_claimer, decimals)?,
+                &[vault_ai.clone(), mint_ai.clone(), claimer_token.clone(), swap_ai.clone(), token_prog.clone()], &[&signer])?;
+        }
+        if fee > 0 {
+            invoke_signed(&spl_token::instruction::transfer_checked(&spl_token::ID, vault_ai.key, mint_ai.key, relayer_token.key, swap_ai.key, &[], fee, decimals)?,
+                &[vault_ai.clone(), mint_ai.clone(), relayer_token.clone(), swap_ai.clone(), token_prog.clone()], &[&signer])?;
+        }
+        invoke_signed(&spl_token::instruction::close_account(&spl_token::ID, vault_ai.key, owner.key, swap_ai.key, &[])?,
+            &[vault_ai.clone(), owner.clone(), swap_ai.clone(), token_prog.clone()], &[&signer])?;
+        let lamports = **swap_ai.lamports.borrow();
+        **swap_ai.lamports.borrow_mut() = 0;
+        **owner.lamports.borrow_mut() = owner.lamports().checked_add(lamports).ok_or(ProgramError::ArithmeticOverflow)?;
+        for b in swap_ai.data.borrow_mut().iter_mut() { *b = 0; }
+        msg!("monzero-sol: spl relayed claim, fee {}", fee);
+        solana_program::log::sol_log_data(&[b"claim_secret", &secret]);
         Ok(())
     }
 }

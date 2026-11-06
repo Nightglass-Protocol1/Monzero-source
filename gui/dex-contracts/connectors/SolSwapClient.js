@@ -161,6 +161,22 @@ class SolSwapClient {
       { pubkey: new PublicKey(owner), isSigner: false, isWritable: true },
       { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false }]});
   }
+
+  /** Gasless SPL claim: relayer submits + takes `fee` in the token; claimer gets amount-fee.
+   *  The claimer still signs `relayMessage(...)` (same auth); place ed25519AuthIx before this. */
+  claimRelayedSpl({ relayer, swap, claimerToken, relayerToken, vault, owner, mint, secret, fee }) {
+    const data = Buffer.concat([Buffer.from([8]), buf32(secret), u64le(fee)]);
+    return new TransactionInstruction({ programId: this.programId, data, keys: [
+      { pubkey: new PublicKey(relayer), isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(swap), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(claimerToken), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(relayerToken), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(vault), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(owner), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(mint), isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false }]});
+  }
 }
 
 module.exports = { SolSwapClient };
