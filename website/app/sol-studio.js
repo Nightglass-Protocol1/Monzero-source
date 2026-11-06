@@ -29,10 +29,7 @@
   async function ensureLibs() {
     if (loaded) return;
     await loadScript('/app/solana-web3.iife.min.js'); // -> window.solanaWeb3
-    // The spl-token bundle uses Node's Buffer; web3.js ships one, so expose it as the global
-    // before the bundle runs (it has no other Node-global dependencies).
-    if (window.solanaWeb3 && window.solanaWeb3.Buffer && !window.Buffer) window.Buffer = window.solanaWeb3.Buffer;
-    await loadScript('/app/sol-mint.bundle.js');       // -> window.SolMintClient (uses the web3 + Buffer globals)
+    await loadScript('/app/sol-mint.bundle.js?v=2');   // -> window.SolMintClient (self-contained: web3 aliased to the global, Buffer polyfilled in)
     if (!window.solanaWeb3 || !window.SolMintClient) throw new Error('Solana libraries did not load');
     loaded = true;
   }
