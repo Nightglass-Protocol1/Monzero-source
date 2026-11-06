@@ -20,8 +20,36 @@
   // --- minimal borsh encoders for CreateMetadataAccountV3's DataV2 ---
   const u16le = (n) => { const b = Buffer.alloc(2); b.writeUInt16LE(n); return b; };
   const u32le = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+  const u64le = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
   const borshStr = (s) => { const b = Buffer.from(String(s), 'utf8'); return Buffer.concat([u32le(b.length), b]); };
   const NONE = Buffer.from([0]); // Option::None
+
+  /** Master Edition PDA — makes an NFT a "printable" master (or, with maxSupply 0, locks it). */
+  function masterEditionPda(mint) {
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from('metadata'), METADATA_PROGRAM_ID.toBuffer(), new PublicKey(mint).toBuffer(), Buffer.from('edition')],
+      METADATA_PROGRAM_ID)[0];
+  }
+
+  // Metaplex CreateMasterEditionV3 (discriminator 17): turns the 1/1 into a master edition and
+  // moves the mint authority to the edition PDA. maxSupply: null = unlimited prints, N = N prints,
+  // 0 = none (used for a collection parent).
+  function createMasterEditionV3Ix({ mint, updateAuthority, mintAuthority, payer, maxSupply }) {
+    const ms = (maxSupply == null) ? NONE : Buffer.concat([Buffer.from([1]), u64le(maxSupply)]);
+    return new TransactionInstruction({
+      programId: METADATA_PROGRAM_ID, data: Buffer.concat([Buffer.from([17]), ms]),
+      keys: [
+        { pubkey: masterEditionPda(mint), isSigner: false, isWritable: true },
+        { pubkey: new PublicKey(mint), isSigner: false, isWritable: true },
+        { pubkey: new PublicKey(updateAuthority), isSigner: true, isWritable: false },
+        { pubkey: new PublicKey(mintAuthority), isSigner: true, isWritable: false },
+        { pubkey: new PublicKey(payer), isSigner: true, isWritable: true },
+        { pubkey: metadataPda(mint), isSigner: false, isWritable: true },
+        { pubkey: spl.TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+    });
+  }
 
   /** PDA of an NFT's Metaplex metadata account. */
   function metadataPda(mint) {
@@ -30,7 +58,7 @@
       METADATA_PROGRAM_ID)[0];
   }
 
-  function createMetadataV3Ix({ mint, mintAuthority, payer, updateAuthority, name, symbol, uri, sellerFeeBasisPoints }) {
+  function createMetadataV3Ix({ mint, mintAuthority, payer, updateAuthority, name, symbol, uri, sellerFeeBasisPoints, collectionSize }) {
     if (Buffer.from(name, 'utf8').length > 32) throw new Error('name exceeds 32 bytes');
     if (Buffer.from(symbol, 'utf8').length > 10) throw new Error('symbol exceeds 10 bytes');
     if (Buffer.from(uri, 'utf8').length > 200) throw new Error('uri exceeds 200 bytes');
@@ -42,7 +70,8 @@
       NONE,                                   // collection: Option<Collection>
       NONE,                                   // uses: Option<Uses>
       Buffer.from([1]),                       // isMutable = true
-      NONE,                                   // collectionDetails: Option
+      // collectionDetails: None, or Some(V1 { size }) to mark this mint a collection parent
+      (collectionSize == null ? NONE : Buffer.concat([Buffer.from([1, 0]), u64le(collectionSize)])),
     ]);
     return new TransactionInstruction({
       programId: METADATA_PROGRAM_ID, data,
@@ -113,5 +142,45 @@
     return { mint, ata, metadata, instructions, signers: [mint] };
   }
 
-  return { buildCreateToken, buildCreateNft, metadataPda, METADATA_PROGRAM_ID };
+  /** A collection "parent" NFT: a 1/1 flagged as a sized collection, with a master edition
+   *  (maxSupply 0 — not printable). NFTs can later be verified into it. */
+  function buildCreateCollection({ payer, name, symbol = '', uri, rentLamports, sellerFeeBasisPoints = 0 }) {
+    const payerPk = new PublicKey(payer);
+    const mint = Keypair.generate();
+    if (!name || !uri) throw new Error('name and uri are required');
+    const ata = spl.getAssociatedTokenAddressSync(mint.publicKey, payerPk);
+    const instructions = [
+      createMintAccountIx(payerPk, mint.publicKey, rentLamports),
+      spl.createInitializeMint2Instruction(mint.publicKey, 0, payerPk, payerPk),
+      spl.createAssociatedTokenAccountInstruction(payerPk, ata, payerPk, mint.publicKey),
+      spl.createMintToInstruction(mint.publicKey, ata, payerPk, 1n),
+      createMetadataV3Ix({ mint: mint.publicKey, mintAuthority: payerPk, payer: payerPk,
+        updateAuthority: payerPk, name, symbol, uri, sellerFeeBasisPoints, collectionSize: 0 }),
+      createMasterEditionV3Ix({ mint: mint.publicKey, updateAuthority: payerPk, mintAuthority: payerPk, payer: payerPk, maxSupply: 0 }),
+    ];
+    return { mint, ata, metadata: metadataPda(mint.publicKey), masterEdition: masterEditionPda(mint.publicKey), instructions, signers: [mint] };
+  }
+
+  /** A master-edition NFT from which up to `maxSupply` numbered prints can be minted
+   *  (null = unlimited). */
+  function buildCreateEdition({ payer, name, symbol = '', uri, rentLamports, maxSupply = null, sellerFeeBasisPoints = 0 }) {
+    const payerPk = new PublicKey(payer);
+    const mint = Keypair.generate();
+    if (!name || !uri) throw new Error('name and uri are required');
+    if (maxSupply != null && (!Number.isInteger(maxSupply) || maxSupply < 0)) throw new Error('maxSupply must be a non-negative integer or null');
+    const ata = spl.getAssociatedTokenAddressSync(mint.publicKey, payerPk);
+    const instructions = [
+      createMintAccountIx(payerPk, mint.publicKey, rentLamports),
+      spl.createInitializeMint2Instruction(mint.publicKey, 0, payerPk, payerPk),
+      spl.createAssociatedTokenAccountInstruction(payerPk, ata, payerPk, mint.publicKey),
+      spl.createMintToInstruction(mint.publicKey, ata, payerPk, 1n),
+      createMetadataV3Ix({ mint: mint.publicKey, mintAuthority: payerPk, payer: payerPk,
+        updateAuthority: payerPk, name, symbol, uri, sellerFeeBasisPoints }),
+      createMasterEditionV3Ix({ mint: mint.publicKey, updateAuthority: payerPk, mintAuthority: payerPk, payer: payerPk, maxSupply }),
+    ];
+    return { mint, ata, metadata: metadataPda(mint.publicKey), masterEdition: masterEditionPda(mint.publicKey), instructions, signers: [mint] };
+  }
+
+  return { buildCreateToken, buildCreateNft, buildCreateCollection, buildCreateEdition,
+    metadataPda, masterEditionPda, METADATA_PROGRAM_ID };
 });

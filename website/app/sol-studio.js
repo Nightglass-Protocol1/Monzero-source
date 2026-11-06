@@ -29,7 +29,7 @@
   async function ensureLibs() {
     if (loaded) return;
     await loadScript('/app/solana-web3.iife.min.js'); // -> window.solanaWeb3
-    await loadScript('/app/sol-mint.bundle.js?v=3');   // -> window.SolMintClient (self-contained: web3 aliased to the global, Buffer polyfilled in)
+    await loadScript('/app/sol-mint.bundle.js?v=4');   // -> window.SolMintClient (self-contained: web3 aliased to the global, Buffer polyfilled in)
     if (!window.solanaWeb3 || !window.SolMintClient) throw new Error('Solana libraries did not load');
     loaded = true;
   }
@@ -127,12 +127,20 @@
         } else {
           const uri = field('metadata_uri');
           if (!uri) return say('Set the metadata URI (export + host the metadata JSON first).', true);
-          built = SM.buildCreateNft({ payer: pub, name, symbol: field('symbol'), uri, rentLamports: rent });
-          what = 'NFT';
+          const common = { payer: pub, name, symbol: field('symbol'), uri, rentLamports: rent };
+          if (kind === 'collection') { built = SM.buildCreateCollection(common); what = 'collection'; }
+          else if (kind === 'edition') {
+            const n = parseInt(field('edition_size') || '', 10);
+            built = SM.buildCreateEdition({ ...common, maxSupply: Number.isInteger(n) && n > 0 ? n : null });
+            what = 'edition';
+          } else { built = SM.buildCreateNft(common); what = 'NFT'; }
         }
 
         say('Building transaction…');
-        const tx = new web3.Transaction().add(...built.instructions);
+        // collections/editions add a master-edition CPI — give the tx headroom.
+        const tx = new web3.Transaction()
+          .add(web3.ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }))
+          .add(...built.instructions);
         tx.feePayer = pub;
         tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
         tx.partialSign(...built.signers);           // the new mint keypair co-signs

@@ -78,7 +78,7 @@ async function send(conn, payer, built, label) {
   const mpl = await conn.getAccountInfo(SolMint.METADATA_PROGRAM_ID);
   assert(mpl && mpl.executable, 'Metaplex Token Metadata program is not on this cluster (clone it on a local validator)');
 
-  console.log('\n[1/2] fixed-supply SPL token (+ metadata)');
+  console.log('\n[1/4] fixed-supply SPL token (+ metadata)');
   let b = SolMint.buildCreateToken({ payer: payer.publicKey, decimals: 6, supply: 1_000_000_000n, rentLamports: rent,
     name: 'Monzero Smoke Token', symbol: 'MST', uri: 'https://monzero.org/app/creators/materials/metadata-example.json' });
   await send(conn, payer, b, 'token');
@@ -88,7 +88,7 @@ async function send(conn, payer, built, label) {
   assert(tmeta && tmeta.owner.equals(SolMint.METADATA_PROGRAM_ID), 'token has Metaplex metadata');
   console.log('  ✓ token', b.mint.publicKey.toBase58(), '— supply locked + on-chain metadata');
 
-  console.log('\n[2/2] 1/1 NFT + Metaplex metadata');
+  console.log('\n[2/4] 1/1 NFT + Metaplex metadata');
   b = SolMint.buildCreateNft({ payer: payer.publicKey, name: 'Monzero Smoke NFT', symbol: 'MZS',
     uri: 'https://monzero.org/app/creators/materials/metadata-example.json', rentLamports: rent });
   await send(conn, payer, b, 'nft');
@@ -100,6 +100,22 @@ async function send(conn, payer, built, label) {
   assert(meta && meta.owner.equals(SolMint.METADATA_PROGRAM_ID), 'metadata owned by Metaplex');
   console.log('  ✓ nft', b.mint.publicKey.toBase58(), '— 1/1 with on-chain metadata');
   console.log('    explorer: https://explorer.solana.com/address/' + b.mint.publicKey.toBase58() + clusterQ);
+
+  console.log('\n[3/4] collection NFT (sized collection + locked master edition)');
+  b = SolMint.buildCreateCollection({ payer: payer.publicKey, name: 'Monzero Smoke Collection', symbol: 'MSC',
+    uri: 'https://monzero.org/app/creators/materials/metadata-example.json', rentLamports: rent });
+  await send(conn, payer, b, 'collection');
+  let cme = await conn.getAccountInfo(b.masterEdition);
+  assert(cme && cme.owner.equals(SolMint.METADATA_PROGRAM_ID), 'collection master edition created');
+  console.log('  ✓ collection', b.mint.publicKey.toBase58());
+
+  console.log('\n[4/4] master edition (maxSupply 10)');
+  b = SolMint.buildCreateEdition({ payer: payer.publicKey, name: 'Monzero Smoke Edition', symbol: 'MSE',
+    uri: 'https://monzero.org/app/creators/materials/metadata-example.json', rentLamports: rent, maxSupply: 10 });
+  await send(conn, payer, b, 'edition');
+  let eme = await conn.getAccountInfo(b.masterEdition);
+  assert(eme && eme.owner.equals(SolMint.METADATA_PROGRAM_ID), 'master edition created');
+  console.log('  ✓ edition', b.mint.publicKey.toBase58());
 
   console.log('\nSMOKE TEST PASSED ✓');
 })().catch((e) => { console.error('ERROR:', e.message); if (e.logs) console.error(e.logs.join('\n')); process.exit(1); });

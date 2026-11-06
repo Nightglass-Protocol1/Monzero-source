@@ -62,6 +62,31 @@ describe('SolMintClient — Studio asset creation', () => {
     assert.ok(instructions[5].programId.equals(spl.TOKEN_PROGRAM_ID));
   });
 
+  it('buildCreateCollection: NFT + sized collection + master edition', () => {
+    const r = SolMint.buildCreateCollection({ payer: PAYER, name: 'My Collection', symbol: 'COL', uri: 'https://x/c.json', rentLamports: RENT });
+    assert.strictEqual(r.instructions.length, 6, 'mint,init,ATA,mintTo,metadata,masterEdition');
+    assert.strictEqual(r.instructions[4].data[0], 33, 'metadata');
+    const me = r.instructions[5];
+    assert.ok(me.programId.equals(SolMint.METADATA_PROGRAM_ID));
+    assert.strictEqual(me.data[0], 17, 'CreateMasterEditionV3');
+    assert.strictEqual(me.data[1], 1, 'maxSupply Some');
+    assert.strictEqual(me.data.readBigUInt64LE(2), 0n, 'collection parent is not printable (0)');
+    assert.ok(r.masterEdition.equals(SolMint.masterEditionPda(r.mint.publicKey)));
+  });
+
+  it('buildCreateEdition: NFT + master edition with maxSupply', () => {
+    const r = SolMint.buildCreateEdition({ payer: PAYER, name: 'Ed', symbol: 'ED', uri: 'https://x/e.json', rentLamports: RENT, maxSupply: 100 });
+    assert.strictEqual(r.instructions.length, 6);
+    const me = r.instructions[5];
+    assert.strictEqual(me.data[0], 17);
+    assert.strictEqual(me.data[1], 1, 'Some(maxSupply)');
+    assert.strictEqual(me.data.readBigUInt64LE(2), 100n, 'maxSupply = 100');
+    // unlimited edition (null)
+    const u = SolMint.buildCreateEdition({ payer: PAYER, name: 'U', symbol: 'U', uri: 'https://x/u.json', rentLamports: RENT });
+    assert.strictEqual(u.instructions[5].data[1], 0, 'None = unlimited');
+    assert.throws(() => SolMint.buildCreateEdition({ payer: PAYER, name: 'x', uri: 'u', rentLamports: RENT, maxSupply: -1 }), /maxSupply/);
+  });
+
   it('metadataPda is deterministic', () => {
     const m = new PublicKey('CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8');
     assert.ok(SolMint.metadataPda(m).equals(SolMint.metadataPda(m)));
