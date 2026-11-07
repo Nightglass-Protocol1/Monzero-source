@@ -9,6 +9,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTest>
+#include <QDebug>
 #include <functional>
 
 // Owned node-fixture transport only. This is never linked into the wallet.
@@ -31,6 +32,25 @@ inline void runLitecoinAppFixture(DexEngine &alice,DexEngine &bob,const QDir &di
             {"peer",engine.litecoinNegotiationStatus()},{"reservation",engine.litecoinReservationStatus()},
             {"redemption",engine.litecoinRedemptionStatus()},{"lightFunding",engine.litecoinLightFundingStatus()},
             {"reconnects",engine.litecoinReconnectsForTesting()}});
+    };
+    // Mainnet coordination (recovery handshake, XMZ settlement confirmations) runs far slower than
+    // regtest/testnet. The 300 s step waits below are a floor; MONZERO_LTC_FIXTURE_WAIT_MS raises
+    // them for mainnet. waitFor() logs each engine's negotiation state every 15 s, so a stall shows
+    // exactly which side and phase is stuck instead of a blind timeout.
+    bool waitMsOk=false;int waitMs=qEnvironmentVariableIntValue("MONZERO_LTC_FIXTURE_WAIT_MS",&waitMsOk);
+    if (!waitMsOk || waitMs<300000) waitMs=300000;
+    const auto brief=[&](DexEngine &e){const QJsonObject s=state(e);return QJsonObject{{"peer",s.value("peer")},{"busy",s.value("app").toObject().value("busy")}};};
+    const auto waitFor=[&](int sequence,const QString &label,const std::function<bool()> &cond){
+        QElapsedTimer timer;timer.start();qint64 lastLog=-100000;
+        while (!cond() && timer.elapsed()<waitMs) {
+            if (timer.elapsed()-lastLog>=15000) {lastLog=timer.elapsed();
+                qWarning().noquote()<<QStringLiteral("[ltc-fixture] waiting '%1' seq=%2 elapsed=%3s alice=%4 bob=%5")
+                    .arg(label).arg(sequence).arg(timer.elapsed()/1000)
+                    .arg(QString::fromUtf8(QJsonDocument(brief(alice)).toJson(QJsonDocument::Compact)))
+                    .arg(QString::fromUtf8(QJsonDocument(brief(bob)).toJson(QJsonDocument::Compact)));}
+            QTest::qWait(200);
+        }
+        return cond();
     };
     QVERIFY(directory.exists());QVERIFY(write("ready.json",{{"schema","monzero-ltc-app-driver-ready-v1"}}));
     // Long chain waits send a keepalive every 240 s; this bounds a run at about 45 days.
@@ -58,7 +78,7 @@ inline void runLitecoinAppFixture(DexEngine &alice,DexEngine &bob,const QDir &di
                     && (!request.value("recovery").toBool() || e.litecoinNegotiationStatus().value("recoveryComplete").toBool());});
             };
             QElapsedTimer waited;waited.start();
-            while (!reconnected() && waited.elapsed()<300000) QTest::qWait(200);
+            while (!reconnected() && waited.elapsed()<waitMs) QTest::qWait(200);
             accepted=reconnected();
         }
         else if (operation=="funding-refresh") accepted=engine.requestLitecoinPhaseCheck("funding");
@@ -114,17 +134,17 @@ inline void runLitecoinAppFixture(DexEngine &alice,DexEngine &bob,const QDir &di
         else if (operation=="payout-check") accepted=engine.checkLitecoinPayout();
         else if (operation=="refund-check") accepted=engine.checkLitecoinRefund();
         if (operation=="wait-release") {
-            QTRY_VERIFY_WITH_TIMEOUT(bob.litecoinNegotiationStatus().value("canReleaseRedemption").toBool()
-                || bob.litecoinNegotiationStatus().value("state")=="unknown",300000);
+            waitFor(sequence,"wait-release",[&]{return bob.litecoinNegotiationStatus().value("canReleaseRedemption").toBool()
+                || bob.litecoinNegotiationStatus().value("state")=="unknown";});
             accepted=bob.litecoinNegotiationStatus().value("canReleaseRedemption").toBool();
         }
         if (operation=="wait-negotiation" || operation=="wait-recovery" || operation=="wait-settlement") {
             const QString key=operation=="wait-negotiation"?"complete":operation=="wait-recovery"?"recoveryComplete":"settlementComplete";
             const auto done=[&]{return all([&](DexEngine &e){return e.litecoinNegotiationStatus().value(key).toBool();});};
-            QTRY_VERIFY_WITH_TIMEOUT(done() || any([](DexEngine &e){return e.litecoinNegotiationStatus().value("state")=="unknown";}),300000);
+            waitFor(sequence,operation,[&]{return done() || any([](DexEngine &e){return e.litecoinNegotiationStatus().value("state")=="unknown";});});
             accepted=done();
         }
-        QTRY_VERIFY_WITH_TIMEOUT(all([](DexEngine &e){return !e.litecoinAppStatus().value("busy").toBool();}),300000);
+        QVERIFY(waitFor(sequence,"idle",[&]{return all([](DexEngine &e){return !e.litecoinAppStatus().value("busy").toBool();});}));
         QVERIFY(write(prefix+"-response.json",{{"schema","monzero-ltc-app-driver-response-v1"},{"sequence",sequence},
             {"accepted",accepted},{"alice",state(alice)},{"bob",state(bob)}}));
         if (operation=="quit") return;
