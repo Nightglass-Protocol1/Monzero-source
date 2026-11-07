@@ -311,8 +311,15 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         if locks && record.trade.as_ref().is_some_and(|t| record.approved != Some(t.transcript)) {
             return Err(DriverError::AwaitingApproval);
         }
-        // Nothing is locked until our account can pay for the lock and for what protects it
-        if locks {
+        // Nothing is locked until our account can pay for the lock and for what protects it. Only
+        // before the first lock is signed: afterwards the value is already spent, and the lock is
+        // only rebroadcast until it has enough confirmations (on Ethereum, about 19 minutes).
+        let first_lock = actions.iter().any(|a| match a {
+            Action::SendNewSwap => !record.retained.contains_key("new_swap"),
+            Action::LockXmz { .. } => true,
+            _ => false,
+        });
+        if first_lock {
             let funds = self.chain.funds().await?;
             let owner = matches!(record.state, RoleState::Owner(_));
             let needed = funding_needed(&self.trade.terms, owner, funds.fee_per_gas);

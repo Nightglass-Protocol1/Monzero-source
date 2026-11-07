@@ -684,3 +684,30 @@ async fn refunded_swap_returns_the_xmz_over_real_wallets() {
     }
     assert_eq!(state, RoleState::Claimer(ClaimerState::Done(Outcome::Refunded)));
 }
+
+/// Once the lock is sent its value is spent. While the lock waits for its confirmations it is only
+/// rebroadcast, which must not wait for the funding a new lock would need.
+#[tokio::test]
+async fn a_sent_lock_is_rebroadcast_without_the_funding_check() {
+    let Some(url) = std::env::var("MONZERO_EVM_RPC").ok() else { return };
+    let _chain = CHAIN.lock().await;
+    let w = world(url.clone()).await;
+    let owner_address = w.trade.terms.owner;
+    let mut owner = w.owner(MemoryJournal(Record::new(RoleState::Owner(OwnerState::Start))));
+    // The lock stays in the mempool, so the next tick is a rebroadcast
+    rpc(&url, "evm_setAutomine", json!([false])).await;
+    assert_eq!(owner.tick().await.unwrap(), RoleState::Owner(OwnerState::LockSent));
+    // Leave the account what the sent lock costs, which is less than a new lock needs
+    let raw = owner.journal().0.retained["new_swap"][0].raw.clone();
+    let alloy::consensus::TxEnvelope::Eip1559(signed) = alloy::consensus::TxEnvelope::decode_2718(&mut raw.as_ref()).unwrap() else { panic!("EIP-1559") };
+    let tx = signed.tx();
+    let upfront = tx.value + U256::from(tx.gas_limit) * U256::from(tx.max_fee_per_gas);
+    let needed = monzero_dex_evm::driver::funding_needed(&w.trade.terms, true, U256::from(tx.max_fee_per_gas));
+    assert!(upfront < needed, "the test needs a balance below what a new lock requires");
+    set_balance(&w.url, owner_address, upfront).await;
+    let again = owner.tick().await;
+    rpc(&url, "evm_setAutomine", json!([true])).await;
+    set_balance(&w.url, owner_address, U256::from(10_000u64) * U256::from(10u64.pow(18))).await;
+    assert_eq!(again.unwrap(), RoleState::Owner(OwnerState::LockSent));
+    assert_eq!(owner.journal().0.retained["new_swap"].len(), 1, "the same lock, not a second one");
+}

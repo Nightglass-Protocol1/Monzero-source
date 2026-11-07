@@ -411,6 +411,8 @@ async fn main() {
                 tokio::time::sleep(Duration::from_secs(20)).await;
             }
             log("our XMZ is spendable");
+            // Deadlines count from now, not from the start: waiting for the XMZ to unlock can take an hour
+            let now = provider.get_block_by_number(alloy::eips::BlockNumberOrTag::Latest).await.unwrap().unwrap().header.timestamp;
             // Our search for the owner's lock starts before our first key request and is kept
             // for retries: the owner may lock as soon as it has answered any of them
             let start = dir.join("start-block.txt");
