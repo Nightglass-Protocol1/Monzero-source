@@ -89,28 +89,33 @@ pub enum Error {
 pub enum Chain {
     BscMainnet,
     BscTestnet,
+    EthMainnet,
+    EthSepolia,
     /// Hardhat / anvil test node
     Local,
 }
 
 impl Chain {
     pub fn from_id(id: u64) -> Option<Chain> {
-        [Chain::BscMainnet, Chain::BscTestnet, Chain::Local].into_iter().find(|c| c.id() == id)
+        [Chain::BscMainnet, Chain::BscTestnet, Chain::EthMainnet, Chain::EthSepolia, Chain::Local].into_iter().find(|c| c.id() == id)
     }
 
     pub fn id(self) -> u64 {
         match self {
             Chain::BscMainnet => 56,
             Chain::BscTestnet => 97,
+            Chain::EthMainnet => 1,
+            Chain::EthSepolia => 11_155_111,
             Chain::Local => 31337,
         }
     }
 
     /// Blocks an EVM transaction may stay unmined before it is replaced with higher fees
-    /// (about a minute on BNB Chain).
+    /// (about a minute on BNB Chain, two minutes on Ethereum).
     pub fn bump_after_blocks(self) -> u64 {
         match self {
             Chain::BscMainnet | Chain::BscTestnet => 40,
+            Chain::EthMainnet | Chain::EthSepolia => 10,
             Chain::Local => 3,
         }
     }
@@ -120,16 +125,20 @@ impl Chain {
     pub fn max_fee_cap(self) -> u128 {
         match self {
             Chain::BscMainnet | Chain::BscTestnet => 50_000_000_000,
+            Chain::EthMainnet | Chain::EthSepolia => 200_000_000_000,
             Chain::Local => 1_000_000_000_000,
         }
     }
 
     /// Blocks after a transaction before the app acts on it. BNB Chain has fast finality
     /// (about 2 blocks); this keeps a margin for testnet reorganisations and lagging RPCs.
+    /// Ethereum finalizes after two to three epochs: the finalized block is 65-96 behind the
+    /// head, so 96 blocks (about 19 minutes) is always final.
     pub fn confirmations(self) -> u64 {
         match self {
             Chain::BscMainnet => 15,
             Chain::BscTestnet => 15,
+            Chain::EthMainnet | Chain::EthSepolia => 96,
             Chain::Local => 1,
         }
     }

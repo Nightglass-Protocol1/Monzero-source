@@ -194,6 +194,8 @@ fn rejects_a_wrong_id_contract_chain_or_stage() {
     assert_eq!(check_lock(&terms(), &lock), Err(Error::TermsMismatch("emitted by another contract")));
 
     let mut lock = lock_with(|_| {});
+    lock.chain_id = Chain::EthMainnet.id();
+    assert_eq!(check_lock(&terms(), &lock), Err(Error::TermsMismatch("chain id")));
     lock.chain_id = Chain::BscMainnet.id();
     assert_eq!(check_lock(&terms(), &lock), Err(Error::TermsMismatch("chain id")));
 
@@ -273,4 +275,16 @@ fn finds_a_revealed_secret_only_for_this_swap_and_contract() {
     assert_eq!(revealed_secret(&[event_log(CONTRACT, other_swap)], CONTRACT, &swap), None, "another swap");
     assert_eq!(revealed_secret(&[event_log(CONTRACT, wrong_secret)], CONTRACT, &swap), None, "secret that does not open the commitment");
     assert_eq!(revealed_secret(&[event_log(Address::repeat_byte(0x77), claimed)], CONTRACT, &swap), None, "another contract");
+}
+
+#[test]
+fn ethereum_chains_wait_for_finality_and_bump_every_two_minutes() {
+    assert_eq!(Chain::from_id(1), Some(Chain::EthMainnet));
+    assert_eq!(Chain::from_id(11_155_111), Some(Chain::EthSepolia));
+    assert_eq!(Chain::from_id(10), None, "a chain nobody configured");
+    for chain in [Chain::EthMainnet, Chain::EthSepolia] {
+        assert_eq!(chain.confirmations(), 96);
+        assert_eq!(chain.bump_after_blocks(), 10);
+        assert!(chain.max_fee_cap() > Chain::BscMainnet.max_fee_cap());
+    }
 }

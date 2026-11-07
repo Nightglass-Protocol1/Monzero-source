@@ -181,8 +181,8 @@ fn our_own_frame_must_carry_our_keys() {
 #[test]
 fn unknown_chains_and_out_of_range_secrets_are_refused() {
     let (owner, claimer) = (side(), side());
-    let bad = Offer { chain_id: 1, ..offer(&owner, &claimer) };
-    assert!(matches!(KeyExchange::new(bad, Role::Owner, copy(&owner.keys)), Err(E::UnknownChain(1))));
+    let bad = Offer { chain_id: 10, ..offer(&owner, &claimer) };
+    assert!(matches!(KeyExchange::new(bad, Role::Owner, copy(&owner.keys)), Err(E::UnknownChain(10))));
     let mut top = [0u8; 32];
     top[31] = 0x10;
     let big = SecretShare::from_ed25519_le(top).unwrap();

@@ -38,6 +38,11 @@ impl Timing {
         owner_refund_margin: 1800,
         claim_margin: 1800,
     };
+
+    /// Ethereum: the same margins. The 96-block wait (about 19 minutes) delays what each side
+    /// sees of the other's transactions, but these margins are measured against timeouts of
+    /// hours and only have to cover the XMZ confirmations and getting one transaction mined.
+    pub const ETH: Timing = Timing::BSC;
 }
 
 /// One agreed trade, as both sides hold it.

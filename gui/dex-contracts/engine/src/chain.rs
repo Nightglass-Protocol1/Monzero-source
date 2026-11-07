@@ -103,6 +103,28 @@ impl AlloyChain {
             .map_err(|e| chain_err(format!("endpoint does not serve contract logs: {e}")))
     }
 
+    /// The endpoint's chain, refused unless it is the chain this trade agreed on: everything
+    /// signed here carries this id, so a misconfigured endpoint must not choose the network.
+    pub async fn check_network(&self) -> Result<u64, DriverError> {
+        let id = self.reader.get_chain_id().await.map_err(chain_err)?;
+        if id != self.chain.id() {
+            return Err(chain_err(format!("endpoint is on chain {id}, this trade is on chain {}", self.chain.id())));
+        }
+        Ok(id)
+    }
+
+    /// Refuse an account with code on chain. The contract pays out with a plain transfer, so an
+    /// account that rejects it (a contract, or an EIP-7702 delegated wallet) could not collect a
+    /// claim or a refund and its coins would stay locked. Check both sides before agreeing.
+    pub async fn check_plain_accounts(&self, accounts: &[Address]) -> Result<(), DriverError> {
+        for account in accounts {
+            if !self.reader.get_code_at(*account).await.map_err(chain_err)?.is_empty() {
+                return Err(chain_err(format!("account {account} has code on chain, so it may not be able to receive the payout: use a plain account")));
+            }
+        }
+        Ok(())
+    }
+
     /// The newest block with enough confirmations.
     async fn confirmed_block(&self) -> Result<u64, DriverError> {
         let head = self.reader.get_block_number().await.map_err(chain_err)?;
@@ -144,7 +166,7 @@ impl AlloyChain {
             .with_to(to)
             .with_value(amount)
             .with_nonce(latest)
-            .with_chain_id(self.reader.get_chain_id().await.map_err(chain_err)?)
+            .with_chain_id(self.check_network().await?)
             .with_gas_limit(gas)
             .with_max_fee_per_gas(fees.max_fee_per_gas)
             .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas.min(fees.max_fee_per_gas));
@@ -206,6 +228,7 @@ impl EvmChain for AlloyChain {
     }
 
     async fn sign(&self, call: &EvmCall) -> Result<Bytes, DriverError> {
+        let chain_id = self.check_network().await?;
         let (input, value) = match call {
             EvmCall::NewSwap { terms, nonce } => (
                 XmzSwap::newSwapCall {
@@ -232,7 +255,7 @@ impl EvmChain for AlloyChain {
         let fees = self.reader.estimate_eip1559_fees().await.map_err(chain_err)?;
         let tx = tx
             .with_nonce(self.reader.get_transaction_count(self.from).pending().await.map_err(chain_err)?)
-            .with_chain_id(self.reader.get_chain_id().await.map_err(chain_err)?)
+            .with_chain_id(chain_id)
             .with_gas_limit(gas + gas / 5)
             .with_max_fee_per_gas(fees.max_fee_per_gas)
             .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
@@ -259,6 +282,7 @@ impl EvmChain for AlloyChain {
             return Err(chain_err("kept transaction is not ours"));
         }
         let tx = signed.tx();
+        self.check_network().await?;
         // Mined (this or another version): the account's nonce has moved past it
         let used = self.reader.get_transaction_count(self.from).block_id(BlockId::latest()).await.map_err(chain_err)?;
         if used > tx.nonce {

@@ -1,6 +1,7 @@
-// Deploys XmzSwap to BNB Smart Chain mainnet (chain 56) with a key the owner types in, and
-// records it in deployments/bsc-mainnet.json.
-//   npx hardhat run --network bscMainnet scripts/deploy-mainnet.js
+// Deploys XmzSwap with a key the owner types in, and records it in deployments/<name>.json, on:
+//   npx hardhat run --network bscMainnet scripts/deploy-mainnet.js    BNB Smart Chain (56)
+//   npx hardhat run --network ethSepolia scripts/deploy-mainnet.js    Ethereum Sepolia testnet
+//   npx hardhat run --network ethMainnet scripts/deploy-mainnet.js    Ethereum mainnet (1)
 // Rehearsal on a local node first (key: any funded local account):
 //   npx hardhat node &  npx hardhat run --network localhost scripts/deploy-mainnet.js
 //
@@ -15,7 +16,12 @@ const path = require("path");
 const readline = require("readline");
 const os = require("os");
 
-const CHAINS = { 56n: "bsc-mainnet", 31337n: "local-rehearsal" };
+const CHAINS = {
+  56n: { name: "bsc-mainnet", coin: "BNB", confirmations: 15, real: true },
+  1n: { name: "eth-mainnet", coin: "ETH", confirmations: 96, real: true },
+  11155111n: { name: "eth-sepolia", coin: "SepoliaETH", confirmations: 96, real: false },
+};
+const LOCAL = { name: "local-rehearsal", coin: "local ETH", confirmations: 1, real: false };
 
 function ask(question, hidden) {
   return new Promise((resolve) => {
@@ -27,15 +33,19 @@ function ask(question, hidden) {
 
 async function main() {
   const { chainId } = await ethers.provider.getNetwork();
-  const name = CHAINS[chainId];
-  if (!name) throw new Error(`refusing chain ${chainId}: BNB mainnet (56) or a local rehearsal (31337) only`);
+  // Decided by the network, not the chain id: a local copy of mainnet also reports chain 1, and
+  // must never write the real chain's record
+  const local = ["localhost", "hardhat"].includes(network.name);
+  const chain = local ? LOCAL : CHAINS[chainId];
+  if (!chain) throw new Error(`refusing chain ${chainId}: ${Object.keys(CHAINS).join(", ")} or a local rehearsal only`);
+  const { name, coin } = chain;
   const out = path.join(__dirname, "..", "deployments", `${name}.json`);
-  if (name !== "local-rehearsal" && fs.existsSync(out)) throw new Error(`${out} exists: already deployed`);
+  if (!local && fs.existsSync(out)) throw new Error(`${out} exists: already deployed`);
 
-  console.log(`Network: ${network.name} (chain ${chainId})${chainId === 56n ? "  ** REAL BNB **" : ""}`);
+  console.log(`Network: ${network.name} (chain ${chainId})${chain.real ? `  ** REAL ${coin} **` : ""}`);
   let deployer;
   if (process.env.DEPLOYER === "test-phrase") {
-    const file = process.env.ACCOUNTS_FILE || path.join(os.homedir(), ".config", "monzero-dex", "bsc-mainnet-accounts.json");
+    const file = process.env.ACCOUNTS_FILE || path.join(os.homedir(), ".config", "monzero-dex", `${name}-accounts.json`);
     if ((fs.statSync(file).mode & 0o077) !== 0) throw new Error(`${file} must be private (chmod 600)`);
     const { mnemonic } = JSON.parse(fs.readFileSync(file, "utf8"));
     deployer = ethers.HDNodeWallet.fromPhrase(mnemonic, undefined, "m/44'/60'/0'/0/0").connect(ethers.provider);
@@ -54,8 +64,8 @@ async function main() {
   const gasPrice = fee.gasPrice ?? fee.maxFeePerGas;
   const cost = gas * gasPrice;
   console.log(`Deployer: ${deployer.address}`);
-  console.log(`Balance:  ${ethers.formatEther(balance)} BNB`);
-  console.log(`Estimate: ${gas} gas x ${ethers.formatUnits(gasPrice, "gwei")} gwei = ${ethers.formatEther(cost)} BNB`);
+  console.log(`Balance:  ${ethers.formatEther(balance)} ${coin}`);
+  console.log(`Estimate: ${gas} gas x ${ethers.formatUnits(gasPrice, "gwei")} gwei = ${ethers.formatEther(cost)} ${coin}`);
   if (balance < (cost * 3n) / 2n) throw new Error("the balance does not cover the estimate with a 50% margin");
   if ((await ask('Type DEPLOY to deploy XmzSwap with this account: ', false)) !== "DEPLOY") {
     console.log("Not deployed.");
@@ -65,7 +75,7 @@ async function main() {
   const swap = await factory.deploy({ gasLimit: (gas * 6n) / 5n });
   const tx = swap.deploymentTransaction();
   console.log("deploy tx", tx.hash);
-  const receipt = await tx.wait(chainId === 56n ? 15 : 1);
+  const receipt = await tx.wait(chain.confirmations);
   const address = await swap.getAddress();
 
   const onChain = await ethers.provider.getCode(address);
@@ -86,7 +96,7 @@ async function main() {
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, JSON.stringify(record, null, 2) + "\n");
   console.log(JSON.stringify(record, null, 2));
-  console.log(`Saved ${path.relative(process.cwd(), out)}. Same code as testnet: ${
+  console.log(`Saved ${path.relative(process.cwd(), out)}. Same code as the BNB deployments: ${
     record.runtimeCodeKeccak === "0xe2368d8f82649ecd46a19e882e70c9535752dbc9f4c9499a22af141877f21f1a" ? "yes" : "NO - check"}`);
 }
 
