@@ -1,0 +1,11 @@
+{
+  "chainId": 11155111,
+  "contract": "0xcFc3b72EA8E5fa41905a2119c457c43162d9Ab30",
+  "deployTx": "0x97387ee2e44dacfed8bb8db54e873867de04b04c847f43a564f424899140f7a9",
+  "block": 12085832,
+  "deployer": "0x05D86b60F0A6ca8A0D0fad2636A1ba427e0a622C",
+  "gasUsed": "7990957",
+  "runtimeCodeKeccak": "0xe2368d8f82649ecd46a19e882e70c9535752dbc9f4c9499a22af141877f21f1a",
+  "compiler": "solc 0.8.28, optimizer 200 runs, evm cancun",
+  "deployedAt": "2026-11-07T20:07:13.134Z"
+}
