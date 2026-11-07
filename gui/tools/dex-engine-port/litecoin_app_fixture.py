@@ -36,7 +36,12 @@ class LitecoinAppFixture:
         require(ready == {"schema": "monzero-ltc-app-driver-ready-v1"}, "Unexpected resident app greeting")
 
     def read_when_ready(self, path):
-        deadline = time.monotonic() + 420
+        # Per-operation response ceiling. 420 s suits fast regtest/testnet runs, but on
+        # mainnet the peer recovery handshake (bob "wait-recovery") can wait on slow XMZ
+        # blocks and light-wallet/Electrum sync, so the mainnet runner raises this via
+        # MONZERO_APP_FIXTURE_TIMEOUT. The ceiling only fires on a genuine stall; a healthy
+        # operation still returns in milliseconds.
+        deadline = time.monotonic() + int(os.environ.get("MONZERO_APP_FIXTURE_TIMEOUT", "420"))
         while not path.exists():
             if self.process.poll() is not None or time.monotonic() > deadline:
                 raise RuntimeError("Resident app did not respond: " + self.log.read_text(errors="replace")[-16000:])
