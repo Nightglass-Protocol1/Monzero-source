@@ -49,7 +49,6 @@
     <tr><th>System</th><th>Default location</th></tr>
     <tr><td>Linux</td><td><code>~/.local/share/xmr-btc-swap/</code></td></tr>
     <tr><td>macOS</td><td><code>~/Library/Application Support/xmr-btc-swap/</code></td></tr>
-    <tr><td>Windows</td><td><code>%APPDATA%\xmr-btc-swap\</code></td></tr>
   </table>
   <p>The exact folder name depends on your build — the Monzero app shows its data directory in <strong>Settings</strong>, and the swap CLI prints it on start-up (or you set it with <code>--data-base-dir</code>). Inside are the swap database (SQLite) and the Bitcoin and XMZ wallet files. Treat this folder like a seed backup: it can spend your in-flight swap, so keep it private and encrypted.</p>
 

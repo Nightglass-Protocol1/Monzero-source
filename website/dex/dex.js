@@ -411,54 +411,21 @@
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeMenu(); });
 })();
 
-/* Launch gate. The DEX page shows "Coming soon" + a countdown until the owner
-   flips the server-side ready flag (monzero-private/dex-status.php -> live=true).
-   This controls PRESENTATION only — real trading is gated by the app's signed
-   control document / kill-switch, never by this timer. */
+/* Launch gate. The DEX page shows "Coming soon" until the owner flips the
+   server-side ready flag (monzero-private/dex-status.php -> live=true). No launch
+   date is published. This controls PRESENTATION only: real trading is gated by the
+   app's signed control document / kill-switch. */
 (function () {
-  var el = document.getElementById("dex-countdown");
+  var el = document.getElementById("dex-launch");
   if (!el) return;
-  var notice = document.querySelector(".dex-notice");
-  var launch = Date.parse(el.getAttribute("data-launch")) || 0; // fallback if API is down
-  var live = false, timer = null;
-
-  function pad(n) { return (n < 10 ? "0" : "") + n; }
-  function set(id, v) { var n = document.getElementById(id); if (n) n.textContent = v; }
-
-  function render() {
-    el.hidden = false;
-    if (live) {
-      clearInterval(timer);
-      el.classList.add("live");
-      el.innerHTML = '<span class="dc-live">🟢 Monzero DEX is live</span>';
-      if (notice) notice.innerHTML = '<strong>Live.</strong> Trade XMZ for BTC or SOL (0.1%–0.5%) or Litecoin (free) from your own wallet in the Monzero app. <a href="/dex/recovery/">How to recover your funds →</a>';
-      return;
-    }
-    el.classList.remove("live");
-    var diff = launch - Date.now();
-    if (!launch || diff <= 0) {
-      // Date reached (or unknown) but not flagged live: just say coming soon.
-      clearInterval(timer);
-      el.innerHTML = '<span class="dc-soon">Coming soon</span>';
-      return;
-    }
-    if (!document.getElementById("dc-d")) {
-      el.innerHTML = '<span class="dc-label">Coming soon · opens in</span>'
-        + '<span class="dc-clock"><b id="dc-d">0</b><i>d</i> <b id="dc-h">00</b><i>h</i> '
-        + '<b id="dc-m">00</b><i>m</i> <b id="dc-s">00</b><i>s</i></span>';
-    }
-    set("dc-d", Math.floor(diff / 86400000));
-    set("dc-h", pad(Math.floor(diff / 3600000) % 24));
-    set("dc-m", pad(Math.floor(diff / 60000) % 60));
-    set("dc-s", pad(Math.floor(diff / 1000) % 60));
-  }
-
   fetch("/dex/api.php", { cache: "no-store" })
     .then(function (r) { return r.json(); })
     .then(function (s) {
-      if (s && typeof s.launch_at === "number" && s.launch_at > 0) launch = s.launch_at * 1000;
-      live = !!(s && s.live);
+      if (!s || !s.live) return;
+      var notice = document.querySelector(".dex-notice");
+      el.classList.add("live");
+      el.innerHTML = '<span class="dc-live">🟢 Monzero DEX is live</span>';
+      if (notice) notice.innerHTML = '<strong>Live.</strong> Trade XMZ for BTC or SOL (0.1%–0.5%) or Litecoin (free) from your own wallet in the Monzero app. <a href="/dex/recovery/">How to recover your funds →</a>';
     })
-    .catch(function () { /* keep the attribute fallback */ })
-    .then(function () { render(); timer = setInterval(render, 1000); });
+    .catch(function () { /* stays "Coming soon" */ });
 })();

@@ -5,7 +5,7 @@
 // configured here; they are pinned in the app build.
 return [
     'live'            => false,       // presentation gate; set true only when trading is actually enabled in the app
-    'launch_at'       => 1796342400,  // countdown target, unix time (2026-12-04T00:00:00Z)
+    'launch_at'       => null,        // when it went live, unix time; only served once live is true
     'min_app_version' => null,        // e.g. '1.0.0' to ask older apps to update; null = no floor
     // libp2p multiaddrs where makers register, so the app can discover peers. Must start
     // with /ip4 /ip6 /dns4 /dns6 /dnsaddr (others are dropped). A hostile value can only

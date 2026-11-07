@@ -10,7 +10,7 @@ and to blockchain nodes to actually trade.
 ```json
 {
   "live": false,
-  "launch_at": 1796342400,
+  "launch_at": null,
   "min_app_version": null,
   "rendezvous": ["/dns4/.../tcp/.../p2p/12D3KooW..."],
   "pairs": [{"pair":"XMZ/BTC","status":"beta","fee":"0.1%-0.5%"}, ...],
@@ -21,8 +21,8 @@ Owner-controlled via `monzero-private/dex-status.php` (validated server-side;
 malformed rendezvous multiaddrs are dropped). Source: `website/dex/api.php`.
 
 ## What the app does with it
-1. **Gate the DEX UI.** If `live` is false (or `now < launch_at`), show "coming soon"
-   / the countdown; do not offer trading. (This is presentation only — real trading is
+1. **Gate the DEX UI.** If `live` is false, show "coming soon"; do not offer
+   trading. No launch date is published: `launch_at` stays null until `live` is true. (This is presentation only — real trading is
    also gated by the signed operator control document in `DexRiskControl`.)
 2. **Nudge updates.** If `min_app_version` is set and newer than this build, show an
    "update to trade" prompt.

@@ -42,7 +42,7 @@ messages = (
     + "<h3>Short description (about 50 words)</h3>"
     + snip("Monzero (XMZ) is a private, community-run digital currency. Amounts are hidden with RingCT, senders are hidden in rings of 16, and every payment goes to a one-time address. It is mined with ordinary CPUs (RandomX), has no premine or token sale, and its wallets run on desktop, Android and in the browser.")
     + "<h3>Long description (about 120 words)</h3>"
-    + snip("Monzero (XMZ) is an independent privacy currency built from the Monero codebase, with its own chain since 25 August 2026. Every transaction is private by default: RingCT hides amounts, ring signatures of 16 hide the sender, and one-time addresses hide the receiver. XMZ is mined, not sold: RandomX proof of work runs on ordinary CPUs, there was no ICO or token sale, and a permanent tail emission keeps miners paid. Wallets are available for Windows, Linux, Android and the browser (wallet.monzero.org), with signed releases anyone can verify. The project is building a decentralized exchange based on atomic swaps, so XMZ can be traded for Bitcoin and other coins without custodians, bridges or wrapped tokens. All source code is public.")
+    + snip("Monzero (XMZ) is an independent privacy currency built from the Monero codebase, with its own chain since 25 August 2026. Every transaction is private by default: RingCT hides amounts, ring signatures of 16 hide the sender, and one-time addresses hide the receiver. XMZ is mined, not sold: RandomX proof of work runs on ordinary CPUs, there was no ICO or token sale, and a permanent tail emission keeps miners paid. Wallets are available for Linux, Android and the browser (wallet.monzero.org), with signed releases anyone can verify. The project is building a decentralized exchange based on atomic swaps, so XMZ can be traded for Bitcoin and other coins without custodians, bridges or wrapped tokens. All source code is public.")
 )
 
 talking = cards([
@@ -120,7 +120,7 @@ faq = [
     ("Where can I buy XMZ? What's the price?", "XMZ is not listed on exchanges yet and has no market price; we don't discuss price. Listing waits until mining is spread out enough. A no-custody DEX is in testing (monzero.org/roadmap)."),
     ("Is there an airdrop?", "No airdrop is live. A community rewards programme for real work (running nodes, testing, translations) is being designed and will be announced only on official channels. Anything asking you to claim tokens is a scam."),
     ("Is there an XMZ token on Solana / Ethereum / BNB Chain?", "No. XMZ exists only on the Monzero blockchain. Any token elsewhere claiming to be Monzero is not ours."),
-    ("Which wallet should I use?", "The graphical wallet for Windows, the command-line wallet for Linux and Windows, the Android wallet, or the web wallet at wallet.monzero.org, all from monzero.org/download. Write down the 25-word recovery phrase on paper; the same phrase works in all of them."),
+    ("Which wallet should I use?", "The graphical or command-line wallet for Linux, the Android wallet, or the web wallet at wallet.monzero.org, all from monzero.org/download. Write down the 25-word recovery phrase on paper; the same phrase works in all of them."),
     ("How do I mine?", "With any modern CPU: join the pool (pool.monzero.org, 1% fee, hourly payouts) or mine solo against a node. Guides at monzero.org/mining."),
     ("Is the DEX live?", "Not for the public yet. Real-funds tests by the project have run on mainnet (XMZ ↔ BNB done, Bitcoin in progress). It will open in gated stages with small limits (monzero.org/objectives)."),
     ("Is it safe? Has it been audited?", "The code is open source and releases are signed, but it has not been independently audited yet. Use small amounts and report problems privately to security@monzero.org."),
@@ -182,7 +182,7 @@ visuals = (
     "<h3>Logos and banners</h3><p>Use the official files from the <a href=\"/press/#logos\">press kit</a>: emblem, coin logo, wordmark and banners in several sizes. Do not recolour, stretch or add effects to the logo.</p>"
     '<div class="logos"><img src="/press/monzero-emblem-20261026-200.png" alt="Monzero emblem" width="100" height="100"><img src="/press/monzero-xmz-logo-200.png" alt="Monzero XMZ coin logo" width="100" height="100"></div>'
     "<h3>Brand colours</h3>" + swatches
-    + "<h3>App screenshots</h3><p>Desktop wallet (Microsoft Store edition, empty demo wallet). Click for full size (1600 px).</p>" + gallery
+    + "<h3>App screenshots</h3><p>Desktop wallet (empty demo wallet). Click for full size (1600 px).</p>" + gallery
     + "<p class=\"muted\">Never post a screenshot that shows a real recovery phrase, private key or a wallet you use.</p>"
 )
 

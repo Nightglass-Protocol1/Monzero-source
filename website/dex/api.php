@@ -28,7 +28,7 @@ function dexPrivateDir(): string {
 // rendezvous/min_app_version via monzero-private/dex-status.php.
 $cfg = [
     'live' => false,
-    'launch_at' => 1796342400, // 2026-12-04T00:00:00Z
+    'launch_at' => null,        // no date is published before the DEX is live
     'min_app_version' => null,  // e.g. "1.0.0" to require a recent app; null = no floor
     'rendezvous' => [],         // libp2p multiaddrs where makers register (owner-set)
     'pairs' => [
@@ -59,7 +59,7 @@ if (is_file($path) && !is_link($path)) {
 echo json_encode([
     'schema' => 'monzero-dex-bootstrap-v1',
     'live' => $cfg['live'],
-    'launch_at' => $cfg['launch_at'],
+    'launch_at' => $cfg['live'] ? $cfg['launch_at'] : null,
     'min_app_version' => $cfg['min_app_version'],
     'rendezvous' => $cfg['rendezvous'],
     'pairs' => $cfg['pairs'],

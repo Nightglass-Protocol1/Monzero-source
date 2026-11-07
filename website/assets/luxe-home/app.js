@@ -194,10 +194,10 @@
   // Verified roadmap phases, not gamified or invented progress percentages.
   const phases = [
     { badge: '● RELEASED', title: ['The network is real.', 'And running.'],
-      description: 'Monzero core v1.0.0, Windows and Linux command-line packages, the Windows GUI update, an explorer and mining tools have been published. Check release limitations before installing.',
+      description: 'Monzero core v1.0.0, Linux graphical and command-line packages, web and Android wallets, an explorer and mining tools have been published. Check release limitations before installing.',
       checks: ['Independent mainnet and RandomX PoW', 'Core software and wallet downloads', 'Explorer, mining and community tools'], url: 'https://monzero.org/download/', link: 'View release evidence' },
     { badge: '◌ IN DEVELOPMENT', title: ['Testing the edges.', 'Building the future.'],
-      description: 'Native Windows validation and broader wallet and ecosystem work continue. The roadmap records public testnet swap evidence, mobile-wallet emulator results and DEX engineering—but not an enabled public trading service.',
+      description: 'Broader wallet and ecosystem work continues. The roadmap records public testnet swap evidence, mobile-wallet emulator results and DEX engineering—but not an enabled public trading service.',
       checks: ['Mobile wallet / miner: emulator checks reported', 'DEX: individual testnet and funded mainnet trials', 'Security review and release acceptance pending'], url: 'https://monzero.org/roadmap/', link: 'Read engineering updates' },
     { badge: '○ CONDITIONAL', title: ['No shortcuts.', 'No invented dates.'],
       description: 'Broader exchange access, public trading infrastructure and other proposed services depend on testing, security review, recovery checks and operator acceptance. There is no committed public launch date.',
