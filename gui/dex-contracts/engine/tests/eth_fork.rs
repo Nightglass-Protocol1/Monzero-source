@@ -138,7 +138,8 @@ async fn swap_completes_on_chain_one() {
     let gained = balance(&w.url, w.terms.claimer).await - before;
     assert!(gained > w.terms.value - U256::from(1_000_000_000_000_000u64) && gained <= w.terms.value, "claimer received the value less gas: {gained}");
 
-    // The owner reads the secret straight away, without the wait, and can sweep the XMZ
+    // The owner reads the secret without the finality wait, two blocks later, and can sweep the XMZ
+    mine(&w.url, Chain::EthMainnet.search_lag()).await;
     assert_eq!(w.owner.revealed(&swap).await.unwrap(), Some(Revealed::Claimed(w.claim_secret)));
 }
 
@@ -150,6 +151,7 @@ async fn owner_gets_a_refund_back_on_chain_one() {
     let before = balance(&w.url, w.terms.owner).await;
     send(&w.owner, &EvmCall::Refund(swap.clone(), w.refund_secret), &w.url).await;
     assert!(balance(&w.url, w.terms.owner).await > before, "owner received the value back");
+    mine(&w.url, Chain::EthMainnet.search_lag()).await;
     assert_eq!(w.claimer.revealed(&swap).await.unwrap(), Some(Revealed::Refunded(w.refund_secret)));
 }
 

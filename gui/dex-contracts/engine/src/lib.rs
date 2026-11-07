@@ -130,6 +130,16 @@ impl Chain {
         }
     }
 
+    /// Blocks a search for revealed secrets stays behind the head. Public endpoints balance
+    /// over nodes a block or two apart, and a lagging node refuses a search that reaches past
+    /// its own head.
+    pub fn search_lag(self) -> u64 {
+        match self {
+            Chain::Local => 0,
+            _ => 2,
+        }
+    }
+
     /// Blocks after a transaction before the app acts on it. BNB Chain has fast finality
     /// (about 2 blocks); this keeps a margin for testnet reorganisations and lagging RPCs.
     /// Ethereum finalizes after two to three epochs: the finalized block is 65-96 behind the

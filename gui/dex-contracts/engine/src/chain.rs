@@ -223,7 +223,11 @@ impl EvmChain for AlloyChain {
             .event_signature(vec![XmzSwap::Claimed::SIGNATURE_HASH, XmzSwap::Refunded::SIGNATURE_HASH])
             .topic1(crate::swap_id(swap));
         let head = self.reader.get_block_number().await.map_err(chain_err)?;
-        let logs = self.logs(crate::swap_id(swap), &filter, head).await?;
+        let to = head.saturating_sub(self.chain.search_lag());
+        if to < self.from_block {
+            return Ok(None);
+        }
+        let logs = self.logs(crate::swap_id(swap), &filter, to).await?;
         Ok(revealed_secret(&logs, self.contract, swap))
     }
 
