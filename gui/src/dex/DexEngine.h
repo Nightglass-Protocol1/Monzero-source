@@ -319,6 +319,7 @@ public:
     int litecoinReconnectsForTesting() const;
 #endif
     bool startLitecoinRecovery(const QByteArray &reservedPsbt);
+    void maybeStartLitecoinLightRecovery();  // (re)start light-funder peer recovery once prepared + allowed
     QVariantMap litecoinLightFundingStatus() const;
     Q_INVOKABLE bool useLitecoinLightWallet();
     Q_INVOKABLE bool queryLitecoinLightTerms();

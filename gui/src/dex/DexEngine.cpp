@@ -427,7 +427,13 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     connect(m_ltcReservation,&LitecoinReservationJob::changed,this,&DexEngine::litecoinReservationChanged);
     connect(m_ltcLightFunding,&LitecoinLightFundingController::changed,this,&DexEngine::litecoinStateChanged);
     connect(this,&DexEngine::lightWalletsChanged,this,&DexEngine::litecoinStateChanged);
-    connect(m_ltcLightFunding,&LitecoinLightFundingController::prepared,this,[this](const QByteArray &psbt){if(litecoinLightFundingAllowed())startLitecoinRecovery(psbt);});
+    // The light funder starts peer recovery once its lock PSBT is prepared. prepared() is a one-shot and
+    // can fire while the app is still marked busy from the prepare op, when litecoinLightFundingAllowed()
+    // is transiently false and the start would be silently dropped (the swap then stalls forever at
+    // recoveryState=not-started). So attempt it on prepared AND retry on each funding-state change via a
+    // queued call, once the busy flag clears. startRecovery() is self-guarded, so retries are safe no-ops.
+    connect(m_ltcLightFunding,&LitecoinLightFundingController::prepared,this,[this](const QByteArray &){maybeStartLitecoinLightRecovery();});
+    connect(m_ltcLightFunding,&LitecoinLightFundingController::changed,this,&DexEngine::maybeStartLitecoinLightRecovery,Qt::QueuedConnection);
     connect(this,&DexEngine::litecoinNegotiationChanged,this,&DexEngine::litecoinReservationChanged);
     connect(m_ltcReservation,&LitecoinReservationJob::prepared,this,[this](const QByteArray &psbt){startLitecoinRecovery(psbt);});
     connect(m_ltcJournal,&LitecoinJournalJob::changed,this,&DexEngine::litecoinJournalChanged);
@@ -1075,6 +1081,14 @@ bool DexEngine::reviewLitecoinLockFunding() {return !litecoinLightFundingSelecte
 bool DexEngine::submitLitecoinLockFunding(const QString &commitment) {return !litecoinLightFundingSelected() && litecoinOperationAllowed() && m_ltcReservation->submitFunding(commitment);}
 bool DexEngine::prepareLitecoinReservation() {return !litecoinLightFundingSelected() && litecoinOperationAllowed() && litecoinReservationStatus().value("canPrepare").toBool() && m_ltcReservation->prepare();}
 bool DexEngine::startLitecoinRecovery(const QByteArray &psbt) { return litecoinOperationAllowed() && m_ltcNegotiation && m_ltcNegotiation->startRecovery(psbt); }
+void DexEngine::maybeStartLitecoinLightRecovery() {
+    // Retry-safe entry point for starting the light funder's peer recovery: litecoinLightFundingAllowed()
+    // and startRecovery()'s own guards make this a no-op unless the light path is selected, its lock PSBT
+    // is prepared, and recovery has not already started. Called on prepared() and on each funding change.
+    if (!litecoinLightFundingAllowed()) return;
+    const auto psbt = m_ltcLightFunding->status().value("result").toMap().value("fundingPsbt").toString().toLatin1();
+    if (!psbt.isEmpty()) startLitecoinRecovery(psbt);
+}
 QVariantMap DexEngine::litecoinJournalStatus() const { return litecoinAppView(m_ltcJournal->status()); }
 bool DexEngine::configureLitecoinJournal(const QString &path) {
     if (!m_ltcJournal->configure(path)) return false;
