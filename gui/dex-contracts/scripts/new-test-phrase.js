@@ -17,5 +17,5 @@ const account = (i) => ethers.HDNodeWallet.fromPhrase(mnemonic, undefined, `m/44
 fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
 fs.writeFileSync(out, JSON.stringify({ mnemonic, purpose: "Monzero DEX real-funds test only" }) + "\n", { mode: 0o600, flag: "wx" });
 console.log(`Saved ${out} (private, 0600). Back it up like any wallet while it holds funds.`);
-console.log(`Buyer  (account 0, pays BNB):  ${account(0)}`);
+console.log(`Buyer  (account 0, pays BNB or ETH):  ${account(0)}`);
 console.log(`Seller (account 1, sells XMZ): ${account(1)}`);
