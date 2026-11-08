@@ -261,6 +261,20 @@ def cmd_offers(a):
                   f"  ({(l['expiresAt'] - now) // 60} min left)")
 
 
+MAX_XMZ_FEE_ATOMS = 10_000_000_000  # largest XMZ claim/refund fee cap a trade may sign (0.1 XMZ)
+
+
+def xmz_payout(xmz_atoms, claim_fee_max, refund_fee_max):
+    """The buyer's payout: the lock less the fee reserve (the larger cap); None when it cannot be."""
+    try:
+        lock, claim, refund = int(xmz_atoms), int(claim_fee_max), int(refund_fee_max)
+    except (TypeError, ValueError):
+        return None
+    if not (0 < claim <= MAX_XMZ_FEE_ATOMS and 0 < refund <= MAX_XMZ_FEE_ATOMS) or lock <= max(claim, refund):
+        return None
+    return str(lock - max(claim, refund))
+
+
 def build_terms(maker_role, listing, params, maker_card, taker_card, taker_addresses):
     k = kit()
     terms = {"schema": k.SCHEMA, "quoteId": str(uuid4()), "swapId": str(uuid4()), "appFeeXmzAtoms": "0",
@@ -273,6 +287,10 @@ def build_terms(maker_role, listing, params, maker_card, taker_card, taker_addre
             if value is None:
                 fail(f"no value for {f}")
             terms[f] = str(value)
+    payout = xmz_payout(terms["xmzAtoms"], terms["xmzClaimFeeMaxAtoms"], terms["xmzRefundFeeMaxAtoms"])
+    if payout is None:
+        fail("the XMZ amount does not cover the fee reserve")
+    terms["xmzPayoutAtoms"] = payout
     return k.canonical(terms), terms
 
 
@@ -372,6 +390,9 @@ def cmd_take(a):
                 "ltcFunder" if me.role == "ltc" else "xmzFunder": me.card["funderKey"],
                 "ltcFunder" if maker_role == "ltc" else "xmzFunder": listing["makerKey"], **addresses}
             wrong = [f for f, v in expected.items() if terms.get(f) != v]
+            payout = xmz_payout(terms.get("xmzAtoms"), terms.get("xmzClaimFeeMaxAtoms"), terms.get("xmzRefundFeeMaxAtoms"))
+            if payout is None or terms.get("xmzPayoutAtoms") != payout:
+                wrong.append("xmzPayoutAtoms")
             policy = letter.get("policy")
             if wrong or not isinstance(policy, dict) or policy.get("ltc_network") != terms["ltcNetwork"]:
                 fail("the maker's terms differ from its offer: " + ", ".join(wrong or ["policy"]))

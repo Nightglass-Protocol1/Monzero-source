@@ -826,6 +826,7 @@ int main(int argc, char *argv[])
             bool portOk=false;const auto override=qEnvironmentVariable("MONZERO_DEX_XMZ_DAEMON_PORT").toUShort(&portOk);
             const quint16 daemon=portOk && override ? override : quint16(mainnet ? 6175 : 16175);
             const auto root=QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(mainnet ? "dex/mainnet" : "dex/testnet");
+            dexEngine.setJournalHelper(QCoreApplication::applicationDirPath()+QString::fromLatin1(BundledDexHelpers::journalRelativePath));
             if (!dexEngine.configureDexWallets(root,rpc,QString::fromLatin1(rpcHash.result().toHex()),daemon,mainnet ? QString() : QStringLiteral("--testnet"),
                     QCoreApplication::applicationDirPath()+QString::fromLatin1(BundledDexHelpers::evmRelativePath),QString::fromLatin1(BundledDexHelpers::evmSha256)))
                 qWarning("The DEX trading wallet could not start");

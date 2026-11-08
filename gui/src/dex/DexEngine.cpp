@@ -25,6 +25,10 @@
 #include "DexRiskControl.h"
 #include "DexDeployment.h"
 #include <QJsonArray>
+#include "BtcTradeSetup.h"
+#include <QCoreApplication>
+#include <QNetworkReply>
+#include <QNetworkAccessManager>
 #include "BchAdmissionProtocol.h"
 #include "LitecoinJournalProtocol.h"
 #include "SwapWalletRpcProcess.h"
@@ -197,6 +201,7 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     m_dexWallets=new DexWalletService(this);
     connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::dexWalletChanged);
     connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::setUpEvmMarkets);
+    connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::setUpUtxoMarket);
     connect(m_btcMarket,&BtcMarketJob::changed,this,&DexEngine::btcMarketChanged);
     connect(m_btcMarket,&BtcMarketJob::agreed,this,[this](const QString &app){
         m_btcMessage=tr("Trade agreed through the relay. Review it below and start it: %1").arg(app);emit btcMarketChanged();
@@ -891,6 +896,103 @@ void DexEngine::setUpEvmMarkets() {
         if (!addEvmMarket(path)) qWarning("The DEX market for chain %d could not start",c.id);
     }
 }
+namespace {
+// Trade settings of each swap network: confirmations and timelocks, the fee of each contract spend,
+// fee ceilings, the smallest output and largest lock. Sized for the opening limits ($25 a trade).
+struct UtxoDefaults {int confirmations,cancelBlocks,punishBlocks;qint64 spendFee,fundingFeeMax,recoveryFeeMax,minimumOutput,maximumLock;};
+UtxoDefaults utxoDefaults(const QString &network) {
+    if (network=="btc-mainnet") return {2,36,10,2000,20000,20000,10000,1000000};
+    if (network.startsWith("btc-")) return {1,36,10,2000,20000,20000,10000,10000000};
+    return {network=="ltc-mainnet" ? 2 : 1,72,20,10000,100000,50000,100000,100000000};
+}
+// Electrum servers the trade journal may use besides the wallet's own (it needs two independent ones)
+QJsonArray electrumServers(const QString &network,const QJsonObject &own) {
+    QJsonArray servers;QSet<QString> seen;
+    const auto add=[&](const QString &host,int port){
+        const auto key=host.toLower()+":"+QString::number(port);
+        if (host.isEmpty() || port<1 || port>65535 || seen.contains(key) || servers.size()>=8) return;
+        seen.insert(key);servers.append(QJsonObject{{"host",host},{"port",port}});
+    };
+    if (!own.isEmpty()) add(own.value("host").toString(),own.value("port").toInt());
+    for (const auto &entry:qEnvironmentVariable("MONZERO_DEX_ELECTRUM").split(',',Qt::SkipEmptyParts))
+        add(entry.section(':',0,-2).trimmed(),entry.section(':',-1).toInt());
+    if (network=="btc-mainnet") {add("electrum.acinq.co",50002);add("electrum.hodlister.co",50002);add("electrum2.bluewallet.io",443);}
+    if (network=="ltc-mainnet") {add("electrum-ltc.bysh.me",50002);add("backup.electrum-ltc.org",443);add("electrum1.cipig.net",20063);}
+    return servers;
+}
+}
+void DexEngine::setUpUtxoMarket() {
+    if (m_utxoAuto || m_btcMarket->status().value("configured").toBool()) return;
+    const auto network=DexDeployment::litecoinNetwork();
+    if (BtcTradeSetup::pairOf(network).isEmpty() || network.endsWith("regtest")) return;
+    const auto xmz=m_dexWallets->utxoLocal();
+    auto *light=swapLight();
+    if (xmz.isEmpty() || !light || m_journalHelper.isEmpty()) return;
+    connect(light,&LitecoinLightJob::changed,this,&DexEngine::setUpUtxoMarket,Qt::UniqueConnection);
+    const auto note=[this](const QString &why){if (m_utxoMessage!=why) {m_utxoMessage=why;emit btcMarketChanged();}};
+    if (!light->walletConfigured()) {note(tr("Set up your %1 light wallet to trade %1 offers.").arg(DexDeployment::swapCoinName()));return;}
+    const auto servers=electrumServers(network,light->lightEndpoint());
+    if (servers.size()<2) {note(tr("Trading %1 needs two Electrum servers; add one with MONZERO_DEX_ELECTRUM.").arg(DexDeployment::swapCoinName()));return;}
+    // The XMZ chain's genesis: fixed on mainnet, asked of the local daemon otherwise
+    if (m_xmzGenesis.isEmpty()) {
+        if (DexDeployment::mainnetStage()) m_xmzGenesis=DexDeployment::xmzMainnetGenesis();
+        else {
+            static bool asking=false;
+            if (asking) return;
+            asking=true;
+            auto *net=new QNetworkAccessManager(this);
+            QNetworkRequest request(QUrl(QStringLiteral("http://127.0.0.1:%1/json_rpc").arg(m_dexWallets->daemonPort())));
+            request.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
+            auto *reply=net->post(request,QJsonDocument(QJsonObject{{"jsonrpc","2.0"},{"id","0"},{"method","get_block_header_by_height"},
+                {"params",QJsonObject{{"height",0}}}}).toJson(QJsonDocument::Compact));
+            connect(reply,&QNetworkReply::finished,this,[this,reply,net]{
+                asking=false;
+                const auto hash=QJsonDocument::fromJson(reply->readAll()).object().value("result").toObject().value("block_header").toObject().value("hash").toString();
+                reply->deleteLater();net->deleteLater();
+                static const QRegularExpression hex("\\A[0-9a-f]{64}\\z");
+                if (hex.match(hash).hasMatch() && hash!=DexDeployment::xmzMainnetGenesis()) {m_xmzGenesis=hash;setUpUtxoMarket();}
+            });
+            return;
+        }
+    }
+    // The user's own BTC/LTC address for payouts and refunds, from the light wallet
+    const auto address=light->receivedAddress();
+    if (address.isEmpty()) {
+        if (!m_utxoAsked && !light->busy()) m_utxoAsked=light->receiveCurrentWallet();
+        return;
+    }
+    m_utxoAuto=true;
+    const auto d=utxoDefaults(network);
+    const auto xmzNetwork=DexDeployment::mainnetStage() ? QStringLiteral("xmz-mainnet") : QStringLiteral("xmz-testnet");
+    const QJsonObject policy{{"ltc_network",network},{"xmz_network",xmzNetwork},{"xmz_genesis",m_xmzGenesis},{"ltc_confirmations",d.confirmations},
+        {"xmz_confirmations",10},{"cancel_blocks",d.cancelBlocks},{"punish_blocks",d.punishBlocks},{"maximum_ltc_atoms",double(d.maximumLock)},
+        {"maximum_xmz_atoms",1e17},{"maximum_ltc_funding_fee",double(d.fundingFeeMax)},{"maximum_ltc_recovery_fee",double(d.recoveryFeeMax)},
+        {"maximum_xmz_fee",double(BtcTradeSetup::MaxXmzFeeAtoms)},{"minimum_ltc_output",double(d.minimumOutput)},{"minimum_relay_fee_atoms_per_kb",1000}};
+    const auto n=[](qint64 v){return QString::number(v);};
+    const auto xmzAddress=xmz.value("sourceAddress").toString();
+    // xmzPayoutAtoms is worked out for each offer from its amount (BtcTradeSetup::xmzPayout)
+    const QJsonObject params{{"ltcGenesis",DexDeployment::litecoinGenesis()},{"xmzGenesis",m_xmzGenesis},{"ltcNetwork",network},{"xmzNetwork",xmzNetwork},
+        {"ltcPayout",address},{"ltcRefund",address},{"xmzPayout",xmzAddress},{"xmzRefund",xmzAddress},
+        {"ltcFundingFeeMaxAtoms",n(d.fundingFeeMax)},{"xmzNativeFeeMaxAtoms",n(BtcTradeSetup::MaxXmzFeeAtoms)},
+        {"ltcCancelFeeAtoms",n(d.spendFee)},{"ltcRefundFeeAtoms",n(d.spendFee)},{"ltcRedeemFeeAtoms",n(d.spendFee)},
+        {"ltcPunishFeeAtoms",n(d.spendFee)},{"ltcEarlyRefundFeeAtoms",n(d.spendFee)},
+        {"ltcConfirmations",n(d.confirmations)},{"xmzConfirmations","10"},{"cancelBlocks",n(d.cancelBlocks)},{"punishBlocks",n(d.punishBlocks)},
+        {"ltcMinimumOutputAtoms",n(d.minimumOutput)},{"ltcMinimumRelayFeeAtomsPerKb","1000"},{"xmzPayoutAtoms","0"},
+        {"xmzClaimFeeMaxAtoms",n(BtcTradeSetup::MaxXmzFeeAtoms)},{"xmzRefundFeeMaxAtoms",n(BtcTradeSetup::MaxXmzFeeAtoms)}};
+    QJsonArray relays;for (const auto &r:defaultRelays()) relays.append(r);
+    const auto root=m_dexWallets->root();
+    const QJsonObject config{{"schema","monzero-private-btc-market-v1"},{"network",network},{"relays",relays},
+        {"tradesDir",root+"/utxo-trades/"+network},
+        {"journalHelper",m_journalHelper},
+        {"local",QJsonObject{{"litecoin",QJsonObject{{"light",QJsonObject{{"servers",servers},{"maximumTipAge",5400}}}}},{"xmz",xmz}}},
+        {"params",params},{"policy",policy}};
+    const auto path=root+"/utxo-market-"+network+".json";
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly|QIODevice::Truncate) || !f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner)) {m_utxoAuto=false;return;}
+    f.write(QJsonDocument(config).toJson(QJsonDocument::Compact));f.close();
+    if (!configureBtcMarket(path)) {qWarning("The DEX %s market could not start",qPrintable(network));note(tr("The %1 offers could not start.").arg(DexDeployment::swapCoinName()));return;}
+    note({});
+}
 bool DexEngine::configureEvmMarket(const QString &config,const QString &seedFile) {
     if (!QDir::isAbsolutePath(seedFile) || QDir::cleanPath(seedFile)!=seedFile) return false;
     m_evmSeedFile=seedFile;
@@ -999,7 +1101,7 @@ bool DexEngine::configureBtcMarket(const QString &config) {
     if (m_btcMarket->network()!=DexDeployment::litecoinNetwork()) return false;
     m_btcTicker->start();return true;
 }
-QVariantMap DexEngine::btcMarketStatus() const {auto s=m_btcMarket->status();s.insert("message",m_btcMessage);return s;}
+QVariantMap DexEngine::btcMarketStatus() const {auto s=m_btcMarket->status();s.insert("message",m_btcMessage.isEmpty() ? m_utxoMessage : m_btcMessage);return s;}
 bool DexEngine::refreshBtcOffers() {return m_btcMarket->refreshListings();}
 QString DexEngine::btcOfferRefusal(const QString &sats,const QString &atoms) {
     bool satsOk=false,atomsOk=false;

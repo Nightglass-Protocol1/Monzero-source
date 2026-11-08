@@ -247,6 +247,14 @@ public:
     // Writes and starts the ETH/BNB markets of this stage on the app's own wallets (no hand-made configs)
     void setUpEvmMarkets();
     static QStringList defaultRelays();
+    // Writes and starts the BTC/LTC market of this stage (trade kit layout) on the app's wallets and
+    // the user's light wallet; waits until both are ready and the light wallet gave an address
+    void setUpUtxoMarket();
+    bool m_utxoAuto=false,m_utxoAsked=false;
+    QString m_journalHelper;
+    // The bundled journal helper the BTC/LTC market uses (set at startup, before the wallets start)
+    void setJournalHelper(const QString &path) {m_journalHelper=path;}
+    QString m_xmzGenesis,m_utxoMessage;
     bool m_evmAuto=false;
     QVariantMap evmMarketStatus() const;
     Q_INVOKABLE bool refreshEvmOffers(const QString &pair);

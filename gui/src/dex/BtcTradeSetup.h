@@ -38,6 +38,10 @@ QJsonObject checkListing(const QJsonObject &signedListing,qint64 now=0);
 
 // The maker's terms: the offer's amounts, both keys, both sides' destinations, the maker's other
 // parameters, a fresh quote id and swap id, and an expiry QuoteSeconds from `now`
+// Largest XMZ claim/refund fee cap a trade may sign (0.1 XMZ)
+constexpr quint64 MaxXmzFeeAtoms=10000000000ULL;
+// The buyer's XMZ payout for a lock (decimal atoms); empty when the lock does not cover the reserve
+QString xmzPayout(const QString &xmzAtoms,const QString &claimFeeMax,const QString &refundFeeMax);
 QByteArray buildTerms(const QString &makerRole,const QJsonObject &listing,const QJsonObject &params,
     const QJsonObject &makerCard,const QJsonObject &takerCard,const QJsonObject &takerAddresses,qint64 now,QString *error);
 // Canonical terms with every field a string; empty object if not

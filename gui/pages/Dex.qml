@@ -2764,6 +2764,13 @@ Later addresses may be missing from this backup. Payment and active swap recover
                 }
             }
             M.TextPlain {
+                // BTC/LTC offers start by themselves once the light wallet and the trading wallet are ready
+                objectName: "dexUtxoSetup"
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.dimmedFontColor
+                visible: root.btcMarket.configured !== true && (root.btcMarket.message || "") !== ""
+                text: root.btcMarket.message || ""
+            }
+            M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.errorColor
                 visible: (tradingSetup.w.keysMessage || "") !== ""
                 text: tradingSetup.w.keysMessage || ""

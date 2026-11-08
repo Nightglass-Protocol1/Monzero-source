@@ -18,6 +18,8 @@ const QString RequestSchema="monzero-xmz-evm-helper-request-v1";
 const QString WalletName="dex";
 // The trading wallet's service binding (a fixed id; the folder is the app's own)
 const QString MainServiceId="6d6f6e7a-6572-4f64-8578-77616c6c6574";
+const QString ClaimServiceId="6d6f6e7a-6572-4f64-8578-636c61696d73";
+const QString ObserverServiceId="6d6f6e7a-6572-4f64-8578-6f6273657276";
 // A port kept next to a service folder: the service binding records it, so a restart reuses it
 quint16 keptPort(const QString &path,quint16 fresh) {
     QFile f(path);
@@ -61,70 +63,101 @@ bool DexWalletService::configure(const QString &root,const QString &walletRpc,co
     m_state="configured";emit changed();return true;
 }
 
-bool DexWalletService::start() {
-    if (m_state!="configured" && m_state!="stopped" && m_state!="failed") return false;
-    if (!privateDir(m_root)) {m_state="failed";m_error=tr("The DEX folder could not be created.");emit changed();return false;}
-    // The trading wallet's password, made once; the service folder holds only the service's files
-    const auto passwordPath=m_root+"/xmz-wallet.password";
-    if (!QFile::exists(passwordPath)) {
-        QByteArray secret(24,'\0');randombytes_buf(secret.data(),secret.size());
-        auto hex=secret.toHex();sodium_memzero(secret.data(),secret.size());
-        QFile f(passwordPath);
-        const bool ok=f.open(QIODevice::WriteOnly|QIODevice::NewOnly) && f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner) && f.write(hex)==hex.size();
-        sodium_memzero(hex.data(),hex.size());
-        if (!ok) {m_state="failed";m_error=tr("The DEX wallet password could not be saved.");emit changed();return false;}
-    }
-    const auto serviceDir=m_root+"/xmz-wallet";
-    if (!QFileInfo::exists(serviceDir) && !privateDir(serviceDir)) return false;
-    // After the app was closed abruptly, the trading wallet's service is left "active" or
-    // "recovery-required". It holds no swap state (only the wallet files), so once nothing holds
-    // its lock or port it may resume. Trade services never take this path.
+bool DexWalletService::makePasswordFile(const QString &path) {
+    if (QFile::exists(path)) return true;
+    QByteArray secret(24,'\0');randombytes_buf(secret.data(),secret.size());
+    auto hex=secret.toHex();sodium_memzero(secret.data(),secret.size());
+    QFile f(path);
+    const bool ok=f.open(QIODevice::WriteOnly|QIODevice::NewOnly) && f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner) && f.write(hex)==hex.size();
+    sodium_memzero(hex.data(),hex.size());
+    return ok;
+}
+
+// After the app was closed abruptly, an app service is left "active" or "recovery-required". The
+// app's own services hold no swap state (only wallet files), so once nothing holds the lock or
+// port they may resume. Per-trade swap services never take this path.
+bool DexWalletService::resumeAfterUncleanExit(const QString &serviceDir,const QString &portPath) {
+    if (!QFileInfo::exists(serviceDir+"/service.binding")) return true;
     const auto statePath=serviceDir+"/service.state";
-    if (QFileInfo::exists(serviceDir+"/service.binding")) {
-        QFile state(statePath);
-        const auto recorded=state.open(QIODevice::ReadOnly) ? state.read(65) : QByteArray();state.close();
-        if (recorded!="monzero-swap-rpc-v1\nstopped\n") {
-            QLockFile lock(serviceDir+"/service.lock");lock.setStaleLockTime(0);
-            const quint16 port=keptPort(m_root+"/xmz-wallet.port",0);
-            QTcpServer probe;
-            const bool portFree=port && probe.listen(QHostAddress::LocalHost,port);probe.close();
-            if (!lock.tryLock(0) || !portFree) {m_state="failed";m_error=tr("The DEX wallet service is still running from an earlier session.");emit changed();return false;}
-            for (const auto &name:QDir(serviceDir).entryList({"monzero-wallet-rpc.*.login"},QDir::Files)) QFile::remove(serviceDir+"/"+name);
-            QSaveFile reset(statePath);
-            const QByteArray stopped="monzero-swap-rpc-v1\nstopped\n";
-            const bool ok=reset.open(QIODevice::WriteOnly) && reset.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner)
-                && reset.write(stopped)==stopped.size() && reset.commit();
-            lock.unlock();
-            if (!ok) {m_state="failed";m_error=tr("The DEX wallet service could not be resumed.");emit changed();return false;}
-            qWarning("DEX trading wallet: resumed after an unclean exit");
-        }
-    }
+    QFile state(statePath);
+    const auto recorded=state.open(QIODevice::ReadOnly) ? state.read(65) : QByteArray();state.close();
+    if (recorded=="monzero-swap-rpc-v1\nstopped\n") return true;
+    QLockFile lock(serviceDir+"/service.lock");lock.setStaleLockTime(0);
+    const quint16 port=keptPort(portPath,0);
+    QTcpServer probe;
+    const bool portFree=port && probe.listen(QHostAddress::LocalHost,port);probe.close();
+    if (!lock.tryLock(0) || !portFree) {m_error=tr("A DEX wallet service is still running from an earlier session.");return false;}
+    for (const auto &name:QDir(serviceDir).entryList({"monzero-wallet-rpc.*.login"},QDir::Files)) QFile::remove(serviceDir+"/"+name);
+    QSaveFile reset(statePath);
+    const QByteArray stopped="monzero-swap-rpc-v1\nstopped\n";
+    const bool ok=reset.open(QIODevice::WriteOnly) && reset.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner)
+        && reset.write(stopped)==stopped.size() && reset.commit();
+    lock.unlock();
+    if (!ok) {m_error=tr("A DEX wallet service could not be resumed.");return false;}
+    qWarning("DEX wallet service %s: resumed after an unclean exit",qPrintable(QFileInfo(serviceDir).fileName()));
+    return true;
+}
+
+bool DexWalletService::startService(const QString &name,const QString &id,QPointer<SwapWalletRpcProcess> &slot,quint16 &port,std::function<void()> listening) {
+    const auto serviceDir=m_root+"/"+name,portPath=m_root+"/"+name+".port";
+    if ((!QFileInfo::exists(serviceDir) && !privateDir(serviceDir)) || !resumeAfterUncleanExit(serviceDir,portPath)) return false;
     auto *service=new SwapWalletRpcProcess(this);
-    m_main=service;m_walletPort=keptPort(m_root+"/xmz-wallet.port",freePort());
+    slot=service;port=keptPort(portPath,freePort());
     service->setNetworkFlag(m_networkFlag);
-    connect(service,&SwapWalletRpcProcess::processStarted,this,[this]{
+    connect(service,&SwapWalletRpcProcess::processStarted,this,[this,service,name,listening]{
         // The login file appears once the service is listening
         auto *wait=new QTimer(this);wait->setInterval(250);
         auto tries=std::make_shared<int>(0);
-        connect(wait,&QTimer::timeout,this,[this,wait,tries]{
-            if (m_main && QFile::exists(m_main->loginFile())) {wait->stop();wait->deleteLater();openWallet();return;}
-            if (++*tries>240) {wait->stop();wait->deleteLater();m_state="failed";m_error=tr("The DEX wallet service did not start.");qWarning("DEX trading wallet: no login file at %s",m_main?qPrintable(m_main->loginFile()):"?");emit changed();}
+        connect(wait,&QTimer::timeout,this,[this,wait,tries,service,name,listening]{
+            if (QFile::exists(service->loginFile())) {wait->stop();wait->deleteLater();listening();return;}
+            if (++*tries>240) {
+                wait->stop();wait->deleteLater();m_state="failed";m_error=tr("The DEX wallet service did not start.");
+                qWarning("DEX wallet service %s: no login file at %s",qPrintable(name),qPrintable(service->loginFile()));emit changed();
+            }
         });
         wait->start();
     });
     connect(service,&SwapWalletRpcProcess::stopped,this,[this](bool clean){
-        m_poll.stop();m_state=clean?"stopped":"failed";if (!clean) m_error=tr("The DEX wallet service stopped unexpectedly.");emit changed();
+        if (m_stopping) return;
+        m_poll.stop();m_state=clean?"stopped":"failed";if (!clean) m_error=tr("A DEX wallet service stopped unexpectedly.");emit changed();
     });
-    m_state="starting";emit changed();
-    if (!service->startBoundWithDigest(m_walletRpc,m_walletRpcSha256,serviceDir,MainServiceId,m_daemonPort,m_walletPort)) {
-        m_state="failed";m_error=tr("The DEX wallet service was refused (its folder is in use or was not stopped cleanly).");emit changed();return false;
+    if (!service->startBoundWithDigest(m_walletRpc,m_walletRpcSha256,serviceDir,id,m_daemonPort,port)) {
+        m_error=tr("A DEX wallet service was refused (its folder is in use or was not stopped cleanly).");return false;
     }
     return true;
 }
 
+bool DexWalletService::start() {
+    if (m_state!="configured" && m_state!="stopped" && m_state!="failed") return false;
+    const auto fail=[this](const QString &why){m_state="failed";if (!why.isEmpty()) m_error=why;qWarning("DEX wallets: %s",qPrintable(m_error));emit changed();return false;};
+    if (!privateDir(m_root)) return fail(tr("The DEX folder could not be created."));
+    // Passwords made once: the trading wallet's, and the one the swap journal gives the wallets it creates
+    if (!makePasswordFile(m_root+"/xmz-wallet.password") || !makePasswordFile(m_root+"/claim-wallet.password"))
+        return fail(tr("The DEX wallet password could not be saved."));
+    m_state="starting";m_claimUp=m_observerUp=false;m_stopping=false;emit changed();
+    // The trading wallet (also the XMZ source when selling XMZ for BTC/LTC), the claim service the
+    // swap journal creates claim wallets in, and the observer service it watches XMZ locks with
+    if (!startService("xmz-wallet",MainServiceId,m_main,m_walletPort,[this]{openWallet();})) return fail({});
+    if (!startService("claim-wallets",ClaimServiceId,m_claim,m_claimPort,[this]{m_claimUp=true;emit changed();})) return fail({});
+    if (!startService("observer-wallets",ObserverServiceId,m_observer,m_observerPort,[this]{m_observerUp=true;emit changed();})) return fail({});
+    return true;
+}
+
+QJsonObject DexWalletService::utxoLocal() const {
+    if (!ready() || !m_claimUp || !m_observerUp || !m_claim || !m_observer || !m_main) return {};
+    const auto address=m_wallet.value("address").toString();
+    if (address.isEmpty()) return {};
+    return {{"daemonPort",m_daemonPort},{"claimWalletPort",m_claimPort},{"claimLoginFile",m_claim->loginFile()},
+        {"sourceWalletPort",m_walletPort},{"sourceLoginFile",m_main->loginFile()},{"sourceAddress",address},
+        {"observerWalletPort",m_observerPort},{"observerLoginFile",m_observer->loginFile()},
+        {"walletPasswordFile",m_root+"/claim-wallet.password"}};
+}
+
 void DexWalletService::stop() {
-    m_poll.stop();
+    m_poll.stop();m_stopping=true;
     if (m_main) m_main->stop();
+    if (m_claim) m_claim->stop();
+    if (m_observer) m_observer->stop();
     for (const auto &s:m_trades) if (s) s->stop();
 }
 

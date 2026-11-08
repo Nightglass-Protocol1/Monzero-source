@@ -57,6 +57,12 @@ public:
     // done(swapSeedHex, evmKeyHex, evmAddress) with empty values on failure; the caller wipes them.
     bool deriveEvmSwapKeys(const QString &password,quint32 account,std::function<void(QByteArray,QByteArray,QString)> done);
     bool vaultReady() const {return m_walletConfigured && m_vaultConfigured;}
+    // The Electrum server this wallet syncs from ({host, port}; empty when none)
+    QJsonObject lightEndpoint() const;
+    // The wallet's receiving address once a receive request answered (empty otherwise)
+    QString receivedAddress() const {return m_operation=="wallet-receive" ? m_wallet.value("address").toString() : QString();}
+    bool walletConfigured() const {return m_walletConfigured;}
+    bool busy() const {return operationBusy();}
     QString recoverySeed() const;
     QString recoveryPassphrase() const;
     void hideRecovery();

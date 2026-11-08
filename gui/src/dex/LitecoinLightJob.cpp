@@ -1146,3 +1146,9 @@ bool LitecoinLightJob::deriveEvmSwapKeys(const QString &password,quint32 account
     QTimer::singleShot(120000,process,[process]{if (process->state()!=QProcess::NotRunning) process->kill();});
     return true;
 }
+
+QJsonObject LitecoinLightJob::lightEndpoint() const {
+    if (!m_endpoint) return {};
+    const auto e=QJsonDocument::fromJson(m_config).object().value("endpoint").toObject();
+    return e.value("host").toString().isEmpty() ? QJsonObject{} : QJsonObject{{"host",e.value("host")},{"port",e.value("port").toInt()}};
+}

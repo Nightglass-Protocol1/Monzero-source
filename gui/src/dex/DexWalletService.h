@@ -37,16 +37,25 @@ public:
     void tradeService(const QString &tradeDir,const QString &tradeId,std::function<void(const QJsonObject&)> done);
     QString helper() const {return m_helper;}
     QString root() const {return m_root;}
+    // The XMZ wallet settings a BTC/LTC trade needs (trade kit "local.xmz"); empty until all services answer
+    QJsonObject utxoLocal() const;
+    QString networkFlag() const {return m_networkFlag;}
+    quint16 daemonPort() const {return m_daemonPort;}
     QString helperSha256() const {return m_helperSha256;}
 signals:
     void changed();
 private:
     bool runHelper(const QJsonObject &walletRequest,std::function<void(const QJsonObject&)> done);
     void openWallet();
+    bool makePasswordFile(const QString &path);
+    bool resumeAfterUncleanExit(const QString &serviceDir,const QString &portPath);
+    bool startService(const QString &name,const QString &id,QPointer<SwapWalletRpcProcess> &slot,quint16 &port,std::function<void()> listening);
     static quint16 freePort();
     QString m_root,m_walletRpc,m_walletRpcSha256,m_networkFlag,m_helper,m_helperSha256,m_state="unconfigured",m_error;
     quint16 m_daemonPort=0,m_walletPort=0;
-    QPointer<SwapWalletRpcProcess> m_main;
+    QPointer<SwapWalletRpcProcess> m_main,m_claim,m_observer;
+    quint16 m_claimPort=0,m_observerPort=0;
+    bool m_claimUp=false,m_observerUp=false,m_stopping=false;
     QHash<QString,QPointer<SwapWalletRpcProcess>> m_trades;
     QHash<QString,quint16> m_tradePorts;
     QJsonObject m_wallet;

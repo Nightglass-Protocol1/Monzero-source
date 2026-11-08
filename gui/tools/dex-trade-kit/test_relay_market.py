@@ -62,5 +62,13 @@ class Offers(unittest.TestCase):
         self.assertLessEqual(int(terms["expiresAt"]) - int(time.time()), rm.QUOTE_SECONDS)
 
 
+class Payout(unittest.TestCase):
+    def test_payout_is_the_lock_less_the_reserve(self):
+        self.assertEqual(rm.xmz_payout("200000000000", "10000000000", "9000000000"), "190000000000")
+        self.assertIsNone(rm.xmz_payout("10000000000", "10000000000", "1"))      # nothing left to pay
+        self.assertIsNone(rm.xmz_payout("200000000000", "10000000001", "1"))     # fee cap above the limit
+        self.assertIsNone(rm.xmz_payout("200000000000", "0", "1"))
+
+
 if __name__ == "__main__":
     unittest.main()

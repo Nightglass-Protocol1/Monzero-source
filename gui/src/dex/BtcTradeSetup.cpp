@@ -128,6 +128,18 @@ QJsonObject checkListing(const QJsonObject &signedListing,qint64 now) {
     return l;
 }
 
+QString xmzPayout(const QString &xmzAtoms,const QString &claimFeeMax,const QString &refundFeeMax) {
+    // The engine pays the buyer xmzPayoutAtoms of the locked xmzAtoms; the rest is the fee reserve,
+    // which must cover the larger fee cap and returns to the XMZ seller less the fee actually paid.
+    // So the payout is the lock less exactly that reserve, and the caps are bounded.
+    bool a=false,c=false,r=false;
+    const quint64 lock=xmzAtoms.toULongLong(&a),claim=claimFeeMax.toULongLong(&c),refund=refundFeeMax.toULongLong(&r);
+    if (!a || !c || !r || claim==0 || refund==0 || claim>MaxXmzFeeAtoms || refund>MaxXmzFeeAtoms) return {};
+    const quint64 reserve=qMax(claim,refund);
+    if (lock<=reserve) return {};
+    return QString::number(lock-reserve);
+}
+
 QByteArray buildTerms(const QString &makerRole,const QJsonObject &listing,const QJsonObject &params,
         const QJsonObject &makerCard,const QJsonObject &takerCard,const QJsonObject &takerAddresses,qint64 now,QString *error) {
     QJsonObject cards{{makerRole,makerCard},{otherRole(makerRole),takerCard}};
@@ -141,6 +153,9 @@ QByteArray buildTerms(const QString &makerRole,const QJsonObject &listing,const 
         if (v.isUndefined() || v.isNull() || v.toVariant().toString().isEmpty()) {if (error) *error="no value for "+f;return {};}
         terms.insert(f,v.isString() ? v.toString() : v.toVariant().toString());
     }
+    const auto payout=xmzPayout(terms.value("xmzAtoms").toString(),terms.value("xmzClaimFeeMaxAtoms").toString(),terms.value("xmzRefundFeeMaxAtoms").toString());
+    if (payout.isEmpty()) {if (error) *error="the XMZ amount does not cover the fee reserve";return {};}
+    terms.insert("xmzPayoutAtoms",payout);
     return canonical(terms);
 }
 
@@ -162,6 +177,9 @@ QString termsRefusal(const QByteArray &payload,const QJsonObject &listing,const 
     for (auto it=ownAddresses.begin();it!=ownAddresses.end();++it) expected.insert(it.key(),it.value());
     QStringList wrong;
     for (auto it=expected.begin();it!=expected.end();++it) if (t.value(it.key())!=it.value()) wrong<<it.key();
+    // What the buyer receives: the lock less the fee reserve, never less
+    const auto payout=xmzPayout(t.value("xmzAtoms").toString(),t.value("xmzClaimFeeMaxAtoms").toString(),t.value("xmzRefundFeeMaxAtoms").toString());
+    if (payout.isEmpty() || t.value("xmzPayoutAtoms").toString()!=payout) wrong<<QStringLiteral("xmzPayoutAtoms");
     // The policy the apps will run must say what the terms say
     const QList<QPair<QString,QString>> same{{"ltc_network","ltcNetwork"},{"ltc_confirmations","ltcConfirmations"},
         {"xmz_confirmations","xmzConfirmations"},{"cancel_blocks","cancelBlocks"},{"punish_blocks","punishBlocks"},{"xmz_genesis","xmzGenesis"}};
