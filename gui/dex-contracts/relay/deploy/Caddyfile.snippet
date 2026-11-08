@@ -1,0 +1,13 @@
+# Appended to /etc/caddy/Caddyfile (replace HOST with relay1.monzero.org or relay2.monzero.org)
+HOST {
+	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+	request_body {
+		max_size 1MB
+	}
+	reverse_proxy 127.0.0.1:8790
+}
