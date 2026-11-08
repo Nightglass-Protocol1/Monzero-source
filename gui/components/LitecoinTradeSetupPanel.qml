@@ -21,6 +21,8 @@ ColumnLayout {
         && !!review.terms && review.appPath === path.text
     visible: market === coin && appStatus.configured !== true
     spacing: 10
+    // An app folder made from a relay offer: fill in its path and review it
+    function prepare(appPath) { path.text=appPath; reviewSetup() }
     function clearReview() { review=({}); consent.checked=false; expiry.stop() }
     function reviewSetup() {
         clearReview(); notice=""

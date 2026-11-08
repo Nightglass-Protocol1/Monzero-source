@@ -349,6 +349,9 @@ int main(int argc, char *argv[])
     QCommandLineOption dexEvmTradeOption("dex-evm-trade", "Attach a private XMZ<->BNB/ETH trade (prototype); needs --dex-evm-seed-file.", "config");
     dexEvmTradeOption.setFlags(QCommandLineOption::HiddenFromHelp);
     parser.addOption(dexEvmTradeOption);
+    QCommandLineOption dexBtcMarketOption("dex-btc-market", "Attach public BTC/XMZ offers through the open relays (prototype).", "config");
+    dexBtcMarketOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexBtcMarketOption);
     QCommandLineOption dexEvmMarketOption("dex-evm-market", "Attach public XMZ<->ETH/BNB offers through the open relays (prototype); needs --dex-evm-seed-file.", "config");
     dexEvmMarketOption.setFlags(QCommandLineOption::HiddenFromHelp);
     parser.addOption(dexEvmMarketOption);
@@ -809,6 +812,12 @@ int main(int argc, char *argv[])
         if (!dexPrototypeEnabled || !parser.isSet(dexEvmTradeOption) || !parser.isSet(dexEvmSeedOption)
             || !dexEngine.configureEvmTrade(parser.value(dexEvmTradeOption),parser.value(dexEvmSeedOption))) {
             qCritical("Private XMZ<->EVM trade configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexBtcMarketOption)) {
+        if (!dexPrototypeEnabled || !dexEngine.configureBtcMarket(parser.value(dexBtcMarketOption))) {
+            qCritical("Public BTC/XMZ offer configuration rejected");
             return 1;
         }
     }

@@ -10,6 +10,11 @@
 #include "BchRefundWalletWorkerTestFixture.h"
 #include "../DexEngine.h"
 #include "../EvmMarketJob.h"
+#include "../BtcTradeSetup.h"
+#include "../BtcMarketJob.h"
+#include "../LitecoinAppConfig.h"
+#include "btc_kit_vectors.h"
+#include "../OfferIdentity.h"
 #include "../LightWalletHelperUpgrade.h"
 #include "../LitecoinLightJob.h"
 #include "../LitecoinLightFundingContext.h"
@@ -49,6 +54,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
+#include <QScopeGuard>
 #include <QDateTime>
 #include <QThreadPool>
 #include <QSignalSpy>
@@ -273,6 +279,138 @@ private slots:
     // bnb-mainnet document. Confirm the control mechanism works on an EVM network: a signed
     // document enforces caps, an in-flight trade is never blocked after a stop, and error text
     // names the right coin.
+    // The app and the trade kit (relay_market.py) must read each other's offers, letters and
+    // signatures: vectors made by the kit, checked here; and the app's own round trip.
+    void btcTradeSetupInteroperatesWithTheKit() {
+        const auto v=QJsonDocument::fromJson(QByteArray(BtcKitVectors)).object();
+        const auto signedListing=v.value("signed").toObject();
+        QCOMPARE(BtcTradeSetup::canonical(signedListing.value("listing").toObject()),v.value("canonicalListing").toString().toUtf8());
+        QVERIFY(!BtcTradeSetup::checkListing(signedListing).isEmpty());
+        QVERIFY(BtcTradeSetup::checkListing(signedListing,1800003600).isEmpty());   // expired then
+        auto tampered=signedListing;auto l=tampered.value("listing").toObject();l.insert("btc","200001");tampered.insert("listing",l);
+        QVERIFY(BtcTradeSetup::checkListing(tampered).isEmpty());
+        const auto secret=QByteArray::fromHex(v.value("mailboxSecret").toString().toLatin1());
+        QCOMPARE(BtcTradeSetup::open(secret,QByteArray::fromHex(v.value("sealed").toString().toLatin1())),v.value("plain").toString().toUtf8());
+        const auto terms=v.value("terms").toString().toUtf8();
+        QVERIFY(!BtcTradeSetup::parseTerms(terms).isEmpty());
+        const auto pub=QByteArray::fromHex(v.value("publicKey").toString().toLatin1()),sig=QByteArray::fromHex(v.value("termsSignature").toString().toLatin1());
+        QVERIFY(BtcTradeSetup::verifyTerms(terms,"xmz",pub,sig));
+        QVERIFY(!BtcTradeSetup::verifyTerms(terms,"ltc",pub,sig));   // the role is part of what is signed
+        // Our own letters: only the recipient opens them
+        QByteArray other(32,'\x05');
+        const auto sealed=BtcTradeSetup::seal(BtcTradeSetup::mailboxPublic(secret),"hello");
+        QCOMPARE(BtcTradeSetup::open(secret,sealed),QByteArray("hello"));
+        QVERIFY(BtcTradeSetup::open(other,sealed).isEmpty());
+        // Our own offers sign and check
+        OfferIdentity identity;
+        auto mine=signedListing.value("listing").toObject();mine.insert("makerKey",QString::fromLatin1(identity.publicKey().toHex()));
+        const QJsonObject ours{{"listing",mine},{"signature",QString::fromLatin1(identity.signBtcOffer(BtcTradeSetup::canonical(mine)).toHex())}};
+        QVERIFY(!BtcTradeSetup::checkListing(ours).isEmpty());
+    }
+    // An app and a trade kit agree a BTC trade through a live relay, in both directions: same signed
+    // quote on both sides, and the app's folder passes the trade setup review. Needs
+    // MONZERO_TEST_RELAY (a relay serving btc-regtest), MONZERO_TEST_KIT (trade_kit.py),
+    // MONZERO_TEST_KIT_PYTHON (with PyNaCl) and MONZERO_TEST_JOURNAL_HELPER.
+    void btcOffersBetweenTheAppAndTheKit() {
+        const auto relay=qEnvironmentVariable("MONZERO_TEST_RELAY"),kitPath=qEnvironmentVariable("MONZERO_TEST_KIT");
+        const auto python=qEnvironmentVariable("MONZERO_TEST_KIT_PYTHON"),helper=qEnvironmentVariable("MONZERO_TEST_JOURNAL_HELPER");
+        if (relay.isEmpty() || kitPath.isEmpty() || python.isEmpty() || helper.isEmpty()) QSKIP("set MONZERO_TEST_RELAY, MONZERO_TEST_KIT, MONZERO_TEST_KIT_PYTHON and MONZERO_TEST_JOURNAL_HELPER");
+        QTemporaryDir dir;QVERIFY(dir.isValid());const auto root=dir.path();
+        if (qEnvironmentVariableIsSet("MONZERO_TEST_KEEP")) {dir.setAutoRemove(false);qWarning("kept %s",qPrintable(root));}
+        // The Bitcoin regtest stage, as an app trading BTC there runs; the default stage afterwards
+        DexDeployment::resetForTesting();QVERIFY(DexDeployment::selectLitecoinStage("btc-regtest"));
+        const auto restore=qScopeGuard([]{DexDeployment::resetForTesting();DexDeployment::lockLitecoinStage();});
+        const QString xmzGenesis(64,'1'),btcGenesis=DexDeployment::litecoinGenesis();
+        auto env=QProcessEnvironment::systemEnvironment();env.insert("MONZERO_KIT_PASSPHRASE","kit test passphrase 1");
+        const auto kit=[&](const QStringList &args,int timeoutMs=120000){
+            QProcess p;p.setProcessEnvironment(env);p.setProcessChannelMode(QProcess::MergedChannels);
+            p.start(python,QStringList{"-I",kitPath}+args);
+            const bool done=p.waitForFinished(timeoutMs);
+            const auto out=p.readAll();
+            if (!done || p.exitCode()!=0) qWarning("kit %s: %s",qPrintable(args.join(' ')),out.constData());
+            return done && p.exitCode()==0 ? out : QByteArray();
+        };
+        auto write=[](const QString &path,const QByteArray &data){QFile f(path);return f.open(QIODevice::WriteOnly) && f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner) && f.write(data)==data.size();};
+        const QJsonObject policy{{"ltc_network","btc-regtest"},{"xmz_network","xmz-mainnet"},{"xmz_genesis",xmzGenesis},{"ltc_confirmations",1},
+            {"xmz_confirmations",10},{"cancel_blocks",36},{"punish_blocks",10},{"maximum_ltc_atoms",1000000000},{"maximum_xmz_atoms",qint64(200000000000)},
+            {"maximum_ltc_funding_fee",100000},{"maximum_ltc_recovery_fee",20000},{"maximum_xmz_fee",qint64(10000000000)},{"minimum_ltc_output",100000},
+            {"minimum_relay_fee_atoms_per_kb",1000}};
+        QJsonObject params;
+        for (const auto &f:BtcTradeSetup::fields()) params.insert(f,"1");
+        for (const auto &f:{"schema","quoteId","swapId","ltcFunder","xmzFunder","appFeeXmzAtoms","ltcAtoms","xmzAtoms","expiresAt"}) params.remove(f);
+        params.insert("ltcNetwork","btc-regtest");params.insert("xmzNetwork","xmz-mainnet");params.insert("xmzGenesis",xmzGenesis);
+        params.insert("ltcGenesis",btcGenesis);
+        params.insert("ltcConfirmations","1");params.insert("xmzConfirmations","10");params.insert("cancelBlocks","36");params.insert("punishBlocks","10");
+        const QJsonObject addresses{{"ltcPayout","bcrt1qmaker"},{"xmzRefund","Kmaker"},{"ltcRefund","bcrt1qtaker"},{"xmzPayout","Ktaker"}};
+        for (auto it=addresses.begin();it!=addresses.end();++it) params.insert(it.key(),it.value());
+        const QJsonObject local{{"litecoin",QJsonObject{{"light",QJsonObject{{"servers",QJsonArray{QJsonObject{{"host","one.example"},{"port",50002}},
+            QJsonObject{{"host","two.example"},{"port",50002}}}},{"maximumTipAge",5400}}}}},{"xmz",QJsonObject{{"daemonPort",1},{"claimWalletPort",2},
+            {"claimLoginFile",root+"/login"},{"sourceWalletPort",3},{"sourceLoginFile",root+"/login"},{"sourceAddress","Ksource"},
+            {"observerWalletPort",4},{"observerLoginFile",root+"/login"},{"walletPasswordFile",root+"/password"}}}};
+        QVERIFY(write(root+"/market.json",QJsonDocument(QJsonObject{{"schema","monzero-private-btc-market-v1"},{"network","btc-regtest"},
+            {"relays",QJsonArray{relay}},{"tradesDir",root+"/app-trades"},{"journalHelper",helper},{"local",local},{"params",params},{"policy",policy}}).toJson(QJsonDocument::Compact)));
+        BtcMarketJob app;QVERIFY(app.configure(root+"/market.json"));
+        QSignalSpy agreed(&app,&BtcMarketJob::agreed);
+        auto idle=[&]{QTRY_VERIFY_WITH_TIMEOUT(!app.status().value("busy").toBool(),30000);};
+
+        // (A) the kit offers to sell XMZ, the app takes it
+        QVERIFY(!kit({"identity","--role","xmz","--dir",root+"/kit-xmz"}).isEmpty());
+        QJsonObject kitParams=params;kitParams.remove("ltcRefund");kitParams.remove("xmzPayout");
+        QVERIFY(write(root+"/kit-params.json",QJsonDocument(kitParams).toJson()) && write(root+"/policy.json",QJsonDocument(policy).toJson()));
+        QVERIFY(!kit({"offer","--dir",root+"/kit-xmz","--relay",relay,"--network","btc-regtest","--side","sell-xmz","--btc","200000",
+            "--xmz","200000000000","--params",root+"/kit-params.json","--policy",root+"/policy.json","--hours","1"}).isEmpty());
+        const auto kitOffer=QJsonDocument::fromJson([&]{QFile f(root+"/kit-xmz/offer.json");f.open(QIODevice::ReadOnly);return f.readAll();}()).object()
+            .value("signed").toObject().value("listing").toObject().value("id").toString();
+        QProcess serve;serve.setProcessEnvironment(env);serve.setProcessChannelMode(QProcess::MergedChannels);
+        serve.start(python,{"-I",kitPath,"serve","--dir",root+"/kit-xmz","--relay",relay,"--wait","120"});
+        QVERIFY(app.refreshListings());idle();
+        QVERIFY2(app.take(kitOffer),qPrintable(app.status().value("error").toString()));
+        for (int i=0;i<60 && agreed.isEmpty();++i) {idle();app.step();idle();QTest::qWait(1000);}
+        QCOMPARE(agreed.count(),1);
+        QVERIFY(serve.state()==QProcess::NotRunning || serve.waitForFinished(60000));QCOMPARE(serve.exitCode(),0);
+        const auto read=[](const QString &path){QFile f(path);f.open(QIODevice::ReadOnly);return f.readAll();};
+        // The folder loads as a trade app (every config, the journal and the helper digest), and the
+        // signed quote it points at carries both valid signatures. (The trade setup review also
+        // checks the chain identities against the app's selected stage, which this test leaves alone.)
+        const auto loads=[&](const QString &appPath,const QString &role){
+            LitecoinAppConfig config;
+            if (!LitecoinAppConfig::load(appPath,config)) return false;
+            const auto journal=QJsonDocument::fromJson(config.sources.value(config.journal)).object();
+            const auto envelope=QJsonDocument::fromJson(read(journal.value("startQuoteFile").toString())).object();
+            const auto payload=envelope.value("payload").toString().toUtf8();const auto terms=BtcTradeSetup::parseTerms(payload);
+            return journal.value("role")==role && !terms.isEmpty()
+                && BtcTradeSetup::verifyTerms(payload,"ltc",QByteArray::fromHex(terms.value("ltcFunder").toString().toLatin1()),QByteArray::fromHex(envelope.value("ltcSignature").toString().toLatin1()))
+                && BtcTradeSetup::verifyTerms(payload,"xmz",QByteArray::fromHex(terms.value("xmzFunder").toString().toLatin1()),QByteArray::fromHex(envelope.value("xmzSignature").toString().toLatin1()));
+        };
+        const auto appA=agreed.takeFirst().at(0).toString();
+        QCOMPARE(read(QFileInfo(appA).dir().path()+"/../start-quote.json"),read(root+"/kit-xmz/trade/start-quote.json"));
+        QVERIFY(loads(appA,"litecoin-funder"));
+        // And the trade setup review the user sees before starting accepts it
+        const auto reviewA=LitecoinAppConfig::review(appA);
+        QCOMPARE(reviewA.value("signaturesVerified").toBool(),true);QCOMPARE(reviewA.value("role").toString(),QString("litecoin-funder"));
+
+        // (B) the app offers to sell XMZ, the kit takes it
+        QVERIFY(app.post("sell-xmz","300000","100000000000",1));idle();
+        QString ourOffer;
+        for (const auto &v:app.status().value("mine").toList()) if (v.toMap().value("kind")=="offer") ourOffer=v.toMap().value("id").toString();
+        QVERIFY(!ourOffer.isEmpty());
+        QVERIFY(!kit({"identity","--role","ltc","--dir",root+"/kit-ltc"}).isEmpty());
+        QVERIFY(write(root+"/kit-addresses.json",QJsonDocument(QJsonObject{{"ltcRefund","bcrt1qkit"},{"xmzPayout","Kkit"}}).toJson()));
+        QProcess take;take.setProcessEnvironment(env);take.setProcessChannelMode(QProcess::MergedChannels);
+        take.start(python,{"-I",kitPath,"take","--dir",root+"/kit-ltc","--relay",relay,"--offer",ourOffer,"--addresses",root+"/kit-addresses.json","--wait","120"});
+        for (int i=0;i<90 && agreed.isEmpty();++i) {idle();app.step();idle();QTest::qWait(1000);}
+        QCOMPARE(agreed.count(),1);
+        QVERIFY(take.state()==QProcess::NotRunning || take.waitForFinished(60000));
+        QVERIFY2(take.exitCode()==0,take.readAll().constData());
+        const auto appB=agreed.takeFirst().at(0).toString();
+        QCOMPARE(read(QFileInfo(appB).dir().path()+"/../start-quote.json"),read(root+"/kit-ltc/trade/start-quote.json"));
+        QVERIFY(loads(appB,"native-funder"));
+        QCOMPARE(LitecoinAppConfig::review(appB).value("signaturesVerified").toBool(),true);
+        const auto termsB=BtcTradeSetup::parseTerms(QJsonDocument::fromJson(read(QFileInfo(appB).dir().path()+"/../start-quote.json")).object().value("payload").toString().toUtf8());
+        QCOMPARE(termsB.value("ltcRefund").toString(),QString("bcrt1qkit"));     // the kit taker's own
+        QCOMPARE(termsB.value("ltcPayout").toString(),QString("bcrt1qmaker"));   // ours, the maker's
+        QCOMPARE(termsB.value("ltcAtoms").toString(),QString("300000"));
+    }
     // Offer amounts typed in the app become exact atomic units (no floating point)
     void evmOfferAmounts() {
         QCOMPARE(DexEngine::atomic("0.005",18),QString("5000000000000000"));

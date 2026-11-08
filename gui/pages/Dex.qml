@@ -176,6 +176,8 @@ Rectangle {
     property var bchNativeObservation: root.dex.bchNativeObservationStatus || ({})
     property var evmTrade: root.dex.evmTradeStatus || ({})
     property var evmMarket: root.dex.evmMarketStatus || ({})
+    property var btcMarket: root.dex.btcMarketStatus || ({})
+    property string btcMarketError: ""
     property string evmMarketError: ""
     // The lab panels are for testers; traders see the trade card first.
     property bool showAdvanced: false
@@ -2613,6 +2615,104 @@ Later addresses may be missing from this backup. Payment and active swap recover
         }
 
         ColumnLayout {
+            // BTC/XMZ offers from the open relays. Taking or answering one sets the trade up through
+            // sealed relay mail (identity, terms, both signatures); the agreed trade then opens in the
+            // trade setup review below, and the two apps negotiate through the relay.
+            objectName: "btcOfferBoard"
+            id: btcBoard
+            Layout.fillWidth: true
+            visible: root.btcMarket.configured === true && root.baseCoin === "BTC"
+            enabled: visible
+            function hoursLeft(t) { return Math.max(0, Math.round((t - Date.now() / 1000) / 360) / 10) }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor; font.bold: true
+                text: qsTr("Offers: XMZ ↔ BTC")
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
+                text: qsTr("Signed offers from the open relays (%1, %2). Each trade gets its own identity; the terms are checked against the offer and your own addresses before anything is signed. Trades are small while the DEX is new.").arg((root.btcMarket.relays || []).length).arg(root.btcMarket.network || "")
+            }
+            M.StandardButton {
+                objectName: "btcOffersRefresh"; text: root.btcMarket.busy === true ? qsTr("Working…") : qsTr("Refresh offers")
+                enabled: root.btcMarket.busy !== true
+                onClicked: root.btcMarketError = root.dex.refreshBtcOffers() ? "" : qsTr("Offers could not be loaded now.")
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; color: M.Style.dimmedFontColor
+                visible: (root.btcMarket.listings || []).length === 0
+                text: qsTr("No open offers loaded. Refresh, or post your own below.")
+            }
+            Repeater {
+                model: root.btcMarket.listings || []
+                delegate: RowLayout {
+                    Layout.fillWidth: true
+                    M.TextPlain {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
+                        text: (modelData.side === "sell-xmz" ? qsTr("Sells %1 XMZ for %2 BTC") : qsTr("Buys %1 XMZ for %2 BTC")).arg(modelData.xmz).arg(modelData.btc)
+                            + "  ·  " + qsTr("%1 BTC per XMZ").arg(modelData.price) + "  ·  " + qsTr("%1 h left").arg(btcBoard.hoursLeft(modelData.expiresAt))
+                    }
+                    M.StandardButton {
+                        text: modelData.side === "sell-xmz" ? qsTr("Buy this XMZ") : qsTr("Sell XMZ here")
+                        enabled: root.btcMarket.busy !== true
+                        onClicked: root.btcMarketError = root.dex.takeBtcOffer(modelData.id) ? "" : (root.btcMarket.message || qsTr("The offer could not be taken now."))
+                    }
+                }
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor; font.bold: true
+                text: qsTr("Post an offer")
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                M.StandardButton {
+                    id: btcOfferSide; property bool sell: true
+                    text: sell ? qsTr("I sell XMZ") : qsTr("I buy XMZ")
+                    onClicked: sell = !sell
+                }
+                M.LineEdit { id: btcOfferXmz; Layout.fillWidth: true; placeholderText: qsTr("XMZ amount") }
+                M.LineEdit { id: btcOfferBtc; Layout.fillWidth: true; placeholderText: qsTr("BTC amount") }
+                M.LineEdit { id: btcOfferHours; Layout.preferredWidth: 80; text: "6"; placeholderText: qsTr("hours") }
+                M.StandardButton {
+                    objectName: "btcOfferPost"; text: qsTr("Post")
+                    enabled: root.btcMarket.busy !== true && btcOfferXmz.text !== "" && btcOfferBtc.text !== ""
+                    onClicked: root.btcMarketError = root.dex.postBtcOffer(btcOfferSide.sell ? "sell-xmz" : "buy-xmz",
+                        btcOfferBtc.text, btcOfferXmz.text, parseInt(btcOfferHours.text) || 0) ? "" : (root.btcMarket.message || qsTr("The offer could not be posted now."))
+                }
+            }
+            Repeater {
+                model: root.btcMarket.mine || []
+                delegate: RowLayout {
+                    Layout.fillWidth: true
+                    M.TextPlain {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
+                        text: (modelData.kind === "offer" ? qsTr("Your offer: ") : qsTr("Your take: ")) + qsTr("%1 XMZ for %2 BTC").arg(modelData.xmz).arg(modelData.btc)
+                            + "  ·  " + (modelData.state === "open" ? (modelData.kind === "offer" ? qsTr("waiting for a taker") : qsTr("waiting for the maker"))
+                                : modelData.state === "agreed" ? qsTr("agreed") : modelData.state === "expired" ? qsTr("expired") : qsTr("cancelled"))
+                            + (modelData.detail ? "  ·  " + modelData.detail : "")
+                    }
+                    M.StandardButton {
+                        visible: modelData.state === "agreed" && modelData.app !== ""
+                        text: qsTr("Review and start")
+                        onClicked: tradeSetupPanel.prepare(modelData.app)
+                    }
+                    M.StandardButton {
+                        visible: modelData.kind === "offer" && modelData.state === "open"
+                        text: qsTr("Cancel")
+                        enabled: root.btcMarket.busy !== true
+                        onClicked: root.btcMarketError = root.dex.cancelBtcOffer(modelData.folder) ? "" : qsTr("The offer could not be cancelled now.")
+                    }
+                }
+            }
+            M.TextPlain {
+                objectName: "btcMarketOutcome"
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.dimmedFontColor
+                visible: text !== ""
+                text: root.btcMarketError ? root.btcMarketError : root.btcMarket.message ? root.btcMarket.message
+                    : root.btcMarket.state === "failed" ? qsTr("Last request failed: ") + (root.btcMarket.error || qsTr("unknown error")) : ""
+            }
+        }
+
+        ColumnLayout {
             // Public offers from the open relays: post one, or take one. Keys are exchanged
             // through sealed relay mail; once agreed the trade appears in the panel below.
             objectName: "evmOfferBoard"
@@ -3442,6 +3542,7 @@ Later addresses may be missing from this backup. Payment and active swap recover
             }
 
             M.LitecoinTradeSetupPanel {
+                id: tradeSetupPanel
                 Layout.fillWidth: true
                 coin: root.swapCoin
                 backend: root.dex

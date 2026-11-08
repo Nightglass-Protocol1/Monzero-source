@@ -26,6 +26,7 @@ class BchNativeProofJob;
 class BchNativeObservationJob;
 class EvmTradeJob;
 class EvmMarketJob;
+class BtcMarketJob;
 class BchSuccessReleaseReviewJob;
 class BchSuccessPreparationJob;
 class BchPublicationRepairJob;
@@ -63,6 +64,7 @@ class DexEngine : public QObject {
     Q_PROPERTY(QVariantMap bchNativeObservationStatus READ bchNativeObservationStatus NOTIFY bchNativeObservationChanged)
     Q_PROPERTY(QVariantMap evmTradeStatus READ evmTradeStatus NOTIFY evmTradeChanged)
     Q_PROPERTY(QVariantMap evmMarketStatus READ evmMarketStatus NOTIFY evmMarketChanged)
+    Q_PROPERTY(QVariantMap btcMarketStatus READ btcMarketStatus NOTIFY btcMarketChanged)
     Q_PROPERTY(QVariantMap bchSuccessReleaseReviewStatus READ bchSuccessReleaseReviewStatus NOTIFY bchSuccessReleaseReviewChanged)
     Q_PROPERTY(QVariantMap bchPublicationRepairStatus READ bchPublicationRepairStatus NOTIFY bchPublicationRepairChanged)
     Q_PROPERTY(QVariantMap bchSuccessPreparationStatus READ bchSuccessPreparationStatus NOTIFY bchSuccessPreparationChanged)
@@ -244,6 +246,14 @@ public:
     Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours);
     Q_INVOKABLE bool takeEvmOffer(const QString &listingId);
     Q_INVOKABLE bool cancelEvmOffer(const QString &folder);
+    // BTC/XMZ offers through the open relays (see BtcMarketJob). An agreed trade opens in the
+    // trade setup review (reviewLitecoinTradeSetup / importLitecoinTradeSetup) like any other.
+    bool configureBtcMarket(const QString &config);
+    QVariantMap btcMarketStatus() const;
+    Q_INVOKABLE bool refreshBtcOffers();
+    Q_INVOKABLE bool postBtcOffer(const QString &side,const QString &btcAmount,const QString &xmzAmount,int lifetimeHours);
+    Q_INVOKABLE bool takeBtcOffer(const QString &listingId);
+    Q_INVOKABLE bool cancelBtcOffer(const QString &folder);
     // Atomic units from decimal text ("0.005", 18 places -> "5000000000000000"); empty if invalid
     static QString atomic(const QString &text,int places);
     Q_INVOKABLE bool requestBchNativeObservation();
@@ -447,6 +457,7 @@ signals:
     void bchNativeObservationChanged();
     void evmTradeChanged();
     void evmMarketChanged();
+    void btcMarketChanged();
     void bchSuccessReleaseReviewChanged();
     void bchSuccessSignedReleaseReviewChanged();
     void bchSuccessSignatureReviewChanged();
@@ -506,6 +517,10 @@ private:
     QString m_marketMessage,m_reportedTrade,m_evmControlUrlBase;
     void bindEvmNetwork(const QString &network);
     void stepEvmMarket();
+    BtcMarketJob *m_btcMarket=nullptr;
+    QTimer *m_btcTicker=nullptr;
+    QString m_btcMessage;
+    QString btcOfferRefusal(const QString &sats,const QString &atoms);
     void evmOfferAgreed(const QString &tradeDir);
     // Kill switch and caps for an offer before it is posted or taken (nothing is recorded)
     QString evmOfferRefusal(qint64 chainId,const QString &valueWei,const QString &xmzAtoms);

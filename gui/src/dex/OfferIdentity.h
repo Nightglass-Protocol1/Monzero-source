@@ -20,6 +20,11 @@ public:
     QByteArray signLitecoinNegotiation(const QByteArray &frame) const;
     QByteArray signLitecoinRecovery(const QByteArray &frame) const;
     QByteArray signLitecoinRedeem(const QByteArray &frame) const;
+    // A public BTC/XMZ offer or its cancel for the open relays (canonical JSON), domain-separated
+    // from every other signature of this key: "MONZERO-DEX-BTC-LISTING-V1\n" / "-CANCEL-V1\n" + JSON.
+    QByteArray signBtcOffer(const QByteArray &canonical) const;
+    QByteArray signBtcCancel(const QByteArray &canonical) const;
+    static bool verifyBtcOffer(const QByteArray &canonical,const QByteArray &publicKey,const QByteArray &signature);
     // Sensitive BCH adaptor: only a chain-gated private session may supply it.
     QByteArray signBchSuccess(const QByteArray &frame) const;
     static bool verify(const QByteArray &payload, const QByteArray &network,

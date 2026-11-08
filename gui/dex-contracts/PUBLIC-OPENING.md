@@ -124,9 +124,19 @@ BTC/XMZ trades are set up from both traders' identity cards and two signatures o
 
 Evidence (regtest, two separate app processes, `core/build`): `btc-regtest-relay-1` (the apps
 connected only through the relay; 1018 s, passed) and `btc-regtest-relay-offer-1` (the whole
-setup from a relay offer as well). Not yet: BTC offers on the app's own offer board (today the
-kit posts and takes them; the app then runs the trade), and a signet/mainnet run through a public
-relay. BTC prints are not charted yet (a claim would need a Bitcoin chain check).
+setup from a relay offer as well).
+
+- **In the app.** The DEX screen's BTC/XMZ offer board (`BtcMarketJob`, `BtcTradeSetup`): refresh,
+  post, take, cancel. Each offer or take gets its own identity and folder; when both signatures
+  are in, the folder holds the signed quote and an app folder whose peer is the relay, and
+  "Review and start" opens it in the normal trade setup review. The app and the kit speak the
+  same protocol: `btcOffersBetweenTheAppAndTheKit` (dex_tests, with a live relay) agrees trades
+  both ways (app takes a kit offer; kit takes an app offer), checks both sides hold the same
+  signed quote and that the app's folder passes the trade setup review. Startup flag
+  `--dex-btc-market <config>` (`monzero-private-btc-market-v1`: network, relays, tradesDir,
+  journalHelper, local services, params with our four destinations, policy).
+
+Not yet: a signet/mainnet run through a public relay. BTC prints are not charted yet (a claim would need a Bitcoin chain check).
 
 ## Order of work
 
@@ -134,5 +144,5 @@ relay. BTC prints are not charted yet (a claim would need a Bitcoin chain check)
 2. Website market view (TradingView Lightweight Charts, self-hosted). Done, not deployed.
 3. App: post and take offers for ETH/BNB, trade runs through the existing EVM helper. Done.
 4. Public/dev edition split; limits tool. Done; the owner signs and publishes the documents.
-5. BTC through the relays (above): kit offers + relay negotiation done; app offer board next.
+5. BTC through the relays (above): kit and app offer boards, relay negotiation. Done.
 6. The app's own chart (the website chart's data, in the DEX screen).

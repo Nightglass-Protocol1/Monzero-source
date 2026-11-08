@@ -12,6 +12,7 @@
 #include "BchNativeObservationJob.h"
 #include "EvmTradeJob.h"
 #include "EvmMarketJob.h"
+#include "BtcMarketJob.h"
 #include "BchSuccessReleaseReviewJob.h"
 #include "BchSuccessPreparationJob.h"
 #include "BchPublicationRepairJob.h"
@@ -192,6 +193,13 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     connect(m_evmMarket,&EvmMarketJob::agreed,this,&DexEngine::evmOfferAgreed);
     m_marketTicker->setInterval(20000);
     connect(m_marketTicker,&QTimer::timeout,this,&DexEngine::stepEvmMarket);
+    m_btcMarket=new BtcMarketJob(this);m_btcTicker=new QTimer(this);
+    connect(m_btcMarket,&BtcMarketJob::changed,this,&DexEngine::btcMarketChanged);
+    connect(m_btcMarket,&BtcMarketJob::agreed,this,[this](const QString &app){
+        m_btcMessage=tr("Trade agreed through the relay. Review it below and start it: %1").arg(app);emit btcMarketChanged();
+    });
+    m_btcTicker->setInterval(15000);
+    connect(m_btcTicker,&QTimer::timeout,this,[this]{m_btcMarket->step();});
     connect(m_bchNativeObservation,&BchNativeObservationJob::changed,this,&DexEngine::bchRefundProtectionChanged);
     connect(m_bchRefundProtection,&BchRefundProtectionJob::changed,this,&DexEngine::bchNativeObservationChanged);
     connect(m_bchNativeObservation,&BchNativeObservationJob::changed,this,&DexEngine::bchRecoveryRetentionChanged);
@@ -885,6 +893,41 @@ bool DexEngine::cancelEvmOffer(const QString &folder) {
     QByteArray seed=evmSeed();
     return m_evmMarket->cancel(seed,folder);
 }
+bool DexEngine::configureBtcMarket(const QString &config) {
+    if (!m_btcMarket->configure(config)) return false;
+    // The swap stage and the offers must be on the same Bitcoin network
+    if (m_btcMarket->network()!=DexDeployment::litecoinNetwork()) return false;
+    m_btcTicker->start();return true;
+}
+QVariantMap DexEngine::btcMarketStatus() const {auto s=m_btcMarket->status();s.insert("message",m_btcMessage);return s;}
+bool DexEngine::refreshBtcOffers() {return m_btcMarket->refreshListings();}
+QString DexEngine::btcOfferRefusal(const QString &sats,const QString &atoms) {
+    bool satsOk=false,atomsOk=false;
+    const auto s=sats.toULongLong(&satsOk),a=atoms.toULongLong(&atomsOk);
+    if (!satsOk || !atomsOk) return tr("The amount could not be read.");
+    // The same kill switch and caps as the trade start; nothing is recorded here
+    return m_riskControl->refusal(OfferCheckId,s,a);
+}
+bool DexEngine::postBtcOffer(const QString &side,const QString &btcAmount,const QString &xmzAmount,int lifetimeHours) {
+    const auto sats=atomic(btcAmount,8),atoms=atomic(xmzAmount,11);
+    if (sats.isEmpty() || atoms.isEmpty()) {m_btcMessage=tr("Check the amounts.");emit btcMarketChanged();return false;}
+    const auto refusal=btcOfferRefusal(sats,atoms);
+    if (!refusal.isEmpty()) {m_btcMessage=refusal;emit btcMarketChanged();return false;}
+    m_btcMessage.clear();
+    const bool ok=m_btcMarket->post(side,sats,atoms,lifetimeHours);
+    if (!ok) m_btcMessage=tr("The offer could not be posted now.");
+    emit btcMarketChanged();return ok;
+}
+bool DexEngine::takeBtcOffer(const QString &listingId) {
+    const auto a=m_btcMarket->listingAmounts(listingId);
+    const auto refusal=btcOfferRefusal(a.value("btcSats").toString(),a.value("xmzAtoms").toString());
+    if (!refusal.isEmpty()) {m_btcMessage=refusal;emit btcMarketChanged();return false;}
+    m_btcMessage.clear();
+    const bool ok=m_btcMarket->take(listingId);
+    if (!ok) m_btcMessage=tr("The offer could not be taken now.");
+    emit btcMarketChanged();return ok;
+}
+bool DexEngine::cancelBtcOffer(const QString &folder) {return m_btcMarket->cancel(folder);}
 void DexEngine::stepEvmMarket() {
     if (m_evmMarket->status().value("busy").toBool()) return;
     QByteArray seed=evmSeed();

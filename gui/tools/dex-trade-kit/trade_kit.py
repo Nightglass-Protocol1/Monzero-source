@@ -588,7 +588,10 @@ def cmd_configure(a):
             fail(f"{a.peer_card} has no mailbox key; the other party must make a new identity")
         if not (d / "mailbox.key").is_file():
             fail(f"{d / 'mailbox.key'} is missing; make a new identity to trade through relays")
-    if not isinstance(peer.get("tlsCertificatePem"), str) or not isinstance(peer.get("tlsCertificateSha256"), str):
+    # A direct connection pins the peer's TLS certificate; through relays its mailbox key (an app's card
+    # carries no TLS certificate at all)
+    relayed = isinstance(local_preview, dict) and relay_peer(local_preview)
+    if not relayed and (not isinstance(peer.get("tlsCertificatePem"), str) or not isinstance(peer.get("tlsCertificateSha256"), str)):
         fail(f"{a.peer_card} lacks the peer's TLS certificate")
     quote = Path(a.quote).resolve()
     terms = load_verified_quote(quote)
@@ -629,7 +632,9 @@ def main():
     for flag in ("--terms", "--ltc-sig", "--xmz-sig", "--out"): p.add_argument(flag, required=True)
     p = sub.add_parser("configure")
     for flag in ("--dir", "--quote", "--peer-card", "--policy", "--local", "--out"): p.add_argument(flag, required=True)
-    import relay_market  # BTC/XMZ offers through the open relays
+    # BTC/XMZ offers through the open relays (next to this file; found even under python -I)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import relay_market
     relay_commands = relay_market.add_parsers(sub)
     a = parser.parse_args()
     {"identity": cmd_identity, "terms": cmd_terms, "sign": cmd_sign, "assemble": cmd_assemble,
