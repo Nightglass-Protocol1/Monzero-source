@@ -168,9 +168,12 @@
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   if (!$("mode-pro")) return;
-  var PAIRS = ["ETH", "BNB"];
-  var NAME = { ETH: "Ethereum", BNB: "BNB" };
-  var EXPLORER = { ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/" };
+  var PAIRS = ["BTC", "ETH", "BNB", "LTC"];
+  var NAME = { BTC: "Bitcoin", ETH: "Ethereum", BNB: "BNB", LTC: "Litecoin" };
+  var EXPLORER = { BTC: "https://mempool.space/tx/", ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/", LTC: "https://litecoinspace.org/tx/" };
+  // Bitcoin and Litecoin offers give the coin in satoshis/litoshis (`coin`); EVM offers in wei (`value`, hex)
+  var UTXO = { BTC: true, LTC: true };
+  var MAINNET = { BTC: "btc-mainnet", LTC: "ltc-mainnet" };
   var TF = { "1h": 3600, "4h": 14400, "1D": 86400 };
   var OPENING_USD = 0.001; // the DEX's opening quote, not a market price
   var pro = { coin: "ETH", tf: "1h", rendered: false, timer: null, chart: null, candles: null, vol: null, ref: null, usd: {}, gen: 0 };
@@ -179,6 +182,7 @@
   function places(p) { return p > 0 ? Math.min(14, Math.max(2, 3 - Math.floor(Math.log(p) / Math.LN10))) : 2; }
   function price(p) { return fmt(p, places(p)); }
   function wei(hex) { return parseInt(hex, 16) / 1e18; }
+  function coinOf(l) { return UTXO[pro.coin] ? Number(l.coin) / 1e8 : wei(l.value); }
   function coins(atoms) { return Number(atoms) / 1e11; }
   function pDot(t) { return '<span class="cdot" data-c="' + t + '">' + t.slice(0, 1) + '</span>'; }
   function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); }
@@ -233,7 +237,8 @@
     if (list.length) { empty.hidden = true; }
     else {
       empty.hidden = false;
-      empty.textContent = "No completed swaps on XMZ / " + pro.coin + " yet." + (usd > 0 ? " Dashed line: the DEX's $0.001 opening rate at today's " + pro.coin + " price." : "");
+      empty.textContent = (UTXO[pro.coin] ? NAME[pro.coin] + " swaps are not reported to relays yet." : "No completed swaps yet.") +
+        (usd > 0 ? " Dashed line: the $0.001 opening rate." : "");
     }
     pro.chart.timeScale().fitContent();
   }
@@ -241,7 +246,10 @@
   function book(listings) {
     var asks = [], bids = [];
     listings.forEach(function (o) {
-      var l = o.listing, row = { price: wei(l.value) / coins(l.xmz), amt: coins(l.xmz), total: wei(l.value) };
+      var l = o.listing;
+      if (!l || l.pair !== pro.coin + "/XMZ" || (UTXO[pro.coin] && l.network !== MAINNET[pro.coin])) return;
+      var c = coinOf(l), row = { price: c / coins(l.xmz), amt: coins(l.xmz), total: c };
+      if (!(row.price > 0)) return;
       (l.side === "sell-xmz" ? asks : bids).push(row);
     });
     asks.sort(function (a, b) { return a.price - b.price; });
@@ -264,7 +272,7 @@
     $("book-mid").textContent = mid ? price(mid) : "—";
     $("book-spread-v").textContent = mid ? ((b.asks[0].price - b.bids[0].price) / mid * 100).toFixed(2) + "%" : "—";
     renderDepth(b, mid);
-    $("r-offers").textContent = String(listings.length);
+    $("r-offers").textContent = String(b.asks.length + b.bids.length);
   }
 
   function renderDepth(b, mid) {
@@ -298,7 +306,7 @@
 
   function renderTrades(prints) {
     var now = Date.now() / 1000;
-    prints.forEach(function (p, i) { p.px = wei(p.value) / coins(p.xmz); });
+    prints.forEach(function (p, i) { p.px = coinOf(p) / coins(p.xmz); });
     $("trades").innerHTML = prints.length ? prints.slice(0, 20).map(function (p, i) {
       var older = prints[i + 1], up = !older || p.px >= older.px, d = new Date(p.at * 1000), pp = function (x) { return ("0" + x).slice(-2); };
       var when = (now - p.at < 86400 ? "" : pp(d.getMonth() + 1) + "-" + pp(d.getDate()) + " ") + pp(d.getHours()) + ":" + pp(d.getMinutes());
@@ -382,8 +390,14 @@
   $("mode-simple").addEventListener("click", function () { setMode("simple"); if (history.replaceState) history.replaceState(null, "", location.pathname); });
   $("mode-pro").addEventListener("click", function () { setMode("pro"); if (history.replaceState) history.replaceState(null, "", "#pro"); });
   // Shareable deep link: /dex/#pro opens the market view.
-  window.addEventListener("hashchange", function () { setMode(location.hash === "#pro" ? "pro" : "simple"); });
-  if (location.hash === "#pro") setMode("pro");
+  // #pro opens the order book; #pro-BTC (or -ETH, -BNB, -LTC) also picks the pair
+  function fromHash() {
+    var m = /^#pro(?:-([A-Z]{3}))?$/.exec(location.hash);
+    if (m && m[1] && PAIRS.indexOf(m[1]) >= 0 && m[1] !== pro.coin) { pro.coin = m[1]; if (pro.rendered) show(); else syncPair(); }
+    return m ? "pro" : "simple";
+  }
+  window.addEventListener("hashchange", function () { setMode(fromHash()); });
+  if (/^#pro/.test(location.hash)) setMode(fromHash());
   $("pro-pair").addEventListener("click", function (e) { e.stopPropagation(); openPairMenu(); });
   $("tf-group").addEventListener("click", function (e) {
     var b = e.target.closest && e.target.closest("button[data-tf]"); if (!b) return;

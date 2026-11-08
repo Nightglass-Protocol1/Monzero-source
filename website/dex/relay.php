@@ -36,8 +36,10 @@ switch ($what) {
     case 'listings':
     case 'prints':
     case 'candles':
-        if (!is_string($pair) || !in_array($pair, ['ETH/XMZ', 'BNB/XMZ'], true)) relayFail(400, 'unknown pair');
-        $path = '/v1/' . $what;
+        if (!is_string($pair) || !in_array($pair, ['ETH/XMZ', 'BNB/XMZ', 'BTC/XMZ', 'LTC/XMZ'], true)) relayFail(400, 'unknown pair');
+        // Bitcoin and Litecoin offers are kept apart from the EVM ones (amount in satoshis/litoshis)
+        $utxo = $pair === 'BTC/XMZ' || $pair === 'LTC/XMZ';
+        $path = ($utxo && $what === 'listings') ? '/v1/utxo/listings' : '/v1/' . $what;
         $query['pair'] = $pair;
         if ($what === 'candles') {
             $interval = (int)($_GET['interval'] ?? 3600);
