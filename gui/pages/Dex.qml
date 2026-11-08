@@ -2615,18 +2615,19 @@ Later addresses may be missing from this backup. Payment and active swap recover
         }
 
         ColumnLayout {
-            // BTC/XMZ offers from the open relays. Taking or answering one sets the trade up through
+            // BTC/XMZ or LTC/XMZ offers (the app's swap network) from the open relays. Taking or answering one sets the trade up through
             // sealed relay mail (identity, terms, both signatures); the agreed trade then opens in the
             // trade setup review below, and the two apps negotiate through the relay.
             objectName: "btcOfferBoard"
             id: btcBoard
             Layout.fillWidth: true
-            visible: root.btcMarket.configured === true && root.baseCoin === "BTC"
+            visible: root.btcMarket.configured === true && root.baseCoin === root.btcMarket.coin
+            property string coin: root.btcMarket.coin || "BTC"
             enabled: visible
             function hoursLeft(t) { return Math.max(0, Math.round((t - Date.now() / 1000) / 360) / 10) }
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor; font.bold: true
-                text: qsTr("Offers: XMZ ↔ BTC")
+                text: qsTr("Offers: XMZ ↔ %1").arg(btcBoard.coin)
             }
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
@@ -2648,8 +2649,8 @@ Later addresses may be missing from this backup. Payment and active swap recover
                     Layout.fillWidth: true
                     M.TextPlain {
                         Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
-                        text: (modelData.side === "sell-xmz" ? qsTr("Sells %1 XMZ for %2 BTC") : qsTr("Buys %1 XMZ for %2 BTC")).arg(modelData.xmz).arg(modelData.btc)
-                            + "  ·  " + qsTr("%1 BTC per XMZ").arg(modelData.price) + "  ·  " + qsTr("%1 h left").arg(btcBoard.hoursLeft(modelData.expiresAt))
+                        text: (modelData.side === "sell-xmz" ? qsTr("Sells %1 XMZ for %2 %3") : qsTr("Buys %1 XMZ for %2 %3")).arg(modelData.xmz).arg(modelData.btc).arg(btcBoard.coin)
+                            + "  ·  " + qsTr("%1 %2 per XMZ").arg(modelData.price).arg(btcBoard.coin) + "  ·  " + qsTr("%1 h left").arg(btcBoard.hoursLeft(modelData.expiresAt))
                     }
                     M.StandardButton {
                         text: modelData.side === "sell-xmz" ? qsTr("Buy this XMZ") : qsTr("Sell XMZ here")
@@ -2670,7 +2671,7 @@ Later addresses may be missing from this backup. Payment and active swap recover
                     onClicked: sell = !sell
                 }
                 M.LineEdit { id: btcOfferXmz; Layout.fillWidth: true; placeholderText: qsTr("XMZ amount") }
-                M.LineEdit { id: btcOfferBtc; Layout.fillWidth: true; placeholderText: qsTr("BTC amount") }
+                M.LineEdit { id: btcOfferBtc; Layout.fillWidth: true; placeholderText: qsTr("%1 amount").arg(btcBoard.coin) }
                 M.LineEdit { id: btcOfferHours; Layout.preferredWidth: 80; text: "6"; placeholderText: qsTr("hours") }
                 M.StandardButton {
                     objectName: "btcOfferPost"; text: qsTr("Post")
@@ -2685,7 +2686,7 @@ Later addresses may be missing from this backup. Payment and active swap recover
                     Layout.fillWidth: true
                     M.TextPlain {
                         Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
-                        text: (modelData.kind === "offer" ? qsTr("Your offer: ") : qsTr("Your take: ")) + qsTr("%1 XMZ for %2 BTC").arg(modelData.xmz).arg(modelData.btc)
+                        text: (modelData.kind === "offer" ? qsTr("Your offer: ") : qsTr("Your take: ")) + qsTr("%1 XMZ for %2 %3").arg(modelData.xmz).arg(modelData.btc).arg(btcBoard.coin)
                             + "  ·  " + (modelData.state === "open" ? (modelData.kind === "offer" ? qsTr("waiting for a taker") : qsTr("waiting for the maker"))
                                 : modelData.state === "agreed" ? qsTr("agreed") : modelData.state === "expired" ? qsTr("expired") : qsTr("cancelled"))
                             + (modelData.detail ? "  ·  " + modelData.detail : "")

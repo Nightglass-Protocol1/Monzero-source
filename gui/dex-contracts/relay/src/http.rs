@@ -118,9 +118,9 @@ pub fn router<C: ChainView + 'static>(api: Arc<Api<C>>) -> Router {
         .route("/v1/cancel", post(cancel::<C>))
         .route("/v1/prints", get(prints::<C>).post(report::<C>))
         .route("/v1/candles", get(candles::<C>))
-        .route("/v1/btc/listings", get(btc_listings::<C>).post(post_btc::<C>))
-        .route("/v1/btc/listings/{id}", get(btc_listing::<C>))
-        .route("/v1/btc/cancel", post(cancel_btc::<C>))
+        .route("/v1/utxo/listings", get(utxo_listings::<C>).post(post_utxo::<C>))
+        .route("/v1/utxo/listings/{id}", get(utxo_listing::<C>))
+        .route("/v1/utxo/cancel", post(cancel_utxo::<C>))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         // Sealed letters are large (the cross-curve proof), hex in JSON doubles them
         .route("/v1/mail", get(read_mail::<C>).post(post_mail::<C>).layer(DefaultBodyLimit::max(MAX_MAIL_BODY)))
@@ -143,7 +143,7 @@ async fn info<C: ChainView>(State(api): State<Arc<Api<C>>>) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "api": 1,
         "chains": chains,
-        "btcNetworks": api.relay.btc_networks(),
+        "utxoNetworks": api.relay.utxo_networks(),
         "peers": api.peers,
         "intervals": INTERVALS,
         "limits": { "openOffersPerMaker": crate::MAX_PER_MAKER, "writesPerMinute": WRITES_PER_MINUTE },
@@ -236,50 +236,50 @@ async fn read_mail<C: ChainView>(State(api): State<Arc<Api<C>>>, Query(q): Query
     Json(json!({ "to": q.to, "mail": mail }))
 }
 
-impl From<crate::btc::BtcError> for Failure {
-    fn from(e: crate::btc::BtcError) -> Self {
+impl From<crate::utxo::UtxoError> for Failure {
+    fn from(e: crate::utxo::UtxoError) -> Self {
         let status = match e {
-            crate::btc::BtcError::NotFound => StatusCode::NOT_FOUND,
-            crate::btc::BtcError::MakerLimit | crate::btc::BtcError::Full => StatusCode::TOO_MANY_REQUESTS,
+            crate::utxo::UtxoError::NotFound => StatusCode::NOT_FOUND,
+            crate::utxo::UtxoError::MakerLimit | crate::utxo::UtxoError::Full => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::BAD_REQUEST,
         };
         Failure(status, e.to_string())
     }
 }
 
-async fn btc_listings<C: ChainView>(State(api): State<Arc<Api<C>>>) -> Json<Value> {
-    Json(json!({ "listings": api.relay.btc_listings(now()) }))
+async fn utxo_listings<C: ChainView>(State(api): State<Arc<Api<C>>>) -> Json<Value> {
+    Json(json!({ "listings": api.relay.utxo_listings(now()) }))
 }
 
-async fn btc_listing<C: ChainView>(State(api): State<Arc<Api<C>>>, Path(id): Path<B256>) -> Result<Json<crate::btc::SignedBtcListing>, Failure> {
-    api.relay.btc_listing(id).map(Json).ok_or(Failure(StatusCode::NOT_FOUND, "no such offer".into()))
+async fn utxo_listing<C: ChainView>(State(api): State<Arc<Api<C>>>, Path(id): Path<B256>) -> Result<Json<crate::utxo::SignedUtxoListing>, Failure> {
+    api.relay.utxo_listing(id).map(Json).ok_or(Failure(StatusCode::NOT_FOUND, "no such offer".into()))
 }
 
-async fn post_btc<C: ChainView>(
+async fn post_utxo<C: ChainView>(
     State(api): State<Arc<Api<C>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(signed): Json<crate::btc::SignedBtcListing>,
+    Json(signed): Json<crate::utxo::SignedUtxoListing>,
 ) -> Result<Json<Value>, Failure> {
     let now = now();
     if !api.allow_write(&headers, peer, now) {
         return Err(limited());
     }
     let id = signed.listing.get("id").cloned();
-    let new = api.relay.post_btc(signed, now)?;
+    let new = api.relay.post_utxo(signed, now)?;
     Ok(Json(json!({ "id": id, "new": new })))
 }
 
-async fn cancel_btc<C: ChainView>(
+async fn cancel_utxo<C: ChainView>(
     State(api): State<Arc<Api<C>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(signed): Json<crate::btc::SignedBtcCancel>,
+    Json(signed): Json<crate::utxo::SignedUtxoCancel>,
 ) -> Result<Json<Value>, Failure> {
     let now = now();
     if !api.allow_write(&headers, peer, now) {
         return Err(limited());
     }
-    api.relay.cancel_btc(&signed, now)?;
+    api.relay.cancel_utxo(&signed, now)?;
     Ok(Json(json!({ "id": signed.cancel.get("id"), "cancelled": true })))
 }

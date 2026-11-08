@@ -54,6 +54,10 @@ QStringList fields() {
 QStringList ownAddresses(const QString &role) {
     return role=="ltc" ? QStringList{"ltcRefund","xmzPayout"} : QStringList{"ltcPayout","xmzRefund"};
 }
+QString pairOf(const QString &network) {
+    static const QStringList btc{"btc-mainnet","btc-signet","btc-testnet4","btc-regtest"},ltc{"ltc-mainnet","ltc-testnet","ltc-regtest"};
+    return btc.contains(network) ? QStringLiteral("BTC/XMZ") : ltc.contains(network) ? QStringLiteral("LTC/XMZ") : QString();
+}
 QString otherRole(const QString &role) {return role=="ltc" ? QStringLiteral("xmz") : QStringLiteral("ltc");}
 QString roleName(const QString &role) {return role=="ltc" ? QStringLiteral("litecoin-funder") : QStringLiteral("native-funder");}
 QString signingDomain(const QString &role) {return QString(TermsSchema)+(role=="ltc" ? "-ltc-funder" : "-xmz-funder");}
@@ -109,18 +113,18 @@ QByteArray open(const QByteArray &secret,const QByteArray &sealed) {
 
 QJsonObject checkListing(const QJsonObject &signedListing,qint64 now) {
     const auto l=signedListing.value("listing").toObject();
-    const QSet<QString> expected{"schema","id","pair","network","side","btc","xmz","makerKey","mailbox","createdAt","expiresAt"};
+    const QSet<QString> expected{"schema","id","pair","network","side","coin","xmz","makerKey","mailbox","createdAt","expiresAt"};
     const auto names=l.keys();
     if (signedListing.size()!=2 || QSet<QString>(names.cbegin(),names.cend())!=expected) return {};
-    static const QStringList networks{"btc-mainnet","btc-signet","btc-testnet4","btc-regtest"};
-    if (l.value("schema")!=ListingSchema || l.value("pair")!="BTC/XMZ" || !networks.contains(l.value("network").toString())
-        || (l.value("side")!="sell-xmz" && l.value("side")!="buy-xmz") || !digits(l.value("btc")) || !digits(l.value("xmz"))
+    const auto pair=pairOf(l.value("network").toString());
+    if (l.value("schema")!=ListingSchema || pair.isEmpty() || l.value("pair")!=pair
+        || (l.value("side")!="sell-xmz" && l.value("side")!="buy-xmz") || !digits(l.value("coin")) || !digits(l.value("xmz"))
         || hex64(l.value("id")).isEmpty() || !hex(l.value("makerKey").toString(),32) || !hex(l.value("mailbox").toString(),32)
         || !l.value("createdAt").isDouble() || !l.value("expiresAt").isDouble()) return {};
     const auto expires=qint64(l.value("expiresAt").toDouble());
     if (now && expires<=now) return {};
     const auto signature=QByteArray::fromHex(signedListing.value("signature").toString().toLatin1());
-    if (!OfferIdentity::verifyBtcOffer(canonical(l),QByteArray::fromHex(l.value("makerKey").toString().toLatin1()),signature)) return {};
+    if (!OfferIdentity::verifySwapOffer(canonical(l),QByteArray::fromHex(l.value("makerKey").toString().toLatin1()),signature)) return {};
     return l;
 }
 
@@ -129,7 +133,7 @@ QByteArray buildTerms(const QString &makerRole,const QJsonObject &listing,const 
     QJsonObject cards{{makerRole,makerCard},{otherRole(makerRole),takerCard}};
     QJsonObject terms{{"schema",TermsSchema},{"quoteId",QUuid::createUuid().toString(QUuid::WithoutBraces)},
         {"swapId",QUuid::createUuid().toString(QUuid::WithoutBraces)},{"appFeeXmzAtoms","0"},
-        {"ltcAtoms",listing.value("btc")},{"xmzAtoms",listing.value("xmz")},{"expiresAt",QString::number(now+QuoteSeconds)},
+        {"ltcAtoms",listing.value("coin")},{"xmzAtoms",listing.value("xmz")},{"expiresAt",QString::number(now+QuoteSeconds)},
         {"ltcFunder",cards.value("ltc").toObject().value("funderKey")},{"xmzFunder",cards.value("xmz").toObject().value("funderKey")}};
     for (const auto &f:fields()) {
         if (terms.contains(f)) continue;
@@ -153,7 +157,7 @@ QString termsRefusal(const QByteArray &payload,const QJsonObject &listing,const 
     const auto t=parseTerms(payload);
     if (t.isEmpty()) return QStringLiteral("the terms are not a canonical quote");
     const auto makerRole=otherRole(ownRole);
-    QJsonObject expected{{"ltcAtoms",listing.value("btc")},{"xmzAtoms",listing.value("xmz")},{"ltcNetwork",listing.value("network")},
+    QJsonObject expected{{"ltcAtoms",listing.value("coin")},{"xmzAtoms",listing.value("xmz")},{"ltcNetwork",listing.value("network")},
         {ownRole+"Funder",ownCard.value("funderKey")},{makerRole+"Funder",listing.value("makerKey")},{"appFeeXmzAtoms","0"}};
     for (auto it=ownAddresses.begin();it!=ownAddresses.end();++it) expected.insert(it.key(),it.value());
     QStringList wrong;

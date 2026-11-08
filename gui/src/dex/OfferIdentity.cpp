@@ -167,23 +167,23 @@ bool OfferIdentity::verify(const QByteArray &payload, const QByteArray &network,
         reinterpret_cast<const unsigned char *>(publicKey.constData())) == 0;
 }
 
-QByteArray OfferIdentity::signBtcOffer(const QByteArray &canonical) const
+QByteArray OfferIdentity::signSwapOffer(const QByteArray &canonical) const
 {
     if (canonical.isEmpty() || canonical.size() > 16384) return {};
-    return signFramed(QByteArray("MONZERO-DEX-BTC-LISTING-V1\n") + canonical);
+    return signFramed(QByteArray("MONZERO-DEX-UTXO-LISTING-V1\n") + canonical);
 }
 
-QByteArray OfferIdentity::signBtcCancel(const QByteArray &canonical) const
+QByteArray OfferIdentity::signSwapCancel(const QByteArray &canonical) const
 {
     if (canonical.isEmpty() || canonical.size() > 16384) return {};
-    return signFramed(QByteArray("MONZERO-DEX-BTC-CANCEL-V1\n") + canonical);
+    return signFramed(QByteArray("MONZERO-DEX-UTXO-CANCEL-V1\n") + canonical);
 }
 
-bool OfferIdentity::verifyBtcOffer(const QByteArray &canonical,const QByteArray &publicKey,const QByteArray &signature)
+bool OfferIdentity::verifySwapOffer(const QByteArray &canonical,const QByteArray &publicKey,const QByteArray &signature)
 {
     if (sodium_init() < 0 || publicKey.size() != crypto_sign_PUBLICKEYBYTES || signature.size() != crypto_sign_BYTES
         || canonical.isEmpty() || canonical.size() > 16384) return false;
-    const auto message = QByteArray("MONZERO-DEX-BTC-LISTING-V1\n") + canonical;
+    const auto message = QByteArray("MONZERO-DEX-UTXO-LISTING-V1\n") + canonical;
     return crypto_sign_verify_detached(reinterpret_cast<const unsigned char *>(signature.constData()),
         reinterpret_cast<const unsigned char *>(message.constData()), quint64(message.size()),
         reinterpret_cast<const unsigned char *>(publicKey.constData())) == 0;

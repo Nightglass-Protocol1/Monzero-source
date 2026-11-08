@@ -50,11 +50,10 @@ bool BtcMarketJob::configure(const QString &path) {
     if (!m_path.isEmpty()) return false;
     const auto doc=QJsonDocument::fromJson(LitecoinJournalProtocol::privateConfig(path,65536));
     const auto c=doc.object();
-    static const QStringList networks{"btc-mainnet","btc-signet","btc-testnet4","btc-regtest"};
     const QSet<QString> keys{"schema","network","relays","tradesDir","journalHelper","local","params","policy"};
     const auto names=c.keys();
     if (!doc.isObject() || QSet<QString>(names.cbegin(),names.cend())!=keys || c.value("schema")!="monzero-private-btc-market-v1"
-        || !networks.contains(c.value("network").toString()) || !QDir::isAbsolutePath(c.value("tradesDir").toString())
+        || pairOf(c.value("network").toString()).isEmpty() || !QDir::isAbsolutePath(c.value("tradesDir").toString())
         || !QFile::exists(c.value("journalHelper").toString()) || !c.value("local").isObject() || !c.value("params").isObject()
         || !c.value("policy").isObject()) return false;
     QStringList relays;
@@ -110,18 +109,18 @@ void BtcMarketJob::request(const QString &path,const QJsonObject &body,std::func
 
 bool BtcMarketJob::refreshListings() {
     if (m_path.isEmpty()) return false;
-    request("/v1/btc/listings",{},[this](const Replies &replies){
+    request("/v1/utxo/listings",{},[this](const Replies &replies){
         m_signed.clear();m_listings.clear();
         for (const auto &r:replies) for (const auto &v:QJsonDocument::fromJson(r.second).object().value("listings").toArray()) {
             const auto signedListing=v.toObject();
             const auto l=checkListing(signedListing,now());
             if (l.isEmpty() || l.value("network")!=network() || m_signed.contains(l.value("id").toString())) continue;
             m_signed.insert(l.value("id").toString(),signedListing);
-            const auto sats=l.value("btc").toString(),atoms=l.value("xmz").toString();
+            const auto sats=l.value("coin").toString(),atoms=l.value("xmz").toString();
             m_listings.append(QVariantMap{{"id",l.value("id")},{"side",l.value("side")},{"btc",amountText(sats,8)},
                 {"xmz",amountText(atoms,11)},{"btcSats",sats},{"xmzAtoms",atoms},
                 {"price",QString::number(sats.toDouble()/1e8/(atoms.toDouble()/1e11),'g',6)},
-                {"expiresAt",l.value("expiresAt").toDouble()},{"pair","BTC/XMZ"}});
+                {"expiresAt",l.value("expiresAt").toDouble()},{"pair",pairOf(network())}});
         }
         m_state=replies.isEmpty() ? "failed" : "ok";m_error=replies.isEmpty() ? tr("No relay answered.") : QString();
     },false);
@@ -130,7 +129,7 @@ bool BtcMarketJob::refreshListings() {
 
 QVariantMap BtcMarketJob::listingAmounts(const QString &id) const {
     const auto l=m_signed.value(id).value("listing").toObject();
-    return {{"btcSats",l.value("btc")},{"xmzAtoms",l.value("xmz")},{"side",l.value("side")}};
+    return {{"btcSats",l.value("coin")},{"xmzAtoms",l.value("xmz")},{"side",l.value("side")}};
 }
 
 bool BtcMarketJob::newIdentity(const QString &dir,const QString &role,QJsonObject *card) {
@@ -179,16 +178,16 @@ bool BtcMarketJob::post(const QString &side,const QString &btcSats,const QString
     QJsonObject card;
     if (!newIdentity(dir,role,&card)) {fail(tr("The trade identity could not be created."));return false;}
     QByteArray id(32,'\0');randombytes_buf(id.data(),32);
-    const QJsonObject listing{{"schema",ListingSchema},{"id","0x"+QString::fromLatin1(id.toHex())},{"pair","BTC/XMZ"},{"network",network()},
-        {"side",side},{"btc",btcSats},{"xmz",xmzAtoms},{"makerKey",card.value("funderKey")},{"mailbox",card.value("mailbox")},
+    const QJsonObject listing{{"schema",ListingSchema},{"id","0x"+QString::fromLatin1(id.toHex())},{"pair",pairOf(network())},{"network",network()},
+        {"side",side},{"coin",btcSats},{"xmz",xmzAtoms},{"makerKey",card.value("funderKey")},{"mailbox",card.value("mailbox")},
         {"createdAt",double(now())},{"expiresAt",double(now()+qint64(lifetimeHours)*3600)}};
     auto pass=LitecoinJournalProtocol::privateConfig(dir+"/identity.passphrase");
     QFile f(dir+"/identity.bin");f.open(QIODevice::ReadOnly);
     auto identity=OfferIdentity::decrypt(f.readAll(),pass);sodium_memzero(pass.data(),pass.size());
     if (!identity) {fail(tr("The trade identity could not be opened."));return false;}
-    const QJsonObject signedListing{{"listing",listing},{"signature",QString::fromLatin1(identity->signBtcOffer(canonical(listing)).toHex())}};
+    const QJsonObject signedListing{{"listing",listing},{"signature",QString::fromLatin1(identity->signSwapOffer(canonical(listing)).toHex())}};
     if (checkListing(signedListing).isEmpty() || !writeFile(dir+"/offer.json",canonical({{"signed",signedListing}}))) {fail(tr("The offer could not be signed."));return false;}
-    request("/v1/btc/listings",signedListing,[this](const Replies &replies){
+    request("/v1/utxo/listings",signedListing,[this](const Replies &replies){
         if (replies.isEmpty()) fail(tr("No relay took the offer; it stays saved and can be posted again."));
         else {m_state="ok";m_error.clear();}
     },true);
@@ -226,7 +225,7 @@ bool BtcMarketJob::cancel(const QString &folder) {
         QFile file(folder+"/identity.bin");file.open(QIODevice::ReadOnly);
         auto identity=OfferIdentity::decrypt(file.readAll(),pass);sodium_memzero(pass.data(),pass.size());
         if (!identity) return false;
-        request("/v1/btc/cancel",{{"cancel",c},{"signature",QString::fromLatin1(identity->signBtcCancel(canonical(c)).toHex())}},[](const Replies&){},true);
+        request("/v1/utxo/cancel",{{"cancel",c},{"signature",QString::fromLatin1(identity->signSwapCancel(canonical(c)).toHex())}},[](const Replies&){},true);
         writeFile(folder+"/cancelled",QByteArray("cancelled\n"));
         scanFolders();emit changed();return true;
     }
@@ -359,8 +358,9 @@ QVariantMap BtcMarketJob::status() const {
     QVariantList mine;
     for (const auto &f:m_folders)
         mine.append(QVariantMap{{"folder",f.path},{"kind",f.kind},{"state",f.state},{"detail",f.detail},{"id",f.listingId},
-            {"side",f.listing.value("side")},{"btc",amountText(f.listing.value("btc").toString(),8)},
+            {"side",f.listing.value("side")},{"btc",amountText(f.listing.value("coin").toString(),8)},
             {"xmz",amountText(f.listing.value("xmz").toString(),11)},{"app",f.state=="agreed" ? f.path+"/app/app.json" : QString()}});
     return {{"configured",!m_path.isEmpty()},{"busy",m_outstanding>0},{"state",m_state},{"error",m_error},{"network",network()},
+        {"coin",pairOf(network()).left(3)},
         {"listings",m_listings},{"mine",mine},{"relays",QJsonArray::fromStringList(m_relays).toVariantList()}};
 }

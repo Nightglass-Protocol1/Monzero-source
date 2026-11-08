@@ -287,7 +287,7 @@ private slots:
         QCOMPARE(BtcTradeSetup::canonical(signedListing.value("listing").toObject()),v.value("canonicalListing").toString().toUtf8());
         QVERIFY(!BtcTradeSetup::checkListing(signedListing).isEmpty());
         QVERIFY(BtcTradeSetup::checkListing(signedListing,1800003600).isEmpty());   // expired then
-        auto tampered=signedListing;auto l=tampered.value("listing").toObject();l.insert("btc","200001");tampered.insert("listing",l);
+        auto tampered=signedListing;auto l=tampered.value("listing").toObject();l.insert("coin","200001");tampered.insert("listing",l);
         QVERIFY(BtcTradeSetup::checkListing(tampered).isEmpty());
         const auto secret=QByteArray::fromHex(v.value("mailboxSecret").toString().toLatin1());
         QCOMPARE(BtcTradeSetup::open(secret,QByteArray::fromHex(v.value("sealed").toString().toLatin1())),v.value("plain").toString().toUtf8());
@@ -304,21 +304,27 @@ private slots:
         // Our own offers sign and check
         OfferIdentity identity;
         auto mine=signedListing.value("listing").toObject();mine.insert("makerKey",QString::fromLatin1(identity.publicKey().toHex()));
-        const QJsonObject ours{{"listing",mine},{"signature",QString::fromLatin1(identity.signBtcOffer(BtcTradeSetup::canonical(mine)).toHex())}};
+        const QJsonObject ours{{"listing",mine},{"signature",QString::fromLatin1(identity.signSwapOffer(BtcTradeSetup::canonical(mine)).toHex())}};
         QVERIFY(!BtcTradeSetup::checkListing(ours).isEmpty());
     }
     // An app and a trade kit agree a BTC trade through a live relay, in both directions: same signed
     // quote on both sides, and the app's folder passes the trade setup review. Needs
     // MONZERO_TEST_RELAY (a relay serving btc-regtest), MONZERO_TEST_KIT (trade_kit.py),
     // MONZERO_TEST_KIT_PYTHON (with PyNaCl) and MONZERO_TEST_JOURNAL_HELPER.
+    void btcOffersBetweenTheAppAndTheKit_data() {
+        QTest::addColumn<QString>("network");
+        QTest::newRow("BTC/XMZ") << QString("btc-regtest");
+        QTest::newRow("LTC/XMZ") << QString("ltc-regtest");
+    }
     void btcOffersBetweenTheAppAndTheKit() {
+        QFETCH(QString,network);
         const auto relay=qEnvironmentVariable("MONZERO_TEST_RELAY"),kitPath=qEnvironmentVariable("MONZERO_TEST_KIT");
         const auto python=qEnvironmentVariable("MONZERO_TEST_KIT_PYTHON"),helper=qEnvironmentVariable("MONZERO_TEST_JOURNAL_HELPER");
         if (relay.isEmpty() || kitPath.isEmpty() || python.isEmpty() || helper.isEmpty()) QSKIP("set MONZERO_TEST_RELAY, MONZERO_TEST_KIT, MONZERO_TEST_KIT_PYTHON and MONZERO_TEST_JOURNAL_HELPER");
         QTemporaryDir dir;QVERIFY(dir.isValid());const auto root=dir.path();
         if (qEnvironmentVariableIsSet("MONZERO_TEST_KEEP")) {dir.setAutoRemove(false);qWarning("kept %s",qPrintable(root));}
         // The Bitcoin regtest stage, as an app trading BTC there runs; the default stage afterwards
-        DexDeployment::resetForTesting();QVERIFY(DexDeployment::selectLitecoinStage("btc-regtest"));
+        DexDeployment::resetForTesting();QVERIFY(DexDeployment::selectLitecoinStage(network=="ltc-regtest" ? QStringLiteral("regtest") : network));
         const auto restore=qScopeGuard([]{DexDeployment::resetForTesting();DexDeployment::lockLitecoinStage();});
         const QString xmzGenesis(64,'1'),btcGenesis=DexDeployment::litecoinGenesis();
         auto env=QProcessEnvironment::systemEnvironment();env.insert("MONZERO_KIT_PASSPHRASE","kit test passphrase 1");
@@ -331,14 +337,14 @@ private slots:
             return done && p.exitCode()==0 ? out : QByteArray();
         };
         auto write=[](const QString &path,const QByteArray &data){QFile f(path);return f.open(QIODevice::WriteOnly) && f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner) && f.write(data)==data.size();};
-        const QJsonObject policy{{"ltc_network","btc-regtest"},{"xmz_network","xmz-mainnet"},{"xmz_genesis",xmzGenesis},{"ltc_confirmations",1},
+        const QJsonObject policy{{"ltc_network",network},{"xmz_network","xmz-mainnet"},{"xmz_genesis",xmzGenesis},{"ltc_confirmations",1},
             {"xmz_confirmations",10},{"cancel_blocks",36},{"punish_blocks",10},{"maximum_ltc_atoms",1000000000},{"maximum_xmz_atoms",qint64(200000000000)},
             {"maximum_ltc_funding_fee",100000},{"maximum_ltc_recovery_fee",20000},{"maximum_xmz_fee",qint64(10000000000)},{"minimum_ltc_output",100000},
             {"minimum_relay_fee_atoms_per_kb",1000}};
         QJsonObject params;
         for (const auto &f:BtcTradeSetup::fields()) params.insert(f,"1");
         for (const auto &f:{"schema","quoteId","swapId","ltcFunder","xmzFunder","appFeeXmzAtoms","ltcAtoms","xmzAtoms","expiresAt"}) params.remove(f);
-        params.insert("ltcNetwork","btc-regtest");params.insert("xmzNetwork","xmz-mainnet");params.insert("xmzGenesis",xmzGenesis);
+        params.insert("ltcNetwork",network);params.insert("xmzNetwork","xmz-mainnet");params.insert("xmzGenesis",xmzGenesis);
         params.insert("ltcGenesis",btcGenesis);
         params.insert("ltcConfirmations","1");params.insert("xmzConfirmations","10");params.insert("cancelBlocks","36");params.insert("punishBlocks","10");
         const QJsonObject addresses{{"ltcPayout","bcrt1qmaker"},{"xmzRefund","Kmaker"},{"ltcRefund","bcrt1qtaker"},{"xmzPayout","Ktaker"}};
@@ -347,7 +353,7 @@ private slots:
             QJsonObject{{"host","two.example"},{"port",50002}}}},{"maximumTipAge",5400}}}}},{"xmz",QJsonObject{{"daemonPort",1},{"claimWalletPort",2},
             {"claimLoginFile",root+"/login"},{"sourceWalletPort",3},{"sourceLoginFile",root+"/login"},{"sourceAddress","Ksource"},
             {"observerWalletPort",4},{"observerLoginFile",root+"/login"},{"walletPasswordFile",root+"/password"}}}};
-        QVERIFY(write(root+"/market.json",QJsonDocument(QJsonObject{{"schema","monzero-private-btc-market-v1"},{"network","btc-regtest"},
+        QVERIFY(write(root+"/market.json",QJsonDocument(QJsonObject{{"schema","monzero-private-btc-market-v1"},{"network",network},
             {"relays",QJsonArray{relay}},{"tradesDir",root+"/app-trades"},{"journalHelper",helper},{"local",local},{"params",params},{"policy",policy}}).toJson(QJsonDocument::Compact)));
         BtcMarketJob app;QVERIFY(app.configure(root+"/market.json"));
         QSignalSpy agreed(&app,&BtcMarketJob::agreed);
@@ -357,7 +363,7 @@ private slots:
         QVERIFY(!kit({"identity","--role","xmz","--dir",root+"/kit-xmz"}).isEmpty());
         QJsonObject kitParams=params;kitParams.remove("ltcRefund");kitParams.remove("xmzPayout");
         QVERIFY(write(root+"/kit-params.json",QJsonDocument(kitParams).toJson()) && write(root+"/policy.json",QJsonDocument(policy).toJson()));
-        QVERIFY(!kit({"offer","--dir",root+"/kit-xmz","--relay",relay,"--network","btc-regtest","--side","sell-xmz","--btc","200000",
+        QVERIFY(!kit({"offer","--dir",root+"/kit-xmz","--relay",relay,"--network",network,"--side","sell-xmz","--btc","200000",
             "--xmz","200000000000","--params",root+"/kit-params.json","--policy",root+"/policy.json","--hours","1"}).isEmpty());
         const auto kitOffer=QJsonDocument::fromJson([&]{QFile f(root+"/kit-xmz/offer.json");f.open(QIODevice::ReadOnly);return f.readAll();}()).object()
             .value("signed").toObject().value("listing").toObject().value("id").toString();

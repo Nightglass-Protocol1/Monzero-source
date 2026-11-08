@@ -835,16 +835,16 @@ def _run(args, vm_lease=None):
             params = {k:v for k,v in terms.items() if k not in ("schema","quoteId","swapId","ltcFunder","xmzFunder","appFeeXmzAtoms")}
             write_private(root/"kit-params.json", params)
             if args.relay_offers:
-                # The whole setup through the relay: Alice posts a BTC offer and answers takes, Bob
+                # The whole setup through the relay: Alice posts an offer and answers takes, Bob
                 # takes it; cards, terms and both signatures travel only as sealed relay mail.
                 relay_flags = [x for r in args.relay for x in ("--relay", r)]
                 offer_params = {k:v for k,v in params.items() if k not in ("ltcAtoms","xmzAtoms","expiresAt","ltcRefund","xmzPayout")}
                 write_private(root/"kit-offer-params.json", offer_params)
                 write_private(root/"kit-policy.json", policy)
                 run_kit("offer", "--dir", str(root/"kit-xmz"), *relay_flags, "--network", terms["ltcNetwork"], "--side", "sell-xmz",
-                    "--btc", terms["ltcAtoms"], "--xmz", terms["xmzAtoms"], "--params", str(root/"kit-offer-params.json"),
+                    "--coin", terms["ltcAtoms"], "--xmz", terms["xmzAtoms"], "--params", str(root/"kit-offer-params.json"),
                     "--policy", str(root/"kit-policy.json"), "--hours", "2")
-                offer_id = json.loads((root/"kit-xmz/offer.json").read_text())["signed"]["listing"]["id"]
+                offer_id = json.loads((root/"kit-xmz/offer.json").read_text())["signed"]["listing"]["id"]  # BTC/XMZ or LTC/XMZ
                 listed = subprocess.run([sys.executable, str(kit), "offers", *relay_flags], env=kit_env, capture_output=True, text=True)
                 require(offer_id in listed.stdout, "The offer is not listed on the relay: "+listed.stdout+listed.stderr)
                 serve = subprocess.Popen([sys.executable, str(kit), "serve", "--dir", str(root/"kit-xmz"), *relay_flags, "--wait", "600"],

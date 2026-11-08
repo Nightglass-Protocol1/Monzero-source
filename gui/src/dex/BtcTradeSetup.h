@@ -5,13 +5,15 @@
 #include <QString>
 #include <QStringList>
 
-// The steps of a BTC/XMZ trade setup through the open relays, as the trade kit does them
+// The steps of a BTC/XMZ or LTC/XMZ trade setup through the open relays, as the trade kit does them
 // (tools/dex-trade-kit/relay_market.py), so an app and a kit can trade with each other:
 // signed offers, sealed letters, the terms both sides sign, the signed quote and this side's
 // app folder (the layout of `trade_kit.py configure` with a relay peer). No network, no state.
 namespace BtcTradeSetup {
-inline const char *ListingSchema="monzero-dex-btc-listing/1";
-inline const char *CancelSchema="monzero-dex-btc-cancel/1";
+inline const char *ListingSchema="monzero-dex-utxo-listing/1";
+inline const char *CancelSchema="monzero-dex-utxo-cancel/1";
+// The pair a swap network trades ("BTC/XMZ" for btc-*, "LTC/XMZ" for ltc-*); empty if unknown
+QString pairOf(const QString &network);
 inline const char *TermsSchema="monzero-native-ltc-xmz-quote-v2";
 inline const char *EnvelopeSchema="monzero-ltc-signed-quote-envelope-v1";
 inline const char *CardSchema="monzero-ltc-trade-card-v1";

@@ -35,14 +35,14 @@ class Offers(unittest.TestCase):
     def offer(self, maker):
         now = int(time.time())
         return rm.signed_listing(maker, {"schema": rm.LISTING_SCHEMA, "id": "0x" + "ab" * 32, "pair": "BTC/XMZ",
-            "network": "btc-regtest", "side": "sell-xmz", "btc": "200000", "xmz": "200000000000",
+            "network": "btc-regtest", "side": "sell-xmz", "coin": "200000", "xmz": "200000000000",
             "makerKey": maker.card["funderKey"], "mailbox": maker.card["mailbox"], "createdAt": now, "expiresAt": now + 3600})
 
     def test_a_signed_offer_checks_and_any_change_breaks_it(self):
         maker = FakeIdentity("xmz")
         signed = self.offer(maker)
-        self.assertEqual(rm.check_listing(json.loads(json.dumps(signed)), int(time.time()))["btc"], "200000")
-        for field, value in (("btc", "200001"), ("side", "buy-xmz"), ("makerKey", "00" * 32), ("network", "btc-mainnet")):
+        self.assertEqual(rm.check_listing(json.loads(json.dumps(signed)), int(time.time()))["coin"], "200000")
+        for field, value in (("coin", "200001"), ("pair", "LTC/XMZ"), ("side", "buy-xmz"), ("makerKey", "00" * 32), ("network", "btc-mainnet")):
             changed = json.loads(json.dumps(signed))
             changed["listing"][field] = value
             self.assertIsNone(rm.check_listing(changed), field)

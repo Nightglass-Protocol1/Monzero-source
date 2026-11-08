@@ -246,6 +246,9 @@ void LitecoinLightFundingJob::finish(bool success) {
             m_request.value("payment").toObject(),review,result.value("txid").toString());
     }
     m_response=valid?document.object():QJsonObject{};
+    // Why a step was not accepted (the helper's own error text only; it carries no keys)
+    if(!valid) qWarning("light funding %s not accepted: %s%s",qPrintable(m_operation),!success?"the helper did not finish; ":"",
+        qPrintable(document.object().value("error").toString().left(300)));
     // Cancellation/error cannot prove a transaction was not signed or sent.
     m_state=valid?"complete":"outcome-unconfirmed";erase(m_input);erase(m_output);
     const auto psbt=m_response.value("result").toObject().value("fundingPsbt").toString().toLatin1();

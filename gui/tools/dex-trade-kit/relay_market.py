@@ -1,14 +1,14 @@
-"""BTC/XMZ offers through the open DEX relays (trade_kit.py offer | offers | take | serve | cancel).
+"""BTC/XMZ and LTC/XMZ offers through the open DEX relays (trade_kit.py offer | offers | take | serve | cancel).
 
 The kit's two-party setup (cards, terms, two signatures) travels as sealed relay mail instead of
 files handed over by hand, and the apps then negotiate through the relays too (`configure` with
 LOCAL.json "peer": {"relays": [...]}), so neither trader needs an open port.
 
-  offer   --dir DIR --relay URL --network NET --side sell-xmz|buy-xmz --btc SATS --xmz ATOMS
+  offer   --dir DIR --relay URL --network NET --side sell-xmz|buy-xmz --coin ATOMS --xmz ATOMS
           --params PARAMS.json --policy POLICY.json [--hours H]
           Post a signed offer. PARAMS.json holds the maker's own terms: its two destinations, fees,
           confirmations, cancel window, networks and genesis hashes (no amounts, no other party).
-  offers  --relay URL                               list the relays' checked BTC/XMZ offers
+  offers  --relay URL                               list the relays' checked BTC/XMZ and LTC/XMZ offers
   take    --dir DIR --relay URL --offer ID --addresses ADDR.json [--wait S]
           Ask the maker for the trade (ADDR.json: our two destinations), check and sign the terms
           it answers with, and write DIR/trade/ (start-quote.json, peer-card.json, policy.json).
@@ -17,7 +17,9 @@ LOCAL.json "peer": {"relays": [...]}), so neither trader needs an open port.
 
 Mail format: as the app's (engine/src/mail.rs): a fresh X25519 sender key per letter, key
 SHA-256("monzero-dex-mail/1" || shared || sender || recipient), ChaCha20-Poly1305, zero nonce.
-Offers are signed with the identity key over "MONZERO-DEX-BTC-LISTING-V1\\n" + canonical JSON.
+Offers are signed with the identity key over "MONZERO-DEX-UTXO-LISTING-V1\\n" + canonical JSON.
+NET is a btc-* network (pair BTC/XMZ) or an ltc-* network (pair LTC/XMZ); amounts in the coin's
+atoms (sats or litoshis) and XMZ atoms.
 """
 import hashlib, json, secrets, time, urllib.error, urllib.request
 from pathlib import Path
@@ -26,9 +28,12 @@ from nacl.bindings import (crypto_aead_chacha20poly1305_ietf_decrypt, crypto_aea
 from nacl.exceptions import BadSignatureError, CryptoError
 from nacl.signing import SigningKey, VerifyKey
 
-LISTING_SCHEMA, CANCEL_SCHEMA, MAIL_SCHEMA = "monzero-dex-btc-listing/1", "monzero-dex-btc-cancel/1", "monzero-dex-mail/1"
-LISTING_DOMAIN, CANCEL_DOMAIN = b"MONZERO-DEX-BTC-LISTING-V1\n", b"MONZERO-DEX-BTC-CANCEL-V1\n"
-NETWORKS = ("btc-mainnet", "btc-signet", "btc-testnet4", "btc-regtest")
+LISTING_SCHEMA, CANCEL_SCHEMA, MAIL_SCHEMA = "monzero-dex-utxo-listing/1", "monzero-dex-utxo-cancel/1", "monzero-dex-mail/1"
+LISTING_DOMAIN, CANCEL_DOMAIN = b"MONZERO-DEX-UTXO-LISTING-V1\n", b"MONZERO-DEX-UTXO-CANCEL-V1\n"
+# The pair each swap network trades
+PAIRS = {**{n: "BTC/XMZ" for n in ("btc-mainnet", "btc-signet", "btc-testnet4", "btc-regtest")},
+         **{n: "LTC/XMZ" for n in ("ltc-mainnet", "ltc-testnet", "ltc-regtest")}}
+NETWORKS = tuple(PAIRS)
 # Each role's own destinations: where its coin goes back on a refund, and where it is paid
 OWN_ADDRESSES = {"ltc": ("ltcRefund", "xmzPayout"), "xmz": ("ltcPayout", "xmzRefund")}
 VARIABLE = {"schema", "quoteId", "swapId", "ltcFunder", "xmzFunder", "appFeeXmzAtoms", "ltcAtoms", "xmzAtoms", "expiresAt"}
@@ -173,9 +178,9 @@ def check_listing(signed, now=None):
     k = kit()
     try:
         l, sig = signed["listing"], bytes.fromhex(signed["signature"])
-        if set(l) != {"schema", "id", "pair", "network", "side", "btc", "xmz", "makerKey", "mailbox", "createdAt", "expiresAt"}:
+        if set(l) != {"schema", "id", "pair", "network", "side", "coin", "xmz", "makerKey", "mailbox", "createdAt", "expiresAt"}:
             return None
-        if l["schema"] != LISTING_SCHEMA or l["pair"] != "BTC/XMZ" or l["side"] not in ("sell-xmz", "buy-xmz") or l["network"] not in NETWORKS:
+        if l["schema"] != LISTING_SCHEMA or l["pair"] != PAIRS.get(l["network"]) or l["side"] not in ("sell-xmz", "buy-xmz"):
             return None
         VerifyKey(bytes.fromhex(l["makerKey"])).verify(LISTING_DOMAIN + k.canonical(l), sig)
         if now is not None and l["expiresAt"] <= now:
@@ -225,15 +230,15 @@ def cmd_offer(a):
         fail("parameters lack " + ", ".join(missing))
     if params.get("ltcNetwork") != a.network:
         fail("the parameters are for another network")
-    if a.btc <= 0 or a.xmz <= 0 or not 1 <= a.hours <= 24:
+    if a.coin <= 0 or a.xmz <= 0 or not 1 <= a.hours <= 24:
         fail("amounts must be positive and the offer open 1-24 hours")
     now = int(time.time())
-    fields = {"schema": LISTING_SCHEMA, "id": "0x" + secrets.token_hex(32), "pair": "BTC/XMZ", "network": a.network,
-        "side": a.side, "btc": str(a.btc), "xmz": str(a.xmz), "makerKey": me.card["funderKey"], "mailbox": me.card["mailbox"],
+    fields = {"schema": LISTING_SCHEMA, "id": "0x" + secrets.token_hex(32), "pair": PAIRS[a.network], "network": a.network,
+        "side": a.side, "coin": str(a.coin), "xmz": str(a.xmz), "makerKey": me.card["funderKey"], "mailbox": me.card["mailbox"],
         "createdAt": now, "expiresAt": now + a.hours * 3600}
     signed = signed_listing(me, fields)
     k.write_new(me.dir / "offer.json", k.canonical({"signed": signed, "params": params, "policy": policy, "relays": relays}))
-    for r, status in post_all(relays, "/v1/btc/listings", signed):
+    for r, status in post_all(relays, "/v1/utxo/listings", signed):
         print(f"{r}: {status}")
     print(f"Offer {fields['id']} posted. Keep `trade_kit.py serve --dir {me.dir} --relay ...` running to answer takes.")
 
@@ -242,7 +247,7 @@ def cmd_offers(a):
     now, seen = int(time.time()), set()
     for r in (relay_url(x) for x in a.relay):
         try:
-            listings = request(r + "/v1/btc/listings")["listings"]
+            listings = request(r + "/v1/utxo/listings")["listings"]
         except (RuntimeError, OSError, KeyError) as e:
             print(f"{r}: {e}")
             continue
@@ -252,14 +257,14 @@ def cmd_offers(a):
                 continue
             seen.add(l["id"])
             verb = "sells" if l["side"] == "sell-xmz" else "buys"
-            print(f"{l['id']}  {l['network']}  {verb} {int(l['xmz']) / 1e11:g} XMZ for {int(l['btc']) / 1e8:.8f} BTC"
+            print(f"{l['id']}  {l['network']}  {verb} {int(l['xmz']) / 1e11:g} XMZ for {int(l['coin']) / 1e8:.8f} {l['pair'][:3]}"
                   f"  ({(l['expiresAt'] - now) // 60} min left)")
 
 
 def build_terms(maker_role, listing, params, maker_card, taker_card, taker_addresses):
     k = kit()
     terms = {"schema": k.SCHEMA, "quoteId": str(uuid4()), "swapId": str(uuid4()), "appFeeXmzAtoms": "0",
-        "ltcAtoms": listing["btc"], "xmzAtoms": listing["xmz"], "expiresAt": str(int(time.time()) + QUOTE_SECONDS)}
+        "ltcAtoms": listing["coin"], "xmzAtoms": listing["xmz"], "expiresAt": str(int(time.time()) + QUOTE_SECONDS)}
     cards = {maker_role: maker_card, ("xmz" if maker_role == "ltc" else "ltc"): taker_card}
     terms.update(ltcFunder=cards["ltc"]["funderKey"], xmzFunder=cards["xmz"]["funderKey"])
     for f in k.FIELDS:
@@ -332,7 +337,7 @@ def cmd_take(a):
     listing = None
     for r in relays:
         try:
-            listing = check_listing(request(f"{r}/v1/btc/listings/{a.offer}"), int(time.time()))
+            listing = check_listing(request(f"{r}/v1/utxo/listings/{a.offer}"), int(time.time()))
         except (RuntimeError, OSError):
             continue
         if listing:
@@ -363,7 +368,7 @@ def cmd_take(a):
             payload = letter.get("terms", "").encode()
             _, terms = k.validate_terms(payload)
             # The terms must be exactly the offer, both keys and our own destinations
-            expected = {"ltcAtoms": listing["btc"], "xmzAtoms": listing["xmz"], "ltcNetwork": listing["network"],
+            expected = {"ltcAtoms": listing["coin"], "xmzAtoms": listing["xmz"], "ltcNetwork": listing["network"],
                 "ltcFunder" if me.role == "ltc" else "xmzFunder": me.card["funderKey"],
                 "ltcFunder" if maker_role == "ltc" else "xmzFunder": listing["makerKey"], **addresses}
             wrong = [f for f, v in expected.items() if terms.get(f) != v]
@@ -374,7 +379,7 @@ def cmd_take(a):
                 VerifyKey(bytes.fromhex(listing["makerKey"])).verify(k.signing_bytes(payload, maker_role), bytes.fromhex(letter["signature"]))
             except (ValueError, BadSignatureError):
                 fail("the maker's signature does not verify")
-            print(f"Terms: {int(terms['ltcAtoms']) / 1e8:.8f} BTC for {int(terms['xmzAtoms']) / 1e11:g} XMZ, cancel after "
+            print(f"Terms: {int(terms['ltcAtoms']) / 1e8:.8f} {listing['pair'][:3]} for {int(terms['xmzAtoms']) / 1e11:g} XMZ, cancel after "
                   f"{terms['cancelBlocks']} blocks, quote expires {terms['expiresAt']}. Signing.")
             signature = me.key().sign(k.signing_bytes(payload, me.role)).signature.hex()
             send_letter(relays, listing["mailbox"], {"kind": "btc-signature", "listing": listing["id"], "signature": signature})
@@ -392,7 +397,7 @@ def cmd_cancel(a):
     relays = [relay_url(r) for r in a.relay] or state["relays"]
     fields = {"schema": CANCEL_SCHEMA, "id": state["signed"]["listing"]["id"], "makerKey": me.card["funderKey"], "at": int(time.time())}
     signed = {"cancel": fields, "signature": me.key().sign(CANCEL_DOMAIN + k.canonical(fields)).signature.hex()}
-    for r, status in post_all(relays, "/v1/btc/cancel", signed):
+    for r, status in post_all(relays, "/v1/utxo/cancel", signed):
         print(f"{r}: {status}")
 
 
@@ -401,7 +406,7 @@ def add_parsers(sub):
     for flag in ("--dir", "--network", "--side", "--params", "--policy"):
         p.add_argument(flag, required=True)
     p.add_argument("--relay", action="append", required=True)
-    p.add_argument("--btc", type=int, required=True)
+    p.add_argument("--coin", "--btc", dest="coin", type=int, required=True, help="the coin's atoms (sats or litoshis)")
     p.add_argument("--xmz", type=int, required=True)
     p.add_argument("--hours", type=int, default=6)
     p = sub.add_parser("offers")
