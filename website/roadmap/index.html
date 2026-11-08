@@ -38,7 +38,7 @@
 
 <div class="rm-note"><strong>Not live yet.</strong> Public DEX trading is not enabled. Every pair is proven on test networks first, then in a small real-funds test by the project, before any gated public release. Please don't send funds to trade on the DEX yet. XMZ has no market price, and the code has not had an independent security audit.</div>
 
-<p><em>Status as of 6 November 2026. Milestone-based delivery; no committed public-launch date.</em></p>
+<p><em>Status as of 8 November 2026. Milestone-based delivery; no committed public-launch date.</em></p>
 
 <h2>Where each pair stands</h2>
 <p>The DEX is crypto-only — XMZ against Bitcoin, Litecoin, BNB, Ethereum and Solana. (Earlier Bitcoin Cash and Dogecoin work was dropped: a legacy-signature malleability issue made their pre-signed refunds unsafe. A routed XMZ→XMR path is deferred.)</p>
@@ -47,15 +47,15 @@
   <div class="rm-card"><h3>XMZ / BNB <span class="pill done">mainnet tested</span></h3><p>A chain-agnostic EVM atomic-swap contract on BNB Smart Chain. Swap and refund passed on testnet; the first real-funds XMZ↔BNB swap on mainnet completed on 31&nbsp;October.</p></div>
   <div class="rm-card"><h3>XMZ / SOL <span class="pill done">mainnet tested</span></h3><p>A dedicated Solana atomic-swap program (native SOL and SPL). Deployed to Solana mainnet and verified with a live real-funds swap — lock → claim, escrow closed — on 6&nbsp;November.</p></div>
   <div class="rm-card"><h3>XMZ / LTC <span class="pill prog">mainnet validating</span></h3><p>A Litecoin light wallet on both sides. Passed the public-testnet gates; the mainnet path is now enabled and validated end-to-end in a dry run (light-wallet sync and full setup). A first real-funds swap is the next step.</p></div>
-  <div class="rm-card"><h3>XMZ / ETH <span class="pill next">next</span></h3><p>Uses the same EVM contract as BNB. Wiring Ethereum — and low-gas L2s such as Base and Arbitrum — for a testnet run, then a gated mainnet deploy.</p></div>
+  <div class="rm-card"><h3>XMZ / ETH <span class="pill prog">testnet passed</span></h3><p>Uses the same EVM contract as BNB, with Ethereum's finality wait (96 blocks) before either side acts. Passed every test-network gate on Sepolia on 8&nbsp;November — a full swap, both refund cases, and stop-and-resume of each side. A first real-funds swap is the next step; low-gas L2s such as Base and Arbitrum come later.</p></div>
 </div>
 
 <h2>How a pair goes live — the gates</h2>
 <p>Each stage starts only when the one before it passes. A gate failing means fix and retest, never skip.</p>
 <div class="table-wrap"><table class="rm">
 <tr><th>Stage</th><th>What it proves</th><th>Status</th></tr>
-<tr><td>1 · Test networks</td><td>Swap, refund, interruption, power loss, two machines — with light wallets where used</td><td><span class="pill done">BTC · LTC · BNB · SOL</span></td></tr>
-<tr><td>2 · Project real-funds test</td><td>A real swap with the project's own small funds, both sides owner-held</td><td><span class="pill done">BTC · BNB · SOL</span> &nbsp; <span class="pill prog">LTC next</span></td></tr>
+<tr><td>1 · Test networks</td><td>Swap, refund, interruption, power loss, two machines — with light wallets where used</td><td><span class="pill done">BTC · LTC · BNB · SOL · ETH</span></td></tr>
+<tr><td>2 · Project real-funds test</td><td>A real swap with the project's own small funds, both sides owner-held</td><td><span class="pill done">BTC · BNB · SOL</span> &nbsp; <span class="pill prog">LTC · ETH next</span></td></tr>
 <tr><td>3 · Security review</td><td>Community pentest kit, then independent review — before any public money</td><td><span class="pill gate">required · pending</span></td></tr>
 <tr><td>4 · Gated public beta</td><td>In-app offers, small per-trade and daily caps, a signed operator pause switch</td><td><span class="pill next">after review</span></td></tr>
 <tr><td>5 · Raised limits</td><td>Weeks of clean trading; limits raised step by step by signed document</td><td><span class="pill next">later</span></td></tr>
@@ -66,7 +66,7 @@
   <li><strong>Independent security review / community pentest.</strong> The swap contracts and engine have not been externally audited; this gates any public, real-money trading.</li>
   <li><strong>In-app peer discovery and offers.</strong> Swap-key exchange already runs over an authenticated peer-to-peer (libp2p) protocol that answers only the trader named in an offer; public offer discovery is next.</li>
   <li><strong>The go-live controls.</strong> Per-trade and daily caps, published fee addresses, and a signed kill switch that can pause new trades at any time.</li>
-  <li><strong>Finish the pair set.</strong> A first real-funds LTC swap, and wiring ETH and L2s onto the existing EVM contract.</li>
+  <li><strong>Finish the pair set.</strong> First real-funds LTC and ETH swaps, then low-gas L2s on the existing EVM contract.</li>
 </ul>
 
 <h2>What this roadmap means</h2>
