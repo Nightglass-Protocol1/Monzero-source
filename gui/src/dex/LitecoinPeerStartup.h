@@ -46,6 +46,9 @@ private:
     QByteArray m_peerPin;
     QHostAddress m_address;
     QString m_mode,m_peerName;
+    QStringList m_relays;              // relay mode: the open relays carrying the letters
+    QString m_mailboxSecretFile;       // relay mode: our mailbox key (private file)
+    QByteArray m_peerMailbox;          // relay mode: the peer's mailbox key, pinned from its card
     quint16 m_port=0;
     int m_delay=0,m_reconnects=0;
     QString m_resumeRelease,m_settledFunding,m_settledRedemption;

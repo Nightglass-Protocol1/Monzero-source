@@ -3,7 +3,10 @@
 #include "DexEngine.h"
 #include "LitecoinJournalProtocol.h"
 #include "PrivateQuoteServer.h"
+#include <QJsonArray>
 #include <QJsonDocument>
+#include <QRegularExpression>
+#include <QSet>
 #include <QSslKey>
 #include <sodium.h>
 
@@ -28,6 +31,37 @@ bool LitecoinPeerStartup::configure(const QString &path,const QString &journalPa
     };
     if (!appPath.isEmpty() && read(appPath).isEmpty()) return false;
     const auto bytes=read(path);const auto doc=QJsonDocument::fromJson(bytes);const auto c=doc.object();
+    if (c.value("schema")=="monzero-private-ltc-peer-relay-v1") {
+        // Through the open relays' mailboxes: no listener, no address, no TLS certificate. The
+        // peer is authenticated by its mailbox key, pinned from its card in the signed trade.
+        const bool settlement=c.contains("settlementConfigFile");
+        const QSet<QString> keys{"schema","mode","relays","mailboxSecretFile","peerMailbox","identityFile","passphraseFile","settlementConfigFile"};
+        for (auto i=c.begin();i!=c.end();++i) if (!keys.contains(i.key())) return false;
+        static const QRegularExpression hex64("\\A[0-9a-f]{64}\\z");
+        const auto relays=c.value("relays").toArray();
+        if (!doc.isObject() || doc.toJson(QJsonDocument::Compact)!=bytes || c.value("mode")!="relay"
+            || relays.isEmpty() || relays.size()>8 || !hex64.match(c.value("peerMailbox").toString()).hasMatch()) return false;
+        for (const auto &key:{"mailboxSecretFile","identityFile","passphraseFile"}) if (!c.value(key).isString() || c.value(key).toString().isEmpty()) return false;
+        if (settlement && (!c.value("settlementConfigFile").isString() || c.value("settlementConfigFile").toString().isEmpty())) return false;
+        m_relays.clear();for (const auto &r:relays) m_relays.append(r.toString());
+        m_mode="relay";m_peerMailbox=QByteArray::fromHex(c.value("peerMailbox").toString().toLatin1());
+        m_mailboxSecretFile=c.value("mailboxSecretFile").toString();
+        auto secret=read(m_mailboxSecretFile);const bool secretOk=QByteArray::fromHex(secret.trimmed()).size()==32;
+        sodium_memzero(secret.data(),secret.size());
+        const auto journal=QJsonDocument::fromJson(read(journalPath)).object();
+        if (!secretOk || journal.value("schema")!="monzero-private-ltc-journal-v5" || read(journal.value("startQuoteFile").toString()).isEmpty()
+            || read(c.value("identityFile").toString()).isEmpty()) return false;
+        m_journalPath=journalPath;m_identityFile=c.value("identityFile").toString();m_passphraseFile=c.value("passphraseFile").toString();
+        if (read(m_passphraseFile).isEmpty()) return false;
+        if (settlement) {m_settlementFile=c.value("settlementConfigFile").toString();if (read(m_settlementFile).isEmpty()) return false;}
+        if (!buildSession()) return false;
+        if (settlement && journal.value("role")=="native-funder" && !m_engine->configureLitecoinRedemption(m_settlementFile)) return false;
+        if (!sourcesMatch() || !m_engine->attachLitecoinNegotiation(m_session.get())) return false;
+        m_configured=true;
+        connect(m_engine,&DexEngine::litecoinJournalChanged,this,&LitecoinPeerStartup::startWhenSaved);
+        QTimer::singleShot(0,this,&LitecoinPeerStartup::startWhenSaved);
+        return true;
+    }
     const QStringList strings{"schema","mode","address","peerName","peerCertificateSha256",
         "certificateFile","privateKeyFile","caFile","identityFile","passphraseFile"};
     const bool settlement=c.value("schema")=="monzero-private-ltc-peer-v2";
@@ -171,7 +205,16 @@ void LitecoinPeerStartup::startWhenSaved() {
     if (snapshot.value("tradeId")!=expected.value("tradeId") || snapshot.value("role")!=expected.value("role")
         || snapshot.value("quoteCommitment")!=expected.value("quoteCommitment")
         || !DexDeployment::litecoinNetworkAllowed(snapshot.value("ltcNetwork").toString()) || !sourcesMatch()) {m_session->abort();return;}
-    if (m_mode=="listen") {
+    if (m_mode=="relay") {
+        // Both sides write and read letters; nobody listens. A restart of either side shows up as
+        // a lost connection and is rebuilt from the saved trade, as with the socket.
+        auto secretHex=LitecoinJournalProtocol::privateConfig(m_mailboxSecretFile);
+        auto secret=QByteArray::fromHex(secretHex.trimmed());sodium_memzero(secretHex.data(),secretHex.size());
+        m_client.reset(new PrivateQuoteChannel(QSslConfiguration::defaultConfiguration(),QByteArray(),this,PrivateQuoteChannel::Profile::LitecoinNegotiation));
+        const bool started=m_session->attach(*m_client) && m_session->start() && m_client->connectThroughRelays(m_relays,secret,m_peerMailbox);
+        sodium_memzero(secret.data(),secret.size());
+        if (!started) m_session->abort();
+    } else if (m_mode=="listen") {
         if (!m_server) {
             // One listener for the app's lifetime; each rebuilt session takes the next connection.
             m_server.reset(new PrivateQuoteServer(m_tls,m_peerPin,this,PrivateQuoteChannel::Profile::LitecoinNegotiation));

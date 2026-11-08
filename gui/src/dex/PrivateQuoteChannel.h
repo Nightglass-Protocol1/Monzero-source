@@ -6,6 +6,9 @@
 #include <QTimer>
 #include <QHostAddress>
 #include <QElapsedTimer>
+#include <QStringList>
+#include <memory>
+class RelayMailTransport;
 
 // Dedicated TLS client for participant messages, not a public offer relay.
 // Certificate trust/name validation AND an out-of-band SHA-256 leaf pin are
@@ -21,6 +24,12 @@ public:
     // Adopts an accepted TCP descriptor. Configure a local certificate/key and
     // trusted client CA first; peerPin pins the client's leaf certificate.
     bool acceptPeer(qintptr socketDescriptor);
+    // Instead of a TLS socket: sealed letters through the open relays' mailboxes, authenticated
+    // by the two traders' mailbox keys (ours secret, theirs pinned). For traders who cannot accept
+    // incoming connections; the same messages, signals and limits as the socket.
+    bool connectThroughRelays(const QStringList &relays, const QByteArray &ownMailboxSecret,
+                              const QByteArray &peerMailboxPublic);
+    ~PrivateQuoteChannel() override;
     bool send(const QByteArray &message);
     // Admission policy for both Qt TLS queues, excluding kernel/TLS overhead.
     static bool hasWriteCapacity(qint64 plaintextBytes, qint64 encryptedBytes, int messageBytes, Profile profile = Profile::Quotes);
@@ -44,6 +53,7 @@ private:
     QElapsedTimer m_rateWindow;
     int m_messages = 0;
     QByteArray m_pin, m_pending;
+    std::unique_ptr<RelayMailTransport> m_relay;
     bool m_ready = false, m_failed = false;
 };
 #endif

@@ -249,8 +249,8 @@ fn mail_is_kept_per_mailbox_for_two_hours() {
     assert_eq!(r.post_mail(b, Bytes::from(vec![0; 10]), NOW), Err(RelayError::BadMail));
     assert_eq!(r.post_mail(b, Bytes::from(vec![0; MAX_SEALED + 1]), NOW), Err(RelayError::BadMail));
     assert_eq!(r.post_mail(B256::ZERO, letter(3), NOW), Err(RelayError::BadMail));
-    for i in 0..MAIL_PER_BOX as u8 {
-        r.post_mail(b, letter(10 + i), NOW).unwrap();
+    for i in 0..MAIL_PER_BOX as u32 {
+        r.post_mail(b, Bytes::from((i + 1000).to_be_bytes().repeat(25)), NOW).unwrap();
     }
     assert_eq!(r.post_mail(b, letter(99), NOW), Err(RelayError::Full));
     r.prune(NOW + MAIL_SECS + 1);

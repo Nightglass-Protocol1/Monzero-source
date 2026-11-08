@@ -834,21 +834,49 @@ def _run(args, vm_lease=None):
                 run_kit("identity", "--role", side, "--dir", str(root/("kit-"+side)))
             params = {k:v for k,v in terms.items() if k not in ("schema","quoteId","swapId","ltcFunder","xmzFunder","appFeeXmzAtoms")}
             write_private(root/"kit-params.json", params)
-            run_kit("terms", "--ltc-card", str(root/"kit-ltc/card.json"), "--xmz-card", str(root/"kit-xmz/card.json"),
-                "--params", str(root/"kit-params.json"), "--out", str(root/"kit-terms.json"))
-            for side in ("ltc", "xmz"):
-                if remote and side == "ltc":
-                    remote.upload(root/"kit-terms.json", "kit-terms.json")
-                    remote.kit("sign", "--dir", remote.path("kit-ltc"), "--terms", remote.path("kit-terms.json"),
-                        "--out", remote.path("kit-ltc.sig"))
-                    (root/"kit-ltc.sig").write_bytes(remote.read("kit-ltc.sig"))
-                    continue
-                run_kit("sign", "--dir", str(root/("kit-"+side)), "--terms", str(root/"kit-terms.json"), "--out", str(root/("kit-"+side+".sig")))
-            for path in ("bob-meta","bob-secrets","alice-meta","alice-secrets","reservations"):
-                (root/path).mkdir(mode=0o700)
-            run_kit("assemble", "--terms", str(root/"kit-terms.json"), "--ltc-sig", str(root/"kit-ltc.sig"),
-                "--xmz-sig", str(root/"kit-xmz.sig"), "--out", str(root/"start-quote.json"))
-            terms.clear(); terms.update(json.loads((root/"kit-terms.json").read_text()))
+            if args.relay_offers:
+                # The whole setup through the relay: Alice posts a BTC offer and answers takes, Bob
+                # takes it; cards, terms and both signatures travel only as sealed relay mail.
+                relay_flags = [x for r in args.relay for x in ("--relay", r)]
+                offer_params = {k:v for k,v in params.items() if k not in ("ltcAtoms","xmzAtoms","expiresAt","ltcRefund","xmzPayout")}
+                write_private(root/"kit-offer-params.json", offer_params)
+                write_private(root/"kit-policy.json", policy)
+                run_kit("offer", "--dir", str(root/"kit-xmz"), *relay_flags, "--network", terms["ltcNetwork"], "--side", "sell-xmz",
+                    "--btc", terms["ltcAtoms"], "--xmz", terms["xmzAtoms"], "--params", str(root/"kit-offer-params.json"),
+                    "--policy", str(root/"kit-policy.json"), "--hours", "2")
+                offer_id = json.loads((root/"kit-xmz/offer.json").read_text())["signed"]["listing"]["id"]
+                listed = subprocess.run([sys.executable, str(kit), "offers", *relay_flags], env=kit_env, capture_output=True, text=True)
+                require(offer_id in listed.stdout, "The offer is not listed on the relay: "+listed.stdout+listed.stderr)
+                serve = subprocess.Popen([sys.executable, str(kit), "serve", "--dir", str(root/"kit-xmz"), *relay_flags, "--wait", "600"],
+                    env=kit_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                write_private(root/"kit-bob-addresses.json", {"ltcRefund":terms["ltcRefund"],"xmzPayout":terms["xmzPayout"]})
+                run_kit("take", "--dir", str(root/"kit-ltc"), *relay_flags, "--offer", offer_id,
+                    "--addresses", str(root/"kit-bob-addresses.json"), "--wait", "600")
+                served = serve.communicate(timeout=700)[0]
+                require(serve.returncode == 0, "The maker did not finish the take: "+served[-2000:])
+                for path in ("bob-meta","bob-secrets","alice-meta","alice-secrets","reservations"):
+                    (root/path).mkdir(mode=0o700)
+                agreed = [(root/f"kit-{side}/trade/start-quote.json").read_bytes() for side in ("ltc","xmz")]
+                require(agreed[0] == agreed[1], "The two sides assembled different quotes")
+                (root/"start-quote.json").write_bytes(agreed[0]); os.chmod(root/"start-quote.json", 0o600)
+                terms.clear(); terms.update(json.loads(json.loads(agreed[0])["payload"]))
+                note("offer-taken-through-relay", offerId=offer_id, swapId=terms["swapId"])
+            else:
+                run_kit("terms", "--ltc-card", str(root/"kit-ltc/card.json"), "--xmz-card", str(root/"kit-xmz/card.json"),
+                    "--params", str(root/"kit-params.json"), "--out", str(root/"kit-terms.json"))
+                for side in ("ltc", "xmz"):
+                    if remote and side == "ltc":
+                        remote.upload(root/"kit-terms.json", "kit-terms.json")
+                        remote.kit("sign", "--dir", remote.path("kit-ltc"), "--terms", remote.path("kit-terms.json"),
+                            "--out", remote.path("kit-ltc.sig"))
+                        (root/"kit-ltc.sig").write_bytes(remote.read("kit-ltc.sig"))
+                        continue
+                    run_kit("sign", "--dir", str(root/("kit-"+side)), "--terms", str(root/"kit-terms.json"), "--out", str(root/("kit-"+side+".sig")))
+                for path in ("bob-meta","bob-secrets","alice-meta","alice-secrets","reservations"):
+                    (root/path).mkdir(mode=0o700)
+                run_kit("assemble", "--terms", str(root/"kit-terms.json"), "--ltc-sig", str(root/"kit-ltc.sig"),
+                    "--xmz-sig", str(root/"kit-xmz.sig"), "--out", str(root/"start-quote.json"))
+                terms.clear(); terms.update(json.loads((root/"kit-terms.json").read_text()))
         else:
             invoke("prepare_start")
         note("quote-signed", swapId=terms["swapId"], expiresAt=terms["expiresAt"])
@@ -1111,7 +1139,8 @@ def _run(args, vm_lease=None):
                             "sourceWalletPort":source_port,"sourceLoginFile":login(source_port),"sourceAddress":addresses["source"],
                             "observerWalletPort":observer_port,"observerLoginFile":login(observer_port),
                             "walletPasswordFile":str(root/("app-"+role+"-wallet-password"))},
-                        "peer":{"address":(args.listen_address if role == "alice" else args.peer_address) or "127.0.0.1","port":kit_port}}
+                        "peer":{"relays":list(args.relay)} if args.relay else
+                            {"address":(args.listen_address if role == "alice" else args.peer_address) or "127.0.0.1","port":kit_port}}
                     write_private(root/("kit-"+side+"-local.json"), local)
                     write_private(root/"kit-policy.json", policy) if not (root/"kit-policy.json").exists() else None
                     if remote and role == "bob":
@@ -1534,6 +1563,10 @@ if __name__ == "__main__":
     parser.add_argument("--drop-stage", choices=("locks","proof","release"), default="locks",
         help="when to cut it: after both locks, after the funding proof, or after the redemption release")
     parser.add_argument("--quote-kit", action="store_true", help="set up identities and the signed quote with tools/dex-trade-kit")
+    parser.add_argument("--relay-offers", action="store_true",
+        help="with --relay: Alice posts a BTC offer to the relay and Bob takes it (setup through relay mail too)")
+    parser.add_argument("--relay", action="append", default=[],
+        help="with --kit-config: the two apps talk only through this relay's mailboxes (repeatable), no direct connection")
     parser.add_argument("--kit-config", action="store_true",
         help="with --quote-kit --split-processes: start each trader only from the app folder trade_kit.py configure writes")
     parser.add_argument("--split-processes", action="store_true", help="run each trader in its own app process")
@@ -1559,6 +1592,10 @@ if __name__ == "__main__":
     parser.add_argument("--control-seed-file", type=path, help="testnet control key seed (hex) matching the app build's pinned control key")
     parser.add_argument("--keep", action="store_true", help="keep the regtest workspace after success")
     parsed = parser.parse_args()
+    if parsed.relay_offers and not parsed.relay:
+        parser.error("--relay-offers needs --relay")
+    if parsed.relay and not (parsed.kit_config and not parsed.remote_host):
+        parser.error("--relay needs --kit-config (and no --remote-host)")
     if parsed.kit_config and not (parsed.quote_kit and parsed.split_processes):
         parser.error("--kit-config needs --quote-kit and --split-processes")
     run(parsed)

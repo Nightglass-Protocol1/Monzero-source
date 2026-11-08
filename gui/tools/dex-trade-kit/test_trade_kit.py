@@ -82,6 +82,32 @@ class ConfigureQuoteTests(ConfigureFixture, unittest.TestCase):
         app = json.loads((self.root / "app/app.json").read_text())
         self.assertIn("fundingConfigFile", app)
 
+    def test_traders_may_meet_through_relays_with_mailbox_keys(self):
+        mailboxes = {role: "%064x" % (i + 7) for i, role in enumerate(("ltc", "xmz"))}
+        for role in ("ltc", "xmz"):
+            card = json.loads(self.cards[role].read_text())
+            self.cards[role].write_text(json.dumps(dict(card, mailbox=mailboxes[role])))
+            (self.root / role / "mailbox.key").write_text("ab" * 32)
+        (self.root / "local.json").write_text(json.dumps(dict(self.local, peer=dict(relays=["https://relay.example.org"]))))
+        self.configure(self.envelope, "ltc")
+        app = json.loads((self.root / "app/app.json").read_text())
+        peer = json.loads(Path(app["peerConfigFile"]).read_text())
+        self.assertEqual(peer["schema"], "monzero-private-ltc-peer-relay-v1")
+        self.assertEqual((peer["mode"], peer["relays"], peer["peerMailbox"]), ("relay", ["https://relay.example.org"], mailboxes["xmz"]))
+        self.assertEqual(peer["mailboxSecretFile"], str((self.root / "ltc" / "mailbox.key").resolve()))
+        self.assertFalse((self.root / "app" / "ca.pem").exists())
+        # Plain http only to this machine; and the other card must carry a mailbox key
+        for relays in (["http://relay.example.org"], [], ["https://a"] * 9):
+            (self.root / "local.json").write_text(json.dumps(dict(self.local, peer=dict(relays=relays))))
+            with self.assertRaises(SystemExit):
+                self.configure(self.envelope, "ltc", out=self.root / "app2")
+        (self.root / "local.json").write_text(json.dumps(dict(self.local, peer=dict(relays=["http://127.0.0.1:18790"]))))
+        card = json.loads(self.cards["xmz"].read_text())
+        del card["mailbox"]
+        self.cards["xmz"].write_text(json.dumps(card))
+        with self.assertRaises(SystemExit):
+            self.configure(self.envelope, "ltc", out=self.root / "app3")
+
     def write_local(self, litecoin):
         (self.root / "local.json").write_text(json.dumps(dict(self.local, litecoin=litecoin)))
 

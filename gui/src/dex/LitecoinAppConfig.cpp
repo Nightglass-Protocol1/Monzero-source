@@ -46,7 +46,8 @@ bool LitecoinAppConfig::load(const QString &path,LitecoinAppConfig &result) {
     if (paymentRpc.value("schema")!="monzero-private-ltc-"+purpose+"-rpc-v4") return false;
     const auto peerBytes=read(candidate.peer);const auto peerDoc=QJsonDocument::fromJson(peerBytes);const auto peer=peerDoc.object();
     if (!peerDoc.isObject() || peerDoc.toJson(QJsonDocument::Compact)!=peerBytes
-        || peer.value("schema")!="monzero-private-ltc-peer-v2" || !peer.value("settlementConfigFile").isString()) return false;
+        || (peer.value("schema")!="monzero-private-ltc-peer-v2" && peer.value("schema")!="monzero-private-ltc-peer-relay-v1")
+        || !peer.value("settlementConfigFile").isString()) return false;
     if (native) {
         candidate.funding=c.value(roleKey).toString();
         if (peer.value("settlementConfigFile")!=candidate.funding
@@ -114,7 +115,9 @@ QVariantMap LitecoinAppConfig::review(const QString &path) {
     return {{"appPath",path},{"commitment",config.digest()},{"tradeId",journal.value("tradeId").toString()},
         {"network",terms.value("ltcNetwork").toString()},{"role",role},{"terms",terms.toVariantMap()},
         {"peerKey",terms.value(role=="native-funder"?"ltcFunder":"xmzFunder").toString()},
-        {"peerCertificateSha256",peer.value("peerCertificateSha256").toString()},
+        // A direct connection pins the peer's TLS certificate; through the relays, its mailbox key
+        {"peerCertificateSha256",peer.contains("peerMailbox") ? QStringLiteral("relay mailbox ")+peer.value("peerMailbox").toString()
+                                                               : peer.value("peerCertificateSha256").toString()},
         {"helper",journal.value("helper").toString()},{"helperDigest",journal.value("helperDigest").toString()},
         {"signaturesVerified",true},{"executable",false}};
 }

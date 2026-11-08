@@ -50,6 +50,9 @@ struct Config {
     chains: Vec<ChainConfig>,
     #[serde(default)]
     peers: Vec<String>,
+    /// BTC/XMZ offers for these networks ("btc-mainnet", "btc-signet", "btc-regtest", ...)
+    #[serde(default)]
+    btc_networks: Vec<String>,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -83,6 +86,11 @@ struct Listings {
 }
 
 #[derive(Deserialize)]
+struct BtcListings {
+    listings: Vec<monzero_dex_relay::btc::SignedBtcListing>,
+}
+
+#[derive(Deserialize)]
 struct Prints {
     prints: Vec<Print>,
 }
@@ -95,6 +103,15 @@ async fn sync(relay: &Relay<AlloyView>, client: &reqwest::Client, peer: &str) ->
     for signed in fetch::<Listings>(client, &format!("{base}/v1/listings")).await?.listings.into_iter().take(2000) {
         if relay.listing(signed.listing.id).is_none() && relay.post(signed, now).await == Ok(true) {
             offers += 1;
+        }
+    }
+    if !relay.btc_networks().is_empty() {
+        if let Ok(b) = fetch::<BtcListings>(client, &format!("{base}/v1/btc/listings")).await {
+            for signed in b.listings.into_iter().take(2000) {
+                if relay.post_btc(signed, now) == Ok(true) {
+                    offers += 1;
+                }
+            }
         }
     }
     let mut trades = 0;
@@ -151,7 +168,12 @@ async fn main() {
         eprintln!("chain {} ({}): contract {} ok", c.chain_id, chain.pair(), c.contract);
     }
 
-    let relay = Arc::new(Relay::new(rules, chains));
+    for n in &config.btc_networks {
+        if !["btc-mainnet", "btc-signet", "btc-testnet4", "btc-regtest"].contains(&n.as_str()) {
+            fail(format!("unknown BTC network {n}"));
+        }
+    }
+    let relay = Arc::new(Relay::new(rules, chains).with_btc_networks(config.btc_networks.clone()));
     if let Ok(bytes) = std::fs::read(config.data_dir.join("relay.json")) {
         match serde_json::from_slice::<Snapshot>(&bytes) {
             Ok(snap) => relay.restore(snap),

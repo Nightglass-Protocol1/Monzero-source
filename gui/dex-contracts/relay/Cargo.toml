@@ -17,6 +17,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# BTC/XMZ offers are signed with the trader's Ed25519 identity key (see src/btc.rs)
+ed25519-dalek = "2"
+hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "fs", "signal"] }
 
 [dev-dependencies]

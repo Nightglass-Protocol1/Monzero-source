@@ -2,6 +2,8 @@
 #include "../PrivateQuoteServer.h"
 #include "../PrivateQuoteSession.h"
 #include "../SettlementJournal.h"
+#include "../RelayMailTransport.h"
+#include <sodium.h>
 #include "TestAcceptedQuote.h"
 #include <QDateTime>
 #include <QtTest>
@@ -51,6 +53,85 @@ public:
 class PrivateQuoteChannelTest : public QObject {
     Q_OBJECT
 private slots:
+    // Relay letters: one key per direction from the two mailbox keys, one per sender session
+    void relayLettersAreSealedPerDirectionAndSession() {
+        QVERIFY(sodium_init()>=0);
+        auto secret=[]{QByteArray s(32,'\0');randombytes_buf(s.data(),32);return s;};
+        auto publicOf=[](const QByteArray &s){QByteArray p(32,'\0');crypto_scalarmult_base(reinterpret_cast<unsigned char*>(p.data()),reinterpret_cast<const unsigned char*>(s.constData()));return p;};
+        const auto a=secret(),b=secret(),c=secret();
+        QByteArray aSend,aRecv,bSend,bRecv,cSend,cRecv;
+        QVERIFY(RelayMailTransport::directionKeys(a,publicOf(b),&aSend,&aRecv));
+        QVERIFY(RelayMailTransport::directionKeys(b,publicOf(a),&bSend,&bRecv));
+        QVERIFY(RelayMailTransport::directionKeys(c,publicOf(b),&cSend,&cRecv));
+        QCOMPARE(aSend,bRecv);QCOMPARE(bSend,aRecv);QVERIFY(aSend!=aRecv);QVERIFY(cSend!=aSend);
+        const QByteArray session(16,'\x11'),ack(16,'\x22');
+        QByteArray payload=QByteArray(8,'\0');payload[7]=3;payload+="hello swap";
+        const auto letter=RelayMailTransport::sealLetter(aSend,session,ack,7,payload);
+        QVERIFY(!letter.contains("hello swap"));
+        QByteArray s2,ack2,out;quint64 seq=0;
+        QVERIFY(RelayMailTransport::openLetter(bRecv,letter,&s2,&ack2,&seq,&out));
+        QCOMPARE(s2,session);QCOMPARE(ack2,ack);QCOMPARE(seq,quint64(7));QCOMPARE(out,payload);
+        // Not readable the other way, by a third party, or after any change (header included)
+        QVERIFY(!RelayMailTransport::openLetter(bSend,letter,&s2,&ack2,&seq,&out));
+        QVERIFY(!RelayMailTransport::openLetter(cRecv,letter,&s2,&ack2,&seq,&out));
+        for (const int at:{0,6,22,40,48,letter.size()-1}) {
+            auto bad=letter;bad[at]=char(bad.at(at)^1);
+            QVERIFY2(!RelayMailTransport::openLetter(bRecv,bad,&s2,&ack2,&seq,&out),qPrintable(QString::number(at)));
+        }
+        QVERIFY(!RelayMailTransport::openLetter(bRecv,letter.left(40),&s2,&ack2,&seq,&out));
+        // A low-order key gives no shared secret; our own key is not a peer
+        QVERIFY(!RelayMailTransport::directionKeys(a,QByteArray(32,'\0'),&cSend,&cRecv));
+        QVERIFY(!RelayMailTransport::directionKeys(a,publicOf(a),&cSend,&cRecv));
+    }
+    // Two channels through a real relay (MONZERO_TEST_RELAY=http://127.0.0.1:port, a mail-only relay)
+    void relayChannelCarriesMessagesInOrderAndNoticesARestart() {
+        const auto relay=qEnvironmentVariable("MONZERO_TEST_RELAY");
+        if (relay.isEmpty()) QSKIP("set MONZERO_TEST_RELAY to a running monzero-dex-relay");
+        QVERIFY(sodium_init()>=0);
+        auto secret=[]{QByteArray s(32,'\0');randombytes_buf(s.data(),32);return s;};
+        auto publicOf=[](const QByteArray &s){QByteArray p(32,'\0');crypto_scalarmult_base(reinterpret_cast<unsigned char*>(p.data()),reinterpret_cast<const unsigned char*>(s.constData()));return p;};
+        const auto a=secret(),b=secret();
+        auto channel=[&]{return new PrivateQuoteChannel(QSslConfiguration::defaultConfiguration(),QByteArray(),this,PrivateQuoteChannel::Profile::LitecoinNegotiation);};
+        auto *alice=channel(),*bob=channel();
+        QSignalSpy aliceUp(alice,&PrivateQuoteChannel::authenticated),bobUp(bob,&PrivateQuoteChannel::authenticated);
+        QSignalSpy aliceGot(alice,&PrivateQuoteChannel::received),bobGot(bob,&PrivateQuoteChannel::received);
+        QVERIFY(!alice->send("too early"));
+        QVERIFY(alice->connectThroughRelays({relay},a,publicOf(b)));
+        QVERIFY(bob->connectThroughRelays({relay},b,publicOf(a)));
+        QTRY_VERIFY_WITH_TIMEOUT(aliceUp.count()==1 && bobUp.count()==1,30000);
+        const QByteArray big(300000,'z');
+        QVERIFY(alice->send("one"));QVERIFY(alice->send(big));QVERIFY(alice->send("three"));
+        QVERIFY(bob->send("reply"));
+        QTRY_COMPARE_WITH_TIMEOUT(bobGot.count(),3,30000);
+        QCOMPARE(bobGot.at(0).at(0).toByteArray(),QByteArray("one"));
+        QCOMPARE(bobGot.at(1).at(0).toByteArray(),big);
+        QCOMPARE(bobGot.at(2).at(0).toByteArray(),QByteArray("three"));
+        QTRY_COMPARE_WITH_TIMEOUT(aliceGot.count(),1,30000);
+        QCOMPARE(aliceGot.at(0).at(0).toByteArray(),QByteArray("reply"));
+        // Bob restarts (a new channel, a new session): Alice sees a lost connection, as with a socket,
+        // and her next channel and Bob's new one meet again; old letters are not delivered twice
+        QSignalSpy aliceLost(alice,&PrivateQuoteChannel::closed);
+        bob->close();delete bob;
+        auto *bob2=channel();
+        QSignalSpy bob2Up(bob2,&PrivateQuoteChannel::authenticated),bob2Got(bob2,&PrivateQuoteChannel::received);
+        QVERIFY(bob2->connectThroughRelays({relay},b,publicOf(a)));
+        QTRY_COMPARE_WITH_TIMEOUT(aliceLost.count(),1,30000);
+        QVERIFY(!alice->send("after"));
+        auto *alice2=channel();
+        QSignalSpy alice2Up(alice2,&PrivateQuoteChannel::authenticated);
+        QVERIFY(alice2->connectThroughRelays({relay},a,publicOf(b)));
+        QTRY_VERIFY_WITH_TIMEOUT(alice2Up.count()==1 && bob2Up.count()==1,30000);
+        QVERIFY(alice2->send("fresh"));
+        QTRY_COMPARE_WITH_TIMEOUT(bob2Got.count(),1,30000);
+        QCOMPARE(bob2Got.at(0).at(0).toByteArray(),QByteArray("fresh"));
+        // A stranger with Alice's public key cannot speak for Bob
+        auto *mallory=channel();QSignalSpy malloryUp(mallory,&PrivateQuoteChannel::authenticated);
+        QVERIFY(mallory->connectThroughRelays({relay},secret(),publicOf(a)));
+        QTest::qWait(6000);
+        QCOMPARE(malloryUp.count(),0);
+        QCOMPARE(bob2Got.count(),1);
+        delete alice;delete alice2;delete bob2;delete mallory;
+    }
     void writeAdmissionCountsBothTlsQueues() {
         using Profile=PrivateQuoteChannel::Profile;
         QVERIFY(PrivateQuoteChannel::hasWriteCapacity(0,0,410000,Profile::LitecoinNegotiation));

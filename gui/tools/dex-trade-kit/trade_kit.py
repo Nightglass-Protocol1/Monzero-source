@@ -27,7 +27,7 @@ and payload. Nothing here creates a trade, reserves coins or moves funds.
 """
 import argparse, ctypes, errno, getpass, hashlib, json, os, platform, secrets, stat, subprocess, sys, uuid
 from pathlib import Path
-from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_decrypt, crypto_aead_xchacha20poly1305_ietf_encrypt
+from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_decrypt, crypto_aead_xchacha20poly1305_ietf_encrypt, crypto_scalarmult_base
 from nacl.pwhash import argon2id
 from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
@@ -46,6 +46,18 @@ LOCAL_KEYS = {"local settings": ("journalHelper", "litecoin", "xmz", "peer"),
     "litecoin": ("rpcPort", "wallet", "anchor", "cookieFile"),
     "xmz": ("daemonPort", "claimWalletPort", "claimLoginFile", "walletPasswordFile"),
     "peer": ("address", "port")}
+def relay_peer(local):
+    """LOCAL.json peer {"relays": [...]}: talk through the open relays instead of a direct connection."""
+    peer = local.get("peer")
+    if not isinstance(peer, dict) or "relays" not in peer:
+        return None
+    relays = peer["relays"]
+    if set(peer) != {"relays"} or not isinstance(relays, list) or not 1 <= len(relays) <= 8 or not all(
+            isinstance(r, str) and (r.startswith("https://") or r.startswith("http://127.0.0.1:")) for r in relays):
+        fail("LOCAL.json peer.relays must be 1-8 relay URLs (https, or http://127.0.0.1:port) and nothing else")
+    return relays
+
+
 LOCAL_ROLE_KEYS = {"xmz": ("sourceWalletPort", "sourceLoginFile", "sourceAddress"),
     "ltc": ("observerWalletPort", "observerLoginFile")}
 IDENTITY_FILES = ("tls.crt", "tls.key", "identity.bin", "identity.passphrase")  # referenced in place, never copied
@@ -113,9 +125,12 @@ def cmd_identity(a):
         check=True, capture_output=True)
     os.chmod(d / "tls.key", 0o600); os.chmod(d / "tls.crt", 0o600)
     der = subprocess.run(["openssl", "x509", "-in", str(d / "tls.crt"), "-outform", "DER"], check=True, capture_output=True).stdout
+    # The mailbox key lets the two apps talk through the open relays when neither can accept a connection
+    mailbox = secrets.token_bytes(32)
+    write_new(d / "mailbox.key", mailbox.hex().encode())
     card = {"schema": "monzero-ltc-trade-card-v1", "role": a.role, "funderKey": SigningKey(seed).verify_key.encode().hex(),
             "tlsCertificateSha256": hashlib.sha256(der).hexdigest(),
-            "tlsCertificatePem": (d / "tls.crt").read_text()}
+            "tlsCertificatePem": (d / "tls.crt").read_text(), "mailbox": crypto_scalarmult_base(mailbox).hex()}
     write_new(d / "card.json", canonical(card), 0o644)
     print(f"Created {d}. Share only {d / 'card.json'}.")
     print("Funder key:", card["funderKey"])
@@ -262,11 +277,14 @@ def check_local(local, role):
             check_light(value["light"])
             continue
         keys = keys + (LOCAL_ROLE_KEYS[role] if where == "xmz" else ())
+        if where == "peer" and relay_peer(local):
+            continue
         missing = [key for key in keys if value.get(key) is None]
         if missing:
             fail(f"LOCAL.json {where} lacks " + ", ".join(missing))
+    relay = relay_peer(local)
     for section, keys in (("litecoin", () if light else ("rpcPort",)), ("xmz", ("daemonPort", "claimWalletPort") +
-            (("sourceWalletPort",) if role == "xmz" else ("observerWalletPort",))), ("peer", ("port",))):
+            (("sourceWalletPort",) if role == "xmz" else ("observerWalletPort",))), ("peer", () if relay else ("port",))):
         for key in keys:
             value = local[section][key]
             if type(value) is not int or not 1 <= value <= 65535:
@@ -339,6 +357,15 @@ def app_layout(final, role, terms, quote, identity_dir, own_certificate, peer, p
             observerLoginFile=xmz["observerLoginFile"], safetyBlocks=local.get("safetyBlocks", 2)))
         settlement = write_config("redeem.json", {"schema": "monzero-private-ltc-redeem-v1",
             "journalConfigFile": journal_path, "rpcFile": redeem_rpc})
+    relays = relay_peer(local)
+    if relays:
+        # Sealed letters through the relays, authenticated by both mailbox keys (from the cards)
+        manifest["peerConfigFile"] = write_config("peer.json", {"schema": "monzero-private-ltc-peer-relay-v1", "mode": "relay",
+            "relays": relays, "mailboxSecretFile": str(d / "mailbox.key"), "peerMailbox": peer["mailbox"],
+            "identityFile": str(d / "identity.bin"), "passphraseFile": str(d / "identity.passphrase"),
+            "settlementConfigFile": settlement})
+        write_config("app.json", manifest)
+        return directories, files
     ca = add("ca.pem", (own_certificate + peer["tlsCertificatePem"]).encode())
     link = local["peer"]
     manifest["peerConfigFile"] = write_config("peer.json", {"schema": "monzero-private-ltc-peer-v2",
@@ -554,6 +581,13 @@ def cmd_configure(a):
         except OSError as error:
             fail(f"{d / name} is missing ({error.strerror}); run configure on the machine that holds this identity")
     peer = load_card(a.peer_card, "xmz" if role == "ltc" else "ltc")
+    local_preview = read_json(a.local, "local settings")
+    if isinstance(local_preview, dict) and relay_peer(local_preview):
+        mailbox = peer.get("mailbox")
+        if not isinstance(mailbox, str) or len(mailbox) != 64 or any(c not in "0123456789abcdef" for c in mailbox):
+            fail(f"{a.peer_card} has no mailbox key; the other party must make a new identity")
+        if not (d / "mailbox.key").is_file():
+            fail(f"{d / 'mailbox.key'} is missing; make a new identity to trade through relays")
     if not isinstance(peer.get("tlsCertificatePem"), str) or not isinstance(peer.get("tlsCertificateSha256"), str):
         fail(f"{a.peer_card} lacks the peer's TLS certificate")
     quote = Path(a.quote).resolve()
@@ -595,9 +629,11 @@ def main():
     for flag in ("--terms", "--ltc-sig", "--xmz-sig", "--out"): p.add_argument(flag, required=True)
     p = sub.add_parser("configure")
     for flag in ("--dir", "--quote", "--peer-card", "--policy", "--local", "--out"): p.add_argument(flag, required=True)
+    import relay_market  # BTC/XMZ offers through the open relays
+    relay_commands = relay_market.add_parsers(sub)
     a = parser.parse_args()
     {"identity": cmd_identity, "terms": cmd_terms, "sign": cmd_sign, "assemble": cmd_assemble,
-     "configure": cmd_configure}[a.command](a)
+     "configure": cmd_configure, **relay_commands}[a.command](a)
 
 
 if __name__ == "__main__":

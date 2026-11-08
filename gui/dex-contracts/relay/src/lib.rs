@@ -5,6 +5,7 @@
 //! has read the claim on chain itself and matched the swap's nonce to an offer. See
 //! `../PUBLIC-OPENING.md`.
 
+pub mod btc;
 pub mod chain;
 pub mod http;
 
@@ -29,9 +30,10 @@ pub const MAX_PENDING: usize = 500;
 pub const INTERVALS: [u64; 3] = [3600, 4 * 3600, 24 * 3600];
 /// Mail is kept this long; senders resend until answered
 pub const MAIL_SECS: u64 = 2 * 3600;
-pub const MAIL_PER_BOX: usize = 16;
+/// A BTC trade's negotiation runs over relay mail for hours (keepalives every minute)
+pub const MAIL_PER_BOX: usize = 2048;
 /// All mail held at once, in bytes
-pub const MAIL_TOTAL: usize = 128 * 1024 * 1024;
+pub const MAIL_TOTAL: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RelayError {
@@ -124,6 +126,10 @@ pub struct Snapshot {
     pub prints: Vec<Print>,
     /// (chain id, tx) -> first reported
     pub pending: Vec<(u64, B256, u64)>,
+    #[serde(default)]
+    pub btc_active: Vec<btc::SignedBtcListing>,
+    #[serde(default)]
+    pub btc_closed: Vec<(B256, u64)>,
 }
 
 #[derive(Default)]
@@ -143,6 +149,9 @@ pub struct Relay<C> {
     rules: Rules,
     chains: BTreeMap<u64, C>,
     state: Mutex<State>,
+    /// BTC/XMZ offers, for the networks this relay serves ("btc-mainnet", ...)
+    btc_networks: std::collections::BTreeSet<String>,
+    btc: Mutex<btc::BtcBook>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -154,7 +163,36 @@ pub enum PrintStatus {
 
 impl<C: ChainView> Relay<C> {
     pub fn new(rules: Rules, chains: BTreeMap<u64, C>) -> Self {
-        Relay { rules, chains, state: Mutex::default() }
+        Relay { rules, chains, state: Mutex::default(), btc_networks: Default::default(), btc: Mutex::default() }
+    }
+
+    pub fn with_btc_networks(mut self, networks: impl IntoIterator<Item = String>) -> Self {
+        self.btc_networks = networks.into_iter().collect();
+        self
+    }
+
+    pub fn btc_networks(&self) -> &std::collections::BTreeSet<String> {
+        &self.btc_networks
+    }
+
+    fn btc_book(&self) -> std::sync::MutexGuard<'_, btc::BtcBook> {
+        self.btc.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn post_btc(&self, signed: btc::SignedBtcListing, now: u64) -> Result<bool, btc::BtcError> {
+        self.btc_book().post(signed, &self.btc_networks, now)
+    }
+
+    pub fn cancel_btc(&self, signed: &btc::SignedBtcCancel, now: u64) -> Result<(), btc::BtcError> {
+        self.btc_book().cancel(signed, now)
+    }
+
+    pub fn btc_listings(&self, now: u64) -> Vec<btc::SignedBtcListing> {
+        self.btc_book().listings(now)
+    }
+
+    pub fn btc_listing(&self, id: B256) -> Option<btc::SignedBtcListing> {
+        self.btc_book().get(id)
     }
 
     pub fn rules(&self) -> &Rules {
@@ -353,6 +391,9 @@ impl<C: ChainView> Relay<C> {
         }
         s.mail.retain(|_, b| !b.is_empty());
         s.mail_bytes -= freed;
+        drop(s);
+        self.btc_book().prune(now);
+        let mut s = self.state();
         let expired: Vec<_> = s.active.iter().filter(|(_, o)| o.listing.expires_at <= now).map(|(id, _)| *id).collect();
         for id in expired {
             let o = s.active.remove(&id).expect("present");
@@ -387,6 +428,8 @@ impl<C: ChainView> Relay<C> {
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        // One lock of the BTC book at a time (a guard lives to the end of its expression)
+        let (btc_active, btc_closed) = self.btc_book().snapshot();
         let s = self.state();
         Snapshot {
             active: s.active.values().cloned().collect(),
@@ -394,6 +437,8 @@ impl<C: ChainView> Relay<C> {
             closed: s.closed.iter().map(|(k, v)| (*k, *v)).collect(),
             prints: s.prints.clone(),
             pending: s.pending.iter().map(|((c, t), at)| (*c, *t, *at)).collect(),
+            btc_active,
+            btc_closed,
         }
     }
 
@@ -417,6 +462,8 @@ impl<C: ChainView> Relay<C> {
             }
         }
         s.pending.extend(snap.pending.into_iter().map(|(c, t, at)| ((c, t), at)));
+        drop(s);
+        self.btc_book().restore(snap.btc_active, snap.btc_closed, &self.btc_networks);
     }
 }
 

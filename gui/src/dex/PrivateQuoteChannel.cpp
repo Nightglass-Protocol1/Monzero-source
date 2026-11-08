@@ -1,4 +1,5 @@
 #include "PrivateQuoteChannel.h"
+#include "RelayMailTransport.h"
 #include <QCryptographicHash>
 #include <QPointer>
 #include <QSslKey>
@@ -52,6 +53,36 @@ bool PrivateQuoteChannel::connectToPeer(const QString &host, quint16 port, const
     return true;
 }
 
+PrivateQuoteChannel::~PrivateQuoteChannel() = default;
+
+bool PrivateQuoteChannel::connectThroughRelays(const QStringList &relays, const QByteArray &ownMailboxSecret,
+                                               const QByteArray &peerMailboxPublic)
+{
+    if (!m_maximumMessage || m_failed || m_ready || m_relay || m_socket.state() != QAbstractSocket::UnconnectedState) return false;
+    auto relay = std::make_unique<RelayMailTransport>(this);
+    connect(relay.get(), &RelayMailTransport::authenticated, this, [this] {
+        if (m_failed) return;
+        m_ready = true; m_rateWindow.start(); m_messages = 0;
+        emit authenticated();
+    });
+    connect(relay.get(), &RelayMailTransport::received, this, [this](const QByteArray &message) {
+        if (!ready()) return;
+        if (message.size() > m_maximumMessage) { reject(); return; }
+        if (m_rateWindow.elapsed() >= 1000) { m_rateWindow.restart(); m_messages = 0; }
+        if (++m_messages > 64) { reject(); return; }
+        emit received(message);
+    });
+    connect(relay.get(), &RelayMailTransport::closed, this, [this] {
+        if (m_failed) return;
+        m_ready = false; m_failed = true;
+        emit closed();
+    });
+    connect(relay.get(), &RelayMailTransport::failed, this, &PrivateQuoteChannel::reject);
+    if (!relay->start(relays, ownMailboxSecret, peerMailboxPublic)) return false;
+    m_relay = std::move(relay);
+    return true;
+}
+
 bool PrivateQuoteChannel::hasWriteCapacity(qint64 plaintextBytes, qint64 encryptedBytes, int messageBytes, Profile profile)
 {
     const int maximumMessage=limit(profile);
@@ -64,6 +95,7 @@ bool PrivateQuoteChannel::hasWriteCapacity(qint64 plaintextBytes, qint64 encrypt
 
 bool PrivateQuoteChannel::send(const QByteArray &message)
 {
+    if (m_relay) return ready() && !message.isEmpty() && message.size() <= m_maximumMessage && m_relay->send(message);
     if (!ready() || !m_socket.isEncrypted()
         || !hasWriteCapacity(m_socket.bytesToWrite(), m_socket.encryptedBytesToWrite(), message.size(), m_profile)) return false;
     QByteArray frame;
@@ -90,6 +122,7 @@ void PrivateQuoteChannel::reject()
     m_failed = true; m_ready = false;
     m_deadline.stop(); m_pending.clear();
     QPointer<PrivateQuoteChannel> guard(this);
+    if (m_relay) m_relay->stop();
     m_socket.abort();
     if (guard) emit rejected();
 }
@@ -98,6 +131,7 @@ void PrivateQuoteChannel::close()
 {
     m_failed = true; m_ready = false;
     m_deadline.stop(); m_pending.clear();
+    if (m_relay) m_relay->stop();
     m_socket.abort();
 }
 
