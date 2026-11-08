@@ -3,9 +3,11 @@
    real swaps run in the Monzero app. No external requests. */
 (function () {
   "use strict";
-  // Indicative USD anchors purely to compute a plausible receive amount. Not a price feed.
+  // Indicative USD anchors purely to compute a plausible receive amount. XMZ uses the DEX's
+  // opening rate (not a market price); the other coins are replaced by live prices when the
+  // markets feed answers.
   var COINS = {
-    XMZ: { name: "Monzero", usd: 0.015, dp: 4 },
+    XMZ: { name: "Monzero", usd: 0.001, dp: 4 },
     BTC: { name: "Bitcoin", usd: 68000, dp: 8 },
     LTC: { name: "Litecoin", usd: 75, dp: 6 },
     BNB: { name: "BNB", usd: 600, dp: 6 },
@@ -124,6 +126,18 @@
     renderCoinButtons();
     renderPairs();
     recalc();
+    // Live coin prices for the calculator, and each pair's status as the site's DEX API reports it
+    fetch("/markets/api.php?only=coins", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (d) {
+      (d.coins || []).forEach(function (c) { if (c && COINS[c.symbol] && c.symbol !== "XMZ" && c.usd > 0) COINS[c.symbol].usd = c.usd; });
+      recalc();
+    }).catch(function () {});
+    fetch("/dex/api.php", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (d) {
+      (d.pairs || []).forEach(function (p) {
+        var c = p && typeof p.pair === "string" ? p.pair.replace("XMZ/", "") : "";
+        if (STATUS[c] && (p.status === "beta" || p.status === "soon")) STATUS[c] = p.status;
+      });
+      renderPairs();
+    }).catch(function () {});
     $("send-amount").addEventListener("input", recalc);
     $("swap-flip").addEventListener("click", function () {
       state.dir = state.dir === "xmz-to-coin" ? "coin-to-xmz" : "xmz-to-coin";
@@ -147,226 +161,204 @@
   else init();
 })();
 
-/* ===== Pro order-book mode. SIMULATED indicative market (random walk) — not real market
-   data and no trading; real offers are taken in the app. Pauses when hidden / reduced-motion. ===== */
+/* ===== Market view: real offers and completed swaps from the open DEX relays, read through
+   /dex/relay.php. Offers are signed by their makers; trades are swaps a relay read on chain.
+   Posting or taking an offer happens in the Monzero app. ===== */
 (function () {
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   if (!$("mode-pro")) return;
-  var COINS = { XMZ: { usd: 0.015, dp: 4 }, BTC: { usd: 68000, dp: 8 }, LTC: { usd: 75, dp: 6 }, BNB: { usd: 600, dp: 6 }, ETH: { usd: 3500, dp: 6 }, SOL: { usd: 190, dp: 6 } };
-  var NAME = { BTC: "Bitcoin", LTC: "Litecoin", BNB: "BNB", ETH: "Ethereum", SOL: "Solana" };
-  var COUNTERS = ["BTC", "LTC", "BNB", "ETH", "SOL"];
-  var TF = { "1m": { vol: 0.45, tpc: 3 }, "5m": { vol: 1, tpc: 5 }, "15m": { vol: 1.9, tpc: 8 }, "1h": { vol: 3.2, tpc: 12 }, "4h": { vol: 5.5, tpc: 18 }, "1D": { vol: 9, tpc: 26 } };
-  var pro = { coin: "BTC", side: "buy", tf: "5m", rendered: false, mid: null, chg24: 0, vol: 0, trades: [], timer: null, candles: [], formTicks: 0, orders: [], orderId: 0, lastBook: null };
-  var lastShown = 0;
+  var PAIRS = ["ETH", "BNB"];
+  var NAME = { ETH: "Ethereum", BNB: "BNB" };
+  var EXPLORER = { ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/" };
+  var TF = { "1h": 3600, "4h": 14400, "1D": 86400 };
+  var OPENING_USD = 0.001; // the DEX's opening quote, not a market price
+  var pro = { coin: "ETH", tf: "1h", rendered: false, timer: null, chart: null, candles: null, vol: null, ref: null, usd: {}, gen: 0 };
 
-  function baseMid() { return COINS.XMZ.usd / COINS[pro.coin].usd; }
-  function mid() { return pro.mid != null ? pro.mid : baseMid(); }   // counter coin per 1 XMZ
-  function dpp() { return COINS[pro.coin].dp; }
   function fmt(n, d) { if (!isFinite(n)) return "0"; var s = n.toFixed(d); return s.indexOf(".") >= 0 ? s.replace(/0+$/, "").replace(/\.$/, "") : s; }
+  function places(p) { return p > 0 ? Math.min(14, Math.max(2, 3 - Math.floor(Math.log(p) / Math.LN10))) : 2; }
+  function price(p) { return fmt(p, places(p)); }
+  function wei(hex) { return parseInt(hex, 16) / 1e18; }
+  function coins(atoms) { return Number(atoms) / 1e11; }
   function pDot(t) { return '<span class="cdot" data-c="' + t + '">' + t.slice(0, 1) + '</span>'; }
-
-  function genBook() {
-    var m = mid(), asks = [], bids = [], cum, i, price, amt;
-    cum = 0;
-    for (i = 0; i < 13; i++) { price = m * (1 + (i + 1) * 0.0013 + Math.random() * 0.0009); amt = 40 + Math.random() * 900; cum += amt; asks.push({ price: price, amt: amt, cum: cum }); }
-    cum = 0;
-    for (i = 0; i < 13; i++) { price = m * (1 - (i + 1) * 0.0013 - Math.random() * 0.0009); amt = 40 + Math.random() * 900; cum += amt; bids.push({ price: price, amt: amt, cum: cum }); }
-    var maxc = Math.max(asks[asks.length - 1].cum, bids[bids.length - 1].cum);
-    return { asks: asks, bids: bids, m: m, maxc: maxc };
+  function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); }
+  function get(what, extra) {
+    return fetch("/dex/relay.php?what=" + what + "&pair=" + encodeURIComponent(pro.coin + "/XMZ") + (extra || ""), { cache: "no-store" })
+      .then(function (r) { return r.json(); });
   }
+  function cssVar(name, fallback) { var v = getComputedStyle(document.documentElement).getPropertyValue(name).trim(); return v || fallback; }
 
-  function rowHTML(r, maxc, cls) {
-    return '<div class="book-row ' + cls + '" data-price="' + r.price + '"><span class="bar" data-d="' + (r.cum / maxc * 100).toFixed(1) + '"></span>' +
-      '<span class="price">' + fmt(r.price, dpp() + 2) + '</span><span class="num">' + fmt(r.amt, 0) + '</span><span class="num">' + fmt(r.price * r.amt, dpp()) + '</span></div>';
-  }
-
-  function renderBook() {
-    seedCandles();
-    pro.chg24 = Math.random() * 7 - 2.5;
-    pro.vol = 120000 + Math.random() * 400000;
-    lastShown = pro.mid;
-    pro.trades = [];
-    var now = Date.now();
-    for (var i = 0; i < 16; i++) pro.trades.push(makeTrade(now - (i + 1) * (6 + Math.random() * 40) * 1000));
-    renderBookRows();
-    renderTicker(false);
-    renderTradeList(false);
-    renderCandles();
-    renderOrders();
-    syncOrderUnits();
-  }
-
-  function renderBookRows() {
-    var b = genBook();
-    $("book-asks").innerHTML = b.asks.slice().reverse().map(function (r) { return rowHTML(r, b.maxc, "ask"); }).join("");
-    $("book-bids").innerHTML = b.bids.map(function (r) { return rowHTML(r, b.maxc, "bid"); }).join("");
-    Array.prototype.forEach.call(document.querySelectorAll("#view-pro .book-row .bar"), function (bar) { bar.style.width = bar.getAttribute("data-d") + "%"; });
-    $("book-mid").textContent = fmt(b.m, dpp() + 2);
-    $("book-spread-v").textContent = ((b.asks[0].price - b.bids[0].price) / b.m * 100).toFixed(2) + "%";
-    pro.lastBook = b;
-    renderDepth();
-  }
-
-  // Cumulative bid/ask depth areas, drawn as SVG paths (attributes only; CSP-safe).
-  function renderDepth() {
-    var b = pro.lastBook; if (!b || !$("depth-svg")) return;
-    var bids = b.bids, asks = b.asks, maxc = b.maxc;
-    var pmin = bids[bids.length - 1].price, pmax = asks[asks.length - 1].price, span = pmax - pmin || 1;
-    var W = 1000, H = 220, top = 14;
-    function X(pr) { return ((pr - pmin) / span * W).toFixed(1); }
-    function Y(c) { return (H - c / maxc * (H - top)).toFixed(1); }
-    var bpts = [], apts = [], i;
-    for (i = bids.length - 1; i >= 0; i--) bpts.push([X(bids[i].price), Y(bids[i].cum)]);   // low price -> mid
-    for (i = 0; i < asks.length; i++) apts.push([X(asks[i].price), Y(asks[i].cum)]);          // mid -> high price
-    function line(pts) { return "M" + pts.map(function (q) { return q[0] + "," + q[1]; }).join(" L"); }
-    function area(pts) { return line(pts) + " L" + pts[pts.length - 1][0] + "," + H + " L" + pts[0][0] + "," + H + " Z"; }
-    $("d-bid-line").setAttribute("d", line(bpts));
-    $("d-bid-area").setAttribute("d", area(bpts));
-    $("d-ask-line").setAttribute("d", line(apts));
-    $("d-ask-area").setAttribute("d", area(apts));
-    var xm = X(b.m); $("d-mid").setAttribute("x1", xm); $("d-mid").setAttribute("x2", xm);
-    $("d-xmin").textContent = fmt(pmin, dpp() + 2);
-    $("d-xmid").textContent = fmt(b.m, dpp() + 2);
-    $("d-xmax").textContent = fmt(pmax, dpp() + 2);
-  }
-
-  function renderTicker(flash) {
-    var m = mid(), el = $("pro-last");
-    el.textContent = fmt(m, dpp() + 2) + " " + pro.coin;
-    if (flash) { el.classList.remove("tflash-up", "tflash-down"); void el.offsetWidth; el.classList.add(m >= lastShown ? "tflash-up" : "tflash-down"); }
-    lastShown = m;
-    var c = $("pro-chg"); c.textContent = (pro.chg24 >= 0 ? "+" : "") + pro.chg24.toFixed(2) + "%"; c.className = pro.chg24 >= 0 ? "up" : "down";
-    $("pro-vol").textContent = fmt(pro.vol, 0) + " XMZ";
-  }
-
-  function makeTrade(t) {
-    var m = mid();
-    return { up: Math.random() > 0.48, price: m * (1 + (Math.random() - 0.5) * 0.006), amt: 20 + Math.random() * 700, t: t || Date.now() };
-  }
-  function tradeRowHTML(tr, isNew) {
-    var d = new Date(tr.t), pp = function (x) { return ("0" + x).slice(-2); };
-    return '<div class="trade-row' + (isNew ? " flash" : "") + '"><span class="price ' + (tr.up ? "up" : "down") + '">' + fmt(tr.price, dpp() + 2) + '</span><span class="num">' + fmt(tr.amt, 0) + '</span><span class="num">' + pp(d.getHours()) + ":" + pp(d.getMinutes()) + ":" + pp(d.getSeconds()) + '</span></div>';
-  }
-  function renderTradeList(flashFirst) {
-    $("trades").innerHTML = pro.trades.map(function (tr, i) { return tradeRowHTML(tr, flashFirst && i === 0); }).join("");
-  }
-
-  function seedCandles() {
-    var v = TF[pro.tf].vol, price = baseMid() * (1 + (Math.random() - 0.5) * 0.05 * v), i;
-    pro.candles = []; pro.formTicks = 0;
-    for (i = 0; i < 38; i++) {
-      var o = price, c = o * (1 + (Math.random() - 0.5) * 0.012 * v);
-      var h = Math.max(o, c) * (1 + Math.random() * 0.006 * v), l = Math.min(o, c) * (1 - Math.random() * 0.006 * v);
-      pro.candles.push({ o: o, h: h, l: l, c: c }); price = c;
-    }
-    pro.mid = price; lastShown = price;
-  }
-  var SVGNS = "http://www.w3.org/2000/svg";
-  function renderCandles() {
-    var cs = pro.candles; if (!cs.length || !$("price-svg")) return;
-    var lo = Infinity, hi = -Infinity;
-    cs.forEach(function (c) { if (c.l < lo) lo = c.l; if (c.h > hi) hi = c.h; });
-    if (hi <= lo) hi = lo * 1.001;
-    var rng = hi - lo; hi += rng * 0.08; lo -= rng * 0.08;        // headroom so candles don't touch edges
-    var W = 1000, H = 300, n = cs.length, slot = W / n, bodyW = Math.max(4, slot * 0.68);
-    function Y(pr) { return (hi - pr) / (hi - lo) * H; }
-
-    // gridlines + y-axis labels (4 levels)
-    var grid = $("grid"); grid.textContent = "";
-    var yax = $("chart-yaxis"); yax.textContent = "";
-    for (var k = 0; k <= 4; k++) {
-      var gp = lo + (hi - lo) * k / 4, gy = Y(gp);
-      var ln = document.createElementNS(SVGNS, "line"); ln.setAttribute("class", "candle-grid");
-      ln.setAttribute("x1", "0"); ln.setAttribute("x2", String(W)); ln.setAttribute("y1", gy.toFixed(1)); ln.setAttribute("y2", gy.toFixed(1));
-      grid.appendChild(ln);
-      var lab = document.createElement("span"); lab.textContent = fmt(gp, dpp() + 2);
-      lab.style.top = (gy / H * 100) + "%"; yax.appendChild(lab);
-    }
-
-    // candles
-    var g = $("candles"); g.textContent = "";
-    cs.forEach(function (c, i) {
-      var cx = i * slot + slot / 2, up = c.c >= c.o;
-      var grp = document.createElementNS(SVGNS, "g"); grp.setAttribute("class", up ? "candle candle-up" : "candle candle-down");
-      var wick = document.createElementNS(SVGNS, "line"); wick.setAttribute("class", "candle-wick");
-      wick.setAttribute("x1", cx.toFixed(1)); wick.setAttribute("x2", cx.toFixed(1)); wick.setAttribute("y1", Y(c.h).toFixed(1)); wick.setAttribute("y2", Y(c.l).toFixed(1));
-      var yo = Y(c.o), yc = Y(c.c), top = Math.min(yo, yc), hgt = Math.max(1.5, Math.abs(yo - yc));
-      var body = document.createElementNS(SVGNS, "rect"); body.setAttribute("class", "candle-body");
-      body.setAttribute("x", (cx - bodyW / 2).toFixed(1)); body.setAttribute("width", bodyW.toFixed(1)); body.setAttribute("y", top.toFixed(1)); body.setAttribute("height", hgt.toFixed(1));
-      grp.appendChild(wick); grp.appendChild(body); g.appendChild(grp);
+  function ensureChart() {
+    if (pro.chart || !window.LightweightCharts) return !!pro.chart;
+    var up = cssVar("--success", "#93d9b6"), down = cssVar("--danger", "#ff8a9f"), text = cssVar("--muted", "#9eb6bd");
+    var fmtOpt = { type: "custom", minMove: 1e-14, formatter: price };
+    pro.chart = window.LightweightCharts.createChart($("price-chart"), {
+      autoSize: true,
+      layout: { background: { type: "solid", color: "transparent" }, textColor: text, attributionLogo: false },
+      grid: { vertLines: { color: "rgba(128,128,128,.12)" }, horzLines: { color: "rgba(128,128,128,.12)" } },
+      rightPriceScale: { borderVisible: false },
+      timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false },
+      localization: { priceFormatter: price }
     });
-
-    // last price line + tag
-    var last = cs[cs.length - 1].c, ly = Y(last);
-    $("price-last-line").setAttribute("y1", ly.toFixed(1)); $("price-last-line").setAttribute("y2", ly.toFixed(1));
-    var tag = $("price-tag"); tag.textContent = fmt(last, dpp() + 2); tag.style.top = (ly / H * 100) + "%";
+    pro.candles = pro.chart.addCandlestickSeries({ upColor: up, downColor: down, borderVisible: false, wickUpColor: up, wickDownColor: down, priceFormat: fmtOpt });
+    pro.vol = pro.chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false });
+    pro.chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+    pro.ref = pro.chart.addLineSeries({ color: text, lineWidth: 1, lineStyle: 2, priceLineVisible: false, crosshairMarkerVisible: false, title: "Opening rate", priceFormat: fmtOpt,
+      // A flat line alone would give an axis of one repeated price: show ±20% around it
+      autoscaleInfoProvider: function (base) {
+        var r = base();
+        if (r && r.priceRange && r.priceRange.maxValue === r.priceRange.minValue) {
+          var m = Math.abs(r.priceRange.maxValue) * 0.2 || 1e-12;
+          return { priceRange: { minValue: r.priceRange.minValue - m, maxValue: r.priceRange.maxValue + m } };
+        }
+        return r;
+      } });
+    return true;
   }
 
-  function placeOrder() {
-    var price = parseFloat($("o-price").value) || 0, amt = parseFloat($("o-amount").value) || 0;
-    if (price <= 0 || amt <= 0) return;
-    pro.orders.unshift({ id: ++pro.orderId, side: pro.side, coin: pro.coin, price: price, amt: amt, total: price * amt });
-    if (pro.orders.length === 1) $("pro-reveal").hidden = false;
-    renderOrders();
-    $("orders-card").scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }
-  function renderOrders() {
-    if (!$("orders-body")) return;
-    var n = pro.orders.length;
-    $("orders-count").textContent = n ? "(" + n + ")" : "";
-    $("orders-empty").hidden = n > 0;
-    $("orders-body").innerHTML = pro.orders.map(function (o) {
-      return '<div class="orders-row"><span class="side-' + o.side + '">' + (o.side === "buy" ? "Buy" : "Sell") + '</span><span>XMZ / ' + o.coin + '</span>' +
-        '<span class="num">' + fmt(o.price, COINS[o.coin].dp + 2) + '</span><span class="num">' + fmt(o.amt, 0) + '</span>' +
-        '<span class="num">' + fmt(o.total, COINS[o.coin].dp) + ' ' + o.coin + '</span>' +
-        '<button class="order-cancel" type="button" data-id="' + o.id + '">Cancel</button></div>';
-    }).join("");
+  function renderChart(list) {
+    var empty = $("chart-empty"), interval = TF[pro.tf];
+    if (!ensureChart()) { empty.hidden = false; empty.textContent = "The chart could not load."; return; }
+    var up = cssVar("--success", "#93d9b6"), down = cssVar("--danger", "#ff8a9f");
+    pro.candles.setData(list.map(function (c) { return { time: c.t, open: c.o, high: c.h, low: c.l, close: c.c }; }));
+    pro.vol.setData(list.map(function (c) { return { time: c.t, value: c.v, color: (c.c >= c.o ? up : down) + "66" }; }));
+    var usd = pro.usd[pro.coin], now = Math.floor(Date.now() / 1000), refData = [];
+    if (usd > 0) {
+      var ref = OPENING_USD / usd, from = list.length ? list[0].t : now - 30 * interval;
+      from -= from % interval; var to = now - now % interval;
+      refData = [{ time: from, value: ref }];
+      if (to > from) refData.push({ time: to, value: ref });
+    }
+    pro.ref.setData(refData);
+    if (list.length) { empty.hidden = true; }
+    else {
+      empty.hidden = false;
+      empty.textContent = "No completed swaps on XMZ / " + pro.coin + " yet." + (usd > 0 ? " Dashed line: the DEX's $0.001 opening rate at today's " + pro.coin + " price." : "");
+    }
+    pro.chart.timeScale().fitContent();
   }
 
-  function reduceMotion() { return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches; }
-  function simTick() {
-    pro.mid = mid() * (1 + (Math.random() - 0.5) * 0.006);
-    var cur = pro.candles[pro.candles.length - 1];
-    if (cur) { cur.c = pro.mid; if (pro.mid > cur.h) cur.h = pro.mid; if (pro.mid < cur.l) cur.l = pro.mid; }
-    if (++pro.formTicks >= TF[pro.tf].tpc) { pro.formTicks = 0; pro.candles.push({ o: pro.mid, h: pro.mid, l: pro.mid, c: pro.mid }); if (pro.candles.length > 38) pro.candles.shift(); }
-    pro.chg24 += (Math.random() - 0.5) * 0.15;
-    pro.vol += Math.random() * 500;
-    renderBookRows();
-    renderTicker(true);
-    pro.trades.unshift(makeTrade(Date.now()));
-    if (pro.trades.length > 18) pro.trades.pop();
-    renderTradeList(true);
-    renderCandles();
+  function book(listings) {
+    var asks = [], bids = [];
+    listings.forEach(function (o) {
+      var l = o.listing, row = { price: wei(l.value) / coins(l.xmz), amt: coins(l.xmz), total: wei(l.value) };
+      (l.side === "sell-xmz" ? asks : bids).push(row);
+    });
+    asks.sort(function (a, b) { return a.price - b.price; });
+    bids.sort(function (a, b) { return b.price - a.price; });
+    var cum = 0; asks.forEach(function (r) { cum += r.amt; r.cum = cum; });
+    cum = 0; bids.forEach(function (r) { cum += r.amt; r.cum = cum; });
+    var maxc = Math.max(asks.length ? asks[asks.length - 1].cum : 0, bids.length ? bids[bids.length - 1].cum : 0) || 1;
+    return { asks: asks, bids: bids, maxc: maxc };
   }
-  function startSim() { stopSim(); if (!reduceMotion() && !document.hidden && !$("view-pro").hidden) pro.timer = setInterval(simTick, 1900); }
-  function stopSim() { if (pro.timer) { clearInterval(pro.timer); pro.timer = null; } }
+  function rowHTML(r, maxc, cls) {
+    return '<div class="book-row ' + cls + '"><span class="bar" data-d="' + (r.cum / maxc * 100).toFixed(1) + '"></span>' +
+      '<span class="price">' + price(r.price) + '</span><span class="num">' + fmt(r.amt, 2) + '</span><span class="num">' + fmt(r.total, 6) + '</span></div>';
+  }
+  function renderBook(listings) {
+    var b = book(listings);
+    $("book-asks").innerHTML = b.asks.length ? b.asks.slice().reverse().map(function (r) { return rowHTML(r, b.maxc, "ask"); }).join("") : '<p class="book-empty">No offers to sell XMZ</p>';
+    $("book-bids").innerHTML = b.bids.length ? b.bids.map(function (r) { return rowHTML(r, b.maxc, "bid"); }).join("") : '<p class="book-empty">No offers to buy XMZ</p>';
+    Array.prototype.forEach.call(document.querySelectorAll("#view-pro .book-row .bar"), function (bar) { bar.style.width = bar.getAttribute("data-d") + "%"; });
+    var mid = b.asks.length && b.bids.length ? (b.asks[0].price + b.bids[0].price) / 2 : null;
+    $("book-mid").textContent = mid ? price(mid) : "—";
+    $("book-spread-v").textContent = mid ? ((b.asks[0].price - b.bids[0].price) / mid * 100).toFixed(2) + "%" : "—";
+    renderDepth(b, mid);
+    $("r-offers").textContent = String(listings.length);
+  }
 
-  function syncOrderUnits() {
-    $("o-price-unit").textContent = pro.coin;
-    $("o-total-unit").textContent = pro.coin;
-    if (!$("o-price").value) $("o-price").value = fmt(mid(), dpp());
+  function renderDepth(b, mid) {
+    var ids = ["d-bid-line", "d-bid-area", "d-ask-line", "d-ask-area"];
+    if (!b.asks.length && !b.bids.length) {
+      ids.forEach(function (id) { $(id).setAttribute("d", ""); });
+      $("d-xmin").textContent = $("d-xmid").textContent = $("d-xmax").textContent = "—";
+      return;
+    }
+    var prices = b.asks.concat(b.bids).map(function (r) { return r.price; });
+    var pmin = Math.min.apply(null, prices), pmax = Math.max.apply(null, prices), pad = (pmax - pmin) * 0.08 || pmin * 0.05;
+    pmin -= pad; pmax += pad;
+    var W = 1000, H = 220, top = 14, span = pmax - pmin;
+    function X(pr) { return ((pr - pmin) / span * W).toFixed(1); }
+    function Y(c) { return (H - c / b.maxc * (H - top)).toFixed(1); }
+    function steps(rows, toward) { // a stepped cumulative line from the best price outward
+      var pts = [], prev = 0;
+      rows.forEach(function (r) { pts.push([X(r.price), Y(prev)]); pts.push([X(r.price), Y(r.cum)]); prev = r.cum; });
+      if (rows.length) pts.push([X(toward), Y(prev)]);
+      return pts;
+    }
+    function line(pts) { return pts.length ? "M" + pts.map(function (q) { return q[0] + "," + q[1]; }).join(" L") : ""; }
+    function area(pts) { return pts.length ? line(pts) + " L" + pts[pts.length - 1][0] + "," + H + " L" + pts[0][0] + "," + H + " Z" : ""; }
+    var bp = steps(b.bids, pmin), ap = steps(b.asks, pmax);
+    $("d-bid-line").setAttribute("d", line(bp)); $("d-bid-area").setAttribute("d", area(bp));
+    $("d-ask-line").setAttribute("d", line(ap)); $("d-ask-area").setAttribute("d", area(ap));
+    var m = mid || (pmin + pmax) / 2, xm = X(m);
+    $("d-mid").setAttribute("x1", xm); $("d-mid").setAttribute("x2", xm);
+    $("d-xmin").textContent = price(pmin); $("d-xmid").textContent = price(m); $("d-xmax").textContent = price(pmax);
+  }
+
+  function renderTrades(prints) {
+    var now = Date.now() / 1000;
+    prints.forEach(function (p, i) { p.px = wei(p.value) / coins(p.xmz); });
+    $("trades").innerHTML = prints.length ? prints.slice(0, 20).map(function (p, i) {
+      var older = prints[i + 1], up = !older || p.px >= older.px, d = new Date(p.at * 1000), pp = function (x) { return ("0" + x).slice(-2); };
+      var when = (now - p.at < 86400 ? "" : pp(d.getMonth() + 1) + "-" + pp(d.getDate()) + " ") + pp(d.getHours()) + ":" + pp(d.getMinutes());
+      return '<a class="trade-row" href="' + EXPLORER[pro.coin] + esc(p.tx) + '" rel="noopener" title="The claim on chain"><span class="price ' + (up ? "up" : "down") + '">' + price(p.px) +
+        '</span><span class="num">' + fmt(coins(p.xmz), 2) + '</span><span class="num">' + when + '</span></a>';
+    }).join("") : '<p class="book-empty">No completed swaps yet</p>';
+    var last = prints[0], before = null, vol = 0;
+    prints.forEach(function (p) { if (now - p.at <= 86400) vol += coins(p.xmz); else if (!before) before = p; });
+    $("pro-last").textContent = last ? price(last.px) + " " + pro.coin : "—";
+    var c = $("pro-chg");
+    if (last && before) { var ch = (last.px / before.px - 1) * 100; c.textContent = (ch >= 0 ? "+" : "") + ch.toFixed(2) + "%"; c.className = ch >= 0 ? "up" : "down"; }
+    else { c.textContent = "—"; c.className = ""; }
+    $("pro-vol").textContent = fmt(vol, 0) + " XMZ";
+  }
+
+  function noRelay(why) {
+    $("pro-note").textContent = why;
+    $("r-relay").textContent = "none reachable";
+    renderBook([]); renderTrades([]);
+    renderChart([]);
+  }
+
+  function load() {
+    var gen = ++pro.gen, since = Math.floor(Date.now() / 1000) - 400 * TF[pro.tf];
+    Promise.all([get("listings"), get("prints"), get("candles", "&interval=" + TF[pro.tf] + "&since=" + since)]).then(function (r) {
+      if (gen !== pro.gen) return;
+      if (!r[0] || !r[0].relay) { noRelay("No relay is connected yet"); return; }
+      $("pro-note").textContent = "Signed offers from the open relays";
+      $("r-relay").textContent = r[0].relay;
+      renderBook(r[0].listings || []);
+      renderTrades(r[1].prints || []);
+      renderChart(r[2].candles || []);
+    }).catch(function () { if (gen === pro.gen) noRelay("The relays could not be reached"); });
+  }
+
+  function loadPrices() {
+    return fetch("/markets/api.php?only=coins", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (d) {
+      (d.coins || []).forEach(function (c) { if (c && c.symbol && c.usd > 0) pro.usd[c.symbol] = c.usd; });
+    }).catch(function () {});
+  }
+
+  function syncPair() {
     $("pro-pair").innerHTML = pDot("XMZ") + '<span>XMZ / ' + pro.coin + '</span><span class="ccaret">▾</span>';
-    $("o-place").textContent = (pro.side === "buy" ? "Place buy order" : "Place sell order");
-    var cs = $("chart-sub"); if (cs) cs.textContent = "XMZ / " + pro.coin + " \u00b7 indicative";
-    orderCalc();
+    $("chart-sub").textContent = "XMZ / " + pro.coin + " · completed swaps";
   }
-  function orderCalc() {
-    var p = parseFloat($("o-price").value) || 0, a = parseFloat($("o-amount").value) || 0;
-    $("o-total").value = fmt(p * a, dpp());
-  }
+  function show() { syncPair(); load(); }
 
-  // Pair dropdown for pro mode
+  function start() { stop(); if (!document.hidden && !$("view-pro").hidden) pro.timer = setInterval(load, 30000); }
+  function stop() { if (pro.timer) { clearInterval(pro.timer); pro.timer = null; } }
+
   var menu = null;
   function closeMenu() { if (menu) { menu.remove(); menu = null; } $("pro-pair").setAttribute("aria-expanded", "false"); }
   function openPairMenu() {
     if (menu) { closeMenu(); return; }
     menu = document.createElement("div"); menu.className = "coin-menu"; menu.setAttribute("role", "listbox");
-    COUNTERS.forEach(function (c) {
+    PAIRS.forEach(function (c) {
       var b = document.createElement("button"); b.type = "button"; b.setAttribute("role", "option");
       if (c === pro.coin) b.setAttribute("aria-selected", "true");
       b.innerHTML = pDot(c) + "<span>XMZ / " + c + "</span><small>" + NAME[c] + "</small>";
-      b.addEventListener("click", function () { pro.coin = c; $("o-price").value = ""; renderBook(); closeMenu(); });
+      b.addEventListener("click", function () { pro.coin = c; show(); closeMenu(); });
       menu.appendChild(b);
     });
     var host = $("view-pro"); host.style.position = "relative";
@@ -375,38 +367,31 @@
     host.appendChild(menu); $("pro-pair").setAttribute("aria-expanded", "true");
   }
 
-  function setMode(prov) {
-    var proOn = prov === "pro";
+  function setMode(m) {
+    var proOn = m === "pro";
     $("view-simple").hidden = proOn;
     $("view-pro").hidden = !proOn;
     $("mode-simple").classList.toggle("on", !proOn);
     $("mode-pro").classList.toggle("on", proOn);
     $("mode-simple").setAttribute("aria-selected", String(!proOn));
     $("mode-pro").setAttribute("aria-selected", String(proOn));
-    if (proOn && !pro.rendered) { pro.rendered = true; renderBook(); }
-    if (proOn) startSim(); else stopSim();
+    if (proOn && !pro.rendered) { pro.rendered = true; loadPrices().then(show); }
+    if (proOn) start(); else stop();
   }
 
   $("mode-simple").addEventListener("click", function () { setMode("simple"); if (history.replaceState) history.replaceState(null, "", location.pathname); });
   $("mode-pro").addEventListener("click", function () { setMode("pro"); if (history.replaceState) history.replaceState(null, "", "#pro"); });
-  // Shareable deep link: /dex/#pro opens the pro view.
+  // Shareable deep link: /dex/#pro opens the market view.
   window.addEventListener("hashchange", function () { setMode(location.hash === "#pro" ? "pro" : "simple"); });
   if (location.hash === "#pro") setMode("pro");
   $("pro-pair").addEventListener("click", function (e) { e.stopPropagation(); openPairMenu(); });
-  $("o-price").addEventListener("input", orderCalc);
-  $("o-amount").addEventListener("input", orderCalc);
-  $("ot-buy").addEventListener("click", function () { pro.side = "buy"; this.classList.add("on"); $("ot-sell").classList.remove("on"); syncOrderUnits(); });
-  $("ot-sell").addEventListener("click", function () { pro.side = "sell"; this.classList.add("on"); $("ot-buy").classList.remove("on"); syncOrderUnits(); });
   $("tf-group").addEventListener("click", function (e) {
     var b = e.target.closest && e.target.closest("button[data-tf]"); if (!b) return;
     pro.tf = b.getAttribute("data-tf");
     Array.prototype.forEach.call(this.children, function (x) { x.classList.toggle("on", x === b); });
-    seedCandles(); renderCandles();
+    load();
   });
-  $("o-place").addEventListener("click", placeOrder);
-  $("orders-body").addEventListener("click", function (e) { var b = e.target.closest && e.target.closest(".order-cancel"); if (!b) return; var id = +b.getAttribute("data-id"); pro.orders = pro.orders.filter(function (o) { return o.id !== id; }); renderOrders(); });
-  $("view-pro").addEventListener("click", function (e) { var row = e.target.closest && e.target.closest(".book-row"); if (row) { $("o-price").value = fmt(parseFloat(row.getAttribute("data-price")), dpp()); orderCalc(); } });
-  document.addEventListener("visibilitychange", function () { if (!$("view-pro").hidden) { if (document.hidden) stopSim(); else startSim(); } });
+  document.addEventListener("visibilitychange", function () { if (!$("view-pro").hidden) { if (document.hidden) stop(); else { load(); start(); } } });
   document.addEventListener("click", function (e) { if (menu && !menu.contains(e.target)) closeMenu(); });
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeMenu(); });
 })();
@@ -425,7 +410,7 @@
       var notice = document.querySelector(".dex-notice");
       el.classList.add("live");
       el.innerHTML = '<span class="dc-live">🟢 Monzero DEX is live</span>';
-      if (notice) notice.innerHTML = '<strong>Live.</strong> Trade XMZ for BTC or SOL (0.1%–0.5%) or Litecoin (free) from your own wallet in the Monzero app. <a href="/dex/recovery/">How to recover your funds →</a>';
+      if (notice) notice.innerHTML = '<strong>Live.</strong> Trade XMZ for ETH and BNB from your own wallet in the Monzero app, with small limits while the DEX is new. <a href="/dex/recovery/">How to recover your funds →</a>';
     })
     .catch(function () { /* stays "Coming soon" */ });
 })();

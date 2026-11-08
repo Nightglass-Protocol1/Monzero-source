@@ -43,7 +43,7 @@
 <h2>Where each pair stands</h2>
 <p>The DEX is crypto-only — XMZ against Bitcoin, Litecoin, BNB, Ethereum and Solana. (Earlier Bitcoin Cash and Dogecoin work was dropped: a legacy-signature malleability issue made their pre-signed refunds unsafe. A routed XMZ→XMR path is deferred.)</p>
 <div class="rm-grid">
-  <div class="rm-card"><h3>XMZ / BTC <span class="pill done">mainnet tested</span></h3><p>Passed every test-network gate on signet and testnet4 — swap, refund, two machines, interruption and power-loss — with light wallets on both sides (no Bitcoin node needed). The first real-funds BTC↔XMZ swap on Bitcoin mainnet completed on 4&nbsp;November.</p></div>
+  <div class="rm-card"><h3>XMZ / BTC <span class="pill done">mainnet tested</span></h3><p>Passed every test-network gate on signet and testnet4 — swap, refund, two machines, interruption and power-loss — with light wallets on both sides (no Bitcoin node needed). The first real-funds BTC↔XMZ swap on Bitcoin mainnet completed on 4&nbsp;November. On 8&nbsp;November a signet swap was started from a signed offer posted to a relay and completed through it — Bitcoin lock, XMZ lock, redemption and payout.</p></div>
   <div class="rm-card"><h3>XMZ / BNB <span class="pill done">mainnet tested</span></h3><p>A chain-agnostic EVM atomic-swap contract on BNB Smart Chain. Swap and refund passed on testnet; the first real-funds XMZ↔BNB swap on mainnet completed on 31&nbsp;October.</p></div>
   <div class="rm-card"><h3>XMZ / SOL <span class="pill done">mainnet tested</span></h3><p>A dedicated Solana atomic-swap program (native SOL and SPL). Deployed to Solana mainnet and verified with a live real-funds swap — lock → claim, escrow closed — on 6&nbsp;November.</p></div>
   <div class="rm-card"><h3>XMZ / LTC <span class="pill prog">mainnet validating</span></h3><p>A Litecoin light wallet on both sides. Passed the public-testnet gates; the mainnet path is now enabled and validated end-to-end in a dry run (light-wallet sync and full setup). A first real-funds swap is the next step.</p></div>
@@ -57,14 +57,14 @@
 <tr><td>1 · Test networks</td><td>Swap, refund, interruption, power loss, two machines — with light wallets where used</td><td><span class="pill done">BTC · LTC · BNB · SOL · ETH</span></td></tr>
 <tr><td>2 · Project real-funds test</td><td>A real swap with the project's own small funds, both sides owner-held</td><td><span class="pill done">BTC · BNB · SOL · ETH</span> &nbsp; <span class="pill prog">LTC next</span></td></tr>
 <tr><td>3 · Security review</td><td>Community pentest kit, then independent review — before any public money</td><td><span class="pill gate">required · pending</span></td></tr>
-<tr><td>4 · Gated public beta</td><td>In-app offers, small per-trade and daily caps, a signed operator pause switch</td><td><span class="pill next">after review</span></td></tr>
+<tr><td>4 · Gated public beta</td><td>In-app offers, small per-trade and daily caps, a signed operator pause switch</td><td><span class="pill prog">offers &amp; relays built</span> &nbsp; <span class="pill next">opens after review</span></td></tr>
 <tr><td>5 · Raised limits</td><td>Weeks of clean trading; limits raised step by step by signed document</td><td><span class="pill next">later</span></td></tr>
 </table></div>
 
 <h2>What's left before a public beta</h2>
 <ul>
   <li><strong>Independent security review / community pentest.</strong> The swap contracts and engine have not been externally audited; this gates any public, real-money trading.</li>
-  <li><strong>In-app peer discovery and offers.</strong> Swap-key exchange already runs over an authenticated peer-to-peer (libp2p) protocol that answers only the trader named in an offer; public offer discovery is next.</li>
+  <li><strong>In-app peer discovery and offers — built, in testing.</strong> Two public relays are now running (<code>relay1.monzero.org</code> in Europe, <code>relay2.monzero.org</code> in the US) and share offers with each other; anyone can run another. Traders post signed offers for BTC, LTC, ETH and BNB, and agree trade keys through sealed messages only the two traders can read, so neither needs an open port. A relay cannot change an offer or read the messages. The app now sets up its own trading wallet and offer markets, and derives its trading keys from the wallet's recovery words, so no hand-written settings are needed. While building this we found and closed a gap: a taker now refuses any terms that would pay out less XMZ than the offer shows.</li>
   <li><strong>The go-live controls.</strong> Per-trade and daily caps, published fee addresses, and a signed kill switch that can pause new trades at any time.</li>
   <li><strong>Finish the pair set.</strong> A first real-funds LTC swap, then low-gas L2s on the existing EVM contract.</li>
 </ul>
@@ -80,7 +80,7 @@
 
 </div>
 </main>
-  <footer class="footer wrap"><a class="brand" href="../"><img class="brand-mark brand-coin" src="../assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"> MONZERO</a><p>Experimental, community-run development.<br>Roadmap snapshot: 6 November 2026 · Subject to revision.</p><a href="#main">Back to top ↑</a></footer>
+  <footer class="footer wrap"><a class="brand" href="../"><img class="brand-mark brand-coin" src="../assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"> MONZERO</a><p>Experimental, community-run development.<br>Roadmap snapshot: 8 November 2026 · Subject to revision.</p><a href="#main">Back to top ↑</a></footer>
   <script type="module" src="/community/posts.mjs?v=20261020"></script><script src="../site-nav.js?v=20261026-brand" defer></script>
 </body>
 </html>

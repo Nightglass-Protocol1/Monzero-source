@@ -31,11 +31,12 @@ $cfg = [
     'launch_at' => null,        // no date is published before the DEX is live
     'min_app_version' => null,  // e.g. "1.0.0" to require a recent app; null = no floor
     'rendezvous' => [],         // libp2p multiaddrs where makers register (owner-set)
+    'relays' => [],             // open offer relays (monzero-dex-relay base URLs, owner-set)
     'pairs' => [
         ['pair' => 'XMZ/BTC',  'status' => 'beta', 'fee' => '0.1%-0.5%'],
         ['pair' => 'XMZ/LTC',  'status' => 'soon', 'fee' => 'free'],
-        ['pair' => 'XMZ/BNB',  'status' => 'soon', 'fee' => 'tbd'],
-        ['pair' => 'XMZ/ETH',  'status' => 'soon', 'fee' => 'tbd'],
+        ['pair' => 'XMZ/BNB',  'status' => 'beta', 'fee' => 'tbd'],
+        ['pair' => 'XMZ/ETH',  'status' => 'beta', 'fee' => 'tbd'],
         ['pair' => 'XMZ/SOL',  'status' => 'soon', 'fee' => '0.1%-0.5%'],
     ],
 ];
@@ -52,6 +53,10 @@ if (is_file($path) && !is_link($path)) {
             $cfg['rendezvous'] = array_values(array_filter($o['rendezvous'], static fn($m) =>
                 is_string($m) && $m !== '' && strlen($m) <= 512 && preg_match('#^/(ip4|ip6|dns4|dns6|dnsaddr)/#', $m)));
         }
+        if (isset($o['relays']) && is_array($o['relays'])) {
+            $cfg['relays'] = array_values(array_filter($o['relays'], static fn($u) =>
+                is_string($u) && strlen($u) <= 200 && preg_match('#^https://[A-Za-z0-9.\-]+(:\d{1,5})?(/[A-Za-z0-9._\-/]*)?$#', $u)));
+        }
         if (isset($o['pairs']) && is_array($o['pairs'])) $cfg['pairs'] = $o['pairs'];
     }
 }
@@ -62,6 +67,7 @@ echo json_encode([
     'launch_at' => $cfg['live'] ? $cfg['launch_at'] : null,
     'min_app_version' => $cfg['min_app_version'],
     'rendezvous' => $cfg['rendezvous'],
+    'relays' => $cfg['relays'],
     'pairs' => $cfg['pairs'],
     'trust' => 'Discovery/display only. Trading is peer-to-peer and non-custodial; contract addresses are pinned in the app, not served here.',
 ], JSON_UNESCAPED_SLASHES);
