@@ -26,42 +26,100 @@ limits; offers found through open relays; a candlestick chart in the app and on 
 `monzero-dex-listing/1`, signed with EIP-191 by `maker` (an EVM trading account, plain, no code):
 
 ```
-id         32 random bytes (hex); becomes the swap nonce, so a print can be tied to it
+id         32 random bytes; also the trade id, so the swap nonce (its first 8 bytes) ties a
+           claim on chain to the offer
 pair       "ETH/XMZ" | "BNB/XMZ"
-chainId    1 | 56   (testnets: 11155111 | 97 on a test relay)
-contract   the pinned XmzSwap deployment for chainId
+chainId    1 | 56   (testnets: 11155111 | 97)
+contract   the XmzSwap deployment pinned in the app for chainId
 side       "sell-xmz": the maker sells XMZ and receives coin (maker = claimer)
            "buy-xmz":  the maker pays coin and receives XMZ (maker = owner)
-value      coin amount in wei (string)
-xmz        XMZ amount in atoms, 1e11 per XMZ (string)
+value      coin amount in wei
+xmz        XMZ amount in atoms, 1e11 per XMZ (decimal string)
 maker      maker's EVM address
-peer       maker's libp2p multiaddr with /p2p/<peer id>
+mailbox    maker's X25519 mailbox key: takes are sealed to it
 xmzNetwork "mainnet" | "testnet" | "stagenet"
 createdAt, expiresAt   unix seconds; at most 24 h apart
 ```
 
 All or nothing, one fill. A maker cancels with a signed `monzero-dex-cancel/1` for the id.
 
+## Taking an offer: sealed relay mail
+
+Most traders cannot accept incoming connections, so the key exchange goes through relay
+mailboxes (`engine/src/mail.rs`, `market.rs`). The taker seals a `take` (its account, its reply
+mailbox, its signed key frame) to the maker's mailbox key; the maker answers with its own frame,
+sealed to the taker's mailbox. Each letter uses a fresh X25519 sender key and ChaCha20-Poly1305;
+relays see only ciphertext. Frames stay signed by the traders' EVM accounts and are checked as in
+the direct exchange, so a relay can delay or drop letters but never change a trade. Both sides
+build the same trade from the listing: trade id = listing id, both timeouts 2 h. A letter is
+about 340 KB (the cross-curve proof); relays keep up to 512 KB per letter, 16 per mailbox, 2 h.
+
 ## Relay HTTP API v1
 
 ```
 GET  /v1/info                     version, chains and contracts, peer relays
-GET  /v1/listings?pair=ETH/XMZ    active offers
-POST /v1/listings                 signed offer
+GET  /v1/listings?pair=ETH/XMZ    open offers
+GET  /v1/listings/{id}            an open or recently closed offer
+POST /v1/listings                 signed offer (the maker's account must back it)
 POST /v1/cancel                   signed cancel
-POST /v1/prints                   {chainId, tx}: a claim to record
-GET  /v1/prints?pair=             recorded trades, newest first
+POST /v1/mail  {to, sealed}       leave a sealed letter
+GET  /v1/mail?to=&since=          letters for a mailbox
+POST /v1/prints {chainId, tx}     a claim to record (checked on chain once final)
+GET  /v1/prints?pair=&since=      recorded trades, newest first
 GET  /v1/candles?pair=&interval=  OHLCV, interval 3600 | 14400 | 86400
 ```
 
 Relays pull `/v1/listings` and `/v1/prints` from their peer relays and check them again: offers by
 signature, prints on chain. Apps query several relays and merge.
 
+## In the app
+
+- Helper commands (`monzero-dex-evm-helper`, one JSON request each): `listings`, `post`, `serve`
+  (maker: answer takes; call again until taken), `take` (taker: call again until agreed), `cancel`,
+  `report` (claimer: tell the relays where the claim is). Once agreed the trade folder holds the
+  saved trade and `status` / `approve` / `tick` / `payout` run it as before.
+- `EvmMarketJob` runs them; `DexEngine` exposes `refreshEvmOffers`, `postEvmOffer`, `takeEvmOffer`,
+  `cancelEvmOffer`, checks the kill switch and caps before posting or taking, and hands an agreed
+  trade to `EvmTradeJob`. Startup flag `--dex-evm-market <config>` with `--dex-evm-seed-file`.
+  Config `monzero-private-xmz-evm-market-v1`: helper, helperDigest, tradesDir, evmRpc, chainId,
+  accountIndex, mainWallet, swapWallet, relays (optional evmLogChunk, localContract for chain 31337).
+- One trade at a time: a second agreed trade waits until the first is finished.
+
+## Public and dev editions
+
+`-DDEX_PUBLIC_EDITION=ON` (needs `WITH_DEX_PROTOTYPE=ON` and `MONZERO_DEX_CONTROL_PUBKEY`):
+- no `MONZERO_ENABLE_PRIVATE_DEX` opt-in; mainnets only (Bitcoin mainnet for BTC; chains 1 and 56
+  for EVM); test networks are refused, so there is no path without a document;
+- control documents come only from `https://monzero.org/dex/control/<network>.json`, checked
+  against the pinned key; local `--dex-control-file`, `--dex-evm-control-file` and
+  `--dex-control-url` are refused. No document, an expired one or `newTradesEnabled: false` =
+  no new trades; trades already started always finish or refund.
+The dev edition (option OFF) keeps today's behaviour for the team.
+
+Opening limits (owner, 8 Nov): $25 per trade, $250 per day per network, XMZ at the $0.001 opening
+rate (25,000 XMZ per trade). `gui/tools/dex-control/opening-limits.py --sequence N` prints the
+`sign-control.py` commands at today's prices; the owner signs with the control key and publishes
+`btc-mainnet.json`, `eth-mainnet.json`, `bnb-mainnet.json` under `website/dex/control/`. Documents
+last at most 30 days (7 by default), so they are re-signed regularly; raising limits is a new
+document with a higher sequence.
+
+## BTC through the relays (next)
+
+The BTC/XMZ trade negotiates over `PrivateQuoteChannel`, a direct TLS socket with a pinned
+certificate, and its trade folder is prepared by the test kit. To carry it through the relays:
+1. A BTC listing variant: pair `BTC/XMZ`, signed by the maker's `OfferIdentity` (Ed25519) key, with
+   a mailbox key; no contract. The relay checks the signature; prints for BTC need a Bitcoin chain
+   check (an Electrum lookup of the redeem), so BTC trades are not charted at first.
+2. A `RelayMailChannel` with the same interface as `PrivateQuoteChannel`, carrying the negotiation
+   messages as sealed letters (the same mailbox crypto), so neither side needs an open port.
+3. Self-service BTC trade folders in the app (today from the test kit), then a Bitcoin mainnet run
+   between two app instances through a relay before it is offered.
+
 ## Order of work
 
-1. Offer type, signing and checks in the engine (`src/listing.rs`), shared by relay and app. 
-2. Relay service (`relay/`), with tests against a local chain.
-3. Website chart on /markets/ (TradingView Lightweight Charts, self-hosted).
-4. App: post and take offers for ETH/BNB, the trade runs through the existing EVM helper; chart.
-5. Public/dev build split; control documents eth-mainnet / bnb-mainnet at $25 / $250 (owner signs).
-6. BTC through the same relays (its offers carry a BTC payout path instead of a contract).
+1. Offer type, mail, take logic and relay. Done.
+2. Website market view (TradingView Lightweight Charts, self-hosted). Done, not deployed.
+3. App: post and take offers for ETH/BNB, trade runs through the existing EVM helper. Done.
+4. Public/dev edition split; limits tool. Done; the owner signs and publishes the documents.
+5. BTC through the relays (above).
+6. The app's own chart (the website chart's data, in the DEX screen).

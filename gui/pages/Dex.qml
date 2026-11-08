@@ -175,6 +175,8 @@ Rectangle {
     }
     property var bchNativeObservation: root.dex.bchNativeObservationStatus || ({})
     property var evmTrade: root.dex.evmTradeStatus || ({})
+    property var evmMarket: root.dex.evmMarketStatus || ({})
+    property string evmMarketError: ""
     // The lab panels are for testers; traders see the trade card first.
     property bool showAdvanced: false
     // The user's own wallets (optional), per coin; BNB keeps its earlier MetaMask setting
@@ -2611,15 +2613,116 @@ Later addresses may be missing from this backup. Payment and active swap recover
         }
 
         ColumnLayout {
+            // Public offers from the open relays: post one, or take one. Keys are exchanged
+            // through sealed relay mail; once agreed the trade appears in the panel below.
+            objectName: "evmOfferBoard"
+            id: offerBoard
+            Layout.fillWidth: true
+            visible: root.evmMarket.configured === true && root.baseCoin === root.evmMarket.coin
+            enabled: visible
+            property string coin: root.evmMarket.coin || "ETH"
+            property var listings: (root.evmMarket.listings || []).filter(function (l) { return l.pair === offerBoard.coin + "/XMZ" })
+            function hoursLeft(t) { return Math.max(0, Math.round((t - Date.now() / 1000) / 360) / 10) }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor; font.bold: true
+                text: qsTr("Offers: XMZ ↔ %1").arg(offerBoard.coin)
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
+                text: qsTr("Signed offers from the open relays (%1). Taking one starts a trade with its maker; your coins stay yours until the swap completes or refunds. Trades are small while the DEX is new.").arg((root.evmMarket.relays || []).length)
+            }
+            RowLayout {
+                M.StandardButton {
+                    objectName: "evmOffersRefresh"; text: root.evmMarket.busy === true ? qsTr("Working…") : qsTr("Refresh offers")
+                    enabled: root.evmMarket.busy !== true
+                    onClicked: root.evmMarketError = root.dex.refreshEvmOffers(offerBoard.coin + "/XMZ") ? "" : qsTr("Offers could not be loaded now.")
+                }
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; color: M.Style.dimmedFontColor
+                visible: offerBoard.listings.length === 0
+                text: qsTr("No open offers loaded. Refresh, or post your own below.")
+            }
+            Repeater {
+                model: offerBoard.listings
+                delegate: RowLayout {
+                    Layout.fillWidth: true
+                    M.TextPlain {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
+                        text: (modelData.side === "sell-xmz" ? qsTr("Sells %1 XMZ for %2 %3") : qsTr("Buys %1 XMZ for %2 %3")).arg(modelData.xmz).arg(modelData.coin).arg(offerBoard.coin)
+                            + "  ·  " + qsTr("%1 %2 per XMZ").arg(modelData.price).arg(offerBoard.coin)
+                            + "  ·  " + qsTr("%1 h left").arg(offerBoard.hoursLeft(modelData.expiresAt))
+                    }
+                    M.StandardButton {
+                        text: modelData.side === "sell-xmz" ? qsTr("Buy this XMZ") : qsTr("Sell XMZ here")
+                        enabled: root.evmMarket.busy !== true
+                        onClicked: root.evmMarketError = root.dex.takeEvmOffer(modelData.id) ? "" : (root.evmMarket.message || qsTr("The offer could not be taken now."))
+                    }
+                }
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor; font.bold: true
+                text: qsTr("Post an offer")
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                M.StandardButton {
+                    id: offerSide; property bool sell: true
+                    text: sell ? qsTr("I sell XMZ") : qsTr("I buy XMZ")
+                    onClicked: sell = !sell
+                }
+                M.LineEdit { id: offerXmz; Layout.fillWidth: true; placeholderText: qsTr("XMZ amount") }
+                M.LineEdit { id: offerCoin; Layout.fillWidth: true; placeholderText: qsTr("%1 amount").arg(offerBoard.coin) }
+                M.LineEdit { id: offerHours; Layout.preferredWidth: 80; text: "6"; placeholderText: qsTr("hours") }
+                M.StandardButton {
+                    objectName: "evmOfferPost"; text: qsTr("Post")
+                    enabled: root.evmMarket.busy !== true && offerXmz.text !== "" && offerCoin.text !== ""
+                    onClicked: root.evmMarketError = root.dex.postEvmOffer(root.evmMarket.chainId, offerSide.sell ? "sell-xmz" : "buy-xmz",
+                        offerCoin.text, offerXmz.text, parseInt(offerHours.text) || 0) ? "" : (root.evmMarket.message || qsTr("The offer could not be posted now."))
+                }
+            }
+            Repeater {
+                model: root.evmMarket.mine || []
+                delegate: RowLayout {
+                    Layout.fillWidth: true
+                    M.TextPlain {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
+                        text: (modelData.kind === "offer" ? qsTr("Your offer: ") : qsTr("Your take: "))
+                            + (modelData.side === "sell-xmz" ? qsTr("%1 XMZ for %2 %3") : qsTr("%1 XMZ for %2 %3")).arg(modelData.xmz).arg(modelData.coin).arg(offerBoard.coin)
+                            + "  ·  " + (modelData.state === "open" ? (modelData.kind === "offer" ? qsTr("waiting for a taker") : qsTr("waiting for the maker"))
+                                : modelData.state === "agreed" ? qsTr("keys agreed: see the trade below")
+                                : modelData.state === "expired" ? qsTr("expired") : qsTr("cancelled"))
+                            + (modelData.detail ? "  ·  " + modelData.detail : "")
+                    }
+                    M.StandardButton {
+                        visible: modelData.kind === "offer" && modelData.state === "open"
+                        text: qsTr("Cancel")
+                        enabled: root.evmMarket.busy !== true
+                        onClicked: root.evmMarketError = root.dex.cancelEvmOffer(modelData.folder) ? "" : qsTr("The offer could not be cancelled now.")
+                    }
+                }
+            }
+            M.TextPlain {
+                objectName: "evmMarketOutcome"
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.dimmedFontColor
+                visible: text !== ""
+                text: root.evmMarketError ? root.evmMarketError
+                    : root.evmMarket.message ? root.evmMarket.message
+                    : root.evmMarket.state === "refused" || root.evmMarket.state === "failed" ? qsTr("Last request failed: ") + (root.evmMarket.error || qsTr("unknown error"))
+                    : ""
+            }
+        }
+
+        ColumnLayout {
             objectName: "evmTradePanel"
             Layout.fillWidth: true
             property var snapshot: root.evmTrade.snapshot || ({})
             property var offer: snapshot.offer || ({})
-            visible: root.baseCoin === "BNB" && root.evmTrade.configured === true
+            visible: (root.baseCoin === "BNB" || root.baseCoin === "ETH") && root.evmTrade.configured === true
             enabled: visible
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor; font.bold: true
-                text: qsTr("XMZ ↔ BNB trade (BNB testnet prototype)")
+                text: qsTr("XMZ ↔ %1 trade").arg(root.baseCoin)
             }
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor

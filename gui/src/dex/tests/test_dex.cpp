@@ -9,6 +9,7 @@
 #include "BchPunishmentWorkerTestFixture.h"
 #include "BchRefundWalletWorkerTestFixture.h"
 #include "../DexEngine.h"
+#include "../EvmMarketJob.h"
 #include "../LightWalletHelperUpgrade.h"
 #include "../LitecoinLightJob.h"
 #include "../LitecoinLightFundingContext.h"
@@ -272,6 +273,19 @@ private slots:
     // bnb-mainnet document. Confirm the control mechanism works on an EVM network: a signed
     // document enforces caps, an in-flight trade is never blocked after a stop, and error text
     // names the right coin.
+    // Offer amounts typed in the app become exact atomic units (no floating point)
+    void evmOfferAmounts() {
+        QCOMPARE(DexEngine::atomic("0.005",18),QString("5000000000000000"));
+        QCOMPARE(DexEngine::atomic("11193",11),QString("1119300000000000"));
+        QCOMPARE(DexEngine::atomic("0.00000000001",11),QString("1"));
+        QCOMPARE(DexEngine::atomic(" 1.5 ",18),QString("1500000000000000000"));
+        for (const auto &bad:{"","0","0.000","abc","1e5","-1","1.","1,5","0.000000000001"})
+            QVERIFY2(DexEngine::atomic(bad,11).isEmpty(),bad);
+        QCOMPARE(EvmMarketJob::weiToCoin("5000000000000000"),QString("0.005"));
+        QCOMPARE(EvmMarketJob::weiToCoin("1000000000000000000"),QString("1"));
+        QCOMPARE(EvmMarketJob::priceText("5000000000000000","1119300000000000"),QString("4.46708e-07"));
+        QVERIFY(EvmMarketJob::priceText("0","1").isEmpty());
+    }
     void evmNetworkControlDocument() {
         QVERIFY(sodium_init()>=0);
         unsigned char pk[crypto_sign_PUBLICKEYBYTES],sk[crypto_sign_SECRETKEYBYTES];crypto_sign_keypair(pk,sk);

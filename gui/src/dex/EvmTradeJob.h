@@ -24,6 +24,7 @@ public:
     QVariantMap status() const;
     // For the operator kill switch / caps gate (DexEngine): the pinned trade and its offer.
     QString tradeId() const {return m_trade;}
+    QString tradeDir() const {return m_tradeDir;}
     QJsonObject offer() const {return m_snapshot.value("offer").toObject();}
 signals:
     void changed();

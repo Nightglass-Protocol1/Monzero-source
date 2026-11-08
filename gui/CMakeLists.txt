@@ -17,6 +17,9 @@ option(WITH_SCANNER "Enable webcam QR scanner" OFF)
 option(WITH_DESKTOP_ENTRY "Ask to install desktop entry on first startup" ON)
 option(WITH_UPDATER "Regularly check for new updates" OFF)
 option(WITH_DEX_PROTOTYPE "Compile the private, non-networked DEX prototype" OFF)
+# Public DEX edition: real trades on mainnets only, always under the owner-signed control document
+# (kill switch and caps, fetched over HTTPS and checked against the pinned key). OFF = the dev edition.
+option(DEX_PUBLIC_EDITION "Build the public, limited DEX edition (needs WITH_DEX_PROTOTYPE and MONZERO_DEX_CONTROL_PUBKEY)" OFF)
 option(WITH_MINING "Include solo and P2Pool mining (OFF for Microsoft Store wallet builds)" ON)
 option(DEV_MODE "Checkout latest monero master on build" OFF)
 cmake_dependent_option(QML_TESTS "Build QML tests" ON "NOT STATIC;NOT ANDROID;NOT IOS" OFF)
@@ -107,6 +110,16 @@ endif()
 
 if(WITH_DEX_PROTOTYPE)
     add_definitions(-DWITH_DEX_PROTOTYPE)
+endif()
+
+if(DEX_PUBLIC_EDITION)
+    if(NOT WITH_DEX_PROTOTYPE)
+        message(FATAL_ERROR "DEX_PUBLIC_EDITION needs WITH_DEX_PROTOTYPE=ON")
+    endif()
+    if(NOT MONZERO_DEX_CONTROL_PUBKEY MATCHES "^[0-9a-f]+$")
+        message(FATAL_ERROR "DEX_PUBLIC_EDITION needs MONZERO_DEX_CONTROL_PUBKEY (the owner's control key): without it no trade could start")
+    endif()
+    add_definitions(-DMONZERO_DEX_PUBLIC_EDITION)
 endif()
 
 if(WITH_DESKTOP_ENTRY)

@@ -349,6 +349,9 @@ int main(int argc, char *argv[])
     QCommandLineOption dexEvmTradeOption("dex-evm-trade", "Attach a private XMZ<->BNB/ETH trade (prototype); needs --dex-evm-seed-file.", "config");
     dexEvmTradeOption.setFlags(QCommandLineOption::HiddenFromHelp);
     parser.addOption(dexEvmTradeOption);
+    QCommandLineOption dexEvmMarketOption("dex-evm-market", "Attach public XMZ<->ETH/BNB offers through the open relays (prototype); needs --dex-evm-seed-file.", "config");
+    dexEvmMarketOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    parser.addOption(dexEvmMarketOption);
     QCommandLineOption dexEvmSeedOption("dex-evm-seed-file", "Private file with the wallet seed (hex) for the XMZ<->BNB/ETH prototype, until the vault supplies it.", "file");
     dexEvmSeedOption.setFlags(QCommandLineOption::HiddenFromHelp);
     parser.addOption(dexEvmSeedOption);
@@ -660,8 +663,23 @@ int main(int argc, char *argv[])
 #ifdef WITH_DEX_PROTOTYPE
     dexPrototypeEnabled = qgetenv("MONZERO_ENABLE_PRIVATE_DEX") == "I_UNDERSTAND_THIS_IS_A_LOCAL_PROTOTYPE";
 #endif
+#ifdef MONZERO_DEX_PUBLIC_EDITION
+    // The public edition is the opt-in: it trades on mainnets only, and every new trade is checked
+    // against the owner-signed control document (kill switch, per-trade and 24 h caps)
+    dexPrototypeEnabled = true;
+    const QString dexControlBase = QStringLiteral("https://monzero.org/dex/control/");
+#endif
     engine.rootContext()->setContextProperty("dexPrototypeEnabled", dexPrototypeEnabled);
 #ifdef WITH_DEX_PROTOTYPE
+#ifdef MONZERO_DEX_PUBLIC_EDITION
+    {
+        // Bitcoin mainnet unless another mainnet pair is chosen; never a test stage (no document, no caps)
+        const QString swapNetwork=parser.isSet(dexLtcNetworkOption) ? parser.value(dexLtcNetworkOption) : QStringLiteral("btc-mainnet");
+        if (swapNetwork!="btc-mainnet" || !DexDeployment::selectLitecoinStage(swapNetwork)) {
+            qCritical("The public DEX edition trades on Bitcoin mainnet only");return 1;
+        }
+    }
+#else
     if (parser.isSet(dexLtcNetworkOption)) {
         const QString swapNetwork=parser.value(dexLtcNetworkOption);
         if ((swapNetwork=="btc-mainnet" || swapNetwork=="ltc-mainnet") && qgetenv("MONZERO_DEX_MAINNET")!="I_ACCEPT_REAL_FUNDS_RISK") {
@@ -671,6 +689,7 @@ int main(int argc, char *argv[])
             qCritical("Swap network rejected; only regtest, testnet, btc-regtest, btc-testnet4, btc-signet, btc-mainnet or ltc-mainnet is available");return 1;
         }
     }
+#endif
     DexDeployment::lockLitecoinStage();
     DexEngine dexEngine;
     {
@@ -683,6 +702,16 @@ int main(int argc, char *argv[])
             || !dexEngine.evmRiskControl()->setPublicKey(QStringLiteral(MONZERO_DEX_CONTROL_PUBKEY))) {
             qCritical("DEX trade-limit storage or control key is invalid");return 1;
         }
+#ifdef MONZERO_DEX_PUBLIC_EDITION
+        // Only the signed documents published by the owner; no local override
+        if (parser.isSet(dexEvmControlFileOption) || parser.isSet(dexControlFileOption) || parser.isSet(dexControlUrlOption)) {
+            qCritical("The public DEX edition reads its control documents from monzero.org only");return 1;
+        }
+        dexEngine.setEvmControlUrlBase(dexControlBase);
+        if (!dexEngine.riskControl()->startPolling(dexControlBase+QStringLiteral("btc-mainnet.json"))) {
+            qCritical("DEX operator control URL rejected");return 1;
+        }
+#endif
         if (parser.isSet(dexEvmControlFileOption)) {
             if (!dexPrototypeEnabled) {qCritical("DEX EVM control document rejected");return 1;}
             dexEngine.setEvmControlFile(parser.value(dexEvmControlFileOption)); // loaded when the trade binds its chain
@@ -776,10 +805,17 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
-    if (parser.isSet(dexEvmTradeOption) || parser.isSet(dexEvmSeedOption)) {
+    if (parser.isSet(dexEvmTradeOption) || (parser.isSet(dexEvmSeedOption) && !parser.isSet(dexEvmMarketOption))) {
         if (!dexPrototypeEnabled || !parser.isSet(dexEvmTradeOption) || !parser.isSet(dexEvmSeedOption)
             || !dexEngine.configureEvmTrade(parser.value(dexEvmTradeOption),parser.value(dexEvmSeedOption))) {
             qCritical("Private XMZ<->EVM trade configuration rejected");
+            return 1;
+        }
+    }
+    if (parser.isSet(dexEvmMarketOption)) {
+        if (!dexPrototypeEnabled || !parser.isSet(dexEvmSeedOption)
+            || !dexEngine.configureEvmMarket(parser.value(dexEvmMarketOption),parser.value(dexEvmSeedOption))) {
+            qCritical("Public XMZ<->EVM offer configuration rejected");
             return 1;
         }
     }

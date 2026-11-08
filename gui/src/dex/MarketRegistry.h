@@ -30,10 +30,10 @@ inline const std::array<Market, 8> &markets()
             "XMR/XMZ requires a separate atomic-swap protocol; settlement is unavailable."},
         {"DOGE", 8, 64, "dogecoin", "protocol-research",
             "DOGE requires its own lock and refund protocol; settlement is unavailable."},
-        {"ETH", 18, 256, "ethereum", "unimplemented",
-            "ETH uses the same swap contract as BNB; it is not deployed on an Ethereum network yet. Settlement is unavailable."},
-        {"BNB", 18, 256, "evm", "isolated-fixtures",
-            "BNB/XMZ swap, refund, two-machine and power-cut runs pass on BNB testnet through the swap contract; app screens are a prototype and live trading is unavailable."},
+        {"ETH", 18, 256, "ethereum", "mainnet-tested",
+            "ETH/XMZ passed swap, refund and stop-and-resume on Sepolia and a real-funds Ethereum mainnet swap (8 Nov 2026). Offers go through the open relays; trades are capped by the signed control document."},
+        {"BNB", 18, 256, "evm", "mainnet-tested",
+            "BNB/XMZ passed the BNB testnet runs and a real-funds mainnet swap (31 Oct 2026). Offers go through the open relays; trades are capped by the signed control document."},
         {"RUNE", 8, 64, "thorchain-native", "protocol-research",
             "Native THORChain RUNE settlement is not implemented."}
     }};

@@ -11,6 +11,7 @@
 #include "BchNativeProofJob.h"
 #include "BchNativeObservationJob.h"
 #include "EvmTradeJob.h"
+#include "EvmMarketJob.h"
 #include "BchSuccessReleaseReviewJob.h"
 #include "BchSuccessPreparationJob.h"
 #include "BchPublicationRepairJob.h"
@@ -47,6 +48,8 @@
 #include "NativeQuoteCoordinator.h"
 
 #include <QRegularExpression>
+#include <QFile>
+#include <QJsonDocument>
 #include <QHash>
 #include <QDateTime>
 #include <QUuid>
@@ -184,6 +187,11 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     connect(m_evmTrade,&EvmTradeJob::changed,this,&DexEngine::evmTradeChanged);
     m_evmTicker->setInterval(20000);
     connect(m_evmTicker,&QTimer::timeout,this,&DexEngine::stepEvmTrade);
+    m_evmMarket=new EvmMarketJob(this);m_marketTicker=new QTimer(this);
+    connect(m_evmMarket,&EvmMarketJob::changed,this,&DexEngine::evmMarketChanged);
+    connect(m_evmMarket,&EvmMarketJob::agreed,this,&DexEngine::evmOfferAgreed);
+    m_marketTicker->setInterval(20000);
+    connect(m_marketTicker,&QTimer::timeout,this,&DexEngine::stepEvmMarket);
     connect(m_bchNativeObservation,&BchNativeObservationJob::changed,this,&DexEngine::bchRefundProtectionChanged);
     connect(m_bchRefundProtection,&BchRefundProtectionJob::changed,this,&DexEngine::bchNativeObservationChanged);
     connect(m_bchNativeObservation,&BchNativeObservationJob::changed,this,&DexEngine::bchRecoveryRetentionChanged);
@@ -730,10 +738,29 @@ QString evmControlNetwork(qint64 chainId) {
     switch (chainId) {
     case 56: return QStringLiteral("bnb-mainnet");
     case 1:  return QStringLiteral("eth-mainnet");
+#ifndef MONZERO_DEX_PUBLIC_EDITION
+    // The public edition trades on mainnets only, always under a signed document
     case 97: case 11155111: case 1337: case 31337: return QStringLiteral("evm-regtest");
+#endif
     default: return {};
     }
 }
+// The trade-limit ledger keys trades by UUID; an EVM trade id is a 32-byte hash ("0x" + 64 hex).
+// Its first 16 bytes give the same UUID every time, so a resumed trade is found again.
+QString evmLedgerId(const QString &tradeId) {
+    static const QRegularExpression hash("\\A0x[0-9a-f]{64}\\z");
+    if (!hash.match(tradeId).hasMatch()) return {};
+    return QUuid::fromRfc4122(QByteArray::fromHex(tradeId.mid(2,32).toLatin1())).toString(QUuid::WithoutBraces);
+}
+// A trade id no real trade has: checks caps for an offer without counting anything
+const QString OfferCheckId=QStringLiteral("6f666665-722d-4368-9563-6b0000000000");
+}
+void DexEngine::bindEvmNetwork(const QString &network) {
+    if (m_evmBoundNetwork==network) return;
+    // Bind the EVM risk control to this chain and load its signed control document once
+    m_evmRiskControl->setNetwork(network);m_evmBoundNetwork=network;
+    if (!m_evmControlFile.isEmpty()) m_evmRiskControl->loadControlFile(m_evmControlFile);
+    if (!m_evmControlUrlBase.isEmpty() && network.endsWith("-mainnet")) m_evmRiskControl->startPolling(m_evmControlUrlBase+network+".json");
 }
 
 bool DexEngine::configureEvmTrade(const QString &config,const QString &seedFile) {
@@ -754,20 +781,20 @@ bool DexEngine::approveEvmTrade(const QString &commitment) {
     const auto refuse=[this](const QString &why){m_evmStartRefusal=why;emit evmTradeChanged();return false;};
     if (network.isEmpty()) return refuse(tr("This EVM chain is not supported for trading."));
     bool valueOk=false,xmzOk=false;
-    const auto valueHex=offer.value("value").toString();
-    const quint64 valueWei=valueHex.startsWith("0x")?valueHex.mid(2).toULongLong(&valueOk,16):0;
+    // The helper shows the value in decimal; hex ("0x...") is accepted too
+    const auto valueText=offer.value("value").toString();
+    const quint64 valueWei=valueText.startsWith("0x")?valueText.mid(2).toULongLong(&valueOk,16)
+        :(QRegularExpression("\\A[0-9]{1,20}\\z").match(valueText).hasMatch()?valueText.toULongLong(&valueOk,10):0);
     const auto xmzValue=offer.value("xmzAmount");
     const quint64 xmzAtoms=xmzValue.isString()?xmzValue.toString().toULongLong(&xmzOk)
         :(xmzOk=(xmzValue.isDouble() && xmzValue.toDouble()>=0 && xmzValue.toDouble()<9.007199254740992e15),quint64(xmzValue.toDouble()));
     if (!valueOk || !xmzOk) return refuse(tr("The trade amount could not be read."));
-    if (m_evmBoundNetwork!=network) {
-        // Bind the EVM risk control to this trade's chain and load its signed control document once.
-        m_evmRiskControl->setNetwork(network);m_evmBoundNetwork=network;
-        if (!m_evmControlFile.isEmpty()) m_evmRiskControl->loadControlFile(m_evmControlFile);
-    }
-    const auto refusal=m_evmRiskControl->refusal(trade,valueWei,xmzAtoms);
+    const auto ledgerId=evmLedgerId(trade);
+    if (ledgerId.isEmpty()) return refuse(tr("The trade identifier could not be read."));
+    bindEvmNetwork(network);
+    const auto refusal=m_evmRiskControl->refusal(ledgerId,valueWei,xmzAtoms);
     if (!refusal.isEmpty()) return refuse(refusal);
-    if (!m_evmRiskControl->recordStart(trade,valueWei)) return refuse(tr("The trade could not be recorded; not started."));
+    if (!m_evmRiskControl->recordStart(ledgerId,valueWei)) return refuse(tr("The trade could not be recorded; not started."));
     m_evmStartRefusal.clear();
     return m_evmTrade->approve(commitment);
 }
@@ -779,12 +806,105 @@ bool DexEngine::payoutEvmTrade(const QString &address) {
 }
 void DexEngine::stepEvmTrade() {
     const auto s=m_evmTrade->status();
-    if (s.value("snapshot").toMap().value("done").toBool()) {m_evmTicker->stop();emit evmTradeChanged();return;}
+    const auto snapshot=s.value("snapshot").toMap();
+    if (snapshot.value("done").toBool()) {
+        // A swap we claimed: tell the relays where the claim is, for the public price chart
+        if (snapshot.value("role")=="claimer" && snapshot.value("stage")=="Done(Swapped)" && m_reportedTrade!=m_evmTrade->tradeId()
+            && m_evmMarket->status().value("configured").toBool() && m_evmMarket->report(m_evmTrade->tradeDir()))
+            m_reportedTrade=m_evmTrade->tradeId();
+        m_evmTicker->stop();emit evmTradeChanged();return;
+    }
     if (s.value("busy").toBool() || m_evmSeedFile.isEmpty()) return;
     // The seed is read for each step and wiped by the job once written to the helper
     QByteArray hex=LitecoinJournalProtocol::privateConfig(m_evmSeedFile,256).trimmed();
     QByteArray seed=QByteArray::fromHex(hex);hex.fill('\0');
     m_evmTrade->tick(seed);
+}
+QByteArray DexEngine::evmSeed() const {
+    if (m_evmSeedFile.isEmpty()) return {};
+    QByteArray hex=LitecoinJournalProtocol::privateConfig(m_evmSeedFile,256).trimmed();
+    QByteArray seed=QByteArray::fromHex(hex);hex.fill('\0');
+    return seed;
+}
+bool DexEngine::configureEvmMarket(const QString &config,const QString &seedFile) {
+    if (!QDir::isAbsolutePath(seedFile) || QDir::cleanPath(seedFile)!=seedFile) return false;
+    if (!m_evmMarket->configure(config)) return false;
+    m_evmSeedFile=seedFile;m_marketTicker->start();
+    // Start fetching this chain's control document now, so the first offer is not refused for lack of it
+    const auto network=evmControlNetwork(qint64(m_evmMarket->config().value("chainId").toDouble()));
+    if (network.isEmpty()) return false;
+    bindEvmNetwork(network);
+    return true;
+}
+QVariantMap DexEngine::evmMarketStatus() const {
+    auto s=m_evmMarket->status();s.insert("message",m_marketMessage);return s;
+}
+QString DexEngine::atomic(const QString &text,int places) {
+    static const QRegularExpression format("\\A([0-9]{1,30})(\\.([0-9]{1,30}))?\\z");
+    const auto m=format.match(text.trimmed());
+    if (!m.hasMatch() || m.captured(3).size()>places) return {};
+    QString digits=m.captured(1)+m.captured(3).leftJustified(places,'0');
+    while (digits.size()>1 && digits.startsWith('0')) digits.remove(0,1);
+    return digits=="0" ? QString() : digits;
+}
+QString DexEngine::evmOfferRefusal(qint64 chainId,const QString &valueWei,const QString &xmzAtoms) {
+    const auto network=evmControlNetwork(chainId);
+    if (network.isEmpty()) return tr("This EVM chain is not supported for trading.");
+    bool valueOk=false,xmzOk=false;
+    const quint64 wei=valueWei.toULongLong(&valueOk),atoms=xmzAtoms.toULongLong(&xmzOk);
+    if (!valueOk || !xmzOk) return tr("The amount is too large for this test phase.");
+    bindEvmNetwork(network);
+    // The same caps and kill switch as the approval; nothing is recorded here
+    return m_evmRiskControl->refusal(OfferCheckId,wei,atoms);
+}
+bool DexEngine::refreshEvmOffers(const QString &pair) {return m_evmMarket->refreshListings(pair);}
+bool DexEngine::postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours) {
+    const auto wei=atomic(coinAmount,18),atoms=atomic(xmzAmount,11);
+    if (wei.isEmpty() || atoms.isEmpty() || lifetimeHours<1 || lifetimeHours>24) {m_marketMessage=tr("Check the amounts and how long the offer stays open (1-24 hours).");emit evmMarketChanged();return false;}
+    const auto refusal=evmOfferRefusal(chainId,wei,atoms);
+    if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
+    QByteArray seed=evmSeed();
+    const bool started=m_evmMarket->post(seed,chainId,side,wei,atoms,qint64(lifetimeHours)*3600);
+    m_marketMessage=started ? QString() : tr("The offer could not be posted now.");
+    emit evmMarketChanged();return started;
+}
+bool DexEngine::takeEvmOffer(const QString &listingId) {
+    for (const auto &v:m_evmMarket->status().value("listings").toList()) {
+        const auto l=v.toMap();
+        if (l.value("id")!=listingId) continue;
+        const auto refusal=evmOfferRefusal(qint64(l.value("chainId").toDouble()),l.value("valueWei").toString(),l.value("xmzAtoms").toString());
+        if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
+        QByteArray seed=evmSeed();
+        const bool started=m_evmMarket->take(seed,listingId);
+        m_marketMessage=started ? QString() : tr("The offer could not be taken now.");
+        emit evmMarketChanged();return started;
+    }
+    return false;
+}
+bool DexEngine::cancelEvmOffer(const QString &folder) {
+    QByteArray seed=evmSeed();
+    return m_evmMarket->cancel(seed,folder);
+}
+void DexEngine::stepEvmMarket() {
+    if (m_evmMarket->status().value("busy").toBool()) return;
+    QByteArray seed=evmSeed();
+    m_evmMarket->step(seed);
+}
+void DexEngine::evmOfferAgreed(const QString &tradeDir) {
+    // The taken offer is a saved trade now: hand it to the trade job (one trade at a time)
+    const auto path=tradeDir+"/trade-config.json";
+    QFile file(path);
+    const auto bytes=QJsonDocument(m_evmMarket->tradeConfig(tradeDir)).toJson(QJsonDocument::Compact);
+    if (!QFile::exists(path)) {
+        if (!file.open(QIODevice::WriteOnly|QIODevice::NewOnly)) return;
+        file.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);
+        file.write(bytes);file.close();
+    }
+    if (m_evmTrade->status().value("configured").toBool()) {
+        m_marketMessage=tr("Keys agreed for a new trade (%1). Finish the current trade, then restart the app to continue it.").arg(tradeDir);
+        emit evmMarketChanged();return;
+    }
+    if (!configureEvmTrade(path,m_evmSeedFile)) {m_marketMessage=tr("The agreed trade could not be opened: %1").arg(tradeDir);emit evmMarketChanged();}
 }
 bool DexEngine::configureBchNativeObservation(const QString &path) {return bchOperationIdle() && m_bchNativeObservation->configure(path);}
 QVariantMap DexEngine::bchNativeObservationStatus() const {

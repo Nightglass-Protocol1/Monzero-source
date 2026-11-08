@@ -25,6 +25,7 @@ class BchNativeRelayJob;
 class BchNativeProofJob;
 class BchNativeObservationJob;
 class EvmTradeJob;
+class EvmMarketJob;
 class BchSuccessReleaseReviewJob;
 class BchSuccessPreparationJob;
 class BchPublicationRepairJob;
@@ -61,6 +62,7 @@ class DexEngine : public QObject {
     Q_PROPERTY(QVariantMap bchNativeProofStatus READ bchNativeProofStatus NOTIFY bchNativeProofChanged)
     Q_PROPERTY(QVariantMap bchNativeObservationStatus READ bchNativeObservationStatus NOTIFY bchNativeObservationChanged)
     Q_PROPERTY(QVariantMap evmTradeStatus READ evmTradeStatus NOTIFY evmTradeChanged)
+    Q_PROPERTY(QVariantMap evmMarketStatus READ evmMarketStatus NOTIFY evmMarketChanged)
     Q_PROPERTY(QVariantMap bchSuccessReleaseReviewStatus READ bchSuccessReleaseReviewStatus NOTIFY bchSuccessReleaseReviewChanged)
     Q_PROPERTY(QVariantMap bchPublicationRepairStatus READ bchPublicationRepairStatus NOTIFY bchPublicationRepairChanged)
     Q_PROPERTY(QVariantMap bchSuccessPreparationStatus READ bchSuccessPreparationStatus NOTIFY bchSuccessPreparationChanged)
@@ -233,6 +235,17 @@ public:
     Q_INVOKABLE bool approveEvmTrade(const QString &commitment);
     // After the trade: pay what its account holds to the user's own wallet (e.g. MetaMask)
     Q_INVOKABLE bool payoutEvmTrade(const QString &address);
+    // Public offers for XMZ<->ETH/BNB through the open relays (see EvmMarketJob). Uses the same
+    // seed file as the trade. A taken offer becomes the EVM trade above.
+    bool configureEvmMarket(const QString &config,const QString &seedFile);
+    QVariantMap evmMarketStatus() const;
+    Q_INVOKABLE bool refreshEvmOffers(const QString &pair);
+    // side: "sell-xmz" (we sell XMZ for the coin) or "buy-xmz"; amounts as decimal text in coins
+    Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours);
+    Q_INVOKABLE bool takeEvmOffer(const QString &listingId);
+    Q_INVOKABLE bool cancelEvmOffer(const QString &folder);
+    // Atomic units from decimal text ("0.005", 18 places -> "5000000000000000"); empty if invalid
+    static QString atomic(const QString &text,int places);
     Q_INVOKABLE bool requestBchNativeObservation();
     bool configureBchPublicationRepair(const QString &path);
     QVariantMap bchPublicationRepairStatus() const;
@@ -349,6 +362,8 @@ public:
     DexRiskControl *evmRiskControl() const {return m_evmRiskControl;}
     // The signed control document for the EVM network is loaded when the trade binds its chain.
     void setEvmControlFile(const QString &path) {m_evmControlFile=path;}
+    // Public edition: signed EVM control documents are fetched from <base><network>.json over HTTPS
+    void setEvmControlUrlBase(const QString &base) {m_evmControlUrlBase=base;}
     QVariantMap dexRiskStatus() const;
     // Empty when the configured Litecoin start may proceed; otherwise a user-facing reason.
     QString litecoinStartRefusal() const;
@@ -431,6 +446,7 @@ signals:
     void bchNativeProofChanged();
     void bchNativeObservationChanged();
     void evmTradeChanged();
+    void evmMarketChanged();
     void bchSuccessReleaseReviewChanged();
     void bchSuccessSignedReleaseReviewChanged();
     void bchSuccessSignatureReviewChanged();
@@ -485,6 +501,15 @@ private:
     QTimer *m_evmTicker;
     QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();
+    EvmMarketJob *m_evmMarket;
+    QTimer *m_marketTicker;
+    QString m_marketMessage,m_reportedTrade,m_evmControlUrlBase;
+    void bindEvmNetwork(const QString &network);
+    void stepEvmMarket();
+    void evmOfferAgreed(const QString &tradeDir);
+    // Kill switch and caps for an offer before it is posted or taken (nothing is recorded)
+    QString evmOfferRefusal(qint64 chainId,const QString &valueWei,const QString &xmzAtoms);
+    QByteArray evmSeed() const;
     BchSuccessReleaseReviewJob *m_bchSuccessReleaseReview;
     BchSuccessReleaseReviewJob *m_bchSuccessSignedReleaseReview;
     BchSuccessReleaseReviewJob *m_bchSuccessSignatureReview;
