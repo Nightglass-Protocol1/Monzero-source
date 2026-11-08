@@ -350,3 +350,5 @@ pub mod evm_key;
 pub mod exchange;
 pub mod helper;
 pub mod listing;
+pub mod mail;
+pub mod market;

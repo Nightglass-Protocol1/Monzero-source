@@ -5,8 +5,9 @@
 //! covers the canonical JSON of the listing (the fields in declaration order, as serde writes
 //! them), so the same listing has one signed form however a relay re-encodes it.
 //!
-//! The listing id becomes the swap's on-chain nonce when the offer is taken, which lets a relay
-//! tie a claim on chain to the offer's XMZ amount. See `PUBLIC-OPENING.md`.
+//! A trade taken from a listing has the listing's id as its trade id, so the swap's on-chain
+//! nonce (the id's first 8 bytes) ties a claim on chain to the offer's XMZ amount. See
+//! `PUBLIC-OPENING.md`.
 
 use crate::negotiation::Role;
 use crate::xmz::XmzNetwork;
@@ -23,7 +24,6 @@ pub const CANCEL_SCHEMA: &str = "monzero-dex-cancel/1";
 pub const MAX_LIFETIME: u64 = 24 * 3600;
 /// How far in the future a maker's clock may be
 pub const CLOCK_SKEW: u64 = 300;
-pub const MAX_PEER_LEN: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -58,8 +58,8 @@ pub struct Listing {
     #[serde(with = "u64_string")]
     pub xmz: u64,
     pub maker: Address,
-    /// libp2p multiaddr ending in /p2p/<peer id>
-    pub peer: String,
+    /// The maker's mailbox (X25519 public key): takes are sealed to it and left on the relays
+    pub mailbox: B256,
     pub xmz_network: XmzNetwork,
     pub created_at: u64,
     pub expires_at: u64,
@@ -115,8 +115,8 @@ pub enum ListingError {
     TooLarge,
     #[error("expired, from the future, or open longer than 24 hours")]
     Time,
-    #[error("the peer address must be a libp2p multiaddr ending in /p2p/<id>")]
-    Peer,
+    #[error("the mailbox key must not be zero")]
+    Mailbox,
     #[error("the id must not be zero")]
     Id,
 }
@@ -161,9 +161,10 @@ impl Listing {
         self.side.maker_role()
     }
 
-    /// The swap nonce a trade from this listing uses
+    /// The swap nonce a trade from this listing uses: a trade's id is its listing's id, and
+    /// the owner's `newSwap` nonce is the first 8 bytes of the trade id
     pub fn swap_nonce(&self) -> U256 {
-        U256::from_be_bytes(self.id.0)
+        U256::from_be_slice(&self.id[..8])
     }
 
     pub fn check(&self, rules: &Rules, now: u64) -> Result<Chain, ListingError> {
@@ -193,11 +194,8 @@ impl Listing {
         if self.created_at > now + CLOCK_SKEW || self.expires_at <= now || self.expires_at <= self.created_at || self.expires_at - self.created_at > MAX_LIFETIME {
             return Err(ListingError::Time);
         }
-        let peer_ok = self.peer.len() <= MAX_PEER_LEN
-            && self.peer.starts_with('/')
-            && self.peer.rsplit_once("/p2p/").is_some_and(|(_, id)| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()));
-        if !peer_ok {
-            return Err(ListingError::Peer);
+        if self.mailbox == B256::ZERO {
+            return Err(ListingError::Mailbox);
         }
         Ok(chain)
     }

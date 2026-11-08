@@ -52,6 +52,12 @@ impl SwapSeed {
         Zeroizing::new(hex::encode(*bytes))
     }
 
+    /// Our mailbox for one listing: as maker of it, or as its taker (see `mail`)
+    pub fn mailbox(&self, listing: alloy::primitives::B256, maker: bool) -> crate::mail::Mailbox {
+        let side: &[u8] = if maker { b"maker" } else { b"taker" };
+        crate::mail::Mailbox::from_secret(prf(&*self.0, &[b"mailbox", listing.as_slice(), side]))
+    }
+
     fn stream(&self, label: &[u8], offer: &Offer, role: Role) -> ChaCha20Rng {
         let role: &[u8] = match role {
             Role::Owner => b"owner",

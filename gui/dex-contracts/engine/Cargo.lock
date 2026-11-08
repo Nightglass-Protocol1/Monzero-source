@@ -3627,6 +3627,7 @@ name = "monzero-dex-evm"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "chacha20poly1305",
  "curve25519-dalek",
  "curve25519-dalek-ng",
  "futures",
@@ -3646,6 +3647,7 @@ dependencies = [
  "sigma_fun",
  "thiserror 2.0.21",
  "tokio",
+ "x25519-dalek",
  "zeroize",
 ]
 

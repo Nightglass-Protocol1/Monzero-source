@@ -47,7 +47,7 @@ fn offer(maker: &PrivateKeySigner, id: u8, side: Side, value: u64, xmz_coins: u6
         value: U256::from(value),
         xmz: xmz_coins * 100_000_000_000,
         maker: maker.address(),
-        peer: "/ip4/203.0.113.5/tcp/47101/p2p/12D3KooWJLkmg3mWLckBzVLAMVrqCM76mgYZaQpq16pw2y3U5qRU".into(),
+        mailbox: B256::repeat_byte(0x5a),
         xmz_network: XmzNetwork::Mainnet,
         created_at: NOW,
         expires_at: NOW + 3600,
@@ -150,7 +150,7 @@ async fn claims_that_do_not_match_an_offer_are_refused() {
         Swap { value: good.value + U256::from(1), ..good.clone() },
         Swap { owner: taker.address(), ..good.clone() },
         Swap { asset: Address::repeat_byte(9), ..good.clone() },
-        Swap { nonce: U256::from(12345), ..good.clone() },
+        Swap { nonce: good.nonce + U256::from(1), ..good.clone() },
     ];
     for (i, swap) in cases.into_iter().enumerate() {
         let tx = B256::repeat_byte(i as u8 + 1);
@@ -233,4 +233,29 @@ async fn state_survives_a_restart() {
     let tampered = relay();
     tampered.restore(snap);
     assert!(tampered.listings(None, NOW).is_empty());
+}
+
+#[test]
+fn mail_is_kept_per_mailbox_for_two_hours() {
+    let r = relay();
+    let (a, b) = (B256::repeat_byte(1), B256::repeat_byte(2));
+    let letter = |x: u8| Bytes::from(vec![x; 100]);
+    assert_eq!(r.post_mail(a, letter(1), NOW), Ok(()));
+    assert_eq!(r.post_mail(a, letter(1), NOW), Ok(()), "the same letter again");
+    assert_eq!(r.post_mail(a, letter(2), NOW + 60), Ok(()));
+    assert_eq!(r.mail(a, 0).len(), 2);
+    assert_eq!(r.mail(a, NOW + 30).len(), 1);
+    assert!(r.mail(b, 0).is_empty());
+    assert_eq!(r.post_mail(b, Bytes::from(vec![0; 10]), NOW), Err(RelayError::BadMail));
+    assert_eq!(r.post_mail(b, Bytes::from(vec![0; MAX_SEALED + 1]), NOW), Err(RelayError::BadMail));
+    assert_eq!(r.post_mail(B256::ZERO, letter(3), NOW), Err(RelayError::BadMail));
+    for i in 0..MAIL_PER_BOX as u8 {
+        r.post_mail(b, letter(10 + i), NOW).unwrap();
+    }
+    assert_eq!(r.post_mail(b, letter(99), NOW), Err(RelayError::Full));
+    r.prune(NOW + MAIL_SECS + 1);
+    assert_eq!(r.mail(a, 0).len(), 1, "the later letter is still kept");
+    assert_eq!(r.post_mail(b, letter(99), NOW + MAIL_SECS + 1), Ok(()), "room again after expiry");
+    r.prune(NOW + 60 + MAIL_SECS);
+    assert!(r.mail(a, 0).is_empty());
 }

@@ -31,6 +31,9 @@ sha2 = "0.10"
 sigma_fun = { version = "0.7", default-features = false, features = ["ed25519", "secp256k1", "alloc", "serde"] }
 thiserror = "2"
 zeroize = { version = "1", features = ["serde"] }
+# Sealed mailbox messages between the two traders of an offer (carried by relays)
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.10"
 
 # The helper binary's runtime (alloy already uses tokio)
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -24,7 +24,7 @@ fn listing(maker: &PrivateKeySigner) -> Listing {
         value: U256::from(5_000_000_000_000_000u64),
         xmz: 1_119_300_000_000_000,
         maker: maker.address(),
-        peer: "/ip4/203.0.113.5/tcp/47101/p2p/12D3KooWJLkmg3mWLckBzVLAMVrqCM76mgYZaQpq16pw2y3U5qRU".into(),
+        mailbox: B256::repeat_byte(0x5a),
         xmz_network: XmzNetwork::Mainnet,
         created_at: NOW,
         expires_at: NOW + 3600,
@@ -80,9 +80,7 @@ fn listings_outside_the_rules_are_refused() {
     assert_eq!(check(Listing { expires_at: NOW, ..base.clone() }), Err(ListingError::Time));
     assert_eq!(check(Listing { created_at: NOW + CLOCK_SKEW + 1, expires_at: NOW + 7200, ..base.clone() }), Err(ListingError::Time));
     assert_eq!(check(Listing { expires_at: NOW + MAX_LIFETIME + 1, ..base.clone() }), Err(ListingError::Time));
-    assert_eq!(check(Listing { peer: "203.0.113.5:47101".into(), ..base.clone() }), Err(ListingError::Peer));
-    assert_eq!(check(Listing { peer: "/ip4/1.2.3.4/tcp/1/p2p/".into(), ..base.clone() }), Err(ListingError::Peer));
-    assert_eq!(check(Listing { peer: format!("/dns/{}/p2p/x", "a".repeat(300)), ..base.clone() }), Err(ListingError::Peer));
+    assert_eq!(check(Listing { mailbox: B256::ZERO, ..base.clone() }), Err(ListingError::Mailbox));
     assert_eq!(check(Listing { id: B256::ZERO, ..base.clone() }), Err(ListingError::Id));
     assert_eq!(check(Listing { schema: "monzero-dex-listing/2".into(), ..base.clone() }), Err(ListingError::Schema));
 }
@@ -105,8 +103,11 @@ fn malformed_json_is_refused() {
 #[test]
 fn the_listing_id_is_the_swap_nonce() {
     let key = PrivateKeySigner::random();
-    let l = Listing { id: B256::from(U256::from(0x1234u64)), ..listing(&key) };
-    assert_eq!(l.swap_nonce(), U256::from(0x1234u64));
+    let mut id = [0u8; 32];
+    id[..8].copy_from_slice(&0x0102030405060708u64.to_be_bytes());
+    id[31] = 0xff;
+    let l = Listing { id: B256::from(id), ..listing(&key) };
+    assert_eq!(l.swap_nonce(), U256::from(0x0102030405060708u64));
 }
 
 #[test]

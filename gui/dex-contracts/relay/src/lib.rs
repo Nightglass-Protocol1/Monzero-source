@@ -8,7 +8,8 @@
 pub mod chain;
 pub mod http;
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
+use monzero_dex_evm::mail::MAX_SEALED;
 use monzero_dex_evm::listing::{ListingError, Rules, SignedCancel, SignedListing};
 use monzero_dex_evm::negotiation::Role;
 use monzero_dex_evm::Swap;
@@ -26,6 +27,11 @@ pub const ARCHIVE_SECS: u64 = 7 * 24 * 3600;
 pub const PENDING_SECS: u64 = 4 * 3600;
 pub const MAX_PENDING: usize = 500;
 pub const INTERVALS: [u64; 3] = [3600, 4 * 3600, 24 * 3600];
+/// Mail is kept this long; senders resend until answered
+pub const MAIL_SECS: u64 = 2 * 3600;
+pub const MAIL_PER_BOX: usize = 16;
+/// All mail held at once, in bytes
+pub const MAIL_TOTAL: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RelayError {
@@ -47,6 +53,8 @@ pub enum RelayError {
     NotAClaim(String),
     #[error("the claimed swap does not come from an offer this relay knows")]
     UnknownListing,
+    #[error("a letter must be a sealed message of at most 512 KB to a mailbox")]
+    BadMail,
     #[error("the chain could not be read: {0}")]
     ChainRead(String),
 }
@@ -126,6 +134,9 @@ struct State {
     prints: Vec<Print>,
     print_txs: HashSet<B256>,
     pending: HashMap<(u64, B256), u64>,
+    /// mailbox -> (received at, sealed letter)
+    mail: HashMap<B256, Vec<(u64, Bytes)>>,
+    mail_bytes: usize,
 }
 
 pub struct Relay<C> {
@@ -267,8 +278,15 @@ impl<C: ChainView> Relay<C> {
             ClaimLookup::Final { swap, at } => {
                 let mut s = self.state();
                 s.pending.remove(&(chain_id, tx));
-                let id = B256::from(swap.nonce);
-                let listing = s.active.get(&id).or_else(|| s.archive.get(&id)).cloned().ok_or(RelayError::UnknownListing)?;
+                // A trade's id is its listing's id; the swap nonce is the id's first 8 bytes
+                let listing = s
+                    .active
+                    .values()
+                    .chain(s.archive.values())
+                    .find(|o| o.listing.swap_nonce() == swap.nonce)
+                    .cloned()
+                    .ok_or(RelayError::UnknownListing)?;
+                let id = listing.listing.id;
                 let l = &listing.listing;
                 let maker_ok = match l.maker_role() {
                     Role::Owner => swap.owner == l.maker,
@@ -298,9 +316,43 @@ impl<C: ChainView> Relay<C> {
         }
     }
 
+    /// Leaves a sealed letter for a mailbox. Idempotent for the same letter.
+    pub fn post_mail(&self, to: B256, sealed: Bytes, now: u64) -> Result<(), RelayError> {
+        if sealed.len() > MAX_SEALED || sealed.len() < 48 || to == B256::ZERO {
+            return Err(RelayError::BadMail);
+        }
+        let mut s = self.state();
+        if s.mail.get(&to).is_some_and(|b| b.iter().any(|(_, m)| m == &sealed)) {
+            return Ok(());
+        }
+        if s.mail.get(&to).is_some_and(|b| b.len() >= MAIL_PER_BOX) || s.mail_bytes + sealed.len() > MAIL_TOTAL {
+            return Err(RelayError::Full);
+        }
+        s.mail_bytes += sealed.len();
+        s.mail.entry(to).or_default().push((now, sealed));
+        Ok(())
+    }
+
+    /// Letters for a mailbox received at or after `since`, oldest first
+    pub fn mail(&self, to: B256, since: u64) -> Vec<(u64, Bytes)> {
+        self.state().mail.get(&to).map(|b| b.iter().filter(|(at, _)| *at >= since).cloned().collect()).unwrap_or_default()
+    }
+
     /// Closes expired offers and forgets old ones
     pub fn prune(&self, now: u64) {
         let mut s = self.state();
+        let mut freed = 0;
+        for b in s.mail.values_mut() {
+            b.retain(|(at, m)| {
+                let keep = *at + MAIL_SECS > now;
+                if !keep {
+                    freed += m.len();
+                }
+                keep
+            });
+        }
+        s.mail.retain(|_, b| !b.is_empty());
+        s.mail_bytes -= freed;
         let expired: Vec<_> = s.active.iter().filter(|(_, o)| o.listing.expires_at <= now).map(|(id, _)| *id).collect();
         for id in expired {
             let o = s.active.remove(&id).expect("present");

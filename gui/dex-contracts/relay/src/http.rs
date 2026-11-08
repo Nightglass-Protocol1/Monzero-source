@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Writes one address may make per minute
 pub const WRITES_PER_MINUTE: u32 = 30;
 const MAX_BODY: usize = 16 * 1024;
+const MAX_MAIL_BODY: usize = 2 * monzero_dex_evm::mail::MAX_SEALED + 1024;
 
 pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -93,6 +94,12 @@ struct CandleQuery {
 }
 
 #[derive(Deserialize)]
+struct MailQuery {
+    to: B256,
+    since: Option<u64>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Report {
     chain_id: u64,
@@ -112,6 +119,8 @@ pub fn router<C: ChainView + 'static>(api: Arc<Api<C>>) -> Router {
         .route("/v1/prints", get(prints::<C>).post(report::<C>))
         .route("/v1/candles", get(candles::<C>))
         .layer(DefaultBodyLimit::max(MAX_BODY))
+        // Sealed letters are large (the cross-curve proof), hex in JSON doubles them
+        .route("/v1/mail", get(read_mail::<C>).post(post_mail::<C>).layer(DefaultBodyLimit::max(MAX_MAIL_BODY)))
         .layer(cors)
         .with_state(api)
 }
@@ -202,4 +211,23 @@ async fn candles<C: ChainView>(State(api): State<Arc<Api<C>>>, Query(q): Query<C
         return Err(Failure(StatusCode::BAD_REQUEST, format!("interval must be one of {INTERVALS:?}")));
     }
     Ok(Json(json!({ "pair": q.pair, "interval": interval, "candles": api.relay.candles(&q.pair, interval, q.since.unwrap_or(0)) })))
+}
+
+async fn post_mail<C: ChainView>(
+    State(api): State<Arc<Api<C>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(e): Json<monzero_dex_evm::mail::Envelope>,
+) -> Result<Json<Value>, Failure> {
+    let now = now();
+    if !api.allow_write(&headers, peer, now) {
+        return Err(limited());
+    }
+    api.relay.post_mail(e.to, e.sealed, now)?;
+    Ok(Json(json!({ "to": e.to, "kept": true })))
+}
+
+async fn read_mail<C: ChainView>(State(api): State<Arc<Api<C>>>, Query(q): Query<MailQuery>) -> Json<Value> {
+    let mail: Vec<Value> = api.relay.mail(q.to, q.since.unwrap_or(0)).into_iter().map(|(at, sealed)| json!({ "at": at, "sealed": sealed })).collect();
+    Json(json!({ "to": q.to, "mail": mail }))
 }
