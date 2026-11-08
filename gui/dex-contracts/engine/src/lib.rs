@@ -354,3 +354,4 @@ pub mod mail;
 pub mod market;
 pub mod relay_client;
 pub mod helper_market;
+pub mod helper_wallet;

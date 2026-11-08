@@ -22,6 +22,8 @@ public:
     // After the trade: send what its account holds to the user's own wallet (e.g. MetaMask)
     bool payout(QByteArray &walletSeed,const QString &address);
     QVariantMap status() const;
+    // Keys of the trade account from the light-wallet vault (hex); used instead of a wallet seed
+    void setSwapKeys(const QByteArray &swapSeedHex,const QByteArray &evmKeyHex);
     // For the operator kill switch / caps gate (DexEngine): the pinned trade and its offer.
     QString tradeId() const {return m_trade;}
     QString tradeDir() const {return m_tradeDir;}
@@ -29,6 +31,7 @@ public:
 signals:
     void changed();
 private:
+    QByteArray m_swapSeedHex,m_evmKeyHex;
     bool run(const QJsonObject &request);
     bool tickConfig(QByteArray &walletSeed,QJsonObject *out) const;
     bool sourceMatches() const;

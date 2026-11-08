@@ -1,6 +1,7 @@
 #ifndef MONZERO_LITECOIN_LIGHT_JOB_H
 #define MONZERO_LITECOIN_LIGHT_JOB_H
 #include <QObject>
+#include <functional>
 #include <QProcess>
 #include <QTimer>
 #include <QJsonObject>
@@ -51,6 +52,11 @@ public:
     bool restoreMnemonicRecovery(const QString &digest,const QString &phrase,const QString &passphrase,const QString &password,const QString &confirmation,bool approved);
     bool restoreRecovery(const QString &digest,const QString &seed,const QString &password,const QString &confirmation,bool approved);
     bool revealRecovery(const QString &digest,const QString &password,bool approved);
+    // The keys of one XMZ<->EVM trade account, derived by the helper from the unlocked vault (the
+    // wallet seed never leaves it). Delivered only to `done` (native code); never status or QML.
+    // done(swapSeedHex, evmKeyHex, evmAddress) with empty values on failure; the caller wipes them.
+    bool deriveEvmSwapKeys(const QString &password,quint32 account,std::function<void(QByteArray,QByteArray,QString)> done);
+    bool vaultReady() const {return m_walletConfigured && m_vaultConfigured;}
     QString recoverySeed() const;
     QString recoveryPassphrase() const;
     void hideRecovery();

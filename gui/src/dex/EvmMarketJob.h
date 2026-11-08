@@ -26,6 +26,8 @@ public:
     // Answers takes of our open offers and continues our takes; one helper run per call
     bool step(QByteArray &walletSeed);
     QVariantMap status() const;
+    // Keys of the trade account from the light-wallet vault (hex); used instead of a wallet seed
+    void setSwapKeys(const QByteArray &swapSeedHex,const QByteArray &evmKeyHex);
     QJsonObject config() const {return m_config;}
     // The values a trade config for EvmTradeJob needs (helper, endpoints, account)
     QJsonObject tradeConfig(const QString &tradeDir) const;
@@ -36,6 +38,7 @@ signals:
     void changed();
     void agreed(const QString &tradeDir);
 private:
+    QByteArray m_swapSeedHex,m_evmKeyHex;
     struct Folder {QString path,kind,listingId,state,detail;QJsonObject listing;};
     bool run(const QJsonObject &request,const QString &folder);
     bool tickConfig(QByteArray &walletSeed,QJsonObject *out) const;

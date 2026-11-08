@@ -1,4 +1,5 @@
 #include "EvmTradeJob.h"
+#include <sodium.h>
 #include "BackendExecutable.h"
 #include "BchAdmissionProtocol.h"
 #include "LitecoinJournalProtocol.h"
@@ -125,6 +126,13 @@ bool EvmTradeJob::payout(QByteArray &walletSeed,const QString &address) {
     return run({{"schema",RequestSchema},{"command","payout"},{"tradeDir",m_tradeDir},{"tick",t},{"payoutAddress",address}});
 }
 bool EvmTradeJob::tickConfig(QByteArray &walletSeed,QJsonObject *out) const {
+    if (!m_swapSeedHex.isEmpty()) {
+        walletSeed.fill('\0');walletSeed.clear();
+        QJsonObject t{{"evmRpc",m_config.value("evmRpc")},{"swapKeys",QJsonObject{{"swapSeedHex",QString::fromLatin1(m_swapSeedHex)},
+            {"evmKeyHex",QString::fromLatin1(m_evmKeyHex)}}},{"mainWallet",m_config.value("mainWallet")},{"swapWallet",m_config.value("swapWallet")}};
+        if (m_config.contains("evmLogChunk")) t.insert("evmLogChunk",m_config.value("evmLogChunk"));
+        *out=t;return true;
+    }
     const bool valid=walletSeed.size()>=16 && walletSeed.size()<=64;
     QByteArray seedHex=walletSeed.toHex();walletSeed.fill('\0');walletSeed.clear();
     if (!valid) {seedHex.fill('\0');return false;}
@@ -185,4 +193,9 @@ void EvmTradeJob::finish(bool success) {
         if (m_snapshot.value("approved").toBool()) emit changed();
         else if (!approve(pending)) {m_state="refused";m_error="the approval could not be sent";emit changed();}
     }
+}
+
+void EvmTradeJob::setSwapKeys(const QByteArray &swapSeedHex,const QByteArray &evmKeyHex) {
+    sodium_memzero(m_swapSeedHex.data(),m_swapSeedHex.size());sodium_memzero(m_evmKeyHex.data(),m_evmKeyHex.size());
+    m_swapSeedHex=swapSeedHex;m_evmKeyHex=evmKeyHex;
 }

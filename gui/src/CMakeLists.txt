@@ -182,6 +182,7 @@ add_custom_command(TARGET monzero-wallet-gui POST_BUILD COMMAND ${CMAKE_COMMAND}
 include(Deploy)
 
 include("${CMAKE_SOURCE_DIR}/cmake/LightWalletHelper.cmake")
+include("${CMAKE_SOURCE_DIR}/cmake/DexHelpers.cmake")
 target_include_directories(monzero-wallet-gui PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 install(TARGETS monzero-wallet-gui
@@ -210,7 +211,8 @@ if(WITH_DEX_PROTOTYPE)
         target_sources(dex_tests PRIVATE dex/NativeFeePreviewReceiver.cpp dex/LitecoinLightJob.cpp dex/LitecoinLightJob.h)
         # DexEngine drives the XMZ<->BNB/ETH trade job too
         target_sources(dex_tests PRIVATE dex/EvmTradeJob.cpp dex/EvmTradeJob.h dex/EvmMarketJob.cpp dex/EvmMarketJob.h
-            dex/BtcMarketJob.cpp dex/BtcMarketJob.h dex/BtcTradeSetup.cpp dex/BtcTradeSetup.h)
+            dex/BtcMarketJob.cpp dex/BtcMarketJob.h dex/BtcTradeSetup.cpp dex/BtcTradeSetup.h
+            dex/DexWalletService.cpp dex/DexWalletService.h)
         target_sources(dex_tests PRIVATE dex/DexLitecoinLightFunding.cpp dex/LitecoinLightFundingController.cpp dex/LitecoinLightFundingController.h dex/LitecoinLightFundingJob.cpp dex/LitecoinLightFundingJob.h)
         target_sources(dex_tests PRIVATE dex/DexBchLightFunding.cpp dex/BchLightFundingController.cpp dex/BchLightFundingController.h dex/BchLightFundingJob.cpp dex/BchLightFundingJob.h)
         target_sources(dex_tests PRIVATE dex/BchFundingReceiptJob.cpp dex/BchFundingReceiptJob.h)

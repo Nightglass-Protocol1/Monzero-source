@@ -175,7 +175,7 @@ Rectangle {
     }
     property var bchNativeObservation: root.dex.bchNativeObservationStatus || ({})
     property var evmTrade: root.dex.evmTradeStatus || ({})
-    property var evmMarket: root.dex.evmMarketStatus || ({})
+    property var evmMarket: (root.dex.evmMarketStatus || ({}))[root.baseCoin] || ({})
     property var btcMarket: root.dex.btcMarketStatus || ({})
     property string btcMarketError: ""
     property string evmMarketError: ""
@@ -2713,6 +2713,62 @@ Later addresses may be missing from this backup. Payment and active swap recover
             }
         }
 
+        ColumnLayout {
+            // Trading set-up the app does itself: its own XMZ trading wallet (fund it from your
+            // main wallet; trade XMZ lands here) and this session's trade keys from your light wallet
+            objectName: "dexTradingSetup"
+            id: tradingSetup
+            Layout.fillWidth: true
+            property var w: root.dex.dexWalletStatus || ({})
+            visible: w.state !== undefined && w.state !== "unconfigured"
+            M.TextPlain {
+                Layout.fillWidth: true; color: M.Style.defaultFontColor; font.bold: true
+                text: qsTr("Trading wallet")
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
+                text: tradingSetup.w.state === "ready"
+                    ? qsTr("Balance %1 XMZ (%2 unlocked). Send XMZ here from your main wallet to trade; XMZ you buy arrives here.").arg(tradingSetup.w.balance).arg(tradingSetup.w.unlocked)
+                    : tradingSetup.w.state === "failed" ? qsTr("The trading wallet is not running: %1").arg(tradingSetup.w.error)
+                    : qsTr("Starting the trading wallet…")
+            }
+            M.TextPlain {
+                objectName: "dexTradingAddress"
+                Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; color: M.Style.dimmedFontColor
+                visible: (tradingSetup.w.address || "") !== ""
+                text: tradingSetup.w.address || ""
+            }
+            RowLayout {
+                visible: tradingSetup.w.state === "ready"
+                M.LineEdit { id: withdrawAddress; Layout.fillWidth: true; placeholderText: qsTr("Send back to (your XMZ address)") }
+                M.LineEdit { id: withdrawAmount; Layout.preferredWidth: 140; placeholderText: qsTr("XMZ (empty: all)") }
+                M.StandardButton {
+                    objectName: "dexTradingSend"; text: qsTr("Send")
+                    enabled: tradingSetup.w.busy !== true && withdrawAddress.text !== ""
+                    onClicked: if (root.dex.sendFromDexWallet(withdrawAddress.text, withdrawAmount.text)) { withdrawAmount.text = "" }
+                }
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
+                text: tradingSetup.w.keysReady === true
+                    ? qsTr("Trade keys unlocked for this session (ETH/BNB account %1). Fund it with the coin you trade.").arg(tradingSetup.w.tradeAccount)
+                    : qsTr("Unlock your trade keys: they come from your Bitcoin or Litecoin light wallet's recovery words, so a restore brings them back.")
+            }
+            RowLayout {
+                visible: tradingSetup.w.keysReady !== true
+                M.LineEdit { id: keysPassword; Layout.fillWidth: true; password: true; placeholderText: qsTr("Light wallet password") }
+                M.StandardButton {
+                    objectName: "dexUnlockKeys"; text: tradingSetup.w.keysBusy === true ? qsTr("Unlocking…") : qsTr("Unlock")
+                    enabled: tradingSetup.w.keysBusy !== true && keysPassword.text !== ""
+                    onClicked: { root.dex.unlockDexKeys(keysPassword.text); keysPassword.text = "" }
+                }
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.errorColor
+                visible: (tradingSetup.w.keysMessage || "") !== ""
+                text: tradingSetup.w.keysMessage || ""
+            }
+        }
         ColumnLayout {
             // Public offers from the open relays: post one, or take one. Keys are exchanged
             // through sealed relay mail; once agreed the trade appears in the panel below.

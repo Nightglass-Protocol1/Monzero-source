@@ -56,6 +56,9 @@ pub struct Request {
     /// The contract on a local test chain (31337) only; real chains use the pinned ones
     #[serde(default)]
     pub local_contract: Option<alloy::primitives::Address>,
+    /// `xmzWallet`: the app's DEX XMZ wallet
+    #[serde(default)]
+    pub xmz_wallet: Option<crate::helper_wallet::XmzWalletRequest>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -77,6 +80,8 @@ pub enum Command {
     Cancel,
     /// After a swap, report its claim to the relays (claimer)
     Report,
+    /// The app's DEX XMZ wallet: open (create once), status, send
+    XmzWallet,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +154,7 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         }
         Command::Cancel => crate::helper_market::cancel(&r.trade_dir, r.tick.as_ref().ok_or("cancel needs tick")?, relays(&r)?).await,
         Command::Report => crate::helper_market::report(&r.trade_dir, relays(&r)?).await,
+        Command::XmzWallet => crate::helper_wallet::run(r.xmz_wallet.as_ref().ok_or("xmzWallet needs xmzWallet")?).await,
     }
 }
 

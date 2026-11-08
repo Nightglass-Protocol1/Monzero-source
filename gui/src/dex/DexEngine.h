@@ -27,6 +27,7 @@ class BchNativeObservationJob;
 class EvmTradeJob;
 class EvmMarketJob;
 class BtcMarketJob;
+class DexWalletService;
 class BchSuccessReleaseReviewJob;
 class BchSuccessPreparationJob;
 class BchPublicationRepairJob;
@@ -65,6 +66,7 @@ class DexEngine : public QObject {
     Q_PROPERTY(QVariantMap evmTradeStatus READ evmTradeStatus NOTIFY evmTradeChanged)
     Q_PROPERTY(QVariantMap evmMarketStatus READ evmMarketStatus NOTIFY evmMarketChanged)
     Q_PROPERTY(QVariantMap btcMarketStatus READ btcMarketStatus NOTIFY btcMarketChanged)
+    Q_PROPERTY(QVariantMap dexWalletStatus READ dexWalletStatus NOTIFY dexWalletChanged)
     Q_PROPERTY(QVariantMap bchSuccessReleaseReviewStatus READ bchSuccessReleaseReviewStatus NOTIFY bchSuccessReleaseReviewChanged)
     Q_PROPERTY(QVariantMap bchPublicationRepairStatus READ bchPublicationRepairStatus NOTIFY bchPublicationRepairChanged)
     Q_PROPERTY(QVariantMap bchSuccessPreparationStatus READ bchSuccessPreparationStatus NOTIFY bchSuccessPreparationChanged)
@@ -240,6 +242,12 @@ public:
     // Public offers for XMZ<->ETH/BNB through the open relays (see EvmMarketJob). Uses the same
     // seed file as the trade. A taken offer becomes the EVM trade above.
     bool configureEvmMarket(const QString &config,const QString &seedFile);
+    // One market per chain (ETH, BNB); from a config the app wrote or a prototype file
+    bool addEvmMarket(const QString &config);
+    // Writes and starts the ETH/BNB markets of this stage on the app's own wallets (no hand-made configs)
+    void setUpEvmMarkets();
+    static QStringList defaultRelays();
+    bool m_evmAuto=false;
     QVariantMap evmMarketStatus() const;
     Q_INVOKABLE bool refreshEvmOffers(const QString &pair);
     // side: "sell-xmz" (we sell XMZ for the coin) or "buy-xmz"; amounts as decimal text in coins
@@ -249,6 +257,18 @@ public:
     // BTC/XMZ offers through the open relays (see BtcMarketJob). An agreed trade opens in the
     // trade setup review (reviewLitecoinTradeSetup / importLitecoinTradeSetup) like any other.
     bool configureBtcMarket(const QString &config);
+    // The app's own XMZ trading wallet and per-trade swap wallets (see DexWalletService)
+    bool configureDexWallets(const QString &root,const QString &walletRpc,const QString &walletRpcSha256,quint16 daemonPort,
+                             const QString &networkFlag,const QString &helper,const QString &helperSha256);
+    QVariantMap dexWalletStatus() const;
+    DexWalletService *dexWallets() const {return m_dexWallets;}
+    Q_INVOKABLE bool refreshDexWallet();
+    // Unlocks this session's trade keys (ETH/BNB) from the Bitcoin or Litecoin light wallet's vault;
+    // the password goes only to the vault helper and the keys stay in native memory until exit.
+    Q_INVOKABLE bool unlockDexKeys(const QString &password);
+    bool dexKeysReady() const {return !m_evmAccount.isEmpty();}
+    // Send XMZ from the trading wallet to `address` (amount in XMZ as text; empty sends everything)
+    Q_INVOKABLE bool sendFromDexWallet(const QString &address,const QString &amount);
     QVariantMap btcMarketStatus() const;
     Q_INVOKABLE bool refreshBtcOffers();
     Q_INVOKABLE bool postBtcOffer(const QString &side,const QString &btcAmount,const QString &xmzAmount,int lifetimeHours);
@@ -458,6 +478,7 @@ signals:
     void evmTradeChanged();
     void evmMarketChanged();
     void btcMarketChanged();
+    void dexWalletChanged();
     void bchSuccessReleaseReviewChanged();
     void bchSuccessSignedReleaseReviewChanged();
     void bchSuccessSignatureReviewChanged();
@@ -512,16 +533,22 @@ private:
     QTimer *m_evmTicker;
     QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();
-    EvmMarketJob *m_evmMarket;
+    QHash<int,EvmMarketJob*> m_evmMarkets;   // by chain id
+    EvmMarketJob *evmMarketFor(const QString &tradeDir) const;
+    EvmMarketJob *evmMarketForCoin(const QString &coin) const;
+    QByteArray m_evmSwapSeedHex,m_evmKeyHex;
     QTimer *m_marketTicker;
     QString m_marketMessage,m_reportedTrade,m_evmControlUrlBase;
     void bindEvmNetwork(const QString &network);
     void stepEvmMarket();
     BtcMarketJob *m_btcMarket=nullptr;
+    DexWalletService *m_dexWallets=nullptr;
+    QString m_evmAccount,m_keysMessage;
+    bool m_keysBusy=false;
     QTimer *m_btcTicker=nullptr;
     QString m_btcMessage;
     QString btcOfferRefusal(const QString &sats,const QString &atoms);
-    void evmOfferAgreed(const QString &tradeDir);
+    void evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir);
     // Kill switch and caps for an offer before it is posted or taken (nothing is recorded)
     QString evmOfferRefusal(qint64 chainId,const QString &valueWei,const QString &xmzAtoms);
     QByteArray evmSeed() const;

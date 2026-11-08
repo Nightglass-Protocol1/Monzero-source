@@ -18,6 +18,9 @@
 #include <QLockFile>
 #include <QDir>
 #include <QCryptographicHash>
+#include <QRegularExpression>
+#include <QTimer>
+#include <sodium.h>
 #include <QDateTime>
 namespace {
 // Best-effort erasure of worker-owned buffers. Qt/QML/QProcess may make copies;
@@ -1113,4 +1116,33 @@ void LitecoinLightJob::finish(bool success) {
     m_wallet=valid?response.value("wallet").toObject():QJsonObject{};
     m_state=valid?(m_operation=="wallet-create"?"wallet-created":m_operation=="wallet-restore"?"wallet-restored":m_operation=="wallet-backup-save"?"wallet-backup-saved":m_operation=="wallet-backup-verify"?"wallet-backup-verified":m_operation=="wallet-reconcile"?"wallet-reconciled":m_operation=="wallet-broadcast"?"wallet-broadcast-acknowledged":m_operation=="wallet-broadcast-status"?"wallet-broadcast-status":m_operation=="wallet-signed"?"wallet-signed-recovered":m_operation=="wallet-sign"?"wallet-signed":m_operation=="wallet-reopen"?"wallet-reopened":m_operation=="wallet-estimate"?"wallet-estimated":m_operation=="wallet-prepare"?"wallet-prepared":m_operation=="wallet-receive"?"wallet-address":m_operation=="wallet-init"?"wallet-ready":m_operation=="wallet-refresh"?"wallet-checked":m_sync?"checked":"loaded"):"unknown";
     m_signReview={};m_backupReview={};erase(m_input);erase(m_output);emit changed();
+}
+
+bool LitecoinLightJob::deriveEvmSwapKeys(const QString &password,quint32 account,std::function<void(QByteArray,QByteArray,QString)> done) {
+    Credential credential{password.toUtf8()};
+    if (operationBusy() || !m_walletConfigured || !m_vaultConfigured || m_configPath.isEmpty() || credential.bytes.isEmpty()
+        || credential.bytes.size()>1024 || account>=(1u<<31) || !sourcesMatch()) return false;
+    const auto digest=QString::fromLatin1(QCryptographicHash::hash(m_config,QCryptographicHash::Sha256).toHex());
+    QByteArray input=QJsonDocument(QJsonObject{{"schema",LightWalletProfile::schema(m_coin,"light-wallet-evm-swap-keys-request")},
+        {"requestId",QUuid::createUuid().toString(QUuid::WithoutBraces)},{"approvedConfigDigest",digest},{"keysApproved",true},
+        {"evmAccount",double(account)}}).toJson(QJsonDocument::Compact);
+    input.chop(1);input.append(",\"password\":");appendPassword(input,credential.bytes);input.append("}");
+    auto *process=new QProcess(this);
+    QProcessEnvironment environment;environment.insert("LANG","C");process->setProcessEnvironment(environment);
+    connect(process,qOverload<int,QProcess::ExitStatus>(&QProcess::finished),this,[process,done](int code,QProcess::ExitStatus status){
+        QByteArray output=process->readAllStandardOutput().left(2048);process->deleteLater();
+        const auto r=QJsonDocument::fromJson(output).object();sodium_memzero(output.data(),output.size());
+        static const QRegularExpression hex64("\\A[0-9a-f]{64}\\z"),address("\\A0x[0-9a-f]{40}\\z");
+        QByteArray seed=r.value("swapSeedHex").toString().toLatin1(),key=r.value("evmKeyHex").toString().toLatin1();
+        const auto evm=r.value("evmAddress").toString();
+        if (status!=QProcess::NormalExit || code!=0 || !hex64.match(QString::fromLatin1(seed)).hasMatch()
+            || !hex64.match(QString::fromLatin1(key)).hasMatch() || !address.match(evm).hasMatch()) {
+            sodium_memzero(seed.data(),seed.size());sodium_memzero(key.data(),key.size());done({},{},{});return;
+        }
+        done(seed,key,evm);sodium_memzero(seed.data(),seed.size());sodium_memzero(key.data(),key.size());
+    });
+    process->start(m_program,{"--wallet-evm-swap-keys-stdio-v1",m_configPath});
+    process->write(input);sodium_memzero(input.data(),input.size());process->closeWriteChannel();
+    QTimer::singleShot(120000,process,[process]{if (process->state()!=QProcess::NotRunning) process->kill();});
+    return true;
 }

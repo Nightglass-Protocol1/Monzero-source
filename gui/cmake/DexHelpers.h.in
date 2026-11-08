@@ -1,0 +1,11 @@
+#ifndef MONZERO_BUNDLED_DEX_HELPERS_H
+#define MONZERO_BUNDLED_DEX_HELPERS_H
+// Digests are fixed by the reviewed build configuration, never an adjacent manifest. Empty when
+// the build bundles no such helper (then trading for those pairs needs a configured helper).
+namespace BundledDexHelpers {
+constexpr const char *evmSha256 = "@MONZERO_BUNDLED_EVM_HELPER_SHA256@";
+constexpr const char *evmRelativePath = "/monzero-dex/monzero-dex-evm-helper";
+constexpr const char *journalSha256 = "@MONZERO_BUNDLED_JOURNAL_HELPER_SHA256@";
+constexpr const char *journalRelativePath = "/monzero-dex/native-ltc-journal";
+}
+#endif

@@ -13,6 +13,7 @@
 #include "EvmTradeJob.h"
 #include "EvmMarketJob.h"
 #include "BtcMarketJob.h"
+#include "DexWalletService.h"
 #include "BchSuccessReleaseReviewJob.h"
 #include "BchSuccessPreparationJob.h"
 #include "BchPublicationRepairJob.h"
@@ -23,6 +24,7 @@
 #include "BchRefundWalletJob.h"
 #include "DexRiskControl.h"
 #include "DexDeployment.h"
+#include <QJsonArray>
 #include "BchAdmissionProtocol.h"
 #include "LitecoinJournalProtocol.h"
 #include "SwapWalletRpcProcess.h"
@@ -188,12 +190,13 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     connect(m_evmTrade,&EvmTradeJob::changed,this,&DexEngine::evmTradeChanged);
     m_evmTicker->setInterval(20000);
     connect(m_evmTicker,&QTimer::timeout,this,&DexEngine::stepEvmTrade);
-    m_evmMarket=new EvmMarketJob(this);m_marketTicker=new QTimer(this);
-    connect(m_evmMarket,&EvmMarketJob::changed,this,&DexEngine::evmMarketChanged);
-    connect(m_evmMarket,&EvmMarketJob::agreed,this,&DexEngine::evmOfferAgreed);
+    m_marketTicker=new QTimer(this);
     m_marketTicker->setInterval(20000);
     connect(m_marketTicker,&QTimer::timeout,this,&DexEngine::stepEvmMarket);
     m_btcMarket=new BtcMarketJob(this);m_btcTicker=new QTimer(this);
+    m_dexWallets=new DexWalletService(this);
+    connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::dexWalletChanged);
+    connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::setUpEvmMarkets);
     connect(m_btcMarket,&BtcMarketJob::changed,this,&DexEngine::btcMarketChanged);
     connect(m_btcMarket,&BtcMarketJob::agreed,this,[this](const QString &app){
         m_btcMessage=tr("Trade agreed through the relay. Review it below and start it: %1").arg(app);emit btcMarketChanged();
@@ -772,7 +775,9 @@ void DexEngine::bindEvmNetwork(const QString &network) {
 }
 
 bool DexEngine::configureEvmTrade(const QString &config,const QString &seedFile) {
-    if (!QDir::isAbsolutePath(seedFile) || QDir::cleanPath(seedFile)!=seedFile || !m_evmTrade->configure(config)) return false;
+    // A seed file (prototype) or this session's vault keys
+    const bool seedOk=seedFile.isEmpty() ? dexKeysReady() : (QDir::isAbsolutePath(seedFile) && QDir::cleanPath(seedFile)==seedFile);
+    if (!seedOk || !m_evmTrade->configure(config)) return false;
     m_evmSeedFile=seedFile;m_evmTrade->refresh();m_evmTicker->start();return true;
 }
 QVariantMap DexEngine::evmTradeStatus() const {
@@ -818,11 +823,11 @@ void DexEngine::stepEvmTrade() {
     if (snapshot.value("done").toBool()) {
         // A swap we claimed: tell the relays where the claim is, for the public price chart
         if (snapshot.value("role")=="claimer" && snapshot.value("stage")=="Done(Swapped)" && m_reportedTrade!=m_evmTrade->tradeId()
-            && m_evmMarket->status().value("configured").toBool() && m_evmMarket->report(m_evmTrade->tradeDir()))
+            && evmMarketFor(m_evmTrade->tradeDir()) && evmMarketFor(m_evmTrade->tradeDir())->report(m_evmTrade->tradeDir()))
             m_reportedTrade=m_evmTrade->tradeId();
         m_evmTicker->stop();emit evmTradeChanged();return;
     }
-    if (s.value("busy").toBool() || m_evmSeedFile.isEmpty()) return;
+    if (s.value("busy").toBool() || (m_evmSeedFile.isEmpty() && !dexKeysReady())) return;
     // The seed is read for each step and wiped by the job once written to the helper
     QByteArray hex=LitecoinJournalProtocol::privateConfig(m_evmSeedFile,256).trimmed();
     QByteArray seed=QByteArray::fromHex(hex);hex.fill('\0');
@@ -834,18 +839,68 @@ QByteArray DexEngine::evmSeed() const {
     QByteArray seed=QByteArray::fromHex(hex);hex.fill('\0');
     return seed;
 }
+EvmMarketJob *DexEngine::evmMarketFor(const QString &tradeDir) const {
+    for (auto *job:m_evmMarkets) if (tradeDir.startsWith(job->config().value("tradesDir").toString()+"/")) return job;
+    return nullptr;
+}
+EvmMarketJob *DexEngine::evmMarketForCoin(const QString &coin) const {
+    for (auto *job:m_evmMarkets) if (job->status().value("coin")==coin) return job;
+    return nullptr;
+}
+bool DexEngine::addEvmMarket(const QString &config) {
+    auto *job=new EvmMarketJob(this);
+    if (!job->configure(config)) {job->deleteLater();return false;}
+    const auto chain=int(job->config().value("chainId").toDouble());
+    if (m_evmMarkets.contains(chain)) {job->deleteLater();return false;}
+    connect(job,&EvmMarketJob::changed,this,&DexEngine::evmMarketChanged);
+    connect(job,&EvmMarketJob::agreed,this,[this,job](const QString &tradeDir){evmOfferAgreed(job,tradeDir);});
+    m_evmMarkets.insert(chain,job);
+    if (!m_evmSwapSeedHex.isEmpty()) job->setSwapKeys(m_evmSwapSeedHex,m_evmKeyHex);
+    m_marketTicker->start();
+    // Start fetching this chain's control document now, so the first offer is not refused for lack of it
+    const auto network=evmControlNetwork(chain);
+    if (!network.isEmpty()) bindEvmNetwork(network);
+    emit evmMarketChanged();return !network.isEmpty();
+}
+QStringList DexEngine::defaultRelays() {
+    // The open relays the project runs (anyone can add their own with MONZERO_DEX_RELAYS, comma-separated)
+    const auto extra=qEnvironmentVariable("MONZERO_DEX_RELAYS").split(',',Qt::SkipEmptyParts);
+    if (!extra.isEmpty()) {QStringList r;for (const auto &e:extra) r<<e.trimmed();return r.mid(0,8);}
+    return {QStringLiteral("https://relay1.monzero.org"),QStringLiteral("https://relay2.monzero.org")};
+}
+void DexEngine::setUpEvmMarkets() {
+    if (m_evmAuto || !m_dexWallets->ready() || !m_evmMarkets.isEmpty()) return;
+    m_evmAuto=true;
+    const auto main=m_dexWallets->mainEndpoint();
+    const auto root=m_dexWallets->root();
+    const bool mainnet=DexDeployment::mainnetStage();
+    struct Chain {int id;const char *rpc;};
+    const QList<Chain> chains=mainnet ? QList<Chain>{{1,"https://ethereum-rpc.publicnode.com"},{56,"https://bsc-rpc.publicnode.com"}}
+                                      : QList<Chain>{{11155111,"https://ethereum-sepolia-rpc.publicnode.com"},{97,"https://bsc-testnet-rpc.publicnode.com"}};
+    QJsonArray relays;for (const auto &r:defaultRelays()) relays.append(r);
+    for (const auto &c:chains) {
+        const auto rpcOverride=qEnvironmentVariable(QStringLiteral("MONZERO_DEX_EVM_RPC_%1").arg(c.id).toLatin1().constData());
+        // Until a trade agrees, the swap wallet is the trading wallet's service; each trade gets its own
+        const QJsonObject config{{"schema","monzero-private-xmz-evm-market-v1"},{"helper",m_dexWallets->helper()},{"helperDigest",m_dexWallets->helperSha256()},
+            {"tradesDir",QStringLiteral("%1/evm-trades/%2").arg(root).arg(c.id)},{"evmRpc",rpcOverride.isEmpty() ? QString::fromLatin1(c.rpc) : rpcOverride},
+            {"chainId",c.id},{"accountIndex",0},{"mainWallet",main},{"swapWallet",main},{"relays",relays}};
+        const auto path=QStringLiteral("%1/evm-market-%2.json").arg(root).arg(c.id);
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly|QIODevice::Truncate) || !f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner)) continue;
+        f.write(QJsonDocument(config).toJson(QJsonDocument::Compact));f.close();
+        if (!addEvmMarket(path)) qWarning("The DEX market for chain %d could not start",c.id);
+    }
+}
 bool DexEngine::configureEvmMarket(const QString &config,const QString &seedFile) {
     if (!QDir::isAbsolutePath(seedFile) || QDir::cleanPath(seedFile)!=seedFile) return false;
-    if (!m_evmMarket->configure(config)) return false;
-    m_evmSeedFile=seedFile;m_marketTicker->start();
-    // Start fetching this chain's control document now, so the first offer is not refused for lack of it
-    const auto network=evmControlNetwork(qint64(m_evmMarket->config().value("chainId").toDouble()));
-    if (network.isEmpty()) return false;
-    bindEvmNetwork(network);
-    return true;
+    m_evmSeedFile=seedFile;
+    return addEvmMarket(config);
 }
 QVariantMap DexEngine::evmMarketStatus() const {
-    auto s=m_evmMarket->status();s.insert("message",m_marketMessage);return s;
+    // By coin ("ETH", "BNB"); each with the shared message
+    QVariantMap all;
+    for (auto *job:m_evmMarkets) {auto s=job->status();s.insert("message",m_marketMessage);all.insert(s.value("coin").toString(),s);}
+    return all;
 }
 QString DexEngine::atomic(const QString &text,int places) {
     static const QRegularExpression format("\\A([0-9]{1,30})(\\.([0-9]{1,30}))?\\z");
@@ -865,33 +920,78 @@ QString DexEngine::evmOfferRefusal(qint64 chainId,const QString &valueWei,const 
     // The same caps and kill switch as the approval; nothing is recorded here
     return m_evmRiskControl->refusal(OfferCheckId,wei,atoms);
 }
-bool DexEngine::refreshEvmOffers(const QString &pair) {return m_evmMarket->refreshListings(pair);}
+bool DexEngine::refreshEvmOffers(const QString &pair) {
+    auto *job=evmMarketForCoin(pair.section('/',0,0));
+    return job && job->refreshListings(pair);
+}
 bool DexEngine::postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours) {
     const auto wei=atomic(coinAmount,18),atoms=atomic(xmzAmount,11);
     if (wei.isEmpty() || atoms.isEmpty() || lifetimeHours<1 || lifetimeHours>24) {m_marketMessage=tr("Check the amounts and how long the offer stays open (1-24 hours).");emit evmMarketChanged();return false;}
     const auto refusal=evmOfferRefusal(chainId,wei,atoms);
     if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
+    auto *job=m_evmMarkets.value(chainId);
+    if (!job) return false;
     QByteArray seed=evmSeed();
-    const bool started=m_evmMarket->post(seed,chainId,side,wei,atoms,qint64(lifetimeHours)*3600);
+    const bool started=job->post(seed,chainId,side,wei,atoms,qint64(lifetimeHours)*3600);
     m_marketMessage=started ? QString() : tr("The offer could not be posted now.");
     emit evmMarketChanged();return started;
 }
 bool DexEngine::takeEvmOffer(const QString &listingId) {
-    for (const auto &v:m_evmMarket->status().value("listings").toList()) {
+    for (auto *job:m_evmMarkets) for (const auto &v:job->status().value("listings").toList()) {
         const auto l=v.toMap();
         if (l.value("id")!=listingId) continue;
         const auto refusal=evmOfferRefusal(qint64(l.value("chainId").toDouble()),l.value("valueWei").toString(),l.value("xmzAtoms").toString());
         if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
         QByteArray seed=evmSeed();
-        const bool started=m_evmMarket->take(seed,listingId);
+        const bool started=job->take(seed,listingId);
         m_marketMessage=started ? QString() : tr("The offer could not be taken now.");
         emit evmMarketChanged();return started;
     }
     return false;
 }
 bool DexEngine::cancelEvmOffer(const QString &folder) {
+    auto *job=evmMarketFor(folder);
     QByteArray seed=evmSeed();
-    return m_evmMarket->cancel(seed,folder);
+    return job && job->cancel(seed,folder);
+}
+bool DexEngine::configureDexWallets(const QString &root,const QString &walletRpc,const QString &walletRpcSha256,quint16 daemonPort,
+        const QString &networkFlag,const QString &helper,const QString &helperSha256) {
+    return m_dexWallets->configure(root,walletRpc,walletRpcSha256,daemonPort,networkFlag,helper,helperSha256) && m_dexWallets->start();
+}
+QVariantMap DexEngine::dexWalletStatus() const {
+    auto s=m_dexWallets->status();
+    s.insert("keysReady",dexKeysReady());s.insert("keysBusy",m_keysBusy);s.insert("tradeAccount",m_evmAccount);s.insert("keysMessage",m_keysMessage);
+    return s;
+}
+bool DexEngine::refreshDexWallet() {return m_dexWallets->refresh();}
+bool DexEngine::unlockDexKeys(const QString &password) {
+    if (m_keysBusy || password.isEmpty()) return false;
+    // The vault that holds the user's Bitcoin (or else Litecoin) light wallet
+    LitecoinLightJob *vault=nullptr;
+    for (const auto &coin:{"btc","ltc"}) {
+        auto *job=m_lightWallets.value(coin);
+        if (job && job->vaultReady()) {vault=job;break;}
+    }
+    if (!vault && swapLight() && swapLight()->vaultReady()) vault=swapLight();
+    if (!vault) {m_keysMessage=tr("Set up a Bitcoin or Litecoin wallet in the app first: its recovery words also hold your trading keys.");emit dexWalletChanged();return false;}
+    m_keysBusy=true;m_keysMessage.clear();emit dexWalletChanged();
+    const bool started=vault->deriveEvmSwapKeys(password,0,[this](QByteArray seed,QByteArray key,QString address){
+        m_keysBusy=false;
+        if (seed.isEmpty()) {m_keysMessage=tr("The wallet could not be unlocked; check the password.");emit dexWalletChanged();return;}
+        m_evmTrade->setSwapKeys(seed,key);
+        for (auto *job:m_evmMarkets) job->setSwapKeys(seed,key);
+        sodium_memzero(m_evmSwapSeedHex.data(),m_evmSwapSeedHex.size());sodium_memzero(m_evmKeyHex.data(),m_evmKeyHex.size());
+        m_evmSwapSeedHex=seed;m_evmKeyHex=key;
+        m_evmAccount=address;m_keysMessage.clear();
+        emit dexWalletChanged();emit evmMarketChanged();
+    });
+    if (!started) {m_keysBusy=false;m_keysMessage=tr("The wallet is busy; try again in a moment.");emit dexWalletChanged();}
+    return started;
+}
+bool DexEngine::sendFromDexWallet(const QString &address,const QString &amount) {
+    const auto atoms=amount.trimmed().isEmpty() ? QString() : atomic(amount,11);
+    if (!amount.trimmed().isEmpty() && atoms.isEmpty()) return false;
+    return m_dexWallets->send(address.trimmed(),atoms);
 }
 bool DexEngine::configureBtcMarket(const QString &config) {
     if (!m_btcMarket->configure(config)) return false;
@@ -929,25 +1029,43 @@ bool DexEngine::takeBtcOffer(const QString &listingId) {
 }
 bool DexEngine::cancelBtcOffer(const QString &folder) {return m_btcMarket->cancel(folder);}
 void DexEngine::stepEvmMarket() {
-    if (m_evmMarket->status().value("busy").toBool()) return;
-    QByteArray seed=evmSeed();
-    m_evmMarket->step(seed);
+    if (m_evmSeedFile.isEmpty() && !dexKeysReady()) return;
+    for (auto *job:m_evmMarkets) {
+        if (job->status().value("busy").toBool()) continue;
+        QByteArray seed=evmSeed();
+        job->step(seed);
+    }
 }
-void DexEngine::evmOfferAgreed(const QString &tradeDir) {
-    // The taken offer is a saved trade now: hand it to the trade job (one trade at a time)
-    const auto path=tradeDir+"/trade-config.json";
-    QFile file(path);
-    const auto bytes=QJsonDocument(m_evmMarket->tradeConfig(tradeDir)).toJson(QJsonDocument::Compact);
-    if (!QFile::exists(path)) {
-        if (!file.open(QIODevice::WriteOnly|QIODevice::NewOnly)) return;
-        file.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);
-        file.write(bytes);file.close();
+void DexEngine::evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir) {
+    // The taken offer is a saved trade now: give it its own swap-wallet service (the app's, when it
+    // runs the wallets), then hand it to the trade job (one trade at a time)
+    const auto open=[this,job,tradeDir](const QJsonObject &swapWallet){
+        const auto path=tradeDir+"/trade-config.json";
+        auto config=job->tradeConfig(tradeDir);
+        if (!swapWallet.isEmpty()) config.insert("swapWallet",swapWallet);
+        if (!QFile::exists(path)) {
+            QFile file(path);
+            if (!file.open(QIODevice::WriteOnly|QIODevice::NewOnly)) return;
+            file.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);
+            file.write(QJsonDocument(config).toJson(QJsonDocument::Compact));file.close();
+        }
+        if (m_evmTrade->status().value("configured").toBool()) {
+            m_marketMessage=tr("Keys agreed for a new trade (%1). Finish the current trade, then restart the app to continue it.").arg(tradeDir);
+            emit evmMarketChanged();return;
+        }
+        if (!configureEvmTrade(path,m_evmSeedFile)) {m_marketMessage=tr("The agreed trade could not be opened: %1").arg(tradeDir);emit evmMarketChanged();}
+    };
+    if (!m_dexWallets->ready()) {open({});return;}
+    // The trade id is the listing id (from the folder's listing or take record)
+    QString trade;
+    for (const auto &name:{"/listing.json","/take.json"}) {
+        QFile f(tradeDir+name);
+        if (f.open(QIODevice::ReadOnly)) {trade=QJsonDocument::fromJson(f.readAll()).object().value("listing").toObject().value("listing").toObject().value("id").toString();break;}
     }
-    if (m_evmTrade->status().value("configured").toBool()) {
-        m_marketMessage=tr("Keys agreed for a new trade (%1). Finish the current trade, then restart the app to continue it.").arg(tradeDir);
-        emit evmMarketChanged();return;
-    }
-    if (!configureEvmTrade(path,m_evmSeedFile)) {m_marketMessage=tr("The agreed trade could not be opened: %1").arg(tradeDir);emit evmMarketChanged();}
+    m_dexWallets->tradeService(tradeDir,trade,[this,open,tradeDir](const QJsonObject &endpoint){
+        if (endpoint.isEmpty()) {m_marketMessage=tr("The trade's swap wallet could not start: %1").arg(tradeDir);emit evmMarketChanged();return;}
+        open(endpoint);
+    });
 }
 bool DexEngine::configureBchNativeObservation(const QString &path) {return bchOperationIdle() && m_bchNativeObservation->configure(path);}
 QVariantMap DexEngine::bchNativeObservationStatus() const {

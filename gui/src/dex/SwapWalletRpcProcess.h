@@ -27,6 +27,8 @@ public:
     bool startBoundWithDigest(const QString &program,const QString &expectedSha256,
         const QString &directory,const QString &tradeId,quint16 daemonPort,quint16 walletPort);
     void stop();
+    // The XMZ network of the daemon ("--testnet" or "--stagenet"; none for mainnet). Before start.
+    bool setNetworkFlag(const QString &flag);
     // Caller must record before dispatch and complete only after verifying the
     // native operation. Tokens prevent late callbacks completing a newer action.
     bool walletOperationAvailable() const;
@@ -49,6 +51,7 @@ private:
     bool launch(const QString &program, const QString &directory, quint16 daemonPort,
         quint16 walletPort, bool resume,const QByteArray &binding=QByteArray());
     bool recordState(const QByteArray &state);
+    QString m_networkFlag;
     bool finishRecord(bool clean);
     bool removeLoginAfterExit();
     std::unique_ptr<QLockFile> m_lock;

@@ -181,12 +181,19 @@ bool SwapWalletRpcProcess::launch(const QString &program, const QString &directo
     m_process->setWorkingDirectory(m_directory);
     m_process->setStandardOutputFile(QProcess::nullDevice());
     m_process->setStandardErrorFile(QProcess::nullDevice());
-    m_process->start(program,{"--wallet-dir",QDir(m_directory).filePath("wallets"),
+    QStringList arguments{"--wallet-dir",QDir(m_directory).filePath("wallets"),
         "--daemon-address",QString("127.0.0.1:%1").arg(daemonPort),
         "--rpc-bind-ip","127.0.0.1","--rpc-bind-port",QString::number(walletPort),
         "--non-interactive","--max-concurrency","2",
-        "--log-file",QDir(m_directory).filePath("rpc.log")});
+        "--log-file",QDir(m_directory).filePath("rpc.log")};
+    if (!m_networkFlag.isEmpty()) arguments.prepend(m_networkFlag);
+    m_process->start(program,arguments);
     return true;
+}
+
+bool SwapWalletRpcProcess::setNetworkFlag(const QString &flag) {
+    if (m_used || (!flag.isEmpty() && flag!="--testnet" && flag!="--stagenet")) return false;
+    m_networkFlag=flag;return true;
 }
 
 bool SwapWalletRpcProcess::recordState(const QByteArray &state) {

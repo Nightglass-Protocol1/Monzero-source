@@ -8,7 +8,7 @@ limits; offers found through open relays; a candlestick chart in the app and on 
 | Discovery | Public relays plus peer-to-peer. Signed offers on open relays (the project runs the first ones; anyone can run another). Relays copy offers and trades from each other. Traders then talk directly over libp2p, as today. |
 | Chart | Candles (price and volume) in the app and on monzero.org/markets/, from completed trades the relays checked on chain. Before the first trade: the $0.001 opening rate as a reference line. |
 | Limits | $25 per trade and $250 a day per pair, in the owner-signed control document for each network. Raised later only by a new signed document. |
-| Pairs | ETH and BNB first (the app already runs their trades), then BTC. SOL waits: its mainnet program was closed after the test and the app has no SOL path yet. |
+| Pairs | ETH, BNB, BTC through the relays; LTC too (same swap as BTC) once its own real-funds swap passes. SOL waits: its mainnet program was closed after the test, and the app has no SOL trade path (no XMZ side wired to the Solana program). |
 
 ## Trust model
 
@@ -103,15 +103,19 @@ rate (25,000 XMZ per trade). `gui/tools/dex-control/opening-limits.py --sequence
 last at most 30 days (7 by default), so they are re-signed regularly; raising limits is a new
 document with a higher sequence.
 
-## BTC through the relays
+## BTC and LTC through the relays
+
+LTC/XMZ runs the same swap as BTC/XMZ, so everything below covers both. Offers are
+`monzero-dex-utxo-listing/1`: pair `BTC/XMZ` (btc-* networks) or `LTC/XMZ` (ltc-* networks), the
+amount in the coin's atoms (`coin`), signed over `"MONZERO-DEX-UTXO-LISTING-V1\n"` + canonical
+JSON; relays serve them at `/v1/utxo/listings` for the networks in `utxoNetworks`.
+
 
 BTC/XMZ trades are set up from both traders' identity cards and two signatures over the terms
 (the trade kit), then negotiated by the two apps. Both steps now go through the relays:
 
-- **Offers.** `trade_kit.py offer` posts a signed BTC offer (`monzero-dex-btc-listing/1`: network,
-  side, sats, XMZ atoms, the maker's Ed25519 identity key, its mailbox key; signed with that
-  identity key). Relays serve them at `/v1/btc/listings` for the networks they list in
-  `btcNetworks`, and copy them from peer relays. `trade_kit.py offers` lists the checked offers.
+- **Offers.** `trade_kit.py offer` posts a signed offer (network, side, the coin amount, XMZ atoms, the maker's Ed25519 identity key, its mailbox key; signed with that
+  identity key). Relays copy them from peer relays. `trade_kit.py offers` lists the checked offers.
 - **Taking.** `trade_kit.py take` sends the taker's card and destinations as a sealed letter;
   the maker's `trade_kit.py serve` answers the first taker with the terms (the offer's amounts,
   both keys, both sides' destinations, the maker's fees and timelocks) and its signature; the

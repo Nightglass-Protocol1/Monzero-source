@@ -88,13 +88,15 @@ pays XMZ and receives Litecoin.
 
 ## Through the open relays (no open port, no files handed over)
 
+For BTC/XMZ (`--network btc-*`) and LTC/XMZ (`--network ltc-*`); `--coin` is in sats or litoshis.
+
 The same setup can run through the open DEX relays (`relay_market.py`). Identities made with this
 version carry a mailbox key on the card.
 
 ```
 # the maker (here the XMZ seller)
 python3 trade_kit.py offer --dir my-trade --relay https://relay.example.org --network btc-mainnet \
-    --side sell-xmz --btc 33000 --xmz 2500000000000000 --params params.json --policy policy.json
+    --side sell-xmz --coin 33000 --xmz 2500000000000000 --params params.json --policy policy.json
 python3 trade_kit.py serve --dir my-trade --relay https://relay.example.org
 # the taker (the BTC buyer)
 python3 trade_kit.py offers --relay https://relay.example.org

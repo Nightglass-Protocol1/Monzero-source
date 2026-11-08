@@ -78,6 +78,7 @@
 #include "dex/DexRiskControl.h"
 #include "dex/DexTradeFolders.h"
 #include "LightWalletHelper.h"
+#include "DexHelpers.h"
 #include "dex/LitecoinPeerStartup.h"
 #include "dex/PrivateBackendConfig.h"
 #include "dex/NativeQuoteConfig.h"
@@ -813,6 +814,21 @@ int main(int argc, char *argv[])
             || !dexEngine.configureEvmTrade(parser.value(dexEvmTradeOption),parser.value(dexEvmSeedOption))) {
             qCritical("Private XMZ<->EVM trade configuration rejected");
             return 1;
+        }
+    }
+    // The app's own XMZ trading wallet, when this build bundles the DEX helpers: the wallet RPC
+    // installed next to the app (its digest taken now) on the local daemon of the swap stage.
+    if (dexPrototypeEnabled && BundledDexHelpers::evmSha256[0]!='\0' && !DexDeployment::litecoinNetwork().endsWith("regtest")) {
+        const auto rpc=QCoreApplication::applicationDirPath()+"/monzero-wallet-rpc";
+        QFile rpcFile(rpc);QCryptographicHash rpcHash(QCryptographicHash::Sha256);
+        if (rpcFile.open(QIODevice::ReadOnly) && rpcHash.addData(&rpcFile)) {
+            const bool mainnet=DexDeployment::mainnetStage();
+            bool portOk=false;const auto override=qEnvironmentVariable("MONZERO_DEX_XMZ_DAEMON_PORT").toUShort(&portOk);
+            const quint16 daemon=portOk && override ? override : quint16(mainnet ? 6175 : 16175);
+            const auto root=QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(mainnet ? "dex/mainnet" : "dex/testnet");
+            if (!dexEngine.configureDexWallets(root,rpc,QString::fromLatin1(rpcHash.result().toHex()),daemon,mainnet ? QString() : QStringLiteral("--testnet"),
+                    QCoreApplication::applicationDirPath()+QString::fromLatin1(BundledDexHelpers::evmRelativePath),QString::fromLatin1(BundledDexHelpers::evmSha256)))
+                qWarning("The DEX trading wallet could not start");
         }
     }
     if (parser.isSet(dexBtcMarketOption)) {
