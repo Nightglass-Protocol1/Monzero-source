@@ -1,0 +1,23 @@
+[package]
+name = "monzero-dex-relay"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Open relay for Monzero DEX offers and on-chain-checked trades (no funds, no keys)"
+publish = false
+
+[workspace]
+
+[dependencies]
+monzero-dex-evm = { path = "../engine" }
+alloy = { version = "1", default-features = false, features = ["providers", "rpc-types", "network", "reqwest", "reqwest-rustls-tls", "sol-types", "contract"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "fs", "signal"] }
+
+[dev-dependencies]
+alloy = { version = "1", default-features = false, features = ["signer-local"] }
