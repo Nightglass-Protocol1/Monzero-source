@@ -41,6 +41,21 @@ pub struct Request {
     /// `payout` only: where the trade's account sends what it holds
     #[serde(default)]
     pub payout_address: Option<String>,
+    /// Market commands: the open relays to use
+    #[serde(default)]
+    pub relays: Option<Vec<String>>,
+    /// `listings`: only this pair ("ETH/XMZ", "BNB/XMZ")
+    #[serde(default)]
+    pub pair: Option<String>,
+    /// `post`: the offer to make
+    #[serde(default)]
+    pub offer: Option<crate::helper_market::OfferParams>,
+    /// `take`: the offer to take, as `listings` returned it (first call only)
+    #[serde(default)]
+    pub listing: Option<crate::listing::SignedListing>,
+    /// The contract on a local test chain (31337) only; real chains use the pinned ones
+    #[serde(default)]
+    pub local_contract: Option<alloy::primitives::Address>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -50,6 +65,18 @@ pub enum Command {
     Approve,
     Tick,
     Payout,
+    /// Open offers from the relays, each checked
+    Listings,
+    /// Make and post an offer (maker)
+    Post,
+    /// Answer takes of our offer (maker; call again until taken)
+    Serve,
+    /// Take an offer (taker; call again until agreed)
+    Take,
+    /// Withdraw our untaken offer
+    Cancel,
+    /// After a swap, report its claim to the relays (claimer)
+    Report,
 }
 
 #[derive(Deserialize)]
@@ -93,12 +120,7 @@ pub async fn handle(request: &[u8]) -> Value {
     let result = match serde_json::from_slice::<Request>(request) {
         Err(e) => Err(format!("bad request: {e}")),
         Ok(r) if r.schema != REQUEST_SCHEMA => Err(format!("unknown schema {}", r.schema)),
-        Ok(r) => match r.command {
-            Command::Status => status(&r.trade_dir),
-            Command::Approve => approve(&r.trade_dir, r.commitment),
-            Command::Tick => tick(&r.trade_dir, r.tick).await,
-            Command::Payout => payout(&r.trade_dir, r.tick, r.payout_address.as_deref()).await,
-        },
+        Ok(r) => dispatch(r).await,
     };
     match result {
         Ok(mut v) => {
@@ -110,11 +132,40 @@ pub async fn handle(request: &[u8]) -> Value {
     }
 }
 
+async fn dispatch(r: Request) -> Result<Value, String> {
+    match r.command {
+        Command::Status => status(&r.trade_dir),
+        Command::Approve => approve(&r.trade_dir, r.commitment),
+        Command::Tick => tick(&r.trade_dir, r.tick).await,
+        Command::Payout => payout(&r.trade_dir, r.tick, r.payout_address.as_deref()).await,
+        Command::Listings => market_listings(&r).await,
+        Command::Post => match (&r.tick, &r.offer) {
+            (Some(t), Some(o)) => crate::helper_market::post(&r.trade_dir, t, relays(&r)?, o, r.local_contract).await,
+            _ => Err("post needs tick (keys and endpoints) and offer".into()),
+        },
+        Command::Serve => crate::helper_market::serve(&r.trade_dir, r.tick.as_ref().ok_or("serve needs tick")?, relays(&r)?).await,
+        Command::Take => {
+            crate::helper_market::take(&r.trade_dir, r.tick.as_ref().ok_or("take needs tick")?, relays(&r)?, r.listing.clone(), r.local_contract).await
+        }
+        Command::Cancel => crate::helper_market::cancel(&r.trade_dir, r.tick.as_ref().ok_or("cancel needs tick")?, relays(&r)?).await,
+        Command::Report => crate::helper_market::report(&r.trade_dir, relays(&r)?).await,
+    }
+}
+
+fn relays(r: &Request) -> Result<&[String], String> {
+    r.relays.as_deref().filter(|v| !v.is_empty()).ok_or_else(|| "this command needs relays".to_string())
+}
+
+async fn market_listings(r: &Request) -> Result<Value, String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    crate::helper_market::listings(relays(r)?, r.pair.as_deref(), r.local_contract, now).await
+}
+
 fn journal(dir: &Path) -> FileJournal {
     FileJournal(dir.join("journal.json"))
 }
 
-fn status(dir: &Path) -> Result<Value, String> {
+pub(crate) fn status(dir: &Path) -> Result<Value, String> {
     let record = journal(dir).load().map_err(|e| e.to_string())?;
     let saved = record.trade.as_ref().ok_or("the journal holds no saved trade")?;
     let o = &saved.offer;
@@ -192,22 +243,7 @@ async fn tick(dir: &Path, cfg: Option<TickConfig>) -> Result<Value, String> {
     if let Some(n) = cfg.evm_log_chunk {
         chain = chain.with_log_chunk(n);
     }
-    let rpc = |e: &Endpoint| match &e.login_file {
-        Some(f) => WalletRpc::with_login_file(&e.url, f).map_err(|e| e.to_string()),
-        None => Ok(WalletRpc::new(&e.url, None)),
-    };
-    let xmz = WalletRpcXmz::new(
-        WalletRpcConfig {
-            shared: agreed.shared.clone(),
-            restore_height: saved.xmz_restore_height,
-            wallet_name: "shared".into(),
-            wallet_password: swap_seed.wallet_password(&saved.offer, saved.role).to_string(),
-            sweep_confirmations: 10,
-            record: dir.join("xmz.json"),
-        },
-        rpc(&cfg.main_wallet)?,
-        rpc(&cfg.swap_wallet)?,
-    );
+    let xmz = xmz_parts(dir, &cfg, &saved, &agreed, &swap_seed)?;
     let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?;
     let (awaiting, funding) = match driver.tick().await {
         Ok(_) => (false, None),
@@ -222,6 +258,35 @@ async fn tick(dir: &Path, cfg: Option<TickConfig>) -> Result<Value, String> {
         None => Value::Null,
     };
     Ok(v)
+}
+
+pub(crate) fn rpc(e: &Endpoint) -> Result<WalletRpc, String> {
+    match &e.login_file {
+        Some(f) => WalletRpc::with_login_file(&e.url, f).map_err(|e| e.to_string()),
+        None => Ok(WalletRpc::new(&e.url, None)),
+    }
+}
+
+/// The XMZ side of a saved trade: the shared wallet through the app's wallet RPCs
+pub(crate) fn xmz_parts(
+    dir: &Path,
+    cfg: &TickConfig,
+    saved: &crate::exchange::SavedTrade,
+    agreed: &crate::negotiation::Agreed,
+    seed: &SwapSeed,
+) -> Result<WalletRpcXmz, String> {
+    Ok(WalletRpcXmz::new(
+        WalletRpcConfig {
+            shared: agreed.shared.clone(),
+            restore_height: saved.xmz_restore_height,
+            wallet_name: "shared".into(),
+            wallet_password: seed.wallet_password(&saved.offer, saved.role).to_string(),
+            sweep_confirmations: 10,
+            record: dir.join("xmz.json"),
+        },
+        rpc(&cfg.main_wallet)?,
+        rpc(&cfg.swap_wallet)?,
+    ))
 }
 
 /// After the trade is done, send the trade account's balance to the user's own address.
@@ -268,7 +333,7 @@ fn parse_address(text: &str) -> Result<alloy::primitives::Address, String> {
 
 /// The swap seed and the EVM account key: derived by the vault (`swapKeys`), or from the
 /// wallet seed in the prototype (`walletSeedHex` + `accountIndex`).
-fn keys(cfg: &TickConfig) -> Result<(SwapSeed, alloy::signers::local::PrivateKeySigner), String> {
+pub(crate) fn keys(cfg: &TickConfig) -> Result<(SwapSeed, alloy::signers::local::PrivateKeySigner), String> {
     let bytes32 = |hex_text: &str, what: &str| -> Result<Zeroizing<[u8; 32]>, String> {
         let v = Zeroizing::new(hex::decode(hex_text.trim()).map_err(|_| format!("{what} is not hex"))?);
         let mut out = Zeroizing::new([0u8; 32]);

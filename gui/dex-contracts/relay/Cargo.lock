@@ -3101,6 +3101,7 @@ dependencies = [
  "monzero-evm-keys",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
+ "reqwest 0.12.28",
  "secp256kfun",
  "serde",
  "serde_json",

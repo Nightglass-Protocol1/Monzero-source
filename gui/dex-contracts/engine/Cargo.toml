@@ -34,6 +34,8 @@ zeroize = { version = "1", features = ["serde"] }
 # Sealed mailbox messages between the two traders of an offer (carried by relays)
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 chacha20poly1305 = "0.10"
+# The app talks to the open relays (same reqwest as alloy)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # The helper binary's runtime (alloy already uses tokio)
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
