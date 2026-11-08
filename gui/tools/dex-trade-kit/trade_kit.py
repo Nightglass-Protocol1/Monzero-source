@@ -613,7 +613,7 @@ def cmd_configure(a):
     except (TypeError, ValueError) as error:  # e.g. text that cannot be encoded
         fail(f"cannot build the app configuration: {error}")
     publish_directory(final, directories, files)
-    stage = {"ltc-testnet": "testnet", "btc-testnet4": "btc-testnet4", "btc-signet": "btc-signet", "btc-regtest": "btc-regtest"}.get(terms["ltcNetwork"], "regtest")
+    stage = {"ltc-testnet": "testnet", "btc-testnet4": "btc-testnet4", "btc-signet": "btc-signet", "btc-regtest": "btc-regtest", "btc-mainnet": "btc-mainnet"}.get(terms["ltcNetwork"], "regtest")
     print(f"Wrote {final}. Start the app with: --dex-ltc-network {stage} --dex-ltc-app {final / 'app.json'}")
 
 

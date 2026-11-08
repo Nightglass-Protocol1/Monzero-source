@@ -103,17 +103,30 @@ rate (25,000 XMZ per trade). `gui/tools/dex-control/opening-limits.py --sequence
 last at most 30 days (7 by default), so they are re-signed regularly; raising limits is a new
 document with a higher sequence.
 
-## BTC through the relays (next)
+## BTC through the relays
 
-The BTC/XMZ trade negotiates over `PrivateQuoteChannel`, a direct TLS socket with a pinned
-certificate, and its trade folder is prepared by the test kit. To carry it through the relays:
-1. A BTC listing variant: pair `BTC/XMZ`, signed by the maker's `OfferIdentity` (Ed25519) key, with
-   a mailbox key; no contract. The relay checks the signature; prints for BTC need a Bitcoin chain
-   check (an Electrum lookup of the redeem), so BTC trades are not charted at first.
-2. A `RelayMailChannel` with the same interface as `PrivateQuoteChannel`, carrying the negotiation
-   messages as sealed letters (the same mailbox crypto), so neither side needs an open port.
-3. Self-service BTC trade folders in the app (today from the test kit), then a Bitcoin mainnet run
-   between two app instances through a relay before it is offered.
+BTC/XMZ trades are set up from both traders' identity cards and two signatures over the terms
+(the trade kit), then negotiated by the two apps. Both steps now go through the relays:
+
+- **Offers.** `trade_kit.py offer` posts a signed BTC offer (`monzero-dex-btc-listing/1`: network,
+  side, sats, XMZ atoms, the maker's Ed25519 identity key, its mailbox key; signed with that
+  identity key). Relays serve them at `/v1/btc/listings` for the networks they list in
+  `btcNetworks`, and copy them from peer relays. `trade_kit.py offers` lists the checked offers.
+- **Taking.** `trade_kit.py take` sends the taker's card and destinations as a sealed letter;
+  the maker's `trade_kit.py serve` answers the first taker with the terms (the offer's amounts,
+  both keys, both sides' destinations, the maker's fees and timelocks) and its signature; the
+  taker checks the terms against the offer and its own destinations, signs, and both assemble
+  the same signed quote. Then each side runs `configure` with LOCAL.json
+  `"peer": {"relays": [...]}`.
+- **Negotiation.** The apps talk through `RelayMailTransport` (a mode of `PrivateQuoteChannel`):
+  letters authenticated by both mailbox keys, in order, exactly once; a restart shows as a lost
+  connection and is resumed from the saved trade, as with the socket. No port is opened.
+
+Evidence (regtest, two separate app processes, `core/build`): `btc-regtest-relay-1` (the apps
+connected only through the relay; 1018 s, passed) and `btc-regtest-relay-offer-1` (the whole
+setup from a relay offer as well). Not yet: BTC offers on the app's own offer board (today the
+kit posts and takes them; the app then runs the trade), and a signet/mainnet run through a public
+relay. BTC prints are not charted yet (a claim would need a Bitcoin chain check).
 
 ## Order of work
 
@@ -121,5 +134,5 @@ certificate, and its trade folder is prepared by the test kit. To carry it throu
 2. Website market view (TradingView Lightweight Charts, self-hosted). Done, not deployed.
 3. App: post and take offers for ETH/BNB, trade runs through the existing EVM helper. Done.
 4. Public/dev edition split; limits tool. Done; the owner signs and publishes the documents.
-5. BTC through the relays (above).
+5. BTC through the relays (above): kit offers + relay negotiation done; app offer board next.
 6. The app's own chart (the website chart's data, in the DEX screen).

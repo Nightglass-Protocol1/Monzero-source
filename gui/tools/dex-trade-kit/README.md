@@ -86,6 +86,30 @@ pays XMZ and receives Litecoin.
    creating `my-app/app.json` and the files it points to.
    Start the app with `--dex-ltc-network testnet --dex-ltc-app my-app/app.json`.
 
+## Through the open relays (no open port, no files handed over)
+
+The same setup can run through the open DEX relays (`relay_market.py`). Identities made with this
+version carry a mailbox key on the card.
+
+```
+# the maker (here the XMZ seller)
+python3 trade_kit.py offer --dir my-trade --relay https://relay.example.org --network btc-mainnet \
+    --side sell-xmz --btc 33000 --xmz 2500000000000000 --params params.json --policy policy.json
+python3 trade_kit.py serve --dir my-trade --relay https://relay.example.org
+# the taker (the BTC buyer)
+python3 trade_kit.py offers --relay https://relay.example.org
+python3 trade_kit.py take --dir my-trade --relay https://relay.example.org --offer 0x... \
+    --addresses addresses.json          # {"ltcRefund": "bc1...", "xmzPayout": "4..."}
+```
+
+`params.json` holds the maker's own terms: its two destinations (`ltcPayout` and `xmzRefund` for
+the XMZ seller; `ltcRefund` and `xmzPayout` for the BTC buyer), fees, confirmations, cancel and
+punish windows, networks and genesis hashes, without amounts or the other side. Both sides end with
+`my-trade/trade/` (start-quote.json, peer-card.json, policy.json) and run `configure` with
+`"peer": {"relays": ["https://relay.example.org"]}` in LOCAL.json: the apps then negotiate through
+the relay as well. The taker checks that the terms are exactly the offer, both keys and its own
+destinations before it signs.
+
 ## Format
 
 `start-quote.json` is swap-machine's signed-quote envelope
