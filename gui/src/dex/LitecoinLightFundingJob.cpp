@@ -150,7 +150,7 @@ bool LitecoinLightFundingJob::launch(const QString &operation,const QJsonObject 
         erase(m_input);m_activeWallet->releaseFunding(this);return false;
     }
     m_request=request;m_operation=operation;m_requestId=request.value("requestId").toString();
-    m_response={};erase(m_output);m_errors=0;m_busy=true;m_state="running";
+    m_response={};erase(m_output);m_errors=0;m_errorTail.clear();m_busy=true;m_state="running";
     QProcessEnvironment environment;environment.insert("LANG","C");const auto system=QProcessEnvironment::systemEnvironment();
     for(const auto key:{"SSL_CERT_FILE","SSL_CERT_DIR"})if(system.contains(key))environment.insert(key,system.value(key));
     m_process.setProcessEnvironment(environment);m_process.setProcessChannelMode(QProcess::SeparateChannels);
@@ -162,7 +162,8 @@ bool LitecoinLightFundingJob::launch(const QString &operation,const QJsonObject 
 void LitecoinLightFundingJob::drain() {
     if(!m_busy)return;
     m_process.setReadChannel(QProcess::StandardOutput);m_output+=m_process.read(262145-m_output.size());
-    m_process.setReadChannel(QProcess::StandardError);auto errors=m_process.read(1025);m_errors+=errors.size();erase(errors);
+    m_process.setReadChannel(QProcess::StandardError);auto errors=m_process.read(1025);m_errors+=errors.size();
+    m_errorTail=(m_errorTail+errors).right(400);erase(errors);   // the tail only, for the warning below
     if(m_output.size()>262144 || m_errors>1024)finish(false);
 }
 bool LitecoinLightFundingJob::validResponse(const QJsonObject &r) const {
@@ -247,8 +248,10 @@ void LitecoinLightFundingJob::finish(bool success) {
     }
     m_response=valid?document.object():QJsonObject{};
     // Why a step was not accepted (the helper's own error text only; it carries no keys)
-    if(!valid) qWarning("light funding %s not accepted: %s%s",qPrintable(m_operation),!success?"the helper did not finish; ":"",
-        qPrintable(document.object().value("error").toString().left(300)));
+    if(!valid) qWarning("light funding %s not accepted: %s%s%s",qPrintable(m_operation),!success?"the helper did not finish; ":"",
+        qPrintable(document.object().value("error").toString().left(300)),
+        qPrintable(QStringLiteral(" [exit %1, stderr: %2, answer: %3]").arg(m_process.exitCode()).arg(QString::fromUtf8(m_errorTail).simplified())
+            .arg(QString::fromUtf8(QJsonDocument(document.object().contains("result") ? QJsonObject{{"code",document.object().value("code")}} : document.object()).toJson(QJsonDocument::Compact).left(400)))));
     // Cancellation/error cannot prove a transaction was not signed or sent.
     m_state=valid?"complete":"outcome-unconfirmed";erase(m_input);erase(m_output);
     const auto psbt=m_response.value("result").toObject().value("fundingPsbt").toString().toLatin1();

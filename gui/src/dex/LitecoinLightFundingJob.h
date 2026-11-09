@@ -26,6 +26,7 @@ signals:
     void changed();
     void prepared(const QByteArray &psbt);
 private:
+    QByteArray m_errorTail;
     bool sourcesMatch() const;
     bool launch(const QString &operation,const QJsonObject &request,const QByteArray &password);
     bool validResponse(const QJsonObject &response) const;

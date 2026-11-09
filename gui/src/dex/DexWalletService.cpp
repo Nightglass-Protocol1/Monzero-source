@@ -117,12 +117,14 @@ bool DexWalletService::resumeAfterUncleanExit(const QString &serviceDir,const QS
     QLockFile lock(serviceDir+"/service.lock");lock.setStaleLockTime(0);
     const quint16 port=keptPort(portPath,0);
     const auto portFree=[port]{QTcpServer probe;const bool free=port && probe.listen(QHostAddress::LocalHost,port);probe.close();return free;};
+    // Another running copy of the app holds the lock: its service is live, never a leftover
+    if (!lock.tryLock(0)) {m_error=tr("The DEX wallets are in use by another copy of the app.");return false;}
     if (!portFree()) {
         // Possibly our own service, orphaned when the app was killed
         const auto pidPath=QString(portPath).replace(QStringLiteral(".port"),QStringLiteral(".pid"));
         if (stopLeftover(serviceDir,pidPath)) for (int i=0;i<50 && !portFree();++i) QThread::msleep(100);
     }
-    if (!lock.tryLock(0) || !portFree()) {m_error=tr("A DEX wallet service is still running from an earlier session.");return false;}
+    if (!portFree()) {m_error=tr("A DEX wallet service is still running from an earlier session.");return false;}
     for (const auto &name:QDir(serviceDir).entryList({"monzero-wallet-rpc.*.login"},QDir::Files)) QFile::remove(serviceDir+"/"+name);
     QSaveFile reset(statePath);
     const QByteArray stopped="monzero-swap-rpc-v1\nstopped\n";
