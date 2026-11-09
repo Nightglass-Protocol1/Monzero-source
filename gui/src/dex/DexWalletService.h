@@ -49,6 +49,8 @@ private:
     void openWallet();
     bool makePasswordFile(const QString &path);
     bool resumeAfterUncleanExit(const QString &serviceDir,const QString &portPath);
+    bool stopLeftover(const QString &serviceDir,const QString &pidPath);
+    static void writePid(const QString &path,qint64 pid);
     bool startService(const QString &name,const QString &id,QPointer<SwapWalletRpcProcess> &slot,quint16 &port,std::function<void()> listening);
     static quint16 freePort();
     QString m_root,m_walletRpc,m_walletRpcSha256,m_networkFlag,m_helper,m_helperSha256,m_state="unconfigured",m_error;

@@ -79,6 +79,7 @@
 #include "dex/DexTradeFolders.h"
 #include "LightWalletHelper.h"
 #include "DexHelpers.h"
+#include "dex/DexTestDriver.h"
 #include "dex/LitecoinPeerStartup.h"
 #include "dex/PrivateBackendConfig.h"
 #include "dex/NativeQuoteConfig.h"
@@ -1030,6 +1031,13 @@ int main(int argc, char *argv[])
         QObject::connect(&app,&QCoreApplication::aboutToQuit,dexOwner.get(),&SwapWalletRpcProcess::stop);
     }
     engine.rootContext()->setContextProperty("dexEngine", &dexEngine);
+#ifndef MONZERO_DEX_PUBLIC_EDITION
+    // Test-only remote control of the DEX engine (end-to-end runs of two apps); prototype opt-in only
+    if (dexPrototypeEnabled && qEnvironmentVariableIsSet("MONZERO_DEX_TEST_DRIVER")) {
+        auto *driver=new DexTestDriver(&dexEngine,&app);
+        if (!driver->listen(qEnvironmentVariable("MONZERO_DEX_TEST_DRIVER"))) {qCritical("The DEX test driver could not start");return 1;}
+    }
+#endif
 #endif
 
     engine.rootContext()->setContextProperty("screenAvailableWidth", screenAvailableSize.width());

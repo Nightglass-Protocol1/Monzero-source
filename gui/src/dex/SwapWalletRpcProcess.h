@@ -42,6 +42,7 @@ public:
     bool ownsBchNativeSession(const QString &path) const;
     QString dataDirectory() const { return m_directory; }
     QString loginFile() const { return m_login; }
+    qint64 processId() const;
 signals:
     void availabilityChanged();
     void processStarted(); // Not authenticated readiness or chain validation.

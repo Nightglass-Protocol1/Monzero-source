@@ -47,6 +47,9 @@ fn password(path: &PathBuf) -> Result<Zeroizing<String>, String> {
 
 async fn status(w: &crate::xmz::WalletRpc) -> Result<Value, String> {
     let _ = w.call("refresh", json!({})).await;
+    // Coins a swap locked from this wallet (built first, relayed later) stay counted until the
+    // wallet asks the node which outputs are spent
+    let _ = w.call("rescan_spent", json!({})).await;
     let address = w.call("get_address", json!({"account_index": 0})).await.map_err(|e| e.to_string())?;
     let balance = w.call("get_balance", json!({"account_index": 0})).await.map_err(|e| e.to_string())?;
     let height = w.call("get_height", json!({})).await.map_err(|e| e.to_string())?;

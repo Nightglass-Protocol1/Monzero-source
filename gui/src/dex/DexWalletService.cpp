@@ -11,6 +11,11 @@
 #include <QRegularExpression>
 #include <QTcpServer>
 #include <QUuid>
+#include <QThread>
+#ifdef Q_OS_LINUX
+#include <csignal>
+#include <sys/types.h>
+#endif
 #include <sodium.h>
 
 namespace {
@@ -63,6 +68,11 @@ bool DexWalletService::configure(const QString &root,const QString &walletRpc,co
     m_state="configured";emit changed();return true;
 }
 
+void DexWalletService::writePid(const QString &path,qint64 pid) {
+    QFile f(path);
+    if (pid>0 && f.open(QIODevice::WriteOnly|QIODevice::Truncate)) {f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);f.write(QByteArray::number(pid));}
+}
+
 bool DexWalletService::makePasswordFile(const QString &path) {
     if (QFile::exists(path)) return true;
     QByteArray secret(24,'\0');randombytes_buf(secret.data(),secret.size());
@@ -76,6 +86,28 @@ bool DexWalletService::makePasswordFile(const QString &path) {
 // After the app was closed abruptly, an app service is left "active" or "recovery-required". The
 // app's own services hold no swap state (only wallet files), so once nothing holds the lock or
 // port they may resume. Per-trade swap services never take this path.
+// A service left running by an app that was killed: stopped only when it is verifiably ours (the
+// wallet RPC the app runs, serving this very folder), never another program on the port
+bool DexWalletService::stopLeftover(const QString &serviceDir,const QString &pidPath) {
+#ifdef Q_OS_LINUX
+    QFile f(pidPath);
+    if (!f.open(QIODevice::ReadOnly)) return false;
+    bool ok=false;const auto pid=f.readAll().trimmed().toLongLong(&ok);
+    if (!ok || pid<=1) return false;
+    const auto proc=QStringLiteral("/proc/%1").arg(pid);
+    if (QFileInfo(proc+"/exe").symLinkTarget()!=QFileInfo(m_walletRpc).canonicalFilePath()) return false;
+    QFile cmd(proc+"/cmdline");
+    if (!cmd.open(QIODevice::ReadOnly) || !cmd.readAll().split('\0').contains(QFile::encodeName(serviceDir+"/wallets"))) return false;
+    ::kill(pid_t(pid),SIGTERM);
+    for (int i=0;i<100 && QFileInfo::exists(proc);++i) QThread::msleep(100);
+    if (QFileInfo::exists(proc)) {::kill(pid_t(pid),SIGKILL);QThread::msleep(300);}
+    qWarning("DEX wallet service %s: stopped one left running by an earlier session",qPrintable(QFileInfo(serviceDir).fileName()));
+    return !QFileInfo::exists(proc);
+#else
+    Q_UNUSED(serviceDir);Q_UNUSED(pidPath);return false;
+#endif
+}
+
 bool DexWalletService::resumeAfterUncleanExit(const QString &serviceDir,const QString &portPath) {
     if (!QFileInfo::exists(serviceDir+"/service.binding")) return true;
     const auto statePath=serviceDir+"/service.state";
@@ -84,9 +116,13 @@ bool DexWalletService::resumeAfterUncleanExit(const QString &serviceDir,const QS
     if (recorded=="monzero-swap-rpc-v1\nstopped\n") return true;
     QLockFile lock(serviceDir+"/service.lock");lock.setStaleLockTime(0);
     const quint16 port=keptPort(portPath,0);
-    QTcpServer probe;
-    const bool portFree=port && probe.listen(QHostAddress::LocalHost,port);probe.close();
-    if (!lock.tryLock(0) || !portFree) {m_error=tr("A DEX wallet service is still running from an earlier session.");return false;}
+    const auto portFree=[port]{QTcpServer probe;const bool free=port && probe.listen(QHostAddress::LocalHost,port);probe.close();return free;};
+    if (!portFree()) {
+        // Possibly our own service, orphaned when the app was killed
+        const auto pidPath=QString(portPath).replace(QStringLiteral(".port"),QStringLiteral(".pid"));
+        if (stopLeftover(serviceDir,pidPath)) for (int i=0;i<50 && !portFree();++i) QThread::msleep(100);
+    }
+    if (!lock.tryLock(0) || !portFree()) {m_error=tr("A DEX wallet service is still running from an earlier session.");return false;}
     for (const auto &name:QDir(serviceDir).entryList({"monzero-wallet-rpc.*.login"},QDir::Files)) QFile::remove(serviceDir+"/"+name);
     QSaveFile reset(statePath);
     const QByteArray stopped="monzero-swap-rpc-v1\nstopped\n";
@@ -104,7 +140,9 @@ bool DexWalletService::startService(const QString &name,const QString &id,QPoint
     auto *service=new SwapWalletRpcProcess(this);
     slot=service;port=keptPort(portPath,freePort());
     service->setNetworkFlag(m_networkFlag);
-    connect(service,&SwapWalletRpcProcess::processStarted,this,[this,service,name,listening]{
+    const auto pidPath=m_root+"/"+name+".pid";
+    connect(service,&SwapWalletRpcProcess::processStarted,this,[this,service,name,listening,pidPath]{
+        writePid(pidPath,service->processId());
         // The login file appears once the service is listening
         auto *wait=new QTimer(this);wait->setInterval(250);
         auto tries=std::make_shared<int>(0);
@@ -222,11 +260,14 @@ void DexWalletService::tradeService(const QString &tradeDir,const QString &trade
         return;
     }
     const auto dir=tradeDir+"/swap-service",id=serviceId(tradeId);
-    if (id.isEmpty() || (!QFileInfo::exists(dir) && !privateDir(dir))) {done({});return;}
+    // The trade's journal resumes it; its swap wallet holds no state of its own, so after a crash the
+    // service may resume the same way as the app's own services
+    if (id.isEmpty() || (!QFileInfo::exists(dir) && !privateDir(dir)) || !resumeAfterUncleanExit(dir,tradeDir+"/swap-service.port")) {done({});return;}
     auto *service=new SwapWalletRpcProcess(this);
     const auto port=keptPort(tradeDir+"/swap-service.port",freePort());
     service->setNetworkFlag(m_networkFlag);
     connect(service,&SwapWalletRpcProcess::processStarted,this,[this,service,tradeDir,port,done]{
+        writePid(tradeDir+"/swap-service.pid",service->processId());
         auto *wait=new QTimer(this);wait->setInterval(250);
         auto tries=std::make_shared<int>(0);
         connect(wait,&QTimer::timeout,this,[this,wait,tries,service,tradeDir,port,done]{

@@ -357,3 +357,5 @@ QString SwapWalletRpcProcess::provisionBchNativeSession() {
 void SwapWalletRpcProcess::notifyAvailabilityChanged() {
     QMetaObject::invokeMethod(this,"availabilityChanged",Qt::QueuedConnection);
 }
+
+qint64 SwapWalletRpcProcess::processId() const {return m_process->processId();}

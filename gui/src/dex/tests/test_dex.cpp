@@ -427,7 +427,8 @@ private slots:
             QVERIFY2(DexEngine::atomic(bad,11).isEmpty(),bad);
         QCOMPARE(EvmMarketJob::weiToCoin("5000000000000000"),QString("0.005"));
         QCOMPARE(EvmMarketJob::weiToCoin("1000000000000000000"),QString("1"));
-        QCOMPARE(EvmMarketJob::priceText("5000000000000000","1119300000000000"),QString("4.46708e-07"));
+        QCOMPARE(EvmMarketJob::priceText("5000000000000000","1119300000000000"),QString("0.000000446708"));
+        QCOMPARE(EvmMarketJob::priceText("5000000000000000","10000000000000"),QString("0.00005"));
         QVERIFY(EvmMarketJob::priceText("0","1").isEmpty());
     }
     void evmNetworkControlDocument() {

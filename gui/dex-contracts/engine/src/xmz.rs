@@ -371,7 +371,13 @@ impl WalletRpcXmz {
     /// transaction counts as relayed when the wallet already knows it.
     async fn relay(rpc: &WalletRpc, tx: &Retained) -> Result<(), DriverError> {
         match rpc.call("relay_tx", json!({"hex": tx.metadata})).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // A transaction built with do_not_relay and relayed later leaves its inputs counted
+                // as unspent in the sending wallet: ask the node which are spent (best effort; the
+                // balance shown to the user is otherwise too high until a rescan)
+                let _ = rpc.call("rescan_spent", json!({})).await;
+                Ok(())
+            }
             Err(e) => {
                 // Already sent: the wallet knows it, possibly only after a refresh (a wallet
                 // killed before saving reopens behind and refuses to relay its own spent inputs)

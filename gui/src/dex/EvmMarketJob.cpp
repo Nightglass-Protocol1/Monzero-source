@@ -1,5 +1,7 @@
 #include "EvmMarketJob.h"
 #include <sodium.h>
+#include <cmath>
+#include <algorithm>
 #include "BackendExecutable.h"
 #include "LitecoinJournalProtocol.h"
 #include <QDir>
@@ -271,6 +273,8 @@ void EvmMarketJob::finish(bool success) {
     } else if (m_command=="post") {
         scanFolders();
     } else if (m_command=="serve" || m_command=="take") {
+        // A first take creates its folder: track it, so later steps collect the maker's answer
+        if (m_command=="take" && std::none_of(m_folders.cbegin(),m_folders.cend(),[this](const Folder &f){return f.path==m_folder;})) scanFolders();
         const bool done=r.value("taken").toBool() || r.value("agreed").toBool();
         for (auto &f:m_folders) if (f.path==m_folder) {
             if (done) f.state="agreed";
@@ -307,7 +311,12 @@ QString EvmMarketJob::priceText(const QString &valueWei,const QString &xmzAtoms)
     // coin per XMZ = (wei / 1e18) / (atoms / 1e11); for display only
     const double wei=valueWei.toDouble(),atoms=xmzAtoms.toDouble();
     if (!(wei>0) || !(atoms>0)) return {};
-    return QString::number(wei/1e18/(atoms/1e11),'g',6);
+    // Plain decimals with six significant digits (never "5e-05"), trailing zeros trimmed
+    const double price=wei/1e18/(atoms/1e11);
+    const int places=qBound(0,5-int(std::floor(std::log10(price))),18);
+    QString text=QString::number(price,'f',places);
+    if (text.contains('.')) {while (text.endsWith('0')) text.chop(1);if (text.endsWith('.')) text.chop(1);}
+    return text;
 }
 
 void EvmMarketJob::setSwapKeys(const QByteArray &swapSeedHex,const QByteArray &evmKeyHex) {
