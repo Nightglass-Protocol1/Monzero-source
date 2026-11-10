@@ -29,7 +29,7 @@
 
   var st = {
     coin: "ETH", listings: [], side: "buy", link: null, account: "", status: null, wallets: null,
-    pairing: null, note: "", error: "", busy: "", limits: {}, timer: null, form: { xmz: "", price: "" }, dismissed: ""
+    pairing: null, note: "", error: "", busy: "", paying: "", told: "", stageKey: "", stageSince: 0, limits: {}, timer: null, form: { xmz: "", price: "" }, dismissed: ""
   };
   try { st.link = JSON.parse(localStorage.getItem(STORE) || "null"); } catch (e) { st.link = null; }
   if (st.link && PORTS.indexOf(st.link.port) < 0) st.link = null;   // saved for another wallet
@@ -105,8 +105,9 @@
       if (missing <= 0n) return null;
       say("MetaMask will ask you to send " + fromUnits(missing, 18, 8) + " " + st.coin + " to your trade account in the Monzero wallet.");
       return eth("eth_sendTransaction", [{ from: st.link.account, to: acct, value: hex(missing) }]).then(function (tx) {
-        say("Payment sent. Waiting for it to confirm…");
-        return receipt(tx);
+        st.paying = tx;
+        say("Payment sent from MetaMask. Waiting for the network to confirm it (usually under a minute)…");
+        return receipt(tx).then(function (r) { st.paying = ""; return r; }, function (e) { st.paying = ""; throw e; });
       });
     });
   }
@@ -144,6 +145,7 @@
 
   // ---- connecting
   function connect() {
+    try { if (window.Notification && Notification.permission === "default") Notification.requestPermission(); } catch (e) {}
     if (st.busy) return;
     st.busy = "connect"; st.error = "";
     var port;
@@ -262,6 +264,14 @@
       if (r && r.ok) say(told); else fail(new Error((r && r.message) || (r && r.error === "wait a moment" ? "One moment, then try again." : "The wallet could not do that now.")));
     }).catch(fail);
   }
+  // What "Add XMZ" suggests: enough for the amount typed in the sell form (plus the fee margin),
+  // less what the trading wallet already holds
+  function wantedXmz() {
+    var xmz = st.side === "sell" ? toUnits(st.form.xmz, 11) : null, w = st.status && st.status.wallet;
+    if (!xmz || !w) return {};
+    var have = toUnits(String(w.balance || "0"), 11) || 0n, need = xmz + xmz / 2n - have + 100000000000n;   // one XMZ over, for the transfer fee and rounding
+    return need > 0n ? { xmz: fromUnits(need, 11, 2) } : {};
+  }
   function cancel(folder) {
     if (st.busy) return;
     st.busy = "cancel";
@@ -298,6 +308,42 @@
     "WaitingForEvmLock": "Waiting for the buyer to lock the coin…", "XmzLockSent": "Locking your XMZ…", "XmzLocked": "Your XMZ is locked. Waiting for the buyer to release the swap…",
     "ClaimSent": "Claiming the coin…", "WaitingForRefund": "Waiting for the buyer's refund.", "SweepingBack": "The buyer refunded. Taking your XMZ back…"
   };
+  // The trade as a list of steps, so it is always clear what has happened, what is happening now
+  // and what is waited for. wait: what this step usually takes (the XMZ steps need 10 blocks).
+  var XMZ_WAIT = "usually 20 to 40 minutes: it needs 10 XMZ blocks";
+  var STEPS = {
+    owner: [
+      { at: ["Start"], text: "Approve the trade in your Monzero wallet" },
+      { at: ["LockSent"], text: "Your %COIN% goes into the swap contract", wait: "under a minute" },
+      { at: ["Locked"], text: "The seller locks the XMZ", wait: XMZ_WAIT },
+      { at: ["ReadySent", "Ready"], text: "The swap is released and the seller is paid", wait: "a minute or two" },
+      { at: ["Sweeping"], text: "Your XMZ arrives in your trading wallet", wait: XMZ_WAIT }
+    ],
+    claimer: [
+      { at: ["WaitingForEvmLock"], text: "The buyer's %COIN% goes into the swap contract", wait: "a few minutes; the wallet then asks you to approve" },
+      { at: ["XmzLockSent"], text: "Your XMZ is locked for the buyer", wait: XMZ_WAIT },
+      { at: ["XmzLocked"], text: "The buyer releases the swap", wait: "a minute or two" },
+      { at: ["ClaimSent"], text: "Your %COIN% is claimed and sent to MetaMask", wait: "a minute or two" }
+    ]
+  };
+  function stepsHTML(t) {
+    var s = t.snapshot || {}, list = STEPS[s.role], stage = s.stage || "";
+    if (!list || /Refund|SweepingBack/.test(stage)) return "";
+    var now = -1;
+    list.forEach(function (x, i) { if (x.at.indexOf(stage) >= 0) now = i; });
+    if (s.done) now = list.length;
+    if (now < 0) return "";
+    // How long the current step has been running (this browser's clock, since the page saw it start)
+    var key = (t.tradeId || "") + ":" + stage;
+    if (st.stageKey !== key) { st.stageKey = key; st.stageSince = Date.now(); }
+    var mins = Math.floor((Date.now() - st.stageSince) / 60000);
+    return '<ol class="tp-track">' + list.map(function (x, i) {
+      var cls = i < now ? "done" : i === now ? "now" : "next", text = esc(x.text.replace("%COIN%", st.coin)), more = "";
+      if (i === now && !t.awaitingApproval && x.wait) more = '<span class="tp-wait">' + esc(x.wait) + (mins >= 1 ? " · " + mins + " min so far" : "") + "</span>";
+      if (i === now && t.awaitingApproval) more = '<span class="tp-wait">waiting for you: look at your Monzero wallet</span>';
+      return '<li class="' + cls + '"><span class="tp-dot" aria-hidden="true">' + (i < now ? "✓" : i === now ? "●" : "○") + "</span><span>" + text + more + "</span></li>";
+    }).join("") + "</ol>";
+  }
   function tradeHTML(t) {
     var s = t.snapshot || {}, o = s.offer || {}, c = chain(), buying = s.role === "owner", h = "";
     if (st.note.indexOf("Offer taken") === 0) st.note = "";   // the trade itself is on screen now
@@ -306,6 +352,7 @@
       : "You pay <strong>" + esc(xmzAmt) + "</strong> · you receive <strong>" + esc(coinAmt) + "</strong>") + "</p>";
     if (t.awaitingApproval) h += '<p class="tp-act">Approve this trade in your Monzero wallet. The wallet shows the amounts it holds; check them there.</p>';
     else h += '<p class="tp-stage">' + esc(STAGE[s.stage] || s.stage || "Starting…") + "</p>";
+    h += stepsHTML(t);
     if (t.startRefusal) h += '<p class="tp-err">' + esc(t.startRefusal) + "</p>";
     if (t.error) h += '<p class="tp-err">' + esc(t.error) + "</p>";
     var need = t.awaitingFunding || {};
@@ -318,9 +365,37 @@
     if (s.done) {
       if (t.payout && t.payout.tx) h += '<p class="tp-note">' + esc(fromUnits(BigInt(t.payout.amountWei), 18, 8)) + " " + st.coin + " went back to " + esc(short(t.payout.to)) + ".</p>";
       else if (t.payout && t.payout.sent === false) h += '<p class="tp-note">Nothing was left in the trade account to send back to MetaMask.</p>';
+      if (buying && s.stage === "Done(Swapped)") h += '<p class="tp-note">Your XMZ is in your trading wallet, ready for the next trade. ' +
+        '<button class="tp-link" type="button" data-act="xmz-return">Move it to my main balance</button></p>';
       h += '<button class="button secondary" type="button" data-act="dismiss">New trade</button>';
     } else h += '<p class="tp-note">Keep the wallet open until this finishes. If the other side stops, your funds are returned after the time limit.</p>';
     return '<div class="tp-trade">' + h + "</div>";
+  }
+  // XMZ that reached the trading wallet but is not usable yet (10 blocks after it arrives)
+  function arrivingHTML(w) {
+    var total = toUnits(String(w.balance || "0"), 11) || 0n, ready = toUnits(String(w.unlocked || "0"), 11) || 0n;
+    if (total <= ready) return "";
+    return ' <span class="tp-arriving">+ ' + esc(fromUnits(total - ready, 11, 4)) + " XMZ arriving (ready in up to 40 minutes)</span>";
+  }
+  // Things that need the user, or that just finished: say so in the tab title and, when the
+  // browser allows it, in a notification, because the wallet and the page are different windows
+  var TITLE = document.title;
+  function notify(key, title, text) {
+    if (st.told === key) return;
+    st.told = key;
+    try { if (window.Notification && Notification.permission === "granted" && document.hidden) new Notification(title, { body: text, tag: "monzero-dex" }); } catch (e) {}
+  }
+  function attention() {
+    var s = st.status, t = s && s.trade, w = s && s.wallet, mark = "";
+    if (s && w && !w.keysReady) mark = "Password needed";
+    else if (t && t.configured && st.dismissed !== t.tradeId) {
+      var need = t.awaitingFunding || {}, snap = t.snapshot || {};
+      if (t.awaitingApproval) { mark = "Approve in wallet"; notify(t.tradeId + ":approve", "Approve your trade", "Your Monzero wallet is asking you to approve the trade."); }
+      else if (need.missingWei) { mark = "Top-up needed"; notify(t.tradeId + ":topup", "Your trade needs a small top-up", "Open the DEX page to send it from MetaMask."); }
+      else if (snap.done) { mark = snap.stage === "Done(Swapped)" ? "Swap complete" : "Trade ended"; notify(t.tradeId + ":done", mark, "Open the DEX page to see the result."); }
+      else mark = "Trade running";
+    }
+    document.title = mark ? "(" + mark + ") " + TITLE : TITLE;
   }
   function offersHTML() {
     var me = (st.status.wallet.tradeAccount || "").toLowerCase(), want = st.side === "buy" ? "sell-xmz" : "buy-xmz", rows = [];
@@ -341,10 +416,10 @@
   function render() {
     var h = "", c = chain();
     if (!c) {
-      h = '<p class="pro-order-lede">Bitcoin and Litecoin trades run inside the <strong>Monzero app</strong>. Pick ETH or BNB to trade from this page with MetaMask.</p>' +
+      h = '<p class="pro-order-lede">Pick ETH or BNB to trade from this page with MetaMask. Bitcoin and Litecoin are not open here yet.</p>' +
         '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the app</a></div>';
     } else if (!window.ethereum) {
-      h = '<p class="pro-order-lede">To trade ' + st.coin + ' from this page you need <strong>MetaMask</strong> in this browser and the <strong>Monzero wallet</strong> open on this computer. You can also trade inside the wallet.</p>' +
+      h = '<p class="pro-order-lede">To trade ' + st.coin + ' from this page you need <strong>MetaMask</strong> in this browser and the <strong>Monzero wallet</strong> open on this computer.</p>' +
         '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the wallet</a><a class="button secondary" href="https://metamask.io/download/" rel="noopener">Get MetaMask</a></div>';
     } else if (st.pairing) {
       h = '<p class="pro-order-lede">Look at your Monzero wallet. Accept the connection there if it shows this code:</p><p class="tp-code">' + esc(st.pairing.code) + "</p>";
@@ -354,9 +429,9 @@
         '<div class="swap-reveal-cta"><button class="button primary" type="button" data-act="connect"' + (st.busy ? " disabled" : "") + ">" + (st.link ? "Reconnect" : "Connect MetaMask and wallet") + '</button><a class="button secondary" href="/download/">Get the wallet</a></div>';
     } else {
       var s = st.status, w = s.wallet, t = s.trade || {}, m = (s.markets || {})[st.coin] || {};
-      h += '<ul class="relay-facts"><li><span>Wallet</span><strong>connected · ' + esc(String(w.unlocked || "0")) + ' XMZ ready</strong> <button class="tp-link" type="button" data-act="xmz-add">Add XMZ</button>' +
-        (w.tradeAccount ? ' <span class="tp-acct">trade account ' + esc(short(w.tradeAccount)) + "</span>" : "") +
-        (Number(w.unlocked) > 0 ? ' · <button class="tp-link" type="button" data-act="xmz-return">Move back</button>' : "") + "</li><li><span>MetaMask</span><strong>" + esc(short(s.account)) +
+      h += '<ul class="relay-facts"><li><span>Wallet</span><strong>connected · ' + esc(String(w.unlocked || "0")) + ' XMZ ready</strong>' + arrivingHTML(w) + '  <button class="tp-link" type="button" data-act="xmz-add">Add XMZ</button>' +
+        (Number(w.unlocked) > 0 ? ' · <button class="tp-link" type="button" data-act="xmz-return">Move back</button>' : "") +
+        (w.tradeAccount ? ' <span class="tp-acct">· trade account ' + esc(short(w.tradeAccount)) + "</span>" : "") + "</li><li><span>MetaMask</span><strong>" + esc(short(s.account)) +
         "</strong></li><li><span>Network</span><strong>" + esc(c.name) + "</strong></li></ul>";
       if (st.account && s.account && st.account.toLowerCase() !== s.account.toLowerCase())
         h += '<p class="tp-err">MetaMask is now on another account. Proceeds still go to ' + esc(short(s.account)) + ", the account you accepted in the wallet. Disconnect and connect again to change it.</p>";
@@ -383,7 +458,9 @@
       }
       h += '<p class="tp-note"><button class="tp-link" type="button" data-act="disconnect">Disconnect this page</button></p>';
     }
-    if (st.note) h += '<p class="tp-say" role="status">' + esc(st.note) + "</p>";
+    if (st.note) h += '<p class="tp-say' + (st.busy ? " tp-busy" : "") + '" role="status">' + esc(st.note) +
+      (st.paying && chain() ? ' <a href="' + chain().tx + esc(st.paying) + '" rel="noopener" target="_blank">See the payment</a>' : "") + "</p>";
+    attention();
     if (st.error) h += '<p class="tp-err" role="alert">' + esc(st.error) + "</p>";
     // Keep what is being typed
     var active = document.activeElement && document.activeElement.id, pos = active && document.activeElement.selectionStart;
@@ -411,7 +488,7 @@
     else if (act === "return") giveBack();
     else if (act === "topup") topUp();
     else if (act === "unlock") ask("/v1/unlock", {}, "Look at your Monzero wallet: it is asking for your trading password.");
-    else if (act === "xmz-add") ask("/v1/xmz-add", {}, "Look at your Monzero wallet: its Send page is open with your trading wallet filled in. Enter the amount and confirm there. New XMZ is ready to trade after about 20 minutes.");
+    else if (act === "xmz-add") ask("/v1/xmz-add", wantedXmz(), "Look at your Monzero wallet: its Send page is open with your trading wallet filled in. Enter the amount and confirm there. New XMZ is ready to trade after about 20 minutes.");
     else if (act === "xmz-return") ask("/v1/xmz-return", {}, "Look at your Monzero wallet: confirm there to move your trading XMZ back to your main balance.");
     else if (act === "dismiss") { st.dismissed = st.status.trade.tradeId; st.note = ""; render(); }
   });

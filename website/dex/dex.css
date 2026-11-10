@@ -317,3 +317,16 @@ a.trade-row:hover, a.trade-row:focus-visible { background: color-mix(in srgb, va
 .tp-link { background: none; border: 0; padding: 0; color: var(--accent, #3b82f6); font: inherit; cursor: pointer; text-decoration: underline; }
 @media (max-width: 520px) { .tp-form { grid-template-columns: 1fr; } }
 .tp-acct { color: var(--muted); font-weight: 400; font-size: 12.5px; }
+.tp-track { list-style: none; margin: 12px 0; padding: 0; font-size: 13.5px; line-height: 1.45; }
+.tp-track li { display: flex; gap: 10px; padding: 5px 0; color: var(--muted); }
+.tp-track li.done { color: var(--text); }
+.tp-track li.now { color: var(--text); font-weight: 600; }
+.tp-track .tp-dot { flex: 0 0 18px; text-align: center; }
+.tp-track li.done .tp-dot, .tp-track li.now .tp-dot { color: var(--accent, #3b82f6); }
+.tp-track li.now .tp-dot { animation: tp-pulse 1.6s ease-in-out infinite; }
+.tp-wait { display: block; font-weight: 400; font-size: 12.5px; color: var(--muted); }
+.tp-arriving { font-weight: 400; font-size: 12.5px; color: var(--muted); }
+.tp-busy::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 8px; border-radius: 50%; border: 2px solid var(--accent, #3b82f6); border-right-color: transparent; animation: tp-spin .9s linear infinite; vertical-align: -1px; }
+@keyframes tp-pulse { 50% { opacity: .35; } }
+@keyframes tp-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .tp-track li.now .tp-dot, .tp-busy::before { animation: none; } }
