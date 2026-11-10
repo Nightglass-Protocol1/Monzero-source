@@ -18,7 +18,7 @@ use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use monzero_dex_evm::listing::{Rules, SignedListing};
 use monzero_dex_evm::Chain;
-use monzero_dex_relay::chain::AlloyView;
+use monzero_dex_relay::chain::{AlloyView, View};
 use monzero_dex_relay::http::{now, router, Api};
 use monzero_dex_relay::{Print, Relay, Snapshot, ARCHIVE_SECS};
 use serde::Deserialize;
@@ -36,7 +36,12 @@ const RUNTIME_KECCAK: &str = "0xe2368d8f82649ecd46a19e882e70c9535752dbc9f4c9499a
 struct ChainConfig {
     chain_id: u64,
     rpc: String,
-    contract: Address,
+    /// EVM chains: the XmzSwap contract
+    #[serde(default)]
+    contract: Option<Address>,
+    /// Solana clusters: the swap program (base58). It must be the one the app pins for the cluster.
+    #[serde(default)]
+    sol_program: Option<String>,
     max_value_wei: Option<U256>,
 }
 
@@ -60,7 +65,7 @@ fn fail(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1)
 }
 
-fn save(relay: &Relay<AlloyView>, dir: &Path) {
+fn save(relay: &Relay<View>, dir: &Path) {
     let tmp = dir.join("relay.json.tmp");
     let data = serde_json::to_vec(&relay.snapshot()).expect("snapshot serializes");
     if let Err(e) = std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, dir.join("relay.json"))) {
@@ -96,7 +101,7 @@ struct Prints {
 }
 
 /// Copies offers and trades from one peer relay, checking each again (signatures; claims on chain)
-async fn sync(relay: &Relay<AlloyView>, client: &reqwest::Client, peer: &str) -> Result<(usize, usize), String> {
+async fn sync(relay: &Relay<View>, client: &reqwest::Client, peer: &str) -> Result<(usize, usize), String> {
     let base = peer.trim_end_matches('/');
     let now = now();
     let mut offers = 0;
@@ -148,24 +153,45 @@ async fn main() {
     let expected: B256 = RUNTIME_KECCAK.parse().expect("constant");
     for c in &config.chains {
         let chain = Chain::from_id(c.chain_id).unwrap_or_else(|| fail(format!("unknown chain {}", c.chain_id)));
-        let view = AlloyView::new(&c.rpc, chain, c.contract).unwrap_or_else(|e| fail(e));
+        if chain.is_solana() {
+            use monzero_dex_evm::sol;
+            let text = c.sol_program.as_deref().unwrap_or_else(|| fail(format!("chain {}: solProgram is missing", c.chain_id)));
+            let program = sol::from_base58(text).unwrap_or_else(|e| fail(format!("chain {}: {e}", c.chain_id)));
+            // A real cluster serves the program the app pins, nothing else; a local validator, the given one
+            match chain {
+                Chain::SolLocal => sol::set_local_program(program),
+                _ if sol::program_of(chain) != Some(program) => fail(format!("chain {}: {text} is not the pinned swap program", c.chain_id)),
+                _ => {}
+            }
+            sol::check_program(&c.rpc, &program).await.unwrap_or_else(|e| fail(format!("chain {}: {e}", c.chain_id)));
+            let contract = sol::contract_address(&program);
+            rules.contracts.insert(c.chain_id, contract);
+            if let Some(max) = c.max_value_wei {
+                rules.max_value.insert(c.chain_id, max);
+            }
+            chains.insert(c.chain_id, View::Solana);
+            eprintln!("chain {} ({}): program {text} ok (offers stand for it as {contract})", c.chain_id, chain.pair());
+            continue;
+        }
+        let contract = c.contract.unwrap_or_else(|| fail(format!("chain {}: contract is missing", c.chain_id)));
+        let view = AlloyView::new(&c.rpc, chain, contract).unwrap_or_else(|e| fail(e));
         view.check().await.unwrap_or_else(|e| fail(format!("chain {}: {e}", c.chain_id)));
         if chain != Chain::Local {
             let code = ProviderBuilder::new()
                 .connect_http(c.rpc.parse().unwrap_or_else(|e| fail(format!("{}: {e}", c.rpc))))
-                .get_code_at(c.contract)
+                .get_code_at(contract)
                 .await
                 .unwrap_or_else(|e| fail(format!("chain {}: {e}", c.chain_id)));
             if keccak256(&code) != expected {
-                fail(format!("chain {}: {} is not the pinned XmzSwap code", c.chain_id, c.contract));
+                fail(format!("chain {}: {} is not the pinned XmzSwap code", c.chain_id, contract));
             }
         }
-        rules.contracts.insert(c.chain_id, c.contract);
+        rules.contracts.insert(c.chain_id, contract);
         if let Some(max) = c.max_value_wei {
             rules.max_value.insert(c.chain_id, max);
         }
-        chains.insert(c.chain_id, view);
-        eprintln!("chain {} ({}): contract {} ok", c.chain_id, chain.pair(), c.contract);
+        chains.insert(c.chain_id, View::Evm(view));
+        eprintln!("chain {} ({}): contract {} ok", c.chain_id, chain.pair(), contract);
     }
 
     for n in &config.utxo_networks {

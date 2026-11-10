@@ -3090,9 +3090,12 @@ name = "monzero-dex-evm"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "base64 0.22.1",
+ "bs58",
  "chacha20poly1305",
  "curve25519-dalek",
  "curve25519-dalek-ng",
+ "ed25519-dalek",
  "hex",
  "hmac",
  "k256",

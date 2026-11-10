@@ -162,8 +162,8 @@ async fn agree(url: &str, program: sol::Pubkey, tag: u8, timing: Timing) -> (Par
         let mut d = Driver::start(p.saved.clone(), &p.seed, &p.key, p.chain(url, program), p.xmz.clone(), FileJournal(p.journal.clone())).unwrap();
         d.approve(p.saved.transcript).unwrap();
     }
-    fund(url, &owner.account(), LAMPORTS + 10_000_000).await;
-    fund(url, &claimer.account(), 2_000_000).await;
+    fund(url, &owner.account(), LAMPORTS + 4_500_000).await; // exactly the reserve the driver asks for
+    fund(url, &claimer.account(), 1_500_000).await;
     (owner, claimer)
 }
 
@@ -206,7 +206,8 @@ async fn full_swap_with_both_traders_resumed_from_their_journals_every_tick() {
     assert!(FileJournal(claimer.journal.clone()).load().unwrap().retained.contains_key("claim"));
 
     // Afterwards the claimer sends what its account holds to its own wallet
-    let home = [0x42u8; 32];
+    // A fresh address every run (an address is any 32 bytes)
+    let home: [u8; 32] = rand::random();
     let (id, amount) = sol::pay_out(&url, &sol::account_key(&claimer.key.to_bytes().0), &home).await.unwrap().expect("something to send");
     assert!(!id.is_empty());
     for _ in 0..40 {

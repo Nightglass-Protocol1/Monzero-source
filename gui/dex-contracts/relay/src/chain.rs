@@ -89,3 +89,30 @@ impl ChainView for AlloyView {
         Ok(ClaimLookup::Final { swap, at: block.header.timestamp })
     }
 }
+
+/// The chain behind a served pair: an EVM chain the relay reads, or Solana.
+///
+/// On Solana the relay reads nothing yet. An offer there is signed by the maker's EVM-style
+/// trade account, which says nothing about the maker's Solana account, so the balance that
+/// backs an offer cannot be checked: those offers rest on the per-maker and rate limits alone.
+/// Claims there are not recorded as trades for the price chart either.
+pub enum View {
+    Evm(AlloyView),
+    Solana,
+}
+
+impl ChainView for View {
+    async fn balance(&self, account: Address) -> Result<U256, String> {
+        match self {
+            View::Evm(v) => v.balance(account).await,
+            View::Solana => Ok(U256::MAX),
+        }
+    }
+
+    async fn claim(&self, tx: B256) -> Result<ClaimLookup, String> {
+        match self {
+            View::Evm(v) => v.claim(tx).await,
+            View::Solana => Ok(ClaimLookup::NotAClaim("claims on Solana are not recorded yet".into())),
+        }
+    }
+}

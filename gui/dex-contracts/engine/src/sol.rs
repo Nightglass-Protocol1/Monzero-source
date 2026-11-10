@@ -38,10 +38,11 @@ const SWAP_LEN: usize = 196;
 /// A signature costs 5000 lamports; our transactions carry one
 pub const FEE_LAMPORTS: u64 = 5_000;
 /// "Lamports per gas" for the driver's funding rule (gas for three calls, doubled, for the
-/// owner; one call for the claimer): 3,000,000 lamports cover the swap account's rent
-/// (2,255,040, returned when the swap closes) and fees; 1,000,000 keep the claimer's account
-/// above the rent-exempt minimum while it pays for its claim.
-const LAMPORTS_PER_GAS: u64 = 2;
+/// owner; one call for the claimer). The owner's 4,500,000 lamports cover the swap account's
+/// rent (2,255,040, returned when the swap closes), its fees, and the 890,880 an account must
+/// keep to stay open (a lock that left less was refused: "InsufficientFundsForRent"). The
+/// claimer's 1,500,000 keep its account open while it pays for its claim.
+const LAMPORTS_PER_GAS: u64 = 3;
 /// What stands for an account or point that is not the agreed one
 const NOT_AGREED: Address = Address::repeat_byte(0xEE);
 
