@@ -51,6 +51,9 @@ struct MakerFile {
     taken_by: Option<Address>,
     /// keccak256 of every take letter already answered
     answered: BTreeSet<B256>,
+    /// The relays were told the taken offer is closed (so it leaves the board before it expires)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    closed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -239,7 +242,7 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
     check_funds(listing.maker_role(), &listing, &key, cfg).await?;
     let signed = listing.sign(&key);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    write(&dir.join("listing.json"), &MakerFile { listing: signed.clone(), taken_by: None, answered: BTreeSet::new() })?;
+    write(&dir.join("listing.json"), &MakerFile { listing: signed.clone(), taken_by: None, answered: BTreeSet::new(), closed: false })?;
     let posted = client.post_listing(&signed).await;
     Ok(json!({"listing": signed, "posted": posted}))
 }
@@ -247,6 +250,7 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
 pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Value, String> {
     let mut file: MakerFile = read(&dir.join("listing.json"))?.ok_or("this folder holds no offer of ours")?;
     if journal_has_trade(dir) && file.taken_by.is_some() {
+        close_taken(dir, &mut file, cfg, relays).await;
         let mut v = status(dir)?;
         v["taken"] = json!(true);
         v["takenBy"] = json!(file.taken_by);
@@ -297,6 +301,7 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
         None => heights(cfg, chain_of_id(file.listing.listing.chain_id)?, None).await.map(|h| h.now).unwrap_or(0),
     };
     if file.taken_by.is_some() && journal_has_trade(dir) {
+        close_taken(dir, &mut file, cfg, relays).await;
         let mut v = status(dir)?;
         v["taken"] = json!(true);
         v["takenBy"] = json!(file.taken_by);
@@ -304,6 +309,26 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
         return Ok(v);
     }
     Ok(json!({"taken": false, "answered": answered, "expired": now >= file.listing.listing.expires_at, "listing": file.listing}))
+}
+
+/// A taken offer is no longer on offer: the maker closes it on the relays with a signed cancel,
+/// or it would stay on the board until it expires. The relays keep a closed offer on record, so
+/// the trade's claim is still matched to it. Best effort; tried again on the next call.
+async fn close_taken(dir: &Path, file: &mut MakerFile, cfg: &TickConfig, relays: &[String]) {
+    if file.closed {
+        return;
+    }
+    let (Ok(client), Ok((_, key))) = (RelayClient::new(relays), keys(cfg)) else { return };
+    let l = &file.listing.listing;
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(l.created_at);
+    let signed = Cancel { schema: CANCEL_SCHEMA.into(), id: l.id, maker: key.address(), at }.sign(&key);
+    let told = client.cancel(&signed).await;
+    // Gone already counts (another relay passed it on, or it expired there)
+    let gone = |v: &Value| v["ok"] == true || v["error"].as_str().is_some_and(|e| e.contains("not found") || e.contains("404"));
+    if !told.is_empty() && told.iter().any(gone) {
+        file.closed = true;
+        let _ = write(&dir.join("listing.json"), file);
+    }
 }
 
 pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Option<SignedListing>, local_contract: Option<Address>) -> Result<Value, String> {
@@ -500,7 +525,7 @@ mod withdraw_tests {
         .sign(&key);
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let file = MakerFile { listing, taken_by: taken.then(|| Address::repeat_byte(9)), answered: BTreeSet::new() };
+        let file = MakerFile { listing, taken_by: taken.then(|| Address::repeat_byte(9)), answered: BTreeSet::new(), closed: false };
         write(&dir.join("listing.json"), &file).unwrap();
         dir
     }

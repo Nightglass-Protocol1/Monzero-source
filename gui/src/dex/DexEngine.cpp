@@ -841,7 +841,9 @@ bool DexEngine::payoutEvmTrade(const QString &address) {
     return m_evmTrade->payout(seed,address);
 }
 bool DexEngine::abandonEvmTrade() {
+    const auto dir=m_evmTrade->tradeDir();
     if (!m_evmTrade->abandon()) return false;
+    if (!dir.isEmpty()) m_dexWallets->releaseTradeService(dir);
     m_evmTicker->stop();m_evmStartRefusal.clear();
     for (auto *job:m_evmMarkets) job->rescan();
     emit evmTradeChanged();emit evmMarketChanged();return true;
@@ -1280,8 +1282,20 @@ void DexEngine::resumeEvmTrades() {
     });
     nextEvmResume();
 }
+bool DexEngine::releaseEvmTrade() {
+    // A finished trade leaves the job: mark its folder (so a restart does not reopen it) and stop
+    // its swap wallet, which otherwise runs until the app closes
+    const auto dir=m_evmTrade->tradeDir();
+    if (!m_evmTrade->release()) return false;
+    if (!dir.isEmpty()) {
+        QFile mark(dir+"/finished");
+        if (!mark.exists() && mark.open(QIODevice::WriteOnly)) {mark.write("finished\n");mark.close();}
+        m_dexWallets->releaseTradeService(dir);
+    }
+    return true;
+}
 void DexEngine::nextEvmResume() {
-    if (m_evmTrade->status().value("configured").toBool() && !m_evmTrade->release()) {m_evmResuming=false;m_evmResume.clear();return;}
+    if (m_evmTrade->status().value("configured").toBool() && !releaseEvmTrade()) {m_evmResuming=false;m_evmResume.clear();return;}
     while (!m_evmResume.isEmpty()) {
         const auto next=m_evmResume.takeFirst();
         if (!next.first) continue;
@@ -1310,7 +1324,7 @@ void DexEngine::evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir) {
             file.write(QJsonDocument(config).toJson(QJsonDocument::Compact));file.close();
         }
         // A finished trade makes room for the next one; a running one keeps the job
-        if (m_evmTrade->status().value("configured").toBool() && !m_evmTrade->release()) {
+        if (m_evmTrade->status().value("configured").toBool() && !releaseEvmTrade()) {
             if (m_evmTrade->status().value("snapshot").toMap().value("done").toBool()) {
                 // Finished, but its last step (the payout) is still in flight: open the new trade right after
                 QTimer::singleShot(3000,this,[this,job,tradeDir]{evmOfferAgreed(job,tradeDir);});

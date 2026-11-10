@@ -42,7 +42,7 @@ public:
     // decimals: of the coin's smallest unit (18 for wei, 9 for Solana's lamports)
     static QString priceText(const QString &valueWei,const QString &xmzAtoms,int decimals=18);
     static QString weiToCoin(const QString &valueWei,int decimals=18);
-    // Folders of trades whose keys were agreed (running or finished)
+    // Folders of trades whose keys were agreed and that are not marked finished
     QStringList agreedFolders() const;
     // Ask the helper for this wallet's trade accounts (Solana chains: where SOL is paid in)
     bool requestAccounts(QByteArray &walletSeed);

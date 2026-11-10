@@ -142,7 +142,8 @@ void EvmMarketJob::scanFolders() {
 
 QStringList EvmMarketJob::agreedFolders() const {
     QStringList out;
-    for (const auto &f:m_folders) if (f.state=="agreed") out.append(f.path);
+    // A trade the wallet saw finished is marked; reopening it would only start its swap wallet again
+    for (const auto &f:m_folders) if (f.state=="agreed" && !QFile::exists(f.path+"/finished")) out.append(f.path);
     return out;
 }
 

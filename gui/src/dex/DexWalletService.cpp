@@ -284,6 +284,13 @@ void DexWalletService::tradeService(const QString &tradeDir,const QString &trade
     if (!service->startBoundWithDigest(m_walletRpc,m_walletRpcSha256,dir,id,m_daemonPort,port)) {service->deleteLater();done({});}
 }
 
+void DexWalletService::releaseTradeService(const QString &tradeDir) {
+    const auto service=m_trades.take(tradeDir);m_tradePorts.remove(tradeDir);
+    if (!service) return;
+    connect(service.data(),&SwapWalletRpcProcess::stopped,service.data(),&QObject::deleteLater);
+    service->stop();
+}
+
 QVariantMap DexWalletService::status() const {
     const auto atoms=[](const QString &a){
         QString d=a.isEmpty()?QStringLiteral("0"):a;while (d.size()<=11) d.prepend('0');

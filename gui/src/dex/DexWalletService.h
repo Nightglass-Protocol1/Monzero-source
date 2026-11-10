@@ -35,6 +35,8 @@ public:
     bool send(const QString &address,const QString &atoms);
     // A swap-wallet service bound to this trade; `done` gets its endpoint once it answers
     void tradeService(const QString &tradeDir,const QString &tradeId,std::function<void(const QJsonObject&)> done);
+    // The trade is over: stop its swap-wallet service (it restarts from its folder if asked again)
+    void releaseTradeService(const QString &tradeDir);
     QString helper() const {return m_helper;}
     QString root() const {return m_root;}
     // The XMZ wallet settings a BTC/LTC trade needs (trade kit "local.xmz"); empty until all services answer

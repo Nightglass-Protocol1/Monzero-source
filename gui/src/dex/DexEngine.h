@@ -573,6 +573,7 @@ private:
     // After a restart: reopen the trade that was running when the app closed
     void resumeEvmTrades();
     void nextEvmResume();
+    bool releaseEvmTrade();
     QList<QPair<QPointer<EvmMarketJob>,QString>> m_evmResume;
     bool m_evmResuming=false,m_evmResumed=false;
     // Kill switch and caps for an offer before it is posted or taken (nothing is recorded)
