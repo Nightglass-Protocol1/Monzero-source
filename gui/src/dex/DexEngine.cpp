@@ -1071,6 +1071,19 @@ bool DexEngine::cancelEvmOffer(const QString &folder) {
     QByteArray seed=evmSeed();
     return job && job->cancel(seed,folder);
 }
+bool DexEngine::returnEvmFunds(int chainId,const QString &address) {
+    auto *job=m_evmMarkets.value(chainId);
+    if (!job || (m_evmSeedFile.isEmpty() && !dexKeysReady())) return false;
+    // The running trade, if any, may be on this account: the helper checks the folders, and so do we
+    const auto snapshot=m_evmTrade->status().value("snapshot").toMap();
+    if (m_evmTrade->status().value("configured").toBool() && !snapshot.value("done").toBool()) {
+        m_marketMessage=tr("A trade is running: its account needs its funds until it finishes.");emit evmMarketChanged();return false;
+    }
+    QByteArray seed=evmSeed();
+    const bool started=job->withdraw(seed,address.trimmed());
+    m_marketMessage=started ? QString() : tr("The funds could not be sent back now.");
+    emit evmMarketChanged();return started;
+}
 bool DexEngine::configureDexWallets(const QString &root,const QString &walletRpc,const QString &walletRpcSha256,quint16 daemonPort,
         const QString &networkFlag,const QString &helper,const QString &helperSha256) {
     return m_dexWallets->configure(root,walletRpc,walletRpcSha256,daemonPort,networkFlag,helper,helperSha256) && m_dexWallets->start();

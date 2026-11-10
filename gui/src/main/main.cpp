@@ -80,6 +80,9 @@
 #include "LightWalletHelper.h"
 #include "DexHelpers.h"
 #include "dex/DexTestDriver.h"
+#include "dex/DexWebBridge.h"
+#include <QProcess>
+#include <QWindow>
 #include "dex/LitecoinPeerStartup.h"
 #include "dex/PrivateBackendConfig.h"
 #include "dex/NativeQuoteConfig.h"
@@ -1031,11 +1034,37 @@ int main(int argc, char *argv[])
         QObject::connect(&app,&QCoreApplication::aboutToQuit,dexOwner.get(),&SwapWalletRpcProcess::stop);
     }
     engine.rootContext()->setContextProperty("dexEngine", &dexEngine);
+    DexWebBridge *dexWeb=nullptr;
+    {
+        // The DEX web page reaches this wallet over loopback; the wallet asks before connecting
+        // and before every trade. Other sites get no answer; local test pages only in dev builds.
+        if (dexPrototypeEnabled) {
+            bool localPages=true;
+#ifdef MONZERO_DEX_PUBLIC_EDITION
+            localPages=false;
+#endif
+            dexWeb=new DexWebBridge(&dexEngine,{QStringLiteral("https://monzero.org"),QStringLiteral("https://www.monzero.org")},localPages,&app);
+            const QString dexData=QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("dex");
+            if (!dexWeb->listen(QDir(dexData).filePath("web-page.ini"))) qWarning("The DEX web page link could not start (ports in use)");
+            QObject::connect(dexWeb,&DexWebBridge::attention,&app,[](const QString &title,const QString &text){
+                for (auto *window:QGuiApplication::topLevelWindows()) {window->alert(0);window->requestActivate();}
+#ifdef Q_OS_LINUX
+                QProcess::startDetached(QStringLiteral("notify-send"),{QStringLiteral("-a"),QStringLiteral("Monzero"),title,text});
+#endif
+            });
+        }
+        engine.rootContext()->setContextProperty("dexWeb", dexWeb);
+    }
 #ifndef MONZERO_DEX_PUBLIC_EDITION
     // Test-only remote control of the DEX engine (end-to-end runs of two apps); prototype opt-in only
     if (dexPrototypeEnabled && qEnvironmentVariableIsSet("MONZERO_DEX_TEST_DRIVER")) {
         auto *driver=new DexTestDriver(&dexEngine,&app);
         if (!driver->listen(qEnvironmentVariable("MONZERO_DEX_TEST_DRIVER"))) {qCritical("The DEX test driver could not start");return 1;}
+        // The same for the web-page link (to answer its prompts in a test), in the "web" subfolder
+        if (dexWeb) {
+            auto *webDriver=new DexTestDriver(dexWeb,&app);
+            if (!webDriver->listen(QDir(qEnvironmentVariable("MONZERO_DEX_TEST_DRIVER")).filePath("web"))) {qCritical("The DEX test driver could not start");return 1;}
+        }
     }
 #endif
 #endif

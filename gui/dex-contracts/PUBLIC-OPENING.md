@@ -142,6 +142,55 @@ setup from a relay offer as well).
 
 Not yet: a signet/mainnet run through a public relay. BTC prints are not charted yet (a claim would need a Bitcoin chain check).
 
+## Trading from the web page (ETH and BNB)
+
+The website's order book (`website/dex/`, `dex-trade.js`) can trade, with MetaMask in the browser
+and the Monzero wallet open on the same computer. **The page is the screen; the wallet stays the
+engine and the authority.**
+
+- **Link.** The wallet listens on loopback only (`DexWebBridge`, 127.0.0.1, first free port of
+  38471-38475). It answers only requests whose `Origin` is `https://monzero.org` (or
+  `www.`) and whose `Host` is the loopback address itself; dev builds also answer pages served
+  from `localhost`. The site's policy lets `/dex/` connect to those five ports and nothing else.
+- **Connecting.** The page asks MetaMask for the account and asks the wallet to connect. The
+  wallet shows a prompt with the site, that account and a six-digit code; the page shows the same
+  code. Accepting gives the page a token (kept as a hash in `dex/web-page.ini`). One page at a
+  time; "Disconnect" on either side ends it.
+- **What the page can do.** Read the trading wallet's balance, the trade account, our offers and
+  the trade's state; ask to post, take or cancel an offer; ask for unused coin to be sent back.
+  **What it cannot do:** approve a trade, name a payout address, read a key. A trade starts only
+  when the user approves, in the wallet, the amounts the wallet reads from the signed offer
+  (`DexWebPrompt.qml`, with a desktop notification). Proceeds and returned coin go only to the
+  account accepted at connection time. A page that shows a wrong price changes nothing.
+- **Money.** MetaMask pays the coin (the amount plus the fee reserve the engine wants) into the
+  wallet's own trade account; the swap then runs exactly as an in-app trade. When it is over the
+  wallet sends what the account holds back to the MetaMask account by itself. Coin paid in for
+  an offer that was cancelled, refused or never taken goes back with "Send it back to MetaMask"
+  (helper command `withdraw`: refused while any trade in that chain's folder is unfinished or an
+  offer of ours is open).
+- **Limits.** The page reads the same signed control document and refuses, before anything is
+  paid in, what the wallet would refuse; the wallet's own check stays the one that counts.
+- **Keys.** One step in the wallet: "Create trading keys" with a password (`setUpTradingKeys`);
+  the key wallet is made in the app's data folder. The password is never typed into the page.
+
+Tested 10 Nov 2026 with a headless browser and a stand-in for MetaMask that pays real Sepolia
+ETH (`core/build/app2app-20261109`, evidence `web-page-eth-sepolia-1.json`): other origins and a
+foreign `Host` are refused, connecting needs the wallet's acceptance, post + cancel + send back,
+and a full swap taken from the page. Not tested: the real MetaMask extension, and the page served
+from `https://monzero.org` (browsers ask the wallet's permission for a public page to reach a
+local address; the bridge answers that preflight).
+
+### Phones (not built)
+
+The Android wallet has no swap engine yet, so there is nothing for a page to drive. The same
+link works on a phone once it has one: the wallet runs a foreground service on the same loopback
+ports, the page in the phone's browser (or MetaMask's built-in browser) asks to connect, and
+the wallet raises a notification for the connection and for each trade to approve. No cloud push
+service is needed because the page and the wallet are on the same device. What has to be built
+first: the trade helper and an XMZ wallet service for Android (the helper speaks to the wallet
+over its RPC, which the Android wallet does not have), and a foreground service that keeps a
+trade running to its end.
+
 ## Order of work
 
 1. Offer type, mail, take logic and relay. Done.

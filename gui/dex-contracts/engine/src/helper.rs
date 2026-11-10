@@ -56,6 +56,9 @@ pub struct Request {
     /// The contract on a local test chain (31337) only; real chains use the pinned ones
     #[serde(default)]
     pub local_contract: Option<alloy::primitives::Address>,
+    /// `withdraw`: the chain whose trade account is emptied
+    #[serde(default)]
+    pub chain_id: Option<u64>,
     /// `xmzWallet`: the app's DEX XMZ wallet
     #[serde(default)]
     pub xmz_wallet: Option<crate::helper_wallet::XmzWalletRequest>,
@@ -80,6 +83,8 @@ pub enum Command {
     Cancel,
     /// After a swap, report its claim to the relays (claimer)
     Report,
+    /// Send the trade account's unused coin back to the user's own wallet (no trade or offer needs it)
+    Withdraw,
     /// The app's DEX XMZ wallet: open (create once), status, send
     XmzWallet,
 }
@@ -154,6 +159,11 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         }
         Command::Cancel => crate::helper_market::cancel(&r.trade_dir, r.tick.as_ref().ok_or("cancel needs tick")?, relays(&r)?).await,
         Command::Report => crate::helper_market::report(&r.trade_dir, relays(&r)?).await,
+        Command::Withdraw => {
+            let to = parse_address(r.payout_address.as_deref().ok_or("withdraw needs payoutAddress")?)?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            crate::helper_market::withdraw(&r.trade_dir, r.tick.as_ref().ok_or("withdraw needs tick")?, r.chain_id.ok_or("withdraw needs chainId")?, to, now).await
+        }
         Command::XmzWallet => crate::helper_wallet::run(r.xmz_wallet.as_ref().ok_or("xmzWallet needs xmzWallet")?).await,
     }
 }
@@ -323,7 +333,7 @@ async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>) -> Result
 }
 
 /// An EVM address: all lower case, or with a valid EIP-55 checksum (as MetaMask shows it)
-fn parse_address(text: &str) -> Result<alloy::primitives::Address, String> {
+pub(crate) fn parse_address(text: &str) -> Result<alloy::primitives::Address, String> {
     let t = text.trim();
     let hex_part = t.strip_prefix("0x").ok_or("the address must start with 0x")?;
     if hex_part.len() != 40 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {

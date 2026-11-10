@@ -1743,6 +1743,13 @@ ApplicationWindow {
     }
 
     // Information dialog
+    MonzeroComponents.DexWebPrompt {
+        // The DEX web page's connection request and trade approvals, whatever page is open
+        z: parent.z + 2
+        dex: typeof dexEngine !== "undefined" ? dexEngine : null
+        web: typeof dexWeb !== "undefined" ? dexWeb : null
+    }
+
     StandardDialog {
         // dynamically change onclose handler
         property var onCloseCallback

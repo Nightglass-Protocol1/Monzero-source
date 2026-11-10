@@ -262,6 +262,8 @@ public:
     Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours);
     Q_INVOKABLE bool takeEvmOffer(const QString &listingId);
     Q_INVOKABLE bool cancelEvmOffer(const QString &folder);
+    // Coin paid into the trade account that no trade or open offer needs goes back to the user's wallet
+    Q_INVOKABLE bool returnEvmFunds(int chainId,const QString &address);
     // BTC/XMZ offers through the open relays (see BtcMarketJob). An agreed trade opens in the
     // trade setup review (reviewLitecoinTradeSetup / importLitecoinTradeSetup) like any other.
     bool configureBtcMarket(const QString &config);

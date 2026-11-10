@@ -375,6 +375,59 @@ pub async fn cancel(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<V
     Ok(json!({"cancelled": client.cancel(&signed).await}))
 }
 
+/// Why the trade account's coin must stay where it is, if anything in `root` (the folder of
+/// all our offers and trades on one chain) still needs it: a trade that has not finished (its
+/// lock, its claim or its refund pays from this account) or an offer of ours that is still open.
+pub fn funds_in_use(root: &Path, now: u64) -> Result<Option<String>, String> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("the trades folder could not be read: {e}")),
+    };
+    for entry in entries {
+        let dir = entry.map_err(|e| e.to_string())?.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let journal = dir.join("journal.json");
+        if journal.exists() {
+            // A journal we cannot read is treated as a running trade
+            let record = FileJournal(journal).load().map_err(|e| format!("a trade's record could not be read: {e}"))?;
+            if record.trade.is_some() {
+                if !record.state.is_done() {
+                    return Ok(Some("a trade is still running: its account needs its funds until it finishes or refunds".into()));
+                }
+                continue;
+            }
+        }
+        if dir.join("cancelled").exists() {
+            continue;
+        }
+        if let Ok(Some(file)) = read::<MakerFile>(&dir.join("listing.json")) {
+            if file.taken_by.is_some() || file.listing.listing.expires_at > now {
+                return Ok(Some("an offer of yours is still open: cancel it first".into()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Send what the trade account holds on this chain back to the user's own wallet (for example
+/// MetaMask), when nothing of ours needs it: coin paid in for an offer that was cancelled, never
+/// taken, or refused.
+pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: Address, now: u64) -> Result<Value, String> {
+    if let Some(why) = funds_in_use(root, now)? {
+        return Err(why);
+    }
+    let (_, key) = keys(cfg)?;
+    let kind = Chain::from_id(chain_id).ok_or("unknown chain")?;
+    let chain = AlloyChain::new(&cfg.evm_rpc, kind, Address::ZERO, 0, key).map_err(|e| e.to_string())?;
+    Ok(match chain.pay_out(to).await.map_err(|e| e.to_string())? {
+        Some((tx, amount)) => json!({"withdrawn": {"to": to.to_string(), "tx": tx.to_string(), "amountWei": amount.to_string()}}),
+        None => json!({"withdrawn": null, "reason": "nothing to send, or a payment is still pending"}),
+    })
+}
+
 /// After a swap, the claimer tells the relays where its claim is, for the price chart
 pub async fn report(dir: &Path, relays: &[String]) -> Result<Value, String> {
     let record = FileJournal(dir.join("journal.json")).load().map_err(|e| e.to_string())?;
@@ -388,3 +441,70 @@ pub async fn report(dir: &Path, relays: &[String]) -> Result<Value, String> {
     Ok(json!({"tx": tx, "reported": client.report(saved.offer.chain_id, tx).await}))
 }
 
+
+#[cfg(test)]
+mod withdraw_tests {
+    use super::*;
+    use crate::listing::{Listing, Side, LISTING_SCHEMA};
+
+    const NOW: u64 = 1_794_300_000;
+
+    fn offer_folder(root: &Path, name: &str, expires_at: u64, taken: bool) -> std::path::PathBuf {
+        let key = PrivateKeySigner::random();
+        let listing = Listing {
+            schema: LISTING_SCHEMA.into(),
+            id: B256::repeat_byte(7),
+            pair: "ETH/XMZ".into(),
+            chain_id: 1,
+            contract: Address::repeat_byte(1),
+            side: Side::BuyXmz,
+            value: U256::from(5_000_000_000_000_000u64),
+            xmz: 300_000_000_000_000,
+            maker: key.address(),
+            mailbox: B256::repeat_byte(0x5a),
+            xmz_network: XmzNetwork::Mainnet,
+            created_at: NOW - 60,
+            expires_at,
+        }
+        .sign(&key);
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = MakerFile { listing, taken_by: taken.then(|| Address::repeat_byte(9)), answered: BTreeSet::new() };
+        write(&dir.join("listing.json"), &file).unwrap();
+        dir
+    }
+
+    fn root(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("monzero-withdraw-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn coin_stays_while_an_offer_is_open_and_is_free_once_it_is_cancelled_or_expired() {
+        let r = root("offers");
+        assert_eq!(funds_in_use(&r, NOW).unwrap(), None, "nothing of ours: free");
+        assert_eq!(funds_in_use(&r.join("missing"), NOW).unwrap(), None, "no trades folder yet: free");
+        let open = offer_folder(&r, "offer-open", NOW + 3600, false);
+        assert!(funds_in_use(&r, NOW).unwrap().unwrap().contains("still open"));
+        std::fs::write(open.join("cancelled"), b"").unwrap();
+        assert_eq!(funds_in_use(&r, NOW).unwrap(), None, "cancelled: free");
+        offer_folder(&r, "offer-expired", NOW - 1, false);
+        assert_eq!(funds_in_use(&r, NOW).unwrap(), None, "expired: free");
+        // Taken but the trade is not written yet: the taker may be waiting for our lock
+        offer_folder(&r, "offer-taken", NOW - 1, true);
+        assert!(funds_in_use(&r, NOW).unwrap().is_some());
+        std::fs::remove_dir_all(&r).unwrap();
+    }
+
+    #[test]
+    fn a_trade_record_that_cannot_be_read_keeps_the_coin() {
+        let r = root("journal");
+        let dir = r.join("take-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("journal.json"), b"not a journal").unwrap();
+        assert!(funds_in_use(&r, NOW).is_err());
+        std::fs::remove_dir_all(&r).unwrap();
+    }
+}

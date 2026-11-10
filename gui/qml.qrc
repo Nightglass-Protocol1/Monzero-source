@@ -6,6 +6,7 @@
         <file>components/Dialog.qml</file>
         <file>components/Label.qml</file>
         <file>components/LightWalletPanel.qml</file>
+        <file>components/DexWebPrompt.qml</file>
         <file>components/LightDexFundingPanel.qml</file>
         <file>components/BchLightDexFundingPanel.qml</file>
         <file>components/LightWalletBackupRestorePanel.qml</file>

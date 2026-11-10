@@ -205,6 +205,15 @@ bool EvmMarketJob::cancel(QByteArray &walletSeed,const QString &folder) {
     return run(r,folder);
 }
 
+bool EvmMarketJob::withdraw(QByteArray &walletSeed,const QString &address) {
+    static const QRegularExpression format("\\A0x[0-9a-fA-F]{40}\\z");
+    if (m_busy || m_path.isEmpty() || !format.match(address).hasMatch()) {walletSeed.fill('\0');walletSeed.clear();return false;}
+    QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
+    auto r=base("withdraw",QString());r.insert("tick",t);r.insert("payoutAddress",address);r.insert("chainId",m_config.value("chainId"));
+    m_withdrawal.clear();
+    return run(r,QString());
+}
+
 bool EvmMarketJob::report(const QString &folder) {
     if (m_busy || m_path.isEmpty() || !cleanAbsolute(folder) || !folder.startsWith(m_tradesDir+"/")) return false;
     return run(base("report",folder),folder);
@@ -282,6 +291,9 @@ void EvmMarketJob::finish(bool success) {
             f.detail=r.value("refused").isString() ? r.value("refused").toString().left(200) : QString();
         }
         if (done) {const auto folder=m_folder;emit changed();emit agreed(folder);return;}
+    } else if (m_command=="withdraw") {
+        m_withdrawal=r.value("withdrawn").isObject() ? r.value("withdrawn").toObject().toVariantMap()
+            : QVariantMap{{"sent",false},{"reason",r.value("reason").toString().left(200)}};
     } else if (m_command=="cancel") {
         QFile marker(m_folder+"/cancelled");marker.open(QIODevice::WriteOnly);marker.close();
         scanFolders();
@@ -299,7 +311,7 @@ QVariantMap EvmMarketJob::status() const {
             {"price",priceText(wei,l.value("xmz").toString())},{"expiresAt",l.value("expiresAt").toDouble()}});
     }
     return {{"configured",!m_path.isEmpty()},{"busy",m_busy},{"state",m_state},{"error",m_error},{"command",m_command},
-        {"listings",m_listings},{"mine",folders},{"relays",m_config.value("relays").toArray().toVariantList()},
+        {"listings",m_listings},{"mine",folders},{"withdrawal",m_withdrawal},{"relays",m_config.value("relays").toArray().toVariantList()},
         {"chainId",m_config.value("chainId").toDouble()},{"coin",[&]{const int c=m_config.value("chainId").toInt();return (c==56||c==97) ? QStringLiteral("BNB") : QStringLiteral("ETH");}()}};
 }
 

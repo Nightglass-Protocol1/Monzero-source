@@ -23,9 +23,15 @@ public:
     bool take(QByteArray &walletSeed,const QString &listingId);
     bool cancel(QByteArray &walletSeed,const QString &folder);
     bool report(const QString &folder);
+    // Send the trade account's unused coin to the user's own wallet; the helper refuses while a
+    // trade is running or an offer of ours is open
+    bool withdraw(QByteArray &walletSeed,const QString &address);
     // Answers takes of our open offers and continues our takes; one helper run per call
     bool step(QByteArray &walletSeed);
     QVariantMap status() const;
+private:
+    QVariantMap m_withdrawal;
+public:
     // Keys of the trade account from the light-wallet vault (hex); used instead of a wallet seed
     void setSwapKeys(const QByteArray &swapSeedHex,const QByteArray &evmKeyHex);
     QJsonObject config() const {return m_config;}
