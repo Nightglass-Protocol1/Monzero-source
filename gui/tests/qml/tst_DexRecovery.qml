@@ -1705,7 +1705,10 @@ TestCase {
         dexEngine.litecoinNegotiationStatus={settlementConfigured:true,role:"native-funder",canShareFunding:true};
         var share=findChild(page,"litecoinShareFundingProof"),release=findChild(page,"litecoinReleaseRedemption");
         var consent=findChild(page,"litecoinRedemptionConsent"),label=findChild(page,"litecoinRedemptionSessionStatus");
+        verify(!share.enabled);   // not before this app has seen the XMZ funding confirmed
+        dexEngine.litecoinFundingStatus={attached:true,valid:true,busy:false,fundingCheckState:"confirmed"};
         verify(share.enabled);share.clicked();compare(dexEngine.redemptionApproval,"");
+        dexEngine.litecoinFundingStatus=Qt.binding(function(){return dexEngine.litecoinJournalStatus;});
         dexEngine.litecoinNegotiationStatus={settlementConfigured:true,role:"litecoin-funder",canReleaseRedemption:true,nativeFundingTxid:"first"};
         verify(!consent.checked);verify(!release.enabled);consent.checked=true;
         dexEngine.litecoinNegotiationStatus={settlementConfigured:true,role:"litecoin-funder",canReleaseRedemption:true,nativeFundingTxid:"second"};

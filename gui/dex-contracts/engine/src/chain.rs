@@ -142,6 +142,9 @@ impl AlloyChain {
     }
 }
 
+/// The most gas a payout may spend on the receiving account's own code.
+const PAYOUT_GAS_LIMIT: u64 = 150_000;
+
 impl AlloyChain {
     /// After a trade: send everything our account holds, less the fee of this transfer, to
     /// `to` (the user's own wallet, e.g. MetaMask). Returns the transaction and the amount, or
@@ -154,7 +157,16 @@ impl AlloyChain {
         }
         let balance = self.reader.get_balance(self.from).await.map_err(chain_err)?;
         let fees = self.reader.estimate_eip1559_fees().await.map_err(chain_err)?;
-        let gas: u64 = 21_000;
+        // A plain account takes 21,000 gas. A smart or delegated account (EIP-7702, which MetaMask
+        // turns on for its smart accounts) runs code when it is paid and needs more, so a fixed
+        // 21,000 would fail there. Ask the node what this receiver needs and keep a margin; an
+        // absurd answer is refused rather than paid for.
+        let probe = TransactionRequest::default().with_from(self.from).with_to(to).with_value(U256::from(1u8));
+        let needed = self.reader.estimate_gas(probe).await.map_err(chain_err)?;
+        let gas: u64 = if needed <= 21_000 { 21_000 } else { needed + needed / 5 };
+        if gas > PAYOUT_GAS_LIMIT {
+            return Err(DriverError::Chain(format!("the payout address needs {needed} gas to receive a payment; send to a plain account instead")));
+        }
         // Pay the full max fee up front so the amount plus fee never exceeds the balance
         let fee = U256::from(gas) * U256::from(fees.max_fee_per_gas);
         if balance <= fee {

@@ -205,6 +205,9 @@ Rectangle {
             readonly property string missing: need.missingWei ? card.atomic(need.missingWei, card.coinDecimals) : ""
             readonly property string account: card.t.account || ""
             readonly property int chainId: card.snapshot.offer ? Number(card.snapshot.offer.chainId) : 0
+            // The network to pick in MetaMask; a wrong one would send the coin somewhere the trade cannot see
+            readonly property string network: chainId === 1 ? qsTr("Ethereum Mainnet") : chainId === 56 ? qsTr("BNB Smart Chain")
+                : chainId === 11155111 ? qsTr("Sepolia (test network)") : chainId === 97 ? qsTr("BNB Smart Chain Testnet") : qsTr("chain %1").arg(chainId)
             Layout.fillWidth: true
             visible: missing !== "" && account !== "" && chainId > 0   // never a payment request for an unknown network
             color: "transparent"; radius: 6
@@ -231,8 +234,8 @@ Rectangle {
                     }
                     MonzeroComponents.TextPlain { themeTransition: false; color: MonzeroComponents.Style.dimmedFontColor
                         Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 12
-                        text: (card.externalWallet ? qsTr("From your MetaMask (%1): scan the code with MetaMask mobile, or send to this address from MetaMask on BNB Smart Chain.").arg(card.externalWallet.slice(0, 6) + "…" + card.externalWallet.slice(-4))
-                                                   : qsTr("Scan the code with MetaMask mobile, or send to this address from any wallet on BNB Smart Chain."))
+                        text: (card.externalWallet ? qsTr("From your MetaMask (%1): scan the code with MetaMask mobile, or send to this address from MetaMask on %2.").arg(card.externalWallet.slice(0, 6) + "…" + card.externalWallet.slice(-4)).arg(fundingBox.network)
+                                                   : qsTr("Scan the code with MetaMask mobile, or send to this address from any wallet on %1.").arg(fundingBox.network))
                               + " " + qsTr("This is the trade's own account in this app; it covers the swap and its network fees. Nothing is locked until it arrives.")
                     }
                     MonzeroComponents.LineEdit {

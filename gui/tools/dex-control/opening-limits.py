@@ -2,7 +2,10 @@
 """Print the sign-control.py commands for the DEX opening limits at today's prices.
 
   opening-limits.py [--per-trade-usd 25] [--per-day-usd 250] [--xmz-usd 0.001] \
-      [--sequence N] [--days 7] [--key KEYFILE]
+      [--sequence N] [--days 7] [--key KEYFILE] [--networks eth-mainnet,bnb-mainnet]
+
+--networks opens only those pairs (for example the two MetaMask coins first); every other
+network has no document, so the public app starts no trade there.
 
 The owner's decision of 8 Nov 2026: $25 per trade and $250 per day for each pair, set in the
 signed control document of each network (btc-mainnet, eth-mainnet, bnb-mainnet). Prices come
@@ -40,13 +43,22 @@ def main():
     p.add_argument("--xmz-usd", type=Decimal, default=Decimal("0.001"))
     p.add_argument("--sequence", type=int, required=True, help="higher than every document published before")
     p.add_argument("--days", type=float, default=7)
+    p.add_argument("--networks", default="", help="comma-separated networks to open, e.g. eth-mainnet,bnb-mainnet "
+                   "for the MetaMask coins only; a network without a published document stays closed (default: all)")
     p.add_argument("--key", default="~/monzero-private/dex-control-btc-mainnet", help="the owner's control key file")
     a = p.parse_args()
     usd = prices()
     xmz_per_trade = atoms(a.per_trade_usd, a.xmz_usd, XMZ_ATOMS)
     print(f"# ${a.per_trade_usd} per trade, ${a.per_day_usd} per day; XMZ at ${a.xmz_usd} -> at most "
           f"{Decimal(xmz_per_trade) / XMZ_ATOMS} XMZ per trade")
+    wanted = [n for n in a.networks.split(",") if n]
+    unknown = [n for n in wanted if n not in [x[0] for x in NETWORKS]]
+    if unknown:
+        p.error("unknown network: " + ", ".join(unknown))
     for network, coin, per_coin in NETWORKS:
+        if wanted and network not in wanted:
+            print(f"# {network}: not opened (no document; the app refuses new {coin} trades)")
+            continue
         if coin not in usd:
             print(f"# {network}: no {coin} price; skipped")
             continue

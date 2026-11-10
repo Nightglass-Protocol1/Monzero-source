@@ -366,6 +366,20 @@ async fn nothing_is_locked_until_each_account_is_funded() {
     assert!(balance(&w.url, claimer_addr).await < U256::from(10u64.pow(15)));
     assert_eq!(w.chain(CLAIMER_KEY).pay_out(metamask).await.unwrap(), None, "nothing left: repeating sends nothing");
     set_balance(&w.url, claimer_addr, rich).await;
+
+    // A smart or delegated account (as MetaMask smart accounts are) runs code when paid: this one
+    // stores a word, which a fixed 21,000 gas cannot pay for. The payout still arrives.
+    let smart: Address = "0x00000000000000000000000000000000005Ad0E5".parse().unwrap();
+    rpc(&w.url, "hardhat_setCode", json!([smart.to_string(), "0x600160005500"])).await;
+    let before = balance(&w.url, smart).await;
+    let (_, amount) = w.chain(CLAIMER_KEY).pay_out(smart).await.unwrap().expect("a payout to a smart account");
+    assert_eq!(balance(&w.url, smart).await - before, amount);
+    // One that burns gas without end is refused, not paid for
+    let greedy: Address = "0x00000000000000000000000000000000006Ad0E5".parse().unwrap();
+    rpc(&w.url, "hardhat_setCode", json!([greedy.to_string(), "0x5b600056"])).await;
+    set_balance(&w.url, claimer_addr, rich).await;
+    assert!(w.chain(CLAIMER_KEY).pay_out(greedy).await.is_err(), "no payout into an account that cannot take it");
+    set_balance(&w.url, claimer_addr, rich).await;
 }
 
 #[tokio::test]

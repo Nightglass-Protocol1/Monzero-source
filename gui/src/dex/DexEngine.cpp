@@ -451,7 +451,10 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     connect(m_ltcReservation,&LitecoinReservationJob::changed,this,&DexEngine::litecoinReservationChanged);
     connect(m_ltcLightFunding,&LitecoinLightFundingController::changed,this,&DexEngine::litecoinStateChanged);
     connect(this,&DexEngine::lightWalletsChanged,this,&DexEngine::litecoinStateChanged);
-    connect(m_ltcLightFunding,&LitecoinLightFundingController::prepared,this,[this](const QByteArray &psbt){if(litecoinLightFundingAllowed())startLitecoinRecovery(psbt);});
+    // The recovery exchange must follow every prepared funding: without it the funding review has
+    // nothing to check. Another job may be busy at this instant, so keep the PSBT and retry.
+    connect(m_ltcLightFunding,&LitecoinLightFundingController::prepared,this,[this](const QByteArray &psbt){
+        m_ltcRecoveryPending=psbt;retryLitecoinRecoveryStart(60);});
     connect(this,&DexEngine::litecoinNegotiationChanged,this,&DexEngine::litecoinReservationChanged);
     connect(m_ltcReservation,&LitecoinReservationJob::prepared,this,[this](const QByteArray &psbt){startLitecoinRecovery(psbt);});
     connect(m_ltcJournal,&LitecoinJournalJob::changed,this,&DexEngine::litecoinJournalChanged);
@@ -470,7 +473,16 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
 QVariantMap DexEngine::litecoinNegotiationStatus() const {
     return litecoinAppView(m_ltcNegotiation?m_ltcNegotiation->status():QVariantMap{{"attached",false},{"state","unattached"},{"executable",false}});
 }
-bool DexEngine::startLitecoinRedemption(const QString &txid) {return litecoinOperationAllowed() && m_ltcNegotiation && m_ltcNegotiation->startRedemption(txid);}
+bool DexEngine::startLitecoinRedemption(const QString &txid) {
+    if (!litecoinOperationAllowed() || !m_ltcNegotiation) return false;
+    // The XMZ seller shares the funding proof only once this app has seen the funding confirmed:
+    // sent earlier, the proof cannot be made and the session with the peer fails.
+    if (txid.isEmpty() && m_ltcNegotiation->status().value("role")=="native-funder") {
+        const auto funding=litecoinFundingStatus();
+        if (funding.value("fundingSubmissionConfigured").toBool() && funding.value("fundingCheckState")!="confirmed") return false;
+    }
+    return m_ltcNegotiation->startRedemption(txid);
+}
 bool DexEngine::configureLightWalletSetup(const QString &helper,const QString &digest) {
     if (!m_lightSetupHelper.isEmpty() || !BackendExecutable::matches(helper,digest)) return false;
     m_lightSetupHelper=helper;m_lightSetupDigest=digest;
@@ -817,9 +829,9 @@ bool DexEngine::approveEvmTrade(const QString &commitment) {
     return m_evmTrade->approve(commitment);
 }
 bool DexEngine::payoutEvmTrade(const QString &address) {
-    if (m_evmSeedFile.isEmpty() || m_evmTrade->status().value("busy").toBool()) return false;
-    QByteArray hex=LitecoinJournalProtocol::privateConfig(m_evmSeedFile,256).trimmed();
-    QByteArray seed=QByteArray::fromHex(hex);hex.fill('\0');
+    // A seed file (prototype) or this session's vault keys, as for every other trade step
+    if ((m_evmSeedFile.isEmpty() && !dexKeysReady()) || m_evmTrade->status().value("busy").toBool()) return false;
+    QByteArray seed=evmSeed();
     return m_evmTrade->payout(seed,address);
 }
 void DexEngine::stepEvmTrade() {
@@ -1458,6 +1470,17 @@ bool DexEngine::reviewLitecoinLockFunding() {return !litecoinLightFundingSelecte
 bool DexEngine::submitLitecoinLockFunding(const QString &commitment) {return !litecoinLightFundingSelected() && litecoinOperationAllowed() && m_ltcReservation->submitFunding(commitment);}
 bool DexEngine::prepareLitecoinReservation() {return !litecoinLightFundingSelected() && litecoinOperationAllowed() && litecoinReservationStatus().value("canPrepare").toBool() && m_ltcReservation->prepare();}
 bool DexEngine::startLitecoinRecovery(const QByteArray &psbt) { return litecoinOperationAllowed() && m_ltcNegotiation && m_ltcNegotiation->startRecovery(psbt); }
+void DexEngine::retryLitecoinRecoveryStart(int attemptsLeft) {
+    if (m_ltcRecoveryPending.isEmpty()) return;
+    const bool started=m_ltcNegotiation && m_ltcNegotiation->status().value("recoveryStarted").toBool();
+    if (started || (litecoinLightFundingAllowed() && startLitecoinRecovery(m_ltcRecoveryPending))) {m_ltcRecoveryPending.clear();return;}
+    if (attemptsLeft<=0) {
+        m_ltcRecoveryPending.clear();
+        qWarning("DEX: the recovery exchange did not start after funding was prepared; use \"Resume saved recovery exchange\"");
+        return;
+    }
+    QTimer::singleShot(3000,this,[this,attemptsLeft]{retryLitecoinRecoveryStart(attemptsLeft-1);});
+}
 QVariantMap DexEngine::litecoinJournalStatus() const { return litecoinAppView(m_ltcJournal->status()); }
 bool DexEngine::configureLitecoinJournal(const QString &path) {
     if (!m_ltcJournal->configure(path)) return false;

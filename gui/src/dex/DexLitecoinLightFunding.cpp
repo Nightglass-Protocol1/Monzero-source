@@ -43,7 +43,10 @@ bool DexEngine::useLitecoinLightWallet() {
 bool DexEngine::queryLitecoinLightTerms(){return litecoinLightFundingAllowed() && m_ltcLightFunding->queryTerms();}
 bool DexEngine::prepareLitecoinLightFunding(const QString &fee,int confirmations){return confirmations>0 && confirmations<=1000 && litecoinLightFundingAllowed(true) && m_ltcLightFunding->prepare(fee,quint32(confirmations));}
 bool DexEngine::reopenLitecoinLightFunding(){return litecoinLightFundingAllowed(true) && m_ltcLightFunding->reopen();}
-bool DexEngine::reviewLitecoinLightSignature(){return litecoinLightFundingAllowed() && m_ltcLightFunding->reviewSignature();}
+// Signing is reviewed against both parties' saved recovery messages, so it waits for that exchange.
+bool DexEngine::reviewLitecoinLightSignature(){
+    return litecoinLightFundingAllowed() && m_ltcNegotiation->status().value("recoveryComplete").toBool() && m_ltcLightFunding->reviewSignature();
+}
 bool DexEngine::signLitecoinLightFunding(const QString &commitment,const QString &password){
     if(!litecoinLightFundingAllowed())return false;
     auto bytes=password.toUtf8();const bool result=m_ltcLightFunding->sign(commitment,bytes);

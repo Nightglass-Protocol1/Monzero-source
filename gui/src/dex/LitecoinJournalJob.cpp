@@ -483,6 +483,10 @@ void LitecoinJournalJob::finish(bool success) {
             && wallet.value("fundingImported")==true && wallet.value("executable")==false) {
             m_snapshot=snapshot.toVariantMap();m_walletResult=wallet.toVariantMap();m_walletAddress=address;
             m_walletState="verified";m_walletRestoreAttempted=true;
+        } else if (m_walletOperation=="restore") {
+            // A restore that failed (for example before the redemption confirmed) may be tried
+            // again; when the wallet file was already made, the retry fails and "open" is used.
+            m_walletRestoreAttempted=false;
         }
         m_walletSnapshot.clear();m_pendingReview.clear();m_output.clear();m_input.clear();emit changed();return;
     }

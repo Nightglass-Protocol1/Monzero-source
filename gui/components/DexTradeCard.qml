@@ -14,8 +14,8 @@ Rectangle {
     // pair "BTC/XMZ"; side "SELL" sells the coin for XMZ, "BUY" buys the coin with XMZ;
     // price is XMZ per one coin in XMZ atomic units (11 decimals); amount is in coin atomic units.
     property var offers: []
-    property var coins: ["BTC", "LTC", "BCH", "BNB"]
-    property var coinDecimals: ({ "BTC": 8, "LTC": 8, "BCH": 8, "BNB": 18 })
+    property var coins: ["BTC", "LTC", "BCH", "BNB", "ETH"]
+    property var coinDecimals: ({ "BTC": 8, "LTC": 8, "BCH": 8, "BNB": 18, "ETH": 18 })
     property real xmzBalance: -1          // unlocked XMZ; -1 when unknown
     property real feePercent: 1
     property bool canStart: false

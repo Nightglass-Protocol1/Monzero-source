@@ -115,7 +115,12 @@ async fn check_funds(role: Role, listing: &Listing, key: &PrivateKeySigner, cfg:
             let provider = ProviderBuilder::new().connect_http(cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
             let have = provider.get_balance(key.address()).await.map_err(|e| e.to_string())?;
             if have < listing.value {
-                return Err(format!("the trade account {} holds {have} wei; this offer needs {} wei plus fees", key.address(), listing.value));
+                // In coins, not wei: this is what the person reads before sending from their wallet
+                let coins = alloy::primitives::utils::format_ether;
+                return Err(format!(
+                    "the trade account {} holds {}; this offer needs {} plus network fees. Send at least {} more to it (for example from MetaMask), then try again",
+                    key.address(), coins(have), coins(listing.value), coins(listing.value - have)
+                ));
             }
         }
         Role::Claimer => {

@@ -88,7 +88,7 @@ ColumnLayout {
     }
     RowLayout {
         visible: panel.hasPayment
-        M.StandardButton { objectName: "lightDexReviewSign"; enabled: panel.idle; text: qsTr("Review signing"); onClicked: panel.started(panel.backend.reviewLitecoinLightSignature()) }
+        M.StandardButton { objectName: "lightDexReviewSign"; enabled: panel.idle && panel.funding.recoveryComplete === true; text: qsTr("Review signing"); onClicked: panel.started(panel.backend.reviewLitecoinLightSignature()) }
         M.StandardButton { objectName: "lightDexReviewSend"; enabled: panel.idle; text: qsTr("Review sending"); onClicked: panel.started(panel.backend.reviewLitecoinLightSend()) }
     }
     M.TextPlain {

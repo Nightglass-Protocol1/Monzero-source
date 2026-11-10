@@ -77,7 +77,7 @@ Rectangle {
             themeTransition: false; color: MonzeroComponents.Style.dimmedFontColor; font.pixelSize: 11
             Layout.fillWidth: true; wrapMode: Text.Wrap
             text: wallet.coin === "BNB" || wallet.coin === "ETH"
-                ? qsTr("Fund BNB trades from MetaMask and receive BNB back to it. The app still runs the swap and any refund automatically.")
+                ? qsTr("Fund %1 trades from MetaMask and receive %1 back to it. The app still runs the swap and any refund automatically.").arg(wallet.coin)
                 : qsTr("%1 you receive is paid straight to this wallet, and if a trade you pay %1 into does not complete, it is refunded here.").arg(wallet.coin)
                   + (wallet.coin === "LTC" ? " " + qsTr("Use a native SegWit address (ltc1…).") : "")
         }

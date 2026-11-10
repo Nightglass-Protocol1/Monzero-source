@@ -370,6 +370,7 @@ public:
     int litecoinReconnectsForTesting() const;
 #endif
     bool startLitecoinRecovery(const QByteArray &reservedPsbt);
+    void retryLitecoinRecoveryStart(int attemptsLeft);
     QVariantMap litecoinLightFundingStatus() const;
     Q_INVOKABLE bool useLitecoinLightWallet();
     Q_INVOKABLE bool queryLitecoinLightTerms();
@@ -602,6 +603,7 @@ private:
     LitecoinJournalJob *m_ltcJournal;
     LitecoinReservationJob *m_ltcReservation;
     LitecoinLightFundingController *m_ltcLightFunding;
+    QByteArray m_ltcRecoveryPending;   // prepared funding PSBT whose recovery exchange has not started yet
     LitecoinRedemptionJob *m_ltcRedemption;
     QPointer<LitecoinNegotiationSession> m_ltcNegotiation;
     NativeFeePreviewController *m_feePreviewController;

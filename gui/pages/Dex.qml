@@ -181,6 +181,12 @@ Rectangle {
     property string evmMarketError: ""
     // The lab panels are for testers; traders see the trade card first.
     property bool showAdvanced: false
+    // The coin of the active ETH/BNB trade, from the chain its offer names
+    readonly property string evmTradeCoin: {
+        var offer = root.evmTrade && root.evmTrade.snapshot ? root.evmTrade.snapshot.offer : null
+        var id = offer ? Number(offer.chainId) : 0
+        return id === 1 || id === 11155111 ? "ETH" : "BNB"
+    }
     // The user's own wallets (optional), per coin; BNB keeps its earlier MetaMask setting
     property var externalWallets: {
         var m = {}
@@ -437,12 +443,12 @@ Rectangle {
             Layout.fillWidth: true
             visible: root.evmTrade.configured === true
             trade: root.evmTrade
-            coin: "BNB"
+            coin: root.evmTradeCoin
             errorText: root.evmTradeError
             onApprove: root.evmTradeError = root.dex.approveEvmTrade(commitment) ? "" : qsTr("Approval could not start.")
             onRefresh: root.evmTradeError = root.dex.refreshEvmTrade() ? "" : qsTr("Refresh could not start.")
-            externalWallet: root.externalWallets.BNB || ""
-            onPayoutRequested: root.evmTradeError = root.dex.payoutEvmTrade(root.externalWallets.BNB || "") ? "" : qsTr("The payout could not start.")
+            externalWallet: root.externalWallets[root.evmTradeCoin] || ""
+            onPayoutRequested: root.evmTradeError = root.dex.payoutEvmTrade(root.externalWallets[root.evmTradeCoin] || "") ? "" : qsTr("The payout could not start.")
         }
         // Pair tabs, as on an exchange: each shows its last price and 24 h change from completed trades
         M.DexPairTabs {
@@ -452,7 +458,8 @@ Rectangle {
             coin: tradeCard.coin
             market: marketPanel
             coinDecimals: tradeCard.coinDecimals
-            onPicked: { tradeCard.coin = coin; tradeCard.reviewing = false }
+            // The tab also chooses the page's market, so its offers, wallet and trade panels follow
+            onPicked: { tradeCard.coin = coin; tradeCard.reviewing = false; root.selectPair(coin + " / XMZ") }
         }
 
         // Wide windows: market on the left, the trade form beside it; narrow: one column
@@ -2787,6 +2794,11 @@ Later addresses may be missing from this backup. Payment and active swap recover
             property string coin: root.evmMarket.coin || "ETH"
             property var listings: (root.evmMarket.listings || []).filter(function (l) { return l.pair === offerBoard.coin + "/XMZ" })
             function hoursLeft(t) { return Math.max(0, Math.round((t - Date.now() / 1000) / 360) / 10) }
+            readonly property string networkName: {
+                var id = Number(root.evmMarket.chainId)
+                return id === 1 ? qsTr("Ethereum Mainnet") : id === 56 ? qsTr("BNB Smart Chain") : id === 11155111 ? qsTr("Sepolia (test network)")
+                     : id === 97 ? qsTr("BNB Smart Chain Testnet") : qsTr("chain %1").arg(id)
+            }
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor; font.bold: true
                 text: qsTr("Offers: XMZ ↔ %1").arg(offerBoard.coin)
@@ -2794,6 +2806,28 @@ Later addresses may be missing from this backup. Payment and active swap recover
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
                 text: qsTr("Signed offers from the open relays (%1). Taking one starts a trade with its maker; your coins stay yours until the swap completes or refunds. Trades are small while the DEX is new.").arg((root.evmMarket.relays || []).length)
+            }
+            // Paying in from MetaMask: the trade account is this app's own; it must hold the coin
+            // (and a little for network fees) before an offer is posted or taken
+            RowLayout {
+                objectName: "evmFundFromMetaMask"
+                visible: tradingSetup.w.keysReady === true && (tradingSetup.w.tradeAccount || "") !== "" && Number(root.evmMarket.chainId) > 0
+                spacing: 14
+                Image {
+                    objectName: "evmFundQr"
+                    Layout.preferredWidth: 116; Layout.preferredHeight: 116; smooth: false; fillMode: Image.PreserveAspectFit
+                    // EIP-681: MetaMask mobile fills in the address and the network; the amount is the user's choice
+                    source: parent.visible ? "image://qrcode/ethereum:" + tradingSetup.w.tradeAccount + "@" + Number(root.evmMarket.chainId) : ""
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true; spacing: 6
+                    M.TextPlain {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
+                        text: qsTr("Using MetaMask? Send the %1 you want to trade, plus a little for network fees, to your trade account on %2: scan the code with MetaMask mobile or copy the address. When the trade is done, \"Send to MetaMask\" returns what the account holds.")
+                            .arg(offerBoard.coin).arg(offerBoard.networkName)
+                    }
+                    M.LineEdit { objectName: "evmFundAccount"; Layout.fillWidth: true; readOnly: true; copyButton: true; fontSize: 13; text: tradingSetup.w.tradeAccount || "" }
+                }
             }
             RowLayout {
                 M.StandardButton {
@@ -3468,7 +3502,7 @@ Later addresses may be missing from this backup. Payment and active swap recover
                     objectName: "litecoinShareFundingProof"
                     text: qsTr("Share confirmed XMZ funding with peer")
                     visible: root.litecoinNegotiation.role === "native-funder"
-                    enabled: root.litecoinNegotiation.canShareFunding === true
+                    enabled: root.litecoinNegotiation.canShareFunding === true && root.litecoinFunding.fundingCheckState === "confirmed"
                     onClicked: root.dex.startLitecoinRedemption("")
                 }
                 M.TextPlain {
