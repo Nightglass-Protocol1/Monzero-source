@@ -202,7 +202,7 @@
   // ---- trading
   function checks(owner, valueWei, xmzAtoms) {
     var s = st.status, lim = st.limits[st.coin];
-    if (!s || !s.wallet.keysReady) return "Unlock your trading keys in the Monzero wallet first (DEX page).";
+    if (!s || !s.wallet.keysReady) return "Your trading keys are locked. Press Unlock here; your Monzero wallet asks for your trading password.";
     if (s.trade && s.trade.configured && !(s.trade.snapshot && s.trade.snapshot.done)) return "A trade is already running. It has to finish first.";
     if (chain().control && (!lim || !lim.open)) return "Trading " + st.coin + " is not open right now.";
     if (lim && lim.open && (valueWei > lim.coin || xmzAtoms > lim.xmz))
@@ -210,7 +210,7 @@
     if (!owner) {
       var unlocked = toUnits(String(s.wallet.unlocked || "0"), 11) || 0n, wanted = xmzAtoms + xmzAtoms / 2n;
       if (unlocked < wanted) return "Your trading wallet needs " + fromUnits(wanted, 11, 2) + " XMZ unlocked (the amount plus a margin for fees); it has " + fromUnits(unlocked, 11, 2) +
-        ". Send XMZ from your main wallet to your trading wallet address shown in the Monzero wallet, and wait for it to unlock.";
+        ". Press Add XMZ above, confirm the transfer in your Monzero wallet, and wait about 20 minutes for it to be ready.";
     }
     return "";
   }
@@ -252,6 +252,12 @@
       if (!r.ok) throw new Error(r.message || "The wallet could not take this offer. What you paid in stays in your trade account; you can send it back to MetaMask below.");
       st.busy = "";
       say("Offer taken. Waiting for the other side to answer; then the wallet asks you to approve the trade.");
+    }).catch(fail);
+  }
+  // Things only the wallet may do (password, moving XMZ): the page asks it to show its own screen
+  function ask(path, body, told) {
+    api(path, body).then(function (r) {
+      if (r && r.ok) say(told); else fail(new Error((r && r.message) || (r && r.error === "wait a moment" ? "One moment, then try again." : "The wallet could not do that now.")));
     }).catch(fail);
   }
   function cancel(folder) {
@@ -342,16 +348,19 @@
       h = '<p class="pro-order-lede">Look at your Monzero wallet. Accept the connection there if it shows this code:</p><p class="tp-code">' + esc(st.pairing.code) + "</p>";
     } else if (!st.link || !st.status) {
       h = '<p class="pro-order-lede">Trade ' + st.coin + ' for XMZ with <strong>MetaMask</strong>. Your <strong>Monzero wallet</strong> on this computer runs the swap and asks you to approve each trade; nobody holds your coins.</p>' +
-        '<ol class="tp-steps"><li>Open your Monzero wallet and unlock your trading keys on its DEX page.</li><li>Connect here; accept in the wallet.</li><li>Pick an offer. MetaMask pays in, the wallet asks you to approve.</li></ol>' +
+        '<ol class="tp-steps"><li>Open your Monzero wallet on this computer.</li><li>Connect here; the wallet shows a code to accept and asks for a trading password.</li><li>Pick an offer. MetaMask pays in, the wallet asks you to approve.</li></ol>' +
         '<div class="swap-reveal-cta"><button class="button primary" type="button" data-act="connect"' + (st.busy ? " disabled" : "") + ">" + (st.link ? "Reconnect" : "Connect MetaMask and wallet") + '</button><a class="button secondary" href="/download/">Get the wallet</a></div>';
     } else {
       var s = st.status, w = s.wallet, t = s.trade || {}, m = (s.markets || {})[st.coin] || {};
-      h += '<ul class="relay-facts"><li><span>Wallet</span><strong>connected · ' + esc(String(w.unlocked || "0")) + " XMZ ready</strong></li><li><span>MetaMask</span><strong>" + esc(short(s.account)) +
+      h += '<ul class="relay-facts"><li><span>Wallet</span><strong>connected · ' + esc(String(w.unlocked || "0")) + ' XMZ ready</strong> <button class="tp-link" type="button" data-act="xmz-add">Add XMZ</button>' +
+        (Number(w.unlocked) > 0 ? ' · <button class="tp-link" type="button" data-act="xmz-return">Move back</button>' : "") + "</li><li><span>MetaMask</span><strong>" + esc(short(s.account)) +
         "</strong></li><li><span>Network</span><strong>" + esc(c.name) + "</strong></li></ul>";
       if (st.account && s.account && st.account.toLowerCase() !== s.account.toLowerCase())
         h += '<p class="tp-err">MetaMask is now on another account. Proceeds still go to ' + esc(short(s.account)) + ", the account you accepted in the wallet. Disconnect and connect again to change it.</p>";
       var live = t.configured && t.tradeId && st.dismissed !== t.tradeId;
-      if (!w.keysReady) h += '<p class="tp-act">Open the DEX page in your Monzero wallet and create or unlock your trading keys. This page continues by itself.</p>';
+      if (!w.keysReady) h += '<p class="tp-act">' + (w.keysBusy ? "Your wallet is unlocking your trading keys…" : w.keysExist ? "Your trading keys are locked. Your Monzero wallet asks for your trading password."
+        : "One more step: your Monzero wallet asks you to choose a trading password.") + '</p>' +
+        (w.keysBusy ? "" : '<button class="button primary" type="button" data-act="unlock">' + (w.keysExist ? "Unlock in the wallet" : "Set it up in the wallet") + "</button>");
       else if (live) h += tradeHTML(t);
       else {
         var lim = st.limits[st.coin];
@@ -398,6 +407,9 @@
     else if (act === "cancel") cancel(b.getAttribute("data-folder"));
     else if (act === "return") giveBack();
     else if (act === "topup") topUp();
+    else if (act === "unlock") ask("/v1/unlock", {}, "Look at your Monzero wallet: it is asking for your trading password.");
+    else if (act === "xmz-add") ask("/v1/xmz-add", {}, "Look at your Monzero wallet: its Send page is open with your trading wallet filled in. Enter the amount and confirm there. New XMZ is ready to trade after about 20 minutes.");
+    else if (act === "xmz-return") ask("/v1/xmz-return", {}, "Look at your Monzero wallet: confirm there to move your trading XMZ back to your main balance.");
     else if (act === "dismiss") { st.dismissed = st.status.trade.tradeId; st.note = ""; render(); }
   });
   box.addEventListener("input", function (e) {
