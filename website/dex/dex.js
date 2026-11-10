@@ -337,6 +337,7 @@
       $("pro-note").textContent = "Signed offers from the open relays";
       $("r-relay").textContent = r[0].relay;
       renderBook(r[0].listings || []);
+      announce(r[0].listings || []);
       renderTrades(r[1].prints || []);
       renderChart(r[2].candles || []);
     }).catch(function () { if (gen === pro.gen) noRelay("The relays could not be reached"); });
@@ -352,7 +353,9 @@
     $("pro-pair").innerHTML = pDot("XMZ") + '<span>XMZ / ' + pro.coin + '</span><span class="ccaret">▾</span>';
     $("chart-sub").textContent = "XMZ / " + pro.coin + " · completed swaps";
   }
-  function show() { syncPair(); load(); }
+  // The trade panel (dex-trade.js) follows the selected pair and the relays' offers
+  function announce(listings) { document.dispatchEvent(new CustomEvent("monzero-dex-book", { detail: { coin: pro.coin, listings: listings || [] } })); }
+  function show() { syncPair(); announce([]); load(); }
 
   function start() { stop(); if (!document.hidden && !$("view-pro").hidden) pro.timer = setInterval(load, 30000); }
   function stop() { if (pro.timer) { clearInterval(pro.timer); pro.timer = null; } }

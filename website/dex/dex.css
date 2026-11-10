@@ -293,3 +293,26 @@
 .book-empty { margin: 10px 2px; color: var(--dim); font: 500 12px var(--mono); }
 a.trade-row { color: inherit; text-decoration: none; border-radius: 4px; }
 a.trade-row:hover, a.trade-row:focus-visible { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+
+/* Trading from the page (dex-trade.js) */
+.trade-panel h3 { font-size: 13px; margin: 16px 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.tp-steps { margin: 0 0 12px; padding-left: 20px; color: var(--muted); font-size: 13.5px; line-height: 1.6; }
+.tp-code { font: 700 34px var(--mono); letter-spacing: .12em; text-align: center; margin: 10px 0 14px; color: var(--text); }
+.tp-side { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 4px 0 8px; }
+.tp-side button { padding: 9px 10px; border-radius: 8px; border: 1px solid var(--line, #2c3a47); background: transparent; color: var(--muted); font: 600 13px inherit; cursor: pointer; }
+.tp-side button.on { background: var(--accent, #3b82f6); border-color: var(--accent, #3b82f6); color: #fff; }
+.tp-offers { list-style: none; margin: 0 0 6px; padding: 0; display: grid; gap: 6px; }
+.tp-offers li { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13.5px; color: var(--text); }
+.tp-offers li span { overflow-wrap: anywhere; }
+.tp-offers .button { padding: 6px 14px; min-height: 0; font-size: 13px; }
+.tp-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 6px; }
+.tp-form label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+.tp-form input { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--line, #2c3a47); background: transparent; color: var(--text); font: 500 14px var(--mono); }
+.tp-note { color: var(--muted); font-size: 12.5px; line-height: 1.5; margin: 8px 0; }
+.tp-say { color: var(--text); font-size: 13.5px; line-height: 1.5; margin: 12px 0 0; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line, #2c3a47); }
+.tp-err { color: #ef6b6b; font-size: 13.5px; line-height: 1.5; margin: 10px 0 0; }
+.tp-act { color: var(--text); font-weight: 600; font-size: 14px; line-height: 1.5; margin: 10px 0; }
+.tp-terms, .tp-stage { font-size: 14px; line-height: 1.5; margin: 8px 0; color: var(--text); }
+.tp-links { font-size: 12.5px; color: var(--muted); margin: 8px 0; overflow-wrap: anywhere; }
+.tp-link { background: none; border: 0; padding: 0; color: var(--accent, #3b82f6); font: inherit; cursor: pointer; text-decoration: underline; }
+@media (max-width: 520px) { .tp-form { grid-template-columns: 1fr; } }
