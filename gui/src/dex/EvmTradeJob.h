@@ -19,6 +19,8 @@ public:
     // Let go of a finished trade so the next one can be opened (one trade at a time). False while
     // the trade is still running or a step is in flight.
     bool release();
+    // Give up a trade this side never approved (nothing of ours is locked yet). False once approved.
+    bool abandon();
     bool refresh();
     bool approve(const QString &commitment);
     bool tick(QByteArray &walletSeed);

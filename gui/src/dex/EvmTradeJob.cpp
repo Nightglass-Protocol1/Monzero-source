@@ -37,8 +37,19 @@ bool snapshotValid(const QJsonObject &r) {
     static const QRegularExpression hash("\\A0x[0-9a-f]{64}\\z"),stage("\\A[A-Za-z]{1,32}(\\([A-Za-z]{1,16}\\))?\\z");
     static const QRegularExpression address("\\A0x[0-9a-fA-F]{40}\\z"),wei("\\A[0-9]{1,78}\\z");
     static const QSet<QString> allowed{"schema","ok","role","stage","done","approved","commitment","offer","deadlines",
-        "evmTxs","xmzLock","xmzSweeps","awaitingApproval","account","awaitingFunding","payout"};
+        "evmTxs","xmzLock","xmzSweeps","awaitingApproval","account","awaitingFunding","payout","progress"};
     for (auto i=r.begin();i!=r.end();++i) if (!allowed.contains(i.key())) return false;
+    // Shown only ("8 of 10 confirmations"): small whole numbers under the two known names
+    if (r.contains("progress") && !r.value("progress").isNull()) {
+        const auto progress=r.value("progress").toObject();
+        if (!r.value("progress").isObject() || progress.size()>2) return false;
+        for (auto i=progress.begin();i!=progress.end();++i) {
+            const auto count=i.value().toObject();
+            const double have=count.value("confirmations").toDouble(-1),needed=count.value("needed").toDouble(-1);
+            if ((i.key()!="xmzLock" && i.key()!="xmzSweep") || count.size()!=2 || have<0 || needed<1 || needed>1000 || have>needed
+                || have!=qint64(have) || needed!=qint64(needed)) return false;
+        }
+    }
     const auto offer=r.value("offer").toObject();
     if (r.contains("account") && !address.match(r.value("account").toString()).hasMatch()) return false;
     if (r.contains("awaitingFunding") && !r.value("awaitingFunding").isNull()) {
@@ -99,6 +110,17 @@ bool EvmTradeJob::release() {
     m_error.clear();m_pendingApproval.clear();m_stepError.clear();m_source.clear();m_config=QJsonObject();m_snapshot=QJsonObject();
     m_funding.clear();m_payout.clear();m_errors=0;m_awaitingApproval=false;m_state="unconfigured";
     emit changed();return true;
+}
+bool EvmTradeJob::abandon() {
+    const auto stage=m_snapshot.value("stage").toString();
+    if (m_path.isEmpty() || m_busy || m_tradeDir.isEmpty() || m_snapshot.value("approved").toBool()
+        || (stage!="Start" && stage!="WaitingForEvmLock")) return false;
+    QFile mark(m_tradeDir+"/abandoned");
+    if (!mark.open(QIODevice::WriteOnly)) return false;
+    mark.write("abandoned before approval\n");mark.close();
+    // As release(), for a trade that is not done
+    m_snapshot.insert("done",true);
+    return release();
 }
 bool EvmTradeJob::sourceMatches() const {
     return !m_path.isEmpty() && LitecoinJournalProtocol::privateConfig(m_path)==m_source && BackendExecutable::matches(m_program,m_digest);

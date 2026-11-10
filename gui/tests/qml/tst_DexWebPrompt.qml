@@ -38,6 +38,8 @@ TestCase {
         function sendFromDexWallet(address, amount) { returnedTo = address; return true }
         property string approved: ""
         function approveEvmTrade(commitment) { approved = commitment; return true }
+        property int abandoned: 0
+        function abandonEvmTrade() { abandoned++; evmTradeStatus = ({}); return true }
     }
     Components.DexWebPrompt { id: prompt; dex: test.dex; web: test.web }
 
@@ -137,5 +139,32 @@ TestCase {
         compare(dex.returnedTo, "FXmain")
         mouseClick(inside(dialog.contentItem, "dexWebReturnClose"))
         tryVerify(function () { return !dialog.opened })
+    }
+    function test_a_running_trade_shows_a_status_line_in_the_wallet() {
+        var bar = findChild(prompt, "dexWebTradeBar"), text = findChild(prompt, "dexWebTradeBarText")
+        web.connection = { origin: "https://monzero.org", account: "0xaD13C3F11Dd4FeE608e6764ac3e48b03952E630b" }
+        dex.evmTradeStatus = ({})
+        verify(!bar.visible)
+        dex.evmTradeStatus = { configured: true, snapshot: { role: "claimer", stage: "XmzLockSent", approved: true, done: false, progress: { xmzLock: { confirmations: 8, needed: 10 } } } }
+        verify(bar.visible)
+        verify(text.text.indexOf("step 2 of 4: locking your XMZ (8 of 10 confirmations)") > 0, text.text)
+        dex.evmTradeStatus = { configured: true, snapshot: { role: "owner", stage: "Sweeping", approved: true, done: false, progress: { xmzSweep: { confirmations: 3, needed: 10 } } } }
+        verify(text.text.indexOf("step 6 of 6: your XMZ is arriving (3 of 10 confirmations)") > 0, text.text)
+        dex.evmTradeStatus = { configured: true, snapshot: { role: "owner", stage: "Done(Swapped)", approved: true, done: true } }
+        verify(!bar.visible)
+        dex.evmTradeStatus = { configured: true, snapshot: { role: "owner", stage: "Start", approved: false, done: false } }
+        verify(!bar.visible)   // an old trade nobody approved is not "in progress"
+        dex.evmTradeStatus = ({}); web.connection = ({})
+    }
+    function test_b_an_unapproved_trade_can_be_cancelled_from_the_prompt() {
+        var dialog = popup("dexWebApproveDialog")
+        web.connection = { origin: "https://monzero.org", account: "0xaD13C3F11Dd4FeE608e6764ac3e48b03952E630b" }
+        dex.evmTradeStatus = { awaitingApproval: true, commitment: "0xc0c", snapshot: { role: "owner", stage: "Start", offer: { chainId: 56, value: "1", xmzAmount: "1" } } }
+        tryVerify(function () { return dialog.opened })
+        mouseClick(inside(dialog.contentItem, "dexWebApproveCancel"))
+        compare(dex.abandoned, 1)
+        tryVerify(function () { return !dialog.opened })
+        compare(dex.approved, "0xabc")   // nothing was approved
+        web.connection = ({})
     }
 }

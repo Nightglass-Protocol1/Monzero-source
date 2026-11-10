@@ -122,6 +122,7 @@ Item {
             }
             RowLayout {
                 Layout.alignment: Qt.AlignRight; spacing: 12
+                M.StandardButton { objectName: "dexWebApproveCancel"; text: qsTr("Cancel this trade"); primary: false; onClicked: prompt.dex.abandonEvmTrade() }
                 M.StandardButton { objectName: "dexWebApproveLater"; text: qsTr("Not now"); primary: false; onClicked: { prompt.dismissedTrade = prompt.trade.commitment; approveDialog.close() } }
                 M.StandardButton { objectName: "dexWebApprove"; text: qsTr("Approve"); onClicked: prompt.dex.approveEvmTrade(prompt.trade.commitment) }
             }
@@ -198,6 +199,42 @@ Item {
                     onClicked: returnDialog.note = prompt.dex.sendFromDexWallet(prompt.mainAddress(), "")
                         ? qsTr("Sent. It shows in your main balance after a few minutes.") : qsTr("That could not start now. Try again in a moment.")
                 }
+            }
+        }
+    }
+
+    // While a trade runs: one line at the bottom of the wallet, whatever page is open, so it is
+    // clear that something is in progress and that the wallet has to stay open
+    Rectangle {
+        id: tradeBar
+        objectName: "dexWebTradeBar"
+        readonly property var snapshot: prompt.trade.snapshot || ({})
+        readonly property bool running: prompt.trade.configured === true && snapshot.done !== true && (snapshot.stage || "") !== ""
+            && (snapshot.approved === true || prompt.trade.awaitingApproval === true)
+        readonly property var steps: snapshot.role === "owner" ? ["Start", "LockSent", "Locked", "ReadySent", "Ready", "Sweeping"]
+            : ["WaitingForEvmLock", "XmzLockSent", "XmzLocked", "ClaimSent"]
+        readonly property var texts: ({
+            "Start": qsTr("waiting for your approval"), "LockSent": qsTr("locking your coin"), "Locked": qsTr("waiting for the seller's XMZ"),
+            "ReadySent": qsTr("releasing the swap"), "Ready": qsTr("waiting for the seller to claim"), "Sweeping": qsTr("your XMZ is arriving"),
+            "WaitingForEvmLock": qsTr("waiting for the buyer's coin"), "XmzLockSent": qsTr("locking your XMZ"), "XmzLocked": qsTr("waiting for the buyer to release"),
+            "ClaimSent": qsTr("claiming your coin"), "RefundSent": qsTr("refunding your coin"), "WaitingForRefund": qsTr("waiting for the buyer's refund"),
+            "SweepingBack": qsTr("taking your XMZ back") })
+        readonly property var counted: {
+            var p = snapshot.progress || ({})
+            var c = snapshot.stage === "Sweeping" || snapshot.stage === "SweepingBack" ? p.xmzSweep : (snapshot.stage === "Locked" || snapshot.stage === "XmzLockSent") ? p.xmzLock : null
+            return c && c.needed ? qsTr(" (%1 of %2 confirmations)").arg(c.confirmations).arg(c.needed) : ""
+        }
+        visible: running
+        anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
+        height: 34; color: "#16303a"; border.color: "#2f6f7a"
+        M.TextPlain {
+            objectName: "dexWebTradeBarText"
+            anchors.verticalCenter: parent.verticalCenter; anchors.left: parent.left; anchors.leftMargin: 16; anchors.right: parent.right; anchors.rightMargin: 16
+            elide: Text.ElideRight; color: "#f0f5fa"; font.pixelSize: 13; themeTransition: false
+            text: {
+                var at = tradeBar.steps.indexOf(tradeBar.snapshot.stage || "")
+                var where = at >= 0 ? qsTr("step %1 of %2: ").arg(at + 1).arg(tradeBar.steps.length) : ""
+                return qsTr("DEX trade in progress, %1%2%3. Keep the wallet open.").arg(where).arg(tradeBar.texts[tradeBar.snapshot.stage] || tradeBar.snapshot.stage || "").arg(tradeBar.counted)
             }
         }
     }

@@ -311,6 +311,21 @@ impl WalletRpcXmz {
         }
     }
 
+    /// What the user is shown while waiting ("8 of 10 confirmations"): written next to the record,
+    /// best effort. Nothing reads it to decide anything.
+    fn note_progress(&self, what: &str, confirmations: u64, needed: u64) {
+        let Some(dir) = self.cfg.record.parent() else { return };
+        let path = dir.join("progress.json");
+        let mut all: serde_json::Map<String, Value> =
+            std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let entry = json!({"confirmations": confirmations.min(needed), "needed": needed});
+        if all.get(what) == Some(&entry) {
+            return;
+        }
+        all.insert(what.into(), entry);
+        let _ = std::fs::write(&path, Value::Object(all).to_string());
+    }
+
     fn save(&self, record: &XmzRecord) -> Result<(), DriverError> {
         let text = serde_json::to_string_pretty(record).map_err(xmz_err)?;
         crate::driver::durable_write(&self.cfg.record, text.as_bytes()).map_err(xmz_err)
@@ -370,6 +385,13 @@ impl WalletRpcXmz {
     /// Relay a kept transaction. Relaying again is fine; if the node refuses it, the
     /// transaction counts as relayed when the wallet already knows it.
     async fn relay(rpc: &WalletRpc, tx: &Retained) -> Result<(), DriverError> {
+        // Already in a block: relaying it once more would only leave a second, "failed" copy of it
+        // in the wallet's history
+        if let Ok(known) = rpc.call("get_transfer_by_txid", json!({"txid": tx.tx_hash})).await {
+            if known["transfer"]["type"].as_str() == Some("out") && known["transfer"]["height"].as_u64().unwrap_or(0) > 0 {
+                return Ok(());
+            }
+        }
         match rpc.call("relay_tx", json!({"hex": tx.metadata})).await {
             Ok(_) => {
                 // A transaction built with do_not_relay and relayed later leaves its inputs counted
@@ -405,6 +427,9 @@ impl XmzSide for WalletRpcXmz {
             }
             amount = amount.checked_add(t["amount"].as_u64().ok_or_else(|| xmz_err("transfer without an amount"))?).ok_or_else(|| xmz_err("amount overflow"))?;
             confirmations = confirmations.min(t["confirmations"].as_u64().unwrap_or(0));
+        }
+        if amount > 0 {
+            self.note_progress("xmzLock", confirmations, crate::machine::Timing::BSC.xmz_confirmations);
         }
         Ok((amount > 0).then_some(XmzLock { amount, confirmations }))
     }
@@ -491,13 +516,15 @@ impl XmzSide for WalletRpcXmz {
         };
         self.open(Opened::Spend, None).await?;
         self.swap.call("refresh", json!({})).await?;
+        let mut least = u64::MAX;
         for tx in &txs {
             let found = self.swap.call("get_transfer_by_txid", json!({"txid": tx.tx_hash})).await?;
-            if found["transfer"]["confirmations"].as_u64().unwrap_or(0) < self.cfg.sweep_confirmations {
-                return Ok(false);
-            }
+            least = least.min(found["transfer"]["confirmations"].as_u64().unwrap_or(0));
         }
-        Ok(true)
+        if !txs.is_empty() {
+            self.note_progress("xmzSweep", least, self.cfg.sweep_confirmations);
+        }
+        Ok(!txs.is_empty() && least >= self.cfg.sweep_confirmations)
     }
 }
 

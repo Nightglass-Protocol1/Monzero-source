@@ -42,6 +42,7 @@ public:
     static QString weiToCoin(const QString &valueWei);
     // Folders of trades whose keys were agreed (running or finished)
     QStringList agreedFolders() const;
+    void rescan() {scanFolders();emit changed();}
 signals:
     void changed();
     void agreed(const QString &tradeDir);

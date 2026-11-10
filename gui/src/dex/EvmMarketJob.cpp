@@ -133,7 +133,7 @@ void EvmMarketJob::scanFolders() {
         if (!listingValid(f.listing)) continue;
         f.listingId=f.listing.value("listing").toObject().value("id").toString();
         f.state=QFile::exists(path+"/journal.json") ? "agreed" : (maker && !o.value("takenBy").isNull() ? "agreed" : "open");
-        if (QFile::exists(path+"/cancelled")) f.state="cancelled";
+        if (QFile::exists(path+"/cancelled") || QFile::exists(path+"/abandoned")) f.state="cancelled";
         m_folders.append(f);
     }
 }

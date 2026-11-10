@@ -120,7 +120,7 @@ QVariantMap DexWebBridge::statusFor() const {
     for (auto it=markets.cbegin();it!=markets.cend();++it)
         marketOut.insert(it.key(),pick(it.value().toMap(),{"coin","chainId","configured","busy","state","mine","message","error","withdrawal"}));
     auto tradeOut=pick(trade,{"configured","busy","state","tradeId","commitment","awaitingApproval","awaitingFunding","startRefusal","error","payout","account"});
-    tradeOut.insert("snapshot",pick(trade.value("snapshot").toMap(),{"stage","role","done","offer","evmTxs","xmzSweeps","approved"}));
+    tradeOut.insert("snapshot",pick(trade.value("snapshot").toMap(),{"stage","role","done","offer","evmTxs","xmzSweeps","approved","progress","deadlines"}));
     return {{"wallet",pick(wallet,{"state","balance","unlocked","address","keysReady","keysExist","keysBusy","tradeAccount","error"})},
         {"markets",marketOut},{"trade",tradeOut},{"account",m_account}};
 }
@@ -239,6 +239,8 @@ QByteArray DexWebBridge::respond(const Request &r,int *status) {
         }
         return json({{"ok",true}});
     }
+    // Giving up a trade that was never approved moves nothing: the page may ask for it
+    if (r.path=="/v1/abandon") return json({{"ok",call("abandonEvmTrade",{})}});
     if (r.path=="/v1/disconnect") {disconnectPage();return json({{"ok",true}});}
     return fail(404,"unknown");
 }

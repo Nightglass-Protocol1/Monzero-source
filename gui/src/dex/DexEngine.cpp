@@ -837,6 +837,12 @@ bool DexEngine::payoutEvmTrade(const QString &address) {
     QByteArray seed=evmSeed();
     return m_evmTrade->payout(seed,address);
 }
+bool DexEngine::abandonEvmTrade() {
+    if (!m_evmTrade->abandon()) return false;
+    m_evmTicker->stop();m_evmStartRefusal.clear();
+    for (auto *job:m_evmMarkets) job->rescan();
+    emit evmTradeChanged();emit evmMarketChanged();return true;
+}
 void DexEngine::stepEvmTrade() {
     const auto s=m_evmTrade->status();
     const auto snapshot=s.value("snapshot").toMap();

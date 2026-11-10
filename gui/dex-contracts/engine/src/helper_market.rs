@@ -127,7 +127,7 @@ async fn check_funds(role: Role, listing: &Listing, key: &PrivateKeySigner, cfg:
             let main = rpc(&cfg.main_wallet)?;
             main.call("refresh", json!({})).await.map_err(|e| e.to_string())?;
             let unlocked = main.call("get_balance", json!({})).await.map_err(|e| e.to_string())?["unlocked_balance"].as_u64().unwrap_or(0);
-            let needed = listing.xmz.saturating_add(listing.xmz / 2);
+            let needed = xmz_needed(listing.xmz);
             if unlocked < needed {
                 return Err(format!("the XMZ wallet has {unlocked} atoms unlocked; this offer needs {needed} (the amount plus a margin for fees)"));
             }
@@ -389,6 +389,10 @@ pub fn funds_in_use(root: &Path, now: u64) -> Result<Option<String>, String> {
         if !dir.is_dir() {
             continue;
         }
+        // A trade the user gave up before approving it: nothing of it was ever locked
+        if dir.join("abandoned").exists() {
+            continue;
+        }
         let journal = dir.join("journal.json");
         if journal.exists() {
             // A journal we cannot read is treated as a running trade
@@ -410,6 +414,12 @@ pub fn funds_in_use(root: &Path, now: u64) -> Result<Option<String>, String> {
         }
     }
     Ok(None)
+}
+
+/// What a seller's trading wallet must hold unlocked for an offer: the amount, plus room for the
+/// lock transaction's fee (about 0.01 XMZ): 1%, and never less than 1 XMZ.
+pub fn xmz_needed(atoms: u64) -> u64 {
+    atoms.saturating_add((atoms / 100).max(100_000_000_000))
 }
 
 /// Send what the trade account holds on this chain back to the user's own wallet (for example

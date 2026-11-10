@@ -239,6 +239,9 @@ public:
     Q_INVOKABLE bool approveEvmTrade(const QString &commitment);
     // After the trade: pay what its account holds to the user's own wallet (e.g. MetaMask)
     Q_INVOKABLE bool payoutEvmTrade(const QString &address);
+    // Give up the agreed trade before approving it (nothing is locked yet); the wallet is then free
+    // for another trade. The other side gets its coin back after its time limit if it already locked.
+    Q_INVOKABLE bool abandonEvmTrade();
     // Public offers for XMZ<->ETH/BNB through the open relays (see EvmMarketJob). Uses the same
     // seed file as the trade. A taken offer becomes the EVM trade above.
     bool configureEvmMarket(const QString &config,const QString &seedFile);

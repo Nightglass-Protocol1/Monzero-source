@@ -222,6 +222,7 @@ pub(crate) fn status(dir: &Path) -> Result<Value, String> {
         },
         "deadlines": deadlines,
         "evmTxs": evm_txs,
+        "progress": std::fs::read_to_string(dir.join("progress.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()),
         "xmzLock": xmz.lock.as_ref().map(|r| r.tx_hash.clone()),
         "xmzSweeps": xmz.sweep.as_ref().map(|v| v.iter().map(|r| r.tx_hash.clone()).collect::<Vec<_>>()),
     }))
