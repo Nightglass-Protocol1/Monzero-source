@@ -301,7 +301,9 @@
     if (t.payout && t.payout.tx) links.push('<a href="' + c.tx + esc(t.payout.tx) + '" rel="noopener" target="_blank">sent back to MetaMask</a>');
     if (links.length) h += '<p class="tp-links">On chain: ' + links.join(" · ") + "</p>";
     if (s.done) {
+      if (st.note.indexOf("Offer taken") === 0) st.note = "";
       if (t.payout && t.payout.tx) h += '<p class="tp-note">' + esc(fromUnits(BigInt(t.payout.amountWei), 18, 8)) + " " + st.coin + " went back to " + esc(short(t.payout.to)) + ".</p>";
+      else if (t.payout && t.payout.sent === false) h += '<p class="tp-note">Nothing was left in the trade account to send back to MetaMask.</p>';
       h += '<button class="button secondary" type="button" data-act="dismiss">New trade</button>';
     } else h += '<p class="tp-note">Keep the wallet open until this finishes. If the other side stops, your funds are returned after the time limit.</p>';
     return '<div class="tp-trade">' + h + "</div>";
