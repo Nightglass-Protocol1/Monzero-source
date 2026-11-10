@@ -22,8 +22,9 @@
                       rpcUrls: ["https://bsc-dataseed.binance.org"], blockExplorerUrls: ["https://bscscan.com"] } } };
   var PORTS = [38471, 38472, 38473, 38474, 38475];
   // Two wallets on one computer: ?wallet=38472 picks one (the wallet's port is one of the five)
-  (function () { var m = /[?&]wallet=(3847[1-5])(&|$)/.exec(location.search); if (m) PORTS = [Number(m[1])]; })();
+  // Each picked wallet keeps its own saved connection, so two tabs can be linked to two wallets
   var STORE = "monzero-dex-link";
+  (function () { var m = /[?&]wallet=(3847[1-5])(&|$)/.exec(location.search); if (m) { PORTS = [Number(m[1])]; STORE += "-" + m[1]; } })();
   var OWNER_GAS = 1500000n, CLAIMER_GAS = 500000n;   // what the wallet's engine wants in reserve, in gas units
 
   var st = {
@@ -31,6 +32,7 @@
     pairing: null, note: "", error: "", busy: "", limits: {}, timer: null, form: { xmz: "", price: "" }, dismissed: ""
   };
   try { st.link = JSON.parse(localStorage.getItem(STORE) || "null"); } catch (e) { st.link = null; }
+  if (st.link && PORTS.indexOf(st.link.port) < 0) st.link = null;   // saved for another wallet
 
   // ---- small helpers
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); }
@@ -353,6 +355,7 @@
     } else {
       var s = st.status, w = s.wallet, t = s.trade || {}, m = (s.markets || {})[st.coin] || {};
       h += '<ul class="relay-facts"><li><span>Wallet</span><strong>connected · ' + esc(String(w.unlocked || "0")) + ' XMZ ready</strong> <button class="tp-link" type="button" data-act="xmz-add">Add XMZ</button>' +
+        (w.tradeAccount ? ' <span class="tp-acct">trade account ' + esc(short(w.tradeAccount)) + "</span>" : "") +
         (Number(w.unlocked) > 0 ? ' · <button class="tp-link" type="button" data-act="xmz-return">Move back</button>' : "") + "</li><li><span>MetaMask</span><strong>" + esc(short(s.account)) +
         "</strong></li><li><span>Network</span><strong>" + esc(c.name) + "</strong></li></ul>";
       if (st.account && s.account && st.account.toLowerCase() !== s.account.toLowerCase())
