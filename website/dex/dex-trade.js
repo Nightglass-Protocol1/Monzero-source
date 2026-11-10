@@ -110,21 +110,36 @@
       .then(function (r) { if (r.error) throw new Error("Solana: " + (r.error.message || "request failed")); return r.result; });
   }
   function solBalance(account) { return solRpc("getBalance", [account, { commitment: "confirmed" }]).then(function (r) { return BigInt(r.value); }); }
-  // A plain transfer, laid out by hand (one signer, three accounts): the wallet only signs and sends it
-  function solTransferMessage(from, to, lamports, blockhash) {
-    var m = [1, 0, 1, 3].concat(b58decode(from), b58decode(to), new Array(32).fill(0), b58decode(blockhash), [1, 2, 2, 0, 1, 12, 2, 0, 0, 0]);
-    for (var i = 0n; i < 8n; i++) m.push(Number((lamports >> (8n * i)) & 255n));
-    return new Uint8Array(m);
+  // The Solana library the site already hosts (same origin), loaded only when SOL is traded
+  function loadWeb3() {
+    if (window.solanaWeb3) return Promise.resolve();
+    return new Promise(function (ok, no) {
+      var el = document.createElement("script");
+      el.src = "/app/solana-web3.iife.min.js";
+      el.onload = function () { window.solanaWeb3 ? ok() : no(new Error("The Solana library did not load.")); };
+      el.onerror = function () { no(new Error("The Solana library did not load.")); };
+      document.head.appendChild(el);
+    });
   }
+  // A plain transfer from the user's Solana wallet, which signs and sends it. Built with the
+  // standard library: a message laid out by hand was refused by Phantom ("Reached end of buffer").
   function solSend(to, lamports) {
     var from = st.link.solAccount, p = solProvider();
-    return p.connect({ onlyIfTrusted: false }).then(function (r) {
+    return loadWeb3().then(function () { return p.connect(); }).then(function (r) {
       var now = r && r.publicKey ? r.publicKey.toString() : "";
       if (now && now !== from) throw new Error("Phantom is on another account than the one you connected (" + short(from) + "). Switch back, or disconnect and connect again.");
       return solRpc("getLatestBlockhash", [{ commitment: "confirmed" }]);
     }).then(function (b) {
-      return p.request({ method: "signAndSendTransaction", params: { message: b58encode(solTransferMessage(from, to, lamports, b.value.blockhash)) } });
-    }).then(function (r) { return r.signature; });
+      var web3 = window.solanaWeb3, payer = new web3.PublicKey(from);
+      var tx = new web3.Transaction().add(web3.SystemProgram.transfer({ fromPubkey: payer, toPubkey: new web3.PublicKey(to), lamports: lamports }));
+      tx.feePayer = payer; tx.recentBlockhash = b.value.blockhash;
+      if (typeof p.signAndSendTransaction === "function") return p.signAndSendTransaction(tx);
+      return p.request({ method: "signAndSendTransaction", params: { message: b58encode(tx.serializeMessage()) } });
+    }).then(function (r) {
+      var id = r && (r.signature || r);
+      if (typeof id !== "string" || !id) throw new Error("Phantom did not return the payment's id.");
+      return id;
+    });
   }
   function solConfirmed(signature) {
     var tries = 0;
@@ -133,7 +148,10 @@
         var s = r && r.value && r.value[0];
         if (s && s.err) throw new Error("The payment failed on chain.");
         if (s && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) return s;
-        if (++tries > 90) throw new Error("The payment is taking long to confirm. Wait for it in Phantom, then try again: nothing is sent twice.");
+        // Phantom sends on the network it is set to, which the page cannot see. A payment that never
+        // shows up here was most likely sent on another one, where it is not valid and moves nothing.
+        if (++tries > 20) throw new Error("This payment has not appeared on " + chain().name + ". Check that Phantom is set to the same network" +
+          (chain().id === 501000101 ? "" : " (Settings, Developer Settings, Testnet Mode)") + ", then try again. A payment sent on another network is not valid there and moves nothing.");
         return sleep(2000).then(once);
       });
     }
