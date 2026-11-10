@@ -180,6 +180,24 @@ and a full swap taken from the page. Not tested: the real MetaMask extension, an
 from `https://monzero.org` (browsers ask the wallet's permission for a public page to reach a
 local address; the bridge answers that preflight).
 
+### The wallet has no trading page (public edition)
+
+The public wallet shows no DEX page in its menu. Everything the wallet has to ask is a prompt on
+top of whatever page is open (`components/DexWebPrompt.qml`):
+
+- **Connect**: the code the web page shows, accept or refuse.
+- **Trading password**: asked right after the first connection (it makes the trading keys) and
+  whenever the page finds them locked (`POST /v1/unlock`). The password is typed in the wallet only.
+- **Approve a trade**: the terms the wallet holds.
+- **Add XMZ** (`POST /v1/xmz-add`): opens the wallet's own Send page with the trading wallet's
+  address filled in; the user enters the amount and confirms as for any payment.
+- **Move XMZ back** (`POST /v1/xmz-return`): a confirmation; the only destination is this wallet's
+  own main address.
+
+The page can only ask for these screens (at most one request every three seconds). Developer
+builds keep the in-wallet trading screen behind the menu entry; it opens on a short "connect"
+view (`components/DexConnect.qml`) with the full screen one click away.
+
 ### Phones (not built)
 
 The Android wallet has no swap engine yet, so there is nothing for a page to drive. The same

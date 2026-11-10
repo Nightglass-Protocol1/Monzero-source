@@ -28,6 +28,7 @@ class DexWebBridge final : public QObject {
     Q_PROPERTY(QVariantMap pairRequest READ pairRequest NOTIFY changed)   // {id, origin, account, code} or empty
     Q_PROPERTY(QVariantMap connection READ connection NOTIFY changed)     // {origin, account} or empty
     Q_PROPERTY(int port READ port NOTIFY changed)
+    Q_PROPERTY(bool keysWanted READ keysWanted NOTIFY changed)            // the page waits for the trading keys: ask for the password
 public:
     DexWebBridge(QObject *engine,const QStringList &allowedOrigins,bool allowLocalPages,QObject *parent=nullptr);
     bool listen(const QString &settingsFile);
@@ -37,11 +38,17 @@ public:
     Q_INVOKABLE bool acceptPairing(const QString &id);
     Q_INVOKABLE void refusePairing(const QString &id);
     Q_INVOKABLE void disconnectPage();
+    bool keysWanted() const {return m_keysWanted;}
+    Q_INVOKABLE void dismissKeys();
     static const int FirstPort=38471,Ports=5;
 signals:
     void changed();
     // Something the user must look at in the wallet (a connection request, a trade to approve)
     void attention(const QString &title,const QString &text);
+    // The page asks the wallet to move XMZ between the main balance and the trading wallet. The
+    // wallet shows its own screens for both; nothing moves without the user confirming there.
+    void xmzAddRequested(const QString &xmz);
+    void xmzReturnRequested();
 private slots:
     void watchTrade();
 private:
@@ -64,5 +71,7 @@ private:
     QByteArray m_tokenHash;             // SHA-256 of the page's token
     QString m_origin,m_account;
     QString m_paidTrade,m_announcedTrade;
+    bool m_keysWanted=false;
+    qint64 m_lastAsk=0;
 };
 #endif

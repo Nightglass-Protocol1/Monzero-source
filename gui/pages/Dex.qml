@@ -8,7 +8,11 @@ import "../components" as M
 Rectangle {
     id: root
     color: "transparent"
-    property alias dexHeight: page.height
+    // With the web link available the page is just "connect to the DEX website"; the full trading
+    // screen (charts, offers, coin wallets) stays one click away
+    readonly property bool webLinkAvailable: typeof dexWeb !== "undefined" && dexWeb !== null
+    property bool simpleView: webLinkAvailable
+    property real dexHeight: simpleView ? connectPage.height : page.height
     function formatLtcAtomic(value) {
         if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(value)) return "—"
         while (value.length < 9) value = "0" + value
@@ -418,11 +422,30 @@ Rectangle {
         refreshOffers()
     }
 
+    M.DexConnect {
+        id: connectPage
+        objectName: "dexConnect"
+        anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+        visible: root.simpleView
+        dex: root.dex
+        web: root.webLinkAvailable ? dexWeb : null
+        tradeCoin: root.evmTradeCoin
+        onFullScreenRequested: root.simpleView = false
+    }
+
     ColumnLayout {
         id: page
         anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
         spacing: 12
+        visible: !root.simpleView
 
+        M.TextPlain {
+            objectName: "dexSimpleViewLink"
+            visible: root.webLinkAvailable
+            themeTransition: false; color: M.Style.dimmedFontColor; font.pixelSize: 13
+            text: "‹ " + qsTr("Back to the simple view (trade on the website)")
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.simpleView = true }
+        }
         RowLayout {
             Layout.fillWidth: true
             M.Label { fontSize: 25; text: qsTr("Trade") + translationManager.emptyString }

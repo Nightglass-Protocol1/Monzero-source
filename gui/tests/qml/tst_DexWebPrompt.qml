@@ -12,11 +12,18 @@ TestCase {
     visible: true
     width: 1000
     height: 800
-    property QtObject windowSettings: QtObject { id: appWindow; property bool themeTransition: false }
+    property QtObject windowSettings: QtObject { id: appWindow; property bool themeTransition: false
+        property var currentWallet: QtObject { function address(a, b) { return "FXmain" } } }
+    property QtObject panel: QtObject { id: middlePanel; property string state: ""; property var filled: []
+        property var transferView: QtObject { function sendTo(address, paymentId, description, amount) { middlePanel.filled = [address, amount] } } }
     property QtObject translations: QtObject { id: translationManager; property string emptyString: "" }
     property QtObject web: QtObject {
         property var pairRequest: ({})
         property var connection: ({})
+        property bool keysWanted: false
+        signal xmzAddRequested(string xmz)
+        signal xmzReturnRequested()
+        function dismissKeys() { keysWanted = false }
         property string accepted: ""
         property string refused: ""
         function acceptPairing(id) { accepted = id; pairRequest = ({}); connection = { origin: "https://monzero.org", account: "0xaD13C3F11Dd4FeE608e6764ac3e48b03952E630b" }; return true }
@@ -24,6 +31,11 @@ TestCase {
     }
     property QtObject dex: QtObject {
         property var evmTradeStatus: ({})
+        property var dexWalletStatus: ({ state: "ready", unlocked: "40", address: "FXtrading", keysExist: false, keysReady: false })
+        property string password: ""
+        property string returnedTo: "none"
+        function setUpTradingKeys(p) { password = p; return true }
+        function sendFromDexWallet(address, amount) { returnedTo = address; return true }
         property string approved: ""
         function approveEvmTrade(commitment) { approved = commitment; return true }
     }
@@ -82,5 +94,48 @@ TestCase {
         dex.evmTradeStatus = { awaitingApproval: true, commitment: "0x999", snapshot: { role: "owner", offer: { chainId: 1, value: "1", xmzAmount: "1" } } }
         wait(200)
         verify(!dialog.opened)   // trades started in the app are approved on its DEX page
+    }
+    function test_6_password_is_asked_in_the_wallet_when_the_page_needs_the_keys() {
+        var dialog = popup("dexWebKeysDialog")
+        verify(!dialog.opened)
+        web.keysWanted = true
+        tryVerify(function () { return dialog.opened })
+        compare(inside(dialog.contentItem, "dexWebKeysTitle").text, "Choose a trading password")
+        inside(dialog.contentItem, "dexWebKeysPassword").text = "pw-1"
+        verify(!inside(dialog.contentItem, "dexWebKeysGo").enabled)   // new keys: the password twice
+        inside(dialog.contentItem, "dexWebKeysRepeat").text = "pw-1"
+        mouseClick(inside(dialog.contentItem, "dexWebKeysGo"))
+        compare(dex.password, "pw-1")
+        dex.dexWalletStatus = { state: "ready", unlocked: "40", address: "FXtrading", keysExist: true, keysReady: true }
+        tryVerify(function () { return !dialog.opened })
+        web.keysWanted = false
+    }
+    function test_7_existing_keys_are_unlocked_with_one_password_and_can_be_put_off() {
+        var dialog = popup("dexWebKeysDialog")
+        dex.dexWalletStatus = { state: "ready", unlocked: "40", address: "FXtrading", keysExist: true, keysReady: false }
+        web.keysWanted = true
+        tryVerify(function () { return dialog.opened })
+        compare(inside(dialog.contentItem, "dexWebKeysTitle").text, "Enter your trading password")
+        verify(!inside(dialog.contentItem, "dexWebKeysRepeat").visible)
+        mouseClick(inside(dialog.contentItem, "dexWebKeysLater"))
+        tryVerify(function () { return !dialog.opened })
+        compare(dex.password, "pw-1")
+    }
+    function test_8_adding_xmz_opens_the_send_page_filled_in() {
+        web.xmzAddRequested("125.5")
+        compare(middlePanel.state, "Transfer")
+        compare(middlePanel.filled[0], "FXtrading")
+        compare(middlePanel.filled[1], "125.5")
+    }
+    function test_9_moving_xmz_back_goes_only_to_this_wallet_and_only_when_confirmed() {
+        var dialog = popup("dexWebReturnDialog")
+        web.xmzReturnRequested()
+        tryVerify(function () { return dialog.opened })
+        compare(dex.returnedTo, "none")
+        verify(inside(dialog.contentItem, "dexWebReturnText").text.indexOf("40 XMZ") === 0)
+        mouseClick(inside(dialog.contentItem, "dexWebReturnGo"))
+        compare(dex.returnedTo, "FXmain")
+        mouseClick(inside(dialog.contentItem, "dexWebReturnClose"))
+        tryVerify(function () { return !dialog.opened })
     }
 }

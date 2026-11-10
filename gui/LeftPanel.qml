@@ -420,7 +420,7 @@ Rectangle {
 
             MonzeroComponents.MenuButton {
                 id: dexButton
-                visible: dexPrototypeEnabled
+                visible: dexPrototypeEnabled && (typeof dexFullPage === "undefined" || dexFullPage)
                 anchors.left: parent.left
                 anchors.right: parent.right
                 text: qsTr("Trade") + translationManager.emptyString

@@ -678,6 +678,13 @@ int main(int argc, char *argv[])
     const QString dexControlBase = QStringLiteral("https://monzero.org/dex/control/");
 #endif
     engine.rootContext()->setContextProperty("dexPrototypeEnabled", dexPrototypeEnabled);
+    // The public wallet has no trading page: trading is on the DEX website, and the wallet only asks
+    // (connect, password, approve) in prompts. Developer builds keep the in-wallet trading screen.
+#ifdef MONZERO_DEX_PUBLIC_EDITION
+    engine.rootContext()->setContextProperty("dexFullPage", false);
+#else
+    engine.rootContext()->setContextProperty("dexFullPage", dexPrototypeEnabled);
+#endif
 #ifdef WITH_DEX_PROTOTYPE
 #ifdef MONZERO_DEX_PUBLIC_EDITION
     {

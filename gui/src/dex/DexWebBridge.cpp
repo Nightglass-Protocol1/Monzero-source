@@ -84,16 +84,20 @@ bool DexWebBridge::acceptPairing(const QString &id) {
     const auto token=randomHex(32);
     m_tokenHash=hashed(token);m_origin=m_pairRequest.value("origin").toString();m_account=m_pairRequest.value("account").toString();
     m_pairResult="accepted";m_pairResultId=id;m_pairResultToken=QString::fromLatin1(token);
-    m_pairRequest.clear();save();emit changed();
+    m_pairRequest.clear();save();
+    // No trading keys yet, or locked: ask for the password right away, in the same sitting
+    m_keysWanted=m_engine && !m_engine->property("dexWalletStatus").toMap().value("keysReady").toBool();
+    emit changed();
     return true;
 }
+void DexWebBridge::dismissKeys() {if (m_keysWanted) {m_keysWanted=false;emit changed();}}
 void DexWebBridge::refusePairing(const QString &id) {
     if (m_pairRequest.value("id")!=id) return;
     m_pairResult="refused";m_pairResultId=id;m_pairResultToken.clear();
     m_pairRequest.clear();emit changed();
 }
 void DexWebBridge::disconnectPage() {
-    m_tokenHash.clear();m_origin.clear();m_account.clear();save();emit changed();
+    m_tokenHash.clear();m_origin.clear();m_account.clear();m_keysWanted=false;save();emit changed();
 }
 
 bool DexWebBridge::call(const char *method,const QVariantList &args) const {
@@ -123,6 +127,7 @@ QVariantMap DexWebBridge::statusFor() const {
 
 void DexWebBridge::watchTrade() {
     if (!m_engine || m_tokenHash.isEmpty()) return;
+    if (m_keysWanted && m_engine->property("dexWalletStatus").toMap().value("keysReady").toBool()) {m_keysWanted=false;emit changed();}
     const auto trade=m_engine->property("evmTradeStatus").toMap();
     const auto snapshot=trade.value("snapshot").toMap();
     const auto id=trade.value("tradeId").toString();
@@ -208,6 +213,31 @@ QByteArray DexWebBridge::respond(const Request &r,int *status) {
         const int chainId=body.value("chainId").toInt();
         const bool ok=call("returnEvmFunds",{chainId,m_account});
         return json({{"ok",ok},{"message",message(coinOf(chainId))}});
+    }
+    // Things only the user can do, in the wallet: the page may only ask for the screen to be shown
+    // (at most once every few seconds, so a page cannot flood the wallet with prompts)
+    if (r.path=="/v1/unlock" || r.path=="/v1/xmz-add" || r.path=="/v1/xmz-return") {
+        const auto now=QDateTime::currentMSecsSinceEpoch();
+        if (now-m_lastAsk<3000) return fail(429,"wait a moment");
+        m_lastAsk=now;
+        const auto wallet=m_engine->property("dexWalletStatus").toMap();
+        if (r.path=="/v1/unlock") {
+            if (wallet.value("keysReady").toBool()) return json({{"ok",true},{"ready",true}});
+            m_keysWanted=true;emit changed();
+            emit attention(tr("Your trading password is needed"),tr("Open your Monzero wallet to unlock your trading keys."));
+            return json({{"ok",true}});
+        }
+        if (wallet.value("state")!="ready") return json({{"ok",false},{"message",tr("The trading wallet is still starting.")}});
+        if (r.path=="/v1/xmz-add") {
+            const auto xmz=body.value("xmz").toString();
+            if (!xmz.isEmpty() && !QRegularExpression("\\A[0-9]{1,9}(\\.[0-9]{1,8})?\\z").match(xmz).hasMatch()) return fail(400,"xmz");
+            emit xmzAddRequested(xmz);
+            emit attention(tr("Add XMZ for trading"),tr("Confirm the transfer in your Monzero wallet."));
+        } else {
+            emit xmzReturnRequested();
+            emit attention(tr("Move XMZ back to your main balance"),tr("Confirm it in your Monzero wallet."));
+        }
+        return json({{"ok",true}});
     }
     if (r.path=="/v1/disconnect") {disconnectPage();return json({{"ok",true}});}
     return fail(404,"unknown");

@@ -5,8 +5,9 @@ import QtQuick.Layouts 1.1
 import "." as M
 
 // What the wallet asks the user when the DEX web page is in use: accept the page's connection
-// (compare the code), and approve each trade from the terms the wallet itself holds. The page
-// cannot answer either question.
+// (compare the code), the trading password (to make or unlock the trading keys), each trade's
+// approval from the terms the wallet itself holds, and moving XMZ back out. The page cannot
+// answer any of these.
 Item {
     id: prompt
     anchors.fill: parent
@@ -18,6 +19,25 @@ Item {
     readonly property var offer: (trade.snapshot || ({})).offer || ({})
     readonly property bool approvalWanted: (link.account || "") !== "" && trade.awaitingApproval === true && (trade.commitment || "") !== ""
     property string dismissedTrade: ""
+    readonly property var wallet: dex ? (dex.dexWalletStatus || ({})) : ({})
+    readonly property bool keysWanted: web ? web.keysWanted === true && wallet.keysReady !== true : false
+    function mainAddress() {
+        return typeof appWindow !== "undefined" && appWindow.currentWallet ? appWindow.currentWallet.address(0, 0) : ""
+    }
+    onKeysWantedChanged: if (keysWanted) keysDialog.open(); else keysDialog.close()
+    Connections {
+        target: prompt.web
+        ignoreUnknownSignals: true
+        // Adding XMZ is an ordinary payment from the main balance to the trading wallet: the wallet's
+        // own Send page, filled in, where the user checks the amount and confirms as always
+        onXmzAddRequested: {
+            if (typeof middlePanel === "undefined" || (prompt.wallet.address || "") === "") return
+            middlePanel.state = "Transfer"
+            middlePanel.transferView.sendTo(prompt.wallet.address, "", qsTr("XMZ for trading on the DEX"), xmz)
+            if (typeof leftPanel !== "undefined") leftPanel.selectItem(middlePanel.state)
+        }
+        onXmzReturnRequested: returnDialog.open()
+    }
 
     function units(text, places) {
         var digits = String(text || "0")
@@ -104,6 +124,80 @@ Item {
                 Layout.alignment: Qt.AlignRight; spacing: 12
                 M.StandardButton { objectName: "dexWebApproveLater"; text: qsTr("Not now"); primary: false; onClicked: { prompt.dismissedTrade = prompt.trade.commitment; approveDialog.close() } }
                 M.StandardButton { objectName: "dexWebApprove"; text: qsTr("Approve"); onClicked: prompt.dex.approveEvmTrade(prompt.trade.commitment) }
+            }
+        }
+    }
+
+    Popup {
+        id: keysDialog
+        objectName: "dexWebKeysDialog"
+        modal: true; focus: true; closePolicy: Popup.NoAutoClose
+        x: Math.round((prompt.width - width) / 2); y: Math.round((prompt.height - height) / 2)
+        width: Math.min(560, prompt.width - 40); padding: 24
+        background: Rectangle { color: "#202b36"; radius: 10; border.color: "#526b80" }
+        readonly property bool fresh: prompt.wallet.keysExist !== true
+        contentItem: ColumnLayout {
+            spacing: 14
+            M.TextPlain {
+                objectName: "dexWebKeysTitle"
+                text: keysDialog.fresh ? qsTr("Choose a trading password") : qsTr("Enter your trading password"); font.bold: true; font.pixelSize: 20; color: "#f0f5fa"
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: "#f0f5fa"
+                text: prompt.wallet.keysBusy === true ? qsTr("Working… this can take a minute.")
+                    : keysDialog.fresh ? qsTr("This makes your trading keys. They are kept encrypted on this device, and nobody can restore the password for you. You will be asked for it each time you start trading.")
+                    : qsTr("It unlocks your trading keys until you close the wallet.")
+            }
+            M.LineEdit { id: keysPassword; objectName: "dexWebKeysPassword"; Layout.fillWidth: true; password: true
+                placeholderText: keysDialog.fresh ? qsTr("New trading password") : qsTr("Trading password") }
+            M.LineEdit { id: keysRepeat; objectName: "dexWebKeysRepeat"; Layout.fillWidth: true; password: true
+                visible: keysDialog.fresh; placeholderText: qsTr("Repeat the password") }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.errorColor
+                visible: text !== ""; text: prompt.wallet.keysMessage || ""
+            }
+            RowLayout {
+                Layout.alignment: Qt.AlignRight; spacing: 12
+                M.StandardButton { objectName: "dexWebKeysLater"; text: qsTr("Not now"); primary: false
+                    onClicked: { keysPassword.text = ""; keysRepeat.text = ""; prompt.web.dismissKeys() } }
+                M.StandardButton {
+                    objectName: "dexWebKeysGo"
+                    text: prompt.wallet.keysBusy === true ? qsTr("Working…") : keysDialog.fresh ? qsTr("Create trading keys") : qsTr("Unlock")
+                    enabled: prompt.wallet.keysBusy !== true && keysPassword.text !== "" && (!keysDialog.fresh || keysPassword.text === keysRepeat.text)
+                    onClicked: { prompt.dex.setUpTradingKeys(keysPassword.text); keysPassword.text = ""; keysRepeat.text = "" }
+                }
+            }
+        }
+    }
+
+    Popup {
+        id: returnDialog
+        objectName: "dexWebReturnDialog"
+        modal: true; focus: true; closePolicy: Popup.NoAutoClose
+        x: Math.round((prompt.width - width) / 2); y: Math.round((prompt.height - height) / 2)
+        width: Math.min(560, prompt.width - 40); padding: 24
+        background: Rectangle { color: "#202b36"; radius: 10; border.color: "#526b80" }
+        property string note: ""
+        onOpened: note = ""
+        contentItem: ColumnLayout {
+            spacing: 14
+            M.TextPlain { text: qsTr("Move your trading XMZ back?"); font.bold: true; font.pixelSize: 20; color: "#f0f5fa" }
+            M.TextPlain {
+                objectName: "dexWebReturnText"
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: "#f0f5fa"
+                text: returnDialog.note !== "" ? returnDialog.note
+                    : qsTr("%1 XMZ is ready in your trading wallet. All of it goes back to this wallet's main balance, minus the network fee.").arg(prompt.wallet.unlocked || "0")
+            }
+            RowLayout {
+                Layout.alignment: Qt.AlignRight; spacing: 12
+                M.StandardButton { objectName: "dexWebReturnClose"; text: returnDialog.note !== "" ? qsTr("Close") : qsTr("Cancel"); primary: false; onClicked: returnDialog.close() }
+                M.StandardButton {
+                    objectName: "dexWebReturnGo"; text: qsTr("Move it back")
+                    visible: returnDialog.note === ""
+                    enabled: prompt.wallet.busy !== true && Number(prompt.wallet.unlocked) > 0 && prompt.mainAddress() !== ""
+                    onClicked: returnDialog.note = prompt.dex.sendFromDexWallet(prompt.mainAddress(), "")
+                        ? qsTr("Sent. It shows in your main balance after a few minutes.") : qsTr("That could not start now. Try again in a moment.")
+                }
             }
         }
     }
