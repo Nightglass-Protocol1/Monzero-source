@@ -168,7 +168,7 @@
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   if (!$("mode-pro")) return;
-  var PAIRS = ["BTC", "ETH", "BNB", "LTC"];
+  var PAIRS = ["BTC", "ETH", "BNB", "LTC", "SOL"];
   var NAME = { BTC: "Bitcoin", ETH: "Ethereum", BNB: "BNB", LTC: "Litecoin" };
   var EXPLORER = { BTC: "https://mempool.space/tx/", ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/", LTC: "https://litecoinspace.org/tx/" };
   // Bitcoin and Litecoin offers give the coin in satoshis/litoshis (`coin`); EVM offers in wei (`value`, hex)
@@ -181,7 +181,8 @@
   function fmt(n, d) { if (!isFinite(n)) return "0"; var s = n.toFixed(d); return s.indexOf(".") >= 0 ? s.replace(/0+$/, "").replace(/\.$/, "") : s; }
   function places(p) { return p > 0 ? Math.min(14, Math.max(2, 3 - Math.floor(Math.log(p) / Math.LN10))) : 2; }
   function price(p) { return fmt(p, places(p)); }
-  function wei(hex) { return parseInt(hex, 16) / 1e18; }
+  // The coin's smallest unit: wei (18 decimals), or lamports on Solana (9)
+  function wei(hex) { return parseInt(hex, 16) / (pro.coin === "SOL" ? 1e9 : 1e18); }
   function coinOf(l) { return UTXO[pro.coin] ? Number(l.coin) / 1e8 : wei(l.value); }
   function coins(atoms) { return Number(atoms) / 1e11; }
   function pDot(t) { return '<span class="cdot" data-c="' + t + '">' + t.slice(0, 1) + '</span>'; }
@@ -393,7 +394,7 @@
   $("mode-simple").addEventListener("click", function () { setMode("simple"); if (history.replaceState) history.replaceState(null, "", location.pathname); });
   $("mode-pro").addEventListener("click", function () { setMode("pro"); if (history.replaceState) history.replaceState(null, "", "#pro"); });
   // Shareable deep link: /dex/#pro opens the market view.
-  // #pro opens the order book; #pro-BTC (or -ETH, -BNB, -LTC) also picks the pair
+  // #pro opens the order book; #pro-BTC (or -ETH, -BNB, -LTC, -SOL) also picks the pair
   function fromHash() {
     var m = /^#pro(?:-([A-Z]{3}))?$/.exec(location.hash);
     if (m && m[1] && PAIRS.indexOf(m[1]) >= 0 && m[1] !== pro.coin) { pro.coin = m[1]; if (pro.rendered) show(); else syncPair(); }

@@ -20,6 +20,11 @@
         BNB: { id: 56, name: "BNB Smart Chain", control: "bnb-mainnet", tx: "https://bscscan.com/tx/",
                add: { chainId: "0x38", chainName: "BNB Smart Chain", nativeCurrency: { name: "BNB", symbol: "BNB", decimals: 18 },
                       rpcUrls: ["https://bsc-dataseed.binance.org"], blockExplorerUrls: ["https://bscscan.com"] } } };
+  // SOL: on test networks for now (a local copy of the page). Solana mainnet joins when the swap
+  // program is deployed there and pinned in the wallet. ?sol=local uses a local test validator.
+  if (TEST) CHAINS.SOL = /[?&]sol=local/.test(location.search)
+    ? { id: 501000103, name: "Solana (local test)", control: null, sol: true, rpc: "http://127.0.0.1:18899", tx: "https://solscan.io/tx/" }
+    : { id: 501000102, name: "Solana Devnet (test network)", control: null, sol: true, rpc: "https://api.devnet.solana.com", tx: "https://solscan.io/tx/", txEnd: "?cluster=devnet" };
   var PORTS = [38471, 38472, 38473, 38474, 38475];
   // Two wallets on one computer: ?wallet=38472 picks one (the wallet's port is one of the five)
   // Each picked wallet keeps its own saved connection, so two tabs can be linked to two wallets
@@ -50,6 +55,14 @@
   }
   function short(a) { return a ? a.slice(0, 6) + "…" + a.slice(-4) : ""; }
   function chain() { return CHAINS[st.coin]; }
+  // What differs on Solana: the coin has 9 decimals (lamports), the user's own wallet is a Solana
+  // wallet such as Phantom, and the coin is paid in to the wallet's Solana trade account
+  function sol() { var c = chain(); return !!(c && c.sol); }
+  function dec() { return sol() ? 9 : 18; }
+  function own() { return sol() ? "Phantom" : "MetaMask"; }
+  function ownAccount() { return st.link ? (sol() ? st.link.solAccount : st.link.account) || "" : ""; }
+  function payIn() { var w = st.status.wallet; return sol() ? w.solTradeAccount : w.tradeAccount; }
+  function txLink(id) { var c = chain(); return c.tx + esc(id) + (c.txEnd || ""); }
   function hex(v) { return "0x" + v.toString(16); }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function saveLink() { try { if (st.link) localStorage.setItem(STORE, JSON.stringify(st.link)); else localStorage.removeItem(STORE); } catch (e) {} }
@@ -71,6 +84,72 @@
         .then(function (r) { return r && r.app === "monzero-wallet" ? { port: p, connected: !!r.connected } : null; })
         .catch(function () { return null; });
     })).then(function (all) { return all.filter(Boolean); });
+  }
+
+  // ---- a Solana wallet in the browser (Phantom) and the cluster
+  var B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  function b58encode(bytes) {
+    var n = 0n, out = "", i;
+    for (i = 0; i < bytes.length; i++) n = n * 256n + BigInt(bytes[i]);
+    while (n > 0n) { out = B58[Number(n % 58n)] + out; n /= 58n; }
+    for (i = 0; i < bytes.length && bytes[i] === 0; i++) out = "1" + out;
+    return out;
+  }
+  function b58decode(text) {
+    var n = 0n, i, out = [];
+    for (i = 0; i < text.length; i++) { var d = B58.indexOf(text[i]); if (d < 0) throw new Error("Not a Solana address."); n = n * 58n + BigInt(d); }
+    while (n > 0n) { out.unshift(Number(n % 256n)); n /= 256n; }
+    for (i = 0; i < text.length && text[i] === "1"; i++) out.unshift(0);
+    return out;
+  }
+  function solProvider() { return (window.phantom && window.phantom.solana) || (window.solana && window.solana.isPhantom ? window.solana : null) || window.solana || null; }
+  function solRpc(method, params) {
+    return fetch(chain().rpc, { method: "POST", headers: { "content-type": "application/json" }, cache: "no-store",
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: method, params: params || [] }) })
+      .then(function (r) { return r.json(); })
+      .then(function (r) { if (r.error) throw new Error("Solana: " + (r.error.message || "request failed")); return r.result; });
+  }
+  function solBalance(account) { return solRpc("getBalance", [account, { commitment: "confirmed" }]).then(function (r) { return BigInt(r.value); }); }
+  // A plain transfer, laid out by hand (one signer, three accounts): the wallet only signs and sends it
+  function solTransferMessage(from, to, lamports, blockhash) {
+    var m = [1, 0, 1, 3].concat(b58decode(from), b58decode(to), new Array(32).fill(0), b58decode(blockhash), [1, 2, 2, 0, 1, 12, 2, 0, 0, 0]);
+    for (var i = 0n; i < 8n; i++) m.push(Number((lamports >> (8n * i)) & 255n));
+    return new Uint8Array(m);
+  }
+  function solSend(to, lamports) {
+    var from = st.link.solAccount, p = solProvider();
+    return p.connect({ onlyIfTrusted: false }).then(function (r) {
+      var now = r && r.publicKey ? r.publicKey.toString() : "";
+      if (now && now !== from) throw new Error("Phantom is on another account than the one you connected (" + short(from) + "). Switch back, or disconnect and connect again.");
+      return solRpc("getLatestBlockhash", [{ commitment: "confirmed" }]);
+    }).then(function (b) {
+      return p.request({ method: "signAndSendTransaction", params: { message: b58encode(solTransferMessage(from, to, lamports, b.value.blockhash)) } });
+    }).then(function (r) { return r.signature; });
+  }
+  function solConfirmed(signature) {
+    var tries = 0;
+    function once() {
+      return solRpc("getSignatureStatuses", [[signature], { searchTransactionHistory: true }]).then(function (r) {
+        var s = r && r.value && r.value[0];
+        if (s && s.err) throw new Error("The payment failed on chain.");
+        if (s && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) return s;
+        if (++tries > 90) throw new Error("The payment is taking long to confirm. Wait for it in Phantom, then try again: nothing is sent twice.");
+        return sleep(2000).then(once);
+      });
+    }
+    return once();
+  }
+  // One payment into the wallet's trade account, from the user's own wallet of this chain
+  function pay(to, amount) {
+    if (sol()) return solSend(to, amount).then(function (sig) { st.paying = sig; return sig; }).then(function (sig) {
+      say("Payment sent from Phantom. Waiting for the network to confirm it (a few seconds)…");
+      return solConfirmed(sig);
+    }).then(function (r) { st.paying = ""; return r; }, function (e) { st.paying = ""; throw e; });
+    return onChain().then(function () { return eth("eth_sendTransaction", [{ from: st.link.account, to: to, value: hex(amount) }]); }).then(function (tx) {
+      st.paying = tx;
+      say("Payment sent from MetaMask. Waiting for the network to confirm it (usually under a minute)…");
+      return receipt(tx).then(function (r) { st.paying = ""; return r; }, function (e) { st.paying = ""; throw e; });
+    });
   }
 
   // ---- MetaMask
@@ -99,19 +178,21 @@
   }
   // Pay into the wallet's trade account whatever it still lacks for this trade
   function fund(need) {
-    var acct = st.status.wallet.tradeAccount;
-    return onChain().then(function () { return eth("eth_getBalance", [acct, "latest"]); }).then(function (have) {
-      var missing = need - BigInt(have);
+    var acct = payIn();
+    if (!acct) return Promise.reject(new Error("The wallet has not shown its " + st.coin + " trade account yet. Wait a moment and try again."));
+    var held = sol() ? solBalance(acct) : onChain().then(function () { return eth("eth_getBalance", [acct, "latest"]); }).then(function (h) { return BigInt(h); });
+    return held.then(function (have) {
+      var missing = need - have;
       if (missing <= 0n) return null;
-      say("MetaMask will ask you to send " + fromUnits(missing, 18, 8) + " " + st.coin + " to your trade account in the Monzero wallet.");
-      return eth("eth_sendTransaction", [{ from: st.link.account, to: acct, value: hex(missing) }]).then(function (tx) {
-        st.paying = tx;
-        say("Payment sent from MetaMask. Waiting for the network to confirm it (usually under a minute)…");
-        return receipt(tx).then(function (r) { st.paying = ""; return r; }, function (e) { st.paying = ""; throw e; });
-      });
+      say(own() + " will ask you to send " + fromUnits(missing, dec(), 8) + " " + st.coin + " to your trade account in the Monzero wallet.");
+      return pay(acct, missing);
     });
   }
   function reserve(owner) {
+    // Solana: fixed fees. The buyer's reserve covers the swap account's rent (returned when the
+    // swap closes), fees and the minimum an account must keep; the seller's keeps its account
+    // open while it pays for its claim. The same figures as the wallet's engine.
+    if (sol()) return Promise.resolve(owner ? 4500000n : 1500000n);
     // On the trade's own network: the fee there is what counts
     // Price plus tip, doubled: the wallet pays a tip on top of the base fee, and a reserve that is too
     // small stops the trade until it is topped up. What is not spent goes back after the trade.
@@ -149,16 +230,20 @@
     if (st.busy) return;
     st.busy = "connect"; st.error = "";
     var port;
-    eth("eth_requestAccounts").then(function (a) {
-      st.account = a[0];
+    // The user's own wallet for this coin; the other one, if connected before, stays connected
+    var mine = { account: (st.link && st.link.account) || "", solAccount: (st.link && st.link.solAccount) || "" };
+    var asked = sol()
+      ? solProvider().connect().then(function (r) { mine.solAccount = r.publicKey.toString(); })
+      : eth("eth_requestAccounts").then(function (a) { st.account = a[0]; mine.account = a[0]; });
+    asked.then(function () {
       return findWallets();
     }).then(function (found) {
       if (!found.length) throw new Error("No Monzero wallet answered on this computer. Open your wallet (the version with the DEX) and try again. " +
         "If your browser asks whether this site may reach apps on your device, allow it. Chrome, Brave, Edge and Firefox work; Safari does not allow this.");
       port = found[0].port;
-      return wallet(port, "/v1/pair", "POST", { account: st.account });
+      return wallet(port, "/v1/pair", "POST", mine);
     }).then(function (r) {
-      if (!r.ok) throw new Error(r.error === "account" ? "MetaMask gave no account." : "The wallet is busy with another connection request. Answer it there, then try again.");
+      if (!r.ok) throw new Error(r.error === "account" ? own() + " gave no account." : "The wallet is busy with another connection request. Answer it there, then try again.");
       st.pairing = { id: r.id, code: r.code }; render();
       var tries = 0;
       function poll() {
@@ -171,7 +256,7 @@
       }
       return poll();
     }).then(function (token) {
-      st.link = { port: port, token: token, account: st.account }; saveLink();
+      st.link = { port: port, token: token, account: mine.account, solAccount: mine.solAccount }; saveLink();
       st.pairing = null; st.busy = ""; st.note = ""; refresh();
     }).catch(function (e) { st.pairing = null; fail(e); });
   }
@@ -212,7 +297,7 @@
     if (s.trade && s.trade.configured && !(s.trade.snapshot && s.trade.snapshot.done)) return "A trade is already running. It has to finish first.";
     if (chain().control && (!lim || !lim.open)) return "Trading " + st.coin + " is not open right now.";
     if (lim && lim.open && (valueWei > lim.coin || xmzAtoms > lim.xmz))
-      return "Above the limit while the DEX is new: at most " + fromUnits(lim.coin, 18, 6) + " " + st.coin + " and " + fromUnits(lim.xmz, 11, 2) + " XMZ per trade.";
+      return "Above the limit while the DEX is new: at most " + fromUnits(lim.coin, dec(), 6) + " " + st.coin + " and " + fromUnits(lim.xmz, 11, 2) + " XMZ per trade.";
     if (!owner) {
       var unlocked = toUnits(String(s.wallet.unlocked || "0"), 11) || 0n, wanted = xmzNeeded(xmzAtoms);
       if (unlocked < wanted) return "Your trading wallet needs " + fromUnits(wanted, 11, 2) + " XMZ unlocked (the amount plus a little for the network fee); it has " + fromUnits(unlocked, 11, 2) +
@@ -222,7 +307,7 @@
   }
   function post() {
     if (st.busy) return;
-    var xmz = toUnits(st.form.xmz, 11), price = toUnits(st.form.price, 18);
+    var xmz = toUnits(st.form.xmz, 11), price = toUnits(st.form.price, dec());
     if (!xmz || !price || xmz === 0n || price === 0n) return fail(new Error("Enter the XMZ amount and the price."));
     var value = xmz * price / 100000000000n, owner = st.side === "buy";
     if (value === 0n) return fail(new Error("The total is too small."));
@@ -231,9 +316,9 @@
     st.busy = "post"; say("Preparing…");
     reserve(owner).then(function (gas) { return fund(owner ? value + gas : gas); }).then(function () {
       say("Posting your offer…");
-      return api("/v1/offer", { chainId: chain().id, side: owner ? "buy-xmz" : "sell-xmz", coin: fromUnits(value, 18), xmz: fromUnits(xmz, 11), hours: 6 });
+      return api("/v1/offer", { chainId: chain().id, side: owner ? "buy-xmz" : "sell-xmz", coin: fromUnits(value, dec()), xmz: fromUnits(xmz, 11), hours: 6 });
     }).then(function (r) {
-      if (!r.ok) throw new Error(r.message || "The wallet could not post the offer. What you paid in stays in your trade account; you can send it back to MetaMask below.");
+      if (!r.ok) throw new Error(r.message || "The wallet could not post the offer. What you paid in stays in your trade account; you can send it back to " + own() + " below.");
       return untilIdle();
     }).then(function (s) {
       var m = s.markets[st.coin];
@@ -255,7 +340,7 @@
       say("Asking the wallet to take the offer…");
       return api("/v1/refresh", { pair: st.coin + "/XMZ" });
     }).then(untilIdle).then(function () { return api("/v1/take", { id: id }); }).then(function (r) {
-      if (!r.ok) throw new Error(r.message || "The wallet could not take this offer. What you paid in stays in your trade account; you can send it back to MetaMask below.");
+      if (!r.ok) throw new Error(r.message || "The wallet could not take this offer. What you paid in stays in your trade account; you can send it back to " + own() + " below.");
       st.busy = "";
       say("Offer taken. Waiting for the other side to answer; then the wallet asks you to approve the trade.");
     }).catch(fail);
@@ -281,7 +366,7 @@
   }
   function giveBack() {
     if (st.busy) return;
-    st.busy = "return"; say("Sending the unused " + st.coin + " back to MetaMask…");
+    st.busy = "return"; say("Sending the unused " + st.coin + " back to " + own() + "…");
     api("/v1/return", { chainId: chain().id }).then(function (r) {
       if (!r.ok) throw new Error(r.message || "The wallet could not send the funds back now.");
       return untilIdle();
@@ -289,17 +374,15 @@
       var m = s.markets[st.coin] || {}, w = m.withdrawal || {};
       st.busy = "";
       if (m.state !== "ok" && m.error) return fail(new Error(m.error));
-      say(w.tx ? "Sent back " + fromUnits(BigInt(w.amountWei), 18, 8) + " " + st.coin + " to " + short(w.to) + "." : "Nothing to send back.");
+      say(w.tx ? "Sent back " + fromUnits(BigInt(w.amountWei), dec(), 8) + " " + st.coin + " to " + short(w.to) + "." : "Nothing to send back.");
     }).catch(fail);
   }
   function topUp() {
-    var need = st.status.trade.awaitingFunding || {};
-    if (st.busy || !need.missingWei) return;
+    var need = st.status.trade.awaitingFunding || {}, to = sol() ? st.status.trade.solAccount || payIn() : st.status.wallet.tradeAccount;
+    if (st.busy || !need.missingWei || !to) return;
     st.busy = "fund";
-    onChain().then(function () {
-      say("MetaMask will ask you to send " + fromUnits(BigInt(need.missingWei), 18, 8) + " " + st.coin + ".");
-      return eth("eth_sendTransaction", [{ from: st.link.account, to: st.status.wallet.tradeAccount, value: hex(BigInt(need.missingWei)) }]);
-    }).then(receipt).then(function () { st.busy = ""; say("Paid in. The trade continues by itself."); }).catch(fail);
+    say(own() + " will ask you to send " + fromUnits(BigInt(need.missingWei), dec(), 8) + " " + st.coin + ".");
+    pay(to, BigInt(need.missingWei)).then(function () { st.busy = ""; say("Paid in. The trade continues by itself."); }).catch(fail);
   }
 
   // ---- drawing
@@ -325,7 +408,7 @@
       { at: ["WaitingForEvmLock"], text: "The buyer's %COIN% goes into the swap contract", wait: "a few minutes; the wallet then asks you to approve" },
       { at: ["XmzLockSent"], text: "Your XMZ is locked for the buyer", wait: XMZ_WAIT },
       { at: ["XmzLocked"], text: "The buyer releases the swap", wait: "a minute or two" },
-      { at: ["ClaimSent"], text: "Your %COIN% is claimed and sent to MetaMask", wait: "a minute or two" }
+      { at: ["ClaimSent"], text: "Your %COIN% is claimed and sent to your own wallet", wait: "a minute or two" }
     ]
   };
   // "8 of 10 confirmations", when the wallet reports it for the step that is waiting on XMZ blocks
@@ -356,7 +439,7 @@
   function tradeHTML(t) {
     var s = t.snapshot || {}, o = s.offer || {}, c = chain(), buying = s.role === "owner", h = "";
     if (st.note.indexOf("Offer taken") === 0) st.note = "";   // the trade itself is on screen now
-    var coinAmt = o.value ? fromUnits(BigInt(o.value), 18, 8) + " " + st.coin : "", xmzAmt = o.xmzAmount != null ? fromUnits(BigInt(o.xmzAmount), 11, 4) + " XMZ" : "";
+    var coinAmt = o.value ? fromUnits(BigInt(o.value), dec(), 8) + " " + st.coin : "", xmzAmt = o.xmzAmount != null ? fromUnits(BigInt(o.xmzAmount), 11, 4) + " XMZ" : "";
     h += '<p class="tp-terms">' + (buying ? "You pay <strong>" + esc(coinAmt) + "</strong> · you receive <strong>" + esc(xmzAmt) + "</strong>"
       : "You pay <strong>" + esc(xmzAmt) + "</strong> · you receive <strong>" + esc(coinAmt) + "</strong>") + "</p>";
     if (t.awaitingApproval) h += '<p class="tp-act">Approve this trade in your Monzero wallet. The wallet shows the amounts it holds; check them there.</p>';
@@ -365,15 +448,15 @@
     if (t.startRefusal) h += '<p class="tp-err">' + esc(t.startRefusal) + "</p>";
     if (t.error) h += '<p class="tp-err">' + esc(t.error) + "</p>";
     var need = t.awaitingFunding || {};
-    if (need.missingWei) h += '<p class="tp-act">The trade account needs ' + esc(fromUnits(BigInt(need.missingWei), 18, 8)) + " " + st.coin +
-      ' more for network fees.</p><button class="button primary" type="button" data-act="topup">Send it from MetaMask</button>';
+    if (need.missingWei) h += '<p class="tp-act">The trade account needs ' + esc(fromUnits(BigInt(need.missingWei), dec(), 8)) + " " + st.coin +
+      ' more for network fees.</p><button class="button primary" type="button" data-act="topup">Send it from ' + own() + "</button>";
     var txs = s.evmTxs || {}, links = [];
-    Object.keys(txs).forEach(function (k) { (txs[k] || []).forEach(function (x) { links.push('<a href="' + c.tx + esc(x) + '" rel="noopener" target="_blank">' + esc(k.replace("_", " ")) + "</a>"); }); });
-    if (t.payout && t.payout.tx) links.push('<a href="' + c.tx + esc(t.payout.tx) + '" rel="noopener" target="_blank">sent back to MetaMask</a>');
+    Object.keys(txs).forEach(function (k) { (txs[k] || []).forEach(function (x) { links.push('<a href="' + txLink(x) + '" rel="noopener" target="_blank">' + esc(k.replace("_", " ")) + "</a>"); }); });
+    if (t.payout && t.payout.tx) links.push('<a href="' + txLink(t.payout.tx) + '" rel="noopener" target="_blank">sent back to ' + own() + "</a>");
     if (links.length) h += '<p class="tp-links">On chain: ' + links.join(" · ") + "</p>";
     if (s.done) {
-      if (t.payout && t.payout.tx) h += '<p class="tp-note">' + esc(fromUnits(BigInt(t.payout.amountWei), 18, 8)) + " " + st.coin + " went back to " + esc(short(t.payout.to)) + ".</p>";
-      else if (t.payout && t.payout.sent === false) h += '<p class="tp-note">Nothing was left in the trade account to send back to MetaMask.</p>';
+      if (t.payout && t.payout.tx) h += '<p class="tp-note">' + esc(fromUnits(BigInt(t.payout.amountWei), dec(), 8)) + " " + st.coin + " went back to " + esc(short(t.payout.to)) + ".</p>";
+      else if (t.payout && t.payout.sent === false) h += '<p class="tp-note">Nothing was left in the trade account to send back to ' + own() + ".</p>";
       if (buying && s.stage === "Done(Swapped)") h += '<p class="tp-note">Your XMZ is in your trading wallet, ready for the next trade. ' +
         '<button class="tp-link" type="button" data-act="xmz-return">Move it to my main balance</button></p>';
       h += '<button class="button secondary" type="button" data-act="dismiss">New trade</button>';
@@ -403,7 +486,7 @@
     else if (t && t.configured && st.dismissed !== t.tradeId) {
       var need = t.awaitingFunding || {}, snap = t.snapshot || {};
       if (t.awaitingApproval) { mark = "Approve in wallet"; notify(t.tradeId + ":approve", "Approve your trade", "Your Monzero wallet is asking you to approve the trade."); }
-      else if (need.missingWei) { mark = "Top-up needed"; notify(t.tradeId + ":topup", "Your trade needs a small top-up", "Open the DEX page to send it from MetaMask."); }
+      else if (need.missingWei) { mark = "Top-up needed"; notify(t.tradeId + ":topup", "Your trade needs a small top-up", "Open the DEX page to send it."); }
       else if (snap.done) { mark = snap.stage === "Done(Swapped)" ? "Swap complete" : "Trade ended"; notify(t.tradeId + ":done", mark, "Open the DEX page to see the result."); }
       else mark = "Trade running";
     }
@@ -421,31 +504,37 @@
     rows.sort(function (a, b) { return st.side === "buy" ? (a.price < b.price ? -1 : 1) : (a.price > b.price ? -1 : 1); });
     if (!rows.length) return '<p class="tp-note">No offers to take right now. Post your own below.</p>';
     return '<ul class="tp-offers">' + rows.slice(0, 6).map(function (r) {
-      return "<li><span><strong>" + esc(fromUnits(r.xmz, 11, 2)) + " XMZ</strong> for " + esc(fromUnits(r.value, 18, 8)) + " " + st.coin +
+      return "<li><span><strong>" + esc(fromUnits(r.xmz, 11, 2)) + " XMZ</strong> for " + esc(fromUnits(r.value, dec(), 8)) + " " + st.coin +
         '</span><button class="button primary" type="button" data-act="take" data-id="' + esc(r.id) + '">' + (st.side === "buy" ? "Buy" : "Sell") + "</button></li>";
     }).join("") + "</ul>";
   }
   function render() {
     var h = "", c = chain();
     if (!c) {
-      h = '<p class="pro-order-lede">Pick ETH or BNB to trade from this page with MetaMask. Bitcoin and Litecoin are not open here yet.</p>' +
+      h = '<p class="pro-order-lede">Pick ETH or BNB to trade from this page with MetaMask. The other coins are not open here yet.</p>' +
         '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the app</a></div>';
-    } else if (!window.ethereum) {
-      h = '<p class="pro-order-lede">To trade ' + st.coin + ' from this page you need <strong>MetaMask</strong> in this browser and the <strong>Monzero wallet</strong> open on this computer.</p>' +
-        '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the wallet</a><a class="button secondary" href="https://metamask.io/download/" rel="noopener">Get MetaMask</a></div>';
+    } else if (sol() ? !solProvider() : !window.ethereum) {
+      h = '<p class="pro-order-lede">To trade ' + st.coin + ' from this page you need <strong>' + own() + '</strong> in this browser and the <strong>Monzero wallet</strong> open on this computer.</p>' +
+        '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the wallet</a><a class="button secondary" href="' +
+        (sol() ? "https://phantom.com/download" : "https://metamask.io/download/") + '" rel="noopener">Get ' + own() + "</a></div>";
     } else if (st.pairing) {
       h = '<p class="pro-order-lede">Look at your Monzero wallet. Accept the connection there if it shows this code:</p><p class="tp-code">' + esc(st.pairing.code) + "</p>";
+    } else if (st.link && st.status && !ownAccount()) {
+      // Connected with the other kind of wallet only: this coin needs its own
+      h = '<p class="pro-order-lede">Your Monzero wallet is connected. To trade ' + st.coin + ', connect <strong>' + own() + '</strong> too: it pays the ' + st.coin +
+        ' in and receives what you are owed. The wallet will show a new code to accept.</p>' +
+        '<div class="swap-reveal-cta"><button class="button primary" type="button" data-act="connect"' + (st.busy ? " disabled" : "") + ">Connect " + own() + "</button></div>";
     } else if (!st.link || !st.status) {
-      h = '<p class="pro-order-lede">Trade ' + st.coin + ' for XMZ with <strong>MetaMask</strong>. Your <strong>Monzero wallet</strong> on this computer runs the swap and asks you to approve each trade; nobody holds your coins.</p>' +
-        '<ol class="tp-steps"><li>Open your Monzero wallet on this computer.</li><li>Connect here; the wallet shows a code to accept and asks for a trading password.</li><li>Pick an offer. MetaMask pays in, the wallet asks you to approve.</li></ol>' +
-        '<div class="swap-reveal-cta"><button class="button primary" type="button" data-act="connect"' + (st.busy ? " disabled" : "") + ">" + (st.link ? "Reconnect" : "Connect MetaMask and wallet") + '</button><a class="button secondary" href="/download/">Get the wallet</a></div>';
+      h = '<p class="pro-order-lede">Trade ' + st.coin + ' for XMZ with <strong>' + own() + '</strong>. Your <strong>Monzero wallet</strong> on this computer runs the swap and asks you to approve each trade; nobody holds your coins.</p>' +
+        '<ol class="tp-steps"><li>Open your Monzero wallet on this computer.</li><li>Connect here; the wallet shows a code to accept and asks for a trading password.</li><li>Pick an offer. ' + own() + ' pays in, the wallet asks you to approve.</li></ol>' +
+        '<div class="swap-reveal-cta"><button class="button primary" type="button" data-act="connect"' + (st.busy ? " disabled" : "") + ">" + (st.link ? "Reconnect" : "Connect " + own() + " and wallet") + '</button><a class="button secondary" href="/download/">Get the wallet</a></div>';
     } else {
       var s = st.status, w = s.wallet, t = s.trade || {}, m = (s.markets || {})[st.coin] || {};
       h += '<ul class="relay-facts"><li><span>Wallet</span><strong>connected · ' + esc(String(w.unlocked || "0")) + ' XMZ ready</strong>' + arrivingHTML(w) + '  <button class="tp-link" type="button" data-act="xmz-add">Add XMZ</button>' +
         (Number(w.unlocked) > 0 ? ' · <button class="tp-link" type="button" data-act="xmz-return">Move back</button>' : "") +
-        (w.tradeAccount ? ' <span class="tp-acct">· trade account ' + esc(short(w.tradeAccount)) + "</span>" : "") + "</li><li><span>MetaMask</span><strong>" + esc(short(s.account)) +
+        (payIn() ? ' <span class="tp-acct">· trade account ' + esc(short(payIn())) + "</span>" : "") + "</li><li><span>" + own() + "</span><strong>" + esc(short(sol() ? s.solAccount : s.account)) +
         "</strong></li><li><span>Network</span><strong>" + esc(c.name) + "</strong></li></ul>";
-      if (st.account && s.account && st.account.toLowerCase() !== s.account.toLowerCase())
+      if (!sol() && st.account && s.account && st.account.toLowerCase() !== s.account.toLowerCase())
         h += '<p class="tp-err">MetaMask is now on another account. Proceeds still go to ' + esc(short(s.account)) + ", the account you accepted in the wallet. Disconnect and connect again to change it.</p>";
       var live = t.configured && t.tradeId && st.dismissed !== t.tradeId;
       if (!w.keysReady) h += '<p class="tp-act">' + (w.keysBusy ? "Your wallet is unlocking your trading keys…" : w.keysExist ? "Your trading keys are locked. Your Monzero wallet asks for your trading password."
@@ -460,18 +549,18 @@
         h += "<h3>Or post your own</h3>" + '<div class="tp-form"><label>XMZ<input id="tp-xmz" inputmode="decimal" autocomplete="off" value="' + esc(st.form.xmz) + '"></label>' +
           "<label>Price (" + st.coin + ' per XMZ)<input id="tp-price" inputmode="decimal" autocomplete="off" value="' + esc(st.form.price) + '"></label></div>' +
           '<p class="tp-note" id="tp-total"></p><button class="button secondary" type="button" data-act="post"' + (st.busy ? " disabled" : "") + ">" + (st.side === "buy" ? "Post offer to buy XMZ" : "Post offer to sell XMZ") + "</button>";
-        if (lim && lim.open) h += '<p class="tp-note">While the DEX is new: at most ' + esc(fromUnits(lim.coin, 18, 6)) + " " + st.coin + " and " + esc(fromUnits(lim.xmz, 11, 0)) + " XMZ per trade.</p>";
+        if (lim && lim.open) h += '<p class="tp-note">While the DEX is new: at most ' + esc(fromUnits(lim.coin, dec(), 6)) + " " + st.coin + " and " + esc(fromUnits(lim.xmz, 11, 0)) + " XMZ per trade.</p>";
         var open = (m.mine || []).filter(function (x) { return x.state === "open"; });
         if (open.length) h += "<h3>Your open offers</h3>" + '<ul class="tp-offers">' + open.map(function (x) {
           return "<li><span>" + (x.side === "buy-xmz" ? "Buy " : "Sell ") + "<strong>" + esc(x.xmz) + " XMZ</strong> for " + esc(x.coin) + " " + st.coin +
             '</span><button class="button secondary" type="button" data-act="cancel" data-folder="' + esc(x.folder) + '">Cancel</button></li>';
         }).join("") + "</ul>";
-        else h += '<p class="tp-note">Paid in ' + st.coin + ' you no longer need? <button class="tp-link" type="button" data-act="return">Send it back to MetaMask</button></p>';
+        else h += '<p class="tp-note">Paid in ' + st.coin + ' you no longer need? <button class="tp-link" type="button" data-act="return">Send it back to ' + own() + '</button></p>';
       }
       h += '<p class="tp-note"><button class="tp-link" type="button" data-act="disconnect">Disconnect this page</button></p>';
     }
     if (st.note) h += '<p class="tp-say' + (st.busy ? " tp-busy" : "") + '" role="status">' + esc(st.note) +
-      (st.paying && chain() ? ' <a href="' + chain().tx + esc(st.paying) + '" rel="noopener" target="_blank">See the payment</a>' : "") + "</p>";
+      (st.paying && chain() ? ' <a href="' + txLink(st.paying) + '" rel="noopener" target="_blank">See the payment</a>' : "") + "</p>";
     attention();
     if (st.error) h += '<p class="tp-err" role="alert">' + esc(st.error) + "</p>";
     // Keep what is being typed
@@ -483,8 +572,8 @@
   function total() {
     var el = document.getElementById("tp-total");
     if (!el) return;
-    var xmz = toUnits(st.form.xmz, 11), price = toUnits(st.form.price, 18);
-    el.textContent = xmz && price ? (st.side === "buy" ? "You pay " : "You receive ") + fromUnits(xmz * price / 100000000000n, 18, 8) + " " + st.coin : "";
+    var xmz = toUnits(st.form.xmz, 11), price = toUnits(st.form.price, dec());
+    el.textContent = xmz && price ? (st.side === "buy" ? "You pay " : "You receive ") + fromUnits(xmz * price / 100000000000n, dec(), 8) + " " + st.coin : "";
   }
 
   box.addEventListener("click", function (e) {
@@ -500,7 +589,7 @@
     else if (act === "return") giveBack();
     else if (act === "topup") topUp();
     else if (act === "abandon") api("/v1/abandon", {}).then(function (r) {
-      if (r && r.ok) say("Trade cancelled. What you paid in is still in your trade account; you can send it back to MetaMask below."); else fail(new Error("This trade can no longer be cancelled here: it has started."));
+      if (r && r.ok) say("Trade cancelled. What you paid in is still in your trade account; you can send it back to " + own() + " below."); else fail(new Error("This trade can no longer be cancelled here: it has started."));
       return refresh();
     }).catch(fail);
     else if (act === "unlock") ask("/v1/unlock", {}, "Look at your Monzero wallet: it is asking for your trading password.");

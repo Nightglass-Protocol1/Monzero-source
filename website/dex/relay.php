@@ -36,7 +36,7 @@ switch ($what) {
     case 'listings':
     case 'prints':
     case 'candles':
-        if (!is_string($pair) || !in_array($pair, ['ETH/XMZ', 'BNB/XMZ', 'BTC/XMZ', 'LTC/XMZ'], true)) relayFail(400, 'unknown pair');
+        if (!is_string($pair) || !in_array($pair, ['ETH/XMZ', 'BNB/XMZ', 'SOL/XMZ', 'BTC/XMZ', 'LTC/XMZ'], true)) relayFail(400, 'unknown pair');
         // Bitcoin and Litecoin offers are kept apart from the EVM ones (amount in satoshis/litoshis)
         $utxo = $pair === 'BTC/XMZ' || $pair === 'LTC/XMZ';
         $path = ($utxo && $what === 'listings') ? '/v1/utxo/listings' : '/v1/' . $what;
