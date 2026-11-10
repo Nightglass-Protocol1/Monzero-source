@@ -86,6 +86,10 @@ fn journal_has_trade(dir: &Path) -> bool {
     FileJournal(dir.join("journal.json")).load().is_ok_and(|r| r.trade.is_some())
 }
 
+fn chain_of_id(id: u64) -> Result<Chain, String> {
+    Chain::from_id(id).ok_or_else(|| format!("unknown chain {id}"))
+}
+
 fn parse_amount(text: &str, what: &str) -> Result<U256, String> {
     let t = text.trim();
     if t.is_empty() || t.len() > 78 || !t.bytes().all(|b| b.is_ascii_digit()) {
@@ -95,7 +99,13 @@ fn parse_amount(text: &str, what: &str) -> Result<U256, String> {
 }
 
 /// The EVM clock and head, and the XMZ height: what a saved trade records
-async fn heights(cfg: &TickConfig, evm_from_block: Option<u64>) -> Result<Heights, String> {
+async fn heights(cfg: &TickConfig, chain: Chain, evm_from_block: Option<u64>) -> Result<Heights, String> {
+    if chain.is_solana() {
+        let (now, slot) = crate::sol::clock(&cfg.evm_rpc).await.map_err(|e| e.to_string())?;
+        let main = rpc(&cfg.main_wallet)?;
+        let xmz = main.call("get_height", json!({})).await.map_err(|e| e.to_string())?["height"].as_u64().ok_or("the XMZ wallet gave no height")?;
+        return Ok(Heights { now, evm_from_block: evm_from_block.unwrap_or(slot), xmz_restore_height: xmz.saturating_sub(1) });
+    }
     let provider = ProviderBuilder::new().connect_http(cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
     let head = provider.get_block_number().await.map_err(|e| e.to_string())?;
     let block = provider
@@ -111,6 +121,18 @@ async fn heights(cfg: &TickConfig, evm_from_block: Option<u64>) -> Result<Height
 /// Our side can pay for its part before we offer or take: the coin (owner) or XMZ (claimer)
 async fn check_funds(role: Role, listing: &Listing, key: &PrivateKeySigner, cfg: &TickConfig) -> Result<(), String> {
     match role {
+        Role::Owner if Chain::from_id(listing.chain_id).is_some_and(Chain::is_solana) => {
+            let account = crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes();
+            let have = crate::sol::balance(&cfg.evm_rpc, &account).await.map_err(|e| e.to_string())?;
+            let need = u64::try_from(listing.value).map_err(|_| "the amount does not fit Solana's lamports")?;
+            if have < need {
+                let sol = |lamports: u64| format!("{}.{:09}", lamports / 1_000_000_000, lamports % 1_000_000_000);
+                return Err(format!(
+                    "the trade account {} holds {} SOL; this offer needs {} plus network fees. Send at least {} more to it (for example from Phantom), then try again",
+                    crate::sol::to_base58(&account), sol(have), sol(need), sol(need - have)
+                ));
+            }
+        }
         Role::Owner => {
             let provider = ProviderBuilder::new().connect_http(cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
             let have = provider.get_balance(key.address()).await.map_err(|e| e.to_string())?;
@@ -145,33 +167,26 @@ fn evm_chain(cfg: &TickConfig, listing: &Listing, from_block: u64, key: &Private
     Ok(c)
 }
 
+/// Before offering or taking: the node is the listing's chain and the accounts can be paid (EVM:
+/// no code at the address); on Solana, the pinned swap program is there.
+async fn check_chain(cfg: &TickConfig, listing: &Listing, from_block: u64, key: &PrivateKeySigner, accounts: &[Address]) -> Result<(), String> {
+    let kind = Chain::from_id(listing.chain_id).ok_or("unknown chain")?;
+    if kind.is_solana() {
+        let program = crate::sol::program_of(kind).ok_or("no swap program is pinned for this Solana cluster")?;
+        return crate::sol::check_program(&cfg.evm_rpc, &program).await.map_err(|e| e.to_string());
+    }
+    let chain = evm_chain(cfg, listing, from_block, key)?;
+    chain.check_network().await.map_err(|e| e.to_string())?;
+    chain.check_plain_accounts(accounts).await.map_err(|e| e.to_string())
+}
+
 /// Writes the agreed trade to the journal, before anything is locked
 fn start_trade(dir: &Path, saved: SavedTrade, seed: &SwapSeed, key: &PrivateKeySigner, cfg: &TickConfig) -> Result<(), String> {
     let agreed = saved.agreed(seed, key).map_err(|e| e.to_string())?;
-    let chain = evm_chain(cfg, &listing_view(&saved), saved.evm_from_block, key)?;
+    let chain = crate::helper::trade_chain(cfg, &saved, &agreed, key)?;
     let xmz = xmz_parts(dir, cfg, &saved, &agreed, seed)?;
     Driver::start(saved, seed, key, chain, xmz, FileJournal(dir.join("journal.json"))).map_err(|e| e.to_string())?;
     Ok(())
-}
-
-/// Enough of a listing to build the chain client for a saved trade
-fn listing_view(saved: &SavedTrade) -> Listing {
-    let o = &saved.offer;
-    Listing {
-        schema: LISTING_SCHEMA.into(),
-        id: o.trade_id,
-        pair: String::new(),
-        chain_id: o.chain_id,
-        contract: o.contract,
-        side: Side::SellXmz,
-        value: o.value,
-        xmz: o.xmz_amount,
-        maker: Address::ZERO,
-        mailbox: B256::ZERO,
-        xmz_network: o.xmz_network,
-        created_at: 0,
-        expires_at: o.expires_at,
-    }
 }
 
 fn listing_json(s: &SignedListing, relays: &[String]) -> Value {
@@ -197,7 +212,7 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
         return Err("an offer stays open for at most 24 hours".into());
     }
     let xmz_atoms: u64 = parse_amount(&params.xmz_atoms, "xmzAtoms")?.try_into().map_err(|_| "xmzAtoms is out of range")?;
-    let at = heights(cfg, None).await?;
+    let at = heights(cfg, chain_kind, None).await?;
     let mut id = [0u8; 32];
     OsRng.fill_bytes(&mut id);
     let id = B256::from(id);
@@ -213,16 +228,14 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
         maker: key.address(),
         mailbox: seed.mailbox(id, true).address(),
         xmz_network: match chain_kind {
-            Chain::BscMainnet | Chain::EthMainnet => XmzNetwork::Mainnet,
+            Chain::BscMainnet | Chain::EthMainnet | Chain::SolMainnet => XmzNetwork::Mainnet,
             _ => XmzNetwork::Testnet,
         },
         created_at: at.now,
         expires_at: at.now + params.lifetime_secs,
     };
     listing.check(&rules, at.now).map_err(|e| e.to_string())?;
-    let chain = evm_chain(cfg, &listing, at.evm_from_block, &key)?;
-    chain.check_network().await.map_err(|e| e.to_string())?;
-    chain.check_plain_accounts(&[key.address()]).await.map_err(|e| e.to_string())?;
+    check_chain(cfg, &listing, at.evm_from_block, &key, &[key.address()]).await?;
     check_funds(listing.maker_role(), &listing, &key, cfg).await?;
     let signed = listing.sign(&key);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -256,14 +269,11 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
         }
         let Some(Letter::Take(take)) = Letter::open(&mailbox, &sealed) else { continue };
         if at.is_none() {
-            at = Some(heights(cfg, None).await?);
+            at = Some(heights(cfg, chain_of_id(file.listing.listing.chain_id)?, None).await?);
         }
         let heights = at.expect("set");
         // A taker with code on chain could not receive the payout: refuse before answering
-        let plain = match evm_chain(cfg, &file.listing.listing, heights.evm_from_block, &key) {
-            Ok(c) => c.check_plain_accounts(&[take.taker]).await.is_ok(),
-            Err(_) => false,
-        };
+        let plain = check_chain(cfg, &file.listing.listing, heights.evm_from_block, &key, &[take.taker]).await.is_ok();
         let (answer, saved) = if plain {
             maker.answer(&take, &seed, &key, heights)
         } else {
@@ -284,7 +294,7 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
     }
     let now = match at {
         Some(h) => h.now,
-        None => heights(cfg, None).await.map(|h| h.now).unwrap_or(0),
+        None => heights(cfg, chain_of_id(file.listing.listing.chain_id)?, None).await.map(|h| h.now).unwrap_or(0),
     };
     if file.taken_by.is_some() && journal_has_trade(dir) {
         let mut v = status(dir)?;
@@ -309,7 +319,7 @@ pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Opti
         Some(f) => f,
         None => {
             let signed = offered.ok_or("take needs the offer the first time")?;
-            let at = heights(cfg, None).await?;
+            let at = heights(cfg, chain_of_id(signed.listing.chain_id)?, None).await?;
             signed.verify(&rules(local_contract), at.now).map_err(|e| e.to_string())?;
             let l = &signed.listing;
             if l.maker == key.address() {
@@ -319,9 +329,7 @@ pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Opti
                 Role::Owner => Role::Claimer,
                 Role::Claimer => Role::Owner,
             };
-            let chain = evm_chain(cfg, l, at.evm_from_block, &key)?;
-            chain.check_network().await.map_err(|e| e.to_string())?;
-            chain.check_plain_accounts(&[key.address(), l.maker]).await.map_err(|e| e.to_string())?;
+            check_chain(cfg, l, at.evm_from_block, &key, &[key.address(), l.maker]).await?;
             check_funds(ours, l, &key, cfg).await?;
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             let f = TakerFile { listing: signed, evm_from_block: at.evm_from_block, sent_at: 0 };
@@ -330,7 +338,7 @@ pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Opti
         }
     };
     let l = file.listing.listing.clone();
-    let at = heights(cfg, Some(file.evm_from_block)).await?;
+    let at = heights(cfg, chain_of_id(l.chain_id)?, Some(file.evm_from_block)).await?;
     let (mut taker, letter) = Taker::start(&l, &seed, &key, at.now).map_err(|e| e.to_string())?;
     // An answer first: it may already be waiting
     let mailbox = seed.mailbox(l.id, false);
@@ -370,7 +378,7 @@ pub async fn cancel(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<V
     }
     let client = RelayClient::new(relays)?;
     let (_, key) = keys(cfg)?;
-    let at = heights(cfg, None).await?;
+    let at = heights(cfg, chain_of_id(file.listing.listing.chain_id)?, None).await?;
     let signed = Cancel { schema: CANCEL_SCHEMA.into(), id: file.listing.listing.id, maker: key.address(), at: at.now }.sign(&key);
     Ok(json!({"cancelled": client.cancel(&signed).await}))
 }
@@ -425,12 +433,21 @@ pub fn xmz_needed(atoms: u64) -> u64 {
 /// Send what the trade account holds on this chain back to the user's own wallet (for example
 /// MetaMask), when nothing of ours needs it: coin paid in for an offer that was cancelled, never
 /// taken, or refused.
-pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: Address, now: u64) -> Result<Value, String> {
+pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: &str, now: u64) -> Result<Value, String> {
     if let Some(why) = funds_in_use(root, now)? {
         return Err(why);
     }
     let (_, key) = keys(cfg)?;
     let kind = Chain::from_id(chain_id).ok_or("unknown chain")?;
+    if kind.is_solana() {
+        let to_key = crate::sol::from_base58(to).map_err(|e| e.to_string())?;
+        let sent = crate::sol::pay_out(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to_key).await.map_err(|e| e.to_string())?;
+        return Ok(match sent {
+            Some((tx, amount)) => json!({"withdrawn": {"to": to.trim(), "tx": tx, "amountWei": amount.to_string()}}),
+            None => json!({"withdrawn": null, "reason": "nothing to send, or a payment is still pending"}),
+        });
+    }
+    let to = crate::helper::parse_address(to)?;
     let chain = AlloyChain::new(&cfg.evm_rpc, kind, Address::ZERO, 0, key).map_err(|e| e.to_string())?;
     Ok(match chain.pay_out(to).await.map_err(|e| e.to_string())? {
         Some((tx, amount)) => json!({"withdrawn": {"to": to.to_string(), "tx": tx.to_string(), "amountWei": amount.to_string()}}),
@@ -444,6 +461,10 @@ pub async fn report(dir: &Path, relays: &[String]) -> Result<Value, String> {
     let saved = record.trade.ok_or("the journal holds no saved trade")?;
     if saved.role != Role::Claimer || record.state.stage() != "Done(Swapped)" {
         return Err("only a claimer's finished swap has a claim to report".into());
+    }
+    // The relays check a reported claim on its EVM chain; Solana claims are not reported yet
+    if Chain::from_id(saved.offer.chain_id).is_some_and(Chain::is_solana) {
+        return Ok(json!({"reported": false, "reason": "claims on Solana are not reported to the price chart yet"}));
     }
     let claim = record.retained.get("claim").and_then(|v| v.last()).ok_or("no claim transaction in the journal")?;
     let tx = keccak256(&claim.raw);

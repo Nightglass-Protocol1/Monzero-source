@@ -129,6 +129,11 @@ struct Frame {
     offer: B256,
     role: Role,
     share: KeyShare,
+    /// On Solana only: the account this trader uses there (its ed25519 public key). The frame
+    /// is signed by the trader's account of the offer, which ties the two together. Absent on
+    /// EVM chains, so those frames are the bytes they always were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sol_account: Option<B256>,
 }
 
 /// A frame as sent: its exact bytes and the EIP-191 signature of its role's account.
@@ -195,7 +200,9 @@ impl LocalKeys {
         account: &PrivateKeySigner,
         rng: &mut R,
     ) -> Result<SignedFrame, NegotiationError> {
-        let frame = Frame { schema: SCHEMA.into(), offer: offer.digest(), role, share: self.share(rng) };
+        let solana = Chain::from_id(offer.chain_id).is_some_and(Chain::is_solana);
+        let sol_account = solana.then(|| B256::from(crate::sol::account_key(&account.to_bytes().0).verifying_key().to_bytes()));
+        let frame = Frame { schema: SCHEMA.into(), offer: offer.digest(), role, share: self.share(rng), sol_account };
         let bytes = serde_json::to_vec(&frame).map_err(|e| E::Malformed(e.to_string()))?;
         let signature = account
             .sign_message_sync(signing_message(offer.trade_id, role, &bytes).as_bytes())
@@ -211,6 +218,7 @@ struct Checked {
     spend: EdwardsPoint,
     view: NgScalar,
     signed: SignedFrame,
+    sol_account: Option<B256>,
 }
 
 fn check_share(share: &KeyShare) -> Result<(Address, EdwardsPoint, NgScalar), NegotiationError> {
@@ -245,6 +253,8 @@ pub struct KeyExchange {
 #[derive(Clone, Debug)]
 pub struct Agreed {
     pub terms: AgreedTerms,
+    /// On Solana: both traders' accounts there and the points their commitments stand for
+    pub sol: Option<crate::sol::SolBinding>,
     pub xmz_amount: u64,
     pub shared: SharedXmz,
     /// keccak256 over both signed frames: the record of this exchange
@@ -315,6 +325,11 @@ impl KeyExchange {
             return Err(E::BadSignature(role));
         }
         let (commitment, spend, view) = check_share(&frame.share)?;
+        // A Solana trade needs each trader's account there; an EVM trade must not carry one
+        let solana = Chain::from_id(self.offer.chain_id).is_some_and(Chain::is_solana);
+        if solana != frame.sol_account.is_some() || frame.sol_account == Some(B256::ZERO) {
+            return Err(E::InvalidShare("Solana account"));
+        }
         if role == self.role
             && (commitment != self.keys.secret.commitment()
                 || spend.compress().to_bytes() != self.keys.secret.ed25519_public()
@@ -322,7 +337,7 @@ impl KeyExchange {
         {
             return Err(E::NotOurKeys);
         }
-        let checked = Checked { commitment, spend, view, signed: signed.clone() };
+        let checked = Checked { commitment, spend, view, signed: signed.clone(), sol_account: frame.sol_account };
         match role {
             Role::Owner => self.owner = Some(checked),
             Role::Claimer => self.claimer = Some(checked),
@@ -360,7 +375,18 @@ impl KeyExchange {
             }
         }
         let o = &self.offer;
+        let sol = match (owner.sol_account, claimer.sol_account) {
+            (Some(a), Some(b)) if a == b => return Err(E::InvalidShare("both traders sent the same Solana account")),
+            (Some(a), Some(b)) => Some(crate::sol::SolBinding {
+                owner: a.0,
+                claimer: b.0,
+                claim_point: claimer.spend.compress().to_bytes(),
+                refund_point: owner.spend.compress().to_bytes(),
+            }),
+            _ => None,
+        };
         Ok(Agreed {
+            sol,
             terms: AgreedTerms {
                 chain: Chain::from_id(o.chain_id).ok_or(E::UnknownChain(o.chain_id))?,
                 contract: o.contract,

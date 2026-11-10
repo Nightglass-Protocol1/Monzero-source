@@ -21,6 +21,8 @@ pub fn pinned_contracts() -> BTreeMap<u64, Address> {
     ]
     .into_iter()
     .map(|(id, a)| (id, a.parse().expect("pinned address")))
+    // Solana clusters: the stand-in address of each pinned swap program
+    .chain(crate::sol::pinned_contracts())
     .collect()
 }
 

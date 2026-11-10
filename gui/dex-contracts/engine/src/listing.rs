@@ -127,14 +127,15 @@ impl Chain {
         match self {
             Chain::BscMainnet | Chain::BscTestnet => "BNB/XMZ",
             Chain::EthMainnet | Chain::EthSepolia | Chain::Local => "ETH/XMZ",
+            Chain::SolMainnet | Chain::SolDevnet | Chain::SolLocal => "SOL/XMZ",
         }
     }
 
     fn xmz_network_allowed(self, n: XmzNetwork) -> bool {
         match self {
-            Chain::BscMainnet | Chain::EthMainnet => n == XmzNetwork::Mainnet,
-            Chain::BscTestnet | Chain::EthSepolia => n != XmzNetwork::Mainnet,
-            Chain::Local => true,
+            Chain::BscMainnet | Chain::EthMainnet | Chain::SolMainnet => n == XmzNetwork::Mainnet,
+            Chain::BscTestnet | Chain::EthSepolia | Chain::SolDevnet => n != XmzNetwork::Mainnet,
+            Chain::Local | Chain::SolLocal => true,
         }
     }
 }

@@ -56,6 +56,9 @@ pub struct Request {
     /// The contract on a local test chain (31337) only; real chains use the pinned ones
     #[serde(default)]
     pub local_contract: Option<alloy::primitives::Address>,
+    /// The swap program on a local Solana test validator only; real clusters use the pinned ones
+    #[serde(default)]
+    pub local_sol_program: Option<String>,
     /// `withdraw`: the chain whose trade account is emptied
     #[serde(default)]
     pub chain_id: Option<u64>,
@@ -87,6 +90,8 @@ pub enum Command {
     Withdraw,
     /// The app's DEX XMZ wallet: open (create once), status, send
     XmzWallet,
+    /// The trade accounts of these keys: the EVM address and the Solana address
+    Accounts,
 }
 
 #[derive(Deserialize)]
@@ -143,7 +148,14 @@ pub async fn handle(request: &[u8]) -> Value {
 }
 
 async fn dispatch(r: Request) -> Result<Value, String> {
+    if let Some(program) = &r.local_sol_program {
+        crate::sol::set_local_program(crate::sol::from_base58(program).map_err(|e| e.to_string())?);
+    }
     match r.command {
+        Command::Accounts => {
+            let (_, key) = keys(r.tick.as_ref().ok_or("accounts needs tick (the keys)")?)?;
+            Ok(json!({"evm": key.address().to_string(), "sol": crate::sol::to_base58(&crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes())}))
+        }
         Command::Status => status(&r.trade_dir),
         Command::Approve => approve(&r.trade_dir, r.commitment),
         Command::Tick => tick(&r.trade_dir, r.tick).await,
@@ -160,7 +172,7 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         Command::Cancel => crate::helper_market::cancel(&r.trade_dir, r.tick.as_ref().ok_or("cancel needs tick")?, relays(&r)?).await,
         Command::Report => crate::helper_market::report(&r.trade_dir, relays(&r)?).await,
         Command::Withdraw => {
-            let to = parse_address(r.payout_address.as_deref().ok_or("withdraw needs payoutAddress")?)?;
+            let to = r.payout_address.as_deref().ok_or("withdraw needs payoutAddress")?;
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             crate::helper_market::withdraw(&r.trade_dir, r.tick.as_ref().ok_or("withdraw needs tick")?, r.chain_id.ok_or("withdraw needs chainId")?, to, now).await
         }
@@ -186,11 +198,14 @@ pub(crate) fn status(dir: &Path) -> Result<Value, String> {
     let saved = record.trade.as_ref().ok_or("the journal holds no saved trade")?;
     let o = &saved.offer;
     let xmz: XmzRecord = std::fs::read_to_string(dir.join("xmz.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    let evm_txs: serde_json::Map<String, Value> = record
-        .retained
-        .iter()
-        .map(|(k, v)| (k.clone(), json!(v.iter().map(|s| alloy::primitives::keccak256(&s.raw).to_string()).collect::<Vec<_>>())))
-        .collect();
+    // Transaction ids as the chain's explorers show them: the hash on EVM, the signature on Solana
+    let solana = Chain::from_id(o.chain_id).is_some_and(Chain::is_solana);
+    let id = |raw: &alloy::primitives::Bytes| match solana {
+        true => crate::sol::transaction_id(raw).unwrap_or_default(),
+        false => alloy::primitives::keccak256(raw).to_string(),
+    };
+    let evm_txs: serde_json::Map<String, Value> =
+        record.retained.iter().map(|(k, v)| (k.clone(), json!(v.iter().map(|s| id(&s.raw)).collect::<Vec<_>>()))).collect();
     let deadlines = match &record.state {
         RoleState::Owner(s) => swap_of_owner(s),
         RoleState::Claimer(s) => swap_of_claimer(s),
@@ -255,11 +270,7 @@ async fn tick(dir: &Path, cfg: Option<TickConfig>) -> Result<Value, String> {
     let (swap_seed, key) = keys(&cfg)?;
     let saved = journal(dir).load().map_err(|e| e.to_string())?.trade.ok_or("the journal holds no saved trade")?;
     let agreed = saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
-    let chain_kind = Chain::from_id(saved.offer.chain_id).ok_or("unknown chain")?;
-    let mut chain = AlloyChain::new(&cfg.evm_rpc, chain_kind, saved.offer.contract, saved.evm_from_block, key.clone()).map_err(|e| e.to_string())?;
-    if let Some(n) = cfg.evm_log_chunk {
-        chain = chain.with_log_chunk(n);
-    }
+    let chain = trade_chain(&cfg, &saved, &agreed, &key)?;
     let xmz = xmz_parts(dir, &cfg, &saved, &agreed, &swap_seed)?;
     let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?;
     let (awaiting, funding) = match driver.tick().await {
@@ -269,6 +280,11 @@ async fn tick(dir: &Path, cfg: Option<TickConfig>) -> Result<Value, String> {
         Err(e) => return Err(e.to_string()),
     };
     let mut v = status(dir)?;
+    if let Some(sol) = &agreed.sol {
+        // Where this side's SOL is paid in (the trade account on Solana)
+        let ours = if saved.role == crate::negotiation::Role::Owner { sol.owner } else { sol.claimer };
+        v["solAccount"] = json!(crate::sol::to_base58(&ours));
+    }
     v["awaitingApproval"] = json!(awaiting);
     v["awaitingFunding"] = match funding {
         Some((needed, have)) => json!({"neededWei": needed.to_string(), "haveWei": have.to_string(), "missingWei": (needed - have).to_string()}),
@@ -306,11 +322,64 @@ pub(crate) fn xmz_parts(
     ))
 }
 
+/// The chain client of a saved trade: an EVM chain, or Solana with the accounts and points both
+/// traders signed in their frames.
+pub(crate) fn trade_chain(
+    cfg: &TickConfig,
+    saved: &crate::exchange::SavedTrade,
+    agreed: &crate::negotiation::Agreed,
+    key: &alloy::signers::local::PrivateKeySigner,
+) -> Result<crate::sol::AnyChain, String> {
+    let kind = Chain::from_id(saved.offer.chain_id).ok_or("unknown chain")?;
+    if !kind.is_solana() {
+        let mut chain = AlloyChain::new(&cfg.evm_rpc, kind, saved.offer.contract, saved.evm_from_block, key.clone()).map_err(|e| e.to_string())?;
+        if let Some(n) = cfg.evm_log_chunk {
+            chain = chain.with_log_chunk(n);
+        }
+        return Ok(crate::sol::AnyChain::Evm(chain));
+    }
+    let program = crate::sol::program_of(kind).ok_or("no swap program is pinned for this Solana cluster")?;
+    if saved.offer.contract != crate::sol::contract_address(&program) {
+        return Err("the trade names another swap program".into());
+    }
+    let binding = agreed.sol.ok_or("the key exchange did not carry the Solana accounts")?;
+    let sol_key = crate::sol::account_key(&key.to_bytes().0);
+    let ours = if saved.role == crate::negotiation::Role::Owner { binding.owner } else { binding.claimer };
+    if ours != sol_key.verifying_key().to_bytes() {
+        return Err("the trade's Solana account is not this wallet's".into());
+    }
+    let nonce = u64::try_from(saved.swap_nonce()).map_err(|_| "the swap nonce does not fit")?;
+    crate::sol::SolChain::new(&cfg.evm_rpc, kind, program, sol_key, binding, nonce, saved.offer.value).map(crate::sol::AnyChain::Sol).map_err(|e| e.to_string())
+}
+
 /// After the trade is done, send the trade account's balance to the user's own address.
 async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>) -> Result<Value, String> {
     let cfg = cfg.ok_or("payout needs the tick configuration")?;
-    let to = parse_address(to.ok_or("payout needs payoutAddress")?)?;
+    let to_text = to.ok_or("payout needs payoutAddress")?;
     let (swap_seed, key) = keys(&cfg)?;
+    {
+        let record = journal(dir).load().map_err(|e| e.to_string())?;
+        let saved = record.trade.as_ref().ok_or("the journal holds no saved trade")?;
+        if Chain::from_id(saved.offer.chain_id).is_some_and(Chain::is_solana) {
+            if !record.state.is_done() {
+                return Err("the trade is not finished: its account still needs its funds".into());
+            }
+            saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
+            let to = crate::sol::from_base58(to_text).map_err(|e| e.to_string())?;
+            let sent = crate::sol::pay_out(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to).await.map_err(|e| e.to_string())?;
+            let mut v = status(dir)?;
+            v["payout"] = match sent {
+                Some((tx, amount)) => {
+                    let record = json!({"to": to_text.trim(), "tx": tx, "amountWei": amount.to_string()});
+                    let _ = crate::driver::durable_write(&dir.join("payout.json"), record.to_string().as_bytes());
+                    record
+                }
+                None => json!({"to": to_text.trim(), "sent": false, "reason": "nothing to send, or a payout is still pending"}),
+            };
+            return Ok(v);
+        }
+    }
+    let to = parse_address(to_text)?;
     let record = journal(dir).load().map_err(|e| e.to_string())?;
     if !record.state.is_done() {
         return Err("the trade is not finished: its account still needs its funds".into());

@@ -93,11 +93,18 @@ pub enum Chain {
     EthSepolia,
     /// Hardhat / anvil test node
     Local,
+    /// Solana clusters (their own ids here: Solana has no chain id). The swap program there
+    /// takes ed25519 secrets; see `sol`.
+    SolMainnet,
+    SolDevnet,
+    /// solana-test-validator
+    SolLocal,
 }
 
 impl Chain {
     pub fn from_id(id: u64) -> Option<Chain> {
-        [Chain::BscMainnet, Chain::BscTestnet, Chain::EthMainnet, Chain::EthSepolia, Chain::Local].into_iter().find(|c| c.id() == id)
+        [Chain::BscMainnet, Chain::BscTestnet, Chain::EthMainnet, Chain::EthSepolia, Chain::Local, Chain::SolMainnet, Chain::SolDevnet, Chain::SolLocal]
+            .into_iter().find(|c| c.id() == id)
     }
 
     pub fn id(self) -> u64 {
@@ -107,7 +114,15 @@ impl Chain {
             Chain::EthMainnet => 1,
             Chain::EthSepolia => 11_155_111,
             Chain::Local => 31337,
+            // "SOL" + 1 / 2 / 3: far from any EVM chain id in use
+            Chain::SolMainnet => 501_000_101,
+            Chain::SolDevnet => 501_000_102,
+            Chain::SolLocal => 501_000_103,
         }
+    }
+
+    pub fn is_solana(self) -> bool {
+        matches!(self, Chain::SolMainnet | Chain::SolDevnet | Chain::SolLocal)
     }
 
     /// Blocks an EVM transaction may stay unmined before it is replaced with higher fees
@@ -117,6 +132,8 @@ impl Chain {
             Chain::BscMainnet | Chain::BscTestnet => 40,
             Chain::EthMainnet | Chain::EthSepolia => 10,
             Chain::Local => 3,
+            // Slots: a transaction's blockhash lasts about 150 slots (a minute); then it is remade
+            Chain::SolMainnet | Chain::SolDevnet | Chain::SolLocal => 160,
         }
     }
 
@@ -127,6 +144,8 @@ impl Chain {
             Chain::BscMainnet | Chain::BscTestnet => 50_000_000_000,
             Chain::EthMainnet | Chain::EthSepolia => 200_000_000_000,
             Chain::Local => 1_000_000_000_000,
+            // Fixed fees on Solana (5000 lamports a signature)
+            Chain::SolMainnet | Chain::SolDevnet | Chain::SolLocal => 0,
         }
     }
 
@@ -150,6 +169,8 @@ impl Chain {
             Chain::BscTestnet => 15,
             Chain::EthMainnet | Chain::EthSepolia => 96,
             Chain::Local => 1,
+            // The Solana view reads finalized state instead of counting blocks
+            Chain::SolMainnet | Chain::SolDevnet | Chain::SolLocal => 1,
         }
     }
 }
@@ -343,6 +364,7 @@ pub mod machine;
 pub mod secret;
 pub mod driver;
 pub mod chain;
+pub mod sol;
 pub mod xmz;
 pub mod negotiation;
 pub mod swap_seed;

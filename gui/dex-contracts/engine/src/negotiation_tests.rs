@@ -37,7 +37,7 @@ fn frame(s: &Side, offer: &Offer, role: Role) -> SignedFrame {
 
 /// A frame with any content, signed by `account` (a trader can sign whatever it likes)
 fn forged(account: &PrivateKeySigner, offer: &Offer, role: Role, share: KeyShare) -> SignedFrame {
-    let bytes = serde_json::to_vec(&Frame { schema: SCHEMA.into(), offer: offer.digest(), role, share }).unwrap();
+    let bytes = serde_json::to_vec(&Frame { schema: SCHEMA.into(), offer: offer.digest(), role, share, sol_account: None }).unwrap();
     let signature = account.sign_message_sync(signing_message(offer.trade_id, role, &bytes).as_bytes()).unwrap();
     SignedFrame { frame: bytes.into(), signature: signature.as_bytes().to_vec().into() }
 }
