@@ -274,6 +274,9 @@ public:
     // Unlocks this session's trade keys (ETH/BNB) from the Bitcoin or Litecoin light wallet's vault;
     // the password goes only to the vault helper and the keys stay in native memory until exit.
     Q_INVOKABLE bool unlockDexKeys(const QString &password);
+    // One step for a new user: makes the app's own key wallet (a Bitcoin light wallet kept in the
+    // app's data folder) if there is none, opens it and unlocks the trade keys with this password
+    Q_INVOKABLE bool setUpTradingKeys(const QString &password);
     bool dexKeysReady() const {return !m_evmAccount.isEmpty();}
     // Send XMZ from the trading wallet to `address` (amount in XMZ as text; empty sends everything)
     Q_INVOKABLE bool sendFromDexWallet(const QString &address,const QString &amount);
@@ -371,6 +374,8 @@ public:
 #endif
     bool startLitecoinRecovery(const QByteArray &reservedPsbt);
     void retryLitecoinRecoveryStart(int attemptsLeft);
+    void stepTradingKeysSetup();
+    void endTradingKeysSetup(const QString &message);
     QVariantMap litecoinLightFundingStatus() const;
     Q_INVOKABLE bool useLitecoinLightWallet();
     Q_INVOKABLE bool queryLitecoinLightTerms();
@@ -554,6 +559,8 @@ private:
     DexWalletService *m_dexWallets=nullptr;
     QString m_evmAccount,m_keysMessage;
     bool m_keysBusy=false;
+    QString m_keysSetupPassword;
+    int m_keysSetupSteps=0;
     QTimer *m_btcTicker=nullptr;
     QString m_btcMessage;
     QString btcOfferRefusal(const QString &sats,const QString &atoms);

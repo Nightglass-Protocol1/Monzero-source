@@ -2758,16 +2758,20 @@ Later addresses may be missing from this backup. Payment and active swap recover
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.defaultFontColor
                 text: tradingSetup.w.keysReady === true
-                    ? qsTr("Trade keys unlocked for this session (ETH/BNB account %1). Fund it with the coin you trade.").arg(tradingSetup.w.tradeAccount)
-                    : qsTr("Unlock your trade keys: they come from your Bitcoin or Litecoin light wallet's recovery words, so a restore brings them back.")
+                    ? qsTr("Trading keys unlocked for this session. Your ETH/BNB trade account: %1").arg(tradingSetup.w.tradeAccount)
+                    : tradingSetup.w.keysBusy === true ? qsTr("Setting up your trading keys…")
+                    : tradingSetup.w.keysExist === true ? qsTr("Enter your trading password to unlock your trading keys.")
+                    : qsTr("Choose a password to create your trading keys. They are made and kept encrypted on this device; nobody else can restore them, so keep the password and back up the key wallet (Advanced: coin wallets).")
             }
             RowLayout {
                 visible: tradingSetup.w.keysReady !== true
-                M.LineEdit { id: keysPassword; Layout.fillWidth: true; password: true; placeholderText: qsTr("Light wallet password") }
+                M.LineEdit { id: keysPassword; objectName: "dexKeysPassword"; Layout.fillWidth: true; password: true; placeholderText: tradingSetup.w.keysExist === true ? qsTr("Trading password") : qsTr("New trading password") }
+                M.LineEdit { id: keysPasswordRepeat; objectName: "dexKeysPasswordRepeat"; Layout.fillWidth: true; password: true; visible: tradingSetup.w.keysExist !== true; placeholderText: qsTr("Repeat the password") }
                 M.StandardButton {
-                    objectName: "dexUnlockKeys"; text: tradingSetup.w.keysBusy === true ? qsTr("Unlocking…") : qsTr("Unlock")
-                    enabled: tradingSetup.w.keysBusy !== true && keysPassword.text !== ""
-                    onClicked: { root.dex.unlockDexKeys(keysPassword.text); keysPassword.text = "" }
+                    objectName: "dexUnlockKeys"
+                    text: tradingSetup.w.keysBusy === true ? qsTr("Working…") : tradingSetup.w.keysExist === true ? qsTr("Unlock") : qsTr("Create trading keys")
+                    enabled: tradingSetup.w.keysBusy !== true && keysPassword.text !== "" && (tradingSetup.w.keysExist === true || keysPassword.text === keysPasswordRepeat.text)
+                    onClicked: { root.dex.setUpTradingKeys(keysPassword.text); keysPassword.text = ""; keysPasswordRepeat.text = "" }
                 }
             }
             M.TextPlain {

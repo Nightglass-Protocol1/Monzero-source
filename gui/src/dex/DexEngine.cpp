@@ -33,6 +33,7 @@
 #include "LitecoinJournalProtocol.h"
 #include "SwapWalletRpcProcess.h"
 #include <QDir>
+#include <QStandardPaths>
 #include <QEventLoop>
 #include <QFileInfo>
 #include <QTimer>
@@ -113,6 +114,8 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     m_lightWallets.insert("ltc",m_ltcLight);
     for (const auto &coin:QStringList{"btc","bch","doge"}) m_lightWallets.insert(coin,new LitecoinLightJob(coin,this));
     for (auto *job:m_lightWallets) connect(job,&LitecoinLightJob::changed,this,&DexEngine::lightWalletsChanged);
+    connect(this,&DexEngine::lightWalletsChanged,this,[this]{if (!m_keysSetupPassword.isEmpty()) QTimer::singleShot(0,this,&DexEngine::stepTradingKeysSetup);});
+    connect(this,&DexEngine::lightWalletsChanged,this,&DexEngine::dexWalletChanged);
     connect(this,&DexEngine::bchFundingReceiptChanged,this,&DexEngine::advanceBchStartupChecks,Qt::QueuedConnection);
     connect(m_bchFundingReceipt,&BchFundingReceiptJob::changed,this,&DexEngine::bchFundingReceiptChanged);
     connect(m_bchFundingReceipt,&BchFundingReceiptJob::changed,this,&DexEngine::bchRefundProtectionChanged);
@@ -1074,7 +1077,11 @@ bool DexEngine::configureDexWallets(const QString &root,const QString &walletRpc
 }
 QVariantMap DexEngine::dexWalletStatus() const {
     auto s=m_dexWallets->status();
-    s.insert("keysReady",dexKeysReady());s.insert("keysBusy",m_keysBusy);s.insert("tradeAccount",m_evmAccount);s.insert("keysMessage",m_keysMessage);
+    s.insert("keysReady",dexKeysReady());s.insert("keysBusy",m_keysBusy || !m_keysSetupPassword.isEmpty());s.insert("tradeAccount",m_evmAccount);s.insert("keysMessage",m_keysMessage);
+    // A key wallet already on this device: the user unlocks it; otherwise the app makes one
+    bool exists=swapLight() && swapLight()->status().value("configured").toBool();
+    for (const auto &coin:{"btc","ltc"}) if (auto *job=m_lightWallets.value(coin)) exists=exists || job->status().value("configured").toBool();
+    s.insert("keysExist",exists);s.insert("keysSetupAvailable",m_lightWallets.contains("btc") && lightWalletSetupAvailable());
     return s;
 }
 bool DexEngine::refreshDexWallet() {return m_dexWallets->refresh();}
@@ -1101,6 +1108,62 @@ bool DexEngine::unlockDexKeys(const QString &password) {
     });
     if (!started) {m_keysBusy=false;m_keysMessage=tr("The wallet is busy; try again in a moment.");emit dexWalletChanged();}
     return started;
+}
+bool DexEngine::setUpTradingKeys(const QString &password) {
+    if (m_keysBusy || !m_keysSetupPassword.isEmpty() || password.isEmpty()) return false;
+    for (const auto &coin:{"btc","ltc"}) if (auto *job=m_lightWallets.value(coin)) if (job->vaultReady()) return unlockDexKeys(password);
+    if (swapLight() && swapLight()->vaultReady()) return unlockDexKeys(password);
+    if (!m_lightWallets.contains("btc") || !lightWalletSetupAvailable()) {
+        m_keysMessage=tr("This build cannot create trading keys: its wallet helper is missing.");emit dexWalletChanged();return false;
+    }
+    m_keysSetupPassword=password;m_keysSetupSteps=0;m_keysMessage.clear();emit dexWalletChanged();
+    QTimer::singleShot(0,this,&DexEngine::stepTradingKeysSetup);
+    return true;
+}
+void DexEngine::endTradingKeysSetup(const QString &message) {
+    m_keysSetupPassword.fill(QChar(0));m_keysSetupPassword.clear();
+    m_keysMessage=message;emit dexWalletChanged();
+}
+void DexEngine::stepTradingKeysSetup() {
+    // Presses, in order, what the wallet panels offer: settings, create (or resume), review, open.
+    // Runs again on every wallet change until the vault is open, then unlocks the trade keys.
+    if (m_keysSetupPassword.isEmpty()) return;
+    auto *job=m_lightWallets.value("btc");
+    if (!job) return endTradingKeysSetup(tr("The trading keys could not be set up."));
+    if (job->busy()) return;
+    if (job->vaultReady()) {
+        const QString password=m_keysSetupPassword;
+        endTradingKeysSetup({});
+        unlockDexKeys(password);
+        return;
+    }
+    const auto failed=tr("The trading keys could not be set up. Nothing was lost: open \"Advanced: coin wallets\" to see the key wallet's state, or try again.");
+    const auto s=job->status();
+    bool ok=false;
+    // m_keysSetupSteps: 1 = settings written, 2 = create-or-resume asked, 4 = saved wallet reviewed, 8 = open asked
+    if (!s.value("configured").toBool()) {
+        if (m_keysSetupSteps & 1) return endTradingKeysSetup(failed);
+        m_keysSetupSteps|=1;
+        const bool mainnet=DexDeployment::mainnetStage();
+        const auto stage=DexDeployment::litecoinNetwork();
+        const QString network=mainnet ? QStringLiteral("main") : stage.startsWith("btc-") ? stage.mid(4) : QStringLiteral("testnet4");
+        const auto directory=QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(mainnet ? "dex/mainnet/trading-keys" : "dex/testnet/trading-keys");
+        ok=QDir().mkpath(directory) && QFile::setPermissions(directory,QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner)
+            && prepareLocalLightWallet("btc",network,directory,QString(),0,0);
+    } else if (s.value("walletCreatedOpenAvailable").toBool() && !(m_keysSetupSteps & 8)) {
+        m_keysSetupSteps|=8;
+        ok=job->openCreatedWallet(s.value("wallet").toMap().value("configurationDigest").toString());
+    } else if (s.value("walletCreateAvailable").toBool() && !(m_keysSetupSteps & 2)) {
+        m_keysSetupSteps|=2;
+        ok=createLightWallet("btc",s.value("creationDigest").toString(),m_keysSetupPassword,m_keysSetupPassword);
+    } else if (s.value("walletCreatedReviewAvailable").toBool() && !(m_keysSetupSteps & 4)) {
+        m_keysSetupSteps|=4;
+        ok=job->reviewCreatedWallet();
+    } else {
+        return endTradingKeysSetup((m_keysSetupSteps & 2) ? tr("The key wallet could not be opened; check the password.") : failed);
+    }
+    if (!ok) return endTradingKeysSetup(failed);
+    QTimer::singleShot(1500,this,&DexEngine::stepTradingKeysSetup);   // also when a step ends without a change signal
 }
 bool DexEngine::sendFromDexWallet(const QString &address,const QString &amount) {
     const auto atoms=amount.trimmed().isEmpty() ? QString() : atomic(amount,11);
