@@ -6316,3 +6316,11 @@ wrong-chain requests, restored receive addresses and owner-only file permissions
 It starts no nodes, mining or servers and touches no existing wallet. It does not
 prove online-query privacy or complete DEX recovery. Reports exclude passwords,
 wallet files, keys and addresses; temporary wallets are deleted on exit.
+
+## Observer wallet reopened for the buyer's payout (10 Nov 2026)
+
+`upstream-journal-observer-reopen.patch` applies last. After an app restart the observer wallet
+service no longer has the trade's view-only wallet open, and the buyer's recovered-wallet and
+payout-preparation steps failed with "native RPC rejected request". `native-ltc-journal` now opens
+the view-only wallet again before both steps. Found in the signet app-to-app BTC/XMZ run of
+9 Nov 2026; the 18 journal tests pass. Helper built with it: sha256 `9cc35730…8b641`.

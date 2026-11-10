@@ -1,0 +1,25 @@
+--- a/swap-machine/src/bin/native-ltc-journal.rs
++++ b/swap-machine/src/bin/native-ltc-journal.rs
+@@ -649,6 +649,12 @@
+         isolated_native(daemon,&config.policy).await?;
+         let (_ltc_lease,ltc)=seller_chain(config.policy.ltc_network,port,wallet,anchor,cookie.as_deref(),light.as_ref())?;
+         let block=match block {Some(block)=>block,None=>execution.locate_native_settlement_block(&ltc).await?};
++        // The observer service forgets its open wallet when the app restarts; the claim is
++        // checked through the trade's view-only wallet, so open it again first.
++        if payout {
++            open_observer_view(execution,&observer.login_file,daemon,observer.wallet_port,config.trade_id,config.policy.xmz_network).await
++                .context("Failed to open the trade's view-only XMZ wallet")?;
++        }
+         let (_observer_lease,user,secret)=credentials(&observer.login_file)?;
+         let observer=NativeFundingRpc::new(daemon,observer.wallet_port,user,secret)?;
+         let (_wallet_lease,user,secret)=credentials(&login)?;
+@@ -771,6 +777,9 @@
+         if preparing {
+             let observer=rpc.preparation_observer.as_ref().context("preparation observer is not configured")?;
+             let client=NativeFundingRpc::new(rpc.native_daemon_port,rpc.native_wallet_port,user,password)?;
++            // As for the recovered wallet: the view-only wallet may be closed after an app restart
++            open_observer_view(execution,&observer.login_file,rpc.native_daemon_port,observer.wallet_port,config.trade_id,config.policy.xmz_network).await
++                .context("Failed to open the trade's view-only XMZ wallet")?;
+             let (_observer_file,user,password)=credentials(&observer.login_file)?;
+             let observer_client=NativeFundingRpc::new(rpc.native_daemon_port,observer.wallet_port,user,password)?;
+             let native=observer_client;

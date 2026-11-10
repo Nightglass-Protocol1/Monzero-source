@@ -45,7 +45,7 @@ def main():
     p.add_argument("--days", type=float, default=7)
     p.add_argument("--networks", default="", help="comma-separated networks to open, e.g. eth-mainnet,bnb-mainnet "
                    "for the MetaMask coins only; a network without a published document stays closed (default: all)")
-    p.add_argument("--key", default="~/monzero-private/dex-control-btc-mainnet", help="the owner's control key file")
+    p.add_argument("--key", default="~/monzero-private/dex-control-btc-mainnet/control-signing.key", help="the owner's control key file")
     a = p.parse_args()
     usd = prices()
     xmz_per_trade = atoms(a.per_trade_usd, a.xmz_usd, XMZ_ATOMS)
