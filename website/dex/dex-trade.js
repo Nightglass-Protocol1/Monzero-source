@@ -292,6 +292,7 @@
   };
   function tradeHTML(t) {
     var s = t.snapshot || {}, o = s.offer || {}, c = chain(), buying = s.role === "owner", h = "";
+    if (st.note.indexOf("Offer taken") === 0) st.note = "";   // the trade itself is on screen now
     var coinAmt = o.value ? fromUnits(BigInt(o.value), 18, 8) + " " + st.coin : "", xmzAmt = o.xmzAmount != null ? fromUnits(BigInt(o.xmzAmount), 11, 4) + " XMZ" : "";
     h += '<p class="tp-terms">' + (buying ? "You pay <strong>" + esc(coinAmt) + "</strong> · you receive <strong>" + esc(xmzAmt) + "</strong>"
       : "You pay <strong>" + esc(xmzAmt) + "</strong> · you receive <strong>" + esc(coinAmt) + "</strong>") + "</p>";
@@ -307,7 +308,6 @@
     if (t.payout && t.payout.tx) links.push('<a href="' + c.tx + esc(t.payout.tx) + '" rel="noopener" target="_blank">sent back to MetaMask</a>');
     if (links.length) h += '<p class="tp-links">On chain: ' + links.join(" · ") + "</p>";
     if (s.done) {
-      if (st.note.indexOf("Offer taken") === 0) st.note = "";
       if (t.payout && t.payout.tx) h += '<p class="tp-note">' + esc(fromUnits(BigInt(t.payout.amountWei), 18, 8)) + " " + st.coin + " went back to " + esc(short(t.payout.to)) + ".</p>";
       else if (t.payout && t.payout.sent === false) h += '<p class="tp-note">Nothing was left in the trade account to send back to MetaMask.</p>';
       h += '<button class="button secondary" type="button" data-act="dismiss">New trade</button>';
