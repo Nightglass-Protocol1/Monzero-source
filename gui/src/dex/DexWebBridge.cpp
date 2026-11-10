@@ -1,3 +1,4 @@
+#include "DexChains.h"
 #include "DexWebBridge.h"
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -38,7 +39,10 @@ DexWebBridge::DexWebBridge(QObject *engine,const QStringList &allowedOrigins,boo
 
 int DexWebBridge::port() const {return m_server && m_server->isListening() ? m_server->serverPort() : 0;}
 QVariantMap DexWebBridge::connection() const {
-    return m_tokenHash.isEmpty() ? QVariantMap{} : QVariantMap{{"origin",m_origin},{"account",m_account}};
+    return m_tokenHash.isEmpty() ? QVariantMap{} : QVariantMap{{"origin",m_origin},{"account",m_account},{"solAccount",m_solAccount}};
+}
+QString DexWebBridge::payoutAccount(qint64 chainId) const {
+    return DexChains::solana(chainId) ? m_solAccount : m_account;
 }
 
 bool DexWebBridge::listen(const QString &settingsFile) {
@@ -47,9 +51,10 @@ bool DexWebBridge::listen(const QString &settingsFile) {
     {
         QSettings s(m_settingsFile,QSettings::IniFormat);
         const auto hash=QByteArray::fromHex(s.value("page/tokenHash").toByteArray());
-        const auto origin=s.value("page/origin").toString(),account=s.value("page/account").toString();
-        if (hash.size()==32 && originAllowed(origin.toLatin1()) && QRegularExpression("\\A0x[0-9a-fA-F]{40}\\z").match(account).hasMatch()) {
-            m_tokenHash=hash;m_origin=origin;m_account=account;
+        const auto origin=s.value("page/origin").toString(),account=s.value("page/account").toString(),sol=s.value("page/solAccount").toString();
+        const bool evmOk=DexChains::evmAddress(account),solOk=DexChains::solanaAddress(sol);
+        if (hash.size()==32 && originAllowed(origin.toLatin1()) && (evmOk || solOk) && (account.isEmpty() || evmOk) && (sol.isEmpty() || solOk)) {
+            m_tokenHash=hash;m_origin=origin;m_account=account;m_solAccount=sol;
         }
     }
     m_server=new QTcpServer(this);
@@ -66,7 +71,7 @@ bool DexWebBridge::listen(const QString &settingsFile) {
 void DexWebBridge::save() const {
     QSettings s(m_settingsFile,QSettings::IniFormat);
     s.setValue("page/tokenHash",QString::fromLatin1(m_tokenHash.toHex()));
-    s.setValue("page/origin",m_origin);s.setValue("page/account",m_account);
+    s.setValue("page/origin",m_origin);s.setValue("page/account",m_account);s.setValue("page/solAccount",m_solAccount);
     s.sync();
     QFile::setPermissions(m_settingsFile,QFile::ReadOwner | QFile::WriteOwner);
 }
@@ -83,6 +88,7 @@ bool DexWebBridge::acceptPairing(const QString &id) {
     if (m_pairRequest.isEmpty() || m_pairRequest.value("id")!=id || QDateTime::currentSecsSinceEpoch()>m_pairExpires) return false;
     const auto token=randomHex(32);
     m_tokenHash=hashed(token);m_origin=m_pairRequest.value("origin").toString();m_account=m_pairRequest.value("account").toString();
+    m_solAccount=m_pairRequest.value("solAccount").toString();
     m_pairResult="accepted";m_pairResultId=id;m_pairResultToken=QString::fromLatin1(token);
     m_pairRequest.clear();save();
     // No trading keys yet, or locked: ask for the password right away, in the same sitting
@@ -97,7 +103,7 @@ void DexWebBridge::refusePairing(const QString &id) {
     m_pairRequest.clear();emit changed();
 }
 void DexWebBridge::disconnectPage() {
-    m_tokenHash.clear();m_origin.clear();m_account.clear();m_keysWanted=false;save();emit changed();
+    m_tokenHash.clear();m_origin.clear();m_account.clear();m_solAccount.clear();m_keysWanted=false;save();emit changed();
 }
 
 bool DexWebBridge::call(const char *method,const QVariantList &args) const {
@@ -118,11 +124,11 @@ QVariantMap DexWebBridge::statusFor() const {
     const auto markets=m_engine->property("evmMarketStatus").toMap();
     QVariantMap marketOut;
     for (auto it=markets.cbegin();it!=markets.cend();++it)
-        marketOut.insert(it.key(),pick(it.value().toMap(),{"coin","chainId","configured","busy","state","mine","message","error","withdrawal"}));
-    auto tradeOut=pick(trade,{"configured","busy","state","tradeId","commitment","awaitingApproval","awaitingFunding","startRefusal","error","payout","account"});
+        marketOut.insert(it.key(),pick(it.value().toMap(),{"coin","chainId","decimals","configured","busy","state","mine","message","error","withdrawal"}));
+    auto tradeOut=pick(trade,{"configured","busy","state","tradeId","commitment","awaitingApproval","awaitingFunding","startRefusal","error","payout","account","solAccount"});
     tradeOut.insert("snapshot",pick(trade.value("snapshot").toMap(),{"stage","role","done","offer","evmTxs","xmzSweeps","approved","progress","deadlines"}));
-    return {{"wallet",pick(wallet,{"state","balance","unlocked","address","keysReady","keysExist","keysBusy","tradeAccount","error"})},
-        {"markets",marketOut},{"trade",tradeOut},{"account",m_account}};
+    return {{"wallet",pick(wallet,{"state","balance","unlocked","address","keysReady","keysExist","keysBusy","tradeAccount","solTradeAccount","error"})},
+        {"markets",marketOut},{"trade",tradeOut},{"account",m_account},{"solAccount",m_solAccount}};
 }
 
 void DexWebBridge::watchTrade() {
@@ -142,7 +148,10 @@ void DexWebBridge::watchTrade() {
     const auto markets=m_engine->property("evmMarketStatus").toMap();
     for (const auto &market:markets) for (const auto &mine:market.toMap().value("mine").toList())
         if (mine.toMap().value("state")=="open") return;
-    if (call("payoutEvmTrade",{m_account})) m_paidTrade=id;
+    // To the user's account on the trade's chain; a page without one for that chain is not paid
+    // to by itself (the user sends it back from the page after connecting that wallet)
+    const auto to=payoutAccount(qint64(snapshot.value("offer").toMap().value("chainId").toDouble()));
+    if (!to.isEmpty() && call("payoutEvmTrade",{to})) m_paidTrade=id;
 }
 
 QByteArray DexWebBridge::respond(const Request &r,int *status) {
@@ -153,15 +162,17 @@ QByteArray DexWebBridge::respond(const Request &r,int *status) {
         && QString::fromLatin1(r.origin)==m_origin;
     *status=200;
     if (r.method=="GET" && r.path=="/v1/hello")
-        return json({{"ok",true},{"app","monzero-wallet"},{"bridge",1},{"connected",authorised},{"account",authorised ? m_account : QString()}});
+        return json({{"ok",true},{"app","monzero-wallet"},{"bridge",1},{"connected",authorised},{"account",authorised ? m_account : QString()},{"solAccount",authorised ? m_solAccount : QString()}});
     if (r.method=="POST" && r.path=="/v1/pair") {
-        const auto account=body.value("account").toString();
-        if (!QRegularExpression("\\A0x[0-9a-fA-F]{40}\\z").match(account).hasMatch()) return fail(400,"account");
+        // The user's own wallets: MetaMask (ETH, BNB) and/or a Solana wallet; at least one
+        const auto account=body.value("account").toString(),solAccount=body.value("solAccount").toString();
+        if ((account.isEmpty() && solAccount.isEmpty()) || (!account.isEmpty() && !DexChains::evmAddress(account))
+            || (!solAccount.isEmpty() && !DexChains::solanaAddress(solAccount))) return fail(400,"account");
         const auto now=QDateTime::currentSecsSinceEpoch();
         if (!m_pairRequest.isEmpty() && now<=m_pairExpires) return fail(429,"another connection request is waiting in the wallet");
         const auto id=QString::fromLatin1(randomHex(16));
         const auto code=QString::number(QRandomGenerator::system()->bounded(1000000)).rightJustified(6,'0');
-        m_pairRequest={{"id",id},{"origin",QString::fromLatin1(r.origin)},{"account",account},{"code",code}};
+        m_pairRequest={{"id",id},{"origin",QString::fromLatin1(r.origin)},{"account",account},{"solAccount",solAccount},{"code",code}};
         m_pairExpires=now+180;m_pairResult.clear();m_pairResultId.clear();m_pairResultToken.clear();
         emit changed();
         emit attention(tr("The DEX web page asks to connect"),tr("Open your Monzero wallet and compare the code: %1").arg(code));
@@ -188,10 +199,10 @@ QByteArray DexWebBridge::respond(const Request &r,int *status) {
         const auto market=m_engine->property("evmMarketStatus").toMap().value(coin).toMap();
         return market.value("message").toString();
     };
-    const auto coinOf=[](int chainId){return chainId==56 || chainId==97 ? QStringLiteral("BNB") : QStringLiteral("ETH");};
+    const auto coinOf=[](int chainId){return DexChains::coin(chainId);};
     if (r.path=="/v1/refresh") {
         const auto pair=body.value("pair").toString();
-        if (pair!="ETH/XMZ" && pair!="BNB/XMZ") return fail(400,"pair");
+        if (pair!="ETH/XMZ" && pair!="BNB/XMZ" && pair!="SOL/XMZ") return fail(400,"pair");
         return json({{"ok",call("refreshEvmOffers",{pair})}});
     }
     if (r.path=="/v1/offer") {
@@ -205,13 +216,15 @@ QByteArray DexWebBridge::respond(const Request &r,int *status) {
         const auto id=body.value("id").toString();
         if (!QRegularExpression("\\A0x[0-9a-fA-F]{64}\\z").match(id).hasMatch()) return fail(400,"id");
         const bool ok=call("takeEvmOffer",{id});
-        return json({{"ok",ok},{"message",ok ? QString() : message("ETH").isEmpty() ? message("BNB") : message("ETH")}});
+        return json({{"ok",ok},{"message",ok ? QString() : message("ETH")}});   // the engine's message is one for all coins
     }
     if (r.path=="/v1/cancel") return json({{"ok",call("cancelEvmOffer",{body.value("folder").toString()})}});
     if (r.path=="/v1/return") {
         // Only ever to the account the user accepted for this page
         const int chainId=body.value("chainId").toInt();
-        const bool ok=call("returnEvmFunds",{chainId,m_account});
+        const auto to=payoutAccount(chainId);
+        if (to.isEmpty()) return json({{"ok",false},{"message",tr("Connect your own wallet for this coin first: the funds go back to it.")}});
+        const bool ok=call("returnEvmFunds",{chainId,to});
         return json({{"ok",ok},{"message",message(coinOf(chainId))}});
     }
     // Things only the user can do, in the wallet: the page may only ask for the screen to be shown

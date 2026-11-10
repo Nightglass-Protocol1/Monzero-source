@@ -69,7 +69,10 @@ private:
     QString m_pairResult;               // "", "accepted", "refused" for the last request id
     QString m_pairResultId,m_pairResultToken;
     QByteArray m_tokenHash;             // SHA-256 of the page's token
-    QString m_origin,m_account;
+    // The user's own accounts, accepted at connection time: where proceeds go (MetaMask for
+    // ETH/BNB, a Solana wallet such as Phantom for SOL). Either may be absent.
+    QString m_origin,m_account,m_solAccount;
+    QString payoutAccount(qint64 chainId) const;
     QString m_paidTrade,m_announcedTrade;
     bool m_keysWanted=false;
     qint64 m_lastAsk=0;

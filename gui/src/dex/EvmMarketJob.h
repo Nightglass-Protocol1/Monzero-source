@@ -31,6 +31,7 @@ public:
     QVariantMap status() const;
 private:
     QVariantMap m_withdrawal;
+    QString m_solAccount;
 public:
     // Keys of the trade account from the light-wallet vault (hex); used instead of a wallet seed
     void setSwapKeys(const QByteArray &swapSeedHex,const QByteArray &evmKeyHex);
@@ -38,10 +39,14 @@ public:
     // The values a trade config for EvmTradeJob needs (helper, endpoints, account)
     QJsonObject tradeConfig(const QString &tradeDir) const;
     // Coin per XMZ, as text, from wei and atoms (display only)
-    static QString priceText(const QString &valueWei,const QString &xmzAtoms);
-    static QString weiToCoin(const QString &valueWei);
+    // decimals: of the coin's smallest unit (18 for wei, 9 for Solana's lamports)
+    static QString priceText(const QString &valueWei,const QString &xmzAtoms,int decimals=18);
+    static QString weiToCoin(const QString &valueWei,int decimals=18);
     // Folders of trades whose keys were agreed (running or finished)
     QStringList agreedFolders() const;
+    // Ask the helper for this wallet's trade accounts (Solana chains: where SOL is paid in)
+    bool requestAccounts(QByteArray &walletSeed);
+    QString solAccount() const {return m_solAccount;}
     void rescan() {scanFolders();emit changed();}
 signals:
     void changed();

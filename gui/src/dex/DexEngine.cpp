@@ -1,3 +1,4 @@
+#include "DexChains.h"
 #include "DexEngine.h"
 #include <sodium.h>
 #include "LightWalletSetup.h"
@@ -769,7 +770,9 @@ QString evmControlNetwork(qint64 chainId) {
     switch (chainId) {
     case 56: return QStringLiteral("bnb-mainnet");
     case 1:  return QStringLiteral("eth-mainnet");
+    case DexChains::SolMainnet: return QStringLiteral("sol-mainnet");
 #ifndef MONZERO_DEX_PUBLIC_EDITION
+    case DexChains::SolDevnet: case DexChains::SolLocal: return QStringLiteral("evm-regtest");
     // The public edition trades on mainnets only, always under a signed document
     case 97: case 11155111: case 1337: case 31337: return QStringLiteral("evm-regtest");
 #endif
@@ -879,6 +882,9 @@ bool DexEngine::addEvmMarket(const QString &config) {
     const auto chain=int(job->config().value("chainId").toDouble());
     if (m_evmMarkets.contains(chain)) {job->deleteLater();return false;}
     connect(job,&EvmMarketJob::changed,this,&DexEngine::evmMarketChanged);
+    connect(job,&EvmMarketJob::changed,this,[this,job,known=QString()]() mutable {
+        if (job->solAccount()!=known) {known=job->solAccount();emit dexWalletChanged();}
+    });
     connect(job,&EvmMarketJob::agreed,this,[this,job](const QString &tradeDir){evmOfferAgreed(job,tradeDir);});
     m_evmMarkets.insert(chain,job);
     if (!m_evmSwapSeedHex.isEmpty()) job->setSwapKeys(m_evmSwapSeedHex,m_evmKeyHex);
@@ -901,15 +907,23 @@ void DexEngine::setUpEvmMarkets() {
     const auto root=m_dexWallets->root();
     const bool mainnet=DexDeployment::mainnetStage();
     struct Chain {int id;const char *rpc;};
-    const QList<Chain> chains=mainnet ? QList<Chain>{{1,"https://ethereum-rpc.publicnode.com"},{56,"https://bsc-rpc.publicnode.com"}}
-                                      : QList<Chain>{{11155111,"https://ethereum-sepolia-rpc.publicnode.com"},{97,"https://bsc-testnet-rpc.publicnode.com"}};
+    // Solana mainnet joins this list when its swap program is deployed and pinned in the helper
+    QList<Chain> chains=mainnet ? QList<Chain>{{1,"https://ethereum-rpc.publicnode.com"},{56,"https://bsc-rpc.publicnode.com"}}
+                                : QList<Chain>{{11155111,"https://ethereum-sepolia-rpc.publicnode.com"},{97,"https://bsc-testnet-rpc.publicnode.com"},
+                                               {int(DexChains::SolDevnet),"https://api.devnet.solana.com"}};
+    // A local Solana test validator (tests): its swap program is given, as a local EVM contract is
+    const auto localSolProgram=qEnvironmentVariable("MONZERO_DEX_SOL_LOCAL_PROGRAM");
+    if (!mainnet && DexChains::solanaAddress(localSolProgram)) {
+        for (auto &c:chains) if (c.id==int(DexChains::SolDevnet)) c={int(DexChains::SolLocal),"http://127.0.0.1:8899"};
+    }
     QJsonArray relays;for (const auto &r:defaultRelays()) relays.append(r);
     for (const auto &c:chains) {
         const auto rpcOverride=qEnvironmentVariable(QStringLiteral("MONZERO_DEX_EVM_RPC_%1").arg(c.id).toLatin1().constData());
         // Until a trade agrees, the swap wallet is the trading wallet's service; each trade gets its own
-        const QJsonObject config{{"schema","monzero-private-xmz-evm-market-v1"},{"helper",m_dexWallets->helper()},{"helperDigest",m_dexWallets->helperSha256()},
+        QJsonObject config{{"schema","monzero-private-xmz-evm-market-v1"},{"helper",m_dexWallets->helper()},{"helperDigest",m_dexWallets->helperSha256()},
             {"tradesDir",QStringLiteral("%1/evm-trades/%2").arg(root).arg(c.id)},{"evmRpc",rpcOverride.isEmpty() ? QString::fromLatin1(c.rpc) : rpcOverride},
             {"chainId",c.id},{"accountIndex",0},{"mainWallet",main},{"swapWallet",main},{"relays",relays}};
+        if (c.id==int(DexChains::SolLocal)) config.insert("localSolProgram",localSolProgram);
         const auto path=QStringLiteral("%1/evm-market-%2.json").arg(root).arg(c.id);
         QFile f(path);
         if (!f.open(QIODevice::WriteOnly|QIODevice::Truncate) || !f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner)) continue;
@@ -1049,7 +1063,7 @@ bool DexEngine::refreshEvmOffers(const QString &pair) {
     return job && job->refreshListings(pair);
 }
 bool DexEngine::postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours) {
-    const auto wei=atomic(coinAmount,18),atoms=atomic(xmzAmount,11);
+    const auto wei=atomic(coinAmount,DexChains::decimals(chainId)),atoms=atomic(xmzAmount,11);
     if (wei.isEmpty() || atoms.isEmpty() || lifetimeHours<1 || lifetimeHours>24) {m_marketMessage=tr("Check the amounts and how long the offer stays open (1-24 hours).");emit evmMarketChanged();return false;}
     const auto refusal=evmOfferRefusal(chainId,wei,atoms);
     if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
@@ -1098,6 +1112,8 @@ bool DexEngine::configureDexWallets(const QString &root,const QString &walletRpc
 QVariantMap DexEngine::dexWalletStatus() const {
     auto s=m_dexWallets->status();
     s.insert("keysReady",dexKeysReady());s.insert("keysBusy",m_keysBusy || !m_keysSetupPassword.isEmpty());s.insert("tradeAccount",m_evmAccount);s.insert("keysMessage",m_keysMessage);
+    // Where SOL is paid in: this wallet's trade account on Solana (known once the helper was asked)
+    for (auto *job:m_evmMarkets) if (!job->solAccount().isEmpty()) s.insert("solTradeAccount",job->solAccount());
     // A key wallet already on this device: the user unlocks it; otherwise the app makes one
     bool exists=swapLight() && swapLight()->status().value("configured").toBool();
     for (const auto &coin:{"btc","ltc"}) if (auto *job=m_lightWallets.value(coin)) exists=exists || job->status().value("configured").toBool();
@@ -1231,6 +1247,11 @@ void DexEngine::stepEvmMarket() {
     for (auto *job:m_evmMarkets) {
         if (job->status().value("busy").toBool()) continue;
         QByteArray seed=evmSeed();
+        // A Solana market first learns this wallet's account there (once)
+        if (DexChains::solana(qint64(job->config().value("chainId").toDouble())) && job->solAccount().isEmpty()) {
+            if (job->requestAccounts(seed)) continue;
+            seed=evmSeed();
+        }
         job->step(seed);
     }
 }

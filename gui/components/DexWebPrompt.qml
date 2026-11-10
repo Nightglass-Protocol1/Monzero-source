@@ -17,7 +17,8 @@ Item {
     readonly property var link: web ? (web.connection || ({})) : ({})
     readonly property var trade: dex ? (dex.evmTradeStatus || ({})) : ({})
     readonly property var offer: (trade.snapshot || ({})).offer || ({})
-    readonly property bool approvalWanted: (link.account || "") !== "" && trade.awaitingApproval === true && (trade.commitment || "") !== ""
+    readonly property bool connected: (link.account || "") !== "" || (link.solAccount || "") !== ""
+    readonly property bool approvalWanted: connected && trade.awaitingApproval === true && (trade.commitment || "") !== ""
     property string dismissedTrade: ""
     readonly property var wallet: dex ? (dex.dexWalletStatus || ({})) : ({})
     readonly property bool keysWanted: web ? web.keysWanted === true && wallet.keysReady !== true : false
@@ -46,11 +47,22 @@ Item {
         var whole = digits.slice(0, digits.length - places), part = digits.slice(digits.length - places).replace(/0+$/, "")
         return part === "" ? whole : whole + "." + part
     }
-    function coin(chainId) { var id = Number(chainId); return id === 56 || id === 97 ? "BNB" : "ETH" }
+    function solana(chainId) { var id = Number(chainId); return id >= 501000101 && id <= 501000103 }
+    function coin(chainId) { var id = Number(chainId); return solana(id) ? "SOL" : id === 56 || id === 97 ? "BNB" : "ETH" }
+    function places(chainId) { return solana(chainId) ? 9 : 18 }
+    // The user's own account for a chain, as accepted when the page connected
+    function ownAccount(chainId) { return (solana(chainId) ? link.solAccount : link.account) || "" }
+    function accountsText(a) {
+        var lines = []
+        if ((a.account || "") !== "") lines.push("ETH / BNB: " + a.account)
+        if ((a.solAccount || "") !== "") lines.push("SOL: " + a.solAccount)
+        return lines.join("\n")
+    }
     function network(chainId) {
         var id = Number(chainId)
         return id === 1 ? qsTr("Ethereum Mainnet") : id === 56 ? qsTr("BNB Smart Chain") : id === 11155111 ? qsTr("Sepolia (test network)")
-             : id === 97 ? qsTr("BNB Smart Chain Testnet") : qsTr("chain %1").arg(id)
+             : id === 97 ? qsTr("BNB Smart Chain Testnet") : id === 501000101 ? qsTr("Solana")
+             : id === 501000102 ? qsTr("Solana Devnet (test network)") : id === 501000103 ? qsTr("Solana (local test)") : qsTr("chain %1").arg(id)
     }
 
     onPairingChanged: if ((pairing.id || "") !== "") pairDialog.open(); else pairDialog.close()
@@ -77,7 +89,7 @@ Item {
             }
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; color: "#f0f5fa"
-                text: qsTr("Accept only if the page shows the same code.\n\nWhat you receive from trades is sent to this account:\n%1").arg(prompt.pairing.account || "")
+                text: qsTr("Accept only if the page shows the same code.\n\nWhat you receive from trades is sent to your own wallet:\n%1").arg(prompt.accountsText(prompt.pairing))
             }
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: "#a9b8c6"
@@ -99,7 +111,7 @@ Item {
         width: Math.min(560, prompt.width - 40); padding: 24
         background: Rectangle { color: "#202b36"; radius: 10; border.color: "#526b80" }
         readonly property bool buying: (prompt.trade.snapshot || ({})).role === "owner"
-        readonly property string coinText: prompt.units(prompt.offer.value, 18) + " " + prompt.coin(prompt.offer.chainId)
+        readonly property string coinText: prompt.units(prompt.offer.value, prompt.places(prompt.offer.chainId)) + " " + prompt.coin(prompt.offer.chainId)
         readonly property string xmzText: prompt.units(prompt.offer.xmzAmount, 11) + " XMZ"
         contentItem: ColumnLayout {
             spacing: 14
@@ -114,7 +126,7 @@ Item {
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; color: "#a9b8c6"
                 text: qsTr("Network: %1\nThese amounts are from the signed offer this wallet holds, not from the web page. Once approved the swap runs by itself; keep the wallet open until it is finished. If the other side stops, your funds are returned after the time limit.\n%2 left in the trade account afterwards goes to %3")
-                    .arg(prompt.network(prompt.offer.chainId)).arg(prompt.coin(prompt.offer.chainId)).arg(prompt.link.account || "")
+                    .arg(prompt.network(prompt.offer.chainId)).arg(prompt.coin(prompt.offer.chainId)).arg(prompt.ownAccount(prompt.offer.chainId) || qsTr("(no wallet connected for this coin yet)"))
             }
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.errorColor

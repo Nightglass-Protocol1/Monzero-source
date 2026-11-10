@@ -167,4 +167,23 @@ TestCase {
         compare(dex.approved, "0xabc")   // nothing was approved
         web.connection = ({})
     }
+    function test_c_a_sol_trade_is_shown_in_sol_and_paid_to_the_solana_wallet() {
+        var dialog = popup("dexWebApproveDialog")
+        web.connection = { origin: "https://monzero.org", account: "", solAccount: "9idXkjjEeyu6nLrYSnCcX6PjmRemKQvuz7VwwwYMtihh" }
+        dex.evmTradeStatus = { awaitingApproval: true, commitment: "0x501", snapshot: { role: "owner", offer: { chainId: 501000101, value: "250000000", xmzAmount: "300000000000000" } } }
+        tryVerify(function () { return dialog.opened })
+        var terms = inside(dialog.contentItem, "dexWebApproveTerms").text
+        verify(terms.indexOf("You pay 0.25 SOL") === 0, terms)
+        verify(terms.indexOf("You receive 3000 XMZ") > 0, terms)
+        mouseClick(inside(dialog.contentItem, "dexWebApproveLater"))
+        tryVerify(function () { return !dialog.opened })
+        dex.evmTradeStatus = ({}); web.connection = ({})
+        // The connection prompt names both of the user's wallets
+        var pair = popup("dexWebPairDialog")
+        web.pairRequest = { id: "req9", origin: "https://monzero.org", account: "0xaD13C3F11Dd4FeE608e6764ac3e48b03952E630b", solAccount: "9idXkjjEeyu6nLrYSnCcX6PjmRemKQvuz7VwwwYMtihh", code: "424242" }
+        tryVerify(function () { return pair.opened })
+        compare(prompt.accountsText(prompt.pairing), "ETH / BNB: 0xaD13C3F11Dd4FeE608e6764ac3e48b03952E630b\nSOL: 9idXkjjEeyu6nLrYSnCcX6PjmRemKQvuz7VwwwYMtihh")
+        mouseClick(inside(pair.contentItem, "dexWebPairRefuse"))
+        tryVerify(function () { return !pair.opened })
+    }
 }

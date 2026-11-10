@@ -1,3 +1,4 @@
+#include "DexChains.h"
 #include "EvmTradeJob.h"
 #include <sodium.h>
 #include "BackendExecutable.h"
@@ -23,7 +24,8 @@ bool endpoint(const QJsonValue &value) {
 bool configValid(const QJsonObject &c) {
     const QSet<QString> required{"schema","helper","helperDigest","tradeDir","evmRpc","accountIndex","mainWallet","swapWallet"};
     for (const auto &key:required) if (!c.contains(key)) return false;
-    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk") return false;
+    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk" && i.key()!="localSolProgram") return false;
+    if (c.contains("localSolProgram") && !DexChains::solanaAddress(c.value("localSolProgram").toString())) return false;
     static const QRegularExpression rpc("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?|http://127\\.0\\.0\\.1:[0-9]{1,5})\\z");
     const auto index=c.value("accountIndex").toDouble(-1);
     return c.value("schema")=="monzero-private-xmz-evm-trade-v1" && cleanAbsolute(c.value("helper").toString())
@@ -37,7 +39,7 @@ bool snapshotValid(const QJsonObject &r) {
     static const QRegularExpression hash("\\A0x[0-9a-f]{64}\\z"),stage("\\A[A-Za-z]{1,32}(\\([A-Za-z]{1,16}\\))?\\z");
     static const QRegularExpression address("\\A0x[0-9a-fA-F]{40}\\z"),wei("\\A[0-9]{1,78}\\z");
     static const QSet<QString> allowed{"schema","ok","role","stage","done","approved","commitment","offer","deadlines",
-        "evmTxs","xmzLock","xmzSweeps","awaitingApproval","account","awaitingFunding","payout","progress"};
+        "evmTxs","xmzLock","xmzSweeps","awaitingApproval","account","awaitingFunding","payout","progress","solAccount"};
     for (auto i=r.begin();i!=r.end();++i) if (!allowed.contains(i.key())) return false;
     // Shown only ("8 of 10 confirmations"): small whole numbers under the two known names
     if (r.contains("progress") && !r.value("progress").isNull()) {
@@ -51,7 +53,10 @@ bool snapshotValid(const QJsonObject &r) {
         }
     }
     const auto offer=r.value("offer").toObject();
+    const qint64 chain=qint64(offer.value("chainId").toDouble());
     if (r.contains("account") && !address.match(r.value("account").toString()).hasMatch()) return false;
+    // On Solana the coin is paid in to the trade's Solana account, not to the EVM-style identity
+    if (r.contains("solAccount") && !(DexChains::solana(chain) && DexChains::solanaAddress(r.value("solAccount").toString()))) return false;
     if (r.contains("awaitingFunding") && !r.value("awaitingFunding").isNull()) {
         const auto f=r.value("awaitingFunding").toObject();
         if (f.size()!=3) return false;
@@ -59,9 +64,9 @@ bool snapshotValid(const QJsonObject &r) {
     }
     if (r.contains("payout")) {
         const auto p=r.value("payout").toObject();
-        if (!address.match(p.value("to").toString()).hasMatch()) return false;
+        if (!DexChains::address(chain,p.value("to").toString())) return false;
         const bool sent=p.contains("tx");
-        if (sent ? !(hash.match(p.value("tx").toString()).hasMatch() && wei.match(p.value("amountWei").toString()).hasMatch() && p.size()==3)
+        if (sent ? !(DexChains::transactionId(p.value("tx").toString()) && wei.match(p.value("amountWei").toString()).hasMatch() && p.size()==3)
                  : !(p.value("sent")==false && p.value("reason").isString() && p.size()==3)) return false;
     }
     return (r.value("role")=="owner" || r.value("role")=="claimer") && stage.match(r.value("stage").toString()).hasMatch()
@@ -130,7 +135,7 @@ QVariantMap EvmTradeJob::status() const {
         {"commitment",m_commitment},{"awaitingApproval",m_awaitingApproval},{"snapshot",m_snapshot.toVariantMap()},
         {"approvalPending",!m_pendingApproval.isEmpty()},{"stepError",m_stepError},
         {"canApprove",!m_commitment.isEmpty() && !m_snapshot.value("approved").toBool() && m_pendingApproval.isEmpty()},
-        {"account",m_snapshot.value("account").toString()},{"awaitingFunding",m_funding},{"payout",m_payout}};
+        {"account",m_snapshot.value("account").toString()},{"solAccount",m_snapshot.value("solAccount").toString()},{"awaitingFunding",m_funding},{"payout",m_payout}};
 }
 bool EvmTradeJob::refresh() {
     return run({{"schema",RequestSchema},{"command","status"},{"tradeDir",m_tradeDir}});
@@ -149,8 +154,8 @@ bool EvmTradeJob::tick(QByteArray &walletSeed) {
 }
 bool EvmTradeJob::payout(QByteArray &walletSeed,const QString &address) {
     // Only a finished trade, to an address the user entered (the helper checks its checksum)
-    static const QRegularExpression format("\\A0x[0-9a-fA-F]{40}\\z");
-    if (!m_snapshot.value("done").toBool() || !format.match(address).hasMatch()) {walletSeed.fill('\0');walletSeed.clear();return false;}
+    const qint64 chain=qint64(m_snapshot.value("offer").toObject().value("chainId").toDouble());
+    if (!m_snapshot.value("done").toBool() || !DexChains::address(chain,address)) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;
     if (!tickConfig(walletSeed,&t)) return false;
     return run({{"schema",RequestSchema},{"command","payout"},{"tradeDir",m_tradeDir},{"tick",t},{"payoutAddress",address}});
@@ -176,7 +181,10 @@ bool EvmTradeJob::run(const QJsonObject &request) {
     if (m_busy || m_path.isEmpty() || m_process.state()!=QProcess::NotRunning) return false;
     if (!sourceMatches()) {m_state="source-changed";emit changed();return false;}
     m_command=request.value("command").toString();
-    m_input=QJsonDocument(request).toJson(QJsonDocument::Compact);m_output.clear();m_errors=0;
+    auto sent=request;
+    // The swap program of a local Solana test validator (as the market job passes it)
+    if (m_config.contains("localSolProgram")) sent.insert("localSolProgram",m_config.value("localSolProgram"));
+    m_input=QJsonDocument(sent).toJson(QJsonDocument::Compact);m_output.clear();m_errors=0;
     m_busy=true;m_state="running";m_error.clear();
     QProcessEnvironment environment;environment.insert("LANG","C");
     m_process.setProcessEnvironment(environment);m_process.setProcessChannelMode(QProcess::SeparateChannels);
