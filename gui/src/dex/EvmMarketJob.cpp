@@ -138,6 +138,12 @@ void EvmMarketJob::scanFolders() {
     }
 }
 
+QStringList EvmMarketJob::agreedFolders() const {
+    QStringList out;
+    for (const auto &f:m_folders) if (f.state=="agreed") out.append(f.path);
+    return out;
+}
+
 QJsonObject EvmMarketJob::base(const QString &command,const QString &folder) const {
     QJsonObject r{{"schema",RequestSchema},{"command",command},{"tradeDir",folder.isEmpty() ? m_tradesDir : folder},
         {"relays",m_config.value("relays")}};

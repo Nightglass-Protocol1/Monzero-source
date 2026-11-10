@@ -40,6 +40,8 @@ public:
     // Coin per XMZ, as text, from wei and atoms (display only)
     static QString priceText(const QString &valueWei,const QString &xmzAtoms);
     static QString weiToCoin(const QString &valueWei);
+    // Folders of trades whose keys were agreed (running or finished)
+    QStringList agreedFolders() const;
 signals:
     void changed();
     void agreed(const QString &tradeDir);

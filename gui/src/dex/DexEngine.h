@@ -567,6 +567,11 @@ private:
     QString m_btcMessage;
     QString btcOfferRefusal(const QString &sats,const QString &atoms);
     void evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir);
+    // After a restart: reopen the trade that was running when the app closed
+    void resumeEvmTrades();
+    void nextEvmResume();
+    QList<QPair<QPointer<EvmMarketJob>,QString>> m_evmResume;
+    bool m_evmResuming=false,m_evmResumed=false;
     // Kill switch and caps for an offer before it is posted or taken (nothing is recorded)
     QString evmOfferRefusal(qint64 chainId,const QString &valueWei,const QString &xmzAtoms);
     QByteArray evmSeed() const;

@@ -16,6 +16,9 @@ public:
     explicit EvmTradeJob(QObject *parent=nullptr);
     ~EvmTradeJob() override;
     bool configure(const QString &path);
+    // Let go of a finished trade so the next one can be opened (one trade at a time). False while
+    // the trade is still running or a step is in flight.
+    bool release();
     bool refresh();
     bool approve(const QString &commitment);
     bool tick(QByteArray &walletSeed);

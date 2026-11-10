@@ -910,6 +910,7 @@ void DexEngine::setUpEvmMarkets() {
         f.write(QJsonDocument(config).toJson(QJsonDocument::Compact));f.close();
         if (!addEvmMarket(path)) qWarning("The DEX market for chain %d could not start",c.id);
     }
+    resumeEvmTrades();
 }
 namespace {
 // Trade settings of each swap network: confirmations and timelocks, the fee of each contract spend,
@@ -1118,6 +1119,7 @@ bool DexEngine::unlockDexKeys(const QString &password) {
         m_evmSwapSeedHex=seed;m_evmKeyHex=key;
         m_evmAccount=address;m_keysMessage.clear();
         emit dexWalletChanged();emit evmMarketChanged();
+        resumeEvmTrades();
     });
     if (!started) {m_keysBusy=false;m_keysMessage=tr("The wallet is busy; try again in a moment.");emit dexWalletChanged();}
     return started;
@@ -1226,6 +1228,40 @@ void DexEngine::stepEvmMarket() {
         job->step(seed);
     }
 }
+void DexEngine::resumeEvmTrades() {
+    // Once per session, when the keys are unlocked and the markets know their folders. A trade
+    // that was running when the app closed must be reopened, or its refund would never be claimed.
+    if (m_evmResumed || m_evmMarkets.isEmpty() || (m_evmSeedFile.isEmpty() && !dexKeysReady())) return;
+    m_evmResumed=true;
+    if (m_evmTrade->status().value("configured").toBool()) return;
+    QList<QPair<qint64,QPair<QPointer<EvmMarketJob>,QString>>> found;
+    for (auto *job:m_evmMarkets) for (const auto &dir:job->agreedFolders()) {
+        const QFileInfo journal(dir+"/journal.json");
+        found.append({(journal.exists() ? journal : QFileInfo(dir)).lastModified().toSecsSinceEpoch(),{job,dir}});
+    }
+    std::sort(found.begin(),found.end(),[](const auto &a,const auto &b){return a.first>b.first;});
+    m_evmResume.clear();
+    for (const auto &f:found) m_evmResume.append(f.second);
+    connect(m_evmTrade,&EvmTradeJob::changed,this,[this]{
+        if (!m_evmResuming) return;
+        const auto s=m_evmTrade->status();
+        const auto snapshot=s.value("snapshot").toMap();
+        if (!s.value("configured").toBool() || s.value("busy").toBool() || !snapshot.contains("stage")) return;
+        // The newest unfinished trade is the one to continue; finished ones are passed over
+        if (snapshot.value("done").toBool()) QTimer::singleShot(0,this,&DexEngine::nextEvmResume);
+        else {m_evmResuming=false;m_evmResume.clear();}
+    });
+    nextEvmResume();
+}
+void DexEngine::nextEvmResume() {
+    if (m_evmTrade->status().value("configured").toBool() && !m_evmTrade->release()) {m_evmResuming=false;m_evmResume.clear();return;}
+    while (!m_evmResume.isEmpty()) {
+        const auto next=m_evmResume.takeFirst();
+        if (!next.first) continue;
+        m_evmResuming=true;evmOfferAgreed(next.first,next.second);return;
+    }
+    m_evmResuming=false;
+}
 void DexEngine::evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir) {
     // The taken offer is a saved trade now: give it its own swap-wallet service (the app's, when it
     // runs the wallets), then hand it to the trade job (one trade at a time)
@@ -1233,17 +1269,34 @@ void DexEngine::evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir) {
         const auto path=tradeDir+"/trade-config.json";
         auto config=job->tradeConfig(tradeDir);
         if (!swapWallet.isEmpty()) config.insert("swapWallet",swapWallet);
+        // Written by an older build of the app (its helper is pinned by digest): write it again
+        if (QFile::exists(path)) {
+            QFile old(path);
+            const auto saved=old.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(old.read(65536)).object() : QJsonObject();
+            old.close();
+            if (saved.value("helperDigest")!=config.value("helperDigest") || saved.value("helper")!=config.value("helper")) QFile::remove(path);
+        }
         if (!QFile::exists(path)) {
             QFile file(path);
             if (!file.open(QIODevice::WriteOnly|QIODevice::NewOnly)) return;
             file.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);
             file.write(QJsonDocument(config).toJson(QJsonDocument::Compact));file.close();
         }
-        if (m_evmTrade->status().value("configured").toBool()) {
+        // A finished trade makes room for the next one; a running one keeps the job
+        if (m_evmTrade->status().value("configured").toBool() && !m_evmTrade->release()) {
+            if (m_evmTrade->status().value("snapshot").toMap().value("done").toBool()) {
+                // Finished, but its last step (the payout) is still in flight: open the new trade right after
+                QTimer::singleShot(3000,this,[this,job,tradeDir]{evmOfferAgreed(job,tradeDir);});
+                return;
+            }
             m_marketMessage=tr("Keys agreed for a new trade (%1). Finish the current trade, then restart the app to continue it.").arg(tradeDir);
             emit evmMarketChanged();return;
         }
-        if (!configureEvmTrade(path,m_evmSeedFile)) {m_marketMessage=tr("The agreed trade could not be opened: %1").arg(tradeDir);emit evmMarketChanged();}
+        m_evmStartRefusal.clear();
+        if (!configureEvmTrade(path,m_evmSeedFile)) {
+            m_marketMessage=tr("The agreed trade could not be opened: %1").arg(tradeDir);emit evmMarketChanged();
+            if (m_evmResuming) QTimer::singleShot(0,this,&DexEngine::nextEvmResume);
+        }
     };
     if (!m_dexWallets->ready()) {open({});return;}
     // The trade id is the listing id (from the folder's listing or take record)

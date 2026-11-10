@@ -92,6 +92,14 @@ bool EvmTradeJob::configure(const QString &path) {
     m_digest=config.value("helperDigest").toString();m_tradeDir=config.value("tradeDir").toString();
     m_state="ready";emit changed();return true;
 }
+bool EvmTradeJob::release() {
+    if (m_path.isEmpty()) return true;
+    if (m_busy || !m_snapshot.value("done").toBool()) return false;
+    m_path.clear();m_program.clear();m_digest.clear();m_tradeDir.clear();m_trade.clear();m_commitment.clear();m_command.clear();
+    m_error.clear();m_pendingApproval.clear();m_stepError.clear();m_source.clear();m_config=QJsonObject();m_snapshot=QJsonObject();
+    m_funding.clear();m_payout.clear();m_errors=0;m_awaitingApproval=false;m_state="unconfigured";
+    emit changed();return true;
+}
 bool EvmTradeJob::sourceMatches() const {
     return !m_path.isEmpty() && LitecoinJournalProtocol::privateConfig(m_path)==m_source && BackendExecutable::matches(m_program,m_digest);
 }
