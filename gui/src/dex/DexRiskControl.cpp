@@ -43,7 +43,14 @@ bool DexRiskControl::setLedgerFile(const QString &path) {
     m_ledgerPath=path;return true;
 }
 void DexRiskControl::setNetwork(const QString &network) {
-    if (network!=m_network) {m_network=network;m_control={};m_sequence=0;emit changed();}
+    if (network==m_network) return;
+    if (!m_control.isEmpty()) m_kept.insert(m_network,{m_control,m_sequence});
+    const auto kept=m_kept.value(network);
+    m_network=network;m_control=kept.first;m_sequence=kept.second;m_lastError.clear();emit changed();
+}
+bool DexRiskControl::polled(const QString &network) const {
+    for (const auto &url:m_urls) if (url.endsWith("/"+network+".json")) return true;
+    return false;
 }
 bool DexRiskControl::loadControlFile(const QString &path) {
     const auto bytes=LitecoinJournalProtocol::privateConfig(path,4096);
@@ -73,7 +80,17 @@ bool DexRiskControl::acceptControlDocument(const QByteArray &bytes,qint64 now) {
         || !atoms(payload.value("maxLtcAtomsPerTrade"),&perTradeLtc) || !atoms(payload.value("maxXmzAtomsPerTrade"),&perTradeXmz)
         || !atoms(payload.value("maxLtcAtomsPerDay"),&perDayLtc))
         return reject("malformed control payload");
-    if (payload.value("network")!=m_network) return reject("control document is for another network");
+    const auto network=payload.value("network").toString();
+    // A valid document of another network this object also polls: keep it for when that network
+    // is selected. It says nothing about the current network, so the current state is untouched.
+    if (network!=m_network) {
+        if (!polled(network)) return reject("control document is for another network");
+        if (expires<=issued || qint64(expires)-qint64(issued)>MaxDocumentAge || qint64(issued)>now+300 || qint64(expires)<=now) return false;
+        const auto kept=m_kept.value(network);
+        if (!kept.first.isEmpty() && sequence<kept.second) return false;
+        m_kept.insert(network,{payload,sequence});
+        return true;
+    }
     if (expires<=issued || qint64(expires)-qint64(issued)>MaxDocumentAge || qint64(issued)>now+300)
         return reject("control document validity window rejected");
     if (qint64(expires)<=now) return reject("control document expired");
@@ -83,23 +100,34 @@ bool DexRiskControl::acceptControlDocument(const QByteArray &bytes,qint64 now) {
 }
 bool DexRiskControl::startPolling(const QString &httpsUrl,int intervalSeconds) {
     const QUrl url(httpsUrl);
-    if (url.scheme()!="https" || url.host().isEmpty() || intervalSeconds<60 || m_poll) return false;
-    m_url=httpsUrl;m_network_manager=new QNetworkAccessManager(this);m_poll=new QTimer(this);
-    m_poll->setInterval(intervalSeconds*1000);
-    connect(m_poll,&QTimer::timeout,this,&DexRiskControl::fetch);
-    m_poll->start();QTimer::singleShot(0,this,&DexRiskControl::fetch);return true;
+    if (url.scheme()!="https" || url.host().isEmpty() || intervalSeconds<60) return false;
+    if (m_urls.contains(httpsUrl)) return true;
+    m_urls.append(httpsUrl);m_url=httpsUrl;
+    if (!m_poll) {
+        m_network_manager=new QNetworkAccessManager(this);m_poll=new QTimer(this);
+        m_poll->setInterval(intervalSeconds*1000);
+        connect(m_poll,&QTimer::timeout,this,&DexRiskControl::fetch);
+        m_poll->start();
+    }
+    QTimer::singleShot(0,this,[this,httpsUrl]{fetchUrl(httpsUrl);});return true;
 }
 void DexRiskControl::fetch() {
+    for (const auto &url:m_urls) fetchUrl(url);
+}
+void DexRiskControl::fetchUrl(const QString &url) {
     if (!m_network_manager) return;
-    QNetworkRequest request{QUrl(m_url)};
+    QNetworkRequest request{QUrl(url)};
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,QNetworkRequest::NoLessSafeRedirectPolicy);
     request.setTransferTimeout(30000);
     QPointer<QNetworkReply> reply=m_network_manager->get(request);
     connect(reply,&QNetworkReply::downloadProgress,this,[reply](qint64 received,qint64){if (reply && received>4096) reply->abort();});
-    connect(reply,&QNetworkReply::finished,this,[this,reply]{
+    connect(reply,&QNetworkReply::finished,this,[this,reply,url]{
         if (!reply) return;
         reply->deleteLater();
-        if (reply->error()!=QNetworkReply::NoError) {m_lastError="control document unreachable";emit changed();return;}
+        if (reply->error()!=QNetworkReply::NoError) {
+            if (m_urls.size()<2 || url.endsWith("/"+m_network+".json")) {m_lastError="control document unreachable";emit changed();}
+            return;
+        }
         acceptControlDocument(reply->read(4097));
     });
 }
@@ -131,6 +159,10 @@ QString DexRiskControl::refusal(const QString &trade,quint64 ltcAtoms,quint64 xm
     quint64 day=0;
     for (auto it=trades.begin();it!=trades.end();++it) {
         const auto entry=it.value().toObject();
+        // Each network has its own coin and its own daily limit (entries from before networks were
+        // recorded count everywhere)
+        const auto on=entry.value("network").toString();
+        if (!on.isEmpty() && on!=m_network) continue;
         if (now-qint64(entry.value("startedAt").toDouble())<Day) day+=entry.value("ltcAtoms").toString().toULongLong();
     }
     if (day+ltcAtoms<day || day+ltcAtoms>m_control.value("maxLtcAtomsPerDay").toString().toULongLong())
@@ -147,7 +179,7 @@ bool DexRiskControl::recordStart(const QString &trade,quint64 ltcAtoms,qint64 no
     if (trades.contains(trade)) return true;
     for (const auto &key:trades.keys())
         if (now-qint64(trades.value(key).toObject().value("startedAt").toDouble())>LedgerRetention) trades.remove(key);
-    trades.insert(trade,QJsonObject{{"ltcAtoms",QString::number(ltcAtoms)},{"startedAt",double(now)}});
+    trades.insert(trade,QJsonObject{{"ltcAtoms",QString::number(ltcAtoms)},{"startedAt",double(now)},{"network",m_network}});
     const auto bytes=QJsonDocument(QJsonObject{{"schema","monzero-dex-started-trades-v1"},{"trades",trades}}).toJson(QJsonDocument::Compact);
     QSaveFile file(m_ledgerPath);
     if (!file.open(QIODevice::WriteOnly) || !file.setPermissions(QFile::ReadOwner | QFile::WriteOwner)

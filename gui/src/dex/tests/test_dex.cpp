@@ -466,7 +466,53 @@ private slots:
         // Error text names BNB, not Litecoin.
         QVERIFY(evm.acceptControlDocument(doc({{"sequence",3}}),now));
         QVERIFY(evm.refusal(t2,bnbCap+1,1,now).contains("BNB"));
+        // One gate serves ETH and BNB. Each network's document is polled and kept, so the gate has
+        // the right one whichever network is selected (it used to fetch only the first network's
+        // document and refuse every trade on the other: "control document is for another network").
+        {
+            const QString t3="cccccccc-3333-4333-8333-333333333333",t4="dddddddd-4444-4444-8444-444444444444";
+            DexRiskControl both;both.setNetwork("eth-mainnet");
+            QVERIFY(both.setLedgerFile(root.filePath("both.json")));
+            QVERIFY(both.setPublicKey(QString::fromLatin1(QByteArray(reinterpret_cast<const char *>(pk),32).toHex())));
+            QVERIFY(!both.acceptControlDocument(doc({}),now));                      // BNB document, not polled: refused
+            QVERIFY(both.startPolling("https://127.0.0.1:9/dex/control/eth-mainnet.json"));
+            QVERIFY(both.startPolling("https://127.0.0.1:9/dex/control/bnb-mainnet.json"));
+            QVERIFY(both.startPolling("https://127.0.0.1:9/dex/control/bnb-mainnet.json"));  // again: nothing new
+            QVERIFY(both.acceptControlDocument(doc({{"sequence",4}}),now));         // BNB document while on ETH: kept
+            QVERIFY(!both.refusal(t3,1,1,now).isEmpty());                           // ...but ETH still has none
+            QVERIFY(both.acceptControlDocument(doc({{"network","eth-mainnet"},{"maxLtcAtomsPerTrade","20000000000000000"},{"maxLtcAtomsPerDay","20000000000000000"}}),now));
+            QVERIFY(both.refusal(t3,20000000000000000ULL,1,now).isEmpty());
+            QVERIFY(both.recordStart(t3,20000000000000000ULL,now));                 // ETH's day is used up
+            QVERIFY(!both.refusal(t4,1,1,now).isEmpty());
+            both.setNetwork("bnb-mainnet");
+            QVERIFY(both.refusal(t4,bnbCap,1,now).isEmpty());                       // BNB: its own document, its own day
+            QVERIFY(!both.acceptControlDocument(doc({{"sequence",3}}),now));        // no rollback on BNB
+            QVERIFY(both.acceptControlDocument(doc({{"network","eth-mainnet"},{"sequence",2},{"newTradesEnabled",false}}),now)); // ETH stopped meanwhile
+            QVERIFY(both.refusal(t4,bnbCap,1,now).isEmpty());                       // BNB unaffected
+            both.setNetwork("eth-mainnet");
+            QVERIFY(!both.refusal(t4,1,1,now).isEmpty());                           // ETH is stopped
+            QVERIFY(both.refusal(t3,1,1,now).isEmpty());                            // its started trade is not
+        }
         sodium_memzero(sk,sizeof sk);
+    }
+    void liveControlDocumentsOpenBothEvmNetworks() {
+        // Against the published documents: MONZERO_TEST_LIVE_CONTROL=<64-hex control public key>
+        const auto key=qEnvironmentVariable("MONZERO_TEST_LIVE_CONTROL");
+        if (key.isEmpty()) QSKIP("set MONZERO_TEST_LIVE_CONTROL to the pinned control public key");
+        QTemporaryDir root;QVERIFY(root.isValid());
+        DexRiskControl gate;gate.setNetwork("eth-mainnet");
+        QVERIFY(gate.setLedgerFile(root.filePath("live.json")));QVERIFY(gate.setPublicKey(key));
+        QVERIFY(gate.startPolling("https://monzero.org/dex/control/eth-mainnet.json"));
+        const QString t="eeeeeeee-5555-4555-8555-555555555555";
+        QTRY_VERIFY_WITH_TIMEOUT(gate.refusal(t,1,1).isEmpty(),30000);
+        // What the wallet does when the user picks BNB after the app started on ETH
+        gate.setNetwork("bnb-mainnet");
+        QVERIFY(gate.startPolling("https://monzero.org/dex/control/bnb-mainnet.json"));
+        QTRY_VERIFY2_WITH_TIMEOUT(gate.refusal(t,4000000000000000ULL,200000000000000ULL).isEmpty(),qPrintable(gate.refusal(t,4000000000000000ULL,200000000000000ULL)),30000);
+        gate.setNetwork("eth-mainnet");
+        QVERIFY2(gate.refusal(t,1,1).isEmpty(),qPrintable(gate.refusal(t,1,1)));   // straight away: its document was kept
+        gate.setNetwork("bnb-mainnet");
+        QVERIFY(gate.refusal(t,4000000000000000ULL,200000000000000ULL).isEmpty());
     }
     void tradeFoldersDiscoverOneActiveTrade() {
         DexDeployment::resetForTesting();DexDeployment::lockLitecoinStage(); // ltc-regtest

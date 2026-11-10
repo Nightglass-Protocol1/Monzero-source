@@ -3,6 +3,9 @@
 #include <QByteArray>
 #include <QJsonObject>
 #include <QObject>
+#include <QHash>
+#include <QPair>
+#include <QStringList>
 #include <QString>
 #include <QVariantMap>
 
@@ -43,6 +46,7 @@ signals:
     void changed();
 private:
     void fetch();
+    void fetchUrl(const QString &url);
     QJsonObject ledger() const;
     QString coinName() const {
         if (m_network.startsWith("btc-")) return QStringLiteral("Bitcoin");
@@ -55,6 +59,12 @@ private:
     QByteArray m_publicKey;
     QJsonObject m_control;
     quint64 m_sequence=0;
+    // One object serves several networks (ETH and BNB share the EVM gate): every network's signed
+    // document is polled, and the last valid one of each is kept, so switching network never
+    // leaves the gate without its document
+    QStringList m_urls;
+    QHash<QString,QPair<QJsonObject,quint64>> m_kept;
+    bool polled(const QString &network) const;
     QString m_lastError;
     QNetworkAccessManager *m_network_manager=nullptr;
     QTimer *m_poll=nullptr;
