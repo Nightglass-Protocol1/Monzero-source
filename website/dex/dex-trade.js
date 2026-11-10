@@ -110,7 +110,13 @@
   }
   function reserve(owner) {
     // On the trade's own network: the fee there is what counts
-    return onChain().then(function () { return eth("eth_gasPrice"); }).then(function (gp) { return (owner ? OWNER_GAS : CLAIMER_GAS) * BigInt(gp) * 3n / 2n; });
+    // Price plus tip, doubled: the wallet pays a tip on top of the base fee, and a reserve that is too
+    // small stops the trade until it is topped up. What is not spent goes back after the trade.
+    return onChain().then(function () { return eth("eth_gasPrice"); }).then(function (gp) {
+      return eth("eth_maxPriorityFeePerGas").catch(function () { return "0x0"; }).then(function (tip) {
+        return (owner ? OWNER_GAS : CLAIMER_GAS) * (BigInt(gp) + BigInt(tip || "0x0")) * 2n;
+      });
+    });
   }
 
   // ---- limits the owner signed for this network (the wallet enforces them; shown here so nothing is paid in for a trade it would refuse)
