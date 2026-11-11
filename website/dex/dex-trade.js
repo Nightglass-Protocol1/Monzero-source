@@ -20,9 +20,10 @@
         BNB: { id: 56, name: "BNB Smart Chain", control: "bnb-mainnet", tx: "https://bscscan.com/tx/",
                add: { chainId: "0x38", chainName: "BNB Smart Chain", nativeCurrency: { name: "BNB", symbol: "BNB", decimals: 18 },
                       rpcUrls: ["https://bsc-dataseed.binance.org"], blockExplorerUrls: ["https://bscscan.com"] } } };
-  // SOL: on test networks for now (a local copy of the page). Solana mainnet joins when the swap
-  // program is deployed there and pinned in the wallet. ?sol=local uses a local test validator.
-  if (TEST) CHAINS.SOL = /[?&]sol=local/.test(location.search)
+  // SOL: Solana mainnet opens with its signed control document, like ETH and BNB. On a local copy
+  // of the page: devnet, or with ?sol=local a local test validator.
+  if (!TEST) CHAINS.SOL = { id: 501000101, name: "Solana", control: "sol-mainnet", sol: true, rpc: "https://solana-rpc.publicnode.com", tx: "https://solscan.io/tx/" };
+  else CHAINS.SOL = /[?&]sol=local/.test(location.search)
     ? { id: 501000103, name: "Solana (local test)", control: null, sol: true, rpc: "http://127.0.0.1:18899", tx: "https://solscan.io/tx/" }
     : { id: 501000102, name: "Solana Devnet (test network)", control: null, sol: true, rpc: "https://api.devnet.solana.com", tx: "https://solscan.io/tx/", txEnd: "?cluster=devnet" };
   var PORTS = [38471, 38472, 38473, 38474, 38475];
