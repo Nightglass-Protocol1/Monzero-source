@@ -205,6 +205,29 @@ async fn full_swap_with_both_traders_resumed_from_their_journals_every_tick() {
     assert!(record.retained.contains_key("new_swap") && record.retained.contains_key("set_ready"));
     assert!(FileJournal(claimer.journal.clone()).load().unwrap().retained.contains_key("claim"));
 
+    // The relays' view: the claim, once final, proves the swap (who, how much, which trade's nonce);
+    // the transaction that made the swap is not a claim
+    let signature = |raw: &[u8]| -> [u8; 64] { bs58::decode(sol::transaction_id(raw).unwrap()).into_vec().unwrap().try_into().unwrap() };
+    let claims: Vec<[u8; 64]> = FileJournal(claimer.journal.clone()).load().unwrap().retained["claim"].iter().map(|c| signature(&c.raw)).collect();
+    let mut seen = None;
+    'wait: for _ in 0..120 {
+        for c in &claims {
+            if let sol::ClaimSeen::Final(swap) = sol::claim_lookup(&url, &program, c).await.unwrap() {
+                seen = Some(swap);
+                break 'wait;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let swap = seen.expect("the claim became final and was recognised");
+    let trade = record.trade.as_ref().expect("saved trade");
+    assert_eq!((swap.owner, swap.claimer, swap.lamports), (owner.account(), claimer.account(), LAMPORTS));
+    assert_eq!(alloy::primitives::U256::from(swap.nonce), alloy::primitives::U256::from_be_slice(&trade.offer.trade_id[..8]));
+    assert!(swap.at > 1_700_000_000);
+    let made = signature(&record.retained["new_swap"].last().unwrap().raw);
+    assert!(matches!(sol::claim_lookup(&url, &program, &made).await.unwrap(), sol::ClaimSeen::NotAClaim(_) | sol::ClaimSeen::Pending));
+    assert_eq!(sol::claim_lookup(&url, &program, &[7u8; 64]).await.unwrap(), sol::ClaimSeen::Pending, "unknown to the node");
+
     // Afterwards the claimer sends what its account holds to its own wallet
     // A fresh address every run (an address is any 32 bytes)
     let home: [u8; 32] = rand::random();

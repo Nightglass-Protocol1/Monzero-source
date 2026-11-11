@@ -138,8 +138,13 @@ impl RelayClient {
         (found.into_values().collect(), errors)
     }
 
-    pub async fn post_listing(&self, signed: &SignedListing) -> Vec<Value> {
-        self.post_all("/v1/listings", &serde_json::to_value(signed).expect("serializes")).await
+    /// `account`: on Solana, the maker's signed note naming its Solana trade account
+    pub async fn post_listing(&self, signed: &SignedListing, account: Option<&crate::listing::SignedSolAccount>) -> Vec<Value> {
+        let mut body = serde_json::to_value(signed).expect("serializes");
+        if let Some(a) = account {
+            body["solAccount"] = serde_json::to_value(a).expect("serializes");
+        }
+        self.post_all("/v1/listings", &body).await
     }
 
     pub async fn cancel(&self, signed: &SignedCancel) -> Vec<Value> {
@@ -166,7 +171,8 @@ impl RelayClient {
         out
     }
 
-    pub async fn report(&self, chain_id: u64, tx: B256) -> Vec<Value> {
+    /// `tx`: the claim's id as its chain shows it (0x… hash, or a Solana signature in base58)
+    pub async fn report(&self, chain_id: u64, tx: &str) -> Vec<Value> {
         self.post_all("/v1/prints", &json!({"chainId": chain_id, "tx": tx})).await
     }
 }

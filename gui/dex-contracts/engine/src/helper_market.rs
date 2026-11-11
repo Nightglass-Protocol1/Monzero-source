@@ -243,7 +243,12 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
     let signed = listing.sign(&key);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     write(&dir.join("listing.json"), &MakerFile { listing: signed.clone(), taken_by: None, answered: BTreeSet::new(), closed: false })?;
-    let posted = client.post_listing(&signed).await;
+    // On Solana the relays also want the maker's Solana trade account, signed (see `SolAccount`)
+    let account = chain_kind.is_solana().then(|| {
+        let account = B256::from(crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes());
+        crate::listing::SolAccount { schema: crate::listing::SOL_ACCOUNT_SCHEMA.into(), id: signed.listing.id, account }.sign(&key)
+    });
+    let posted = client.post_listing(&signed, account.as_ref()).await;
     Ok(json!({"listing": signed, "posted": posted}))
 }
 
@@ -487,14 +492,15 @@ pub async fn report(dir: &Path, relays: &[String]) -> Result<Value, String> {
     if saved.role != Role::Claimer || record.state.stage() != "Done(Swapped)" {
         return Err("only a claimer's finished swap has a claim to report".into());
     }
-    // The relays check a reported claim on its EVM chain; Solana claims are not reported yet
-    if Chain::from_id(saved.offer.chain_id).is_some_and(Chain::is_solana) {
-        return Ok(json!({"reported": false, "reason": "claims on Solana are not reported to the price chart yet"}));
-    }
     let claim = record.retained.get("claim").and_then(|v| v.last()).ok_or("no claim transaction in the journal")?;
-    let tx = keccak256(&claim.raw);
+    // The claim's id as its chain shows it: the relays read the claim there themselves
+    let tx = if Chain::from_id(saved.offer.chain_id).is_some_and(Chain::is_solana) {
+        crate::sol::transaction_id(&claim.raw).ok_or("the saved claim is not a Solana transaction")?
+    } else {
+        keccak256(&claim.raw).to_string()
+    };
     let client = RelayClient::new(relays)?;
-    Ok(json!({"tx": tx, "reported": client.report(saved.offer.chain_id, tx).await}))
+    Ok(json!({"tx": tx, "reported": client.report(saved.offer.chain_id, &tx).await}))
 }
 
 

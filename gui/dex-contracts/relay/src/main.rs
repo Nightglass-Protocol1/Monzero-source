@@ -16,7 +16,7 @@
 
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
-use monzero_dex_evm::listing::{Rules, SignedListing};
+use monzero_dex_evm::listing::{Rules, SignedListing, SignedSolAccount};
 use monzero_dex_evm::Chain;
 use monzero_dex_relay::chain::{AlloyView, View};
 use monzero_dex_relay::http::{now, router, Api};
@@ -96,6 +96,11 @@ struct UtxoListings {
 }
 
 #[derive(Deserialize)]
+struct SolAccounts {
+    accounts: Vec<SignedSolAccount>,
+}
+
+#[derive(Deserialize)]
 struct Prints {
     prints: Vec<Print>,
 }
@@ -105,8 +110,12 @@ async fn sync(relay: &Relay<View>, client: &reqwest::Client, peer: &str) -> Resu
     let base = peer.trim_end_matches('/');
     let now = now();
     let mut offers = 0;
+    // Offers on Solana come with their makers' signed Solana accounts (a peer that predates them has none)
+    let mut accounts: std::collections::HashMap<B256, SignedSolAccount> =
+        fetch::<SolAccounts>(client, &format!("{base}/v1/sol-accounts")).await.map(|a| a.accounts).unwrap_or_default().into_iter().take(10000).map(|a| (a.note.id, a)).collect();
     for signed in fetch::<Listings>(client, &format!("{base}/v1/listings")).await?.listings.into_iter().take(2000) {
-        if relay.listing(signed.listing.id).is_none() && relay.post(signed, now).await == Ok(true) {
+        let account = accounts.get(&signed.listing.id).cloned();
+        if relay.listing(signed.listing.id).is_none() && relay.post_with(signed, account, now).await == Ok(true) {
             offers += 1;
         }
     }
@@ -122,20 +131,20 @@ async fn sync(relay: &Relay<View>, client: &reqwest::Client, peer: &str) -> Resu
     let mut trades = 0;
     let since = now.saturating_sub(ARCHIVE_SECS);
     for p in fetch::<Prints>(client, &format!("{base}/v1/prints?since={since}")).await?.prints.into_iter().take(2000) {
-        if relay.known_print(p.tx) {
+        if relay.known_print(&p.tx) {
             continue;
         }
         if relay.listing(p.listing).is_none() {
             match fetch::<SignedListing>(client, &format!("{base}/v1/listings/{}", p.listing)).await {
                 Ok(l) if l.listing.id == p.listing => {
-                    if relay.remember(l).is_err() {
+                    if relay.remember(l, accounts.remove(&p.listing)).is_err() {
                         continue;
                     }
                 }
                 _ => continue,
             }
         }
-        if relay.report(p.chain_id, p.tx, now).await.is_ok() && relay.known_print(p.tx) {
+        if relay.report(p.chain_id, p.tx.clone(), now).await.is_ok() && relay.known_print(&p.tx) {
             trades += 1;
         }
     }
@@ -169,7 +178,7 @@ async fn main() {
             if let Some(max) = c.max_value_wei {
                 rules.max_value.insert(c.chain_id, max);
             }
-            chains.insert(c.chain_id, View::Solana);
+            chains.insert(c.chain_id, View::Solana(monzero_dex_relay::chain::SolView::new(&c.rpc, program)));
             eprintln!("chain {} ({}): program {text} ok (offers stand for it as {contract})", c.chain_id, chain.pair());
             continue;
         }

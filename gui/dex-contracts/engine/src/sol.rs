@@ -364,6 +364,90 @@ impl Rpc {
     }
 }
 
+/// A finished swap, as its claim transaction and the swap's creation prove it
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimedSwap {
+    pub owner: Pubkey,
+    pub claimer: Pubkey,
+    pub lamports: u64,
+    pub nonce: u64,
+    /// Block time of the claim
+    pub at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimSeen {
+    /// Unknown to the node yet, or not yet final
+    Pending,
+    Final(ClaimedSwap),
+    NotAClaim(String),
+}
+
+/// The pinned program's top-level instructions in a transaction: (accounts, data) each
+fn program_calls(tx: &Value, program: &Pubkey) -> Vec<(Vec<Pubkey>, Vec<u8>)> {
+    let message = &tx["transaction"]["message"];
+    let keys: Vec<Option<Pubkey>> = message["accountKeys"].as_array().into_iter().flatten().map(|k| k.as_str().and_then(|k| from_base58(k).ok())).collect();
+    let key = |i: &Value| i.as_u64().and_then(|i| keys.get(i as usize).copied().flatten());
+    let mut out = vec![];
+    for ix in message["instructions"].as_array().into_iter().flatten() {
+        if key(&ix["programIdIndex"]) != Some(*program) {
+            continue;
+        }
+        let accounts: Option<Vec<Pubkey>> = ix["accounts"].as_array().into_iter().flatten().map(key).collect();
+        let data = ix["data"].as_str().and_then(|d| bs58::decode(d).into_vec().ok());
+        if let (Some(accounts), Some(data)) = (accounts, data) {
+            out.push((accounts, data));
+        }
+    }
+    out
+}
+
+/// What a transaction reported as a swap's claim really is, read from a node (for the relays'
+/// record of trades). A claim counts once it is final, was a direct claim on the pinned program,
+/// and the swap it paid out was made with terms that give exactly that swap account's address.
+pub async fn claim_lookup(url: &str, program: &Pubkey, signature: &[u8; 64]) -> Result<ClaimSeen, DriverError> {
+    let rpc = Rpc::new(url)?;
+    let options = json!({"encoding": "json", "commitment": "finalized", "maxSupportedTransactionVersion": 0});
+    let tx = rpc.call("getTransaction", json!([bs58::encode(signature).into_string(), options])).await?;
+    if tx.is_null() {
+        return Ok(ClaimSeen::Pending);
+    }
+    if !tx["meta"]["err"].is_null() {
+        return Ok(ClaimSeen::NotAClaim("the transaction failed".into()));
+    }
+    // Claim = 2: the secret follows; accounts are the claimer, the swap, the owner
+    let Some((claim, _)) = program_calls(&tx, program).into_iter().find(|(a, d)| d.len() == 33 && d[0] == 2 && a.len() >= 3) else {
+        return Ok(ClaimSeen::NotAClaim("no claim on the pinned program in it".into()));
+    };
+    let (claimer, swap, owner) = (claim[0], claim[1], claim[2]);
+    let Some(at) = tx["blockTime"].as_u64() else {
+        return Ok(ClaimSeen::Pending);
+    };
+    // The swap account is closed by now: its terms are in the transaction that made it, among
+    // the oldest that touched its address (anyone can send it dust later, never earlier)
+    let history = rpc.call("getSignaturesForAddress", json!([to_base58(&swap), {"limit": 1000, "commitment": "finalized"}])).await?;
+    let oldest: Vec<&str> = history.as_array().into_iter().flatten().rev().filter(|s| s["err"].is_null()).filter_map(|s| s["signature"].as_str()).take(4).collect();
+    for id in oldest {
+        let made = rpc.call("getTransaction", json!([id, options])).await?;
+        for (accounts, data) in program_calls(&made, program) {
+            // NewSwap = 0: both points, both durations, the amount, the nonce; accounts are
+            // the owner, the claimer, the swap
+            if data.len() != 97 || data[0] != 0 || accounts.len() < 3 || accounts[2] != swap {
+                continue;
+            }
+            let point = |at: usize| -> [u8; 32] { data[at..at + 32].try_into().expect("32 bytes") };
+            let word = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().expect("8 bytes"));
+            let binding = SolBinding { owner: accounts[0], claimer: accounts[1], claim_point: point(1), refund_point: point(33) };
+            let (lamports, nonce) = (word(81), word(89));
+            if binding.swap_address(program, lamports, nonce) != Some(swap) || binding.owner != owner || binding.claimer != claimer {
+                continue;
+            }
+            return Ok(ClaimSeen::Final(ClaimedSwap { owner, claimer, lamports, nonce, at }));
+        }
+    }
+    Ok(ClaimSeen::NotAClaim("the claimed swap's creation was not found".into()))
+}
+
 /// The swap as the program stores it
 struct Stored {
     owner: Pubkey,

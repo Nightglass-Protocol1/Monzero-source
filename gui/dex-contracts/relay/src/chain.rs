@@ -1,6 +1,6 @@
 //! Read-only chain access for the relay: balances (spam guard) and claim checks.
 
-use crate::{ChainView, ClaimLookup};
+use crate::{ChainView, ClaimLookup, TxId};
 use alloy::consensus::Transaction;
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, B256, U256};
@@ -47,7 +47,10 @@ impl ChainView for AlloyView {
         self.reader.get_balance(account).await.map_err(|e| e.to_string())
     }
 
-    async fn claim(&self, tx: B256) -> Result<ClaimLookup, String> {
+    async fn claim(&self, tx: &TxId) -> Result<ClaimLookup, String> {
+        let Some(tx) = tx.evm() else {
+            return Ok(ClaimLookup::NotAClaim("not a transaction hash of this chain".into()));
+        };
         let Some(receipt) = self.reader.get_transaction_receipt(tx).await.map_err(|e| e.to_string())? else {
             return Ok(ClaimLookup::Pending);
         };
@@ -90,29 +93,61 @@ impl ChainView for AlloyView {
     }
 }
 
-/// The chain behind a served pair: an EVM chain the relay reads, or Solana.
+/// A Solana cluster, read over its JSON-RPC: balances (spam guard) and claim checks
+pub struct SolView {
+    url: String,
+    program: [u8; 32],
+}
+
+impl SolView {
+    pub fn new(url: &str, program: [u8; 32]) -> Self {
+        SolView { url: url.to_string(), program }
+    }
+}
+
+/// The chain behind a served pair: an EVM chain the relay reads, or a Solana cluster.
 ///
-/// On Solana the relay reads nothing yet. An offer there is signed by the maker's EVM-style
-/// trade account, which says nothing about the maker's Solana account, so the balance that
-/// backs an offer cannot be checked: those offers rest on the per-maker and rate limits alone.
-/// Claims there are not recorded as trades for the price chart either.
+/// An offer on Solana is signed by the maker's EVM-style trade account, as everywhere; the
+/// maker's Solana account comes next to it in a note signed by the same key. That account's
+/// balance backs the offer, and it must be the maker's side of a claim recorded as a trade.
 pub enum View {
     Evm(AlloyView),
-    Solana,
+    Solana(SolView),
 }
 
 impl ChainView for View {
     async fn balance(&self, account: Address) -> Result<U256, String> {
         match self {
             View::Evm(v) => v.balance(account).await,
-            View::Solana => Ok(U256::MAX),
+            View::Solana(_) => Err("an offer on Solana is backed by its Solana account".into()),
         }
     }
 
-    async fn claim(&self, tx: B256) -> Result<ClaimLookup, String> {
+    async fn claim(&self, tx: &TxId) -> Result<ClaimLookup, String> {
+        use monzero_dex_evm::sol::{claim_lookup, ClaimSeen};
         match self {
             View::Evm(v) => v.claim(tx).await,
-            View::Solana => Ok(ClaimLookup::NotAClaim("claims on Solana are not recorded yet".into())),
+            View::Solana(v) => {
+                let Some(signature) = tx.solana() else {
+                    return Ok(ClaimLookup::NotAClaim("not a Solana transaction signature".into()));
+                };
+                Ok(match claim_lookup(&v.url, &v.program, &signature).await.map_err(|e| e.to_string())? {
+                    ClaimSeen::Pending => ClaimLookup::Pending,
+                    ClaimSeen::NotAClaim(why) => ClaimLookup::NotAClaim(why),
+                    ClaimSeen::Final(s) => ClaimLookup::FinalSol { owner: s.owner.into(), claimer: s.claimer.into(), lamports: s.lamports, nonce: s.nonce, at: s.at },
+                })
+            }
+        }
+    }
+
+    fn solana(&self) -> bool {
+        matches!(self, View::Solana(_))
+    }
+
+    async fn sol_balance(&self, account: B256) -> Result<U256, String> {
+        match self {
+            View::Evm(_) => Err("not a Solana chain".into()),
+            View::Solana(v) => monzero_dex_evm::sol::balance(&v.url, &account.0).await.map(U256::from).map_err(|e| e.to_string()),
         }
     }
 }

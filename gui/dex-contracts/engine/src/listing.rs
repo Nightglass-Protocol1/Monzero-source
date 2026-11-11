@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 
 pub const LISTING_SCHEMA: &str = "monzero-dex-listing/1";
 pub const CANCEL_SCHEMA: &str = "monzero-dex-cancel/1";
+pub const SOL_ACCOUNT_SCHEMA: &str = "monzero-dex-sol-account/1";
 /// The longest a listing may stay open
 pub const MAX_LIFETIME: u64 = 24 * 3600;
 /// How far in the future a maker's clock may be
@@ -86,6 +87,52 @@ pub struct Cancel {
 pub struct SignedCancel {
     pub cancel: Cancel,
     pub signature: Bytes,
+}
+
+/// On Solana an offer's maker also names its Solana trade account, signed like the offer: a relay
+/// checks that account's balance before it lists the offer, and a recorded trade must have that
+/// account as the maker's side of the swap. It travels next to the offer, not inside it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SolAccount {
+    pub schema: String,
+    /// The listing's id
+    pub id: B256,
+    /// The maker's Solana account (its 32-byte key)
+    pub account: B256,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignedSolAccount {
+    pub note: SolAccount,
+    pub signature: Bytes,
+}
+
+impl SolAccount {
+    pub fn sign(self, key: &PrivateKeySigner) -> SignedSolAccount {
+        let bytes = serde_json::to_vec(&self).expect("note serializes");
+        let signature = key.sign_message_sync(message(SOL_ACCOUNT_SCHEMA, &bytes).as_bytes()).expect("local signing");
+        SignedSolAccount { note: self, signature: signature.as_bytes().to_vec().into() }
+    }
+}
+
+impl SignedSolAccount {
+    /// Signed by the maker of `listing`, for that listing
+    pub fn verify(&self, listing: &Listing) -> Result<(), ListingError> {
+        if self.note.schema != SOL_ACCOUNT_SCHEMA {
+            return Err(ListingError::Schema);
+        }
+        if self.note.id != listing.id || self.note.account == B256::ZERO {
+            return Err(ListingError::Id);
+        }
+        let bytes = serde_json::to_vec(&self.note).expect("note serializes");
+        let signature = Signature::try_from(self.signature.as_ref()).map_err(|_| ListingError::BadSignature)?;
+        match signature.recover_address_from_msg(message(SOL_ACCOUNT_SCHEMA, &bytes).as_bytes()) {
+            Ok(a) if a == listing.maker => Ok(()),
+            _ => Err(ListingError::BadSignature),
+        }
+    }
 }
 
 /// What a relay (or app) accepts: the pinned contract per chain and an optional coin cap.

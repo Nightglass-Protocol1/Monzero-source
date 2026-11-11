@@ -3122,6 +3122,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "axum",
+ "bs58",
  "ed25519-dalek",
  "hex",
  "monzero-dex-evm",

@@ -103,7 +103,7 @@ struct MailQuery {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Report {
     chain_id: u64,
-    tx: B256,
+    tx: crate::TxId,
 }
 
 pub fn router<C: ChainView + 'static>(api: Arc<Api<C>>) -> Router {
@@ -115,6 +115,7 @@ pub fn router<C: ChainView + 'static>(api: Arc<Api<C>>) -> Router {
         .route("/v1/info", get(info::<C>))
         .route("/v1/listings", get(listings::<C>).post(post_listing::<C>))
         .route("/v1/listings/{id}", get(listing::<C>))
+        .route("/v1/sol-accounts", get(sol_accounts::<C>))
         .route("/v1/cancel", post(cancel::<C>))
         .route("/v1/prints", get(prints::<C>).post(report::<C>))
         .route("/v1/candles", get(candles::<C>))
@@ -158,18 +159,30 @@ async fn listing<C: ChainView>(State(api): State<Arc<Api<C>>>, Path(id): Path<B2
     api.relay.listing(id).map(Json).ok_or(Failure(StatusCode::NOT_FOUND, "no such offer".into()))
 }
 
+/// The makers' signed Solana accounts for the offers on Solana (peers copy them with the offers)
+async fn sol_accounts<C: ChainView>(State(api): State<Arc<Api<C>>>) -> Json<Value> {
+    Json(json!({ "accounts": api.relay.sol_accounts() }))
+}
+
 async fn post_listing<C: ChainView>(
     State(api): State<Arc<Api<C>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(signed): Json<SignedListing>,
+    Json(mut body): Json<Value>,
 ) -> Result<Json<Value>, Failure> {
     let now = now();
     if !api.allow_write(&headers, peer, now) {
         return Err(limited());
     }
+    // A signed offer; on Solana with the maker's signed Solana account next to it
+    let bad = |e: serde_json::Error| Failure(StatusCode::BAD_REQUEST, format!("not a signed offer: {e}"));
+    let account = match body.as_object_mut().and_then(|o| o.remove("solAccount")) {
+        Some(a) => Some(serde_json::from_value::<monzero_dex_evm::listing::SignedSolAccount>(a).map_err(bad)?),
+        None => None,
+    };
+    let signed: SignedListing = serde_json::from_value(body).map_err(bad)?;
     let id = signed.listing.id;
-    let new = api.relay.post(signed, now).await?;
+    let new = api.relay.post_with(signed, account, now).await?;
     Ok(Json(json!({ "id": id, "new": new })))
 }
 
@@ -201,7 +214,7 @@ async fn report<C: ChainView>(
     if !api.allow_write(&headers, peer, now) {
         return Err(limited());
     }
-    let status = api.relay.report(r.chain_id, r.tx, now).await?;
+    let status = api.relay.report(r.chain_id, r.tx.clone(), now).await?;
     let code = match status {
         PrintStatus::Recorded => "recorded",
         PrintStatus::Pending => "pending",

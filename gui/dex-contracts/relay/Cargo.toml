@@ -9,6 +9,7 @@ publish = false
 [workspace]
 
 [dependencies]
+bs58 = "0.5"
 monzero-dex-evm = { path = "../engine" }
 alloy = { version = "1", default-features = false, features = ["providers", "rpc-types", "network", "reqwest", "reqwest-rustls-tls", "sol-types", "contract"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }

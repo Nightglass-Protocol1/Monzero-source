@@ -11,7 +11,7 @@ pub mod http;
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use monzero_dex_evm::mail::MAX_SEALED;
-use monzero_dex_evm::listing::{ListingError, Rules, SignedCancel, SignedListing};
+use monzero_dex_evm::listing::{ListingError, Rules, SignedCancel, SignedListing, SignedSolAccount};
 use monzero_dex_evm::negotiation::Role;
 use monzero_dex_evm::Swap;
 use serde::{Deserialize, Serialize};
@@ -57,8 +57,62 @@ pub enum RelayError {
     UnknownListing,
     #[error("a letter must be a sealed message of at most 512 KB to a mailbox")]
     BadMail,
+    #[error("an offer on Solana needs the maker's signed Solana account next to it")]
+    SolAccount,
+    #[error("not a transaction id of this chain")]
+    BadTx,
     #[error("the chain could not be read: {0}")]
     ChainRead(String),
+}
+
+/// A transaction's id as its chain shows it: `0x` and 64 hex digits (EVM), or a Solana signature
+/// in base58. Kept as that text, so trades of every chain share one record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TxId(String);
+
+impl TxId {
+    pub fn evm(&self) -> Option<B256> {
+        (self.0.len() == 66 && self.0.starts_with("0x")).then(|| self.0.parse().ok()).flatten()
+    }
+
+    pub fn solana(&self) -> Option<[u8; 64]> {
+        if self.0.len() < 64 || self.0.len() > 90 {
+            return None;
+        }
+        bs58::decode(&self.0).into_vec().ok()?.try_into().ok()
+    }
+}
+
+impl TryFrom<String> for TxId {
+    type Error = String;
+    fn try_from(text: String) -> Result<Self, String> {
+        let id = TxId(text);
+        match (id.evm(), id.solana()) {
+            // One form per hash, however it was typed
+            (Some(hash), _) => Ok(TxId(hash.to_string())),
+            (None, Some(_)) => Ok(id),
+            _ => Err("not a transaction id".into()),
+        }
+    }
+}
+
+impl From<TxId> for String {
+    fn from(id: TxId) -> String {
+        id.0
+    }
+}
+
+impl From<B256> for TxId {
+    fn from(hash: B256) -> Self {
+        TxId(hash.to_string())
+    }
+}
+
+impl std::fmt::Display for TxId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// What the chain says about a reported claim transaction
@@ -67,13 +121,23 @@ pub enum ClaimLookup {
     /// Unknown to the node yet, or not yet final
     Pending,
     Final { swap: Swap, at: u64 },
+    /// As `Final`, on Solana: the traders are Solana accounts and the amount is in lamports
+    FinalSol { owner: B256, claimer: B256, lamports: u64, nonce: u64, at: u64 },
     NotAClaim(String),
 }
 
 /// Read-only chain access, one per chain id
 pub trait ChainView: Send + Sync {
     fn balance(&self, account: Address) -> impl std::future::Future<Output = Result<U256, String>> + Send;
-    fn claim(&self, tx: B256) -> impl std::future::Future<Output = Result<ClaimLookup, String>> + Send;
+    fn claim(&self, tx: &TxId) -> impl std::future::Future<Output = Result<ClaimLookup, String>> + Send;
+    /// A Solana cluster: offers there come with the maker's signed Solana account
+    fn solana(&self) -> bool {
+        false
+    }
+    /// Lamports a Solana account holds
+    fn sol_balance(&self, _account: B256) -> impl std::future::Future<Output = Result<U256, String>> + Send {
+        async { Err("not a Solana chain".to_string()) }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +145,7 @@ pub trait ChainView: Send + Sync {
 pub struct Print {
     pub pair: String,
     pub chain_id: u64,
-    pub tx: B256,
+    pub tx: TxId,
     /// Block time of the claim
     pub at: u64,
     /// Coin amount (wei), from the chain
@@ -95,7 +159,9 @@ pub struct Print {
 impl Print {
     /// Coin per XMZ
     pub fn price(&self) -> f64 {
-        let coin = self.value.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
+        // The coin's smallest unit: wei (18 places), or lamports on Solana (9)
+        let unit = if monzero_dex_evm::Chain::from_id(self.chain_id).is_some_and(|c| c.is_solana()) { 1e9 } else { 1e18 };
+        let coin = self.value.to_string().parse::<f64>().unwrap_or(0.0) / unit;
         coin / (self.xmz as f64 / 1e11)
     }
 }
@@ -125,7 +191,10 @@ pub struct Snapshot {
     pub closed: BTreeMap<B256, u64>,
     pub prints: Vec<Print>,
     /// (chain id, tx) -> first reported
-    pub pending: Vec<(u64, B256, u64)>,
+    pub pending: Vec<(u64, TxId, u64)>,
+    /// Makers' signed Solana accounts, for the offers on Solana
+    #[serde(default)]
+    pub sol_accounts: Vec<SignedSolAccount>,
     #[serde(default)]
     pub utxo_active: Vec<utxo::SignedUtxoListing>,
     #[serde(default)]
@@ -138,8 +207,10 @@ struct State {
     archive: HashMap<B256, SignedListing>,
     closed: HashMap<B256, u64>,
     prints: Vec<Print>,
-    print_txs: HashSet<B256>,
-    pending: HashMap<(u64, B256), u64>,
+    print_txs: HashSet<TxId>,
+    pending: HashMap<(u64, TxId), u64>,
+    /// listing id -> the maker's signed Solana account
+    sol_accounts: HashMap<B256, SignedSolAccount>,
     /// mailbox -> (received at, sealed letter)
     mail: HashMap<B256, Vec<(u64, Bytes)>>,
     mail_bytes: usize,
@@ -209,8 +280,22 @@ impl<C: ChainView> Relay<C> {
 
     /// Accepts a signed offer. Idempotent for the same offer.
     pub async fn post(&self, signed: SignedListing, now: u64) -> Result<bool, RelayError> {
+        self.post_with(signed, None, now).await
+    }
+
+    /// As `post`; `account` is the maker's signed Solana account, which an offer on Solana needs
+    pub async fn post_with(&self, signed: SignedListing, account: Option<SignedSolAccount>, now: u64) -> Result<bool, RelayError> {
         signed.verify(&self.rules, now)?;
         let l = &signed.listing;
+        let chain = self.chain(l.chain_id)?;
+        let account = match (chain.solana(), account) {
+            (true, Some(a)) => {
+                a.verify(l)?;
+                Some(a)
+            }
+            (true, None) => return Err(RelayError::SolAccount),
+            (false, _) => None,
+        };
         {
             let s = self.state();
             if s.closed.contains_key(&l.id) {
@@ -227,7 +312,11 @@ impl<C: ChainView> Relay<C> {
             }
         }
         // Spam guard: the maker's account backs the offer (the coin for a buyer, gas for a seller)
-        let balance = self.chain(l.chain_id)?.balance(l.maker).await.map_err(RelayError::ChainRead)?;
+        let balance = match &account {
+            Some(a) => chain.sol_balance(a.note.account).await,
+            None => chain.balance(l.maker).await,
+        }
+        .map_err(RelayError::ChainRead)?;
         let backed = match l.maker_role() {
             Role::Owner => balance >= l.value,
             Role::Claimer => !balance.is_zero(),
@@ -238,6 +327,9 @@ impl<C: ChainView> Relay<C> {
         let mut s = self.state();
         if s.closed.contains_key(&l.id) || s.active.contains_key(&l.id) {
             return Ok(false);
+        }
+        if let Some(a) = account {
+            s.sol_accounts.insert(l.id, a);
         }
         s.active.insert(l.id, signed);
         Ok(true)
@@ -273,10 +365,16 @@ impl<C: ChainView> Relay<C> {
     }
 
     /// Adds a closed offer learned from a peer relay, so its trades can be matched
-    pub fn remember(&self, signed: SignedListing) -> Result<(), RelayError> {
+    pub fn remember(&self, signed: SignedListing, account: Option<SignedSolAccount>) -> Result<(), RelayError> {
         // Its time window has passed; check everything else as of when it was made
         signed.verify(&self.rules, signed.listing.created_at)?;
+        if let Some(a) = &account {
+            a.verify(&signed.listing)?;
+        }
         let mut s = self.state();
+        if let Some(a) = account {
+            s.sol_accounts.entry(signed.listing.id).or_insert(a);
+        }
         if !s.active.contains_key(&signed.listing.id) {
             s.archive.entry(signed.listing.id).or_insert(signed);
         }
@@ -290,65 +388,82 @@ impl<C: ChainView> Relay<C> {
         out
     }
 
-    pub fn known_print(&self, tx: B256) -> bool {
-        self.state().print_txs.contains(&tx)
+    pub fn known_print(&self, tx: &TxId) -> bool {
+        self.state().print_txs.contains(tx)
+    }
+
+    /// The signed Solana accounts of the offers held (open or recently closed)
+    pub fn sol_accounts(&self) -> Vec<SignedSolAccount> {
+        self.state().sol_accounts.values().cloned().collect()
+    }
+
+    pub fn sol_account(&self, id: B256) -> Option<SignedSolAccount> {
+        self.state().sol_accounts.get(&id).cloned()
     }
 
     /// A reported claim: recorded once final on chain, kept pending until then
-    pub async fn report(&self, chain_id: u64, tx: B256, now: u64) -> Result<PrintStatus, RelayError> {
-        if self.known_print(tx) {
+    pub async fn report(&self, chain_id: u64, tx: TxId, now: u64) -> Result<PrintStatus, RelayError> {
+        if self.known_print(&tx) {
             return Ok(PrintStatus::Recorded);
         }
-        let lookup = self.chain(chain_id)?.claim(tx).await.map_err(RelayError::ChainRead)?;
-        match lookup {
+        let lookup = self.chain(chain_id)?.claim(&tx).await.map_err(RelayError::ChainRead)?;
+        // What the claim paid out, in the offer's terms: (nonce, amount, the maker's side matches)
+        type Seen<'a> = (U256, U256, u64, Box<dyn Fn(&SignedListing, Option<&SignedSolAccount>) -> bool + Send + 'a>);
+        let (nonce, value, at, maker_ok): Seen = match lookup {
             ClaimLookup::NotAClaim(why) => {
                 self.state().pending.remove(&(chain_id, tx));
-                Err(RelayError::NotAClaim(why))
+                return Err(RelayError::NotAClaim(why));
             }
             ClaimLookup::Pending => {
                 let mut s = self.state();
-                if !s.pending.contains_key(&(chain_id, tx)) && s.pending.len() >= MAX_PENDING {
+                if !s.pending.contains_key(&(chain_id, tx.clone())) && s.pending.len() >= MAX_PENDING {
                     return Err(RelayError::Full);
                 }
                 s.pending.entry((chain_id, tx)).or_insert(now);
-                Ok(PrintStatus::Pending)
+                return Ok(PrintStatus::Pending);
             }
             ClaimLookup::Final { swap, at } => {
-                let mut s = self.state();
-                s.pending.remove(&(chain_id, tx));
-                // A trade's id is its listing's id; the swap nonce is the id's first 8 bytes
-                let listing = s
-                    .active
-                    .values()
-                    .chain(s.archive.values())
-                    .find(|o| o.listing.swap_nonce() == swap.nonce)
-                    .cloned()
-                    .ok_or(RelayError::UnknownListing)?;
-                let id = listing.listing.id;
-                let l = &listing.listing;
-                let maker_ok = match l.maker_role() {
-                    Role::Owner => swap.owner == l.maker,
-                    Role::Claimer => swap.claimer == l.maker,
-                };
-                if l.chain_id != chain_id || swap.asset != Address::ZERO || swap.value != l.value || !maker_ok {
-                    return Err(RelayError::UnknownListing);
-                }
-                if s.print_txs.insert(tx) {
-                    s.prints.push(Print { pair: l.pair.clone(), chain_id, tx, at, value: swap.value, xmz: l.xmz, listing: id });
-                }
-                // One fill per offer
-                if let Some(filled) = s.active.remove(&id) {
-                    s.archive.insert(id, filled);
-                }
-                s.closed.entry(id).or_insert(now);
-                Ok(PrintStatus::Recorded)
+                let native = swap.asset == Address::ZERO;
+                let (owner, claimer) = (swap.owner, swap.claimer);
+                (swap.nonce, swap.value, at, Box::new(move |o, _| {
+                    native
+                        && match o.listing.maker_role() {
+                            Role::Owner => owner == o.listing.maker,
+                            Role::Claimer => claimer == o.listing.maker,
+                        }
+                }))
             }
+            // On Solana the maker's side is the account its signed note names
+            ClaimLookup::FinalSol { owner, claimer, lamports, nonce, at } => (U256::from(nonce), U256::from(lamports), at, Box::new(move |o, account| {
+                account.is_some_and(|a| match o.listing.maker_role() {
+                    Role::Owner => owner == a.note.account,
+                    Role::Claimer => claimer == a.note.account,
+                })
+            })),
+        };
+        let mut s = self.state();
+        s.pending.remove(&(chain_id, tx.clone()));
+        // A trade's id is its listing's id; the swap nonce is the id's first 8 bytes
+        let listing = s.active.values().chain(s.archive.values()).find(|o| o.listing.swap_nonce() == nonce).cloned().ok_or(RelayError::UnknownListing)?;
+        let id = listing.listing.id;
+        let l = &listing.listing;
+        if l.chain_id != chain_id || value != l.value || !maker_ok(&listing, s.sol_accounts.get(&id)) {
+            return Err(RelayError::UnknownListing);
         }
+        // One trade per offer: a second claim under the same offer is not another trade
+        if s.print_txs.insert(tx.clone()) && !s.prints.iter().any(|p| p.listing == id) {
+            s.prints.push(Print { pair: l.pair.clone(), chain_id, tx, at, value, xmz: l.xmz, listing: id });
+        }
+        if let Some(filled) = s.active.remove(&id) {
+            s.archive.insert(id, filled);
+        }
+        s.closed.entry(id).or_insert(now);
+        Ok(PrintStatus::Recorded)
     }
 
     /// Checks every pending claim again
     pub async fn recheck(&self, now: u64) {
-        let pending: Vec<_> = self.state().pending.keys().copied().collect();
+        let pending: Vec<_> = self.state().pending.keys().cloned().collect();
         for (chain, tx) in pending {
             let _ = self.report(chain, tx, now).await;
         }
@@ -400,6 +515,8 @@ impl<C: ChainView> Relay<C> {
             s.archive.insert(id, o);
         }
         s.archive.retain(|_, o| o.listing.expires_at + ARCHIVE_SECS > now);
+        let State { active, archive, sol_accounts, .. } = &mut *s;
+        sol_accounts.retain(|id, _| active.contains_key(id) || archive.contains_key(id));
         s.closed.retain(|_, at| *at + ARCHIVE_SECS > now);
         s.pending.retain(|_, at| *at + PENDING_SECS > now);
     }
@@ -436,7 +553,8 @@ impl<C: ChainView> Relay<C> {
             archive: s.archive.values().cloned().collect(),
             closed: s.closed.iter().map(|(k, v)| (*k, *v)).collect(),
             prints: s.prints.clone(),
-            pending: s.pending.iter().map(|((c, t), at)| (*c, *t, *at)).collect(),
+            pending: s.pending.iter().map(|((c, t), at)| (*c, t.clone(), *at)).collect(),
+            sol_accounts: s.sol_accounts.values().cloned().collect(),
             utxo_active,
             utxo_closed,
         }
@@ -456,8 +574,14 @@ impl<C: ChainView> Relay<C> {
             }
         }
         s.closed.extend(snap.closed);
+        for a in snap.sol_accounts {
+            let known = s.active.get(&a.note.id).or_else(|| s.archive.get(&a.note.id));
+            if known.is_some_and(|o| a.verify(&o.listing).is_ok()) {
+                s.sol_accounts.insert(a.note.id, a);
+            }
+        }
         for p in snap.prints {
-            if s.print_txs.insert(p.tx) {
+            if s.print_txs.insert(p.tx.clone()) {
                 s.prints.push(p);
             }
         }
