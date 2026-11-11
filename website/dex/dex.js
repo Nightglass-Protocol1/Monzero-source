@@ -170,7 +170,9 @@
   if (!$("mode-pro")) return;
   var PAIRS = ["BTC", "ETH", "BNB", "LTC", "SOL"];
   var NAME = { BTC: "Bitcoin", ETH: "Ethereum", BNB: "BNB", LTC: "Litecoin" };
-  var EXPLORER = { BTC: "https://mempool.space/tx/", ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/", LTC: "https://litecoinspace.org/tx/" };
+  var EXPLORER = { BTC: "https://mempool.space/tx/", ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/", LTC: "https://litecoinspace.org/tx/", SOL: "https://explorer.solana.com/tx/" };
+  // A recorded trade's claim on its chain's explorer (Solana's test cluster is named in the link)
+  function claimLink(p) { return EXPLORER[pro.coin] + encodeURIComponent(p.tx) + (p.chainId === 501000102 ? "?cluster=devnet" : ""); }
   // Bitcoin and Litecoin offers give the coin in satoshis/litoshis (`coin`); EVM offers in wei (`value`, hex)
   var UTXO = { BTC: true, LTC: true };
   var MAINNET = { BTC: "btc-mainnet", LTC: "ltc-mainnet" };
@@ -311,7 +313,7 @@
     $("trades").innerHTML = prints.length ? prints.slice(0, 20).map(function (p, i) {
       var older = prints[i + 1], up = !older || p.px >= older.px, d = new Date(p.at * 1000), pp = function (x) { return ("0" + x).slice(-2); };
       var when = (now - p.at < 86400 ? "" : pp(d.getMonth() + 1) + "-" + pp(d.getDate()) + " ") + pp(d.getHours()) + ":" + pp(d.getMinutes());
-      return '<a class="trade-row" href="' + EXPLORER[pro.coin] + esc(p.tx) + '" rel="noopener" title="The claim on chain"><span class="price ' + (up ? "up" : "down") + '">' + price(p.px) +
+      return '<a class="trade-row" href="' + esc(claimLink(p)) + '" rel="noopener" title="The claim on chain"><span class="price ' + (up ? "up" : "down") + '">' + price(p.px) +
         '</span><span class="num">' + fmt(coins(p.xmz), 2) + '</span><span class="num">' + when + '</span></a>';
     }).join("") : '<p class="book-empty">No completed swaps yet</p>';
     var last = prints[0], before = null, vol = 0;
