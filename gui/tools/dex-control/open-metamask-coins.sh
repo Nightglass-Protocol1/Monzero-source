@@ -6,7 +6,8 @@
 # Signs this week's eth-mainnet and bnb-mainnet control documents with the owner's control key
 # ($25 per trade, $250 per day at today's prices) and writes them to WEBSITE_DIR/dex/control/.
 # It uploads nothing: the next commands are printed. SEQUENCE must be higher than the last one
-# published. BTC stays closed (no document). To close a coin again, publish a document signed
+# published. DEX_NETWORKS chooses the coins (default eth-mainnet,bnb-mainnet; add sol-mainnet to
+# open SOL/XMZ too). BTC stays closed (no document). To close a coin again, publish a document signed
 # without --enabled and with a higher sequence.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -15,7 +16,7 @@ site=${2:-$HOME/projects/Monzero-App/monzero-app/website}
 key=${DEX_CONTROL_KEY:-$HOME/monzero-private/dex-control-btc-mainnet/control-signing.key}
 out=$site/dex/control
 mkdir -p "$out"
-python3 "$here/opening-limits.py" --networks eth-mainnet,bnb-mainnet --sequence "$seq" --key "$key" | grep '^python3 ' |
+python3 "$here/opening-limits.py" --networks "${DEX_NETWORKS:-eth-mainnet,bnb-mainnet}" --sequence "$seq" --key "$key" | grep '^python3 ' |
 while read -r _ _ rest; do
     network=$(sed -n 's/.*--network \([a-z-]*\).*/\1/p' <<<"$rest")
     args=${rest% > *}

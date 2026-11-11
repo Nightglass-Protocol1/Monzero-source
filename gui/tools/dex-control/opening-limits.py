@@ -8,7 +8,7 @@
 network has no document, so the public app starts no trade there.
 
 The owner's decision of 8 Nov 2026: $25 per trade and $250 per day for each pair, set in the
-signed control document of each network (btc-mainnet, eth-mainnet, bnb-mainnet). Prices come
+signed control document of each network (btc-mainnet, eth-mainnet, bnb-mainnet, sol-mainnet). Prices come
 from monzero.org/markets/api.php (CoinGecko); XMZ uses the DEX opening rate. Run the printed
 commands with the owner's control key, then publish each output as
 monzero.org/dex/control/<network>.json, where the public app edition fetches it.
@@ -22,6 +22,7 @@ NETWORKS = [  # network, coin symbol, atomic units per coin
     ("btc-mainnet", "BTC", 10**8),
     ("eth-mainnet", "ETH", 10**18),
     ("bnb-mainnet", "BNB", 10**18),
+    ("sol-mainnet", "SOL", 10**9),
 ]
 XMZ_ATOMS = 10**11
 

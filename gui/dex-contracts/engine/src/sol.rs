@@ -71,8 +71,8 @@ pub fn set_local_program(program: Pubkey) {
 pub fn program_of(chain: Chain) -> Option<Pubkey> {
     let text = match chain {
         Chain::SolDevnet => "9idXkjjEeyu6nLrYSnCcX6PjmRemKQvuz7VwwwYMtihh",
-        // Set when the owner has deployed the program for the public opening
-        Chain::SolMainnet => return None,
+        // Deployed by the owner 2026-11-11; the same code as on devnet (sha256 0008fca9…7cef)
+        Chain::SolMainnet => "GtbWmiCkc4c9nmEbN8tERLovA5CG3FbJQTKisaunEkLK",
         Chain::SolLocal => return LOCAL_PROGRAM.get().copied(),
         _ => return None,
     };

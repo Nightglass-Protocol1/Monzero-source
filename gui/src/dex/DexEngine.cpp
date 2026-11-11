@@ -909,8 +909,8 @@ void DexEngine::setUpEvmMarkets() {
     const auto root=m_dexWallets->root();
     const bool mainnet=DexDeployment::mainnetStage();
     struct Chain {int id;const char *rpc;};
-    // Solana mainnet joins this list when its swap program is deployed and pinned in the helper
-    QList<Chain> chains=mainnet ? QList<Chain>{{1,"https://ethereum-rpc.publicnode.com"},{56,"https://bsc-rpc.publicnode.com"}}
+    QList<Chain> chains=mainnet ? QList<Chain>{{1,"https://ethereum-rpc.publicnode.com"},{56,"https://bsc-rpc.publicnode.com"},
+                                               {int(DexChains::SolMainnet),"https://solana-rpc.publicnode.com"}}
                                 : QList<Chain>{{11155111,"https://ethereum-sepolia-rpc.publicnode.com"},{97,"https://bsc-testnet-rpc.publicnode.com"},
                                                {int(DexChains::SolDevnet),"https://api.devnet.solana.com"}};
     // A local Solana test validator (tests): its swap program is given, as a local EVM contract is

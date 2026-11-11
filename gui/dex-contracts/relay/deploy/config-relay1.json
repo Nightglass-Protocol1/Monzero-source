@@ -4,7 +4,8 @@
   "trustProxy": true,
   "chains": [
     {"chainId": 1, "rpc": "https://ethereum-rpc.publicnode.com", "contract": "0xF2b4e38a4d507Cd29F1d4697f3E25D73123ED187", "maxValueWei": "20000000000000000"},
-    {"chainId": 56, "rpc": "https://bsc-rpc.publicnode.com", "contract": "0x9073290952DCDF3225D8f65d787cF9148a490feb", "maxValueWei": "100000000000000000"}
+    {"chainId": 56, "rpc": "https://bsc-rpc.publicnode.com", "contract": "0x9073290952DCDF3225D8f65d787cF9148a490feb", "maxValueWei": "100000000000000000"},
+    {"chainId": 501000101, "rpc": "https://solana-rpc.publicnode.com", "solProgram": "GtbWmiCkc4c9nmEbN8tERLovA5CG3FbJQTKisaunEkLK", "maxValueWei": "500000000"}
   ],
   "peers": ["https://relay2.monzero.org"],
   "utxoNetworks": ["btc-mainnet", "ltc-mainnet"]
