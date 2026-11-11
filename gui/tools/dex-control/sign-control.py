@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("keyfile")
-    p.add_argument("--network", required=True, choices=["ltc-regtest", "ltc-testnet", "ltc-mainnet", "btc-regtest", "btc-testnet4", "btc-signet", "btc-mainnet", "bnb-mainnet", "bnb-testnet", "eth-mainnet"])
+    p.add_argument("--network", required=True, choices=["ltc-regtest", "ltc-testnet", "ltc-mainnet", "btc-regtest", "btc-testnet4", "btc-signet", "btc-mainnet", "bnb-mainnet", "bnb-testnet", "eth-mainnet", "sol-mainnet"])
     p.add_argument("--sequence", type=int, required=True)
     p.add_argument("--days", type=float, default=7)
     state = p.add_mutually_exclusive_group(required=True)
