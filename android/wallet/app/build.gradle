@@ -68,6 +68,16 @@ android {
         }
     }
 
+    // The DEX trade helper and the XMZ wallet service are programs the wallet runs (jniLibs/<abi>/
+    // libmonzero_dex_helper.so, libmonzero_wallet_rpc.so; see dex-native/). Android only lets an app
+    // run programs from its native library folder, so they must be unpacked there at install.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+            keepDebugSymbols += ['**/libmonzero_dex_helper.so', '**/libmonzero_wallet_rpc.so']
+        }
+    }
+
     splits {
         abi {
             enable true

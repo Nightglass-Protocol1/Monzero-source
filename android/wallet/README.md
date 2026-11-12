@@ -20,7 +20,15 @@ Changes from Monerujo:
    ln -s /path/to/monzero-core monero
    make arm64-v8a x86_64 include/wallet2_api.h VERSION
    ```
-2. App: `./gradlew assembleProdMainnetRelease` (`prodDevnet` builds a testnet app).
+2. DEX trading programs (the trade helper and the XMZ wallet service the wallet runs for the DEX
+   web page; see [dex-native/README.md](dex-native/README.md)):
+
+   ```sh
+   cd dex-native
+   ./build-wallet-rpc.sh && ./build-helper.sh
+   ```
+   Without them the wallet builds and works, and its DEX screen says trading is not available.
+3. App: `./gradlew assembleProdMainnetRelease` (`prodDevnet` builds a testnet app).
 
 ---
 

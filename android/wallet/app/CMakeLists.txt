@@ -4,7 +4,8 @@ message(STATUS ABI_INFO  = ${ANDROID_ABI})
 
 add_library( monerujo
              SHARED
-             src/main/cpp/monerujo.cpp )
+             src/main/cpp/monerujo.cpp
+             src/main/cpp/dex_native.cpp )
 
 set(EXTERNAL_LIBS_DIR ${CMAKE_SOURCE_DIR}/../external-libs)
 

@@ -297,6 +297,8 @@ public class LoginActivity extends BaseActivity
         super.onCreate(savedInstanceState);
 
         setContentView(R.layout.activity_login);
+        // The DEX link, when the user left it on: back with the wallet
+        com.m2049r.xmrwallet.dex.DexService.startIfEnabled(this);
         toolbar = findViewById(R.id.toolbar);
         setSupportActionBar(toolbar);
         getSupportActionBar().setDisplayShowTitleEnabled(false);
@@ -699,6 +701,7 @@ public class LoginActivity extends BaseActivity
     @Override
     protected void onResume() {
         super.onResume();
+        com.m2049r.xmrwallet.dex.DexService.showWaiting(this);
         Timber.d("onResume()");
         // wait for WalletService to finish
         if (WalletService.Running && (progressDialog == null)) {

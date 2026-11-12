@@ -198,16 +198,64 @@ The page can only ask for these screens (at most one request every three seconds
 builds keep the in-wallet trading screen behind the menu entry; it opens on a short "connect"
 view (`components/DexConnect.qml`) with the full screen one click away.
 
-### Phones (not built)
+### Phones (Android wallet)
 
-The Android wallet has no swap engine yet, so there is nothing for a page to drive. The same
-link works on a phone once it has one: the wallet runs a foreground service on the same loopback
-ports, the page in the phone's browser (or MetaMask's built-in browser) asks to connect, and
-the wallet raises a notification for the connection and for each trade to approve. No cloud push
-service is needed because the page and the wallet are on the same device. What has to be built
-first: the trade helper and an XMZ wallet service for Android (the helper speaks to the wallet
-over its RPC, which the Android wallet does not have), and a foreground service that keeps a
-trade running to its end.
+The same link works on an Android phone, with the page in the phone's own browser. The wallet app
+carries the engine: the trade helper and `monzero-wallet-rpc`, both built for Android and run as
+programs by the app (`android/wallet/dex-native/`), and a port of the parts of `DexEngine` the page
+drives (`android/wallet/app/src/main/java/com/m2049r/xmrwallet/dex/`).
+
+- **Switching it on.** In an open wallet: menu, "Trade on the DEX", "DEX link on this phone". A
+  foreground service (`DexService`) then listens on the same five loopback ports, with the same
+  origin and host checks, and stays up while the user is in the browser. That wallet's address is
+  remembered as the only place trading XMZ can be moved back to.
+- **Notifications instead of windows.** A page cannot bring the wallet to the front on Android, so
+  everything the wallet has to ask arrives as a notification that opens the wallet's prompt
+  (`DexPromptActivity`): the connection (the same six-digit code as on the page), the trading
+  password, each trade to approve (the amounts the wallet holds from the signed offer), and moving
+  XMZ back. Opening the wallet app while a request waits shows it too. No cloud push service is
+  used: the page and the wallet are on the same phone. After an answer the prompt closes and the
+  phone is back in the browser.
+- **Keys.** The phone makes twelve BIP-39 recovery words of its own and keeps them encrypted under
+  the trading password (Argon2id, AES-256-GCM). The trade account is `m/44'/60'/0'/0/0` of those
+  words (checked against ethers), so the words also open it in MetaMask. They are shown when the
+  keys are made and on request.
+- **Limits.** The same owner-signed control documents, key and rules (`DexRisk`); the wallet's DEX
+  screen shows what they allow. The mainnet build trades on main networks only and answers only
+  `https://monzero.org`.
+- **XMZ node.** The wallet services use the wallet's remote node, untrusted; there is no node on
+  the phone.
+- **While a trade runs** the service holds a wake lock and refuses to be switched off. If the app
+  is closed anyway, the next start asks for the trading password (a notification) and the trade
+  resumes from its journal, as on the desktop.
+
+One change in the helper for Android: its HTTPS client for EVM nodes checks servers against the
+built-in Mozilla roots there (`chain.rs`, `http_client`), because a stand-alone program cannot use
+Android's certificate checker. Other systems are unchanged.
+
+Tested 12 Nov 2026 on an Android 15 emulator (x86_64, `devnet` debug build), with the page in the
+emulator's Chrome, the stand-in for MetaMask of the desktop page tests, the test relay, Sepolia
+and the XMZ testnet (evidence `core/build/app2app-20261109/web-page-phone-eth-sepolia-1.json`,
+driver `phone_trade.py`):
+
+- other origins and a foreign `Host` are refused; the page's connection request raises a
+  notification, its prompt shows the page's code, and accepting hands the page its token once;
+- keys made with a trading password, recovery words shown, a wrong password refused, unlock after
+  an app restart (asked by the page, and by the wallet itself when a trade is waiting);
+- a full swap taken from the page: the phone bought 20 XMZ for 0.001 Sepolia ETH from a desktop
+  app's relay offer; approval from the notification; both sides `Done(Swapped)`; the XMZ arrived in
+  the phone's trading wallet and the ETH left in the trade account went back to the paying account
+  by itself;
+- moving the XMZ back to the wallet's own address, confirmed from its notification;
+- the mainnet build fetched the three live control documents, checked the owner's signature and
+  showed their limits; a device self-check (`DexSelfCheck`, debug builds) covers changed, expired,
+  foreign-network and wrongly signed documents, the per-trade and 24-hour limits, and the key file
+  (25 checks). No offer was posted and nothing was traded on a main network from the phone.
+
+Not built for phones: BTC/LTC (no light wallets there), the wallet's own trading screen, iOS.
+Not tested: a real phone (only the emulator), the real MetaMask or Phantom app's built-in browser,
+the page served from `https://monzero.org` to a phone (the browser's local-network prompt), a
+trade interrupted by Android's battery saving.
 
 ## Order of work
 

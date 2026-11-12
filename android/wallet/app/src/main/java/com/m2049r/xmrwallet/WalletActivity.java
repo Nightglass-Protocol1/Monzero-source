@@ -265,6 +265,8 @@ public class WalletActivity extends BaseActivity implements WalletFragment.Liste
         final int itemId = item.getItemId();
         if (itemId == R.id.action_rescan) {
             onWalletRescan();
+        } else if (itemId == R.id.action_dex) {
+            onDexTrading();
         } else if (itemId == R.id.action_info) {
             onWalletDetails();
         } else if (itemId == R.id.action_share) {
@@ -294,6 +296,19 @@ public class WalletActivity extends BaseActivity implements WalletFragment.Liste
         } else
             return super.onOptionsItemSelected(item);
         return true;
+    }
+
+    // Trading is on the DEX web page; this opens the wallet's side of it (the link and its prompts).
+    // The open wallet's address is where trading XMZ is moved back to.
+    private void onDexTrading() {
+        String daemon = null;
+        try {
+            daemon = WalletManager.getInstance().getDaemonAddress();
+        } catch (IllegalStateException ex) {
+            Timber.d("no daemon set");
+        }
+        final Wallet wallet = getWallet();
+        com.m2049r.xmrwallet.dex.DexActivity.open(this, wallet == null ? null : wallet.getAddress(), daemon);
     }
 
     private void updateStreetMode() {
