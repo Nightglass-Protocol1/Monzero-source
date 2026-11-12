@@ -97,6 +97,57 @@ def target_hex(difficulty):
         return ((0xFFFFFFFF // difficulty) & 0xFFFFFFFF).to_bytes(4, "little").hex()
     return ((0xFFFFFFFFFFFFFFFF // difficulty) & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little").hex()
 
+# --- address keys
+# A wallet's two public keys are always in the curve's prime-order group. An address made up by
+# hand can pass the checksum without that, and the pool wallet then refuses to pay it (its own
+# check finds the coins would not arrive): such an address cannot mine here.
+_P = 2 ** 255 - 19
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_BLOCK = {2: 1, 3: 2, 5: 3, 6: 4, 7: 5, 9: 6, 10: 7, 11: 8}
+
+def _point(key):
+    y = int.from_bytes(key, "little"); sign = y >> 255; y &= (1 << 255) - 1
+    if y >= _P:
+        return None
+    x2 = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P) % _P
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P:
+        x = x * pow(2, (_P - 1) // 4, _P) % _P
+    if (x * x - x2) % _P:
+        return None
+    return (_P - x if x & 1 != sign else x, y)
+
+def _add(a, b):
+    t = _D * a[0] * b[0] * a[1] * b[1] % _P
+    return ((a[0] * b[1] + b[0] * a[1]) * pow(1 + t, _P - 2, _P) % _P, (a[1] * b[1] + a[0] * b[0]) * pow(1 - t, _P - 2, _P) % _P)
+
+def _prime_order(key):
+    point, acc, k = _point(key), (0, 1), _L
+    if point is None or point == (0, 1):
+        return False
+    while k:
+        if k & 1:
+            acc = _add(acc, point)
+        point = _add(point, point); k >>= 1
+    return acc == (0, 1)
+
+def address_keys_usable(address):
+    """True when both public keys in the address are ones a wallet could have made."""
+    try:
+        raw = b""
+        for i in range(0, len(address), 11):
+            block, n = address[i:i + 11], 0
+            for c in block:
+                n = n * 58 + _B58.index(c)
+            raw += n.to_bytes(_B58_BLOCK[len(block)], "big")
+    except (ValueError, KeyError, OverflowError):
+        return False
+    if len(raw) not in (69, 77):       # prefix, spend key, view key, [payment id], checksum
+        return False
+    return _prime_order(raw[1:33]) and _prime_order(raw[33:65])
+
 def with_nonce(blob_hex, nonce_hex):
     o = NONCE_OFFSET * 2
     return blob_hex[:o] + nonce_hex + blob_hex[o + 8:]
@@ -112,6 +163,7 @@ CREATE TABLE IF NOT EXISTS balances (address TEXT PRIMARY KEY, pending INTEGER N
 CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, ts REAL, status TEXT, txid TEXT, fee INTEGER, detail TEXT);
 CREATE TABLE IF NOT EXISTS payment_items (payment INTEGER, address TEXT, amount INTEGER);
 CREATE TABLE IF NOT EXISTS pool_fee (height INTEGER PRIMARY KEY, amount INTEGER);
+CREATE INDEX IF NOT EXISTS payment_items_address ON payment_items(address);
 """
 
 class Store:
@@ -161,6 +213,7 @@ class Pool:
         self.address_ok = {}
         self.payouts_enabled = enable_payouts and cfg["payouts"]["enabled"]
         self.halt_file = Path(cfg["database"]).with_suffix(".payouts-halted")
+        self.held = {}             # address -> time until which its payout is skipped (the wallet refused it)
         self.started = time.time()
 
     # --- daemon / wallet
@@ -178,6 +231,7 @@ class Pool:
         except (RpcError, RpcUncertain):
             return False
         ok = bool(r.get("valid")) and r.get("nettype") == self.cfg["nettype"] and address != self.cfg["pool_address"]
+        ok = ok and await asyncio.to_thread(address_keys_usable, address)
         if len(self.address_ok) < 100000:
             self.address_ok[address] = ok
         return ok
@@ -281,14 +335,35 @@ class Pool:
         while True:
             await asyncio.sleep(self.cfg["payouts"]["interval_seconds"])
             try:
-                await self.pay_once()
+                await self.pay_round()
             except (RpcError, RpcUncertain) as e:
                 log.warning("payouts: %s", e)
 
+    async def pay_round(self):
+        """Pay everyone who is due: one transaction holds at most max_destinations miners (a
+        transaction has 16 outputs: 15 payments and the change), so a round sends several."""
+        sent = []
+        for _ in range(max(1, int(self.cfg["payouts"]["max_batches"]))):
+            held = len(self.held)
+            txid = await self.pay_once()
+            if txid:
+                sent.append(txid)
+            elif len(self.held) == held:   # nothing sent and nobody newly set aside: nothing more to do now
+                break
+        return sent
+
     async def pay_once(self):
         p = self.cfg["payouts"]
-        due = self.store.q("SELECT address, pending FROM balances WHERE pending>=? ORDER BY pending DESC LIMIT ?",
-                           (int(p["threshold_xmz"] * ATOMIC), p["max_destinations"]))
+        # Whoever has waited longest goes first (never paid, then least recently paid). Largest
+        # balance first starved small miners: the big ones refilled the batch every round.
+        due = self.store.q(
+            "SELECT b.address, b.pending FROM balances b LEFT JOIN (SELECT i.address AS address, MAX(p.ts) AS last"
+            " FROM payment_items i JOIN payments p ON p.id=i.payment WHERE p.status!='failed' GROUP BY i.address) l"
+            " ON l.address=b.address WHERE b.pending>=? ORDER BY COALESCE(l.last,0) ASC, b.pending DESC, b.address LIMIT ?",
+            (int(p["threshold_xmz"] * ATOMIC), p["max_destinations"] + len(self.held)))
+        now = time.time()
+        self.held = {a: t for a, t in self.held.items() if t > now}
+        due = [(a, amount) for a, amount in due if a not in self.held][:p["max_destinations"]]
         if not due:
             return None
         if not self.payouts_enabled:
@@ -297,11 +372,43 @@ class Pool:
         if self.halt_file.exists():
             log.error("payouts halted: reconcile %s and delete it", self.halt_file)
             return None
-        total = sum(a for _, a in due)
         bal = await self.w("get_balance", {"account_index": 0})
-        if bal["unlocked_balance"] < total + p["fee_reserve_xmz"] * ATOMIC:
-            log.warning("payouts waiting: unlocked %.5f XMZ < due %.5f XMZ", bal["unlocked_balance"] / ATOMIC, total / ATOMIC)
+        # Pay as many as the unlocked balance covers, in order; the rest lead the next batch
+        room, affordable = bal["unlocked_balance"] - int(p["fee_reserve_xmz"] * ATOMIC), []
+        for addr, amount in due:
+            if amount > room:
+                break
+            affordable.append((addr, amount)); room -= amount
+        if not affordable:
+            log.warning("payouts waiting: unlocked %.5f XMZ < next due %.5f XMZ", bal["unlocked_balance"] / ATOMIC, due[0][1] / ATOMIC)
             return None
+        due = affordable
+        txid, refusal = await self.send_payment(due)
+        if txid or refusal is None or len(due) == 1:
+            if refusal is not None and len(due) == 1 and "not enough" not in refusal.lower():
+                self.hold(due[0][0], refusal)
+            return txid
+        # The wallet refused the whole batch. One address in it can be the cause, and it must not
+        # stop the others: pay each alone, and set aside for a while whoever the wallet still refuses.
+        last = None
+        for one in due:
+            txid, refusal = await self.send_payment([one])
+            if txid:
+                last = txid
+            elif refusal is None or "not enough" in refusal.lower():   # halted, or out of unlocked coins: stop here
+                break
+            else:
+                self.hold(one[0], refusal)
+        return last
+
+    def hold(self, address, why):
+        self.held[address] = time.time() + self.cfg["payouts"]["hold_seconds"]
+        log.error("payout to %s set aside for %d s (balance kept): %s", address, self.cfg["payouts"]["hold_seconds"], why)
+
+    async def send_payment(self, due):
+        """One transaction to these miners. Returns (txid, None) when sent, (None, reason) when the
+        wallet refused it (balances restored), (None, None) when the outcome is unknown (payouts halt)."""
+        total = sum(a for _, a in due)
         with self.store.tx() as db:   # record intent and deduct first
             pid = db.execute("INSERT INTO payments(ts, status) VALUES (?, 'sending')", (time.time(),)).lastrowid
             for addr, amount in due:
@@ -316,19 +423,19 @@ class Pool:
                     db.execute("UPDATE balances SET pending=pending+? WHERE address=?", (amount, addr))
                 db.execute("UPDATE payments SET status='failed', detail=? WHERE id=?", (str(e)[:500], pid))
             log.error("payment %d refused by wallet, balances restored: %s", pid, e)
-            return None
+            return None, str(e)
         except RpcUncertain as e:  # may or may not have been sent
             with self.store.tx() as db:
                 db.execute("UPDATE payments SET status='uncertain', detail=? WHERE id=?", (str(e)[:500], pid))
             self.halt_file.write_text(f"payment {pid} outcome unknown: {e}\nCheck the wallet's outgoing transfers, then fix the payments table and delete this file.\n")
             log.error("payment %d outcome unknown; payouts halted", pid)
-            return None
+            return None, None
         with self.store.tx() as db:
             db.execute("UPDATE payments SET status='sent', txid=?, fee=? WHERE id=?", (r["tx_hash"], r["fee"], pid))
             for addr, amount in due:
                 db.execute("UPDATE balances SET paid=paid+? WHERE address=?", (amount, addr))
         log.info("payment %d sent: %s, %d miners, %.5f XMZ, fee %.5f", pid, r["tx_hash"], len(due), total / ATOMIC, r["fee"] / ATOMIC)
-        return r["tx_hash"]
+        return r["tx_hash"], None
 
     async def janitor(self):
         while True:
@@ -568,7 +675,8 @@ DEFAULTS = {
     "min_difficulty": 100, "max_difficulty": 10_000_000_000, "target_share_seconds": 15, "retarget_seconds": 60,
     "job_refresh_seconds": 30, "miner_timeout_seconds": 600, "max_invalid_shares": 50, "max_miners": 5000,
     "unlock_interval_seconds": 60, "share_retention_days": 7,
-    "payouts": {"enabled": False, "threshold_xmz": 1.0, "interval_seconds": 3600, "max_destinations": 15, "fee_reserve_xmz": 0.1},
+    "payouts": {"enabled": False, "threshold_xmz": 1.0, "interval_seconds": 3600, "max_destinations": 15, "fee_reserve_xmz": 0.1,
+                "max_batches": 8, "hold_seconds": 21600},
 }
 
 def load_config(path):

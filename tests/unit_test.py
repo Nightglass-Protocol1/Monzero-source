@@ -65,6 +65,30 @@ class Credit(unittest.TestCase):
         self.assertEqual(self.pool.store.q("SELECT SUM(amount), COUNT(*) FROM credits")[0], first)
 
 
+class AddressKeys(unittest.TestCase):
+    GOOD = "FTBxy6FD1erFBgYKLgz9sAQvJa4K12tTPFuPfoKZcTQMfHEe7kDTmQdS92ehNFoWkq2D6jQCkUzELVsCGLtYa8G2D2avcNm"
+    # Passes the wallet's validate_address, but its keys are not wallet keys: the pool wallet refused to pay it (12 Nov 2026)
+    MADE_UP = "FWSHPXgK5N3Rw8HJMFDMq9Ar1B1vPBcsa65hcjU7GbQd5CoKoqQTyHm8Gi57YsivHwMhA584Xq6Jbg3yiWufkpEhE3LPVDg"
+
+    def test_wallet_address_is_usable(self):
+        self.assertTrue(xp.address_keys_usable(self.GOOD))
+
+    def test_made_up_address_is_not(self):
+        self.assertFalse(xp.address_keys_usable(self.MADE_UP))
+
+    def test_garbage_is_not(self):
+        for bad in ("", "abc", "0" * 95, self.GOOD[:-1], self.GOOD + "1"):
+            self.assertFalse(xp.address_keys_usable(bad), bad)
+
+    def test_login_refuses_a_made_up_address(self):
+        tmp = tempfile.mkdtemp(); pool = make_pool(tmp)
+        async def w(method, params=None, timeout=60):
+            return {"valid": True, "nettype": "mainnet"}
+        pool.w = w
+        self.assertTrue(asyncio.run(pool.valid_address(self.GOOD)))
+        self.assertFalse(asyncio.run(pool.valid_address(self.MADE_UP)))
+
+
 class Payouts(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -105,6 +129,86 @@ class Payouts(unittest.TestCase):
         self.assertEqual(self.run_with(ok), "ab" * 32)
         self.assertEqual(sorted(x["amount"] for x in seen[0]["destinations"]), [2 * xp.ATOMIC, 3 * xp.ATOMIC])
         self.assertEqual(self.pool.store.q("SELECT SUM(paid) FROM balances")[0][0], 5 * xp.ATOMIC)
+
+    def fill(self, miners):
+        self.pool.store.db.execute("DELETE FROM balances")
+        self.pool.store.db.executemany("INSERT INTO balances(address,pending) VALUES (?,?)", miners)
+
+    def test_small_miners_are_not_starved(self):
+        # 20 miners, room for 15 per transaction: the 5 smallest were never reached before
+        self.fill([("M%02d" % i, (40 - i) * xp.ATOMIC // 10) for i in range(20)])
+        sent = []
+        def ok(p):
+            sent.append([d["address"] for d in p["destinations"]]); return {"tx_hash": "%064x" % len(sent), "fee": 1}
+        self.run_with(ok)                                   # one transaction
+        self.assertEqual(len(sent[0]), 15)
+        left = {a for a, v in self.balances().items() if v}
+        self.assertEqual(left, {"M%02d" % i for i in range(15, 20)})
+        # the big miners earn again before the next round; the waiting ones still go first
+        for i in range(15):
+            self.pool.store.db.execute("UPDATE balances SET pending=? WHERE address=?", (5 * xp.ATOMIC, "M%02d" % i))
+        self.run_with(ok)
+        self.assertEqual(sent[1][:5], ["M%02d" % i for i in range(15, 20)])
+        self.assertEqual(len(sent[1]), 15)
+
+    def test_round_pays_everyone_in_batches(self):
+        self.fill([("M%02d" % i, 2 * xp.ATOMIC) for i in range(32)])
+        sent = []
+        def ok(p):
+            sent.append(len(p["destinations"])); return {"tx_hash": "%064x" % len(sent), "fee": 1}
+        async def w(method, params=None, timeout=60):
+            return {"unlocked_balance": 100 * xp.ATOMIC} if method == "get_balance" else ok(params)
+        self.pool.w = w
+        txids = asyncio.run(self.pool.pay_round())
+        self.assertEqual(sent, [15, 15, 2])
+        self.assertEqual(len(txids), 3)
+        self.assertEqual(set(self.balances().values()), {0})
+        self.assertEqual(self.pool.store.q("SELECT SUM(paid) FROM balances")[0][0], 64 * xp.ATOMIC)
+
+    def test_pays_what_the_unlocked_balance_covers(self):
+        self.fill([("A", 60 * xp.ATOMIC), ("B", 30 * xp.ATOMIC), ("C", 30 * xp.ATOMIC)])
+        sent = []
+        def ok(p):
+            sent.append([d["address"] for d in p["destinations"]]); return {"tx_hash": "cd" * 32, "fee": 1}
+        self.run_with(ok)                                   # 100 XMZ unlocked: A and B fit, C waits
+        self.assertEqual(sent, [["A", "B"]])
+        self.assertEqual(self.balances()["C"], 30 * xp.ATOMIC)
+
+    def test_round_stops_after_a_refusal(self):
+        self.fill([("M%02d" % i, 2 * xp.ATOMIC) for i in range(32)])
+        calls = []
+        def refuse(p):
+            calls.append(1); raise xp.RpcError("not enough unlocked money")
+        async def w(method, params=None, timeout=60):
+            return {"unlocked_balance": 100 * xp.ATOMIC} if method == "get_balance" else refuse(params)
+        self.pool.w = w
+        self.assertEqual(asyncio.run(self.pool.pay_round()), [])
+        self.assertEqual(len(calls), 2, "the batch, then one alone; out of coins stops the round")
+        self.assertEqual(set(self.balances().values()), {2 * xp.ATOMIC})
+        self.assertEqual(self.pool.held, {})
+
+    def test_one_refused_address_does_not_stop_the_others(self):
+        # The wallet refuses any transaction that pays BAD (as on 12 Nov 2026: its own sanity check)
+        self.fill([("M%02d" % i, 2 * xp.ATOMIC) for i in range(20)] + [("BAD", 9 * xp.ATOMIC)])
+        sent = []
+        def transfer(p):
+            if any(d["address"] == "BAD" for d in p["destinations"]):
+                raise xp.RpcError("transfer: {'code': -4, 'message': 'Total received by BAD: 0, expected 9'}")
+            sent.append([d["address"] for d in p["destinations"]]); return {"tx_hash": "%064x" % len(sent), "fee": 1}
+        async def w(method, params=None, timeout=60):
+            return {"unlocked_balance": 1000 * xp.ATOMIC} if method == "get_balance" else transfer(params)
+        self.pool.w = w
+        asyncio.run(self.pool.pay_round())
+        left = {a: v for a, v in self.balances().items() if v}
+        self.assertEqual(left, {"BAD": 9 * xp.ATOMIC}, "everyone else is paid; the refused balance is kept")
+        self.assertIn("BAD", self.pool.held)
+        self.assertEqual(self.pool.store.q("SELECT SUM(paid) FROM balances")[0][0], 40 * xp.ATOMIC)
+        before = len(sent)
+        asyncio.run(self.pool.pay_round())                  # next round: BAD is skipped, not retried
+        self.assertEqual(len(sent), before)
+        self.pool.held["BAD"] = 0                            # after the hold it is tried again
+        asyncio.run(self.pool.pay_round())
+        self.assertIn("BAD", self.pool.held)
 
     def test_disabled_sends_nothing(self):
         self.pool.payouts_enabled = False
