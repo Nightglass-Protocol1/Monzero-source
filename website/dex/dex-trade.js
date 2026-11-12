@@ -530,7 +530,7 @@
   function render() {
     var h = "", c = chain();
     if (!c) {
-      h = '<p class="pro-order-lede">Pick ETH or BNB to trade from this page with MetaMask. The other coins are not open here yet.</p>' +
+      h = '<p class="pro-order-lede">Pick ETH, BNB or SOL to trade from this page with MetaMask or Phantom.</p>' +
         '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the app</a></div>';
     } else if (sol() ? !solProvider() : !window.ethereum) {
       h = '<p class="pro-order-lede">To trade ' + st.coin + ' from this page you need <strong>' + own() + '</strong> in this browser and the <strong>Monzero wallet</strong> open on this computer.</p>' +

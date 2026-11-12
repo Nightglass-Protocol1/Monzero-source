@@ -97,6 +97,7 @@
 .cdot[data-c="LTC"] { background: #b8b8b8; color: #1a1a1a; }
 .cdot[data-c="SOL"] { background: linear-gradient(135deg, #9945FF, #14F195); }
 .cdot[data-c="BNB"] { background: #f3ba2f; }
+.cdot[data-c="ETH"] { background: #627eea; color: #fff; }
 .coin-pick.fixed { cursor: default; }
 .coin-pick.fixed .ccaret { display: none; }
 .coin-pick.fixed:hover { border-color: var(--line); }

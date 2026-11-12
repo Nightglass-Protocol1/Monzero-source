@@ -33,11 +33,10 @@ $cfg = [
     'rendezvous' => [],         // libp2p multiaddrs where makers register (owner-set)
     'relays' => [],             // open offer relays (monzero-dex-relay base URLs, owner-set)
     'pairs' => [
-        ['pair' => 'XMZ/BTC',  'status' => 'beta', 'fee' => '0.1%-0.5%'],
-        ['pair' => 'XMZ/LTC',  'status' => 'soon', 'fee' => 'free'],
-        ['pair' => 'XMZ/BNB',  'status' => 'beta', 'fee' => 'tbd'],
-        ['pair' => 'XMZ/ETH',  'status' => 'beta', 'fee' => 'tbd'],
-        ['pair' => 'XMZ/SOL',  'status' => 'soon', 'fee' => '0.1%-0.5%'],
+        // Bitcoin and Litecoin are not listed while they are being finished (12 Nov 2026)
+        ['pair' => 'XMZ/ETH',  'status' => 'live', 'fee' => 'tbd'],
+        ['pair' => 'XMZ/BNB',  'status' => 'live', 'fee' => 'tbd'],
+        ['pair' => 'XMZ/SOL',  'status' => 'live', 'fee' => '0.1%-0.5%'],
     ],
 ];
 

@@ -8,20 +8,20 @@
   // markets feed answers.
   var COINS = {
     XMZ: { name: "Monzero", usd: 0.001, dp: 4 },
-    BTC: { name: "Bitcoin", usd: 68000, dp: 8 },
-    LTC: { name: "Litecoin", usd: 75, dp: 6 },
     BNB: { name: "BNB", usd: 600, dp: 6 },
     ETH: { name: "Ethereum", usd: 3500, dp: 6 },
     SOL: { name: "Solana", usd: 190, dp: 6 }
   };
-  var COUNTERS = ["BTC", "LTC", "BNB", "ETH", "SOL"];
-  var STATUS = { BTC: "beta", LTC: "soon", BNB: "soon", ETH: "soon", SOL: "soon" };
-  // Project fee per pair: BTC dynamic 0.1%–0.5% (floor used for indicative math),
-  // SOL likewise 0.1%–0.5%; LTC free; EVM (BNB/ETH) fee to be decided. See dex-mainnet/go-live for the live policy.
-  var FEES = { BTC: 0.001, LTC: 0, BNB: 0, ETH: 0, SOL: 0.001 };
-  var FEE_LABEL = { BTC: "0.1%–0.5%", LTC: "Free", BNB: "TBD", ETH: "TBD", SOL: "0.1%–0.5%" };
+  // The pairs open to the public. Bitcoin and Litecoin are not listed while they are being
+  // finished (12 Nov 2026); put them back here, in PAIRS below and in /dex/api.php when they open.
+  var COUNTERS = ["ETH", "BNB", "SOL"];
+  var STATUS = { ETH: "live", BNB: "live", SOL: "live" };
+  // Project fee per pair: SOL dynamic 0.1%–0.5% (floor used for indicative math);
+  // EVM (BNB/ETH) fee to be decided. See dex-mainnet/go-live for the live policy.
+  var FEES = { BNB: 0, ETH: 0, SOL: 0.001 };
+  var FEE_LABEL = { BNB: "TBD", ETH: "TBD", SOL: "0.1%–0.5%" };
 
-  var state = { dir: "xmz-to-coin", coin: "BTC" }; // dir: which way XMZ flows
+  var state = { dir: "xmz-to-coin", coin: "ETH" }; // dir: which way XMZ flows
   var $ = function (id) { return document.getElementById(id); };
   function sym(side) { // the ticker on a given side
     if (side === "send") return state.dir === "xmz-to-coin" ? "XMZ" : state.coin;
@@ -57,16 +57,11 @@
     var gross = amt * rate;
     var FEE = FEES[state.coin] || 0;
     var feeText = FEE_LABEL[state.coin] || "\u2014";
-    if (state.coin === "BTC") {
-      // size-aware spread: clamp( ~2x on-chain cost / trade , 0.1% , 0.5% ) — indicative
-      var btc = sT === "BTC" ? amt : (rT === "BTC" ? gross : 0);
-      var sats = btc * 1e8;
-      FEE = sats > 0 ? Math.min(0.005, Math.max(0.001, 8000 / sats)) : 0.005;
-      feeText = (FEE * 100).toFixed(2) + "%";
-    }
     var out = gross * (1 - FEE);
     $("recv-amount").value = fmt(out, COINS[rT].dp);
-    $("d-rate").textContent = "1 " + sT + " ≈ " + fmt(rate, COINS[rT].dp) + " " + rT;
+    // A small rate (1 XMZ in ETH) needs more places than the amount fields show
+    var rateDp = rate > 0 && rate < 0.001 ? Math.min(14, 2 - Math.floor(Math.log(rate) / Math.LN10)) : COINS[rT].dp;
+    $("d-rate").textContent = "1 " + sT + " ≈ " + fmt(rate, rateDp) + " " + rT;
     $("d-time").textContent = (rT === "XMZ" || sT === "XMZ") ? "~20–40 min" : "~20–40 min";
     var pairCoin = state.coin;
     var pf = $("d-projfee"); if (pf) pf.textContent = feeText;
@@ -80,11 +75,11 @@
       var li = document.createElement("li");
       li.setAttribute("role", "button");
       li.setAttribute("tabindex", "0");
-      var live = STATUS[c] === "beta";
+      var live = STATUS[c] === "live", label = live ? "live" : (STATUS[c] === "beta" ? "beta" : "soon");
       li.innerHTML =
         '<span class="pair-coins"><span class="cdot" data-c="XMZ">X</span><span class="cdot" data-c="' + c + '">' + c.slice(0, 1) + '</span></span>' +
         '<span class="pair-name">XMZ / ' + c + '</span>' +
-        '<span class="pair-status ' + (live ? "live" : "") + '">' + (live ? "beta" : "soon") + '</span>';
+        '<span class="pair-status ' + (live ? "live" : "") + '">' + label + '</span>';
       function pick() { state.coin = c; renderCoinButtons(); recalc(); closeMenus(); }
       li.addEventListener("click", pick);
       li.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
@@ -134,7 +129,7 @@
     fetch("/dex/api.php", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (d) {
       (d.pairs || []).forEach(function (p) {
         var c = p && typeof p.pair === "string" ? p.pair.replace("XMZ/", "") : "";
-        if (STATUS[c] && (p.status === "beta" || p.status === "soon")) STATUS[c] = p.status;
+        if (STATUS[c] && (p.status === "live" || p.status === "beta" || p.status === "soon")) STATUS[c] = p.status;
       });
       renderPairs();
     }).catch(function () {});
@@ -168,8 +163,8 @@
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   if (!$("mode-pro")) return;
-  var PAIRS = ["BTC", "ETH", "BNB", "LTC", "SOL"];
-  var NAME = { BTC: "Bitcoin", ETH: "Ethereum", BNB: "BNB", LTC: "Litecoin" };
+  var PAIRS = ["ETH", "BNB", "SOL"];   // Bitcoin and Litecoin are not listed for now (see COUNTERS above)
+  var NAME = { BTC: "Bitcoin", ETH: "Ethereum", BNB: "BNB", LTC: "Litecoin", SOL: "Solana" };
   var EXPLORER = { BTC: "https://mempool.space/tx/", ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/", LTC: "https://litecoinspace.org/tx/", SOL: "https://explorer.solana.com/tx/" };
   // A recorded trade's claim on its chain's explorer (Solana's test cluster is named in the link)
   function claimLink(p) { return EXPLORER[pro.coin] + encodeURIComponent(p.tx) + (p.chainId === 501000102 ? "?cluster=devnet" : ""); }
@@ -396,7 +391,7 @@
   $("mode-simple").addEventListener("click", function () { setMode("simple"); if (history.replaceState) history.replaceState(null, "", location.pathname); });
   $("mode-pro").addEventListener("click", function () { setMode("pro"); if (history.replaceState) history.replaceState(null, "", "#pro"); });
   // Shareable deep link: /dex/#pro opens the market view.
-  // #pro opens the order book; #pro-BTC (or -ETH, -BNB, -LTC, -SOL) also picks the pair
+  // #pro opens the order book; #pro-ETH (or -BNB, -SOL) also picks the pair
   function fromHash() {
     var m = /^#pro(?:-([A-Z]{3}))?$/.exec(location.hash);
     if (m && m[1] && PAIRS.indexOf(m[1]) >= 0 && m[1] !== pro.coin) { pro.coin = m[1]; if (pro.rendered) show(); else syncPair(); }
@@ -430,7 +425,7 @@
       var notice = document.querySelector(".dex-notice");
       el.classList.add("live");
       el.innerHTML = '<span class="dc-live">🟢 Monzero DEX is live</span>';
-      if (notice) notice.innerHTML = '<strong>Live.</strong> Trade XMZ for ETH and BNB from your own wallet in the Monzero app, with small limits while the DEX is new. <a href="/dex/recovery/">How to recover your funds →</a>';
+      if (notice) notice.innerHTML = '<strong>Live.</strong> Trade XMZ for ETH, BNB and SOL from your own wallet: on this page with MetaMask or Phantom, with the Monzero wallet open to run the swap. Small limits per trade while the DEX is new. <a href="/dex/recovery/">How to recover your funds →</a>';
     })
     .catch(function () { /* stays "Coming soon" */ });
 })();
