@@ -1,0 +1,31 @@
+Monzero for Linux (64-bit PC)
+=============================
+
+Start the wallet
+  Open this folder in a terminal and run:
+
+      ./monzero-wallet-gui
+
+  To add "Monzero" to your applications menu, run  ./install-desktop-entry.sh  once. It
+  only writes a menu entry and icon that point at this folder; run it again if you move
+  the folder.
+
+Keep the files together
+  The wallet starts monzerod and the helper programs in monzero-dex/ and monzero-light/
+  from this folder. Do not move them apart or rename them.
+
+Trading on the DEX
+  Open https://monzero.org/dex/ in a browser on this computer while the wallet is open.
+  ETH and BNB need MetaMask in that browser; SOL needs Phantom. The page shows a code and
+  the wallet asks you to accept the connection. Read RELEASE_NOTES.md first.
+
+Node and command-line tools
+  monzerod, monzero-wallet-cli and monzero-wallet-rpc are the same as in the command-line
+  package. See README.md and README-SYSTEMD.md.
+
+Check what you downloaded
+  sha256sum -c SHA256SUMS      (inside this folder)
+  The archive's own SHA-256 is published in the signed release file on
+  https://monzero.org/download/.
+
+Needs: a 64-bit Intel or AMD PC and glibc 2.31 or newer (Ubuntu 20.04, Debian 11 or later).
