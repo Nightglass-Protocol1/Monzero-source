@@ -43,7 +43,7 @@ wallet, and an in-wallet order book.
 
 | Package | Intended compatibility scope |
 | --- | --- |
-| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.31 or newer (Ubuntu 20.04, Debian 11 and later) |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
 | Complete source | Exact repository commit and recursive pinned submodules |
 | DEX helper source | The adapted swap engine the bundled helper programs are built from (GPL-3.0) |
 

@@ -28,4 +28,6 @@ Check what you downloaded
   The archive's own SHA-256 is published in the signed release file on
   https://monzero.org/download/.
 
-Needs: a 64-bit Intel or AMD PC and glibc 2.31 or newer (Ubuntu 20.04, Debian 11 or later).
+Needs: a 64-bit Intel or AMD PC and glibc 2.35 or newer (Ubuntu 22.04, Debian 12 or later).
+The wallet window uses X11; on a Wayland desktop it runs through XWayland, which desktops
+start for you.
