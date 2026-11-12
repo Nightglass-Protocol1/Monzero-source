@@ -109,7 +109,7 @@ async fn heights(cfg: &TickConfig, chain: Chain, evm_from_block: Option<u64>) ->
         let xmz = main.call("get_height", json!({})).await.map_err(|e| e.to_string())?["height"].as_u64().ok_or("the XMZ wallet gave no height")?;
         return Ok(Heights { now, evm_from_block: evm_from_block.unwrap_or(slot), xmz_restore_height: xmz.saturating_sub(1) });
     }
-    let provider = ProviderBuilder::new().connect_http(cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
+    let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
     let head = provider.get_block_number().await.map_err(|e| e.to_string())?;
     let block = provider
         .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(head))
@@ -137,7 +137,7 @@ async fn check_funds(role: Role, listing: &Listing, key: &PrivateKeySigner, cfg:
             }
         }
         Role::Owner => {
-            let provider = ProviderBuilder::new().connect_http(cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
+            let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
             let have = provider.get_balance(key.address()).await.map_err(|e| e.to_string())?;
             if have < listing.value {
                 // In coins, not wei: this is what the person reads before sending from their wallet

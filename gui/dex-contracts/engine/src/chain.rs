@@ -46,7 +46,31 @@ fn retrying_client(url: alloy::transports::http::reqwest::Url) -> alloy::rpc::cl
     use alloy::transports::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
     let policy = RateLimitRetryPolicy::default()
         .or(|e: &alloy::transports::TransportError| e.as_transport_err().and_then(|t| t.as_http_error()).is_some_and(|h| h.status >= 500 || h.status == 429));
-    alloy::rpc::client::ClientBuilder::default().layer(RetryBackoffLayer::new_with_policy(5, 400, 10_000, policy)).http(url)
+    let transport = alloy::transports::http::Http::with_client(http_client(), url);
+    alloy::rpc::client::ClientBuilder::default().layer(RetryBackoffLayer::new_with_policy(5, 400, 10_000, policy)).transport(transport, false)
+}
+
+/// The HTTP client for a chain node.
+///
+/// On Android the helper is a stand-alone program: the system's certificate checker is reachable
+/// only from an app's Java side, and the default client stops ("rustls-platform-verifier to be
+/// initialized"). There, servers are checked against the built-in Mozilla root certificates, as
+/// the relay client does on every system.
+pub(crate) fn http_client() -> alloy::transports::http::reqwest::Client {
+    #[cfg(target_os = "android")]
+    {
+        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("TLS protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        alloy::transports::http::reqwest::Client::builder().tls_backend_preconfigured(tls).build().expect("TLS client")
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        alloy::transports::http::reqwest::Client::new()
+    }
 }
 
 impl AlloyChain {
