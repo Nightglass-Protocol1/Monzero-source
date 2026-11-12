@@ -26,6 +26,11 @@
   else CHAINS.SOL = /[?&]sol=local/.test(location.search)
     ? { id: 501000103, name: "Solana (local test)", control: null, sol: true, rpc: "http://127.0.0.1:18899", tx: "https://solscan.io/tx/" }
     : { id: 501000102, name: "Solana Devnet (test network)", control: null, sol: true, rpc: "https://api.devnet.solana.com", tx: "https://solscan.io/tx/", txEnd: "?cluster=devnet" };
+  // On an Android phone the wallet is the Monzero app on the same phone: its DEX link answers on
+  // the same loopback ports, and it asks the user through notifications (connect, password, approve)
+  var PHONE = /Android/i.test(navigator.userAgent || "");
+  function dev(computer, phone) { return PHONE ? phone : computer; }
+  var LOOK = dev("Look at your Monzero wallet", "Tap the Monzero notification on this phone");
   var PORTS = [38471, 38472, 38473, 38474, 38475];
   // Two wallets on one computer: ?wallet=38472 picks one (the wallet's port is one of the five)
   // Each picked wallet keeps its own saved connection, so two tabs can be linked to two wallets
@@ -257,7 +262,8 @@
     asked.then(function () {
       return findWallets();
     }).then(function (found) {
-      if (!found.length) throw new Error("No Monzero wallet answered on this computer. Open your wallet (the version with the DEX) and try again. " +
+      if (!found.length) throw new Error(dev("No Monzero wallet answered on this computer. Open your wallet (the version with the DEX) and try again. ",
+        "No Monzero wallet answered on this phone. Open the Monzero wallet app, open a wallet, choose \"Trade on the DEX\" in its menu and turn the DEX link on; then try again. ") +
         "If your browser asks whether this site may reach apps on your device, allow it. Chrome, Brave, Edge and Firefox work; Safari does not allow this.");
       port = found[0].port;
       return wallet(port, "/v1/pair", "POST", mine);
@@ -343,7 +349,7 @@
       var m = s.markets[st.coin];
       st.busy = "";
       if (m && m.state !== "ok" && m.error) return fail(new Error(m.error));
-      say("Your offer is posted. Keep the wallet open: when someone takes it, the wallet asks you to approve the trade.");
+      say("Your offer is posted. " + dev("Keep the wallet open", "Keep the wallet's DEX link on") + ": when someone takes it, the wallet asks you to approve the trade.");
     }).catch(fail);
   }
   function take(id) {
@@ -461,7 +467,7 @@
     var coinAmt = o.value ? fromUnits(BigInt(o.value), dec(), 8) + " " + st.coin : "", xmzAmt = o.xmzAmount != null ? fromUnits(BigInt(o.xmzAmount), 11, 4) + " XMZ" : "";
     h += '<p class="tp-terms">' + (buying ? "You pay <strong>" + esc(coinAmt) + "</strong> · you receive <strong>" + esc(xmzAmt) + "</strong>"
       : "You pay <strong>" + esc(xmzAmt) + "</strong> · you receive <strong>" + esc(coinAmt) + "</strong>") + "</p>";
-    if (t.awaitingApproval) h += '<p class="tp-act">Approve this trade in your Monzero wallet. The wallet shows the amounts it holds; check them there.</p>';
+    if (t.awaitingApproval) h += '<p class="tp-act">' + dev("Approve this trade in your Monzero wallet.", "Approve this trade in your Monzero wallet: tap its notification on this phone.") + ' The wallet shows the amounts it holds; check them there.</p>';
     else h += '<p class="tp-stage">' + esc(STAGE[s.stage] || s.stage || "Starting…") + "</p>";
     h += stepsHTML(t);
     if (t.startRefusal) h += '<p class="tp-err">' + esc(t.startRefusal) + "</p>";
@@ -482,7 +488,7 @@
     } else if (!s.approved && (s.stage === "Start" || s.stage === "WaitingForEvmLock")) {
       // Nothing of yours is locked before you approve: the trade can simply be dropped
       h += '<p class="tp-note">Nothing of yours is locked yet. Changed your mind? <button class="tp-link" type="button" data-act="abandon">Cancel this trade</button></p>';
-    } else h += '<p class="tp-note">Keep the wallet open until this finishes. If the other side stops, your funds are returned after the time limit.</p>';
+    } else h += '<p class="tp-note">' + dev("Keep the wallet open", "Keep the wallet's DEX link on and the phone connected") + ' until this finishes. If the other side stops, your funds are returned after the time limit.</p>';
     return '<div class="tp-trade">' + h + "</div>";
   }
   // XMZ that reached the trading wallet but is not usable yet (10 blocks after it arrives)
@@ -533,20 +539,22 @@
       h = '<p class="pro-order-lede">Pick ETH, BNB or SOL to trade from this page with MetaMask or Phantom.</p>' +
         '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the app</a></div>';
     } else if (sol() ? !solProvider() : !window.ethereum) {
-      h = '<p class="pro-order-lede">To trade ' + st.coin + ' from this page you need <strong>' + own() + '</strong> in this browser and the <strong>Monzero wallet</strong> open on this computer.</p>' +
-        '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the wallet</a><a class="button secondary" href="' +
+      h = '<p class="pro-order-lede">To trade ' + st.coin + ' from this page you need <strong>' + own() + '</strong> in this browser and the <strong>Monzero wallet</strong> ' + dev("open on this computer", "app on this phone, with its DEX link on") + ".</p>" +
+        '<div class="swap-reveal-cta"><a class="button primary" href="/download/' + dev("", "#android") + '">Get the wallet</a><a class="button secondary" href="' +
         (sol() ? "https://phantom.com/download" : "https://metamask.io/download/") + '" rel="noopener">Get ' + own() + "</a></div>";
     } else if (st.pairing) {
-      h = '<p class="pro-order-lede">Look at your Monzero wallet. Accept the connection there if it shows this code:</p><p class="tp-code">' + esc(st.pairing.code) + "</p>";
+      h = '<p class="pro-order-lede">' + LOOK + '. Accept the connection there if it shows this code:</p><p class="tp-code">' + esc(st.pairing.code) + "</p>";
     } else if (st.link && st.status && !ownAccount()) {
       // Connected with the other kind of wallet only: this coin needs its own
       h = '<p class="pro-order-lede">Your Monzero wallet is connected. To trade ' + st.coin + ', connect <strong>' + own() + '</strong> too: it pays the ' + st.coin +
         ' in and receives what you are owed. The wallet will show a new code to accept.</p>' +
         '<div class="swap-reveal-cta"><button class="button primary" type="button" data-act="connect"' + (st.busy ? " disabled" : "") + ">Connect " + own() + "</button></div>";
     } else if (!st.link || !st.status) {
-      h = '<p class="pro-order-lede">Trade ' + st.coin + ' for XMZ with <strong>' + own() + '</strong>. Your <strong>Monzero wallet</strong> on this computer runs the swap and asks you to approve each trade; nobody holds your coins.</p>' +
-        '<ol class="tp-steps"><li>Open your Monzero wallet on this computer.</li><li>Connect here; the wallet shows a code to accept and asks for a trading password.</li><li>Pick an offer. ' + own() + ' pays in, the wallet asks you to approve.</li></ol>' +
-        '<div class="swap-reveal-cta"><button class="button primary" type="button" data-act="connect"' + (st.busy ? " disabled" : "") + ">" + (st.link ? "Reconnect" : "Connect " + own() + " and wallet") + '</button><a class="button secondary" href="/download/">Get the wallet</a></div>';
+      h = '<p class="pro-order-lede">Trade ' + st.coin + ' for XMZ with <strong>' + own() + '</strong>. Your <strong>Monzero wallet</strong> ' + dev("on this computer", "app on this phone") + ' runs the swap and asks you to approve each trade; nobody holds your coins.</p>' +
+        '<ol class="tp-steps"><li>' + dev("Open your Monzero wallet on this computer.", "In the Monzero wallet app, open a wallet, choose \"Trade on the DEX\" in its menu and turn the DEX link on.") +
+        "</li><li>" + dev("Connect here; the wallet shows a code to accept and asks for a trading password.", "Connect here; a notification from the wallet shows a code to accept, then asks for a trading password.") +
+        "</li><li>Pick an offer. " + own() + " pays in, " + dev("the wallet asks you to approve.", "a notification from the wallet asks you to approve.") + "</li></ol>" +
+        '<div class="swap-reveal-cta"><button class="button primary" type="button" data-act="connect"' + (st.busy ? " disabled" : "") + ">" + (st.link ? "Reconnect" : "Connect " + own() + " and wallet") + '</button><a class="button secondary" href="/download/' + dev("", "#android") + '">Get the wallet</a></div>';
     } else {
       var s = st.status, w = s.wallet, t = s.trade || {}, m = (s.markets || {})[st.coin] || {};
       h += '<ul class="relay-facts"><li><span>Wallet</span><strong>connected · ' + esc(String(w.unlocked || "0")) + ' XMZ ready</strong>' + arrivingHTML(w) + '  <button class="tp-link" type="button" data-act="xmz-add">Add XMZ</button>' +
@@ -611,9 +619,11 @@
       if (r && r.ok) say("Trade cancelled. What you paid in is still in your trade account; you can send it back to " + own() + " below."); else fail(new Error("This trade can no longer be cancelled here: it has started."));
       return refresh();
     }).catch(fail);
-    else if (act === "unlock") ask("/v1/unlock", {}, "Look at your Monzero wallet: it is asking for your trading password.");
-    else if (act === "xmz-add") ask("/v1/xmz-add", wantedXmz(), "Look at your Monzero wallet: its Send page is open with your trading wallet filled in. Enter the amount and confirm there. New XMZ is ready to trade after about 20 minutes.");
-    else if (act === "xmz-return") ask("/v1/xmz-return", {}, "Look at your Monzero wallet: confirm there to move your trading XMZ back to your main balance.");
+    else if (act === "unlock") ask("/v1/unlock", {}, LOOK + ": it is asking for your trading password.");
+    else if (act === "xmz-add") ask("/v1/xmz-add", wantedXmz(), dev("Look at your Monzero wallet: its Send page is open with your trading wallet filled in. Enter the amount and confirm there.",
+      "Tap the Monzero notification on this phone: it opens your wallet's Send screen with your trading wallet filled in. Pick the wallet to pay from, enter the amount and confirm there.") +
+      " New XMZ is ready to trade after about 20 minutes.");
+    else if (act === "xmz-return") ask("/v1/xmz-return", {}, LOOK + ": confirm there to move your trading XMZ back to your main balance.");
     else if (act === "dismiss") { st.dismissed = st.status.trade.tradeId; st.note = ""; render(); }
   });
   box.addEventListener("input", function (e) {
