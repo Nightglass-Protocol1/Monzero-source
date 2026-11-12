@@ -11,17 +11,34 @@
 <p class="eyebrow"><a href="/">Monzero</a> / Software releases</p><h1>Downloads &amp; release verification</h1><p class="guide-intro">Choose the package for your system, then check its SHA-256 against the published release information. Platform and signature limitations are listed with each download.</p> <section class="download section" id="download">
 <div class="download-card">
 <div>
-<p class="eyebrow">Monzero v1.0.0 · stable release</p>
+<p class="eyebrow">Monzero v1.1.0 · stable release</p>
 <h2>Download Monzero</h2>
-<p class="release-note"><strong>v1.0.0 network upgrade.</strong> Since block 21,000 (31 October) the network uses LWMA difficulty (hard fork 17), continuing the existing chain. Nodes and wallets older than v1.0.0 stop syncing at that block; update to the packages below. <a href="/upgrade/">Read the upgrade guide and current status</a>.</p>
-<p>Stable v1.0.0 graphical wallet and command-line build for Linux x86-64, plus full source. Also available as a <a href="#web-wallet">web wallet</a> and an <a href="#android">Android app</a> below. Stable packages include the <a href="/WHITEPAPER.md?rev=1.5-20261017">protocol whitepaper</a>, release notes and the <a href="/releases/v1.0.0-notes.txt">upgrade guide</a>.</p>
-<p class="release-note">Original v1.0.0 packages: the <a href="/releases/v1.0.0.json">release file</a> lists their SHA-256 checksums and is signed (<a href="/releases/v1.0.0.json.asc">signature</a>, <a href="/releases/monzero-release-public.asc">release key</a>, fingerprint <code>4C37C618789F86D81FEF28DF390AEFB735F270D6</code>). Not yet independently audited; report issues to security@monzero.org.</p>
-<p class="release-metadata">Core source <code>c4165784db57d8ae410fc8af58861e4178ee1a42</code> · network UUID <code>94834264-d0b2-41dd-b0f2-0ada675c7710</code></p>
+<p>Monzero v1.1.0 is the current release for Linux x86-64: the graphical wallet with the node and command-line programs, plus full source. It adds trading on the <a href="/dex/">DEX</a> and changes no network rule, so v1.0.0 keeps working. A <a href="#web-wallet">web wallet</a> and an <a href="#android">Android app</a> are below; they do not trade on the DEX yet.</p>
+<p class="release-note"><strong>Signed release.</strong> The <a href="/releases/v1.1.0.json">v1.1.0 release file</a> lists the SHA-256 of every v1.1.0 download and is signed (<a href="/releases/v1.1.0.json.asc">signature</a>, <a href="/releases/monzero-release-public.asc">release key</a>, fingerprint <code>4C37C618789F86D81FEF28DF390AEFB735F270D6</code>). Read the <a href="/releases/v1.1.0-notes.txt">release notes</a> before trading. Not independently audited; report issues to security@monzero.org.</p>
+<p class="release-note"><strong>Still on a version older than v1.0.0?</strong> Since block 21,000 (31 October) the network uses LWMA difficulty (hard fork 17), continuing the existing chain. Older nodes and wallets stop syncing at that block; update to v1.0.0 or v1.1.0. <a href="/upgrade/">Read the upgrade guide and current status</a>.</p>
+<p class="release-note">The v1.0.0 packages stay available below. Their <a href="/releases/v1.0.0.json">release file</a> is signed with the same key (<a href="/releases/v1.0.0.json.asc">signature</a>); see its <a href="/releases/v1.0.0-notes.txt">release notes</a>. Packages include the <a href="/WHITEPAPER.md?rev=1.5-20261017">protocol whitepaper</a>.</p>
+<p class="release-metadata">v1.1.0 source <code>1443caf6d6468adec6b650f4fee11cfd769d311a</code> · v1.0.0 core source <code>c4165784db57d8ae410fc8af58861e4178ee1a42</code> · network UUID <code>94834264-d0b2-41dd-b0f2-0ada675c7710</code></p>
 <p><a class="button secondary" href="https://github.com/Nightglass-Protocol1/Monzero-source" rel="noopener noreferrer" target="_blank">View source code on GitHub</a></p>
 </div>
 <div class="download-action" id="packages">
 <div class="release-download">
-<a class="button primary wide" download="" href="/downloads/monzero-v1.0.0-linux-gui-x86_64.tar.gz">Linux graphical wallet · x86-64 <span>41 MB · TAR.GZ · GLIBC 2.35+</span></a>
+<a class="button primary wide" download="" href="/downloads/monzero-v1.1.0-linux-gui-x86_64.tar.gz">Linux wallet v1.1.0 · x86-64 · trades on the DEX <span>89 MB · TAR.GZ · GLIBC 2.35+</span></a>
+<a class="checksum-link" download="" href="/downloads/monzero-v1.1.0-linux-gui-x86_64.tar.gz.sha256">SHA-256 checksum</a>
+<code class="hash">2969fcd478d66af761824162af5670e8451720f88aa2a51021b17e6f259aad7b</code>
+<p class="release-note">Graphical wallet with the node and command-line programs. <strong>This is the wallet for the <a href="/dex/">DEX</a></strong>: it trades XMZ against ETH, BNB and SOL from the DEX page. No consensus change; v1.0.0 keeps working. Read the <a href="/releases/v1.1.0-notes.txt">release notes</a> before trading.</p>
+</div>
+<div class="release-download">
+<a class="button secondary wide" download="" href="/downloads/monzero-v1.1.0-source.tar.gz">Complete source v1.1.0 <span>38 MB · TAR.GZ</span></a>
+<a class="checksum-link" download="" href="/downloads/monzero-v1.1.0-source.tar.gz.sha256">SHA-256 checksum</a>
+<code class="hash">de5d6967f424ee126ba7726afd4a90d9df40758f1f66a84845114ebc34268934</code>
+</div>
+<div class="release-download">
+<a class="button secondary wide" download="" href="/downloads/monzero-v1.1.0-dex-helper-source.tar.gz">DEX helper source v1.1.0 (GPL-3.0) <span>35 MB · TAR.GZ</span></a>
+<a class="checksum-link" download="" href="/downloads/monzero-v1.1.0-dex-helper-source.tar.gz.sha256">SHA-256 checksum</a>
+<code class="hash">29f48dbd8b3cde3c69ff059e693d5e267f1c3d496f880f355e2491b7ebde4706</code>
+</div>
+<div class="release-download">
+<a class="button secondary wide" download="" href="/downloads/monzero-v1.0.0-linux-gui-x86_64.tar.gz">Linux graphical wallet v1.0.0 · x86-64 · no DEX <span>41 MB · TAR.GZ · GLIBC 2.35+</span></a>
 <a class="checksum-link" download="" href="/downloads/monzero-v1.0.0-linux-gui-x86_64.tar.gz.sha256">SHA-256 checksum</a>
 <code class="hash">5a04d6c5457fd215601d3e908197aad676ed5a3b5bbceb95ba7c4f97401ec2ec</code>
 <p class="release-note">Graphical wallet for Linux x86-64. Bundles the unchanged v1.0.0 node and command-line programs; the wallet GUI is a separate build and is not covered by the stable release signature. Check the SHA-256 before running.</p>
