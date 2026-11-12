@@ -74,14 +74,21 @@
   function saveLink() { try { if (st.link) localStorage.setItem(STORE, JSON.stringify(st.link)); else localStorage.removeItem(STORE); } catch (e) {} }
 
   // ---- the wallet on this computer
+  // In a phone wallet's own browser (MetaMask, Phantom) the app may allow plain http to the name
+  // "localhost" only, so a phone tries both names for the loopback address and keeps what worked
+  var HOSTS = PHONE ? ["127.0.0.1", "localhost"] : ["127.0.0.1"], hostAt = 0;
   function wallet(port, path, method, body, token) {
-    var ctl = new AbortController(), t = setTimeout(function () { ctl.abort(); }, 8000);
     var headers = {};
     if (body) headers["content-type"] = "application/json";
     if (token) headers.authorization = "Bearer " + token;
-    return fetch("http://127.0.0.1:" + port + path, { method: method || "GET", headers: headers, body: body ? JSON.stringify(body) : undefined, cache: "no-store", signal: ctl.signal })
-      .then(function (r) { return r.json(); })
-      .finally(function () { clearTimeout(t); });
+    function go(n) {
+      var i = (hostAt + n) % HOSTS.length, ctl = new AbortController(), t = setTimeout(function () { ctl.abort(); }, 8000);
+      return fetch("http://" + HOSTS[i] + ":" + port + path, { method: method || "GET", headers: headers, body: body ? JSON.stringify(body) : undefined, cache: "no-store", signal: ctl.signal })
+        .then(function (r) { hostAt = i; return r.json(); },
+          function (e) { if (n + 1 < HOSTS.length && !ctl.signal.aborted) return go(n + 1); throw e; })
+        .finally(function () { clearTimeout(t); });
+    }
+    return go(0);
   }
   function api(path, body) { return wallet(st.link.port, path, body ? "POST" : "GET", body, st.link.token); }
   function findWallets() {
@@ -539,9 +546,24 @@
       h = '<p class="pro-order-lede">Pick ETH, BNB or SOL to trade from this page with MetaMask or Phantom.</p>' +
         '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the app</a></div>';
     } else if (sol() ? !solProvider() : !window.ethereum) {
-      h = '<p class="pro-order-lede">To trade ' + st.coin + ' from this page you need <strong>' + own() + '</strong> in this browser and the <strong>Monzero wallet</strong> ' + dev("open on this computer", "app on this phone, with its DEX link on") + ".</p>" +
-        '<div class="swap-reveal-cta"><a class="button primary" href="/download/' + dev("", "#android") + '">Get the wallet</a><a class="button secondary" href="' +
-        (sol() ? "https://phantom.com/download" : "https://metamask.io/download/") + '" rel="noopener">Get ' + own() + "</a></div>";
+      if (PHONE) {
+        // A phone browser has no MetaMask or Phantom inside it: the page has to be opened in that app's own browser
+        var here = location.host + location.pathname + location.search + location.hash;
+        var open = sol() ? "https://phantom.app/ul/browse/" + encodeURIComponent(location.href) + "?ref=" + encodeURIComponent(location.origin)
+          : "https://link.metamask.io/dapp/" + here;
+        h = '<p class="pro-order-lede">This browser has no <strong>' + own() + '</strong> in it. On a phone, open this page inside the <strong>' + own() +
+          '</strong> app: its built-in browser is where ' + own() + ' can pay and receive ' + st.coin + '.</p>' +
+          '<p class="tp-note">' + (st.found === true ? "Your Monzero wallet app answered: its DEX link is on. Only " + own() + " is missing here."
+            : st.found === false ? "The Monzero wallet app did not answer. Open it, open a wallet, choose \"Trade on the DEX\" in its menu and turn the DEX link on."
+            : "Looking for your Monzero wallet app…") + '</p>' +
+          '<div class="swap-reveal-cta"><a class="button primary" href="' + esc(open) + '" rel="noopener">Open in ' + own() + '</a>' +
+          (st.found === true ? "" : '<a class="button secondary" href="/download/#android">Get the wallet</a>') + "</div>";
+        if (st.found === undefined) { st.found = null; findWallets().then(function (f) { st.found = f.length > 0; render(); if (!st.found) setTimeout(function () { if (st.found === false) { st.found = undefined; render(); } }, 6000); }); }
+      } else {
+        h = '<p class="pro-order-lede">To trade ' + st.coin + ' from this page you need <strong>' + own() + '</strong> in this browser and the <strong>Monzero wallet</strong> open on this computer.</p>' +
+          '<div class="swap-reveal-cta"><a class="button primary" href="/download/">Get the wallet</a><a class="button secondary" href="' +
+          (sol() ? "https://phantom.com/download" : "https://metamask.io/download/") + '" rel="noopener">Get ' + own() + "</a></div>";
+      }
     } else if (st.pairing) {
       h = '<p class="pro-order-lede">' + LOOK + '. Accept the connection there if it shows this code:</p><p class="tp-code">' + esc(st.pairing.code) + "</p>";
     } else if (st.link && st.status && !ownAccount()) {

@@ -24,9 +24,10 @@ Options -Indexes
     Header always set Content-Security-Policy "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data: https://chainquiry.com; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
   </If>
   # The DEX page talks to the visitor's own Monzero wallet on their computer (loopback only, the
-  # wallet's five fixed ports); loopback is plain http, so that page's requests are not upgraded.
+  # wallet's five fixed ports, as 127.0.0.1 or as localhost: a phone wallet's own browser may allow
+  # only the name); loopback is plain http, so that page's requests are not upgraded.
   <If "%{REQUEST_URI} =~ m#^/dex/(index\.html)?$#">
-    Header always set Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://chainquiry.com; connect-src 'self' https://solana-rpc.publicnode.com http://127.0.0.1:38471 http://127.0.0.1:38472 http://127.0.0.1:38473 http://127.0.0.1:38474 http://127.0.0.1:38475; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://chainquiry.com; connect-src 'self' https://solana-rpc.publicnode.com http://127.0.0.1:38471 http://127.0.0.1:38472 http://127.0.0.1:38473 http://127.0.0.1:38474 http://127.0.0.1:38475 http://localhost:38471 http://localhost:38472 http://localhost:38473 http://localhost:38474 http://localhost:38475; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
   </If>
   # The community forum shows https images that a reader chooses to show (click to load).
   <If "%{REQUEST_URI} =~ m#^/community/board(/|$)#">
