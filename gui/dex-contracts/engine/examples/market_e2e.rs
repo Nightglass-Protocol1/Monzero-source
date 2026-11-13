@@ -3,6 +3,11 @@
 //! mail, both step the swap to the end, the claimer reports the claim and the relay's chart
 //! gets its first candle. Test networks only (Sepolia + XMZ testnet).
 //!
+//! With COIN=xmr the private coin is Monero on its stagenet (pair ETH/XMR): WALLET_RPC_BIN is
+//! the official `monero-wallet-rpc`, XMZ_NODE a Monero stagenet node (host:port), FUNDER_RPC a
+//! stagenet wallet RPC holding test XMR, XMZ_ATOMS in XMR atoms (default 0.01 XMR), and
+//! WITNESSES optional extra stagenet nodes (comma-separated daemon RPC URLs).
+//!
 //!   RELAY=http://127.0.0.1:18790 cargo run --example market_e2e -- <run dir>
 //!
 //! Env: ACCOUNTS_FILE (test phrase; default ~/.config/monzero-dex/eth-sepolia-accounts.json),
@@ -22,6 +27,11 @@ use std::time::Duration;
 
 fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
+}
+
+/// The private coin of this run: XMR (Monero stagenet) or XMZ (testnet)
+fn monero() -> bool {
+    env("COIN", "xmz") == "xmr"
 }
 
 fn log(msg: impl AsRef<str>) {
@@ -45,6 +55,19 @@ fn bip39_seed(phrase: &str) -> [u8; 64] {
     out
 }
 
+fn pair() -> &'static str {
+    if monero() {
+        "ETH/XMR"
+    } else {
+        "ETH/XMZ"
+    }
+}
+
+/// The private-coin amount of the trade, in atoms: 10 tXMZ, or 0.01 stagenet XMR
+fn xmz_atoms() -> String {
+    env("XMZ_ATOMS", if monero() { "10000000000" } else { "1000000000000" })
+}
+
 struct Procs(Vec<Child>);
 
 impl Drop for Procs {
@@ -66,8 +89,9 @@ async fn wallet_rpc(procs: &mut Procs, dir: &Path, name: &str) -> (WalletRpc, Va
     let wallets = dir.join(name);
     std::fs::create_dir_all(&wallets).unwrap();
     procs.0.push(
-        Command::new(env("WALLET_RPC_BIN", "monzero-wallet-rpc"))
-            .args(["--testnet", "--wallet-dir", wallets.to_str().unwrap(), "--daemon-address", &env("XMZ_NODE", "127.0.0.1:16175")])
+        Command::new(env("WALLET_RPC_BIN", if monero() { "monero-wallet-rpc" } else { "monzero-wallet-rpc" }))
+            .args([if monero() { "--stagenet" } else { "--testnet" }, "--wallet-dir", wallets.to_str().unwrap()])
+            .args(["--daemon-address", &env("XMZ_NODE", if monero() { "node.monerodevs.org:38089" } else { "127.0.0.1:16175" })])
             .args(["--trusted-daemon", "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", &port.to_string(), "--non-interactive"])
             .args(["--log-file", dir.join(format!("{name}.log")).to_str().unwrap()])
             .current_dir(dir)
@@ -76,7 +100,7 @@ async fn wallet_rpc(procs: &mut Procs, dir: &Path, name: &str) -> (WalletRpc, Va
             .spawn()
             .unwrap(),
     );
-    let login = dir.join(format!("monzero-wallet-rpc.{port}.login"));
+    let login = dir.join(format!("{}-wallet-rpc.{port}.login", if monero() { "monero" } else { "monzero" }));
     for _ in 0..300 {
         if login.exists() {
             break;
@@ -120,6 +144,7 @@ impl Side {
             "swapKeys": {"swapSeedHex": hex::encode(*swap_seed), "evmKeyHex": hex::encode(key.to_bytes())},
             "mainWallet": main_ep,
             "swapWallet": swap_ep,
+            "witnessDaemons": env("WITNESSES", "").split(',').filter(|w| !w.is_empty()).collect::<Vec<_>>(),
         });
         log(format!("{name}: account {}", key.address()));
         (Side { name, dir: dir.join("trade"), tick, _procs: procs }, main)
@@ -154,23 +179,28 @@ async fn main() {
     let address = taker_main.call("get_address", json!({})).await.unwrap()["address"].as_str().unwrap().to_string();
     let funder = WalletRpc::new(&format!("http://{}", env("FUNDER_RPC", "127.0.0.1:16183")), None);
     if !run.join("funded").exists() {
-        let r = funder.call("transfer", json!({"destinations": [{"amount": 2_000_000_000_000u64, "address": address}], "ring_size": 16})).await.unwrap();
+        // Twice the trade amount (XMZ default: 20 tXMZ for a 10 tXMZ trade), so fees are covered
+        let amount: u64 = env("FUND_ATOMS", &(2 * xmz_atoms().parse::<u64>().unwrap()).to_string()).parse().unwrap();
+        let r = funder.call("transfer", json!({"destinations": [{"amount": amount, "address": address}], "ring_size": 16})).await.unwrap();
         std::fs::write(run.join("funded"), r.to_string()).unwrap();
-        log(format!("taker funded 20 tXMZ: {}", r["tx_hash"]));
+        log(format!("taker funded {amount} atoms: {}", r["tx_hash"]));
     }
 
     // 1. The maker posts a buy-XMZ offer
     let posted = if maker.dir.join("listing.json").exists() {
         json!({"ok": true})
     } else {
-        let offer = json!({"offer": {"chainId": 11155111, "side": "buy-xmz", "valueWei": env("VALUE_WEI", "10000000000000000"), "xmzAtoms": env("XMZ_ATOMS", "1000000000000"), "lifetimeSecs": 6 * 3600}});
+        let mut offer = json!({"offer": {"chainId": 11155111, "side": "buy-xmz", "valueWei": env("VALUE_WEI", "10000000000000000"), "xmzAtoms": xmz_atoms(), "lifetimeSecs": 6 * 3600}});
+        if monero() {
+            offer["offer"]["coin"] = json!("xmr");
+        }
         maker.call("post", offer).await
     };
     assert_eq!(posted["ok"], true, "post: {posted}");
     log(format!("maker posted: {}", posted.get("posted").unwrap_or(&Value::Null)));
 
     // 2. The taker finds it among the relay's checked offers
-    let found = taker.call("listings", json!({"pair": "ETH/XMZ"})).await;
+    let found = taker.call("listings", json!({"pair": pair()})).await;
     let id = serde_json::from_str::<Value>(&std::fs::read_to_string(maker.dir.join("listing.json")).unwrap()).unwrap()["listing"]["listing"]["id"].clone();
     let listing = found["listings"].as_array().unwrap().iter().find(|l| l["signed"]["listing"]["id"] == id).expect("our offer on the relay")["signed"].clone();
     log(format!("taker found offer {id} among {}", found["listings"].as_array().unwrap().len()));
@@ -243,10 +273,10 @@ async fn main() {
     let relay = env("RELAY", "http://127.0.0.1:18790");
     let client = reqwest::Client::new();
     for _ in 0..180 {
-        let c: Value = client.get(format!("{relay}/v1/candles?pair=ETH/XMZ&interval=3600")).send().await.unwrap().json().await.unwrap();
+        let c: Value = client.get(format!("{relay}/v1/candles?pair={}&interval=3600", pair())).send().await.unwrap().json().await.unwrap();
         if c["candles"].as_array().is_some_and(|a| !a.is_empty()) {
             log(format!("relay candles: {}", c["candles"]));
-            let p: Value = client.get(format!("{relay}/v1/prints?pair=ETH/XMZ")).send().await.unwrap().json().await.unwrap();
+            let p: Value = client.get(format!("{relay}/v1/prints?pair={}", pair())).send().await.unwrap().json().await.unwrap();
             log(format!("relay prints: {}", p["prints"]));
             println!("PASS: {} / {}", last[0], last[1]);
             return;

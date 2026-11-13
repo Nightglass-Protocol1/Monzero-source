@@ -79,7 +79,7 @@ pub async fn run(r: &XmzWalletRequest) -> Result<Value, String> {
         "send" => {
             let to = r.to.as_deref().ok_or("send needs the destination address")?;
             if to.len() < 90 || to.len() > 110 || !to.chars().all(|c| c.is_ascii_alphanumeric()) {
-                return Err("that is not an XMZ address".into());
+                return Err("that is not a wallet address of this coin".into());
             }
             let sent = match &r.atoms {
                 None => w.call("sweep_all", json!({"address": to, "ring_size": 16})).await.map_err(|e| e.to_string())?,
