@@ -74,6 +74,15 @@ fn listings_outside_the_rules_are_refused() {
     assert_eq!(check(Listing { pair: "BNB/XMZ".into(), ..base.clone() }), Err(ListingError::Pair("BNB/XMZ".into())));
     assert_eq!(check(Listing { contract: Address::repeat_byte(1), ..base.clone() }), Err(ListingError::Contract));
     assert_eq!(check(Listing { xmz_network: XmzNetwork::Testnet, ..base.clone() }), Err(ListingError::XmzNetwork));
+    // Monero: the pair names the coin, and main networks pair only with Monero mainnet
+    let xmr = Listing { pair: "ETH/XMR".into(), xmz_network: XmzNetwork::XmrMainnet, ..base.clone() };
+    assert_eq!(check(xmr.clone()), Err(ListingError::MoneroClosed), "closed until switched on");
+    let open = Rules { xmr_mainnet: true, ..rules() };
+    let check = |l: Listing| l.sign(&key).verify(&open, NOW);
+    assert!(check(xmr.clone()).is_ok());
+    assert_eq!(check(Listing { pair: "ETH/XMZ".into(), ..xmr.clone() }), Err(ListingError::Pair("ETH/XMZ".into())));
+    assert_eq!(check(Listing { xmz_network: XmzNetwork::Mainnet, ..xmr.clone() }), Err(ListingError::Pair("ETH/XMR".into())));
+    assert_eq!(check(Listing { xmz_network: XmzNetwork::XmrStagenet, ..xmr.clone() }), Err(ListingError::XmzNetwork));
     assert_eq!(check(Listing { value: U256::ZERO, ..base.clone() }), Err(ListingError::Zero));
     assert_eq!(check(Listing { xmz: 0, ..base.clone() }), Err(ListingError::Zero));
     assert_eq!(check(Listing { value: U256::from(10u64.pow(16)) + U256::from(1), ..base.clone() }), Err(ListingError::TooLarge));

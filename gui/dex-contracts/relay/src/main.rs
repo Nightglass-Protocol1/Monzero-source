@@ -58,6 +58,10 @@ struct Config {
     /// BTC/XMZ and LTC/XMZ offers for these networks ("btc-mainnet", "ltc-mainnet", "btc-signet", ...)
     #[serde(default)]
     utxo_networks: Vec<String>,
+    /// Accept Monero (XMR) offers on the main networks. Leave off until XMR trading is opened;
+    /// test networks accept XMR offers either way.
+    #[serde(default)]
+    xmr_mainnet: bool,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -157,7 +161,10 @@ async fn main() {
     let config: Config = serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| fail(format!("{path}: {e}")))).unwrap_or_else(|e| fail(format!("{path}: {e}")));
     std::fs::create_dir_all(&config.data_dir).unwrap_or_else(|e| fail(format!("{}: {e}", config.data_dir.display())));
 
-    let mut rules = Rules::default();
+    let mut rules = Rules { xmr_mainnet: config.xmr_mainnet, ..Rules::default() };
+    if config.xmr_mainnet {
+        eprintln!("Monero (XMR) offers on the main networks: accepted");
+    }
     let mut chains = BTreeMap::new();
     let expected: B256 = RUNTIME_KECCAK.parse().expect("constant");
     for c in &config.chains {

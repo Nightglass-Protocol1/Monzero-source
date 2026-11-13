@@ -249,7 +249,7 @@ async fn swap_from_saved_trades_with_the_owner_resumed_every_tick() {
         duration1: D1,
         duration2: D2,
         xmz_amount: XMZ,
-        xmz_network: XmzNetwork::Mainnet,
+        xmz_network: common::network(),
         expires_at: 1_000,
     };
     let mut maker = Session::start(&owner_seed, offer.clone(), Role::Owner, &owner_key, 0).unwrap();
@@ -562,7 +562,7 @@ async fn real_xmz_traders(w: &World, xmz_chain: &mut common::XmzChain) -> RealXm
         duration1: w.trade.terms.duration1,
         duration2: w.trade.terms.duration2,
         xmz_amount: w.trade.xmz_amount,
-        xmz_network: XmzNetwork::Mainnet,
+        xmz_network: common::network(),
         expires_at: u64::MAX,
     };
     let keys = |secret: &SecretShare| LocalKeys::from_secrets(secret.clone(), share().to_ed25519_le()).unwrap();

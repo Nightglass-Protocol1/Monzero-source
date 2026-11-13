@@ -156,13 +156,22 @@ pub struct Print {
     pub listing: B256,
 }
 
+/// Atoms in one coin of a pair's private side: XMR has 12 decimal places, XMZ 11.
+pub fn private_unit(pair: &str) -> f64 {
+    if pair.ends_with("/XMR") {
+        1e12
+    } else {
+        1e11
+    }
+}
+
 impl Print {
-    /// Coin per XMZ
+    /// Coin per XMZ (or per XMR on a Monero pair)
     pub fn price(&self) -> f64 {
         // The coin's smallest unit: wei (18 places), or lamports on Solana (9)
         let unit = if monzero_dex_evm::Chain::from_id(self.chain_id).is_some_and(|c| c.is_solana()) { 1e9 } else { 1e18 };
         let coin = self.value.to_string().parse::<f64>().unwrap_or(0.0) / unit;
-        coin / (self.xmz as f64 / 1e11)
+        coin / (self.xmz as f64 / private_unit(&self.pair))
     }
 }
 
@@ -528,7 +537,7 @@ impl<C: ChainView> Relay<C> {
         let mut out: Vec<Candle> = Vec::new();
         for p in prints {
             let (t, price) = (p.at - p.at % interval, p.price());
-            let (v, vc) = (p.xmz as f64 / 1e11, price * p.xmz as f64 / 1e11);
+            let (v, vc) = (p.xmz as f64 / private_unit(&p.pair), price * p.xmz as f64 / private_unit(&p.pair));
             match out.last_mut() {
                 Some(c) if c.t == t => {
                     c.h = c.h.max(price);

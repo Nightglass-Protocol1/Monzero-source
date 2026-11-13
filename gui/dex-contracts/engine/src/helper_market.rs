@@ -38,8 +38,11 @@ pub struct OfferParams {
     pub side: Side,
     /// Coin amount in wei, decimal
     pub value_wei: String,
-    /// XMZ in atoms, decimal
+    /// Amount of the private coin in atoms, decimal (XMZ: 1e11 per coin; XMR: 1e12 per coin)
     pub xmz_atoms: String,
+    /// The private coin: "xmz" (default) or "xmr"
+    #[serde(default)]
+    pub coin: Option<String>,
     /// How long the offer stays open (at most 24 h)
     pub lifetime_secs: u64,
 }
@@ -202,6 +205,19 @@ pub async fn listings(relays: &[String], pair: Option<&str>, local_contract: Opt
     Ok(json!({"listings": found.iter().map(|(s, r)| listing_json(s, r)).collect::<Vec<_>>(), "relayErrors": errors}))
 }
 
+/// The private-coin network an offer on `chain` trades: main networks pair with main networks,
+/// test networks with the test network (XMZ testnet, Monero stagenet). A local chain pairs with
+/// the XMZ testnet or a local Monero fakechain, which uses mainnet addresses.
+pub fn offer_network(chain: Chain, coin: Option<&str>) -> Result<XmzNetwork, String> {
+    let main = matches!(chain, Chain::BscMainnet | Chain::EthMainnet | Chain::SolMainnet);
+    let local = matches!(chain, Chain::Local | Chain::SolLocal);
+    match coin.unwrap_or("xmz") {
+        "xmz" => Ok(if main { XmzNetwork::Mainnet } else { XmzNetwork::Testnet }),
+        "xmr" => Ok(if main || local { XmzNetwork::XmrMainnet } else { XmzNetwork::XmrStagenet }),
+        other => Err(format!("unknown coin {other}")),
+    }
+}
+
 pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &OfferParams, local_contract: Option<Address>) -> Result<Value, String> {
     if dir.join("listing.json").exists() || dir.join("take.json").exists() || journal_has_trade(dir) {
         return Err("this trade folder is already in use".into());
@@ -215,6 +231,7 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
         return Err("an offer stays open for at most 24 hours".into());
     }
     let xmz_atoms: u64 = parse_amount(&params.xmz_atoms, "xmzAtoms")?.try_into().map_err(|_| "xmzAtoms is out of range")?;
+    let xmz_network = offer_network(chain_kind, params.coin.as_deref())?;
     let at = heights(cfg, chain_kind, None).await?;
     let mut id = [0u8; 32];
     OsRng.fill_bytes(&mut id);
@@ -222,7 +239,7 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
     let listing = Listing {
         schema: LISTING_SCHEMA.into(),
         id,
-        pair: chain_kind.pair().into(),
+        pair: chain_kind.pair_for(xmz_network),
         chain_id: params.chain_id,
         contract,
         side: params.side,
@@ -230,10 +247,7 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
         xmz: xmz_atoms,
         maker: key.address(),
         mailbox: seed.mailbox(id, true).address(),
-        xmz_network: match chain_kind {
-            Chain::BscMainnet | Chain::EthMainnet | Chain::SolMainnet => XmzNetwork::Mainnet,
-            _ => XmzNetwork::Testnet,
-        },
+        xmz_network,
         created_at: at.now,
         expires_at: at.now + params.lifetime_secs,
     };

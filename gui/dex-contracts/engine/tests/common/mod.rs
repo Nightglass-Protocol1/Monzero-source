@@ -1,17 +1,38 @@
 //! A local XMZ chain for the integration tests: `monzerod --regtest` (fakechain) and
 //! `monzero-wallet-rpc`s with their digest logins, all killed on drop.
+//!
+//! With MONZERO_PRIVATE_COIN=xmr the same tests run on Monero instead: `monerod --regtest` and
+//! `monero-wallet-rpc` from MONZERO_XMR_BIN (the official Monero release).
 #![allow(dead_code)]
 
-use monzero_dex_evm::xmz::WalletRpc;
+use monzero_dex_evm::xmz::{WalletRpc, XmzNetwork};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 pub const GENESIS: &str = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4";
+/// Monero's mainnet genesis block, which its fakechain also starts from
+pub const XMR_GENESIS: &str = "418015bb9ae982a1975da7d79277c2705727a56894ba0fb246adaabb1f4632e3";
+
+/// The tests run on Monero when MONZERO_PRIVATE_COIN=xmr.
+pub fn monero() -> bool {
+    std::env::var("MONZERO_PRIVATE_COIN").is_ok_and(|c| c == "xmr")
+}
+
+/// The network of the local fakechain (both coins use their mainnet addresses there).
+pub fn network() -> XmzNetwork {
+    if monero() {
+        XmzNetwork::XmrMainnet
+    } else {
+        XmzNetwork::Mainnet
+    }
+}
 
 pub struct XmzChain {
     bin: PathBuf,
+    /// "monzero" or "monero": the node is `<prefix>d`, the wallet service `<prefix>-wallet-rpc`
+    prefix: &'static str,
     pub root: PathBuf,
     daemon_port: u16,
     pub daemon: WalletRpc,
@@ -43,14 +64,16 @@ pub async fn wait_for(rpc: &WalletRpc, method: &str) -> Value {
 }
 
 impl XmzChain {
-    /// None when MONZERO_XMZ_BIN (the directory with monzerod and monzero-wallet-rpc) is unset.
+    /// None when MONZERO_XMZ_BIN (the directory with monzerod and monzero-wallet-rpc) is unset;
+    /// for Monero, MONZERO_XMR_BIN (the directory with monerod and monero-wallet-rpc).
     pub async fn start(name: &str) -> Option<XmzChain> {
-        let bin = PathBuf::from(std::env::var("MONZERO_XMZ_BIN").ok()?);
+        let (prefix, var, genesis_hash) = if monero() { ("monero", "MONZERO_XMR_BIN", XMR_GENESIS) } else { ("monzero", "MONZERO_XMZ_BIN", GENESIS) };
+        let bin = PathBuf::from(std::env::var(var).ok()?);
         let root = std::env::temp_dir().join(format!("monzero-xmz-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let (daemon_port, p2p) = (free_port(), free_port());
-        let node = Command::new(bin.join("monzerod"))
+        let node = Command::new(bin.join(format!("{prefix}d")))
             .args(["--regtest", "--keep-fakechain", "--fixed-difficulty", "1", "--offline", "--no-igd", "--hide-my-port"])
             .args(["--no-zmq", "--non-interactive", "--data-dir", root.join("chain").to_str().unwrap()])
             .args(["--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", &daemon_port.to_string()])
@@ -61,11 +84,11 @@ impl XmzChain {
             .spawn()
             .unwrap();
         let daemon = WalletRpc::new(&format!("http://127.0.0.1:{daemon_port}"), None);
-        let chain = XmzChain { bin, root, daemon_port, daemon, procs: vec![node] };
+        let chain = XmzChain { bin, prefix, root, daemon_port, daemon, procs: vec![node] };
         let info = wait_for(&chain.daemon, "get_info").await;
         assert_eq!(info["nettype"], "fakechain");
         let genesis = chain.daemon.call("get_block", json!({"height": 0})).await.unwrap();
-        assert_eq!(genesis["block_header"]["hash"], GENESIS);
+        assert_eq!(genesis["block_header"]["hash"], genesis_hash);
         Some(chain)
     }
 
@@ -74,7 +97,7 @@ impl XmzChain {
         let dir = self.root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         self.procs.push(
-            Command::new(self.bin.join("monzero-wallet-rpc"))
+            Command::new(self.bin.join(format!("{}-wallet-rpc", self.prefix)))
                 .args(["--wallet-dir", dir.to_str().unwrap(), "--daemon-address", &format!("127.0.0.1:{}", self.daemon_port)])
                 .args(["--trusted-daemon", "--allow-mismatched-daemon-version", "--rpc-bind-ip", "127.0.0.1"])
                 .args(["--rpc-bind-port", &port.to_string(), "--non-interactive"])
@@ -86,7 +109,7 @@ impl XmzChain {
                 .unwrap(),
         );
         // The RPC writes its digest login next to it on start
-        let login = self.root.join(format!("monzero-wallet-rpc.{port}.login"));
+        let login = self.root.join(format!("{}-wallet-rpc.{port}.login", self.prefix));
         for _ in 0..300 {
             if login.exists() {
                 break;

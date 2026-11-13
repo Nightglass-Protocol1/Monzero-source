@@ -32,6 +32,33 @@ fn xmz_err(e: impl std::fmt::Display) -> DriverError {
 
 // ---------- addresses ----------
 
+/// The coin on the private side of a swap. Monero (XMR) has the same keys, addresses and wallet
+/// RPC as XMZ, so the swap is the same; only the address prefix and the unit differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateCoin {
+    Xmz,
+    Xmr,
+}
+
+impl PrivateCoin {
+    pub fn ticker(self) -> &'static str {
+        match self {
+            PrivateCoin::Xmz => "XMZ",
+            PrivateCoin::Xmr => "XMR",
+        }
+    }
+
+    /// Decimal places of one coin (XMZ 11, XMR 12)
+    pub fn decimals(self) -> u32 {
+        match self {
+            PrivateCoin::Xmz => 11,
+            PrivateCoin::Xmr => 12,
+        }
+    }
+}
+
+/// The network of the private side. The first three are XMZ (their names are part of signed
+/// listings and saved trades and must not change); the `xmr-` ones are Monero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum XmzNetwork {
@@ -39,16 +66,38 @@ pub enum XmzNetwork {
     Mainnet,
     Testnet,
     Stagenet,
+    /// Monero; also used by the local fakechain (`monerod --regtest`)
+    #[serde(rename = "xmr-mainnet")]
+    XmrMainnet,
+    #[serde(rename = "xmr-testnet")]
+    XmrTestnet,
+    #[serde(rename = "xmr-stagenet")]
+    XmrStagenet,
 }
 
 impl XmzNetwork {
-    /// Varint prefix of a standard address (86, 111, 131)
+    /// Varint prefix of a standard address (XMZ 86, 111, 131; Monero 18, 53, 24)
     fn prefix(self) -> &'static [u8] {
         match self {
             XmzNetwork::Mainnet => &[86],
             XmzNetwork::Testnet => &[111],
             XmzNetwork::Stagenet => &[131, 1],
+            XmzNetwork::XmrMainnet => &[18],
+            XmzNetwork::XmrTestnet => &[53],
+            XmzNetwork::XmrStagenet => &[24],
         }
+    }
+
+    pub fn coin(self) -> PrivateCoin {
+        match self {
+            XmzNetwork::Mainnet | XmzNetwork::Testnet | XmzNetwork::Stagenet => PrivateCoin::Xmz,
+            XmzNetwork::XmrMainnet | XmzNetwork::XmrTestnet | XmzNetwork::XmrStagenet => PrivateCoin::Xmr,
+        }
+    }
+
+    /// Coins on this network have real value.
+    pub fn is_mainnet(self) -> bool {
+        matches!(self, XmzNetwork::Mainnet | XmzNetwork::XmrMainnet)
     }
 }
 
@@ -546,6 +595,51 @@ mod tests {
         assert_eq!(standard_address(XmzNetwork::Mainnet, &b, &b), lines[0]);
         assert_eq!(standard_address(XmzNetwork::Testnet, &b, &b), lines[3]);
         assert_eq!(standard_address(XmzNetwork::Stagenet, &b, &b), lines[6]);
+    }
+
+    /// Inverse of `base58` for a standard address (69 bytes), for the tests only.
+    fn decode_standard(address: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for block in address.as_bytes().chunks(11) {
+            let num = block.iter().fold(0u128, |n, c| n * 58 + ALPHABET.iter().position(|a| a == c).expect("base58 character") as u128);
+            let bytes = BLOCK_CHARS.iter().position(|&n| n == block.len()).expect("block length");
+            out.extend_from_slice(&(num as u64).to_be_bytes()[8 - bytes..]);
+        }
+        out
+    }
+
+    #[test]
+    fn monero_addresses_use_the_monero_prefixes() {
+        // Published Monero addresses: the project's mainnet donation address, and two stagenet
+        // wallets from our own BTC/XMR stagenet runs. Re-encoding their keys must give them back.
+        for (network, address) in [
+            (XmzNetwork::XmrMainnet, "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"),
+            (XmzNetwork::XmrStagenet, "52NoLZLTZdv1dBWmhuHhUQeQyYbH1PKLTejaj2PFrfuVT11UWg38KR92q3Nzauc8sefEyqX5nYisLAnyQQr3SurTQKioAzm"),
+        ] {
+            let raw = decode_standard(address);
+            assert_eq!(raw.len(), 69, "{address}");
+            let (spend, view): ([u8; 32], [u8; 32]) = (raw[1..33].try_into().unwrap(), raw[33..65].try_into().unwrap());
+            assert_eq!(standard_address(network, &spend, &view), address);
+            // the same keys on XMZ give a different address, so a wallet of the wrong coin refuses it
+            assert_ne!(standard_address(XmzNetwork::Mainnet, &spend, &view), address);
+        }
+        let b = basepoint();
+        assert!(standard_address(XmzNetwork::XmrMainnet, &b, &b).starts_with('4'));
+        assert!(standard_address(XmzNetwork::XmrTestnet, &b, &b).starts_with('9') || standard_address(XmzNetwork::XmrTestnet, &b, &b).starts_with('A'));
+        assert!(standard_address(XmzNetwork::XmrStagenet, &b, &b).starts_with('5'));
+    }
+
+    #[test]
+    fn network_names_in_signed_data_are_stable() {
+        let name = |n: XmzNetwork| serde_json::to_string(&n).unwrap();
+        assert_eq!(name(XmzNetwork::Mainnet), "\"mainnet\"");
+        assert_eq!(name(XmzNetwork::Testnet), "\"testnet\"");
+        assert_eq!(name(XmzNetwork::Stagenet), "\"stagenet\"");
+        assert_eq!(name(XmzNetwork::XmrMainnet), "\"xmr-mainnet\"");
+        assert_eq!(name(XmzNetwork::XmrStagenet), "\"xmr-stagenet\"");
+        assert_eq!(serde_json::from_str::<XmzNetwork>("\"xmr-testnet\"").unwrap(), XmzNetwork::XmrTestnet);
+        assert_eq!((XmzNetwork::Mainnet.coin().decimals(), XmzNetwork::XmrMainnet.coin().decimals()), (11, 12));
+        assert!(XmzNetwork::XmrMainnet.is_mainnet() && !XmzNetwork::XmrStagenet.is_mainnet() && !XmzNetwork::Stagenet.is_mainnet());
     }
 
     #[test]

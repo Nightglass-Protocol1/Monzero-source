@@ -34,7 +34,7 @@ async fn lock_watch_and_sweep_on_a_real_xmz_chain() {
     // Both traders' shares; this test plays the trader who locks and later sweeps back
     let (ours, theirs) = (random_share(), random_share());
     let (view_ours, view_theirs) = (random_share().to_ed25519_le(), random_share().to_ed25519_le());
-    let shared = SharedXmz::from_shares(XmzNetwork::Mainnet, &ours, theirs.ed25519_public(), view_ours, view_theirs).unwrap();
+    let shared = SharedXmz::from_shares(common::network(), &ours, theirs.ed25519_public(), view_ours, view_theirs).unwrap();
     let cfg = || WalletRpcConfig {
         shared: shared.clone(),
         restore_height: height - 1,

@@ -135,8 +135,15 @@ async fn info<C: ChainView>(State(api): State<Arc<Api<C>>>) -> Json<Value> {
         .contracts
         .iter()
         .map(|(id, contract)| {
-            let pair = monzero_dex_evm::Chain::from_id(*id).map(|c| c.pair());
-            json!({ "chainId": id, "pair": pair, "contract": contract, "maxValue": rules.max_value.get(id) })
+            let chain = monzero_dex_evm::Chain::from_id(*id);
+            let pair = chain.map(|c| c.pair());
+            // Monero pairs: always on test networks, on main networks only when switched on
+            let main = chain.is_some_and(|c| matches!(c, monzero_dex_evm::Chain::BscMainnet | monzero_dex_evm::Chain::EthMainnet | monzero_dex_evm::Chain::SolMainnet));
+            let mut pairs: Vec<String> = pair.iter().map(|p| p.to_string()).collect();
+            if let (Some(p), true) = (pair, !main || rules.xmr_mainnet) {
+                pairs.push(p.replace("/XMZ", "/XMR"));
+            }
+            json!({ "chainId": id, "pair": pair, "pairs": pairs, "contract": contract, "maxValue": rules.max_value.get(id) })
         })
         .collect();
     Json(json!({

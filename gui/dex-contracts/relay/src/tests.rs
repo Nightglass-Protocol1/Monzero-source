@@ -357,3 +357,45 @@ async fn a_solana_claim_is_a_trade_only_with_the_makers_account_on_the_makers_si
     assert_eq!(serde_json::to_value(&tx).unwrap(), serde_json::json!(bs58::encode([0x55u8; 64]).into_string()));
     assert!(TxId::try_from("0x12".to_string()).is_err());
 }
+
+// ---- Monero (XMR) pairs
+
+fn xmr_offer(maker: &PrivateKeySigner, id: u8, value: u64, xmr_atoms: u64) -> SignedListing {
+    let mut l = offer(maker, id, Side::SellXmz, value, 1).listing;
+    l.pair = "ETH/XMR".into();
+    l.xmz_network = XmzNetwork::XmrMainnet;
+    l.xmz = xmr_atoms;
+    l.sign(maker)
+}
+
+#[tokio::test]
+async fn monero_offers_on_the_main_network_wait_for_the_switch() {
+    let (maker, taker) = (PrivateKeySigner::random(), PrivateKeySigner::random());
+    let closed = relay();
+    fund(&closed, maker.address(), 1);
+    // 0.5 XMR for 0.05 ETH
+    let signed = xmr_offer(&maker, 9, ETH / 20, 500_000_000_000);
+    assert_eq!(closed.post(signed.clone(), NOW).await, Err(RelayError::Listing(ListingError::MoneroClosed)));
+
+    let mut rules = Rules { xmr_mainnet: true, ..Rules::default() };
+    rules.contracts.insert(1, contract());
+    let open = Relay::new(rules, BTreeMap::from([(1, Mock::default())]));
+    fund(&open, maker.address(), 1);
+    assert_eq!(open.post(signed.clone(), NOW).await, Ok(true));
+    // an XMZ offer next to it: each pair has its own board
+    assert_eq!(open.post(offer(&maker, 1, Side::SellXmz, ETH / 100, 10_000), NOW).await, Ok(true));
+    assert_eq!(open.listings(Some("ETH/XMR"), NOW).len(), 1);
+    assert_eq!(open.listings(Some("ETH/XMZ"), NOW).len(), 1);
+
+    // The trade prints at ETH per XMR (12 decimal places, not XMZ's 11)
+    let tx: TxId = B256::repeat_byte(0xbb).into();
+    open.chains[&1].claims.lock().unwrap().insert(tx.clone(), ClaimLookup::Final { swap: swap_for(&signed.listing, taker.address()), at: NOW + 100 });
+    open.report(1, tx, NOW + 200).await.unwrap();
+    let prints = open.prints(Some("ETH/XMR"), 0);
+    assert_eq!(prints.len(), 1);
+    assert!((prints[0].price() - 0.1).abs() < 1e-12, "0.05 ETH for 0.5 XMR is 0.1 ETH per XMR, got {}", prints[0].price());
+    let candles = open.candles("ETH/XMR", 3600, 0);
+    assert_eq!(candles.len(), 1);
+    assert!((candles[0].v - 0.5).abs() < 1e-12 && (candles[0].vc - 0.05).abs() < 1e-12);
+    assert!(open.candles("ETH/XMZ", 3600, 0).is_empty());
+}

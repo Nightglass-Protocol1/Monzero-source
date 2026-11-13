@@ -140,6 +140,9 @@ impl SignedSolAccount {
 pub struct Rules {
     pub contracts: BTreeMap<u64, Address>,
     pub max_value: BTreeMap<u64, U256>,
+    /// Monero offers on the main networks are accepted. Off unless switched on: XMR trading with
+    /// real coins opens only after its own real-funds tests (test networks always accept XMR).
+    pub xmr_mainnet: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -156,6 +159,8 @@ pub enum ListingError {
     Contract,
     #[error("the XMZ network does not match the chain")]
     XmzNetwork,
+    #[error("Monero offers on the main network are not open here")]
+    MoneroClosed,
     #[error("amounts must be above zero")]
     Zero,
     #[error("above this relay's limit for the chain")]
@@ -178,10 +183,19 @@ impl Chain {
         }
     }
 
+    /// The pair a listing on this chain trades against the coin of `n` ("BNB/XMZ", "BNB/XMR")
+    pub fn pair_for(self, n: XmzNetwork) -> String {
+        let base = self.pair();
+        match n.coin() {
+            crate::xmz::PrivateCoin::Xmz => base.to_string(),
+            coin => format!("{}/{}", base.split('/').next().expect("pair has a base"), coin.ticker()),
+        }
+    }
+
     fn xmz_network_allowed(self, n: XmzNetwork) -> bool {
         match self {
-            Chain::BscMainnet | Chain::EthMainnet | Chain::SolMainnet => n == XmzNetwork::Mainnet,
-            Chain::BscTestnet | Chain::EthSepolia | Chain::SolDevnet => n != XmzNetwork::Mainnet,
+            Chain::BscMainnet | Chain::EthMainnet | Chain::SolMainnet => n.is_mainnet(),
+            Chain::BscTestnet | Chain::EthSepolia | Chain::SolDevnet => !n.is_mainnet(),
             Chain::Local | Chain::SolLocal => true,
         }
     }
@@ -224,7 +238,7 @@ impl Listing {
         }
         let chain = Chain::from_id(self.chain_id).ok_or(ListingError::Chain(self.chain_id))?;
         let pinned = rules.contracts.get(&self.chain_id).ok_or(ListingError::Chain(self.chain_id))?;
-        if self.pair != chain.pair() {
+        if self.pair != chain.pair_for(self.xmz_network) {
             return Err(ListingError::Pair(self.pair.clone()));
         }
         if &self.contract != pinned {
@@ -232,6 +246,9 @@ impl Listing {
         }
         if !chain.xmz_network_allowed(self.xmz_network) {
             return Err(ListingError::XmzNetwork);
+        }
+        if self.xmz_network == XmzNetwork::XmrMainnet && !rules.xmr_mainnet && !matches!(chain, Chain::Local | Chain::SolLocal) {
+            return Err(ListingError::MoneroClosed);
         }
         if self.value.is_zero() || self.xmz == 0 {
             return Err(ListingError::Zero);
