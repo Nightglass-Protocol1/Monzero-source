@@ -42,6 +42,8 @@ async fn lock_watch_and_sweep_on_a_real_xmz_chain() {
         wallet_password: "test-only".into(),
         sweep_confirmations: 10,
         record: chain.root.join("xmz-record.json"),
+        // the chain's own node as the independent witness: it must agree with the wallet
+        witnesses: vec![chain.daemon_url()],
     };
     let (main_handle, swap_handle) = (main.clone(), swap.clone());
     let mut xmz = WalletRpcXmz::new(cfg(), main, swap);

@@ -508,5 +508,6 @@ fn config(saved: &SavedTrade, shared: &monzero_dex_evm::xmz::SharedXmz, dir: &Pa
         wallet_password: seed.wallet_password(&saved.offer, saved.role).to_string(),
         sweep_confirmations: 10,
         record: dir.join("xmz.json"),
+        witnesses: Vec::new(),
     }
 }

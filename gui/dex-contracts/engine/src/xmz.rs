@@ -353,6 +353,45 @@ pub struct WalletRpcConfig {
     /// Confirmations before our sweep counts as done
     pub sweep_confirmations: u64,
     pub record: PathBuf,
+    /// Independent nodes of the coin's network (daemon RPC URLs) that must also show the lock
+    /// in the chain before it counts as confirmed. The wallet service believes its own node; a
+    /// lying node could show a lock that is not on the real chain, and the trader paying the
+    /// other coin would release it for nothing. Empty: the wallet's node alone is trusted
+    /// (XMZ uses the project's node; Monero main-network trades must name witnesses).
+    pub witnesses: Vec<String>,
+}
+
+/// The fewest confirmations the `witnesses` report for `txids`: 0 when any of them does not
+/// answer, does not know a transaction, or still has it in its pool.
+pub async fn witnessed_confirmations(witnesses: &[String], txids: &[String]) -> u64 {
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().unwrap_or_default();
+    let mut least = u64::MAX;
+    for url in witnesses {
+        let base = url.trim_end_matches('/');
+        let ask = |path: &'static str, body: Value| {
+            let http = http.clone();
+            async move { http.post(format!("{base}/{path}")).json(&body).send().await.ok()?.json::<Value>().await.ok() }
+        };
+        let (Some(height), Some(found)) = (ask("get_height", json!({})).await, ask("get_transactions", json!({"txs_hashes": txids})).await) else {
+            return 0;
+        };
+        let Some(height) = height["height"].as_u64().filter(|_| height["status"] == "OK") else {
+            return 0;
+        };
+        let txs = found["txs"].as_array().filter(|_| found["status"] == "OK").cloned().unwrap_or_default();
+        for id in txids {
+            // Every transaction we asked for must be there, mined, under its own hash
+            let Some(tx) = txs.iter().find(|t| t["tx_hash"].as_str().is_some_and(|h| h.eq_ignore_ascii_case(id))) else {
+                return 0;
+            };
+            let mined = tx["block_height"].as_u64().filter(|_| tx["in_pool"] == false && tx["double_spend_seen"] != true);
+            match mined {
+                Some(at) if at < height => least = least.min(height - at),
+                _ => return 0,
+            }
+        }
+    }
+    least
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,6 +531,7 @@ impl XmzSide for WalletRpcXmz {
         let transfers = self.swap.call("get_transfers", json!({"in": true})).await?;
         let mut amount = 0u64;
         let mut confirmations = u64::MAX;
+        let mut txids: Vec<String> = Vec::new();
         for t in transfers["in"].as_array().into_iter().flatten() {
             // An output with an unlock time could not be swept in time: it does not count
             if t["unlock_time"].as_u64() != Some(0) || t["subaddr_index"]["minor"].as_u64() != Some(0) {
@@ -499,6 +539,14 @@ impl XmzSide for WalletRpcXmz {
             }
             amount = amount.checked_add(t["amount"].as_u64().ok_or_else(|| xmz_err("transfer without an amount"))?).ok_or_else(|| xmz_err("amount overflow"))?;
             confirmations = confirmations.min(t["confirmations"].as_u64().unwrap_or(0));
+            let id = t["txid"].as_str().ok_or_else(|| xmz_err("transfer without a txid"))?.to_string();
+            if !txids.contains(&id) {
+                txids.push(id);
+            }
+        }
+        if amount > 0 && confirmations > 0 && !self.cfg.witnesses.is_empty() {
+            // The lock counts only as deep as every independent node sees it
+            confirmations = confirmations.min(witnessed_confirmations(&self.cfg.witnesses, &txids).await);
         }
         if amount > 0 {
             self.note_progress("xmzLock", confirmations, crate::machine::Timing::BSC.xmz_confirmations);
@@ -669,6 +717,53 @@ mod tests {
         assert_eq!(serde_json::from_str::<XmzNetwork>("\"xmr-testnet\"").unwrap(), XmzNetwork::XmrTestnet);
         assert_eq!((XmzNetwork::Mainnet.coin().decimals(), XmzNetwork::XmrMainnet.coin().decimals()), (11, 12));
         assert!(XmzNetwork::XmrMainnet.is_mainnet() && !XmzNetwork::XmrStagenet.is_mainnet() && !XmzNetwork::Stagenet.is_mainnet());
+    }
+
+    /// A stand-in node: answers /get_height and /get_transactions with fixed JSON.
+    async fn node(height: Value, txs: Value) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { return };
+                let (height, txs) = (height.clone(), txs.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body = if head.starts_with("POST /get_height") { height } else { txs }.to_string();
+                    let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                });
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_lock_counts_only_as_deep_as_every_witness_sees_it() {
+        let id = "ab".repeat(32);
+        let ids = [id.clone()];
+        let mined = |at: u64| json!({"status": "OK", "txs": [{"tx_hash": id, "in_pool": false, "block_height": at}]});
+        let height = |h: u64| json!({"status": "OK", "height": h});
+        let honest = node(height(110), mined(100)).await;
+        let behind = node(height(103), mined(100)).await;
+        assert_eq!(witnessed_confirmations(&[honest.clone()], &ids).await, 10);
+        assert_eq!(witnessed_confirmations(&[honest.clone(), behind], &ids).await, 3, "the node that is behind decides");
+        // a node that has not seen it, has it only in its pool, saw a double spend, errors, or is down
+        for (h, txs) in [
+            (height(110), json!({"status": "OK", "txs": [], "missed_tx": [id]})),
+            (height(110), json!({"status": "OK", "txs": [{"tx_hash": id, "in_pool": true, "block_height": 0}]})),
+            (height(110), json!({"status": "OK", "txs": [{"tx_hash": id, "in_pool": false, "block_height": 100, "double_spend_seen": true}]})),
+            (height(110), json!({"status": "BUSY", "txs": [{"tx_hash": id, "in_pool": false, "block_height": 100}]})),
+            (json!({"status": "BUSY"}), mined(100)),
+            (height(100), mined(100)),
+            (height(110), json!({"status": "OK", "txs": [{"tx_hash": "cd".repeat(32), "in_pool": false, "block_height": 100}]})),
+        ] {
+            let bad = node(h, txs.clone()).await;
+            assert_eq!(witnessed_confirmations(&[honest.clone(), bad], &ids).await, 0, "{txs}");
+        }
+        assert_eq!(witnessed_confirmations(&[honest, "http://127.0.0.1:1".into()], &ids).await, 0, "a witness that is down");
     }
 
     #[test]

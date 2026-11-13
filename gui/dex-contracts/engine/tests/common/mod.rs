@@ -133,6 +133,11 @@ impl XmzChain {
         self.daemon.call("generateblocks", json!({"wallet_address": to, "amount_of_blocks": blocks})).await.unwrap();
     }
 
+    /// The node's RPC address (also usable as a lock witness)
+    pub fn daemon_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.daemon_port)
+    }
+
     pub async fn height(&self) -> u64 {
         self.daemon.call("get_info", json!({})).await.unwrap()["height"].as_u64().unwrap()
     }

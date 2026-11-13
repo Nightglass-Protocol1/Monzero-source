@@ -592,6 +592,7 @@ async fn real_xmz_traders(w: &World, xmz_chain: &mut common::XmzChain) -> RealXm
         wallet_password: "test-only".into(),
         sweep_confirmations: 10,
         record: xmz_chain.root.join(format!("{who}-xmz.json")),
+        witnesses: vec![xmz_chain.daemon_url()],
     };
     let start = |state| MemoryJournal(Record::new(state));
     let owner = Driver::new(

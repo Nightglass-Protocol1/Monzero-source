@@ -115,6 +115,10 @@ pub struct TickConfig {
     pub account_index: Option<u32>,
     pub main_wallet: Endpoint,
     pub swap_wallet: Endpoint,
+    /// Independent nodes of the private coin's network (daemon RPC URLs) that must also show
+    /// the other trader's lock before it counts. A Monero main-network trade needs at least two.
+    #[serde(default)]
+    pub witness_daemons: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -305,6 +309,9 @@ async fn tick(dir: &Path, cfg: Option<TickConfig>) -> Result<Value, String> {
     Ok(v)
 }
 
+/// Independent Monero nodes a main-network XMR trade must name, besides the wallet's own node
+pub const MIN_XMR_WITNESSES: usize = 2;
+
 pub(crate) fn rpc(e: &Endpoint) -> Result<WalletRpc, String> {
     match &e.login_file {
         Some(f) => WalletRpc::with_login_file(&e.url, f).map_err(|e| e.to_string()),
@@ -320,6 +327,15 @@ pub(crate) fn xmz_parts(
     agreed: &crate::negotiation::Agreed,
     seed: &SwapSeed,
 ) -> Result<WalletRpcXmz, String> {
+    let network = saved.offer.xmz_network;
+    if network == crate::xmz::XmzNetwork::XmrMainnet && cfg.witness_daemons.len() < MIN_XMR_WITNESSES && Chain::from_id(saved.offer.chain_id) != Some(Chain::Local) {
+        return Err(format!("a Monero trade needs at least {MIN_XMR_WITNESSES} independent Monero nodes (witnessDaemons) to confirm the lock"));
+    }
+    for w in &cfg.witness_daemons {
+        if !(w.starts_with("https://") || w.starts_with("http://127.0.0.1:") || w.starts_with("http://localhost:")) {
+            return Err("witnessDaemons must be https addresses".into());
+        }
+    }
     Ok(WalletRpcXmz::new(
         WalletRpcConfig {
             shared: agreed.shared.clone(),
@@ -328,6 +344,7 @@ pub(crate) fn xmz_parts(
             wallet_password: seed.wallet_password(&saved.offer, saved.role).to_string(),
             sweep_confirmations: 10,
             record: dir.join("xmz.json"),
+            witnesses: cfg.witness_daemons.clone(),
         },
         rpc(&cfg.main_wallet)?,
         rpc(&cfg.swap_wallet)?,

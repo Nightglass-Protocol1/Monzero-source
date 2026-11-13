@@ -360,6 +360,7 @@ async fn main() {
         wallet_password: seed.wallet_password(&saved.offer, saved.role).to_string(),
         sweep_confirmations: 10,
         record: dir.join(format!("{who}-xmz.json")),
+        witnesses: Vec::new(),
     };
     let mut owner: Real = Driver::resume(
         &owner_seed,
