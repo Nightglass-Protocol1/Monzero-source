@@ -1329,7 +1329,8 @@ public class LoginActivity extends BaseActivity
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        processUsbIntent(intent);
+        if (!processUsbIntent(intent))
+            processUriIntent(intent); // a payment request while the wallet list is already open
     }
 
     private boolean processUsbIntent(Intent intent) {

@@ -16,6 +16,7 @@
     <string name="dex_stop_refused_text">The DEX link stays on until the trade finishes or refunds. Turning it off now could delay your funds.</string>
     <string name="dex_add_title">Add XMZ for trading</string>
     <string name="dex_add_text">Tap to open your wallet\'s Send screen with your trading wallet\'s address filled in.</string>
+    <string name="dex_add_waiting">The Send screen opens, filled in, as soon as the wallet has finished syncing.</string>
 
     <string name="dex_intro">Trading happens on the DEX page, monzero.org/dex, opened in this phone\'s browser. This wallet holds the trading keys and runs each swap. The page can show your trading balance and ask to post or take offers; it cannot start a trade. Every connection, password and trade is confirmed here, from a notification.</string>
     <string name="dex_switch">DEX link on this phone</string>

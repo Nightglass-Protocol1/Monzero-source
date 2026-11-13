@@ -226,9 +226,50 @@ public class WalletActivity extends BaseActivity implements WalletFragment.Liste
         }
     }
 
+    // A payment request that arrives while this wallet is open (the DEX page's "Add XMZ"
+    // notification): the Send screen opens with it filled in, as soon as the wallet is synced
+    // and on screen
+    private static volatile boolean walletOpen = false;
+
+    public static boolean isWalletOpen() {
+        return walletOpen;
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        final String request = intent.getStringExtra(REQUEST_URI);
+        if (request == null) return;
+        uri = request;
+        sendWhenReady = true;
+        if (!synced)
+            Toast.makeText(this, R.string.dex_add_waiting, Toast.LENGTH_LONG).show();
+    }
+
+    private boolean sendWhenReady = false;
+
+    @Override
+    protected void onPostResume() {
+        super.onPostResume();
+        openRequestedSend(true);
+    }
+
+    private void openRequestedSend(boolean onScreen) {
+        if (!sendWhenReady || uri == null || !synced) return;
+        // screens can only be changed while this one is showing; otherwise the next resume does it
+        if (!onScreen && !getLifecycle().getCurrentState().isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return;
+        if (getWalletFragment() == null) return;
+        sendWhenReady = false;
+        final FragmentManager fragments = getSupportFragmentManager();
+        if (fragments.getBackStackEntryCount() > 0) // back to the wallet's main screen first
+            fragments.popBackStackImmediate(fragments.getBackStackEntryAt(0).getId(), FragmentManager.POP_BACK_STACK_INCLUSIVE);
+        onSendRequest(null);
+    }
+
     @Override
     protected void onDestroy() {
         Timber.d("onDestroy()");
+        walletOpen = false;
         if ((mBoundService != null) && (getWallet() != null)) {
             saveWallet();
         }
@@ -371,6 +412,8 @@ public class WalletActivity extends BaseActivity implements WalletFragment.Liste
         requestStreetMode = extras.getBoolean(REQUEST_STREETMODE);
         password = extras.getString(REQUEST_PW);
         uri = extras.getString(REQUEST_URI);
+        sendWhenReady = uri != null;
+        walletOpen = true;
         boolean sidekick = extras.getBoolean(REQUEST_SIDEKICK);
 
         setContentView(R.layout.activity_wallet);
@@ -600,6 +643,7 @@ public class WalletActivity extends BaseActivity implements WalletFragment.Liste
                     saveWallet(); // save on first sync
                     synced = true;
                     runOnUiThread(walletFragment::onSynced);
+                    runOnUiThread(() -> openRequestedSend(false));
                 }
             }
             runOnUiThread(() -> {

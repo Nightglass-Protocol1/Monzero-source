@@ -21,6 +21,7 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
 
 import com.m2049r.xmrwallet.LoginActivity;
+import com.m2049r.xmrwallet.WalletActivity;
 import com.m2049r.xmrwallet.R;
 
 import org.json.JSONObject;
@@ -245,11 +246,16 @@ public class DexService extends Service implements DexBridge.Listener {
 
     @Override
     public void xmzAddRequested(String address, String xmz) {
-        // The wallet's own Send screen, with the trading wallet's address filled in: the user picks
-        // the wallet, checks the amount and confirms as for any payment
+        // The wallet's own Send screen, with the trading wallet's address filled in: the user
+        // checks the amount and confirms as for any payment
         final StringBuilder uri = new StringBuilder("monzero:").append(address);
         if (xmz != null && !xmz.isEmpty()) uri.append("?tx_amount=").append(xmz);
-        final Intent send = new Intent(Intent.ACTION_VIEW, Uri.parse(uri.toString()), this, LoginActivity.class)
+        // With a wallet open, straight to its Send screen. Going through the wallet list instead
+        // would close the open wallet. With none open, the list: the user picks one first.
+        final Intent send = WalletActivity.isWalletOpen()
+                ? new Intent(this, WalletActivity.class).putExtra(WalletActivity.REQUEST_URI, uri.toString())
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                : new Intent(Intent.ACTION_VIEW, Uri.parse(uri.toString()), this, LoginActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         final Notification notification = new NotificationCompat.Builder(this, CHANNEL_ASK)
                 .setContentTitle(getString(R.string.dex_add_title))
