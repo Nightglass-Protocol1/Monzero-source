@@ -68,12 +68,34 @@ struct TakerFile {
     sent_at: u64,
 }
 
-fn rules(local_contract: Option<Address>) -> Rules {
+/// What the app accepts beyond the pinned rules.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Accept {
+    /// The contract on a local test chain (31337)
+    pub local_contract: Option<Address>,
+    /// Monero offers on the main networks (off until XMR trading is opened in this edition)
+    pub xmr_mainnet: bool,
+}
+
+fn rules(accept: Accept) -> Rules {
     let mut r = pinned_rules();
-    if let Some(c) = local_contract {
+    if let Some(c) = accept.local_contract {
         r.contracts.insert(Chain::Local.id(), c);
     }
+    r.xmr_mainnet = accept.xmr_mainnet;
     r
+}
+
+/// The wallet service behind `rpc` holds the coin of `network`: its address has that network's
+/// prefix. Checked before a trade starts, so an XMR trade never runs on the XMZ wallet or the
+/// other way round.
+async fn check_wallet_coin(rpc: &crate::xmz::WalletRpc, network: XmzNetwork) -> Result<(), String> {
+    let address = rpc.call("get_address", json!({"account_index": 0})).await.map_err(|e| e.to_string())?;
+    let address = address["address"].as_str().ok_or("the wallet gave no address")?;
+    if !crate::xmz::is_standard_address(network, address) {
+        return Err(format!("the wallet service for this trade is not a {} wallet on the trade's network", network.coin().ticker()));
+    }
+    Ok(())
 }
 
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
@@ -155,9 +177,12 @@ async fn check_funds(role: Role, listing: &Listing, key: &PrivateKeySigner, cfg:
             let main = rpc(&cfg.main_wallet)?;
             main.call("refresh", json!({})).await.map_err(|e| e.to_string())?;
             let unlocked = main.call("get_balance", json!({})).await.map_err(|e| e.to_string())?["unlocked_balance"].as_u64().unwrap_or(0);
-            let needed = xmz_needed(listing.xmz);
+            let needed = xmz_needed(listing.xmz, listing.xmz_network.coin());
             if unlocked < needed {
-                return Err(format!("the XMZ wallet has {unlocked} atoms unlocked; this offer needs {needed} (the amount plus a margin for fees)"));
+                return Err(format!(
+                    "the {} wallet has {unlocked} atoms unlocked; this offer needs {needed} (the amount plus a margin for fees)",
+                    listing.xmz_network.coin().ticker()
+                ));
             }
         }
     }
@@ -199,9 +224,9 @@ fn listing_json(s: &SignedListing, relays: &[String]) -> Value {
     json!({"signed": s, "relays": relays})
 }
 
-pub async fn listings(relays: &[String], pair: Option<&str>, local_contract: Option<Address>, now: u64) -> Result<Value, String> {
+pub async fn listings(relays: &[String], pair: Option<&str>, accept: Accept, now: u64) -> Result<Value, String> {
     let client = RelayClient::new(relays)?;
-    let (found, errors) = client.listings(pair, &rules(local_contract), now).await;
+    let (found, errors) = client.listings(pair, &rules(accept), now).await;
     Ok(json!({"listings": found.iter().map(|(s, r)| listing_json(s, r)).collect::<Vec<_>>(), "relayErrors": errors}))
 }
 
@@ -218,20 +243,21 @@ pub fn offer_network(chain: Chain, coin: Option<&str>) -> Result<XmzNetwork, Str
     }
 }
 
-pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &OfferParams, local_contract: Option<Address>) -> Result<Value, String> {
+pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &OfferParams, accept: Accept) -> Result<Value, String> {
     if dir.join("listing.json").exists() || dir.join("take.json").exists() || journal_has_trade(dir) {
         return Err("this trade folder is already in use".into());
     }
     let client = RelayClient::new(relays)?;
     let (seed, key) = keys(cfg)?;
     let chain_kind = Chain::from_id(params.chain_id).ok_or("unknown chain")?;
-    let rules = rules(local_contract);
+    let rules = rules(accept);
     let contract = *rules.contracts.get(&params.chain_id).ok_or("no pinned contract for this chain")?;
     if params.lifetime_secs == 0 || params.lifetime_secs > MAX_LIFETIME {
         return Err("an offer stays open for at most 24 hours".into());
     }
     let xmz_atoms: u64 = parse_amount(&params.xmz_atoms, "xmzAtoms")?.try_into().map_err(|_| "xmzAtoms is out of range")?;
     let xmz_network = offer_network(chain_kind, params.coin.as_deref())?;
+    check_wallet_coin(&rpc(&cfg.main_wallet)?, xmz_network).await?;
     let at = heights(cfg, chain_kind, None).await?;
     let mut id = [0u8; 32];
     OsRng.fill_bytes(&mut id);
@@ -350,7 +376,7 @@ async fn close_taken(dir: &Path, file: &mut MakerFile, cfg: &TickConfig, relays:
     }
 }
 
-pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Option<SignedListing>, local_contract: Option<Address>) -> Result<Value, String> {
+pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Option<SignedListing>, accept: Accept) -> Result<Value, String> {
     if journal_has_trade(dir) {
         let mut v = status(dir)?;
         v["agreed"] = json!(true);
@@ -364,8 +390,9 @@ pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Opti
         None => {
             let signed = offered.ok_or("take needs the offer the first time")?;
             let at = heights(cfg, chain_of_id(signed.listing.chain_id)?, None).await?;
-            signed.verify(&rules(local_contract), at.now).map_err(|e| e.to_string())?;
+            signed.verify(&rules(accept), at.now).map_err(|e| e.to_string())?;
             let l = &signed.listing;
+            check_wallet_coin(&rpc(&cfg.main_wallet)?, l.xmz_network).await?;
             if l.maker == key.address() {
                 return Err("this is our own offer".into());
             }
@@ -470,8 +497,14 @@ pub fn funds_in_use(root: &Path, now: u64) -> Result<Option<String>, String> {
 
 /// What a seller's trading wallet must hold unlocked for an offer: the amount, plus room for the
 /// lock transaction's fee (about 0.01 XMZ): 1%, and never less than 1 XMZ.
-pub fn xmz_needed(atoms: u64) -> u64 {
-    atoms.saturating_add((atoms / 100).max(100_000_000_000))
+/// What the lock needs unlocked in the funds wallet: the amount plus a margin for the network
+/// fee (1%, at least 1 XMZ; for Monero at least 0.0005 XMR, several times a usual fee).
+pub fn xmz_needed(atoms: u64, coin: crate::xmz::PrivateCoin) -> u64 {
+    let least = match coin {
+        crate::xmz::PrivateCoin::Xmz => 100_000_000_000,
+        crate::xmz::PrivateCoin::Xmr => 500_000_000,
+    };
+    atoms.saturating_add((atoms / 100).max(least))
 }
 
 /// Send what the trade account holds on this chain back to the user's own wallet (for example

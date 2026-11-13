@@ -130,6 +130,29 @@ pub fn standard_address(network: XmzNetwork, spend_public: &[u8; 32], view_publi
     base58(&data)
 }
 
+/// `address` is a standard (primary) address of `network`: right length, prefix and checksum.
+pub fn is_standard_address(network: XmzNetwork, address: &str) -> bool {
+    let mut raw = Vec::with_capacity(72);
+    for block in address.as_bytes().chunks(11) {
+        let Some(bytes) = BLOCK_CHARS.iter().position(|&n| n == block.len()).filter(|&n| n > 0) else {
+            return false;
+        };
+        let mut num = 0u128;
+        for c in block {
+            let Some(digit) = ALPHABET.iter().position(|a| a == c) else {
+                return false;
+            };
+            num = num * 58 + digit as u128;
+        }
+        if num >> (8 * bytes) != 0 {
+            return false;
+        }
+        raw.extend_from_slice(&(num as u64).to_be_bytes()[8 - bytes..]);
+    }
+    let prefix = network.prefix();
+    raw.len() == prefix.len() + 68 && raw.starts_with(prefix) && keccak256(&raw[..raw.len() - 4])[..4] == raw[raw.len() - 4..]
+}
+
 /// The shared address both traders watch.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SharedXmz {
@@ -622,6 +645,12 @@ mod tests {
             assert_eq!(standard_address(network, &spend, &view), address);
             // the same keys on XMZ give a different address, so a wallet of the wrong coin refuses it
             assert_ne!(standard_address(XmzNetwork::Mainnet, &spend, &view), address);
+            assert!(is_standard_address(network, address));
+            assert!(!is_standard_address(XmzNetwork::Mainnet, address) && !is_standard_address(XmzNetwork::XmrTestnet, address));
+            let mut typo = address.to_string();
+            typo.replace_range(20..21, if &address[20..21] == "A" { "B" } else { "A" });
+            assert!(!is_standard_address(network, &typo), "a changed character fails the checksum");
+            assert!(!is_standard_address(network, &address[..94]) && !is_standard_address(network, "") && !is_standard_address(network, "0OIl"));
         }
         let b = basepoint();
         assert!(standard_address(XmzNetwork::XmrMainnet, &b, &b).starts_with('4'));

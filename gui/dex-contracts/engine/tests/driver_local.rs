@@ -22,7 +22,7 @@ use monzero_dex_evm::secret::{combined_spend_key, SecretShare};
 use monzero_dex_evm::exchange::{SavedTrade, Session};
 use monzero_dex_evm::negotiation::{KeyExchange, LocalKeys, Offer, Role};
 use monzero_dex_evm::swap_seed::SwapSeed;
-use monzero_dex_evm::xmz::{SharedXmz, WalletRpcConfig, WalletRpcXmz, XmzNetwork};
+use monzero_dex_evm::xmz::{SharedXmz, WalletRpcConfig, WalletRpcXmz};
 use monzero_dex_evm::{AgreedTerms, Chain};
 use serde_json::json;
 use std::str::FromStr;

@@ -56,6 +56,10 @@ pub struct Request {
     /// The contract on a local test chain (31337) only; real chains use the pinned ones
     #[serde(default)]
     pub local_contract: Option<alloy::primitives::Address>,
+    /// Market commands: accept Monero (XMR) offers on the main networks. Absent or false until
+    /// XMR trading is opened in the app's edition; test networks accept XMR either way.
+    #[serde(default)]
+    pub xmr_mainnet: bool,
     /// The swap program on a local Solana test validator only; real clusters use the pinned ones
     #[serde(default)]
     pub local_sol_program: Option<String>,
@@ -162,12 +166,12 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         Command::Payout => payout(&r.trade_dir, r.tick, r.payout_address.as_deref()).await,
         Command::Listings => market_listings(&r).await,
         Command::Post => match (&r.tick, &r.offer) {
-            (Some(t), Some(o)) => crate::helper_market::post(&r.trade_dir, t, relays(&r)?, o, r.local_contract).await,
+            (Some(t), Some(o)) => crate::helper_market::post(&r.trade_dir, t, relays(&r)?, o, accept(&r)).await,
             _ => Err("post needs tick (keys and endpoints) and offer".into()),
         },
         Command::Serve => crate::helper_market::serve(&r.trade_dir, r.tick.as_ref().ok_or("serve needs tick")?, relays(&r)?).await,
         Command::Take => {
-            crate::helper_market::take(&r.trade_dir, r.tick.as_ref().ok_or("take needs tick")?, relays(&r)?, r.listing.clone(), r.local_contract).await
+            crate::helper_market::take(&r.trade_dir, r.tick.as_ref().ok_or("take needs tick")?, relays(&r)?, r.listing.clone(), accept(&r)).await
         }
         Command::Cancel => crate::helper_market::cancel(&r.trade_dir, r.tick.as_ref().ok_or("cancel needs tick")?, relays(&r)?).await,
         Command::Report => crate::helper_market::report(&r.trade_dir, relays(&r)?).await,
@@ -180,13 +184,17 @@ async fn dispatch(r: Request) -> Result<Value, String> {
     }
 }
 
+fn accept(r: &Request) -> crate::helper_market::Accept {
+    crate::helper_market::Accept { local_contract: r.local_contract, xmr_mainnet: r.xmr_mainnet }
+}
+
 fn relays(r: &Request) -> Result<&[String], String> {
     r.relays.as_deref().filter(|v| !v.is_empty()).ok_or_else(|| "this command needs relays".to_string())
 }
 
 async fn market_listings(r: &Request) -> Result<Value, String> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    crate::helper_market::listings(relays(r)?, r.pair.as_deref(), r.local_contract, now).await
+    crate::helper_market::listings(relays(r)?, r.pair.as_deref(), accept(r), now).await
 }
 
 fn journal(dir: &Path) -> FileJournal {
@@ -232,6 +240,10 @@ pub(crate) fn status(dir: &Path) -> Result<Value, String> {
             "asset": o.asset.to_string(),
             "value": o.value.to_string(),
             "xmzAmount": o.xmz_amount.to_string(),
+            // The private coin of the trade: "XMZ" or "XMR", and how many decimal places its atoms have
+            "privateCoin": o.xmz_network.coin().ticker(),
+            "privateDecimals": o.xmz_network.coin().decimals(),
+            "xmzNetwork": o.xmz_network,
             "duration1": o.duration1,
             "duration2": o.duration2,
         },
