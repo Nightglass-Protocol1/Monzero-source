@@ -119,6 +119,10 @@ pub struct TickConfig {
     /// the other trader's lock before it counts. A Monero main-network trade needs at least two.
     #[serde(default)]
     pub witness_daemons: Vec<String>,
+    /// Who pays the claimer's claim gas when its account is empty: "give" (a maker that
+    /// advances it), "expect" (a seller holding none of the chain's coin), default off
+    #[serde(default)]
+    pub gas_advance: crate::driver::GasAdvance,
 }
 
 #[derive(Deserialize)]
@@ -288,7 +292,7 @@ async fn tick(dir: &Path, cfg: Option<TickConfig>) -> Result<Value, String> {
     let agreed = saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
     let chain = trade_chain(&cfg, &saved, &agreed, &key)?;
     let xmz = xmz_parts(dir, &cfg, &saved, &agreed, &swap_seed)?;
-    let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?;
+    let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?.with_gas_advance(cfg.gas_advance);
     let (awaiting, funding) = match driver.tick().await {
         Ok(_) => (false, None),
         Err(DriverError::AwaitingApproval) => (true, None),

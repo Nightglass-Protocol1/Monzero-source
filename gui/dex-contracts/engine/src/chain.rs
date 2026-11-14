@@ -269,8 +269,10 @@ impl EvmChain for AlloyChain {
 
     async fn sign(&self, call: &EvmCall) -> Result<Bytes, DriverError> {
         let chain_id = self.check_network().await?;
-        let (input, value) = match call {
+        let (to, input, value) = match call {
+            EvmCall::GasAdvance { to, amount } => (*to, Vec::new(), *amount),
             EvmCall::NewSwap { terms, nonce } => (
+                self.contract,
                 XmzSwap::newSwapCall {
                     claimer: terms.claimer,
                     claimCommitment: terms.claim_commitment,
@@ -284,11 +286,11 @@ impl EvmChain for AlloyChain {
                 .abi_encode(),
                 if terms.asset == Address::ZERO { terms.value } else { U256::ZERO },
             ),
-            EvmCall::SetReady(swap) => (XmzSwap::setReadyCall { swap: swap.clone() }.abi_encode(), U256::ZERO),
-            EvmCall::Claim(swap, secret) => (XmzSwap::claimCall { swap: swap.clone(), secret: *secret }.abi_encode(), U256::ZERO),
-            EvmCall::Refund(swap, secret) => (XmzSwap::refundCall { swap: swap.clone(), secret: *secret }.abi_encode(), U256::ZERO),
+            EvmCall::SetReady(swap) => (self.contract, XmzSwap::setReadyCall { swap: swap.clone() }.abi_encode(), U256::ZERO),
+            EvmCall::Claim(swap, secret) => (self.contract, XmzSwap::claimCall { swap: swap.clone(), secret: *secret }.abi_encode(), U256::ZERO),
+            EvmCall::Refund(swap, secret) => (self.contract, XmzSwap::refundCall { swap: swap.clone(), secret: *secret }.abi_encode(), U256::ZERO),
         };
-        let tx = TransactionRequest::default().with_from(self.from).with_to(self.contract).with_input(input).with_value(value);
+        let tx = TransactionRequest::default().with_from(self.from).with_to(to).with_input(input).with_value(value);
         // Gas estimation executes the call: a call that would revert fails here, before
         // anything is signed or published.
         let gas = self.reader.estimate_gas(tx.clone()).await.map_err(chain_err)?;
@@ -305,6 +307,10 @@ impl EvmChain for AlloyChain {
 
     async fn head(&self) -> Result<u64, DriverError> {
         self.reader.get_block_number().await.map_err(chain_err)
+    }
+
+    async fn balance_of(&self, who: Address) -> Result<U256, DriverError> {
+        self.reader.get_balance(who).await.map_err(chain_err)
     }
 
     async fn funds(&self) -> Result<crate::driver::Funds, DriverError> {

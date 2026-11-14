@@ -75,6 +75,23 @@ pub enum EvmCall {
     SetReady(Swap),
     Claim(Swap, B256),
     Refund(Swap, B256),
+    /// A plain payment from the owner to the claimer's account, so a claimer who holds none
+    /// of the chain's coin can pay for its claim (see `GasAdvance`)
+    GasAdvance { to: Address, amount: U256 },
+}
+
+/// Who pays the gas for the claimer's claim when the claimer's account is empty.
+/// `Give` (owner): before `setReady`, top the claimer's account up to the cost of a claim.
+/// `Expect` (claimer): lock XMZ without holding gas, relying on the owner's advance. If no
+/// advance comes the claimer cannot claim, the owner refunds after the second deadline and
+/// the claimer takes its XMZ back: time is lost, funds are not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GasAdvance {
+    #[default]
+    Off,
+    Give,
+    Expect,
 }
 
 /// The EVM chain as the driver needs it.
@@ -99,6 +116,10 @@ pub trait EvmChain {
     async fn broadcast(&self, raw: &Bytes) -> Result<(), DriverError>;
     /// Our account's balance and the current maximum fee per gas (wei)
     async fn funds(&self) -> Result<Funds, DriverError>;
+    /// What another account holds (wei). Chains without gas advances need not answer.
+    async fn balance_of(&self, _who: Address) -> Result<U256, DriverError> {
+        Err(DriverError::Chain("this chain has no gas advance".into()))
+    }
 }
 
 /// The XMZ wallet side of the swap.
@@ -237,6 +258,7 @@ pub struct Driver<C, X, J> {
     chain: C,
     xmz: X,
     journal: J,
+    gas_advance: GasAdvance,
 }
 
 impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
@@ -251,7 +273,7 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         if secret.commitment() != ours {
             return Err(DriverError::SecretMismatch);
         }
-        Ok(Driver { trade, secret, swap_nonce, chain, xmz, journal })
+        Ok(Driver { trade, secret, swap_nonce, chain, xmz, journal, gas_advance: GasAdvance::Off })
     }
 
     /// A new trade: the saved trade goes into the journal before the driver can act, so a
@@ -288,6 +310,12 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         approve_journal(&mut self.journal, transcript)
     }
 
+    /// How the claimer's claim gas is paid on this trade (a setting of this run, not saved)
+    pub fn with_gas_advance(mut self, mode: GasAdvance) -> Self {
+        self.gas_advance = mode;
+        self
+    }
+
     pub fn journal(&self) -> &J {
         &self.journal
     }
@@ -322,7 +350,14 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         if first_lock {
             let funds = self.chain.funds().await?;
             let owner = matches!(record.state, RoleState::Owner(_));
-            let needed = funding_needed(&self.trade.terms, owner, funds.fee_per_gas);
+            let claim_gas = funding_needed(&self.trade.terms, false, funds.fee_per_gas);
+            let needed = match (owner, self.gas_advance) {
+                // The owner also holds what it may have to advance
+                (true, GasAdvance::Give) => funding_needed(&self.trade.terms, true, funds.fee_per_gas) + claim_gas,
+                // The claimer counts on the advance
+                (false, GasAdvance::Expect) => U256::ZERO,
+                _ => funding_needed(&self.trade.terms, owner, funds.fee_per_gas),
+            };
             if funds.balance < needed {
                 return Err(DriverError::AwaitingFunding { needed, have: funds.balance });
             }
@@ -363,7 +398,12 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
                 let call = EvmCall::NewSwap { terms: self.trade.terms.clone(), nonce: self.swap_nonce };
                 self.evm("new_swap", call).await
             }
-            Action::SendSetReady(swap) => self.evm("set_ready", EvmCall::SetReady((&swap).into())).await,
+            Action::SendSetReady(swap) => {
+                if self.gas_advance == GasAdvance::Give {
+                    self.advance_gas().await?;
+                }
+                self.evm("set_ready", EvmCall::SetReady((&swap).into())).await
+            }
             Action::SendRefund(swap) => self.evm("refund", EvmCall::Refund((&swap).into(), self.secret.to_evm())).await,
             Action::SendClaim(swap) => self.evm("claim", EvmCall::Claim((&swap).into(), self.secret.to_evm())).await,
             Action::LockXmz { amount } => self.xmz.ensure_lock(amount).await,
@@ -372,6 +412,26 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
                 self.xmz.ensure_sweep(combined_spend_key(&self.secret, &theirs)).await
             }
         }
+    }
+
+    /// The claimer's account topped up to the cost of its claim, once per trade: decided when
+    /// first reached (nothing is sent to an account that already holds enough), then kept and
+    /// rebroadcast like every other transaction of the trade.
+    async fn advance_gas(&mut self) -> Result<(), DriverError> {
+        let to = self.trade.terms.claimer;
+        let record = self.journal.load()?;
+        if record.retained.contains_key("gas_advance") {
+            return self.evm("gas_advance", EvmCall::GasAdvance { to, amount: U256::ZERO }).await;
+        }
+        if record.retained.contains_key("set_ready") {
+            return Ok(());
+        }
+        let needed = funding_needed(&self.trade.terms, false, self.chain.funds().await?.fee_per_gas);
+        let have = self.chain.balance_of(to).await?;
+        if have >= needed {
+            return Ok(());
+        }
+        self.evm("gas_advance", EvmCall::GasAdvance { to, amount: needed - have }).await
     }
 
     /// Sign once and keep it, replace it with higher fees when it is stuck, then

@@ -59,6 +59,21 @@ who never held XMZ; the rule binds the project's apps, page and relays, not the 
 
 Not built yet; it belongs to the app integration below.
 
+## One wallet, nothing else in hand (owner direction, 2026-11-14)
+
+A buyer needs only the Monzero wallet and XMZ: no MetaMask or Phantom, and XMR is paid to any
+Monero address they paste. Launch order: "buy XMR with XMZ" first, against a project-run seller
+bot; selling XMR and outside sellers later.
+
+**Gas advance (built, BNB/ETH).** A trader holding only XMZ has no BNB to pay for collecting
+the middle coin. The contract's `claimRelayer` does not fit: the trader would have to hand its
+secret to whoever relays, and a relayer working with the other side could then take both
+coins. Instead the other side tops the trader's account up to the cost of a claim just before
+`setReady` (`gasAdvance: "give"` in the maker's tick config, `"expect"` in the seller's, see
+`driver::GasAdvance`). If no advance comes the trade refunds: time lost, no funds lost.
+Tested on a local chain (`a_seller_holding_no_gas_is_advanced_the_cost_of_its_claim`).
+Not yet on Solana.
+
 ## Node trust (new)
 
 The wallet service believes its node. A lying Monero node could show an XMR lock that is not on

@@ -675,6 +675,7 @@ impl EvmChain for SolChain {
                 data.extend_from_slice(&program_secret(*secret));
                 (vec![meta(me, true, true), meta(self.swap_address(swap.value)?, false, true), meta(b.owner, false, true)], data)
             }
+            EvmCall::GasAdvance { .. } => return Err(DriverError::Chain("no gas advance on Solana yet".into())),
             EvmCall::Refund(swap, secret) => {
                 let mut data = vec![3u8];
                 data.extend_from_slice(&program_secret(*secret));
@@ -762,6 +763,9 @@ impl EvmChain for AnyChain {
     }
     async fn funds(&self) -> Result<Funds, DriverError> {
         either!(self, c => c.funds().await)
+    }
+    async fn balance_of(&self, who: Address) -> Result<U256, DriverError> {
+        either!(self, c => c.balance_of(who).await)
     }
 }
 
