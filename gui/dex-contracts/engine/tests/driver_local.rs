@@ -309,6 +309,51 @@ async fn set_balance(url: &str, who: Address, wei: U256) {
 /// Funding from outside (e.g. MetaMask): nothing is locked until each account can pay for its
 /// lock and for the transactions that protect it; then the swap goes ahead as usual.
 #[tokio::test]
+async fn a_seller_holding_no_gas_is_advanced_the_cost_of_its_claim() {
+    use monzero_dex_evm::driver::GasAdvance;
+    let Some(url) = std::env::var("MONZERO_EVM_RPC").ok() else { return };
+    let _chain = CHAIN.lock().await;
+    let w = world(url).await;
+    let claimer_addr = w.trade.terms.claimer;
+    set_balance(&w.url, w.trade.terms.owner, U256::from(10_000u64) * U256::from(10u64.pow(18))).await;
+    set_balance(&w.url, claimer_addr, U256::ZERO).await;
+    let mut owner = w.owner(MemoryJournal(Record::new(RoleState::Owner(OwnerState::Start)))).with_gas_advance(GasAdvance::Give);
+    let mut claimer = w.claimer().with_gas_advance(GasAdvance::Expect);
+    let (mut o, mut c) = (None, None);
+    for _ in 0..20 {
+        o = Some(owner.tick().await.unwrap());
+        // Until the advance arrives the seller's claim cannot be paid for: it just tries again
+        c = claimer.tick().await.ok().or(c);
+        w.xmz("chain").mine(5);
+        if o.as_ref().unwrap().is_done() && c.as_ref().is_some_and(|c| c.is_done()) {
+            break;
+        }
+    }
+    assert_eq!(o, Some(RoleState::Owner(OwnerState::Done(Outcome::Swapped))));
+    assert_eq!(c, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
+    assert_eq!(owner.journal().load().unwrap().retained["gas_advance"].len(), 1, "advanced once");
+    // The seller ends with the trade's value and what is left of the advance, never less
+    let balance = w.chain(CLAIMER_KEY).funds().await.unwrap().balance;
+    assert!(balance >= w.trade.terms.value, "{balance}");
+
+    // A seller that already holds gas is sent nothing
+    let w = world(w.url.clone()).await;
+    let mut owner = w.owner(MemoryJournal(Record::new(RoleState::Owner(OwnerState::Start)))).with_gas_advance(GasAdvance::Give);
+    let mut claimer = w.claimer();
+    for _ in 0..20 {
+        let o = owner.tick().await.unwrap();
+        let c = claimer.tick().await.unwrap();
+        w.xmz("chain").mine(5);
+        if o.is_done() && c.is_done() {
+            break;
+        }
+    }
+    assert!(owner.journal().load().unwrap().retained.contains_key("set_ready"));
+    assert!(!owner.journal().load().unwrap().retained.contains_key("gas_advance"), "no advance to a funded account");
+    set_balance(&w.url, claimer_addr, U256::from(10_000u64) * U256::from(10u64.pow(18))).await;
+}
+
+#[tokio::test]
 async fn nothing_is_locked_until_each_account_is_funded() {
     let Some(url) = std::env::var("MONZERO_EVM_RPC").ok() else { return };
     let _chain = CHAIN.lock().await;

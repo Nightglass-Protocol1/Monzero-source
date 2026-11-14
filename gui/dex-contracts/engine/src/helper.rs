@@ -125,6 +125,11 @@ pub struct TickConfig {
     pub account_index: Option<u32>,
     pub main_wallet: Endpoint,
     pub swap_wallet: Endpoint,
+    /// Who pays the claimer's claim fee when its account is empty: "give" (the owner advances
+    /// it), "expect" (a seller holding none of the chain's coin), "off". Absent: the chain's
+    /// default (`default_gas_advance`).
+    #[serde(default)]
+    pub gas_advance: Option<crate::driver::GasAdvance>,
 }
 
 #[derive(Deserialize)]
@@ -310,7 +315,7 @@ async fn tick(dir: &Path, cfg: Option<TickConfig>) -> Result<Value, String> {
     let agreed = saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
     let chain = trade_chain(&cfg, &saved, &agreed, &key)?;
     let xmz = xmz_parts(dir, &cfg, &saved, &agreed, &swap_seed)?;
-    let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?;
+    let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?.with_gas_advance(cfg.gas_advance.unwrap_or_else(|| default_gas_advance(&saved)));
     let (awaiting, funding) = match driver.tick().await {
         Ok(_) => (false, None),
         Err(DriverError::AwaitingApproval) => (true, None),
@@ -362,6 +367,22 @@ pub(crate) fn xmz_parts(
 
 /// The chain client of a saved trade: an EVM chain, or Solana with the accounts and points both
 /// traders signed in their frames.
+/// The fee advance when the configuration names none. On Solana and BNB Smart Chain a claim
+/// costs cents, so the owner (who locks the coin) always tops up an empty claimer account,
+/// once the claimer's XMZ is locked, and a claimer locks XMZ without holding the coin first.
+/// A claimer facing an owner whose app does not advance can still collect by paying the fee in
+/// itself; otherwise the owner refunds after the deadline and the claimer takes its XMZ back.
+/// On Ethereum a claim can cost dollars, so each side pays its own.
+pub(crate) fn default_gas_advance(saved: &crate::exchange::SavedTrade) -> crate::driver::GasAdvance {
+    use crate::driver::GasAdvance;
+    let cheap = matches!(Chain::from_id(saved.offer.chain_id), Some(c) if c.is_solana() || matches!(c, Chain::BscMainnet | Chain::BscTestnet));
+    match (cheap, saved.role) {
+        (false, _) => GasAdvance::Off,
+        (true, crate::negotiation::Role::Owner) => GasAdvance::Give,
+        (true, _) => GasAdvance::Expect,
+    }
+}
+
 pub(crate) fn trade_chain(
     cfg: &TickConfig,
     saved: &crate::exchange::SavedTrade,

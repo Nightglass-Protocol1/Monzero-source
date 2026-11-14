@@ -123,6 +123,11 @@ impl Party {
 
 /// Both traders agree on an offer over the usual key exchange and save the trade.
 async fn agree(url: &str, program: sol::Pubkey, tag: u8, timing: Timing) -> (Party, Party) {
+    agree_funded(url, program, tag, timing, LAMPORTS + 4_500_000, 1_500_000).await
+}
+
+/// As `agree`, with the lamports each side's account is given
+async fn agree_funded(url: &str, program: sol::Pubkey, tag: u8, timing: Timing, owner_lamports: u64, claimer_lamports: u64) -> (Party, Party) {
     let (owner_key, claimer_key) = (PrivateKeySigner::random(), PrivateKeySigner::random());
     let (owner_seed, claimer_seed) = (SwapSeed::from_bytes([tag; 32]), SwapSeed::from_bytes([tag ^ 0xFF; 32]));
     let mut id = [tag; 32];
@@ -162,8 +167,10 @@ async fn agree(url: &str, program: sol::Pubkey, tag: u8, timing: Timing) -> (Par
         let mut d = Driver::start(p.saved.clone(), &p.seed, &p.key, p.chain(url, program), p.xmz.clone(), FileJournal(p.journal.clone())).unwrap();
         d.approve(p.saved.transcript).unwrap();
     }
-    fund(url, &owner.account(), LAMPORTS + 4_500_000).await; // exactly the reserve the driver asks for
-    fund(url, &claimer.account(), 1_500_000).await;
+    fund(url, &owner.account(), owner_lamports).await; // `agree`: exactly the reserve the driver asks for
+    if claimer_lamports > 0 {
+        fund(url, &claimer.account(), claimer_lamports).await;
+    }
     (owner, claimer)
 }
 
@@ -265,4 +272,67 @@ async fn the_owner_takes_its_sol_back_when_no_xmz_is_locked() {
     assert!(before - after <= 10 * sol::FEE_LAMPORTS, "only fees were spent: {}", before - after);
     // The claimer never locked anything and sees nothing to claim
     assert_eq!(claimer.xmz.ledger.lock().unwrap().lock_sends, 0);
+}
+
+#[tokio::test]
+async fn a_claimer_holding_no_sol_collects_with_the_owners_fee_advance() {
+    let Some((url, program)) = setup() else { return };
+    let _chain = CHAIN.lock().await;
+    let timing = Timing { xmz_confirmations: 10, xmz_lock_budget: 120, owner_refund_margin: 120, claim_margin: 120 };
+    // The owner holds its lock, its reserve and the claimer's claim fee; the claimer holds nothing
+    let (owner, claimer) = agree_funded(&url, program, 3, timing, LAMPORTS + 4_500_000 + 1_500_000, 0).await;
+    assert_eq!(balance(&url, &claimer.account()).await, 0);
+    let (mut owner_state, mut claimer_state) = (None, None);
+    for round in 0..90 {
+        owner_state = Some(owner.resume(&url, program).with_gas_advance(GasAdvance::Give).tick().await.unwrap());
+        claimer_state = Some(claimer.resume(&url, program).with_gas_advance(GasAdvance::Expect).tick().await.unwrap());
+        println!("round {round}: owner {} | claimer {}", owner_state.as_ref().unwrap().stage(), claimer_state.as_ref().unwrap().stage());
+        if owner_state.as_ref().unwrap().is_done() && claimer_state.as_ref().unwrap().is_done() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    assert_eq!(owner_state, Some(RoleState::Owner(OwnerState::Done(Outcome::Swapped))));
+    assert_eq!(claimer_state, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
+    let record = FileJournal(owner.journal.clone()).load().unwrap();
+    assert_eq!(record.retained["gas_advance"].len(), 1, "advanced once");
+    // The claimer has the SOL it sold for, plus what is left of the advance after its claim fee
+    assert_eq!(balance(&url, &claimer.account()).await, LAMPORTS + 1_500_000 - sol::FEE_LAMPORTS);
+}
+
+#[tokio::test]
+async fn a_claimer_holding_no_sol_is_asked_for_it_when_no_advance_comes() {
+    let Some((url, program)) = setup() else { return };
+    let _chain = CHAIN.lock().await;
+    let timing = Timing { xmz_confirmations: 10, xmz_lock_budget: 120, owner_refund_margin: 120, claim_margin: 120 };
+    // An owner whose app does not advance (as before this change)
+    let (owner, claimer) = agree_funded(&url, program, 4, timing, LAMPORTS + 4_500_000, 0).await;
+    let mut asked = None;
+    for _ in 0..90 {
+        owner.resume(&url, program).with_gas_advance(GasAdvance::Off).tick().await.unwrap();
+        match claimer.resume(&url, program).with_gas_advance(GasAdvance::Expect).tick().await {
+            Err(DriverError::AwaitingFunding { needed, have }) => {
+                asked = Some((needed, have));
+                break;
+            }
+            r => {
+                r.unwrap();
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    let (needed, have) = asked.expect("the claim asks for SOL instead of failing");
+    assert_eq!((needed, have), (U256::from(1_500_000u64), U256::ZERO));
+    // Paying the fee in lets the claimer collect
+    fund(&url, &claimer.account(), 1_500_000).await;
+    let mut claimer_state = None;
+    for _ in 0..60 {
+        owner.resume(&url, program).with_gas_advance(GasAdvance::Off).tick().await.unwrap();
+        claimer_state = Some(claimer.resume(&url, program).with_gas_advance(GasAdvance::Expect).tick().await.unwrap());
+        if claimer_state.as_ref().unwrap().is_done() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    assert_eq!(claimer_state, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
 }

@@ -655,6 +655,7 @@ impl EvmChain for SolChain {
     async fn sign(&self, call: &EvmCall) -> Result<Bytes, DriverError> {
         let me = self.account();
         let b = &self.binding;
+        let mut program = self.program;
         let (accounts, data) = match call {
             EvmCall::NewSwap { terms, nonce } => {
                 if me != b.owner || terms.asset != Address::ZERO || u64::try_from(*nonce).ok() != Some(self.nonce) {
@@ -676,13 +677,25 @@ impl EvmChain for SolChain {
                 data.extend_from_slice(&program_secret(*secret));
                 (vec![meta(me, true, true), meta(self.swap_address(swap.value)?, false, true), meta(b.owner, false, true)], data)
             }
+            // A plain system transfer from the owner to the claimer's account, so a claimer
+            // holding no SOL can pay for its claim. The claimer is the swap's bound claimer,
+            // whatever address the driver names (EVM addresses do not exist here).
+            EvmCall::GasAdvance { amount, .. } => {
+                if me != b.owner {
+                    return Err(sol_err("only the owner advances the claimer's fee"));
+                }
+                program = SYSTEM_PROGRAM;
+                let mut data = 2u32.to_le_bytes().to_vec();
+                data.extend_from_slice(&lamports(*amount)?.to_le_bytes());
+                (vec![meta(me, true, true), meta(b.claimer, false, true)], data)
+            }
             EvmCall::Refund(swap, secret) => {
                 let mut data = vec![3u8];
                 data.extend_from_slice(&program_secret(*secret));
                 (vec![meta(me, true, true), meta(self.swap_address(swap.value)?, false, true)], data)
             }
         };
-        let raw = signed(&self.key, message(&me, &self.program, &accounts, &data, &self.rpc.blockhash().await?));
+        let raw = signed(&self.key, message(&me, &program, &accounts, &data, &self.rpc.blockhash().await?));
         // As gas estimation on EVM: a call the program would refuse is not kept
         let text = base64::engine::general_purpose::STANDARD.encode(&raw);
         let sim = self.rpc.call("simulateTransaction", json!([text, {"encoding": "base64", "commitment": "confirmed"}])).await?;
@@ -718,6 +731,12 @@ impl EvmChain for SolChain {
     async fn funds(&self) -> Result<Funds, DriverError> {
         let r = self.rpc.call("getBalance", json!([to_base58(&self.account()), {"commitment": "confirmed"}])).await?;
         Ok(Funds { balance: U256::from(r["value"].as_u64().unwrap_or(0)), fee_per_gas: U256::from(LAMPORTS_PER_GAS) })
+    }
+
+    /// The claimer's balance, for the gas advance: always the swap's bound claimer
+    async fn balance_of(&self, _who: Address) -> Result<U256, DriverError> {
+        let r = self.rpc.call("getBalance", json!([to_base58(&self.binding.claimer), {"commitment": "confirmed"}])).await?;
+        Ok(U256::from(r["value"].as_u64().unwrap_or(0)))
     }
 }
 
@@ -763,6 +782,9 @@ impl EvmChain for AnyChain {
     }
     async fn funds(&self) -> Result<Funds, DriverError> {
         either!(self, c => c.funds().await)
+    }
+    async fn balance_of(&self, who: Address) -> Result<U256, DriverError> {
+        either!(self, c => c.balance_of(who).await)
     }
 }
 
