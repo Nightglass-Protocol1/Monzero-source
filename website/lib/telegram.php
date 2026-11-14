@@ -202,9 +202,9 @@ function tgDexOffer(array $l, int $now): ?array {
     $xmz = (int)$l['xmz'];
     $price = ($value / 10 ** $places) / ($xmz / 1e11);   // coin per XMZ
     $selling = $l['side'] === 'sell-xmz';
-    $line = ($selling ? '🟢 Sell ' : '🔵 Buy ') . tgDexAmount($xmz, 11, 4) . ' XMZ for ' . tgDexAmount($value, $places) . " $coin"
-        . ' · ' . rtrim(rtrim(number_format($price, 10, '.', ''), '0'), '.') . " $coin/XMZ"
-        . ' · ' . ($left >= 5400 ? round($left / 3600) . ' h left' : max(1, (int)round($left / 60)) . ' min left');
+    // Short on purpose: whole XMZ, the coin to 4 places, no per-XMZ price (it is all zeros)
+    $line = ($selling ? '🟢 Sell ' : '🔵 Buy ') . tgDexAmount($xmz, 11, $xmz >= 100 * 10 ** 11 ? 0 : 2) . ' XMZ for ' . tgDexAmount($value, $places, 4) . " $coin"
+        . ' (' . ($left >= 5400 ? round($left / 3600) . 'h' : max(1, (int)round($left / 60)) . 'm') . ')';
     return ['coin' => $coin, 'selling' => $selling, 'xmz' => $xmz, 'price' => $price, 'line' => $line];
 }
 
@@ -220,21 +220,17 @@ function tgDexSummary(array $listings, int $now, int $max = 12): ?string {
     $order = array_flip(array_column(TG_DEX_CHAINS, 0));
     usort($offers, static fn($a, $b) => [$order[$a['coin']], !$a['selling'], $a['selling'] ? $a['price'] : -$a['price']] <=> [$order[$b['coin']], !$b['selling'], $b['selling'] ? $b['price'] : -$b['price']]);
     $n = count($offers);
-    $text = '📊 Open trades on the Monzero DEX right now: ' . $n . "\n";
+    $text = '📊 Monzero DEX: ' . $n . ($n === 1 ? ' open trade' : ' open trades') . "\n";
     $coin = null;
     foreach (array_slice($offers, 0, $max) as $o) {
         if ($o['coin'] !== $coin) {
             $coin = $o['coin'];
-            $text .= "\nXMZ / $coin (" . count(array_filter($offers, static fn($x) => $x['coin'] === $coin)) . ")\n";
+            $text .= "\n$coin\n";
         }
         $text .= $o['line'] . "\n";
     }
-    if ($n > $max) $text .= '… and ' . ($n - $max) . " more on the DEX page\n";
-    $sum = static fn(bool $selling) => array_sum(array_map(static fn($o) => $o['selling'] === $selling ? $o['xmz'] : 0, $offers));
-    $text .= "\nIn total: " . tgDexAmount($sum(true), 11, 0) . ' XMZ for sale, ' . tgDexAmount($sum(false), 11, 0) . " XMZ wanted.\n"
-        . "🟢 Sell = the maker sells XMZ, you pay the coin. 🔵 Buy = the maker buys your XMZ.\n\n"
-        . "Each offer is taken whole, in one swap from your own Monzero wallet: no account, and nobody else holds your coins. If either side stops, both are refunded.\n\n"
-        . 'Trade: https://monzero.org/dex/';
+    if ($n > $max) $text .= '+ ' . ($n - $max) . " more\n";
+    $text .= "\n👉 monzero.org/dex";
     return $text;
 }
 
