@@ -71,6 +71,22 @@ public class DexPromptActivity extends SecureActivity {
         super.onPause();
     }
 
+    /**
+     * Leaving the "move it back" screen any way (Back, Home, another app) withdraws the question,
+     * like "Not now". Otherwise it stayed asked and the wallet reopened this screen every time it
+     * came to the front. A send already started carries on.
+     */
+    @Override
+    protected void onStop() {
+        if (!isChangingConfigurations() && (showing.equals("return") || showing.equals("done"))) {
+            returnAsked = false;
+            showing = "";
+            final DexService service = DexService.get();
+            if (service != null && service.engine() != null && service.bridge() != null) service.engine().post(service.bridge()::dismissReturn);
+        }
+        super.onStop();
+    }
+
     private Waiting waiting() {
         final DexService service = DexService.get();
         if (service == null || service.engine() == null) return null;
