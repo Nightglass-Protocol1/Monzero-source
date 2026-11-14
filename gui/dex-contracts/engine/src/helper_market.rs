@@ -103,6 +103,7 @@ fn parse_amount(text: &str, what: &str) -> Result<U256, String> {
 
 /// The EVM clock and head, and the XMZ height: what a saved trade records
 async fn heights(cfg: &TickConfig, chain: Chain, evm_from_block: Option<u64>) -> Result<Heights, String> {
+    crate::helper::step("reading the coin's network");
     if chain.is_solana() {
         let (now, slot) = crate::sol::clock(&cfg.evm_rpc).await.map_err(|e| e.to_string())?;
         let main = rpc(&cfg.main_wallet)?;
@@ -149,6 +150,7 @@ async fn check_funds(role: Role, listing: &Listing, key: &PrivateKeySigner, cfg:
             }
         }
         Role::Claimer => {
+            crate::helper::step("checking the XMZ trading wallet (it may still be syncing with the network)");
             let main = rpc(&cfg.main_wallet)?;
             main.call("refresh", json!({})).await.map_err(|e| e.to_string())?;
             let unlocked = main.call("get_balance", json!({})).await.map_err(|e| e.to_string())?["unlocked_balance"].as_u64().unwrap_or(0);
@@ -173,6 +175,7 @@ fn evm_chain(cfg: &TickConfig, listing: &Listing, from_block: u64, key: &Private
 /// Before offering or taking: the node is the listing's chain and the accounts can be paid (EVM:
 /// no code at the address); on Solana, the pinned swap program is there.
 async fn check_chain(cfg: &TickConfig, listing: &Listing, from_block: u64, key: &PrivateKeySigner, accounts: &[Address]) -> Result<(), String> {
+    crate::helper::step("checking the coin's network");
     let kind = Chain::from_id(listing.chain_id).ok_or("unknown chain")?;
     if kind.is_solana() {
         let program = crate::sol::program_of(kind).ok_or("no swap program is pinned for this Solana cluster")?;
@@ -248,8 +251,18 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
         let account = B256::from(crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes());
         crate::listing::SolAccount { schema: crate::listing::SOL_ACCOUNT_SCHEMA.into(), id: signed.listing.id, account }.sign(&key)
     });
+    crate::helper::step("sending the offer to the relays");
     let posted = client.post_listing(&signed, account.as_ref()).await;
+    mark_posted(dir, &posted);
     Ok(json!({"listing": signed, "posted": posted}))
+}
+
+/// `posted` in the offer's folder once a relay has it. Until then `serve` sends the offer again,
+/// so an offer whose first sending was cut short (no network, the helper stopped) still opens.
+fn mark_posted(dir: &Path, posted: &[Value]) {
+    if posted.iter().any(|p| p["ok"] == true) {
+        let _ = std::fs::write(dir.join("posted"), b"");
+    }
 }
 
 pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Value, String> {
@@ -267,6 +280,15 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
         return Err("these keys are not the offer's maker".into());
     }
     let id = file.listing.listing.id;
+    if !dir.join("posted").exists() && file.taken_by.is_none() && !file.closed {
+        crate::helper::step("sending the offer to the relays");
+        let account = chain_of_id(file.listing.listing.chain_id)?.is_solana().then(|| {
+            let account = B256::from(crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes());
+            crate::listing::SolAccount { schema: crate::listing::SOL_ACCOUNT_SCHEMA.into(), id, account }.sign(&key)
+        });
+        mark_posted(dir, &client.post_listing(&file.listing, account.as_ref()).await);
+    }
+    crate::helper::step("reading the offer's mail on the relays");
     let mailbox = seed.mailbox(id, true);
     let mut maker = Maker::new(file.listing.clone(), file.taken_by);
     let mut at: Option<Heights> = None;

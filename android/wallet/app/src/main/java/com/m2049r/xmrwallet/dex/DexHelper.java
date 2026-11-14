@@ -57,6 +57,8 @@ final class DexHelper {
     void run(final JSONObject request, final long timeoutMs, final int maxOutput, final Done done) {
         final byte[] input;
         try {
+            // The helper answers by itself, naming the slow step, shortly before it would be stopped here
+            request.put("deadlineSecs", Math.max(5, timeoutMs / 1000 - 10));
             input = request.toString().getBytes("UTF-8");
         } catch (Exception e) {
             handler.post(() -> done.done(null));

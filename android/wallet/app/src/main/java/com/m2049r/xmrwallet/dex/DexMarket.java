@@ -281,6 +281,9 @@ final class DexMarket {
             state = r == null ? "failed" : "refused";
             final String e = r == null ? "no valid answer from the helper (" + helper.lastFailure() + ")" : r.optString("error");
             error = e.length() > 300 ? e.substring(0, 300) : e;
+            // An offer that was written before the helper stopped is ours all the same: it shows as
+            // open and the next step sends it to the relays
+            if (r == null && "post".equals(command)) scanFolders();
             listener.marketChanged();
             return;
         }
