@@ -200,10 +200,17 @@ async fn main() {
     log(format!("maker posted: {}", posted.get("posted").unwrap_or(&Value::Null)));
 
     // 2. The taker finds it among the relay's checked offers
-    let found = taker.call("listings", json!({"pair": pair()})).await;
     let id = serde_json::from_str::<Value>(&std::fs::read_to_string(maker.dir.join("listing.json")).unwrap()).unwrap()["listing"]["listing"]["id"].clone();
-    let listing = found["listings"].as_array().unwrap().iter().find(|l| l["signed"]["listing"]["id"] == id).expect("our offer on the relay")["signed"].clone();
-    log(format!("taker found offer {id} among {}", found["listings"].as_array().unwrap().len()));
+    // A run that is being resumed already took the offer: it is no longer on the relay's board
+    let listing = if taker.dir.join("take.json").exists() {
+        log("taker: resuming the take it already made");
+        serde_json::from_str::<Value>(&std::fs::read_to_string(taker.dir.join("take.json")).unwrap()).unwrap()["listing"].clone()
+    } else {
+        let found = taker.call("listings", json!({"pair": pair()})).await;
+        let listing = found["listings"].as_array().unwrap().iter().find(|l| l["signed"]["listing"]["id"] == id).expect("our offer on the relay")["signed"].clone();
+        log(format!("taker found offer {id} among {}", found["listings"].as_array().unwrap().len()));
+        listing
+    };
 
     // 3. Take: the taker waits for its XMZ to unlock, then both sides call until agreed
     let mut agreed = (false, false);
