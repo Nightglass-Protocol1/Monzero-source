@@ -66,6 +66,9 @@ pub struct Request {
     /// `withdraw`: the chain whose trade account is emptied
     #[serde(default)]
     pub chain_id: Option<u64>,
+    /// `routes`: the chain's RPC, to price the network fees a route keeps back
+    #[serde(default)]
+    pub evm_rpc: Option<String>,
     /// `xmzWallet`: the app's DEX XMZ wallet
     #[serde(default)]
     pub xmz_wallet: Option<crate::helper_wallet::XmzWalletRequest>,
@@ -96,6 +99,8 @@ pub enum Command {
     XmzWallet,
     /// The trade accounts of these keys: the EVM address and the Solana address
     Accounts,
+    /// XMZ → XMR routes among the relays' offers on one chain (`chainId`, `evmRpc`), best first
+    Routes,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +178,7 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         Command::Tick => tick(&r.trade_dir, r.tick).await,
         Command::Payout => payout(&r.trade_dir, r.tick, r.payout_address.as_deref()).await,
         Command::Listings => market_listings(&r).await,
+        Command::Routes => market_routes(&r).await,
         Command::Post => match (&r.tick, &r.offer) {
             (Some(t), Some(o)) => crate::helper_market::post(&r.trade_dir, t, relays(&r)?, o, accept(&r)).await,
             _ => Err("post needs tick (keys and endpoints) and offer".into()),
@@ -203,6 +209,25 @@ fn relays(r: &Request) -> Result<&[String], String> {
 async fn market_listings(r: &Request) -> Result<Value, String> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     crate::helper_market::listings(relays(r)?, r.pair.as_deref(), accept(r), now).await
+}
+
+/// XMZ → XMR routes on one EVM chain. The fees kept back are what the taker's leg-2 lock,
+/// `setReady` and a possible refund can cost at the current gas price.
+async fn market_routes(r: &Request) -> Result<Value, String> {
+    use alloy::providers::{Provider, ProviderBuilder};
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let chain = r.chain_id.and_then(Chain::from_id).ok_or("routes needs a known chainId")?;
+    if chain.is_solana() {
+        return Err("XMZ → XMR routes run through BNB or ETH for now".into());
+    }
+    let rpc = r.evm_rpc.as_deref().ok_or("routes needs evmRpc")?;
+    let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
+    let fees = provider.estimate_eip1559_fees().await.map_err(|e| e.to_string())?;
+    let reserve = alloy::primitives::U256::from(crate::driver::GAS_PER_CALL * 3 * 2) * alloy::primitives::U256::from(fees.max_fee_per_gas);
+    let found = crate::helper_market::listings(relays(r)?, None, accept(r), now).await?;
+    let offers: Vec<crate::listing::SignedListing> =
+        found["listings"].as_array().into_iter().flatten().filter_map(|l| serde_json::from_value(l["signed"].clone()).ok()).collect();
+    Ok(json!({"routes": crate::route::buy_xmr_routes(&offers, chain, reserve), "reserveWei": reserve.to_string(), "relayErrors": found["relayErrors"]}))
 }
 
 fn journal(dir: &Path) -> FileJournal {
