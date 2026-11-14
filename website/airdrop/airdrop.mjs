@@ -34,7 +34,7 @@ function shareText(refLink) {
 const TASKS = [
   { key: "wallet", title: "Create a wallet", desc: "Your XMZ address is registered. This reward unlocks once you verify Telegram or mining." },
   { key: "telegram", title: "Join the Telegram", desc: "Join the channel, then verify in one tap." },
-  { key: "mining", title: "Mine XMZ", desc: "Mine on the pool for 7 days over the month (they don't have to be in a row). Highest reward — real work for the network." },
+  { key: "mining", title: "Mine XMZ", desc: "Mine on the pool on 7 different days during the campaign (they don't have to be in a row). Highest reward — real work for the network." },
   { key: "forum_post", title: "Join the forum & post", desc: "Sign up to the Monzero forum and make your first genuine post. A mod checks it.", review: true, openHref: "/community/board/", openLabel: "Open the forum ↗", placeholder: "Your forum username or post link" },
   { key: "forum_active", title: "Stay active on the forum", desc: "Over a week, make 5+ real posts (no spam). A mod reviews them for quality.", review: true, openHref: "/community/board/", openLabel: "Open the forum ↗", placeholder: "Your forum username" },
   { key: "run_node", title: "Run a node", desc: "Run your own Monzero node to strengthen the network, then submit its address. A mod verifies it's live.", review: true, openHref: "/mining/", openLabel: "Node setup \u2197", placeholder: "Your node IP or host, e.g. 203.0.113.9:6174" },
@@ -131,7 +131,7 @@ function showRegister() {
 
 function fmtEnd(ts) {
   if (!ts) return "—";
-  try { return new Date(ts * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }); } catch { return "—"; }
+  try { return new Date(ts * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" }); } catch { return "—"; }
 }
 
 async function registerFlow() {

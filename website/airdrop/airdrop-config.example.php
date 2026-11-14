@@ -18,7 +18,7 @@ return [
     'max_per_ip'     => 3,                // max airdrop entries per IP (0 = no limit). Lenient for shared NAT.
     'trusted_proxies' => [],              // e.g. ['173.245.48.0/20'] if a CDN sets CF-Connecting-IP / X-Real-IP
     'starts_at'      => 0,                // unix time, 0 = now
-    'ends_at'        => 0,                // REQUIRED unix end time (the airdrop stays closed while 0), e.g. date -d '+30 days' +%s
+    'ends_at'        => 1801439999,       // REQUIRED unix end time (closed while 0). 1801439999 = 2027-01-31 23:59:59 UTC
     'admin_token'    => '',               // optional master key; then open /airdrop/admin.php?key=THAT
     // Moderators sign in at /airdrop/admin.php with their XMZ address + Telegram handle +
     // password + PIN (all four must match). Approvals are credited to them and paid to 'address'.
