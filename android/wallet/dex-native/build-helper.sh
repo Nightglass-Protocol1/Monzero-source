@@ -33,6 +33,7 @@ for abi in "${ABIS[@]}"; do
     -e CARGO_INCREMENTAL=0 -e CARGO_HTTP_LOW_SPEED_LIMIT=0 \
     -e ANDROID_NDK_ROOT=/ndk -e ANDROID_NDK_HOME=/ndk \
     -e "CARGO_TARGET_${upper}_LINKER=$bin/${triple}${API}-clang" \
+    -e "CARGO_TARGET_${upper}_RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384" \
     -e "CC_${under}=$bin/${triple}${API}-clang" -e "CXX_${under}=$bin/${triple}${API}-clang++" \
     -e "AR_${under}=$bin/llvm-ar" -e "RANLIB_${under}=$bin/llvm-ranlib" \
     -w /src/engine "$IMAGE" bash -euc "
@@ -44,5 +45,10 @@ for abi in "${ABIS[@]}"; do
   mkdir -p "$out"
   "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" -o "$out/libmonzero_dex_helper.so" \
     "$REPO/gui/dex-contracts/engine/target/android/$triple/release/monzero-dex-evm-helper"
+  # Phones with 16 KB memory pages (newer Android 15+ devices) refuse to run a program whose
+  # segments are only 4 KB aligned, so check the result rather than trust the flags.
+  "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -lW "$out/libmonzero_dex_helper.so" |
+    awk '$1=="LOAD" && strtonum($NF) < 16384 {bad=1} END {exit bad}' ||
+    { echo "!! $abi helper is not 16 KB page aligned"; exit 1; }
   sha256sum "$out/libmonzero_dex_helper.so"
 done
