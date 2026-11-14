@@ -183,6 +183,24 @@ function tgDexRelays(): array {
         is_string($u) && strlen($u) <= 200 && preg_match('#^https?://[A-Za-z0-9.\-]+(:\d{1,5})?(/[A-Za-z0-9._\-/]*)?$#', $u)));
 }
 
+// Makers whose offers the feed leaves out: the project's own liquidity bot (its trade accounts, from
+// `liquidity_bot.py CONFIG accounts`), so its standing ladder never fills or re-triggers the feed.
+function tgDexQuietMakers(): array {
+    $path = tgPrivateDir() . '/dex-status.php';
+    if (!is_file($path) || is_link($path)) return [];
+    $o = (static fn() => require $path)();
+    if (!is_array($o) || !is_array($o['quiet_makers'] ?? null)) return [];
+    $out = [];
+    foreach ($o['quiet_makers'] as $m) if (is_string($m) && preg_match('/\A0x[0-9a-fA-F]{40}\z/', $m)) $out[strtolower($m)] = true;
+    return $out;
+}
+
+// The offers the feed may announce: everything but the quiet makers'
+function tgDexAnnounced(array $listings, array $quiet): array {
+    return array_values(array_filter(array_slice($listings, 0, 2000), static fn($s) =>
+        is_array($s) && is_array($s['listing'] ?? null) && !isset($quiet[strtolower((string)($s['listing']['maker'] ?? ''))])));
+}
+
 // The main networks an offer is announced for: chain id => [coin, network name, decimals of its smallest unit]
 const TG_DEX_CHAINS = [1 => ['ETH', 'Ethereum', 18], 56 => ['BNB', 'BNB Smart Chain', 18], 501000101 => ['SOL', 'Solana', 9]];
 
@@ -241,19 +259,29 @@ function tgDexSummary(array $listings, int $now, int $max = 12): ?string {
     return $text;
 }
 
-// A summary of the open offers every feed_dex_hours, and only while there are any: with nothing
-// open, or no relay answering, nothing is posted and the next check looks again.
+// A summary of the open offers at most every feed_dex_hours, only while there are any, and only when
+// they changed since the last summary (the same board is never posted twice). The project's own
+// liquidity offers are left out. With nothing new, or no relay answering, nothing is posted.
 function tgFeedDex(array $config, int $now): bool {
     if (!$config['feed_chat'] || $config['feed_dex_hours'] === 0) return false;
     if ($now - (int)tgMeta('feed_dex_at') < $config['feed_dex_hours'] * 3600 - 60) return false;
     $context = stream_context_create(['http' => ['timeout' => 5, 'ignore_errors' => true, 'follow_location' => 0]]);
-    $text = null;
+    $text = null; $board = '';
     foreach (tgDexRelays() as $base) {
         $data = json_decode((string)@file_get_contents(rtrim($base, '/') . '/v1/listings', false, $context, 0, 4194304), true);
-        if (is_array($data) && is_array($data['listings'] ?? null)) { $text = tgDexSummary($data['listings'], $now); break; }
+        if (is_array($data) && is_array($data['listings'] ?? null)) {
+            $shown = tgDexAnnounced($data['listings'], tgDexQuietMakers());
+            $text = tgDexSummary($shown, $now);
+            $ids = [];
+            foreach ($shown as $sl) if (tgDexOffer($sl['listing'], $now)) $ids[] = (string)($sl['listing']['id'] ?? '');
+            sort($ids);
+            $board = hash('sha256', implode(',', $ids));
+            break;
+        }
     }
-    if ($text === null) return false;
+    if ($text === null || $board === (string)tgMeta('feed_dex_board')) return false;
     tgMeta('feed_dex_at', (string)$now);   // before sending: a failed send is not repeated within the hour
+    tgMeta('feed_dex_board', $board);
     return tgFeedSend($config, $text);
 }
 
