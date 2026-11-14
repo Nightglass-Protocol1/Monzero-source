@@ -34,6 +34,31 @@ Each leg is atomic on its own. Between the legs the user holds BNB and carries i
 movement; no one else ever holds their coins. If no XMR offer suits them, they keep the BNB or
 send it back to MetaMask.
 
+## XMR only through XMZ (owner rule, 2026-11-14)
+
+Owner: "the only way you can get xmr is by trading xmz for xmr". XMZ is the hub: BNB, ETH and
+SOL trade against XMZ as today, and XMR is reached only from XMZ.
+
+A direct XMZ/XMR swap is still impossible (see above), so the rule is carried by the two-leg
+route, not by a new swap:
+
+- The page and the apps show one Monero market, `XMZ/XMR`. There is no `BNB/XMR`, `ETH/XMR` or
+  `SOL/XMR` market to pick; those pairs exist only as the hidden second leg.
+- Buying XMR = leg 1 sells XMZ for BNB/ETH/SOL, leg 2 spends that same coin on XMR. Leg 2 can
+  only be started from a finished leg 1, for at most the amount leg 1 paid out.
+- Enforced, not just hidden: before agreeing, the XMR seller's app checks on chain that the
+  taker's trade account was paid by a swap-contract claim of an XMZ offer (a relay print) of at
+  least the leg-2 amount, within the last 24 hours, not already used for another leg 2. Takers
+  without one are refused. Relays apply the same check to takes they carry.
+- Selling XMR runs the other way and ends in XMZ: leg 1 sells XMR for BNB/ETH/SOL, leg 2 buys
+  XMZ with it. The page offers no way to stop at leg 1 and keep the BNB, though the coins are
+  the user's and can always be moved out of the trade account.
+
+Limit, stated plainly: someone running changed software could still sell their XMR to a taker
+who never held XMZ; the rule binds the project's apps, page and relays, not the two chains.
+
+Not built yet; it belongs to the app integration below.
+
 ## Node trust (new)
 
 The wallet service believes its node. A lying Monero node could show an XMR lock that is not on
