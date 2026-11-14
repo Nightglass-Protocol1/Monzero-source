@@ -28,8 +28,9 @@ rpc() { curl -s -m 600 "http://127.0.0.1:$FUNDER_PORT/json_rpc" -H 'content-type
 field() { python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('$1',''))"; }
 
 echo "== stagenet funding wallet"
-systemctl --user stop dex-xmr-funder dex-xmr-relay 2>/dev/null || true
-systemd-run --user --quiet --unit=dex-xmr-funder --collect "$MONERO_DIR/linux-x64/monero-wallet-rpc" --stagenet \
+systemctl --user stop dex-xmr-relay 2>/dev/null || true
+# A funding wallet left running by an earlier run is used as it is
+rpc get_version | grep -q result || systemd-run --user --quiet --unit=dex-xmr-funder --collect "$MONERO_DIR/linux-x64/monero-wallet-rpc" --stagenet \
   --wallet-dir "$WORK/funder" --daemon-address "$NODE" --trusted-daemon --disable-rpc-login \
   --rpc-bind-ip 127.0.0.1 --rpc-bind-port $FUNDER_PORT --non-interactive --log-file "$WORK/funder.log"
 trap 'systemctl --user stop dex-xmr-funder dex-xmr-relay 2>/dev/null || true' EXIT
