@@ -80,7 +80,7 @@ function boardPage(string $title, string $body, ?array $account, array $crumbs =
         . '<body class="site-shell bb"><a class="skip-link" href="#main">Skip to content</a>' . siteHeader('/community/board/')
         . '<main id="main" tabindex="-1">' . navbar($account) . '<div class="bb-crumbs" role="navigation" aria-label="Breadcrumb">' . $trail . '</div><h1>' . authH($title) . '</h1>' . $body . '</main>'
         . '<footer><p><a href="/community/">Monzero community</a> · <a href="/community/board/?view=rules">Forum rules</a> · <a href="/community/board/?view=team">The team</a> · <a href="/community/board/?view=bbcode">BBCode guide</a> · <a href="/privacy/">Privacy Policy</a> · <a href="/terms/">Website Terms</a> · All times are UTC</p></footer>'
-        . '<script src="/site-nav.js?v=20261020-sitewide" defer></script><script type="module" src="/community/board/board-editor.mjs?v=20261022-likes"></script></body></html>';
+        . '<script src="/site-nav.js?v=20261113-noticker" defer></script><script type="module" src="/community/board/board-editor.mjs?v=20261022-likes"></script></body></html>';
     exit;
 }
 

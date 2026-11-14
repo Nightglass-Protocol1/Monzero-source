@@ -261,7 +261,7 @@ page = f'''<!doctype html>
 {body}
   </main>
   <footer class="footer wrap"><a class="brand" href="../"><img class="brand-mark brand-coin" src="../assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"> MONZERO</a><p>Experimental, community-run development.<br>Marketing kit · updated 3 November 2026.</p><a href="#main">Back to top ↑</a></footer>
-  <script type="module" src="marketing.mjs?v=20261103"></script><script src="../site-nav.js?v=20261026-brand" defer></script>
+  <script type="module" src="marketing.mjs?v=20261103"></script><script src="../site-nav.js?v=20261113-noticker" defer></script>
 </body>
 </html>
 '''

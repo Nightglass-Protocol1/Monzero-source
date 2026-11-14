@@ -16,7 +16,7 @@ function votePage(string $title, string $body, int $status = 200): never {
         . '<body class="site-shell"><a class="skip-link" href="#main">Skip to content</a>' . siteHeader('/community/voting/')
         . '<main id="main" tabindex="-1"><p class="eyebrow">COMMUNITY VOTING</p><h1>' . authH($title) . '</h1>' . $body . '</main>'
         . '<footer><p><a href="/community/">Monzero community</a> · <a href="/privacy/">Privacy Policy</a> · <a href="/terms/">Website Terms</a></p></footer>'
-        . '<script src="/site-nav.js?v=20261020-sitewide" defer></script></body></html>';
+        . '<script src="/site-nav.js?v=20261113-noticker" defer></script></body></html>';
     exit;
 }
 

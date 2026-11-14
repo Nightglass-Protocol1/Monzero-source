@@ -31,7 +31,7 @@ function page(string $title, string $body, ?array $member = null, bool $turnstil
         . ($turnstile ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : '')
         . '<link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261020-sitewide"></noscript></head><body class="site-shell"><a class="skip-link" href="#main">Skip to content</a>' . siteHeader('/faucet/')
         . '<main id="main" tabindex="-1"><p class="eyebrow">XMZ FAUCET</p><h1>' . authH($title) . '</h1>' . $account . $body . '</main><footer><p><a href="/community/">Monzero community</a> · <a href="/privacy/">Privacy Policy</a> · <a href="/terms/">Website Terms</a></p></footer>'
-        . '<script src="/site-nav.js?v=20261020-sitewide" defer></script>' . ($qr ? '<script type="module" src="/faucet/faucet.mjs?v=20261021"></script>' : '') . '</body></html>';
+        . '<script src="/site-nav.js?v=20261113-noticker" defer></script>' . ($qr ? '<script type="module" src="/faucet/faucet.mjs?v=20261021"></script>' : '') . '</body></html>';
 }
 
 function notice(string $text, bool $error = false): string { return '<p class="notice' . ($error ? ' error" role="alert"' : '" role="status"') . '>' . authH($text) . '</p>'; }

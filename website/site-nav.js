@@ -62,65 +62,6 @@
   });
 })();
 
-// Scrolling headline banner above the header on public pages (not /admin). Reads
-// /news/data/latest.json and stays absent when there is no news.
-(function () {
-  "use strict";
-  const header = document.querySelector(".site-header");
-  const nav = document.getElementById("site-nav");
-  if (!header || !nav || document.body.dataset.newsTicker === "off" || nav.getAttribute("aria-label") !== "Primary navigation" || document.getElementById("news-ticker")) return;
-  const ticker = document.createElement("div");
-  ticker.className = "news-ticker"; ticker.id = "news-ticker"; ticker.hidden = true;
-  ticker.setAttribute("role", "region"); ticker.setAttribute("aria-label", "Top crypto headlines");
-  const label = document.createElement("a");
-  label.className = "ticker-label"; label.href = "/news/"; label.textContent = "Crypto news";
-  const viewport = document.createElement("div");
-  viewport.className = "ticker-viewport";
-  const track = document.createElement("ul");
-  track.className = "ticker-track"; track.id = "ticker-track";
-  viewport.append(track);
-  const pause = document.createElement("button");
-  pause.className = "ticker-pause"; pause.id = "ticker-pause"; pause.type = "button";
-  pause.setAttribute("aria-pressed", "false"); pause.setAttribute("aria-label", "Pause the headlines");
-  ticker.append(label, viewport, pause);
-  header.before(ticker);
-  const https = (v) => { try { const u = new URL(v); return u.protocol === "https:" && !u.username && !u.password; } catch { return false; } };
-
-  function item(story, copy) {
-    const li = document.createElement("li");
-    const a = document.createElement("a");
-    a.href = story.url;
-    a.rel = "noopener noreferrer nofollow";
-    a.textContent = story.title;
-    const source = document.createElement("small");
-    source.textContent = story.source;
-    li.append(a, source);
-    // The second copy only makes the loop seamless: hide it from screen readers and the Tab key.
-    if (copy) { li.setAttribute("aria-hidden", "true"); a.tabIndex = -1; }
-    return li;
-  }
-
-  fetch("/news/data/latest.json", { headers: { Accept: "application/json" }, cache: "no-cache" })
-    .then((r) => (r.ok ? r.json() : null))
-    .then((d) => {
-      if (!d || d.schema !== "monzero-news-v1" || !Array.isArray(d.stories)) return;
-      const stories = d.stories.filter((s) => s && typeof s.title === "string" && s.title.length <= 300 && typeof s.source === "string" && https(s.url));
-      if (!stories.length) return;
-      track.replaceChildren(...stories.map((s) => item(s, false)), ...stories.map((s) => item(s, true)));
-      ticker.hidden = false;
-      // Constant reading speed (about 60 px per second) whatever the number of headlines.
-      const width = track.scrollWidth / 2;
-      track.style.setProperty("--ticker-duration", `${Math.max(30, Math.round(width / 60))}s`);
-    })
-    .catch(() => {});
-
-  pause.addEventListener("click", () => {
-    const paused = ticker.classList.toggle("paused");
-    pause.setAttribute("aria-pressed", String(paused));
-    pause.setAttribute("aria-label", paused ? "Play the headlines" : "Pause the headlines");
-  });
-})();
-
 // v1.0.0 upgrade banner (block 21,000): countdown before the fork, a short notice for a day after it,
 // then nothing. Not in /admin or on /upgrade/ itself; "Hide" keeps it away for 24 hours.
 (function () {
@@ -164,7 +105,7 @@
       // API reply cannot push the first screen down after it has been painted.
       const slot = document.querySelector("[data-upgrade-slot]");
       if (slot) slot.replaceChildren(bar);
-      else (document.getElementById("news-ticker") || header).before(bar);
+      else header.before(bar);
     })
     .catch(() => {});
 })();
