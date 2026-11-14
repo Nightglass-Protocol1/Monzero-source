@@ -331,7 +331,8 @@ pub(crate) fn xmz_parts(
     if network == crate::xmz::XmzNetwork::XmrMainnet && cfg.witness_daemons.len() < MIN_XMR_WITNESSES && Chain::from_id(saved.offer.chain_id) != Some(Chain::Local) {
         return Err(format!("a Monero trade needs at least {MIN_XMR_WITNESSES} independent Monero nodes (witnessDaemons) to confirm the lock"));
     }
-    for w in &cfg.witness_daemons {
+    // Test networks may use plain http nodes; real coins never do
+    for w in cfg.witness_daemons.iter().filter(|_| network.is_mainnet()) {
         if !(w.starts_with("https://") || w.starts_with("http://127.0.0.1:") || w.starts_with("http://localhost:")) {
             return Err("witnessDaemons must be https addresses".into());
         }
