@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory() as tmp:
  (private/'airdrop-config.php').write_text(f"<?php return ['enabled'=>true,'pool_xmz'=>8000,'ends_at'=>{int(time.time())+30*86400},'max_per_ip'=>0,'admin_reward_xmz'=>0.25,'pool_stats'=>'http://127.0.0.1:1/x'];\n")
  with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
  base=f'http://127.0.0.1:{port}'
- env={**os.environ,'MONZERO_PRIVATE_DIR':str(private),'MONZERO_ADMIN_DB':str(private/'admin.sqlite'),'MONZERO_ADMIN_MAIL_LOG':str(mail),'MONZERO_ADMIN_BASE_URL':base}
+ env={**os.environ,'MONZERO_PRIVATE_DIR':str(private),'MONZERO_ADMIN_DB':str(private/'admin.sqlite'),'MONZERO_ADMIN_MAIL_LOG':str(mail),'MONZERO_ADMIN_BASE_URL':base,'MONZERO_BOARD_DB':str(private/'board.sqlite'),'MONZERO_FAUCET_DB':str(private/'faucet.sqlite')}
  assert subprocess.run(['php',str(site/'admin/bootstrap.php'),'security@monzero.org'],env=env,capture_output=True).returncode==0
  server=subprocess.Popen(['php','-d','opcache.enable=0','-S',f'127.0.0.1:{port}','-t',str(site)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  try:
