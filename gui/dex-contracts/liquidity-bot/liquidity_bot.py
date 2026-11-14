@@ -679,6 +679,16 @@ def main():
                     gas = bot.gas_balance(pair, acct) if acct else None
                     have = units(gas, p["decimals"]) if gas is not None else "?"
                     print(f"{pair}-{slot}: {acct}  holds {have} {pair}, needs at least {units(p['keep'], p['decimals'])}")
+            # The offers' maker addresses (EVM form for every pair): the website's Telegram feed
+            # leaves these out (quiet_makers in monzero-private/dex-status.php)
+            makers = []
+            for pair in cfg["pairs"]:
+                for slot, _ in enumerate(cfg["ladder_percent"]):
+                    r = bot.helper({"command": "accounts", "tradeDir": str(bot.state_dir), "tick": bot.tick_config(pair, slot)})
+                    if r.get("ok"):
+                        makers.append(r["evm"])
+            print("quiet_makers for the website's dex-status.php:")
+            print("  " + json.dumps(makers))
         elif a.command == "once":
             if "error" in bot.open_wallet():
                 sys.exit("the XMZ wallet could not be opened")
