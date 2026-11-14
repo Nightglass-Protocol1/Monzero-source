@@ -30,7 +30,8 @@ python3 -m py_compile "$HERE/liquidity_bot.py"
 python3 -W ignore "$HERE/test_liquidity_bot.py" 2>&1 | tail -1
 HELPER=$ENGINE/target/host-test/release/monzero-dex-evm-helper
 [ -x "$HELPER" ] || { echo "!! build the helper first (see README.md)"; exit 1; }
-"$HELPER" </dev/null | grep -q '"ok":false' || { echo "!! $HELPER does not run"; exit 1; }
+# An empty request is answered with an error (exit 1): that answer shows the program runs
+grep -q '"ok":false' <<<"$("$HELPER" </dev/null 2>&1 || true)" || { echo "!! $HELPER does not run"; exit 1; }
 
 echo "== copying"
 scp -q "$HERE/liquidity_bot.py" "$HELPER" "$HERE/deploy/monzero-liquidity.service" "$HERE/config.example.json" "$HOST:/tmp/"
@@ -60,7 +61,7 @@ PY
   echo "wrote /etc/monzero-liquidity/config.json (daemon $DAEMON)"
 fi
 rm -f /tmp/liquidity_bot.py /tmp/monzero-dex-evm-helper /tmp/monzero-liquidity.service /tmp/config.example.json
-/opt/monzero-liquidity/monzero-dex-evm-helper </dev/null | grep -q '"ok":false' || {
+grep -q '"ok":false' <<<"$(/opt/monzero-liquidity/monzero-dex-evm-helper </dev/null 2>&1 || true)" || {
   echo "!! the trade helper does not run on this server (too old a system library?)"; exit 1; }
 systemctl daemon-reload
 if systemctl is-active -q monzero-liquidity; then systemctl restart monzero-liquidity; echo "restarted (it was running)"; fi
