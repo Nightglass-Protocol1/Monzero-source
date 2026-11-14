@@ -279,7 +279,7 @@ final class DexMarket {
         busy = false;
         if (r == null || !r.optBoolean("ok")) {
             state = r == null ? "failed" : "refused";
-            final String e = r == null ? "no valid answer from the helper" : r.optString("error");
+            final String e = r == null ? "no valid answer from the helper (" + helper.lastFailure() + ")" : r.optString("error");
             error = e.length() > 300 ? e.substring(0, 300) : e;
             listener.marketChanged();
             return;
