@@ -195,6 +195,18 @@ function adDb(): PDO {
             CREATE INDEX IF NOT EXISTS ix_submissions_reviewer ON submissions(reviewer, status);
             PRAGMA user_version = 6;");
     }
+    if ((int)$db->query('PRAGMA user_version')->fetchColumn() < 7) {
+        // Owner tools: disqualify/reinstate entries, XMZ adjustments with a reason, and a per-entry log.
+        $db->exec("ALTER TABLE participants ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+            ALTER TABLE participants ADD COLUMN status_reason TEXT NOT NULL DEFAULT '';
+            CREATE TABLE IF NOT EXISTS adjustments (id INTEGER PRIMARY KEY, participant_id INTEGER NOT NULL, centi INTEGER NOT NULL,
+                reason TEXT NOT NULL, actor TEXT NOT NULL, at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_adjustments_p ON adjustments(participant_id);
+            CREATE TABLE IF NOT EXISTS participant_log (id INTEGER PRIMARY KEY, participant_id INTEGER NOT NULL, actor TEXT NOT NULL,
+                action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_participant_log_p ON participant_log(participant_id);
+            PRAGMA user_version = 7;");
+    }
     return $db;
 }
 
@@ -352,7 +364,7 @@ function adCheckMining(array $p): bool {
 function adReferralPoints(array $p): int {
     $n = (int)adDb()->query('SELECT COUNT(DISTINCT pr.participant_id) FROM participants c
         JOIN progress pr ON pr.participant_id = c.id AND pr.task IN (\'telegram\',\'mining\')
-        WHERE c.referred_by = ' . adDb()->quote($p['ref_code']))->fetchColumn();
+        WHERE c.status = \'active\' AND c.referred_by = ' . adDb()->quote($p['ref_code']))->fetchColumn();
     return $n * adPoints('referral');
 }
 
@@ -380,7 +392,10 @@ function adStatus(array $p): array {
     $refEarned = min($refCapCenti, $refPoints);
     $rewards = ['wallet' => adRewardXmz('wallet'), 'telegram' => adRewardXmz('telegram'), 'mining' => adRewardXmz('mining'), 'referral' => adRewardXmz('referral')];
     foreach (adReviewTasks() as $rt) $rewards[$rt] = adRewardXmz($rt);
+    $tot = adTotals((int)$p['id'])[0] ?? ['centi' => 0, 'adj' => 0, 'status' => 'active'];
     return [
+        'disqualified' => $tot['status'] !== 'active',
+        'adjustment' => $tot['adj'] / 100,
         'address' => adShort($p['address']),
         'ref_code' => $p['ref_code'],
         'tasks' => array_merge([
@@ -394,7 +409,7 @@ function adStatus(array $p): array {
         'cap' => adConfig()['per_person_cap'],
         'referral_earned' => $refEarned / 100,
         'referral_cap' => adConfig()['referral_cap'],
-        'earned' => ($taskEarned + $refEarned) / 100,
+        'earned' => $tot['centi'] / 100,
         'mining_days' => adMiningDays((int)$p['id']),
         'mining_days_required' => adConfig()['mining_days_required'],
     ];
@@ -404,6 +419,7 @@ function adReviewTasks(): array { return ['share_x', 'share_instagram', 'forum_p
 
 function adSubmit(array $p, string $task, string $detail): array {
     if (!in_array($task, adReviewTasks(), true)) return ['error' => 'Unknown task.'];
+    if (($p['status'] ?? 'active') !== 'active') return ['error' => 'This airdrop entry has been disqualified.'];
     $detail = trim($detail);
     if ($detail === '') return ['error' => 'Please enter the required detail.'];
     if (strlen($detail) > 400) return ['error' => 'That is too long.'];
@@ -443,20 +459,28 @@ function adAdminPayouts(): array {
     return $out;
 }
 
-// Every participant's capped total in centi-XMZ, in one query.
-function adTotals(): array {
+// Every participant's total in centi-XMZ, in one query: tasks (capped) + verified referrals
+// (capped, active referred entries only) + owner adjustments, never below 0. Disqualified = 0.
+// $pid limits it to one participant.
+function adTotals(?int $pid = null): array {
     $db = adDb();
-    $rows = $db->query("SELECT p.id, p.address,
+    $q = $db->prepare("SELECT p.id, p.address, p.status,
         COALESCE((SELECT SUM(points) FROM progress WHERE participant_id = p.id), 0)
         + COALESCE((SELECT SUM(points) FROM submissions WHERE participant_id = p.id AND status = 'approved'), 0) AS base,
-        (SELECT COUNT(*) FROM participants c WHERE c.referred_by = p.ref_code
-            AND EXISTS (SELECT 1 FROM progress pr WHERE pr.participant_id = c.id AND pr.task IN ('telegram','mining'))) AS refs
-        FROM participants p")->fetchAll();
+        (SELECT COUNT(*) FROM participants c WHERE c.referred_by = p.ref_code AND c.status = 'active'
+            AND EXISTS (SELECT 1 FROM progress pr WHERE pr.participant_id = c.id AND pr.task IN ('telegram','mining'))) AS refs,
+        COALESCE((SELECT SUM(centi) FROM adjustments WHERE participant_id = p.id), 0) AS adj
+        FROM participants p" . ($pid !== null ? ' WHERE p.id = ?' : ''));
+    $q->execute($pid !== null ? [$pid] : []);
     $cap = adCapCenti();
     $refCap = (int)round(adConfig()['referral_cap'] * 100);
     $out = [];
-    foreach ($rows as $r) $out[] = ['id' => (int)$r['id'], 'address' => $r['address'],
-        'centi' => min($cap, (int)$r['base']) + min($refCap, (int)$r['refs'] * adPoints('referral'))];
+    foreach ($q->fetchAll() as $r) {
+        $tasks = min($cap, (int)$r['base']); $refs = min($refCap, (int)$r['refs'] * adPoints('referral'));
+        $centi = $r['status'] === 'active' ? max(0, $tasks + $refs + (int)$r['adj']) : 0;
+        $out[] = ['id' => (int)$r['id'], 'address' => $r['address'], 'status' => $r['status'], 'tasks' => $tasks, 'refs' => $refs,
+            'referred_verified' => (int)$r['refs'], 'adj' => (int)$r['adj'], 'centi' => $centi];
+    }
     return $out;
 }
 
@@ -501,7 +525,7 @@ function adFinalPayouts(): array {
 
 function adLeaderboard(int $limit = 20): array {
     $out = [];
-    foreach (adTotals() as $t) $out[] = ['address' => adShort($t['address']), 'xmz' => $t['centi'] / 100];
+    foreach (adTotals() as $t) if ($t['status'] === 'active') $out[] = ['address' => adShort($t['address']), 'xmz' => $t['centi'] / 100];
     usort($out, fn($a, $b) => $b['xmz'] <=> $a['xmz']);
     return array_slice($out, 0, max(1, min(100, $limit)));
 }
@@ -776,4 +800,124 @@ function adReviewHistory(?string $reviewer = null, ?string $status = null, int $
 
 function adReviewLog(int $limit = 100): array {
     return adDb()->query('SELECT * FROM review_log ORDER BY id DESC LIMIT ' . max(1, min(1000, $limit)))->fetchAll();
+}
+
+// ---- Participants (owner console) ----
+
+const AD_AUTO_TASKS = ['wallet', 'telegram', 'mining'];
+
+function adParticipantLog(int $pid, string $actor, string $action, string $detail = ''): void {
+    adDb()->prepare('INSERT INTO participant_log (participant_id, actor, action, detail, at) VALUES (?, ?, ?, ?, ?)')
+        ->execute([$pid, $actor, $action, mb_substr($detail, 0, 500), time()]);
+}
+
+// List for the console. $filter: organic (joined without a referral link) | referred | all | disqualified | flagged.
+// $q: part of an address or a referral code. Largest earners first.
+function adParticipantsList(string $filter = 'organic', string $q = '', int $limit = 300): array {
+    $db = adDb();
+    $where = []; $args = [];
+    if ($filter === 'organic') $where[] = "(p.referred_by IS NULL OR p.referred_by = '') AND p.status = 'active'";
+    elseif ($filter === 'referred') $where[] = "p.referred_by IS NOT NULL AND p.referred_by != '' AND p.status = 'active'";
+    elseif ($filter === 'disqualified') $where[] = "p.status != 'active'";
+    elseif ($filter === 'flagged') $where[] = "p.status = 'active' AND p.ip_hash IS NOT NULL AND (SELECT COUNT(*) FROM participants o WHERE o.ip_hash = p.ip_hash) > 1";
+    $q = trim($q);
+    if ($q !== '') { $where[] = '(p.address LIKE ? OR p.ref_code = ?)'; $args[] = '%' . str_replace(['%', '_'], ['\%', '\_'], $q) . '%'; $args[] = $q; }
+    $sql = "SELECT p.id, p.address, p.ref_code, p.referred_by, p.status, p.status_reason, p.created_at, p.telegram_id IS NOT NULL AS telegram,
+        (SELECT COUNT(*) FROM mining_days d WHERE d.participant_id = p.id) AS mining_days,
+        (SELECT COUNT(*) FROM submissions s WHERE s.participant_id = p.id AND s.status = 'pending') AS pending,
+        (SELECT COUNT(*) FROM submissions s WHERE s.participant_id = p.id AND s.status = 'approved') AS approved,
+        (SELECT COUNT(*) FROM progress pr WHERE pr.participant_id = p.id) AS auto_done,
+        (SELECT COUNT(*) FROM participants c WHERE c.referred_by = p.ref_code) AS referrals,
+        CASE WHEN p.ip_hash IS NULL THEN 1 ELSE (SELECT COUNT(*) FROM participants o WHERE o.ip_hash = p.ip_hash) END AS same_network
+        FROM participants p" . ($where ? ' WHERE ' . implode(' AND ', $where) : '') . ' ORDER BY p.created_at DESC';
+    $s = $db->prepare($sql); $s->execute($args);
+    $rows = $s->fetchAll();
+    $tot = [];
+    foreach (adTotals() as $t) $tot[$t['id']] = $t;
+    foreach ($rows as &$r) { $t = $tot[(int)$r['id']] ?? null; $r['centi'] = $t['centi'] ?? 0; $r['adj'] = $t['adj'] ?? 0; }
+    unset($r);
+    usort($rows, fn($a, $b) => [$b['centi'], $b['created_at']] <=> [$a['centi'], $a['created_at']]);
+    return array_slice($rows, 0, max(1, min(2000, $limit)));
+}
+
+function adParticipantCounts(): array {
+    $db = adDb();
+    return [
+        'all' => (int)$db->query('SELECT COUNT(*) FROM participants')->fetchColumn(),
+        'organic' => (int)$db->query("SELECT COUNT(*) FROM participants WHERE (referred_by IS NULL OR referred_by = '') AND status = 'active'")->fetchColumn(),
+        'referred' => (int)$db->query("SELECT COUNT(*) FROM participants WHERE referred_by IS NOT NULL AND referred_by != '' AND status = 'active'")->fetchColumn(),
+        'disqualified' => (int)$db->query("SELECT COUNT(*) FROM participants WHERE status != 'active'")->fetchColumn(),
+        'flagged' => (int)$db->query("SELECT COUNT(*) FROM participants p WHERE p.status = 'active' AND p.ip_hash IS NOT NULL AND (SELECT COUNT(*) FROM participants o WHERE o.ip_hash = p.ip_hash) > 1")->fetchColumn(),
+    ];
+}
+
+// Everything about one entry for the detail page.
+function adParticipantDetail(int $id): ?array {
+    $db = adDb();
+    $s = $db->prepare('SELECT * FROM participants WHERE id = ?'); $s->execute([$id]);
+    $p = $s->fetch();
+    if (!$p) return null;
+    $prog = $db->prepare('SELECT task, points, updated_at FROM progress WHERE participant_id = ?'); $prog->execute([$id]);
+    $subs = $db->prepare('SELECT id, platform, url, status, points, reviewer, created_at, reviewed_at FROM submissions WHERE participant_id = ? ORDER BY created_at DESC'); $subs->execute([$id]);
+    $days = $db->prepare('SELECT day FROM mining_days WHERE participant_id = ? ORDER BY day'); $days->execute([$id]);
+    $refs = $db->prepare("SELECT c.id, c.address, c.status, c.created_at, EXISTS (SELECT 1 FROM progress pr WHERE pr.participant_id = c.id AND pr.task IN ('telegram','mining')) AS verified FROM participants c WHERE c.referred_by = ? ORDER BY c.created_at"); $refs->execute([$p['ref_code']]);
+    $referrer = null;
+    if ($p['referred_by']) { $r = $db->prepare('SELECT id, address FROM participants WHERE ref_code = ?'); $r->execute([$p['referred_by']]); $referrer = $r->fetch() ?: null; }
+    $same = [];
+    if ($p['ip_hash']) { $n = $db->prepare('SELECT id, address, status, created_at FROM participants WHERE ip_hash = ? AND id != ? ORDER BY created_at'); $n->execute([$p['ip_hash'], $id]); $same = $n->fetchAll(); }
+    $adj = $db->prepare('SELECT * FROM adjustments WHERE participant_id = ? ORDER BY id DESC'); $adj->execute([$id]);
+    $log = $db->prepare('SELECT * FROM participant_log WHERE participant_id = ? ORDER BY id DESC LIMIT 100'); $log->execute([$id]);
+    $seen = $db->prepare('SELECT earned FROM mining_seen WHERE participant_id = ?'); $seen->execute([$id]);
+    return ['p' => $p, 'totals' => adTotals($id)[0], 'progress' => $prog->fetchAll(), 'submissions' => $subs->fetchAll(),
+        'mining_days' => array_map('intval', $days->fetchAll(PDO::FETCH_COLUMN)), 'pool_earned' => ($v = $seen->fetchColumn()) === false ? null : (int)$v,
+        'referrals' => $refs->fetchAll(), 'referrer' => $referrer, 'same_network' => $same, 'adjustments' => $adj->fetchAll(), 'log' => $log->fetchAll()];
+}
+
+function adDisqualify(int $id, string $reason, string $actor): ?string {
+    $reason = trim($reason);
+    if ($reason === '') return 'Give a reason (kept in the log).';
+    $s = adDb()->prepare("UPDATE participants SET status = 'disqualified', status_reason = ? WHERE id = ? AND status = 'active'");
+    $s->execute([mb_substr($reason, 0, 300), $id]);
+    if ($s->rowCount() !== 1) return 'That entry is not active.';
+    adParticipantLog($id, $actor, 'disqualified', $reason);
+    return null;
+}
+
+function adReinstate(int $id, string $actor): ?string {
+    $s = adDb()->prepare("UPDATE participants SET status = 'active', status_reason = '' WHERE id = ? AND status != 'active'");
+    $s->execute([$id]);
+    if ($s->rowCount() !== 1) return 'That entry is not disqualified.';
+    adParticipantLog($id, $actor, 'reinstated');
+    return null;
+}
+
+// Add or take away XMZ (e.g. +2 for great work, -1.5 for a deleted post). Kept within ±per-person cap.
+function adAdjust(int $id, string $xmz, string $reason, string $actor): ?string {
+    $reason = trim($reason);
+    if (!preg_match('/\A[+-]?\d{1,4}(\.\d{1,2})?\z/', trim($xmz))) return 'Amount: a number of XMZ like 2, -1.5 or +0.25.';
+    $centi = (int)round((float)$xmz * 100);
+    if ($centi === 0) return 'Amount cannot be zero.';
+    if (abs($centi) > adCapCenti()) return 'One adjustment can be at most the per-person cap.';
+    if ($reason === '') return 'Give a reason (kept in the log).';
+    $db = adDb();
+    $s = $db->prepare('SELECT 1 FROM participants WHERE id = ?'); $s->execute([$id]);
+    if (!$s->fetchColumn()) return 'No such entry.';
+    $db->prepare('INSERT INTO adjustments (participant_id, centi, reason, actor, at) VALUES (?, ?, ?, ?, ?)')->execute([$id, $centi, mb_substr($reason, 0, 300), $actor, time()]);
+    adParticipantLog($id, $actor, 'adjusted', sprintf('%+.2f XMZ: %s', $centi / 100, $reason));
+    return null;
+}
+
+// Take back an automatically credited task. Telegram also unlinks the account so it can be re-verified;
+// mining also clears the counted days. Removing telegram/mining does not remove the wallet unlock.
+function adRevokeTask(int $id, string $task, string $reason, string $actor): ?string {
+    if (!in_array($task, AD_AUTO_TASKS, true)) return 'Unknown task.';
+    $reason = trim($reason);
+    if ($reason === '') return 'Give a reason (kept in the log).';
+    $db = adDb();
+    $s = $db->prepare('DELETE FROM progress WHERE participant_id = ? AND task = ?'); $s->execute([$id, $task]);
+    if ($s->rowCount() !== 1) return 'That task is not credited.';
+    if ($task === 'telegram') $db->prepare('UPDATE participants SET telegram_id = NULL WHERE id = ?')->execute([$id]);
+    if ($task === 'mining') $db->prepare('DELETE FROM mining_days WHERE participant_id = ?')->execute([$id]);
+    adParticipantLog($id, $actor, 'revoked ' . $task, $reason);
+    return null;
 }

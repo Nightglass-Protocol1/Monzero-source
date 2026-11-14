@@ -590,6 +590,7 @@ function tgHandle(array $update): ?string {
             if (!adLive()) return 'The airdrop is not open right now. See https://monzero.org/airdrop/';
             $pt = adParticipantByToken($token);
             if (!$pt) return 'That airdrop code is not recognised. Register your XMZ address at https://monzero.org/airdrop/ first.';
+            if (($pt['status'] ?? 'active') !== 'active') return 'This airdrop entry has been disqualified.';
             $verifyChat = $config['verify_chat'] ?? null;
             // Fail closed: without a chat to check membership against, nothing is verified.
             if (!is_string($verifyChat) || $verifyChat === '') return 'Airdrop Telegram verification is not set up yet. Please try again later.';

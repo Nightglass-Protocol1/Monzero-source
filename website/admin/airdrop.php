@@ -10,6 +10,7 @@ require_once dirname(__DIR__) . '/lib/airdrop.php';
 const AIRDROP_ADMIN_MESSAGES = [
     'ad-saved' => 'Saved.', 'ad-suspended' => 'Moderator suspended. They are signed out and cannot review.',
     'ad-activated' => 'Moderator reactivated.', 'ad-removed' => 'Moderator removed.', 'ad-overridden' => 'Decision changed.',
+    'ad-p-saved' => 'Saved.', 'ad-p-disqualified' => 'Entry disqualified: it earns nothing and cannot submit work.', 'ad-p-reinstated' => 'Entry reinstated.',
 ];
 const AIRDROP_TASK_LABELS = ['share_x' => 'Share on X', 'share_instagram' => 'Share on Instagram', 'forum_post' => 'Forum post',
     'forum_active' => 'Forum regular', 'run_node' => 'Run a node'];
@@ -79,7 +80,22 @@ function airdropAdminAction(string $do, array $user): bool {
             $to = (string)($_POST['to'] ?? '');
             if ($err = adOverride((int)($_POST['submission'] ?? 0), $to, 'console:' . $user['email'], (string)($_POST['note'] ?? ''))) adminDeny($err, 409);
             adminAudit($actor, 'airdrop.review_overridden', ['submission' => (int)$_POST['submission'], 'to' => $to]);
+            if ((int)($_POST['back'] ?? 0) > 0) airdropAdminBack('ad-overridden', 'participant', ['id' => (int)$_POST['back']]);
             airdropAdminBack('ad-overridden', 'activity', array_filter(['mod' => (string)($_POST['mod'] ?? ''), 'status' => (string)($_POST['fstatus'] ?? '')]));
+        case 'airdrop-p-disqualify':
+        case 'airdrop-p-reinstate':
+        case 'airdrop-p-adjust':
+        case 'airdrop-p-revoke':
+            $pid = (int)($_POST['pid'] ?? 0); $who = 'console:' . $user['email'];
+            $err = match ($do) {
+                'airdrop-p-disqualify' => adDisqualify($pid, (string)($_POST['reason'] ?? ''), $who),
+                'airdrop-p-reinstate' => adReinstate($pid, $who),
+                'airdrop-p-adjust' => adAdjust($pid, (string)($_POST['xmz'] ?? ''), (string)($_POST['reason'] ?? ''), $who),
+                'airdrop-p-revoke' => adRevokeTask($pid, (string)($_POST['task'] ?? ''), (string)($_POST['reason'] ?? ''), $who),
+            };
+            if ($err !== null) { http_response_code(400); airdropParticipantView($user, $pid, $err); exit; }
+            adminAudit($actor, 'airdrop.participant_' . substr($do, 10), ['participant' => $pid] + array_filter(['xmz' => $_POST['xmz'] ?? null, 'task' => $_POST['task'] ?? null]));
+            airdropAdminBack($do === 'airdrop-p-disqualify' ? 'ad-p-disqualified' : ($do === 'airdrop-p-reinstate' ? 'ad-p-reinstated' : 'ad-p-saved'), 'participant', ['id' => $pid]);
     }
     adminDeny('Unknown action.', 400);
 }
@@ -94,7 +110,7 @@ function airdropCredentialPanel(array $c): string {
 }
 
 function airdropAdminView(array $user, string $tab = 'overview', string $error = '', ?array $cred = null, array $form = []): void {
-    $tab = in_array($tab, ['overview', 'moderators', 'activity'], true) ? $tab : 'overview';
+    $tab = in_array($tab, ['overview', 'moderators', 'activity', 'participants'], true) ? $tab : 'overview';
     $cfg = adConfig();
     $budget = adBudget();
     $closed = adClosedReason();
@@ -109,10 +125,7 @@ function airdropAdminView(array $user, string $tab = 'overview', string $error =
     $err = $error ? '<p class="notice error" role="alert">' . adminH($error) . '</p>' : '';
     $csrf = airdropAdminCsrf($user);
 
-    $tabs = '<nav class="adr-tabs" aria-label="Airdrop sections">';
-    foreach (['overview' => 'Overview', 'moderators' => 'Moderators (' . count($mods) . ')', 'activity' => 'Review activity'] as $k => $label)
-        $tabs .= '<a href="/admin/?view=airdrop&amp;tab=' . $k . '"' . ($k === $tab ? ' aria-current="page"' : '') . '>' . adminH($label) . '</a>';
-    $tabs .= '<a href="/airdrop/admin.php" target="_blank" rel="noopener">Moderator panel ↗</a></nav>';
+    $tabs = airdropTabs($tab, count($mods));
 
     $pct = $budget['pool'] > 0 ? min(100, $budget['committed'] / $budget['pool'] * 100) : 0;
     $kpis = '<div class="adr-kpis">'
@@ -191,6 +204,8 @@ function airdropAdminView(array $user, string $tab = 'overview', string $error =
             . '<button type="submit">Add moderator</button></form></section>';
     }
 
+    if ($tab === 'participants') $body .= airdropParticipantsSection($user);
+
     if ($tab === 'activity') {
         $fmod = is_string($_GET['mod'] ?? null) ? $_GET['mod'] : '';
         $fst = in_array($_GET['status'] ?? '', ['approved', 'rejected'], true) ? $_GET['status'] : '';
@@ -221,6 +236,7 @@ function airdropAdminViewRoute(string $view, array $user): bool {
     if ($view !== 'airdrop') return false;
     if (!adminCan($user, 'airdrop')) adminDeny('You cannot manage the airdrop.');
     try { adDb(); } catch (Throwable $e) { adminDeny('The airdrop storage is unavailable.', 503); }
+    if (($_GET['tab'] ?? '') === 'participant') { airdropParticipantView($user, (int)($_GET['id'] ?? 0)); return true; }
     airdropAdminView($user, is_string($_GET['tab'] ?? null) ? $_GET['tab'] : 'overview');
     return true;
 }
@@ -231,4 +247,98 @@ function airdropAdminLinks(array $user): string {
     catch (Throwable $e) { $pending = 0; $n = 0; }
     return '<section><h2>Community airdrop</h2><ul><li><a href="/admin/?view=airdrop">Airdrop overview</a> (' . $pending . ' waiting for review)</li>'
         . '<li><a href="/admin/?view=airdrop&amp;tab=moderators">Manage moderators</a> (' . $n . ')</li><li><a href="/admin/?view=airdrop&amp;tab=activity">Audit moderator reviews</a></li></ul></section>';
+}
+
+function airdropTabs(string $tab, ?int $mods = null): string {
+    $mods ??= count(adModerators());
+    $tabs = '<nav class="adr-tabs" aria-label="Airdrop sections">';
+    foreach (['overview' => 'Overview', 'participants' => 'Participants (' . adParticipantCount() . ')', 'moderators' => 'Moderators (' . $mods . ')', 'activity' => 'Review activity'] as $k => $label)
+        $tabs .= '<a href="/admin/?view=airdrop&amp;tab=' . $k . '"' . ($k === $tab ? ' aria-current="page"' : '') . '>' . adminH($label) . '</a>';
+    return $tabs . '<a href="/airdrop/admin.php" target="_blank" rel="noopener">Moderator panel ↗</a></nav>';
+}
+
+function airdropParticipantsSection(array $user): string {
+    $filters = ['organic' => 'Joined without a referral link', 'referred' => 'Joined through a referral', 'flagged' => 'Same network as another entry', 'disqualified' => 'Disqualified', 'all' => 'Everyone'];
+    $f = is_string($_GET['f'] ?? null) && isset($filters[$_GET['f']]) ? $_GET['f'] : 'organic';
+    $q = is_string($_GET['q'] ?? null) ? mb_substr(trim($_GET['q']), 0, 110) : '';
+    $counts = adParticipantCounts();
+    $chips = '';
+    foreach ($filters as $k => $label) $chips .= '<a class="adr-chip' . ($k === $f ? ' on' : '') . '" href="/admin/?view=airdrop&amp;tab=participants&amp;f=' . $k . '">' . adminH($label) . ' <span>' . $counts[$k] . '</span></a>';
+    $rows = '';
+    $list = adParticipantsList($f, $q, 500);
+    $sum = 0;
+    foreach ($list as $r) {
+        $sum += $r['centi'];
+        $badges = ($r['same_network'] > 1 ? '<span class="adr-badge warn">' . ($r['same_network'] - 1) . ' on same network</span>' : '')
+            . ($r['status'] !== 'active' ? '<span class="adr-badge warn">disqualified</span>' : '') . ($r['pending'] ? '<span class="adr-badge">' . (int)$r['pending'] . ' waiting</span>' : '')
+            . ((int)$r['adj'] !== 0 ? '<span class="adr-badge">' . adminH(sprintf('%+.2f', $r['adj'] / 100)) . ' adj.</span>' : '');
+        $rows .= '<tr' . ($r['same_network'] > 1 || $r['status'] !== 'active' ? ' class="flag"' : '') . '><td><a href="/admin/?view=airdrop&amp;tab=participant&amp;id=' . (int)$r['id'] . '"><code>' . adminH(adShort($r['address'])) . '</code></a></td>'
+            . '<td>' . adminH(airdropWhen((int)$r['created_at'])) . '</td><td>' . ($r['referred_by'] ? 'via <code>' . adminH($r['referred_by']) . '</code>' : 'direct') . '</td>'
+            . '<td>' . ($r['telegram'] ? '✓' : '—') . '</td><td class="num">' . (int)$r['mining_days'] . '</td><td class="num">' . (int)$r['approved'] . '</td><td class="num">' . (int)$r['referrals'] . '</td>'
+            . '<td class="num"><strong>' . adminH(number_format($r['centi'] / 100, 2)) . '</strong></td><td>' . $badges . '</td></tr>';
+    }
+    return '<section><h2>Participants</h2><p>Everyone who registered an address. The default list shows people who joined <strong>without a referral link</strong>. Open an entry to check their work, adjust their XMZ, take back a task or disqualify them.</p>'
+        . '<div class="adr-chips">' . $chips . '</div>'
+        . '<form method="get" action="/admin/" class="adr-filter"><input type="hidden" name="view" value="airdrop"><input type="hidden" name="tab" value="participants"><input type="hidden" name="f" value="' . adminH($f) . '">'
+        . '<label>Find address or referral code<input name="q" value="' . adminH($q) . '" spellcheck="false" placeholder="part of an address"></label><button type="submit">Search</button></form>'
+        . ($rows ? '<p class="adr-note">' . count($list) . ' shown · ' . adminH(number_format($sum / 100, 2)) . ' XMZ earned between them.</p><div class="table-scroll"><table class="adr-table"><thead><tr><th>Address</th><th>Joined</th><th>Came from</th><th>Telegram</th><th class="num">Mining days</th><th class="num">Approved work</th><th class="num">Referred</th><th class="num">XMZ</th><th>Notes</th></tr></thead><tbody>' . $rows . '</tbody></table></div>'
+            : '<p>Nobody matches.</p>') . '</section>';
+}
+
+function airdropParticipantView(array $user, int $id, string $error = ''): void {
+    $d = adParticipantDetail($id);
+    if (!$d) adminDeny('No such airdrop entry.', 404);
+    $p = $d['p']; $t = $d['totals']; $cfg = adConfig();
+    $csrf = airdropAdminCsrf($user);
+    $hid = fn(array $f) => implode('', array_map(fn($k, $v) => '<input type="hidden" name="' . adminH($k) . '" value="' . adminH($v) . '">', array_keys($f), $f));
+    $form = fn(string $do, array $fields, string $inner, string $btn, string $cls = '') => '<form method="post" action="/admin/?do=' . $do . '" class="stack adr-act">' . $csrf . $hid($fields) . $inner . '<button type="submit"' . ($cls ? ' class="' . $cls . '"' : '') . '>' . adminH($btn) . '</button></form>';
+    $flash = isset($_GET['msg'], AIRDROP_ADMIN_MESSAGES[$_GET['msg']]) ? '<p class="notice" role="status">' . adminH(AIRDROP_ADMIN_MESSAGES[$_GET['msg']]) . '</p>' : '';
+    $active = $p['status'] === 'active';
+    $done = []; foreach ($d['progress'] as $r) $done[$r['task']] = $r;
+    $auto = '';
+    foreach (['wallet' => 'Wallet (unlocks with Telegram or mining)', 'telegram' => 'Telegram verified', 'mining' => 'Mining (' . count($d['mining_days']) . ' of ' . $cfg['mining_days_required'] . ' days)'] as $k => $label) {
+        $ok = isset($done[$k]);
+        $auto .= '<tr><td>' . adminH($label) . '</td><td>' . ($ok ? '<span class="adr-st approved">credited</span> ' . adminH(airdropWhen((int)$done[$k]['updated_at'])) : '<span class="adr-st pending">not yet</span>') . '</td><td class="num">' . ($ok ? adminH(number_format((int)$done[$k]['points'] / 100, 2)) : '—') . '</td><td>'
+            . ($ok ? '<details><summary>Take back</summary>' . $form('airdrop-p-revoke', ['pid' => $id, 'task' => $k], '<label>Reason<input name="reason" maxlength="300" required placeholder="e.g. left the Telegram straight away"></label>', 'Take back this task', 'danger') . '</details>' : '') . '</td></tr>';
+    }
+    $subs = '';
+    foreach ($d['submissions'] as $s) {
+        $u = (string)$s['url'];
+        $detail = preg_match('#^https?://#', $u) ? '<a href="' . adminH($u) . '" target="_blank" rel="noopener noreferrer nofollow">' . adminH(mb_strimwidth($u, 0, 60, '…')) . ' ↗</a>' : '<code>' . adminH($u) . '</code>';
+        $hidden = ['submission' => $s['id'], 'back' => $id];
+        $over = ($s['status'] !== 'approved' ? airdropAdminBtn($user, 'airdrop-override', $hidden + ['to' => 'approved'], 'Approve', 'small') : '')
+            . ($s['status'] !== 'rejected' ? airdropAdminBtn($user, 'airdrop-override', $hidden + ['to' => 'rejected'], 'Reject', 'small danger') : '')
+            . ($s['status'] !== 'pending' ? airdropAdminBtn($user, 'airdrop-override', $hidden + ['to' => 'pending'], 'Back to queue', 'small secondary') : '');
+        $subs .= '<tr><td>' . adminH(AIRDROP_TASK_LABELS[$s['platform']] ?? $s['platform']) . '</td><td>' . $detail . '</td><td>' . adminH(airdropWhen((int)$s['created_at'])) . '</td><td><span class="adr-st ' . adminH($s['status']) . '">' . adminH($s['status']) . '</span>'
+            . ($s['reviewer'] ? ' by ' . adminH($s['reviewer']) : '') . '</td><td class="num">' . adminH(number_format((int)$s['points'] / 100, 2)) . '</td><td class="adr-over">' . $over . '</td></tr>';
+    }
+    $refs = '';
+    foreach ($d['referrals'] as $r) $refs .= '<li><a href="/admin/?view=airdrop&amp;tab=participant&amp;id=' . (int)$r['id'] . '"><code>' . adminH(adShort($r['address'])) . '</code></a> · joined ' . adminH(airdropWhen((int)$r['created_at'])) . ' · ' . ($r['verified'] ? '<span class="adr-st approved">verified</span>' : '<span class="adr-st pending">not verified</span>') . ($r['status'] !== 'active' ? ' <span class="adr-badge warn">disqualified</span>' : '') . '</li>';
+    $same = '';
+    foreach ($d['same_network'] as $r) $same .= '<li><a href="/admin/?view=airdrop&amp;tab=participant&amp;id=' . (int)$r['id'] . '"><code>' . adminH(adShort($r['address'])) . '</code></a> · joined ' . adminH(airdropWhen((int)$r['created_at'])) . ($r['status'] !== 'active' ? ' <span class="adr-badge warn">disqualified</span>' : '') . '</li>';
+    $adj = '';
+    foreach ($d['adjustments'] as $a) $adj .= '<li><strong>' . adminH(sprintf('%+.2f XMZ', $a['centi'] / 100)) . '</strong> · ' . adminH($a['reason']) . ' <span class="adr-when">' . adminH(airdropWhen((int)$a['at'])) . ' by ' . adminH(str_replace('console:', '', $a['actor'])) . '</span></li>';
+    $log = '';
+    foreach ($d['log'] as $l) $log .= '<li><span class="adr-when">' . adminH(airdropWhen((int)$l['at'])) . '</span> <strong>' . adminH($l['action']) . '</strong>' . ($l['detail'] !== '' ? ' — ' . adminH($l['detail']) : '') . ' <span class="adr-when">' . adminH(str_replace('console:', '', $l['actor'])) . '</span></li>';
+    $days = $d['mining_days'] ? implode(', ', array_map(fn($day) => gmdate('j M', $day * 86400), $d['mining_days'])) : 'none yet';
+
+    $head = '<div class="adr-phead"><div><p class="adr-note"><a href="/admin/?view=airdrop&amp;tab=participants">← All participants</a></p><h2><code>' . adminH(adShort($p['address'])) . '</code></h2>'
+        . '<p><code class="adr-full">' . adminH($p['address']) . '</code></p><p>' . ($active ? '<span class="adr-badge ok">active</span>' : '<span class="adr-badge warn">disqualified</span> ' . adminH($p['status_reason']))
+        . ' · joined ' . adminH(gmdate('j M Y H:i', (int)$p['created_at'])) . ' UTC · ' . ($d['referrer'] ? 'referred by <a href="/admin/?view=airdrop&amp;tab=participant&amp;id=' . (int)$d['referrer']['id'] . '"><code>' . adminH(adShort($d['referrer']['address'])) . '</code></a>' : 'joined <strong>without a referral link</strong>')
+        . ' · Telegram ' . ($p['telegram_id'] ? 'linked' : 'not linked') . ' · own referral code <code>' . adminH($p['ref_code']) . '</code></p></div>'
+        . '<div class="adr-earn"><span>Earns</span><strong>' . adminH(number_format($t['centi'] / 100, 2)) . ' XMZ</strong><em>tasks ' . adminH(number_format($t['tasks'] / 100, 2)) . ' · referrals ' . adminH(number_format($t['refs'] / 100, 2)) . ' · adjustments ' . adminH(sprintf('%+.2f', $t['adj'] / 100)) . '</em></div></div>';
+    $manage = '<section class="adr-manage"><h2>Manage</h2><div class="adr-mgrid">'
+        . '<div><h3>Adjust XMZ</h3><p>Add a bonus or take some away. Shown to the participant as an adjustment.</p>' . $form('airdrop-p-adjust', ['pid' => $id], '<label>XMZ (e.g. 2 or -1.5)<input name="xmz" inputmode="decimal" required pattern="[+-]?[0-9]{1,4}([.][0-9]{1,2})?"></label><label>Reason<input name="reason" maxlength="300" required></label>', 'Save adjustment') . '</div>'
+        . '<div><h3>' . ($active ? 'Disqualify' : 'Reinstate') . '</h3>' . ($active
+            ? '<p>Earns nothing, cannot submit work, drops off the leaderboard, and stops counting as anyone\'s referral. Reversible.</p>' . $form('airdrop-p-disqualify', ['pid' => $id], '<label>Reason<input name="reason" maxlength="300" required placeholder="e.g. one of several entries from the same person"></label>', 'Disqualify', 'danger')
+            : '<p>Restores their earnings from completed work.</p>' . $form('airdrop-p-reinstate', ['pid' => $id], '', 'Reinstate')) . '</div></div></section>';
+    $body = $flash . ($error ? '<p class="notice error" role="alert">' . adminH($error) . '</p>' : '') . airdropTabs('participants') . $head . $manage
+        . '<section><h2>Automatic tasks</h2><div class="table-scroll"><table class="adr-table"><thead><tr><th>Task</th><th>Status</th><th class="num">XMZ</th><th></th></tr></thead><tbody>' . $auto . '</tbody></table></div>'
+        . '<p class="adr-note">Mining days counted: ' . adminH($days) . ($d['pool_earned'] !== null ? ' · pool earnings seen: ' . adminH(number_format($d['pool_earned'] / 1e11, 4)) . ' XMZ' : '') . '</p></section>'
+        . '<section><h2>Submitted work</h2>' . ($subs ? '<div class="table-scroll"><table class="adr-table"><thead><tr><th>Task</th><th>Submitted</th><th>When</th><th>Decision</th><th class="num">XMZ</th><th>Change</th></tr></thead><tbody>' . $subs . '</tbody></table></div>' : '<p>Nothing submitted yet.</p>') . '</section>'
+        . '<div class="adr-mgrid"><section><h2>People they referred (' . count($d['referrals']) . ')</h2>' . ($refs ? '<ul class="adr-list">' . $refs . '</ul>' : '<p>None.</p>') . '</section>'
+        . '<section><h2>Other entries from the same network</h2><p class="adr-note">Same internet connection when they registered (stored only as a keyed hash). Can be innocent: families, offices, mobile carriers.</p>' . ($same ? '<ul class="adr-list">' . $same . '</ul>' : '<p>None.</p>') . '</section></div>'
+        . '<div class="adr-mgrid"><section><h2>Adjustments</h2>' . ($adj ? '<ul class="adr-list">' . $adj . '</ul>' : '<p>None.</p>') . '</section>'
+        . '<section><h2>History</h2>' . ($log ? '<ul class="adr-list">' . $log . '</ul>' : '<p>No owner actions yet.</p>') . '</section></div>';
+    adminPage('Airdrop participant', $body, $user);
 }

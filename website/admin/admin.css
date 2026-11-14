@@ -89,3 +89,16 @@ select { font:inherit; color:var(--ink); background:var(--surface); border:1px s
 .adr-meter .w90 { width:90%; }
 .adr-meter .w95 { width:95%; }
 .adr-meter .w100 { width:100%; }
+.adr-chips { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0 16px; }
+.adr-chip { padding:7px 14px; border:1px solid var(--line); border-radius:20px; text-decoration:none; color:var(--muted); font-size:14px; font-weight:600; }
+.adr-chip span { margin-left:4px; padding:1px 7px; border-radius:10px; background:var(--surface); color:var(--ink); font-size:12px; }
+.adr-chip.on { border-color:var(--accent); color:var(--ink); }
+.adr-phead { display:flex; flex-wrap:wrap; justify-content:space-between; gap:20px; align-items:flex-start; }
+.adr-phead h2 { margin:6px 0; } .adr-full { font-size:12px; overflow-wrap:anywhere; }
+.adr-earn { display:grid; gap:2px; padding:16px 20px; border:1px solid var(--accent); border-radius:14px; background:var(--surface); min-width:240px; }
+.adr-earn span { font:600 11px var(--mono); text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
+.adr-earn strong { font-size:28px; color:var(--ink); } .adr-earn em { font-style:normal; font-size:13px; color:var(--muted); }
+.adr-mgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:20px; }
+.adr-manage .adr-mgrid > div { padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--surface); }
+.adr-manage h3 { margin:0 0 6px; } .adr-act { max-width:none; }
+.adr-list { padding-left:18px; display:grid; gap:6px; }

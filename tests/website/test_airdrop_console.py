@@ -93,6 +93,48 @@ with tempfile.TemporaryDirectory() as tmp:
   s=requests.Session();r=s.post(base+'/airdrop/admin.php',data={'action':'login','address':ADDR[2],'telegram':'second_mod','password':'my-own-pass-123','pin':'080015'})
   assert 'Too many failed sign-ins' in r.text
 
+  # Participants: list (default = joined without a referral link), detail, adjust, revoke, disqualify.
+  import sqlite3
+  db=sqlite3.connect(private/'airdrop.sqlite')
+  pid=lambda a:db.execute('SELECT id FROM participants WHERE address=?',(a,)).fetchone()[0]
+  short=lambda a:a[:8]+'…'+a[-6:]
+  lst=owner.get(base+'/admin/?view=airdrop&tab=participants').text
+  assert 'Joined without a referral link' in lst and short(ADDR[0]) in lst and short(ADDR[1]) not in lst
+  assert short(ADDR[1]) in owner.get(base+'/admin/?view=airdrop&tab=participants&f=referred').text
+  assert 'on same network' in owner.get(base+'/admin/?view=airdrop&tab=participants&f=flagged').text  # both registered from 127.0.0.1
+  assert short(ADDR[0]) in owner.get(base+'/admin/?view=airdrop&tab=participants&f=all&q='+ADDR[0][5:15]).text
+  d=owner.get(base+f'/admin/?view=airdrop&tab=participant&id={pid(ADDR[0])}').text
+  assert 'joined <strong>without a referral link</strong>' in d and ADDR[0] in d and 'People they referred (1)' in d
+  status=lambda t:requests.get(API,params={'action':'status','token':t}).json()['status']
+  before=status(own['token'])['earned']
+  assert owner.post(A+'airdrop-p-adjust',data={'csrf':csrf(),'pid':pid(ADDR[0]),'xmz':'abc','reason':'x'}).status_code==400
+  assert owner.post(A+'airdrop-p-adjust',data={'csrf':csrf(),'pid':pid(ADDR[0]),'xmz':'2','reason':''}).status_code==400
+  assert owner.post(A+'airdrop-p-adjust',data={'csrf':csrf(),'pid':pid(ADDR[0]),'xmz':'+2','reason':'great forum guide'},allow_redirects=False).status_code==303
+  st=status(own['token']);assert st['earned']==before+2 and st['adjustment']==2,st
+  assert owner.post(A+'airdrop-p-adjust',data={'csrf':csrf(),'pid':pid(ADDR[0]),'xmz':'-100','reason':'x'}).status_code==400  # beyond the cap
+  assert owner.post(A+'airdrop-p-adjust',data={'csrf':csrf(),'pid':pid(ADDR[0]),'xmz':'-25','reason':'take it all'},allow_redirects=False).status_code==303
+  assert status(own['token'])['earned']==0  # never below zero
+  # Revoke an automatic task.
+  db.execute("INSERT INTO progress VALUES (?,?,?,?)",(pid(ADDR[1]),'telegram',100,0));db.execute('UPDATE participants SET telegram_id=42 WHERE id=?',(pid(ADDR[1]),));db.commit()
+  assert owner.post(A+'airdrop-p-revoke',data={'csrf':csrf(),'pid':pid(ADDR[1]),'task':'mining','reason':'x'}).status_code==400
+  assert owner.post(A+'airdrop-p-revoke',data={'csrf':csrf(),'pid':pid(ADDR[1]),'task':'telegram','reason':'left at once'},allow_redirects=False).status_code==303
+  assert db.execute("SELECT COUNT(*) FROM progress WHERE participant_id=? AND task='telegram'",(pid(ADDR[1]),)).fetchone()[0]==0
+  assert db.execute('SELECT telegram_id FROM participants WHERE id=?',(pid(ADDR[1]),)).fetchone()[0] is None
+  # Disqualify: earns nothing, cannot submit, leaves the leaderboard; reinstate restores.
+  db.execute("INSERT INTO progress VALUES (?,?,?,?)",(pid(ADDR[1]),'mining',600,0));db.commit()
+  fr_earned=status(fr['token'])['earned'];assert fr_earned>0
+  assert owner.post(A+'airdrop-p-disqualify',data={'csrf':csrf(),'pid':pid(ADDR[1]),'reason':''}).status_code==400
+  assert owner.post(A+'airdrop-p-disqualify',data={'csrf':csrf(),'pid':pid(ADDR[1]),'reason':'duplicate entries'},allow_redirects=False).status_code==303
+  st=status(fr['token']);assert st['disqualified'] and st['earned']==0
+  assert 'disqualified' in requests.post(API+'?action=submit',json={'token':fr['token'],'task':'forum_post','detail':'someone'}).json()['error']
+  assert short(ADDR[1]) not in json.dumps(requests.get(API+'?action=leaderboard').json())
+  assert short(ADDR[1]) in owner.get(base+'/admin/?view=airdrop&tab=participants&f=disqualified').text
+  owner.post(A+'airdrop-p-reinstate',data={'csrf':csrf(),'pid':pid(ADDR[1])})
+  assert status(fr['token'])['earned']==fr_earned and not status(fr['token'])['disqualified']
+  d=owner.get(base+f'/admin/?view=airdrop&tab=participant&id={pid(ADDR[1])}').text
+  assert 'reinstated' in d and 'disqualified' in d and 'revoked telegram' in d and 'left at once' in d
+  audit=owner.get(base+'/admin/?view=audit').text;assert 'airdrop.participant_adjust' in audit and 'airdrop.participant_disqualify' in audit
+
   # CSRF is required on console actions.
   assert owner.post(A+'airdrop-mod-add',data={'csrf':'x','name':'Third','address':ADDR[1],'telegram':'@third_mod'}).status_code==403
   print('airdrop console: ok')

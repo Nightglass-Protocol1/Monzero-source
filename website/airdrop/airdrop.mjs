@@ -52,7 +52,8 @@ function render(status, token) {
   $("ad-register").hidden = true;
   $("ad-dash").hidden = false;
   $("ad-total").textContent = status.earned;
-  { const l = $("ad-score-label"); if (l) l.textContent = `XMZ earned · tasks ${status.task_earned}/${status.cap} + referrals ${status.referral_earned}/${status.referral_cap}`; }
+  { const l = $("ad-score-label"); if (l) l.textContent = status.disqualified ? "This entry has been disqualified" :
+      `XMZ earned · tasks ${status.task_earned}/${status.cap} + referrals ${status.referral_earned}/${status.referral_cap}` + (status.adjustment ? ` ${status.adjustment > 0 ? "+" : "−"} ${Math.abs(status.adjustment)} adjustment` : ""); }
   $("ad-myaddr").textContent = status.address;
   const refLink = `${location.origin}/airdrop/?ref=${status.ref_code}`;
   $("ad-reflink").value = refLink;
