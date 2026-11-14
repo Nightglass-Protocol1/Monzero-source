@@ -32,6 +32,9 @@ function tgConfig(): ?array {
         // Major news to the group: stories covered by at least this many outlets (0 = off), capped per day.
         'feed_news_min_outlets' => is_int($c['feed_news_min_outlets'] ?? null) && $c['feed_news_min_outlets'] >= 0 && $c['feed_news_min_outlets'] <= 30 ? $c['feed_news_min_outlets'] : 4,
         'feed_news_daily_max' => is_int($c['feed_news_daily_max'] ?? null) && $c['feed_news_daily_max'] >= 1 && $c['feed_news_daily_max'] <= 50 ? $c['feed_news_daily_max'] : 12,
+        // New DEX offers to the group (false = off), capped per UTC day.
+        'feed_dex' => ($c['feed_dex'] ?? true) === true,
+        'feed_dex_daily_max' => is_int($c['feed_dex_daily_max'] ?? null) && $c['feed_dex_daily_max'] >= 1 && $c['feed_dex_daily_max'] <= 200 ? $c['feed_dex_daily_max'] : 30,
         'pool_stats' => is_string($c['pool_stats'] ?? null) ? $c['pool_stats'] : 'https://pool.monzero.org/api/stats'];
 }
 
@@ -161,6 +164,100 @@ function tgFeedPool(array $config, int $now): bool {
         . "\nPool hashrate: $rateText from " . (int)($pool['miners'] ?? 0) . ' miners'
         . "\n\nMine with the pool: https://pool.monzero.org/\nAlerts for your rigs: t.me/" . ($config['bot_username'] ?: 'Monzero_bot');
     return tgFeedSend($config, $text);
+}
+
+// ---- New DEX offers ---------------------------------------------------------------------------
+// The open relays this site reads (monzero-private/dex-status.php 'relays', as /dex/relay.php does).
+function tgDexRelays(): array {
+    $path = tgPrivateDir() . '/dex-status.php';
+    if (!is_file($path) || is_link($path)) return [];
+    $o = (static fn() => require $path)();
+    if (!is_array($o) || !is_array($o['relays'] ?? null)) return [];
+    return array_values(array_filter($o['relays'], static fn($u) =>
+        is_string($u) && strlen($u) <= 200 && preg_match('#^https?://[A-Za-z0-9.\-]+(:\d{1,5})?(/[A-Za-z0-9._\-/]*)?$#', $u)));
+}
+
+// The main networks an offer is announced for: chain id => [coin, network name, decimals of its smallest unit]
+const TG_DEX_CHAINS = [1 => ['ETH', 'Ethereum', 18], 56 => ['BNB', 'BNB Smart Chain', 18], 501000101 => ['SOL', 'Solana', 9]];
+
+// A whole number of smallest units as a plain decimal ("12345", 3 places => "12.345"), at most
+// $show places after the point, never in exponent form.
+function tgDexAmount(int $units, int $places, int $show = 8): string {
+    $whole = intdiv($units, 10 ** $places);
+    $frac = rtrim(substr(str_pad((string)($units % (10 ** $places)), $places, '0', STR_PAD_LEFT), 0, $show), '0');
+    return number_format($whole) . ($frac !== '' ? '.' . $frac : '');
+}
+
+// The message for one offer, or null when it is not one this feed announces (test networks,
+// Monero pairs, malformed or oversized amounts). Offers are maker-signed and checked by the relay.
+function tgDexOfferText(array $l, int $now): ?string {
+    $chain = TG_DEX_CHAINS[$l['chainId'] ?? 0] ?? null;
+    if (!$chain || ($l['xmzNetwork'] ?? '') !== 'mainnet' || ($l['pair'] ?? '') !== $chain[0] . '/XMZ') return null;
+    if (!in_array($l['side'] ?? '', ['sell-xmz', 'buy-xmz'], true)) return null;
+    if (!is_string($l['value'] ?? null) || !preg_match('/\A0x[0-9a-f]{1,15}\z/', $l['value'])) return null;
+    if (!is_string($l['xmz'] ?? null) || !preg_match('/\A[1-9]\d{0,17}\z/', $l['xmz'])) return null;
+    if (!is_string($l['maker'] ?? null) || !preg_match('/\A0x[0-9a-fA-F]{40}\z/', $l['maker'])) return null;
+    $expires = (int)($l['expiresAt'] ?? 0);
+    if ($expires <= $now) return null;
+    [$coin, $network, $places] = $chain;
+    $value = (int)hexdec(substr($l['value'], 2));
+    $xmz = (int)$l['xmz'];
+    if ($value <= 0) return null;
+    $coinText = tgDexAmount($value, $places) . " $coin";
+    $xmzText = tgDexAmount($xmz, 11, 4) . ' XMZ';
+    // Price of one XMZ in the coin, and how many XMZ one coin buys
+    $perXmz = ($value / 10 ** $places) / ($xmz / 1e11);
+    $price = rtrim(rtrim(number_format($perXmz, 10, '.', ''), '0'), '.');
+    $perCoin = number_format(1 / $perXmz, $perXmz < 0.01 ? 0 : 2);
+    $left = $expires - $now;
+    $open = $left >= 7200 ? round($left / 3600) . ' hours' : max(1, (int)round($left / 60)) . ' minutes';
+    $selling = $l['side'] === 'sell-xmz';
+    return '🔔 New offer on the Monzero DEX: ' . ($selling ? "XMZ for sale" : "buying XMZ") . "\n\n"
+        . ($selling ? "🟢 Selling: $xmzText\n💰 Asking: $coinText" : "🟢 Buying: $xmzText\n💰 Paying: $coinText") . "\n"
+        . "📊 Price: $price $coin per XMZ (1 $coin = $perCoin XMZ)\n"
+        . "🌐 Network: $network\n"
+        . "⏳ Open for: about $open (until " . gmdate('j M H:i', $expires) . " UTC)\n"
+        . '👤 Maker: ' . substr($l['maker'], 0, 6) . '…' . substr($l['maker'], -4) . "\n\n"
+        . ($selling ? "Want it? You pay $coinText and receive $xmzText." : "Want it? You send $xmzText and receive $coinText.")
+        . " The whole offer is taken in one swap, from your own Monzero wallet: no account, and nobody else holds your coins. If either side stops, both are refunded.\n\n"
+        . 'Trade it: https://monzero.org/dex/';
+}
+
+// Offers the relays did not have at the last check are posted to the group: at most 3 per run and
+// feed_dex_daily_max per UTC day. The first run only records what is already open. An offer is
+// marked as seen before it is sent, so a failure never posts it twice.
+function tgFeedDex(array $config, int $now): int {
+    if (!$config['feed_chat'] || !$config['feed_dex']) return 0;
+    $context = stream_context_create(['http' => ['timeout' => 5, 'ignore_errors' => true, 'follow_location' => 0]]);
+    $listings = null;
+    foreach (tgDexRelays() as $base) {
+        $data = json_decode((string)@file_get_contents(rtrim($base, '/') . '/v1/listings', false, $context, 0, 4194304), true);
+        if (is_array($data) && is_array($data['listings'] ?? null)) { $listings = $data['listings']; break; }
+    }
+    if ($listings === null) return 0;   // no relay answered: say nothing, forget nothing
+    $state = json_decode((string)tgMeta('feed_dex'), true);
+    $first = !is_array($state);
+    if ($first) $state = ['seen' => [], 'day' => '', 'count' => 0];
+    $day = gmdate('Y-m-d', $now);
+    if ($state['day'] !== $day) { $state['day'] = $day; $state['count'] = 0; }
+    $save = function () use (&$state) { tgMeta('feed_dex', json_encode($state)); };
+    foreach ($state['seen'] as $id => $until) if ($until < $now - 86400) unset($state['seen'][$id]);
+    $sent = 0;
+    foreach (array_slice($listings, 0, 2000) as $signed) {
+        $l = is_array($signed) && is_array($signed['listing'] ?? null) ? $signed['listing'] : null;
+        $id = $l['id'] ?? null;
+        if (!is_string($id) || !preg_match('/\A0x[0-9a-f]{64}\z/', $id) || isset($state['seen'][$id])) continue;
+        if ($first) { $state['seen'][$id] = (int)($l['expiresAt'] ?? $now); continue; }
+        if ($sent >= 3 || $state['count'] >= $config['feed_dex_daily_max']) break;   // the rest wait for the next run
+        $state['seen'][$id] = (int)($l['expiresAt'] ?? $now);
+        $text = tgDexOfferText($l, $now);
+        if ($text === null) continue;
+        $state['count']++;
+        $save();
+        if (tgFeedSend($config, $text)) $sent++;
+    }
+    $save();
+    return $sent;
 }
 
 // Title words used to recognise the same story (mirrors utils/news/news_collector.py tokens()).
@@ -531,6 +628,7 @@ function tgCheckAll(int $now, bool $force = false): int {
     if (!$force && $now - $last < TG_CHECK_SECONDS) return 0;
     $db->prepare("INSERT INTO meta (key, value) VALUES ('checked_at', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value")->execute([(string)$now]);
     try { tgFeedPool($config, $now); } catch (Throwable $e) { error_log('Monzero telegram feed: ' . $e->getMessage()); }
+    try { tgFeedDex($config, $now); } catch (Throwable $e) { error_log('Monzero telegram DEX feed: ' . $e->getMessage()); }
     $pool = [];
     $sent = 0;
     $started = microtime(true);
