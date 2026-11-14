@@ -13,7 +13,7 @@ ADDR=['FWPbFrwvRqpWTMDJAAeT3wAGsCUvERHyEAZJySDBDTKJJxr4q9gNStxSZghEAmtgvd49oySaD
 
 with tempfile.TemporaryDirectory() as tmp:
  tmp=Path(tmp);private=tmp/'private';private.mkdir();mail=tmp/'mail.jsonl'
- (private/'airdrop-config.php').write_text(f"<?php return ['enabled'=>true,'pool_xmz'=>8000,'ends_at'=>{int(time.time())+30*86400},'max_per_ip'=>0,'admin_reward_xmz'=>0.25,'pool_stats'=>'http://127.0.0.1:1/x'];\n")
+ (private/'airdrop-config.php').write_text(f"<?php return ['enabled'=>true,'pool_xmz'=>8000,'ends_at'=>{int(time.time())+30*86400},'max_per_ip'=>0,'one_per_person'=>false,'admin_reward_xmz'=>0.25,'pool_stats'=>'http://127.0.0.1:1/x'];\n")
  with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
  base=f'http://127.0.0.1:{port}'
  env={**os.environ,'MONZERO_PRIVATE_DIR':str(private),'MONZERO_ADMIN_DB':str(private/'admin.sqlite'),'MONZERO_ADMIN_MAIL_LOG':str(mail),'MONZERO_ADMIN_BASE_URL':base,'MONZERO_BOARD_DB':str(private/'board.sqlite'),'MONZERO_FAUCET_DB':str(private/'faucet.sqlite')}

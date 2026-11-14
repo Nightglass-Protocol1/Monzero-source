@@ -15,7 +15,8 @@ return [
     'auto_renew'     => true,             // budget = max(pool_xmz, committed + topup_buffer), never above the fee collected
     'topup_buffer'   => 1000,             // headroom kept above what is already committed
     'mining_days_required' => 7,          // distinct days a miner must be active to earn the mining reward
-    'max_per_ip'     => 3,                // max airdrop entries per IP (0 = no limit). Lenient for shared NAT.
+    'one_per_person' => true,             // one entry per device/network; later duplicates are auto-disqualified (owner can reinstate)
+    'max_per_ip'     => 3,                // only used when one_per_person is false                // max airdrop entries per IP (0 = no limit). Lenient for shared NAT.
     'trusted_proxies' => [],              // e.g. ['173.245.48.0/20'] if a CDN sets CF-Connecting-IP / X-Real-IP
     'starts_at'      => 0,                // unix time, 0 = now
     'ends_at'        => 1801439999,       // REQUIRED unix end time (closed while 0). 1801439999 = 2027-01-31 23:59:59 UTC

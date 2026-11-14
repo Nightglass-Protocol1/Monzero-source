@@ -3,6 +3,7 @@
 const API = "/airdrop/api.php";
 const TOKEN_KEY = "monzero_airdrop_token";
 const REF_KEY = "monzero_airdrop_ref";
+const DEVICE_KEY = "monzero_airdrop_device";   // random, stays when switching address: one entry per person
 const $ = (id) => document.getElementById(id);
 let CFG = null, BOT = "Monzero_bot";
 
@@ -11,6 +12,16 @@ const ls = {
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
   del(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } },
 };
+
+function device() {
+  let d = ls.get(DEVICE_KEY);
+  if (!/^[a-f0-9]{32}$/.test(d || "")) {
+    const b = new Uint8Array(16); crypto.getRandomValues(b);
+    d = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    ls.set(DEVICE_KEY, d);
+  }
+  return d;
+}
 
 async function api(action, { method = "GET", body = null, query = {} } = {}) {
   const q = new URLSearchParams({ action, ...query }).toString();
@@ -112,13 +123,13 @@ async function submitShare(token, task) {
   if (!input) return;
   msg.textContent = "Submitting…"; msg.classList.remove("err");
   try {
-    const r = await api("submit", { method: "POST", body: { token, task, detail: input.value.trim() } });
+    const r = await api("submit", { method: "POST", body: { token, task, detail: input.value.trim(), device: device() } });
     render(r.status, token);
   } catch (e) { msg.textContent = e.message; msg.classList.add("err"); }
 }
 
 async function refresh(token) {
-  try { const r = await api("status", { query: { token } }); render(r.status, token); }
+  try { const r = await api("status", { query: { token, device: device() } }); render(r.status, token); }
   catch { ls.del(TOKEN_KEY); showRegister(); }
 }
 
@@ -143,7 +154,7 @@ async function registerFlow() {
   $("ad-join-btn").disabled = true;
   try {
     const ref = ls.get(REF_KEY) || "";
-    const r = await api("register", { method: "POST", body: { address: addr, ref } });
+    const r = await api("register", { method: "POST", body: { address: addr, ref, device: device() } });
     if (r.token) ls.set(TOKEN_KEY, r.token);
     const token = r.token || ls.get(TOKEN_KEY);
     ls.del(REF_KEY);

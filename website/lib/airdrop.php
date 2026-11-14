@@ -40,6 +40,7 @@ function adLoadConfig(): array {
         'per_person_cap' => isset($c['per_person_cap']) && is_numeric($c['per_person_cap']) ? (float)$c['per_person_cap'] : 25.0,
         'auto_renew'   => $autoRenew,
         'mining_days_required' => isset($c['mining_days_required']) && is_int($c['mining_days_required']) && $c['mining_days_required'] >= 1 && $c['mining_days_required'] <= 31 ? $c['mining_days_required'] : 7,
+        'one_per_person' => ($c['one_per_person'] ?? true) !== false,   // one entry per device/network; duplicates auto-disqualified
         'max_per_ip'     => isset($c['max_per_ip']) && is_int($c['max_per_ip']) && $c['max_per_ip'] >= 0 ? $c['max_per_ip'] : 3,
         'trusted_proxies' => is_array($c['trusted_proxies'] ?? null) ? $c['trusted_proxies'] : [],
         'referral_cap'   => isset($c['referral_cap']) && is_numeric($c['referral_cap']) ? (float)$c['referral_cap'] : 12.5,
@@ -207,6 +208,18 @@ function adDb(): PDO {
             CREATE INDEX IF NOT EXISTS ix_participant_log_p ON participant_log(participant_id);
             PRAGMA user_version = 7;");
     }
+    if ((int)$db->query('PRAGMA user_version')->fetchColumn() < 8) {
+        // participant_seen: keyed hashes of the networks and browsers each entry has been used from
+        // (never raw IPs or device ids). exempt: the owner reinstated it, so the automatic
+        // one-entry-per-person check leaves it alone.
+        $db->exec("CREATE TABLE IF NOT EXISTS participant_seen (participant_id INTEGER NOT NULL, kind TEXT NOT NULL, hash TEXT NOT NULL,
+                first_at INTEGER NOT NULL, last_at INTEGER NOT NULL, PRIMARY KEY (participant_id, kind, hash));
+            CREATE INDEX IF NOT EXISTS ix_seen_hash ON participant_seen(kind, hash);
+            ALTER TABLE participants ADD COLUMN exempt INTEGER NOT NULL DEFAULT 0;
+            INSERT OR IGNORE INTO participant_seen (participant_id, kind, hash, first_at, last_at)
+                SELECT id, 'ip', ip_hash, created_at, created_at FROM participants WHERE ip_hash IS NOT NULL AND ip_hash != '';
+            PRAGMA user_version = 8;");
+    }
     return $db;
 }
 
@@ -244,6 +257,10 @@ function adClientIp(): string {
     return $remote;
 }
 function adClientHash(): string { $ip = adClientIp(); return $ip === '' ? '' : hash_hmac('sha256', 'client:' . $ip, adSecret()); }
+// The browser's random airdrop device id (kept in its localStorage), as a keyed hash. '' if none.
+function adDeviceHash(?string $device): string {
+    return is_string($device) && preg_match('/\A[a-f0-9]{32}\z/', $device) ? hash_hmac('sha256', 'device:' . $device, adSecret()) : '';
+}
 
 function adToken(): string { return bin2hex(random_bytes(16)); }
 function adHash(string $t): string { return hash('sha256', $t); }
@@ -252,7 +269,7 @@ function adShort(string $a): string { return substr($a, 0, 8) . '…' . substr($
 
 // Register (or return) a participant for an address. Returns [participant row, token|null].
 // token is only returned on first creation.
-function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null): array {
+function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null, string $deviceHash = ''): array {
     $parsed = xmzParseAddress($rawAddress);
     if (isset($parsed['error'])) return ['error' => $parsed['error']];
     if ($parsed['network'] !== 'mainnet' || $parsed['kind'] === 'integrated')
@@ -264,12 +281,15 @@ function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null): a
     $p = $row->fetch();
     if ($p) return ['participant' => $p, 'token' => null, 'existing' => true];
 
+    // One entry per person: refuse a new address from a browser or network another entry already uses.
+    if (adConfig()['one_per_person'] && ($other = adLinkedEntry((string)$ipHash, $deviceHash, null)))
+        return ['error' => 'Only one airdrop entry is allowed per person, and this device or connection already has one (' . adShort($other['address']) . '). Use that address. If this is a mistake (for example a shared connection), contact the team on Telegram.'];
     $budget = adBudget();
     if ($budget['pool'] <= 0 || $budget['committed'] >= $budget['pool'])
         return ['error' => 'The airdrop budget is fully committed, so new entries are closed. Follow the Telegram for the next round.'];
     // Per-IP cap to deter one person farming many wallets (shared NAT gets a few slots).
     $max = adConfig()['max_per_ip'];
-    if (is_string($ipHash) && $ipHash !== '' && $max > 0) {
+    if (!adConfig()['one_per_person'] && is_string($ipHash) && $ipHash !== '' && $max > 0) {
         $cnt = $db->prepare('SELECT COUNT(*) FROM participants WHERE ip_hash = ?');
         $cnt->execute([$ipHash]);
         if ((int)$cnt->fetchColumn() >= $max) return ['error' => 'This connection already has the maximum number of airdrop entries. On a shared network, join from your own connection.'];
@@ -287,7 +307,14 @@ function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null): a
     // The wallet reward is NOT paid here: it unlocks once Telegram or mining is verified, so a
     // bare address (which costs nothing to make) earns nothing on its own.
     $row->execute([$address]); $p = $row->fetch();
+    adSeen((int)$p['id'], (string)$ipHash, $deviceHash);
     return ['participant' => $p, 'token' => $token, 'existing' => false];
+}
+
+function adParticipantById(int $id): ?array {
+    $s = adDb()->prepare('SELECT * FROM participants WHERE id = ?');
+    $s->execute([$id]);
+    return $s->fetch() ?: null;
 }
 
 function adParticipantByToken(string $token): ?array {
@@ -575,6 +602,7 @@ function adTick(array $payload, ?int $now = null): array {
             $db->commit();
         } catch (Throwable $e) { $db->rollBack(); throw $e; }
     }
+    $dupes = adEnforceAll();
     $cfg = adConfig();
     $pool = $cfg['pool_xmz'];
     $fee = $payload['fee_atomic'] ?? null;
@@ -586,7 +614,7 @@ function adTick(array $payload, ?int $now = null): array {
         $tmp = $file . '.tmp';
         if (@file_put_contents($tmp, $target . "\n") !== false) { @chmod($tmp, 0600); @rename($tmp, $file); $pool = $target; }
     }
-    return ['ok' => true, 'checked' => $checked, 'newly_credited' => $credited, 'pool_xmz' => $pool];
+    return ['ok' => true, 'checked' => $checked, 'newly_credited' => $credited, 'duplicates_disqualified' => $dupes, 'pool_xmz' => $pool];
 }
 
 // ---- Moderators (owner-managed from /admin/?view=airdrop) ----
@@ -884,7 +912,8 @@ function adDisqualify(int $id, string $reason, string $actor): ?string {
 }
 
 function adReinstate(int $id, string $actor): ?string {
-    $s = adDb()->prepare("UPDATE participants SET status = 'active', status_reason = '' WHERE id = ? AND status != 'active'");
+    // Reinstated entries are exempt from the automatic one-entry-per-person check (the owner decided).
+    $s = adDb()->prepare("UPDATE participants SET status = 'active', status_reason = '', exempt = 1 WHERE id = ? AND status != 'active'");
     $s->execute([$id]);
     if ($s->rowCount() !== 1) return 'That entry is not disqualified.';
     adParticipantLog($id, $actor, 'reinstated');
@@ -936,4 +965,65 @@ function adPendingCounts(): array {
     $db = adDb();
     return ['organic' => (int)$db->query("SELECT COUNT(*) FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.status = 'pending' AND p.status = 'active' AND (p.referred_by IS NULL OR p.referred_by = '')")->fetchColumn(),
         'all' => (int)$db->query("SELECT COUNT(*) FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.status = 'pending' AND p.status = 'active'")->fetchColumn()];
+}
+
+// ---- One entry per person ----
+
+// Remember which (hashed) network and browser an entry was used from, then enforce the rule.
+function adSeen(int $pid, string $ipHash, string $deviceHash): void {
+    $db = adDb(); $now = time();
+    $up = $db->prepare('INSERT INTO participant_seen (participant_id, kind, hash, first_at, last_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (participant_id, kind, hash) DO UPDATE SET last_at = excluded.last_at');
+    if ($ipHash !== '') $up->execute([$pid, 'ip', $ipHash, $now, $now]);
+    if ($deviceHash !== '') $up->execute([$pid, 'device', $deviceHash, $now, $now]);
+    if (adConfig()['one_per_person']) adEnforceOnePerPerson($pid);
+}
+
+// An active, non-exempt entry (other than $exceptPid) already seen on this network or browser.
+function adLinkedEntry(string $ipHash, string $deviceHash, ?int $exceptPid): ?array {
+    $db = adDb();
+    foreach ([['ip', $ipHash], ['device', $deviceHash]] as [$kind, $hash]) {
+        if ($hash === '') continue;
+        $q = $db->prepare("SELECT p.* FROM participant_seen s JOIN participants p ON p.id = s.participant_id
+            WHERE s.kind = ? AND s.hash = ? AND p.status = 'active' AND p.exempt = 0" . ($exceptPid !== null ? ' AND p.id != ' . (int)$exceptPid : '') . ' ORDER BY p.created_at, p.id LIMIT 1');
+        $q->execute([$kind, $hash]);
+        if ($row = $q->fetch()) return $row;
+    }
+    return null;
+}
+
+// Entries linked to $pid (sharing a network or browser, directly or through each other), active
+// and not exempt. The oldest stays; every newer one is disqualified automatically. Returns the
+// ids it disqualified.
+function adEnforceOnePerPerson(int $pid): array {
+    $db = adDb();
+    $group = [$pid => true]; $queue = [$pid];
+    $q = $db->prepare("SELECT DISTINCT o.participant_id FROM participant_seen m JOIN participant_seen o ON o.kind = m.kind AND o.hash = m.hash
+        JOIN participants p ON p.id = o.participant_id WHERE m.participant_id = ? AND p.status = 'active' AND p.exempt = 0");
+    while ($queue && count($group) < 200) {
+        $q->execute([array_pop($queue)]);
+        foreach ($q->fetchAll(PDO::FETCH_COLUMN) as $id) if (!isset($group[(int)$id])) { $group[(int)$id] = true; $queue[] = (int)$id; }
+    }
+    if (count($group) < 2) return [];
+    $ids = implode(',', array_map('intval', array_keys($group)));
+    $rows = $db->query("SELECT id, address, status, exempt FROM participants WHERE id IN ($ids) AND status = 'active' AND exempt = 0 ORDER BY created_at, id")->fetchAll();
+    if (count($rows) < 2) return [];
+    $keep = array_shift($rows);
+    $out = [];
+    $upd = $db->prepare("UPDATE participants SET status = 'disqualified', status_reason = ? WHERE id = ? AND status = 'active' AND exempt = 0");
+    foreach ($rows as $r) {
+        $reason = 'Automatic: same device or connection as the earlier entry ' . adShort($keep['address']) . ' (one entry per person).';
+        $upd->execute([$reason, $r['id']]);
+        if ($upd->rowCount()) { adParticipantLog((int)$r['id'], 'auto', 'disqualified', $reason); $out[] = (int)$r['id']; }
+    }
+    return $out;
+}
+
+// Check every active entry (run by the 15-minute tick).
+function adEnforceAll(): int {
+    if (!adConfig()['one_per_person']) return 0;
+    $n = 0;
+    foreach (adDb()->query("SELECT id FROM participants WHERE status = 'active' AND exempt = 0 ORDER BY created_at, id")->fetchAll(PDO::FETCH_COLUMN) as $id)
+        $n += count(adEnforceOnePerPerson((int)$id));
+    return $n;
 }

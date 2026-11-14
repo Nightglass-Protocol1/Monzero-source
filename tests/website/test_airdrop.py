@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory() as tmp:
  (private/'airdrop-tick-secret').write_text(SECRET+'\n')
  pool=serve(Pool)
  def config(**kw):
-  c={'enabled':True,'pool_xmz':20,'ends_at':int(time.time())+30*DAY,'auto_renew':True,'topup_buffer':5,'max_per_ip':0,
+  c={'one_per_person':False,'enabled':True,'pool_xmz':20,'ends_at':int(time.time())+30*DAY,'auto_renew':True,'topup_buffer':5,'max_per_ip':0,
      'mining_days_required':2,'admin_reward_xmz':0.25,'pool_stats':f'http://127.0.0.1:{pool.server_port}/api/miner',
      'admins':[{'name':'mod1','token':MOD_TOKEN,'address':ADDR[4]}]};c.update(kw)
   def php(v):
