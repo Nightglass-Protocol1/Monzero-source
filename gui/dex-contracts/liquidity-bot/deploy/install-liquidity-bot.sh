@@ -65,8 +65,11 @@ grep -q '"ok":false' <<<"$(/opt/monzero-liquidity/monzero-dex-evm-helper </dev/n
   echo "!! the trade helper does not run on this server (too old a system library?)"; exit 1; }
 systemctl daemon-reload
 if systemctl is-active -q monzero-liquidity; then systemctl restart monzero-liquidity; echo "restarted (it was running)"; fi
-echo "== the bot's wallet and keys (made on the first install only)"
-sudo -u monzero-liquidity /usr/bin/python3 -I /opt/monzero-liquidity/liquidity_bot.py /etc/monzero-liquidity/config.json init 2>&1 | grep -v ' INFO '
+# First install only: make the keys and wallet. Never while the service runs (it has the wallet open).
+if [ ! -e /var/lib/monzero-liquidity/keys/seed.hex ] && ! systemctl is-active -q monzero-liquidity; then
+  echo "== the bot's wallet and keys"
+  sudo -u monzero-liquidity /usr/bin/python3 -I /opt/monzero-liquidity/liquidity_bot.py /etc/monzero-liquidity/config.json init 2>&1 | grep -v ' INFO '
+fi
 REMOTE
 echo
 echo "Next: bash $0 accounts   (fund the XMZ wallet and the trade accounts), then: bash $0 start"

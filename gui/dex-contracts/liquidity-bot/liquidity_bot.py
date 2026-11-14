@@ -223,6 +223,11 @@ class WalletService:
             return True
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         (self.dir / "wallets").mkdir(exist_ok=True, mode=0o700)
+        with socket.socket() as s:   # someone else's service on our port: leave it (and its login) alone
+            s.settimeout(1)
+            if s.connect_ex(("127.0.0.1", self.port)) == 0:
+                log.error("port %d is already in use (is the bot service running?); not starting a second wallet service", self.port)
+                return False
         for old in self.dir.glob("monzero-wallet-rpc.*.login"):
             old.unlink()
         args = [self.cfg["wallet_rpc_bin"]]
