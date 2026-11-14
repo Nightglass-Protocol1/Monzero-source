@@ -60,7 +60,7 @@ card mining "Mine XMZ with the CPU you already have." "RandomX proof of work. Po
 card fair "No premine. No ICO.\nNo token sale." "Every XMZ was mined. The founder's early mining is disclosed publicly."
 card dex "Swap without handing your coins to anyone." "Atomic swaps: both sides get paid, or both get refunded. No custodian, no bridge."
 card wallet "Your keys never leave your device." "Desktop, Android and web wallets. wallet.monzero.org"
-card scam "Never share your recovery phrase." "Admins never DM first. There is no live airdrop and no Monzero token on other chains."
+card scam "Never share your recovery phrase." "Admins never DM first. The only airdrop is monzero.org/airdrop. No Monzero token on other chains."
 
 # Story / vertical 1080x1920
 bg 1080 1920 "$tmp/story.png"
