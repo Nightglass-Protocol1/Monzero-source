@@ -1,0 +1,234 @@
+<?php
+declare(strict_types=1);
+// Owner console for the community airdrop (lib/airdrop.php): add, edit, suspend, reset and
+// remove airdrop moderators, and audit every review they make (with warning flags), overriding
+// any decision. Permission: 'airdrop'. Every change goes to the admin audit log; passwords and
+// PINs are never logged and are shown only once.
+if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) { http_response_code(404); exit; }
+require_once dirname(__DIR__) . '/lib/airdrop.php';
+
+const AIRDROP_ADMIN_MESSAGES = [
+    'ad-saved' => 'Saved.', 'ad-suspended' => 'Moderator suspended. They are signed out and cannot review.',
+    'ad-activated' => 'Moderator reactivated.', 'ad-removed' => 'Moderator removed.', 'ad-overridden' => 'Decision changed.',
+];
+const AIRDROP_TASK_LABELS = ['share_x' => 'Share on X', 'share_instagram' => 'Share on Instagram', 'forum_post' => 'Forum post',
+    'forum_active' => 'Forum regular', 'run_node' => 'Run a node'];
+
+function airdropAdminCsrf(array $user): string { return '<input type="hidden" name="csrf" value="' . adminH($user['csrf']) . '">'; }
+function airdropAdminBtn(array $user, string $do, array $fields, string $label, string $class = ''): string {
+    $hidden = '';
+    foreach ($fields as $k => $v) $hidden .= '<input type="hidden" name="' . adminH($k) . '" value="' . adminH($v) . '">';
+    return '<form method="post" action="/admin/?do=' . adminH($do) . '" class="inline">' . airdropAdminCsrf($user) . $hidden
+        . '<button type="submit"' . ($class ? ' class="' . adminH($class) . '"' : '') . '>' . adminH($label) . '</button></form>';
+}
+function airdropAdminBack(string $msg, string $tab = 'moderators', array $extra = []): never {
+    header('Location: /admin/?' . http_build_query(['view' => 'airdrop', 'tab' => $tab, 'msg' => $msg] + $extra), true, 303); exit;
+}
+function airdropWhen(?int $t): string {
+    if (!$t) return 'never';
+    $d = time() - $t;
+    if ($d < 60) return 'just now';
+    if ($d < 3600) return intdiv($d, 60) . ' min ago';
+    if ($d < 86400) return intdiv($d, 3600) . ' h ago';
+    if ($d < 30 * 86400) return intdiv($d, 86400) . ' d ago';
+    return gmdate('j M Y', $t);
+}
+
+function airdropAdminAction(string $do, array $user): bool {
+    if (!str_starts_with($do, 'airdrop-')) return false;
+    if (!adminCan($user, 'airdrop')) adminDeny('You cannot manage the airdrop.');
+    $actor = (int)$user['id'];
+    $id = (int)($_POST['id'] ?? 0);
+    switch ($do) {
+        case 'airdrop-mod-add':
+            $r = adModCreate((string)($_POST['name'] ?? ''), (string)($_POST['address'] ?? ''), (string)($_POST['telegram'] ?? ''),
+                (string)($_POST['note'] ?? ''), (string)$user['email'], (string)($_POST['password'] ?? ''), (string)($_POST['pin'] ?? ''));
+            if (isset($r['error'])) { http_response_code(400); airdropAdminView($user, 'moderators', $r['error'], null, $_POST); exit; }
+            adminAudit($actor, 'airdrop.moderator_added', ['name' => $r['name'], 'telegram' => $r['telegram'], 'custom_secret' => ($_POST['password'] ?? '') !== '']);
+            airdropAdminView($user, 'moderators', '', $r + ['fresh' => true]);
+            exit;
+        case 'airdrop-mod-reset':
+            $m = adModById($id);
+            if (!$m || $m['source'] !== 'db') adminDeny('That moderator cannot be reset here.', 409);
+            $sec = adModResetSecrets($id);
+            adminAudit($actor, 'airdrop.moderator_reset', ['name' => $m['name']]);
+            airdropAdminView($user, 'moderators', '', ['name' => $m['name'], 'address' => $m['address'], 'telegram' => $m['telegram']] + $sec + ['fresh' => false]);
+            exit;
+        case 'airdrop-mod-edit':
+            $m = adModById($id);
+            if (!$m || $m['source'] !== 'db') adminDeny('That moderator cannot be edited here.', 409);
+            if ($err = adModUpdate($id, (string)($_POST['address'] ?? ''), (string)($_POST['telegram'] ?? ''), (string)($_POST['note'] ?? ''))) {
+                http_response_code(400); airdropAdminView($user, 'moderators', $err); exit;
+            }
+            adminAudit($actor, 'airdrop.moderator_edited', ['name' => $m['name']]);
+            airdropAdminBack('ad-saved');
+        case 'airdrop-mod-suspend':
+        case 'airdrop-mod-activate':
+            $m = adModById($id);
+            if (!$m || $m['source'] !== 'db' || !adModSetStatus($id, $do === 'airdrop-mod-suspend' ? 'suspended' : 'active')) adminDeny('That moderator cannot be changed.', 409);
+            adminAudit($actor, $do === 'airdrop-mod-suspend' ? 'airdrop.moderator_suspended' : 'airdrop.moderator_activated', ['name' => $m['name']]);
+            airdropAdminBack($do === 'airdrop-mod-suspend' ? 'ad-suspended' : 'ad-activated');
+        case 'airdrop-mod-remove':
+            $m = adModById($id);
+            if (!$m || $m['source'] !== 'db') adminDeny('That moderator cannot be removed here.', 409);
+            if (($_POST['confirm'] ?? '') !== $m['name']) { http_response_code(400); airdropAdminView($user, 'moderators', 'To remove ' . $m['name'] . ', type their name exactly in the confirmation box.'); exit; }
+            adModDelete($id);
+            adminAudit($actor, 'airdrop.moderator_removed', ['name' => $m['name']]);
+            airdropAdminBack('ad-removed');
+        case 'airdrop-override':
+            $to = (string)($_POST['to'] ?? '');
+            if ($err = adOverride((int)($_POST['submission'] ?? 0), $to, 'console:' . $user['email'], (string)($_POST['note'] ?? ''))) adminDeny($err, 409);
+            adminAudit($actor, 'airdrop.review_overridden', ['submission' => (int)$_POST['submission'], 'to' => $to]);
+            airdropAdminBack('ad-overridden', 'activity', array_filter(['mod' => (string)($_POST['mod'] ?? ''), 'status' => (string)($_POST['fstatus'] ?? '')]));
+    }
+    adminDeny('Unknown action.', 400);
+}
+
+function airdropCredentialPanel(array $c): string {
+    $text = "Monzero airdrop moderator access\n\nSign in: https://monzero.org/airdrop/admin.php\nXMZ address: {$c['address']}\nTelegram: {$c['telegram']}\nPassword: {$c['password']}\nPIN: {$c['pin']}\n\n"
+        . "Keep these private. The Monzero team will never ask you for them. Moderator rules: approve only genuine, public work; never review your own entry.";
+    return '<section class="adr-cred" role="status"><h2>' . ($c['fresh'] ? 'Moderator added: ' : 'New sign-in details for ') . adminH($c['name']) . '</h2>'
+        . '<p><strong>Copy this now — the password and PIN are shown only once</strong> and are stored only as hashes. Send it to them privately (a direct Telegram message, not a group).</p>'
+        . '<pre id="adr-cred-text">' . adminH($text) . '</pre><div class="actions"><button type="button" data-copy-target="adr-cred-text">Copy sign-in details</button>'
+        . '<a class="button" href="/admin/?view=airdrop&amp;tab=moderators">Done</a></div></section>';
+}
+
+function airdropAdminView(array $user, string $tab = 'overview', string $error = '', ?array $cred = null, array $form = []): void {
+    $tab = in_array($tab, ['overview', 'moderators', 'activity'], true) ? $tab : 'overview';
+    $cfg = adConfig();
+    $budget = adBudget();
+    $closed = adClosedReason();
+    $mods = adModerators();
+    $stats = adModStats();
+    $db = adDb();
+    $pending = (int)$db->query("SELECT COUNT(*) FROM submissions WHERE status = 'pending'")->fetchColumn();
+    $flagged = 0;
+    foreach ($stats as $st) $flagged += $st['self'] + $st['referred'];
+    $active = count(array_filter($mods, fn($m) => $m['status'] === 'active'));
+    $flash = isset($_GET['msg'], AIRDROP_ADMIN_MESSAGES[$_GET['msg']]) ? '<p class="notice" role="status">' . adminH(AIRDROP_ADMIN_MESSAGES[$_GET['msg']]) . '</p>' : '';
+    $err = $error ? '<p class="notice error" role="alert">' . adminH($error) . '</p>' : '';
+    $csrf = airdropAdminCsrf($user);
+
+    $tabs = '<nav class="adr-tabs" aria-label="Airdrop sections">';
+    foreach (['overview' => 'Overview', 'moderators' => 'Moderators (' . count($mods) . ')', 'activity' => 'Review activity'] as $k => $label)
+        $tabs .= '<a href="/admin/?view=airdrop&amp;tab=' . $k . '"' . ($k === $tab ? ' aria-current="page"' : '') . '>' . adminH($label) . '</a>';
+    $tabs .= '<a href="/airdrop/admin.php" target="_blank" rel="noopener">Moderator panel ↗</a></nav>';
+
+    $pct = $budget['pool'] > 0 ? min(100, $budget['committed'] / $budget['pool'] * 100) : 0;
+    $kpis = '<div class="adr-kpis">'
+        . '<div><span>Campaign</span><strong class="' . ($closed === null ? 'ok' : 'warn') . '">' . ($closed === null ? 'Open' : 'Closed') . '</strong><em>' . ($closed === null ? 'ends ' . adminH(gmdate('j M Y', (int)$cfg['ends_at'])) : adminH($closed)) . '</em></div>'
+        . '<div><span>Budget used</span><strong>' . adminH(number_format($pct, 1)) . '%</strong><em>' . adminH(number_format($budget['committed'], 2)) . ' of ' . adminH(number_format($budget['pool'])) . ' XMZ</em></div>'
+        . '<div><span>Participants</span><strong>' . adParticipantCount() . '</strong><em>' . count(adPayouts()) . ' earning</em></div>'
+        . '<a href="/airdrop/admin.php#review" target="_blank" rel="noopener"><span>Waiting for review</span><strong>' . $pending . '</strong><em>in the moderator queue</em></a>'
+        . '<a href="/admin/?view=airdrop&amp;tab=moderators"><span>Active moderators</span><strong>' . $active . '</strong><em>' . (count($mods) - $active) . ' suspended</em></a>'
+        . '<a href="/admin/?view=airdrop&amp;tab=activity"><span>Warning flags</span><strong class="' . ($flagged ? 'warn' : 'ok') . '">' . $flagged . '</strong><em>own entry or own referrals approved</em></a>'
+        . '</div>';
+
+    $body = $flash . $err . ($cred ? airdropCredentialPanel($cred) : '') . $tabs;
+
+    if ($tab === 'overview') {
+        $board = '';
+        foreach ($mods as $m) {
+            $st = $stats[$m['name']];
+            $board .= '<tr><td><strong>' . adminH($m['name']) . '</strong>' . ($m['status'] !== 'active' ? ' <span class="adr-badge warn">suspended</span>' : '') . '</td><td class="num">' . $st['approved'] . '</td><td class="num">' . $st['rejected'] . '</td><td class="num">'
+                . ($st['rate'] === null ? '—' : adminH(number_format($st['rate'] * 100)) . '%') . '</td><td class="num">' . $st['day'] . '</td><td>' . adminH(airdropWhen($st['last'])) . '</td><td>'
+                . ($st['self'] + $st['referred'] ? '<span class="adr-badge warn">' . ($st['self'] + $st['referred']) . ' flagged</span>' : '<span class="adr-badge ok">clean</span>') . '</td>'
+                . '<td><a href="/admin/?view=airdrop&amp;tab=activity&amp;mod=' . rawurlencode($m['name']) . '">Reviews</a></td></tr>';
+        }
+        $log = '';
+        foreach (array_slice(adReviewLog(15), 0, 15) as $l) {
+            $log .= '<li><span class="adr-when">' . adminH(airdropWhen((int)$l['at'])) . '</span> <strong>' . adminH(str_starts_with($l['actor'], 'console:') ? 'You (console)' : $l['actor']) . '</strong> '
+                . ($l['action'] === 'override' ? 'changed' : 'reviewed') . ' #' . (int)$l['submission_id'] . ': ' . adminH((string)$l['from_status']) . ' → <span class="adr-st ' . adminH((string)$l['to_status']) . '">' . adminH((string)$l['to_status']) . '</span>'
+                . ($l['note'] !== '' ? ' — ' . adminH($l['note']) : '') . '</li>';
+        }
+        $body .= $kpis . '<div class="adr-meter"><span class="w' . ($pct > 0 ? max(5, (int)round($pct / 5) * 5) : 0) . '"></span></div>'
+            . '<section><h2>Moderator scoreboard</h2>' . ($board ? '<div class="table-scroll"><table class="adr-table"><thead><tr><th>Moderator</th><th class="num">Approved</th><th class="num">Rejected</th><th class="num">Approval rate</th><th class="num">Last 24 h</th><th>Last review</th><th>Checks</th><th></th></tr></thead><tbody>' . $board . '</tbody></table></div>' : '<p>No moderators yet. <a href="/admin/?view=airdrop&amp;tab=moderators">Add the first one</a>.</p>') . '</section>'
+            . '<section><h2>Latest decisions</h2>' . ($log ? '<ul class="adr-feed">' . $log . '</ul>' : '<p>No reviews yet.</p>') . '</section>';
+    }
+
+    if ($tab === 'moderators') {
+        $cards = '';
+        foreach ($mods as $m) {
+            $st = $stats[$m['name']];
+            $isDb = $m['source'] === 'db';
+            $flags = ($st['self'] ? '<span class="adr-badge warn">approved own entry ×' . $st['self'] . '</span>' : '') . ($st['referred'] ? '<span class="adr-badge warn">approved own referrals ×' . $st['referred'] . '</span>' : '');
+            $actions = '';
+            if ($isDb) {
+                $actions .= $m['status'] === 'active' ? airdropAdminBtn($user, 'airdrop-mod-suspend', ['id' => $m['id']], 'Suspend', 'secondary') : airdropAdminBtn($user, 'airdrop-mod-activate', ['id' => $m['id']], 'Reactivate');
+                $actions .= airdropAdminBtn($user, 'airdrop-mod-reset', ['id' => $m['id']], 'New password & PIN', 'secondary');
+                $actions .= '<a class="button" href="/admin/?view=airdrop&amp;tab=activity&amp;mod=' . rawurlencode($m['name']) . '">Their reviews</a>';
+            }
+            $edit = $isDb ? '<details><summary>Edit details</summary><form method="post" action="/admin/?do=airdrop-mod-edit" class="stack">' . $csrf . '<input type="hidden" name="id" value="' . (int)$m['id'] . '">'
+                . '<label>XMZ payout address<input name="address" value="' . adminH($m['address']) . '" spellcheck="false" required></label>'
+                . '<label>Telegram handle<input name="telegram" value="' . adminH($m['telegram']) . '" required></label>'
+                . '<label>Private note<input name="note" value="' . adminH($m['note'] ?? '') . '" maxlength="300"></label><button type="submit">Save</button></form></details>'
+                . '<details><summary>Remove moderator</summary><form method="post" action="/admin/?do=airdrop-mod-remove" class="stack">' . $csrf . '<input type="hidden" name="id" value="' . (int)$m['id'] . '">'
+                . '<p>Removing forfeits their unpaid moderator rewards (' . adminH(number_format($st['reward'], 2)) . ' XMZ). Suspend instead to stop them but still pay what they earned. Their past reviews stay in the history.</p>'
+                . '<label>Type <strong>' . adminH($m['name']) . '</strong> to confirm<input name="confirm" autocomplete="off" required></label><button type="submit" class="danger">Remove permanently</button></form></details>'
+                : '<p class="adr-note">Managed in <code>airdrop-config.php</code> on the server. Move them here by adding them below and deleting their config entry.</p>';
+            $cards .= '<article class="adr-mod' . ($m['status'] !== 'active' ? ' off' : '') . '">'
+                . '<div class="adr-mod-head"><h3>' . adminH($m['name']) . '</h3><span class="adr-badge ' . ($m['status'] === 'active' ? 'ok' : 'warn') . '">' . adminH($m['status']) . '</span>' . (!$isDb ? '<span class="adr-badge">config file</span>' : '') . $flags . '</div>'
+                . '<dl><dt>Telegram</dt><dd><a href="https://t.me/' . adminH(ltrim($m['telegram'], '@')) . '" target="_blank" rel="noopener">' . adminH($m['telegram']) . '</a></dd>'
+                . '<dt>Payout address</dt><dd><code title="' . adminH($m['address']) . '">' . adminH($m['address'] !== '' ? adShort($m['address']) : '—') . '</code></dd>'
+                . ($isDb ? '<dt>Added</dt><dd>' . adminH(gmdate('j M Y', (int)$m['created_at'])) . ' by ' . adminH($m['created_by']) . '</dd><dt>Last sign-in</dt><dd>' . adminH(airdropWhen($m['last_login_at'])) . '</dd>' : '')
+                . (($m['note'] ?? '') !== '' ? '<dt>Note</dt><dd>' . adminH($m['note']) . '</dd>' : '')
+                . '<dt>Own referral link</dt><dd>' . ($st['joined'] ? 'yes · ' . $st['referrals'] . ' referred' : 'not joined the airdrop yet') . '</dd></dl>'
+                . '<div class="adr-stats"><div><strong>' . $st['approved'] . '</strong><span>approved</span></div><div><strong>' . $st['rejected'] . '</strong><span>rejected</span></div>'
+                . '<div><strong>' . ($st['rate'] === null ? '—' : adminH(number_format($st['rate'] * 100)) . '%') . '</strong><span>approval rate</span></div><div><strong>' . $st['day'] . '</strong><span>last 24 h</span></div>'
+                . '<div><strong>' . $st['overridden'] . '</strong><span>overridden</span></div><div><strong>' . adminH(number_format($st['reward'], 2)) . '</strong><span>XMZ earned</span></div></div>'
+                . ($actions ? '<div class="actions">' . $actions . '</div>' : '') . $edit . '</article>';
+        }
+        $v = fn($k) => adminH((string)($form[$k] ?? ''));
+        $body .= '<section><h2>Moderators</h2><p>Moderators sign in at <a href="/airdrop/admin.php" target="_blank" rel="noopener">/airdrop/admin.php</a> with their XMZ address, Telegram handle, password and PIN. Suspending signs them out at once.</p>'
+            . ($cards ? '<div class="adr-mods">' . $cards . '</div>' : '<p>No moderators yet.</p>') . '</section>'
+            . '<section class="adr-add"><h2>Add a moderator</h2><form method="post" action="/admin/?do=airdrop-mod-add" class="stack">' . $csrf
+            . '<label>Name (shown on reviews)<input name="name" value="' . $v('name') . '" maxlength="32" required></label>'
+            . '<label>XMZ payout address (also their sign-in)<input name="address" value="' . $v('address') . '" spellcheck="false" required></label>'
+            . '<label>Telegram handle<input name="telegram" value="' . $v('telegram') . '" placeholder="@handle" required></label>'
+            . '<label>Private note (optional)<input name="note" value="' . $v('note') . '" maxlength="300" placeholder="e.g. applied via Telegram on 14 Nov"></label>'
+            . '<details><summary>Set the password and PIN yourself (optional)</summary><p>Leave empty to generate strong ones (recommended). If the moderator already sent you a password in a chat, it is no longer private: generate new ones instead.</p>'
+            . '<label>Password (10+ characters)<input name="password" type="text" autocomplete="off" spellcheck="false" minlength="10"></label><label>PIN (6–8 digits)<input name="pin" type="text" inputmode="numeric" autocomplete="off" pattern="[0-9]{6,8}"></label></details>'
+            . '<button type="submit">Add moderator</button></form></section>';
+    }
+
+    if ($tab === 'activity') {
+        $fmod = is_string($_GET['mod'] ?? null) ? $_GET['mod'] : '';
+        $fst = in_array($_GET['status'] ?? '', ['approved', 'rejected'], true) ? $_GET['status'] : '';
+        $opts = '<option value="">All moderators</option>';
+        foreach (array_unique(array_merge(array_column($mods, 'name'), ['console'])) as $n) $opts .= '<option' . ($n === $fmod ? ' selected' : '') . '>' . adminH($n) . '</option>';
+        $rows = '';
+        foreach (adReviewHistory($fmod, $fst, 300) as $r) {
+            $u = (string)$r['url'];
+            $detail = preg_match('#^https?://#', $u) ? '<a href="' . adminH($u) . '" target="_blank" rel="noopener noreferrer nofollow">' . adminH(mb_strimwidth($u, 0, 48, '…')) . ' ↗</a>' : '<code>' . adminH($u) . '</code>';
+            $flags = implode('', array_map(fn($f) => '<span class="adr-badge warn">' . adminH($f) . '</span>', $r['flags']));
+            $hidden = ['submission' => $r['id'], 'mod' => $fmod, 'fstatus' => $fst];
+            $over = ($r['status'] !== 'approved' ? airdropAdminBtn($user, 'airdrop-override', $hidden + ['to' => 'approved'], 'Approve', 'small') : '')
+                . ($r['status'] !== 'rejected' ? airdropAdminBtn($user, 'airdrop-override', $hidden + ['to' => 'rejected'], 'Reject', 'small danger') : '')
+                . airdropAdminBtn($user, 'airdrop-override', $hidden + ['to' => 'pending'], 'Back to queue', 'small secondary');
+            $rows .= '<tr' . ($r['flags'] ? ' class="flag"' : '') . '><td>' . adminH(airdropWhen($r['reviewed_at'] !== null ? (int)$r['reviewed_at'] : null)) . '</td><td>' . adminH((string)$r['reviewer']) . '</td><td>' . adminH(AIRDROP_TASK_LABELS[$r['platform']] ?? $r['platform']) . '</td>'
+                . '<td>' . $detail . '</td><td><code>' . adminH(adShort($r['address'])) . '</code></td><td><span class="adr-st ' . adminH($r['status']) . '">' . adminH($r['status']) . '</span> ' . $flags . '</td><td class="adr-over">' . $over . '</td></tr>';
+        }
+        $body .= '<section><h2>Review activity</h2><p>Every decision moderators have made, newest first. Rows with warning flags are highlighted. Changing a decision updates the participant\'s reward; the moderator keeps no reward for a decision you overturn.</p>'
+            . '<form method="get" action="/admin/" class="adr-filter"><input type="hidden" name="view" value="airdrop"><input type="hidden" name="tab" value="activity">'
+            . '<label>Moderator<select name="mod">' . $opts . '</select></label><label>Decision<select name="status"><option value="">All</option><option value="approved"' . ($fst === 'approved' ? ' selected' : '') . '>Approved</option><option value="rejected"' . ($fst === 'rejected' ? ' selected' : '') . '>Rejected</option></select></label><button type="submit">Filter</button></form>'
+            . ($rows ? '<div class="table-scroll"><table class="adr-table"><thead><tr><th>When</th><th>Moderator</th><th>Task</th><th>Submitted</th><th>Participant</th><th>Decision</th><th>Change</th></tr></thead><tbody>' . $rows . '</tbody></table></div>' : '<p>No reviews match.</p>') . '</section>';
+    }
+
+    adminPage('Airdrop', $body, $user);
+}
+
+function airdropAdminViewRoute(string $view, array $user): bool {
+    if ($view !== 'airdrop') return false;
+    if (!adminCan($user, 'airdrop')) adminDeny('You cannot manage the airdrop.');
+    try { adDb(); } catch (Throwable $e) { adminDeny('The airdrop storage is unavailable.', 503); }
+    airdropAdminView($user, is_string($_GET['tab'] ?? null) ? $_GET['tab'] : 'overview');
+    return true;
+}
+
+function airdropAdminLinks(array $user): string {
+    if (!adminCan($user, 'airdrop')) return '';
+    try { $pending = (int)adDb()->query("SELECT COUNT(*) FROM submissions WHERE status = 'pending'")->fetchColumn(); $n = count(adModerators()); }
+    catch (Throwable $e) { $pending = 0; $n = 0; }
+    return '<section><h2>Community airdrop</h2><ul><li><a href="/admin/?view=airdrop">Airdrop overview</a> (' . $pending . ' waiting for review)</li>'
+        . '<li><a href="/admin/?view=airdrop&amp;tab=moderators">Manage moderators</a> (' . $n . ')</li><li><a href="/admin/?view=airdrop&amp;tab=activity">Audit moderator reviews</a></li></ul></section>';
+}

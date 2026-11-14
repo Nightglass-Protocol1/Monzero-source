@@ -32,12 +32,8 @@ if (str_starts_with($action, 'admin.')) {
     if ($action === 'admin.review' && $method === 'POST') {
         $b = body(); $id = (int)($b['id'] ?? 0); $decision = str_param($b, 'decision', 10);
         if ($id <= 0 || !in_array($decision, ['approve', 'reject'], true)) out(400, ['error' => 'Bad request']);
-        $s = $db->prepare('SELECT platform FROM submissions WHERE id = ? AND status = \'pending\'');
-        $s->execute([$id]); $plat = $s->fetchColumn();
-        if ($plat === false) out(404, ['error' => 'Not found or already reviewed']);
-        $pts = $decision === 'approve' ? adPoints((string)$plat) : 0;
-        $db->prepare('UPDATE submissions SET status = ?, points = ?, reviewed_at = ?, reviewer = ? WHERE id = ?')
-            ->execute([$decision === 'approve' ? 'approved' : 'rejected', $pts, $now, $reviewer, $id]);
+        $err = adReview($id, $decision, $reviewer);
+        if ($err !== null) out(str_contains($err, 'own') ? 403 : 404, ['error' => $err]);
         out(200, ['ok' => true, 'reviewer' => $reviewer]);
     }
     if ($action === 'admin.export') {

@@ -85,7 +85,8 @@ function adParseAdmins($raw): array {
         if (!is_array($a)) continue;
         $name = mb_substr($str($a, 'name'), 0, 32);
         $entry = ['name' => $name, 'token' => $str($a, 'token'), 'address' => $str($a, 'address'),
-            'telegram' => $str($a, 'telegram'), 'password' => $str($a, 'password'), 'pin' => $str($a, 'pin')];
+            'telegram' => $str($a, 'telegram'), 'password' => $str($a, 'password'), 'pin' => $str($a, 'pin'),
+            'source' => 'config', 'status' => 'active', 'id' => null];
         $hasToken = strlen($entry['token']) >= 16;
         $hasLogin = $entry['address'] !== '' && $entry['telegram'] !== '' && $entry['password'] !== '' && $entry['pin'] !== '';
         if ($name !== '' && ($hasToken || $hasLogin)) $out[] = $entry;
@@ -104,11 +105,12 @@ function adVerifySecret(string $stored, string $given): bool {
 function adAdminLogin(string $address, string $telegram, string $password, string $pin): ?string {
     $tg = ltrim(strtolower(trim($telegram)), '@');
     $address = trim($address);
-    foreach (adConfig()['admins'] as $a) {
+    foreach (adModerators(true) as $a) {
         if (!hash_equals((string)$a['address'], $address)) continue;
         if ($a['telegram'] === '' || ltrim(strtolower($a['telegram']), '@') !== $tg) continue;
         if (!adVerifySecret((string)$a['password'], $password)) continue;
         if (!adVerifySecret((string)$a['pin'], $pin)) continue;
+        if ($a['id'] !== null) adDb()->prepare('UPDATE moderators SET last_login_at = ? WHERE id = ?')->execute([time(), $a['id']]);
         return $a['name'];
     }
     return null;
@@ -126,7 +128,7 @@ function adAdminFromCookie(string $cookie): ?string {
     if (!hash_equals(hash_hmac('sha256', $b64 . '.' . $exp, adSecret()), $sig) || (int)$exp < time()) return null;
     $name = base64_decode(strtr($b64, '-_', '+/'), true);
     if ($name === false) return null;
-    foreach (adConfig()['admins'] as $a) if ($a['name'] === $name) return $name;
+    foreach (adModerators(true) as $a) if ($a['name'] === $name) return $name;   // suspension ends a session at once
     return null;
 }
 // Returns the reviewer name for a valid admin key, or null. The master admin_token reviews as 'admin'.
@@ -134,7 +136,7 @@ function adAdminAuth(string $key): ?string {
     if ($key === '') return null;
     $cfg = adConfig();
     if (is_string($cfg['admin_token']) && $cfg['admin_token'] !== '' && hash_equals($cfg['admin_token'], $key)) return 'admin';
-    foreach ($cfg['admins'] as $a) if (hash_equals($a['token'], $key)) return $a['name'];
+    foreach ($cfg['admins'] as $a) if (strlen($a['token']) >= 16 && hash_equals($a['token'], $key)) return $a['name'];
     return null;
 }
 
@@ -177,6 +179,20 @@ function adDb(): PDO {
             CREATE TABLE IF NOT EXISTS tick_nonces (nonce TEXT PRIMARY KEY, at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS ix_participants_ref ON participants(referred_by);
             PRAGMA user_version = 5;');
+    }
+    if ((int)$db->query('PRAGMA user_version')->fetchColumn() < 6) {
+        // moderators: managed from /admin/ (config-file moderators still work alongside).
+        // review_log: every review decision and every owner override. mod_login_fails: throttle.
+        $db->exec("CREATE TABLE IF NOT EXISTS moderators (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                address TEXT NOT NULL, telegram TEXT NOT NULL, password_hash TEXT NOT NULL, pin_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active', note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+                created_by TEXT NOT NULL DEFAULT '', last_login_at INTEGER);
+            CREATE TABLE IF NOT EXISTS review_log (id INTEGER PRIMARY KEY, submission_id INTEGER NOT NULL, actor TEXT NOT NULL,
+                action TEXT NOT NULL, from_status TEXT, to_status TEXT, note TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_review_log_sub ON review_log(submission_id);
+            CREATE TABLE IF NOT EXISTS mod_login_fails (ip_hash TEXT NOT NULL, at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_submissions_reviewer ON submissions(reviewer, status);
+            PRAGMA user_version = 6;");
     }
     return $db;
 }
@@ -418,7 +434,7 @@ function adAdminPayouts(): array {
     $cfg = adConfig();
     $reward = (float)$cfg['admin_reward_xmz'];
     $addr = [];
-    foreach ($cfg['admins'] as $a) $addr[$a['name']] = $a['address'];
+    foreach (adModerators() as $a) $addr[$a['name']] = $a['address'];   // suspended moderators keep what they earned
     $rows = adDb()->query("SELECT reviewer, COUNT(*) AS n FROM submissions WHERE status = 'approved' AND reviewer IS NOT NULL AND reviewer != '' GROUP BY reviewer")->fetchAll();
     $out = [];
     foreach ($rows as $r) $out[] = ['admin' => $r['reviewer'], 'address' => $addr[$r['reviewer']] ?? '', 'confirmations' => (int)$r['n'], 'xmz' => round($reward * (int)$r['n'], 8)];
@@ -546,4 +562,217 @@ function adTick(array $payload, ?int $now = null): array {
         if (@file_put_contents($tmp, $target . "\n") !== false) { @chmod($tmp, 0600); @rename($tmp, $file); $pool = $target; }
     }
     return ['ok' => true, 'checked' => $checked, 'newly_credited' => $credited, 'pool_xmz' => $pool];
+}
+
+// ---- Moderators (owner-managed from /admin/?view=airdrop) ----
+
+const AD_MOD_LOGIN_MAX_FAILS = 10;      // per client, per 15 minutes
+
+// Every moderator: config-file entries (source=config) plus database ones (source=db).
+// $activeOnly drops suspended database moderators (they cannot sign in or review).
+function adModerators(bool $activeOnly = false): array {
+    $out = adConfig()['admins'];
+    foreach (adDb()->query('SELECT * FROM moderators ORDER BY name COLLATE NOCASE')->fetchAll() as $m) {
+        if ($activeOnly && $m['status'] !== 'active') continue;
+        $out[] = ['id' => (int)$m['id'], 'name' => $m['name'], 'address' => $m['address'], 'telegram' => $m['telegram'],
+            'password' => $m['password_hash'], 'pin' => $m['pin_hash'], 'token' => '', 'source' => 'db', 'status' => $m['status'],
+            'note' => $m['note'], 'created_at' => (int)$m['created_at'], 'created_by' => $m['created_by'], 'last_login_at' => $m['last_login_at'] !== null ? (int)$m['last_login_at'] : null];
+    }
+    return $out;
+}
+
+function adModLoginThrottled(string $ipHash): bool {
+    if ($ipHash === '') return false;
+    $db = adDb();
+    $db->prepare('DELETE FROM mod_login_fails WHERE at < ?')->execute([time() - 900]);
+    $s = $db->prepare('SELECT COUNT(*) FROM mod_login_fails WHERE ip_hash = ?');
+    $s->execute([$ipHash]);
+    return (int)$s->fetchColumn() >= AD_MOD_LOGIN_MAX_FAILS;
+}
+function adModLoginFailed(string $ipHash): void {
+    if ($ipHash !== '') adDb()->prepare('INSERT INTO mod_login_fails (ip_hash, at) VALUES (?, ?)')->execute([$ipHash, time()]);
+}
+
+function adModGeneratePassword(): string {
+    $alpha = 'abcdefghjkmnpqrstuvwxyz23456789';
+    $groups = [];
+    for ($g = 0; $g < 4; $g++) { $x = ''; for ($i = 0; $i < 4; $i++) $x .= $alpha[random_int(0, strlen($alpha) - 1)]; $groups[] = $x; }
+    return implode('-', $groups);
+}
+function adModGeneratePin(): string { return str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT); }
+
+// Validate moderator fields. Returns [normalised fields] or ['error' => ...].
+function adModValidate(string $name, string $address, string $telegram, ?int $selfId = null): array {
+    $name = preg_replace('/\s+/', ' ', trim($name)); $telegram = trim($telegram);
+    if (!preg_match('/\A[A-Za-z0-9_.-]([A-Za-z0-9_. -]{0,30}[A-Za-z0-9_.-])?\z/', $name) || strlen($name) < 2) return ['error' => 'Name: 2 to 32 letters, digits, spaces, dot, dash or underscore.'];
+    if (in_array(strtolower($name), ['admin', 'console', 'owner', 'system'], true)) return ['error' => 'That name is reserved.'];
+    foreach (adModerators() as $m) if (strcasecmp($m['name'], $name) === 0 && $m['id'] !== $selfId) return ['error' => 'A moderator with that name already exists.'];
+    $parsed = xmzParseAddress($address);
+    if (isset($parsed['error'])) return ['error' => 'XMZ address: ' . $parsed['error']];
+    if ($parsed['network'] !== 'mainnet' || $parsed['kind'] === 'integrated') return ['error' => 'Use a main mainnet XMZ address (rewards are paid to it).'];
+    if (!preg_match('/\A@?([A-Za-z0-9_]{5,32})\z/', $telegram, $m)) return ['error' => 'Telegram handle: 5 to 32 letters, digits or underscores.'];
+    return ['name' => $name, 'address' => $parsed['address'], 'telegram' => '@' . $m[1]];
+}
+
+// Owner-chosen secrets: password 10+ characters, PIN 6 to 8 digits. null = OK.
+function adModSecretProblem(string $password, string $pin): ?string {
+    if (strlen($password) < 10 || strlen($password) > 128) return 'Password: at least 10 characters.';
+    if (!preg_match('/\A\d{6,8}\z/', $pin)) return 'PIN: 6 to 8 digits.';
+    return null;
+}
+
+// Create a moderator. Password/PIN are generated unless the owner supplies both.
+// Returns ['id', 'name', 'password', 'pin', ...] (shown once) or ['error'].
+function adModCreate(string $name, string $address, string $telegram, string $note, string $by, string $password = '', string $pin = ''): array {
+    $v = adModValidate($name, $address, $telegram);
+    if (isset($v['error'])) return $v;
+    if ($password !== '' || $pin !== '') {
+        if ($problem = adModSecretProblem($password, $pin)) return ['error' => $problem];
+    } else { $password = adModGeneratePassword(); $pin = adModGeneratePin(); }
+    adDb()->prepare('INSERT INTO moderators (name, address, telegram, password_hash, pin_hash, status, note, created_at, created_by) VALUES (?, ?, ?, ?, ?, \'active\', ?, ?, ?)')
+        ->execute([$v['name'], $v['address'], $v['telegram'], password_hash($password, PASSWORD_DEFAULT), password_hash($pin, PASSWORD_DEFAULT), mb_substr(trim($note), 0, 300), time(), $by]);
+    return ['id' => (int)adDb()->lastInsertId(), 'name' => $v['name'], 'address' => $v['address'], 'telegram' => $v['telegram'], 'password' => $password, 'pin' => $pin];
+}
+
+function adModById(int $id): ?array {
+    foreach (adModerators() as $m) if ($m['id'] === $id) return $m;
+    return null;
+}
+
+function adModUpdate(int $id, string $address, string $telegram, string $note): ?string {
+    $m = adModById($id);
+    if (!$m) return 'No such moderator.';
+    $v = adModValidate($m['name'], $address, $telegram, $id);
+    if (isset($v['error'])) return $v['error'];
+    adDb()->prepare('UPDATE moderators SET address = ?, telegram = ?, note = ? WHERE id = ?')->execute([$v['address'], $v['telegram'], mb_substr(trim($note), 0, 300), $id]);
+    return null;
+}
+
+function adModSetStatus(int $id, string $status): bool {
+    if (!in_array($status, ['active', 'suspended'], true)) return false;
+    $s = adDb()->prepare('UPDATE moderators SET status = ? WHERE id = ?');
+    $s->execute([$status, $id]);
+    return $s->rowCount() === 1;
+}
+
+// New password + PIN (old ones stop working at once). Returns them for one-time display.
+function adModResetSecrets(int $id): ?array {
+    $password = adModGeneratePassword(); $pin = adModGeneratePin();
+    $s = adDb()->prepare('UPDATE moderators SET password_hash = ?, pin_hash = ? WHERE id = ?');
+    $s->execute([password_hash($password, PASSWORD_DEFAULT), password_hash($pin, PASSWORD_DEFAULT), $id]);
+    return $s->rowCount() === 1 ? ['password' => $password, 'pin' => $pin] : null;
+}
+
+// Removing forfeits unpaid moderator rewards (no payout address any more); suspend to keep them.
+function adModDelete(int $id): bool {
+    $s = adDb()->prepare('DELETE FROM moderators WHERE id = ?');
+    $s->execute([$id]);
+    return $s->rowCount() === 1;
+}
+
+// A moderator's own participant entry (same address) and referral code, if they joined.
+function adModParticipant(string $address): ?array {
+    $s = adDb()->prepare('SELECT id, ref_code FROM participants WHERE address = ?');
+    $s->execute([$address]);
+    return $s->fetch() ?: null;
+}
+
+// Moderator review: pending -> approved|rejected. A moderator may not review their own entry.
+function adReview(int $id, string $decision, string $reviewer): ?string {
+    if (!in_array($decision, ['approve', 'reject'], true)) return 'Bad decision.';
+    $db = adDb();
+    $s = $db->prepare("SELECT s.platform, p.address FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.id = ? AND s.status = 'pending'");
+    $s->execute([$id]);
+    $row = $s->fetch();
+    if (!$row) return 'Not found or already reviewed.';
+    foreach (adModerators() as $m) if ($m['name'] === $reviewer && $m['address'] !== '' && hash_equals($m['address'], $row['address']))
+        return 'You cannot review your own submission. Another moderator has to.';
+    $to = $decision === 'approve' ? 'approved' : 'rejected';
+    $now = time();
+    $db->prepare('UPDATE submissions SET status = ?, points = ?, reviewed_at = ?, reviewer = ? WHERE id = ?')
+        ->execute([$to, $to === 'approved' ? adPoints((string)$row['platform']) : 0, $now, $reviewer, $id]);
+    $db->prepare('INSERT INTO review_log (submission_id, actor, action, from_status, to_status, at) VALUES (?, ?, ?, ?, ?, ?)')
+        ->execute([$id, $reviewer, 'review', 'pending', $to, $now]);
+    return null;
+}
+
+// Owner override from /admin/: approved|rejected|pending. The original reviewer stays in the
+// log; an override decision is credited to "console" (no moderator reward for it).
+function adOverride(int $id, string $to, string $actor, string $note = ''): ?string {
+    if (!in_array($to, ['approved', 'rejected', 'pending'], true)) return 'Bad status.';
+    $db = adDb();
+    $s = $db->prepare('SELECT platform, status FROM submissions WHERE id = ?');
+    $s->execute([$id]);
+    $row = $s->fetch();
+    if (!$row) return 'No such submission.';
+    if ($row['status'] === $to) return 'It already has that status.';
+    $now = time();
+    if ($to === 'pending') $db->prepare("UPDATE submissions SET status = 'pending', points = 0, reviewed_at = NULL, reviewer = NULL WHERE id = ?")->execute([$id]);
+    else $db->prepare('UPDATE submissions SET status = ?, points = ?, reviewed_at = ?, reviewer = ? WHERE id = ?')
+        ->execute([$to, $to === 'approved' ? adPoints((string)$row['platform']) : 0, $now, 'console', $id]);
+    $db->prepare('INSERT INTO review_log (submission_id, actor, action, from_status, to_status, note, at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        ->execute([$id, $actor, 'override', $row['status'], $to, mb_substr(trim($note), 0, 300), $now]);
+    return null;
+}
+
+// Per-moderator numbers for the owner: approvals, rejections, last 24 h, last review, and two
+// warning signs: approving their own entry, and approving people they referred.
+function adModStats(): array {
+    $db = adDb();
+    $out = [];
+    $since = time() - 86400;
+    foreach (adModerators() as $m) {
+        $own = adModParticipant($m['address']);
+        $q = $db->prepare("SELECT
+              SUM(status = 'approved') AS approved, SUM(status = 'rejected') AS rejected,
+              SUM(reviewed_at >= ?) AS day, MAX(reviewed_at) AS last
+            FROM submissions WHERE reviewer = ?");
+        $q->execute([$since, $m['name']]);
+        $r = $q->fetch();
+        $self = 0; $referred = 0;
+        if ($own) {
+            $a = $db->prepare("SELECT COUNT(*) FROM submissions WHERE reviewer = ? AND status = 'approved' AND participant_id = ?");
+            $a->execute([$m['name'], $own['id']]); $self = (int)$a->fetchColumn();
+            $b = $db->prepare("SELECT COUNT(*) FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.reviewer = ? AND s.status = 'approved' AND p.referred_by = ?");
+            $b->execute([$m['name'], $own['ref_code']]); $referred = (int)$b->fetchColumn();
+        }
+        $o = $db->prepare("SELECT COUNT(*) FROM review_log l JOIN review_log r ON r.submission_id = l.submission_id AND r.action = 'review' AND r.actor = ?
+            WHERE l.action = 'override'");
+        $o->execute([$m['name']]);
+        $approved = (int)($r['approved'] ?? 0); $rejected = (int)($r['rejected'] ?? 0);
+        $out[$m['name']] = ['approved' => $approved, 'rejected' => $rejected, 'day' => (int)($r['day'] ?? 0),
+            'last' => $r['last'] !== null ? (int)$r['last'] : null, 'self' => $self, 'referred' => $referred, 'overridden' => (int)$o->fetchColumn(),
+            'rate' => $approved + $rejected > 0 ? $approved / ($approved + $rejected) : null,
+            'reward' => round($approved * (float)adConfig()['admin_reward_xmz'], 8), 'joined' => $own !== null,
+            'referrals' => $own ? (int)$db->query('SELECT COUNT(*) FROM participants WHERE referred_by = ' . $db->quote($own['ref_code']))->fetchColumn() : 0];
+    }
+    return $out;
+}
+
+// Reviewed submissions, newest first, with warning flags. $reviewer/$status filter (optional).
+function adReviewHistory(?string $reviewer = null, ?string $status = null, int $limit = 200): array {
+    $db = adDb();
+    $where = ["s.status IN ('approved','rejected')"]; $args = [];
+    if ($reviewer !== null && $reviewer !== '') { $where[] = 's.reviewer = ?'; $args[] = $reviewer; }
+    if ($status !== null && in_array($status, ['approved', 'rejected'], true)) { $where[] = 's.status = ?'; $args[] = $status; }
+    $q = $db->prepare('SELECT s.id, s.platform, s.url, s.status, s.points, s.reviewer, s.reviewed_at, s.created_at, p.address, p.referred_by
+        FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE ' . implode(' AND ', $where) . ' ORDER BY s.reviewed_at DESC, s.id DESC LIMIT ' . max(1, min(1000, $limit)));
+    $q->execute($args);
+    $mods = [];
+    foreach (adModerators() as $m) { $own = adModParticipant($m['address']); $mods[$m['name']] = ['address' => $m['address'], 'ref' => $own['ref_code'] ?? null]; }
+    $out = [];
+    foreach ($q->fetchAll() as $r) {
+        $flags = [];
+        $mod = $mods[$r['reviewer']] ?? null;
+        if ($mod && $mod['address'] !== '' && hash_equals($mod['address'], $r['address'])) $flags[] = 'own entry';
+        if ($mod && $mod['ref'] !== null && $r['referred_by'] === $mod['ref'] && $r['status'] === 'approved') $flags[] = 'their referral';
+        if ($r['reviewed_at'] !== null && (int)$r['reviewed_at'] - (int)$r['created_at'] < 60 && $r['status'] === 'approved') $flags[] = 'approved within a minute';
+        $r['flags'] = $flags;
+        $out[] = $r;
+    }
+    return $out;
+}
+
+function adReviewLog(int $limit = 100): array {
+    return adDb()->query('SELECT * FROM review_log ORDER BY id DESC LIMIT ' . max(1, min(1000, $limit)))->fetchAll();
 }

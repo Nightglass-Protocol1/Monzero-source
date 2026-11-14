@@ -22,12 +22,14 @@ if (isset($_GET['logout'])) { setcookie('ad_admin', '', ['expires' => time() - 3
 
 // Login
 if (($_POST['action'] ?? '') === 'login') {
-    $name = adAdminLogin((string)($_POST['address'] ?? ''), (string)($_POST['telegram'] ?? ''), (string)($_POST['password'] ?? ''), (string)($_POST['pin'] ?? ''));
+    $ipHash = adClientHash();
+    $name = adModLoginThrottled($ipHash) ? null : adAdminLogin((string)($_POST['address'] ?? ''), (string)($_POST['telegram'] ?? ''), (string)($_POST['password'] ?? ''), (string)($_POST['pin'] ?? ''));
     if ($name !== null) {
         setcookie('ad_admin', adAdminCookie($name, time() + 7200), ['expires' => time() + 7200] + $cookieOpts);
         header('Location: ' . $self); exit;
     }
-    $loginError = 'Login failed. Check your address, Telegram handle, password and PIN.';
+    if (adModLoginThrottled($ipHash)) $loginError = 'Too many failed sign-ins. Wait 15 minutes and try again.';
+    else { adModLoginFailed($ipHash); $loginError = 'Login failed. Check your address, Telegram handle, password and PIN.'; }
 }
 
 // Who is signed in: session cookie, or the master token via ?key=/POST key.
@@ -39,17 +41,8 @@ $csrf = $authed ? hash_hmac('sha256', 'act:' . $reviewer, adSecret()) : '';
 // Review action (requires a valid session/token + CSRF)
 if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['id'], $_POST['decision'])) {
     if (!hash_equals($csrf, (string)($_POST['csrf'] ?? ''))) { http_response_code(400); exit('Bad request'); }
-    $id = (int)$_POST['id'];
-    $decision = $_POST['decision'] === 'approve' ? 'approved' : 'rejected';
-    $db = adDb();
-    $s = $db->prepare("SELECT platform FROM submissions WHERE id = ? AND status = 'pending'");
-    $s->execute([$id]);
-    $plat = $s->fetchColumn();
-    if ($plat !== false) {
-        $pts = $decision === 'approved' ? adPoints((string)$plat) : 0;
-        $db->prepare('UPDATE submissions SET status = ?, points = ?, reviewed_at = ?, reviewer = ? WHERE id = ?')->execute([$decision, $pts, time(), $reviewer, $id]);
-    }
-    header('Location: ' . $self . '#review'); exit; // PRG so a refresh doesn't resubmit
+    $err = adReview((int)$_POST['id'], $_POST['decision'] === 'approve' ? 'approve' : 'reject', $reviewer);
+    header('Location: ' . $self . ($err !== null && str_contains($err, 'own') ? '?own=1' : '') . '#review'); exit; // PRG so a refresh doesn't resubmit
 }
 
 // CSV export: the final, budget-capped payout list (participants + moderators) in atomic units.
@@ -109,7 +102,7 @@ $ago = function (int $t): string {
     $myRejected = (int)$reviewed->fetchColumn();
     // The signed-in moderator's own referral code, if their address joined the airdrop.
     $myRef = '';
-    foreach ($cfg['admins'] as $a) if ($a['name'] === $reviewer && $a['address'] !== '') {
+    foreach (adModerators() as $a) if ($a['name'] === $reviewer && $a['address'] !== '') {
         $q = $db->prepare('SELECT ref_code FROM participants WHERE address = ?'); $q->execute([trim($a['address'])]);
         $myRef = (string)($q->fetchColumn() ?: '');
     }
@@ -177,6 +170,7 @@ $ago = function (int $t): string {
 </section>
 
 <section id="review" class="tab-panel">
+  <?php if (isset($_GET['own'])): ?><p class="alert err">You can't review your own submission. Another moderator has to.</p><?php endif; ?>
   <div class="section-head"><h2>Review queue</h2><p class="muted">Approve only genuine, public work. Each approval pays the participant the task reward and you <?= $e((string)$cfg['admin_reward_xmz']) ?> XMZ.</p></div>
   <?php if (!$pending): ?>
     <div class="empty"><strong>All clear</strong><span>Nothing is waiting for review.</span></div>

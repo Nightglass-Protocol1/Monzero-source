@@ -3,6 +3,7 @@ declare(strict_types=1);
 require __DIR__ . '/lib.php';
 require __DIR__ . '/content.php';
 require __DIR__ . '/board.php';
+require __DIR__ . '/airdrop.php';
 
 // Hash of a random discarded value; verifying against it costs the same as a real account.
 const ADMIN_DUMMY_HASH = '$argon2id$v=19$m=65536,t=4,p=1$Qjg0RGdWMU1WaHJLTWowdw$k/8Ak5f58lfla8q4RrXJgpL8Zm8HwOFDzZPSLviW2TY';
@@ -226,7 +227,7 @@ if ($method === 'POST') {
             adminAudit($actor, "account.{$do}d", ['email' => $target['email']]);
             redirect('admins', $do . 'd');
         default:
-            if (contentAction($do, $user) || boardAdminAction($do, $user)) exit;
+            if (contentAction($do, $user) || boardAdminAction($do, $user) || airdropAdminAction($do, $user)) exit;
             adminDeny('Unknown action.', 400);
     }
 }
@@ -256,8 +257,7 @@ if ($view === 'account') {
             $uri = 'otpauth://totp/' . rawurlencode('Monzero admin') . '?secret=' . $secret . '&issuer=Monzero';
             return '<p>Add a second step to sign-in with an authenticator app. Scan the code, or enter the key by hand, then type the 6-digit code it shows.</p>'
                 . '<div id="totp-qr" class="qr" data-uri="' . adminH($uri) . '"></div><p>Key: <code>' . adminH(implode(' ', str_split($secret, 4))) . '</code></p>'
-                . '<form method="post" action="/admin/?do=totp-enable" class="stack">' . $csrf . '<input type="hidden" name="secret" value="' . adminH($secret) . '"><label>Code from the app<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></label><button type="submit">Turn on</button></form>'
-                . '<script type="module" src="/admin/admin.mjs?v=20261021"></script>';
+                . '<form method="post" action="/admin/?do=totp-enable" class="stack">' . $csrf . '<input type="hidden" name="secret" value="' . adminH($secret) . '"><label>Code from the app<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></label><button type="submit">Turn on</button></form>';
         })();
     adminPage('Your account', $flash . '<section><h2>Password</h2><form method="post" action="/admin/?do=password" class="stack">' . $csrf
         . '<label>Current password<input type="password" name="current" autocomplete="current-password" required></label>'
@@ -308,10 +308,10 @@ if ($view === 'audit' && adminCan($user, 'audit.view')) {
     exit;
 }
 
-if (contentView($view, $user) || boardAdminViewRoute($view, $user)) exit;
+if (contentView($view, $user) || boardAdminViewRoute($view, $user) || airdropAdminViewRoute($view, $user)) exit;
 
 $permissions = adminPermissions($user);
 adminPage('Overview', $flash . '<p>Signed in as <strong>' . adminH($user['email']) . '</strong>' . ($isOwner ? ' (owner)' : '') . '.</p>'
     . '<section><h2>Your permissions</h2><ul>' . ($permissions ? implode('', array_map(fn($p) => '<li>' . adminH(ADMIN_PERMISSIONS[$p]) . '</li>', $permissions)) : '<li>None yet. Ask the owner.</li>') . '</ul>'
-    . '</section>' . contentLinks($user) . boardAdminLinks($user)
+    . '</section>' . contentLinks($user) . boardAdminLinks($user) . airdropAdminLinks($user)
     , $user);
