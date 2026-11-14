@@ -15,7 +15,14 @@ cd "$(dirname "$0")/.."
 ROOT=${MONZERO_ROOT:-$HOME/projects/Monzero-App}
 MONERO_DIR=${MONERO_DIR:-$ROOT/core/build/monero-official}
 WORK=${WORK:-$ROOT/core/build/xmr-stagenet}
-NODE=${XMZ_NODE:-node.monerodevs.org:38089}
+# The Monero stagenet node: XMZ_NODE, or the first of these public ones that answers now
+NODE=${XMZ_NODE:-}
+for n in node2.monerodevs.org:38089 node3.monerodevs.org:38089 stagenet.xmr-tw.org:38081 node.monerodevs.org:38089; do
+  [ -n "$NODE" ] && break
+  curl -s -m 8 "http://$n/get_height" | grep -q '"status": *"OK"' && NODE=$n
+done
+[ -n "$NODE" ] || { echo "!! no Monero stagenet node answers; set XMZ_NODE=host:port"; exit 1; }
+echo "== Monero stagenet node: $NODE"
 T=$ROOT/core/build/dex-rust-toolchain-1.95.0/sysroot/usr
 export PATH=$T/bin:$PATH LD_LIBRARY_PATH=$T/lib/x86_64-linux-gnu CARGO_HOME=$ROOT/core/build/dex-cargo-home
 FUNDER_PORT=38183; RELAY_PORT=18796
@@ -29,8 +36,11 @@ field() { python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{
 
 echo "== stagenet funding wallet"
 systemctl --user stop dex-xmr-relay 2>/dev/null || true
-# A funding wallet left running by an earlier run is used as it is
-rpc get_version | grep -q result || systemd-run --user --quiet --unit=dex-xmr-funder --collect "$MONERO_DIR/linux-x64/monero-wallet-rpc" --stagenet \
+# A funding wallet left running by an earlier run is restarted, so it uses the node chosen now
+systemctl --user stop dex-xmr-funder 2>/dev/null || true
+for _ in $(seq 1 20); do systemctl --user is-active --quiet dex-xmr-funder || break; sleep 1; done
+systemctl --user reset-failed dex-xmr-funder 2>/dev/null || true
+systemd-run --user --quiet --unit=dex-xmr-funder --collect "$MONERO_DIR/linux-x64/monero-wallet-rpc" --stagenet \
   --wallet-dir "$WORK/funder" --daemon-address "$NODE" --trusted-daemon --disable-rpc-login \
   --rpc-bind-ip 127.0.0.1 --rpc-bind-port $FUNDER_PORT --non-interactive --log-file "$WORK/funder.log"
 trap 'systemctl --user stop dex-xmr-funder dex-xmr-relay 2>/dev/null || true' EXIT
