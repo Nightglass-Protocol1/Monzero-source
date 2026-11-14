@@ -176,6 +176,56 @@ class BotTest(unittest.TestCase):
         self.assertEqual(self.requests("post"), [])
 
 
+class DynamicPrice(BotTest):
+    def ref(self):
+        return self.bot.reference()
+
+    def test_a_sale_raises_the_price_and_reprices_the_ladder(self):
+        self.bot.cfg["ladder_percent"] = [2]
+        self.bot.round()
+        self.assertEqual(self.ref(), Decimal("0.001"))
+        self.scenario({"unlocked": 100000 * lb.ATOMIC, "taken": True, "done": True})
+        self.bot.round()                       # taken, finished, paid out
+        self.assertEqual(self.ref(), Decimal("0.00102"))
+        self.scenario({"unlocked": 100000 * lb.ATOMIC})
+        self.bot.round()                       # the slot posts again, 2% higher
+        posts = self.requests("post")
+        self.assertEqual([p["offer"]["valueWei"] for p in posts], [str(1020000000000000), str(1040400000000000)])
+        events = [json.loads(x) for x in self.bot.ledger_file.read_text().splitlines()]
+        self.assertEqual([e["referenceUsd"] for e in events if e["event"] == "price"], ["0.001", "0.001020000"])
+
+    def test_open_offers_follow_a_price_change(self):
+        self.bot.round()
+        self.bot.set_reference(Decimal("0.00102"), "test")
+        self.bot.round()
+        self.assertEqual(len(self.requests("cancel")), 2, "both open offers withdrawn to re-post at the new price")
+        self.bot.round()
+        self.assertEqual(len(self.requests("post")), 4)
+
+    def test_quiet_periods_lower_it_down_to_the_floor(self):
+        self.bot.cfg["dynamic_price"]["floor_usd"] = "0.00097"
+        self.bot.reference()
+        self.bot.set_reference(Decimal("0.001"), "test")
+        t0 = self.bot.price["changedAt"]
+        self.bot.price_decay(t0 + 11 * 3600)
+        self.assertEqual(self.ref(), Decimal("0.001"), "not before 12 hours")
+        self.bot.price_decay(t0 + 12 * 3600)
+        self.assertEqual(self.ref(), Decimal("0.00099"))
+        self.bot.price_decay(t0 + 12 * 3600 + 3600)
+        self.assertEqual(self.ref(), Decimal("0.00099"), "the clock restarts after a change")
+        self.bot.price_decay(t0 + 100 * 3600)
+        self.assertEqual(self.ref(), Decimal("0.00097"), "never below the floor")
+        self.bot.price_decay(t0 + 200 * 3600)
+        self.assertEqual(self.ref(), Decimal("0.00097"))
+
+    def test_fixed_when_switched_off(self):
+        self.bot.cfg["dynamic_price"]["enabled"] = False
+        self.bot.price_after_sale("ETH")
+        self.bot.price_decay(time.time() + 99 * 3600)
+        self.assertEqual(self.ref(), Decimal("0.001"))
+        self.assertFalse(self.bot.price_file.exists())
+
+
 class Ed25519(unittest.TestCase):
     def test_rfc8032_vector_1(self):
         pub = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")

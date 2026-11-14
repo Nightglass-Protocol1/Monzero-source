@@ -3,7 +3,8 @@
 
 The pool sends it a share of the pool's own fee (xmzpool `liquidity`); the owner may add XMZ too.
 For each enabled pair (SOL, ETH, BNB) it keeps a ladder of sell offers at steps above a reference
-USD price, converted to the coin at its live price. It runs the trades the same way the phone
+USD price, converted to the coin at its live price. The reference follows demand (`dynamic_price`):
+each sale raises it, quiet periods lower it slowly, never below a floor; every change is logged. It runs the trades the same way the phone
 wallet does (the same trade helper, `monzero-dex-evm-helper`), approves a trade only when it is
 exactly the offer it posted, and after each trade sends what the trade account received to the
 pair's vault address, keeping a little for the next trade's network fees.
@@ -51,6 +52,9 @@ DEFAULTS = {
     "control_key": "9eba2b1784ddfc23f028c03c78f862fecc81af81616722b56e671e6662e0a6fb",
     "daemon": "127.0.0.1:6175",
     "reference_usd": "0.001",
+    # The reference price follows demand: +up% per sale, -down% after every down_every_hours
+    # without a sale or change, never below floor_usd. Its state is in price.json.
+    "dynamic_price": {"enabled": True, "up_percent_per_sale": 2, "down_percent": 1, "down_every_hours": 12, "floor_usd": "0.001"},
     "ladder_percent": [2, 5, 10, 20],
     "offer_xmz": "2000",
     "offer_hours": 6,
@@ -175,7 +179,12 @@ def load_config(path):
     cfg = json.loads(json.dumps(DEFAULTS))
     user = json.loads(Path(path).read_text())
     pairs = user.pop("pairs", {})
+    dynamic = {**cfg["dynamic_price"], **user.pop("dynamic_price", {})}
     cfg.update(user)
+    cfg["dynamic_price"] = dynamic
+    if not (0 <= float(dynamic["up_percent_per_sale"]) <= 50 and 0 <= float(dynamic["down_percent"]) <= 50
+            and float(dynamic["down_every_hours"]) >= 1 and Decimal(dynamic["floor_usd"]) > 0):
+        sys.exit("config: dynamic_price needs up/down 0..50 %, down_every_hours >= 1 and a positive floor_usd")
     cfg["pairs"] = {}
     for name, p in pairs.items():
         if name not in PAIR_DEFAULTS:
@@ -281,6 +290,8 @@ class Bot:
         self.prices = {}
         self.prices_at = 0
         self.slots = read_json(self.slots_file, {}) or {}
+        self.price_file = self.state_dir / "price.json"
+        self.price = read_json(self.price_file, None)
         self.alerts = []
 
     # --- helper
@@ -450,13 +461,61 @@ class Bot:
         self.alerts.append(text)
 
     # --- pricing
+    def reference(self):
+        """The USD price per XMZ the ladder starts from."""
+        if not self.cfg["dynamic_price"]["enabled"]:
+            return Decimal(self.cfg["reference_usd"])
+        if self.price is None:
+            self.price = {"referenceUsd": str(Decimal(self.cfg["reference_usd"])), "changedAt": int(time.time()), "sales": 0}
+            self.save_price("start")
+        return Decimal(self.price["referenceUsd"])
+
+    def save_price(self, why):
+        atomic_write(self.price_file, json.dumps(self.price, indent=1), mode=0o644)
+        self.record({"event": "price", "referenceUsd": self.price["referenceUsd"], "why": why})
+        log.info("reference price %s USD per XMZ (%s)", self.price["referenceUsd"], why)
+
+    def set_reference(self, value, why):
+        floor = Decimal(self.cfg["dynamic_price"]["floor_usd"])
+        value = max(floor, value).quantize(Decimal("1e-9"))
+        self.price.update(referenceUsd=str(value), changedAt=int(time.time()))
+        self.save_price(why)
+
+    def price_after_sale(self, pair):
+        d = self.cfg["dynamic_price"]
+        if not d["enabled"]:
+            return
+        self.reference()
+        self.price["sales"] = int(self.price.get("sales", 0)) + 1
+        self.set_reference(Decimal(self.price["referenceUsd"]) * (1 + Decimal(str(d["up_percent_per_sale"])) / 100), f"sale on {pair}")
+
+    def price_decay(self, now=None):
+        """-down% for each full quiet period since the last change (no sale, no change)."""
+        d = self.cfg["dynamic_price"]
+        if not d["enabled"]:
+            return
+        ref = self.reference()
+        now = now or time.time()
+        period = float(d["down_every_hours"]) * 3600
+        steps = int((now - self.price["changedAt"]) // period)
+        if steps <= 0:
+            return
+        floor = Decimal(self.cfg["dynamic_price"]["floor_usd"])
+        new = max(floor, ref * (1 - Decimal(str(d["down_percent"])) / 100) ** steps)
+        if new == ref:   # at the floor already: only the clock moves on
+            self.price["changedAt"] = int(self.price["changedAt"] + steps * period)
+            atomic_write(self.price_file, json.dumps(self.price, indent=1), mode=0o644)
+            return
+        self.set_reference(new, f"{steps * float(d['down_every_hours']):g} h without a sale")
+        self.price["changedAt"] = int(now)
+
     def offer_for(self, pair, step, doc):
         """(value in the coin's atoms, XMZ atoms) for one ladder step, inside the document's limits."""
         p = self.cfg["pairs"][pair]
         coin_usd = self.prices.get(pair)
         if not coin_usd:
             return None
-        price_usd = Decimal(self.cfg["reference_usd"]) * (1 + Decimal(str(step)) / 100)
+        price_usd = self.reference() * (1 + Decimal(str(step)) / 100)
         xmz = Decimal(self.cfg["offer_xmz"])
         xmz = min(xmz, Decimal(int(doc["maxXmzAtomsPerTrade"])) / ATOMIC)
         per_trade = Decimal(int(doc["maxLtcAtomsPerTrade"]))
@@ -474,6 +533,7 @@ class Bot:
     # --- one round
     def round(self):
         self.alerts = []
+        self.price_decay()
         self.refresh_prices()
         wallet = self.wallet_status()
         if wallet is None:
@@ -545,6 +605,7 @@ class Bot:
             log.warning("%s: %s", key, s["note"])
             return spare
         s.update({"state": "open", "folder": str(folder), "valueAtoms": value, "xmzAtoms": xmz, "step": step, "note": "",
+                  "refUsd": str(self.reference()),
                   "postedAt": int(time.time()), "expiresAt": int(time.time()) + int(self.cfg["offer_hours"]) * 3600})
         self.record({"event": "posted", "pair": pair, "slot": slot, "valueAtoms": str(value), "xmzAtoms": str(xmz), "folder": folder.name})
         log.info("%s: offered %s XMZ for %s %s", key, units(xmz, 11), units(value, self.cfg["pairs"][pair]["decimals"]), pair)
@@ -562,6 +623,7 @@ class Bot:
             self.record({"event": "taken", "pair": pair, "slot": slot, "valueAtoms": str(s["valueAtoms"]), "xmzAtoms": str(s["xmzAtoms"]),
                          "folder": Path(s["folder"]).name})
             log.info("%s: offer taken", key)
+            self.price_after_sale(pair)
             self.trade(pair, slot, s)
             return spare
         if r.get("expired"):
@@ -569,7 +631,10 @@ class Bot:
             return spare
         # Re-price when the coin moved, or when the operator paused new trades
         fresh = self.offer_for(pair, step, doc) if doc else None
-        if doc is None or (fresh and abs(fresh[0] - s["valueAtoms"]) * 100 > s["valueAtoms"] * float(self.cfg["reprice_percent"])):
+        # ...or when the reference price changed since it was posted (a sale or a quiet period)
+        posted_ref = Decimal(s.get("refUsd") or self.reference())
+        ref_moved = abs(self.reference() - posted_ref) * 1000 >= posted_ref * 9   # 0.9 % or more
+        if doc is None or ref_moved or (fresh and abs(fresh[0] - s["valueAtoms"]) * 100 > s["valueAtoms"] * float(self.cfg["reprice_percent"])):
             if self.dry_run:
                 return spare
             c = self.helper({"command": "cancel", "tradeDir": s["folder"], "relays": self.cfg["relays"], "tick": self.tick_config(pair, slot)})
@@ -646,7 +711,8 @@ class Bot:
 
     def write_status(self, wallet):
         atomic_write(self.state_dir / "status.json", json.dumps({
-            "updatedAt": int(time.time()), "dryRun": self.dry_run,
+            "updatedAt": int(time.time()), "dryRun": self.dry_run, "referenceUsd": str(self.reference()),
+            "ladderUsd": [str((self.reference() * (1 + Decimal(str(x)) / 100)).quantize(Decimal("1e-8"))) for x in self.cfg["ladder_percent"]],
             "xmz": {"address": (wallet or {}).get("address"), "balance": units((wallet or {}).get("balanceAtoms", 0), 11),
                     "unlocked": units((wallet or {}).get("unlockedAtoms", 0), 11)},
             "prices": {k: str(v) for k, v in self.prices.items()},
