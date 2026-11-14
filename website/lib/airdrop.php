@@ -6,6 +6,7 @@ declare(strict_types=1);
 // participant's XMZ payout address plus a secret dashboard token. No seed or private key is ever
 // requested. Telegram membership and sustained mining are checked automatically (the wallet
 // reward unlocks with either one); social shares and forum/node tasks are approved by a moderator.
+if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) { http_response_code(404); exit; }
 require_once __DIR__ . '/xmz-address.php';
 
 function adPrivateDir(): string { $d = getenv('MONZERO_PRIVATE_DIR'); return is_string($d) && $d !== '' ? $d : dirname(__DIR__, 2) . '/monzero-private'; }
