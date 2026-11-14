@@ -33,6 +33,12 @@ final class DexHelper {
     private final File program, workDir;
     private final Handler handler;
     private final ExecutorService pool = Executors.newCachedThreadPool();
+    /** Why the last run gave no valid answer, in a few plain words (never the helper's own output). */
+    private volatile String lastFailure = "";
+
+    String lastFailure() {
+        return lastFailure;
+    }
 
     DexHelper(File program, File workDir, Handler handler) {
         this.program = program;
@@ -51,6 +57,8 @@ final class DexHelper {
     void run(final JSONObject request, final long timeoutMs, final int maxOutput, final Done done) {
         final byte[] input;
         try {
+            // The helper answers by itself, naming the slow step, shortly before it would be stopped here
+            request.put("deadlineSecs", Math.max(5, timeoutMs / 1000 - 10));
             input = request.toString().getBytes("UTF-8");
         } catch (Exception e) {
             handler.post(() -> done.done(null));
@@ -113,6 +121,10 @@ final class DexHelper {
                 final int exit = process.waitFor();   // a refusal exits 1 with ok:false: the answer counts either way
                 watchdog.interrupt();
                 why = "exit " + exit + (tooMuch ? ", too much output" : "") + (killed.get() ? ", timed out" : "") + ", " + collected.size() + " bytes: " + errorText;
+                if (killed.get()) lastFailure = "it took longer than " + (timeoutMs / 1000) + " seconds";
+                else if (tooMuch) lastFailure = "its answer was too long";
+                else if (collected.size() == 0) lastFailure = "it stopped without an answer, code " + exit;
+                else lastFailure = "its answer was not understood, code " + exit;
                 if (!tooMuch && !killed.get()) {
                     final JSONObject parsed = new JSONObject(new String(collected.toByteArray(), "UTF-8").trim());
                     if (RESPONSE_SCHEMA.equals(parsed.optString("schema")) && parsed.opt("ok") instanceof Boolean) answer = parsed;
@@ -120,6 +132,7 @@ final class DexHelper {
             } catch (Exception e) {
                 answer = null;
                 why = why + " " + e;
+                if (process == null) lastFailure = "it could not be started";
             } finally {
                 if (BuildConfig.DEBUG && answer == null) Log.w("DexHelper", request.optString("command") + ": no valid answer (" + why.trim() + ")");
                 Arrays.fill(input, (byte) 0);   // may hold the wallet seed

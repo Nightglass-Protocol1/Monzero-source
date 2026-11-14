@@ -72,6 +72,10 @@ pub struct Request {
     /// `routes`: the chain's RPC, to price the network fees a route keeps back
     #[serde(default)]
     pub evm_rpc: Option<String>,
+    /// How long this request may take before the helper answers "took too long" itself (the
+    /// app stops a helper that never answers; an answer that names the slow step is better)
+    #[serde(default)]
+    pub deadline_secs: Option<u64>,
     /// `xmzWallet`: the app's DEX XMZ wallet
     #[serde(default)]
     pub xmz_wallet: Option<crate::helper_wallet::XmzWalletRequest>,
@@ -150,12 +154,29 @@ pub struct Endpoint {
     pub login_file: Option<PathBuf>,
 }
 
+static STEP: std::sync::Mutex<&'static str> = std::sync::Mutex::new("starting");
+
+/// What the helper is doing now, in the user's words: named when a request runs out of time
+pub(crate) fn step(what: &'static str) {
+    if let Ok(mut s) = STEP.lock() {
+        *s = what;
+    }
+}
+
 /// Handle one request; errors become `{"ok": false, "error": ...}`.
 pub async fn handle(request: &[u8]) -> Value {
     let result = match serde_json::from_slice::<Request>(request) {
         Err(e) => Err(format!("bad request: {e}")),
         Ok(r) if r.schema != REQUEST_SCHEMA => Err(format!("unknown schema {}", r.schema)),
-        Ok(r) => dispatch(r).await,
+        Ok(r) => match r.deadline_secs {
+            // Stopping here is as safe as the app stopping the helper: every step that matters is
+            // saved before it is acted on, and the next request carries on from what is saved
+            Some(secs) => match tokio::time::timeout(std::time::Duration::from_secs(secs.clamp(5, 3600)), dispatch(r)).await {
+                Ok(result) => result,
+                Err(_) => Err(format!("this took too long while {}. Nothing is lost: try again in a moment", STEP.lock().map(|s| *s).unwrap_or("working"))),
+            },
+            None => dispatch(r).await,
+        },
     };
     match result {
         Ok(mut v) => {
