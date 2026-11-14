@@ -107,14 +107,15 @@ pub async fn check_program(url: &str, program: &Pubkey) -> Result<(), DriverErro
 }
 
 /// Send everything `key` holds (less the fee) to `to`, outside any trade.
-pub async fn pay_out(url: &str, key: &SigningKey, to: &Pubkey) -> Result<Option<(String, u64)>, DriverError> {
+/// Sends the account's balance to `to`, less the fee and less `keep` lamports (left for later fees)
+pub async fn pay_out(url: &str, key: &SigningKey, to: &Pubkey, keep: u64) -> Result<Option<(String, u64)>, DriverError> {
     let rpc = Rpc::new(url)?;
     let me = key.verifying_key().to_bytes();
     let balance = rpc.call("getBalance", json!([to_base58(&me), {"commitment": "confirmed"}])).await?["value"].as_u64().unwrap_or(0);
-    if balance <= FEE_LAMPORTS || to == &me {
+    if balance <= FEE_LAMPORTS.saturating_add(keep) || to == &me {
         return Ok(None);
     }
-    let amount = balance - FEE_LAMPORTS;
+    let amount = balance - FEE_LAMPORTS - keep;
     let mut data = 2u32.to_le_bytes().to_vec();
     data.extend_from_slice(&amount.to_le_bytes());
     let raw = signed(key, message(&me, &SYSTEM_PROGRAM, &[meta(me, true, true), meta(*to, false, true)], &data, &rpc.blockhash().await?));

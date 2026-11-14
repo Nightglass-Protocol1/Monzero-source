@@ -231,7 +231,7 @@ async fn full_swap_with_both_traders_resumed_from_their_journals_every_tick() {
     // Afterwards the claimer sends what its account holds to its own wallet
     // A fresh address every run (an address is any 32 bytes)
     let home: [u8; 32] = rand::random();
-    let (id, amount) = sol::pay_out(&url, &sol::account_key(&claimer.key.to_bytes().0), &home).await.unwrap().expect("something to send");
+    let (id, amount) = sol::pay_out(&url, &sol::account_key(&claimer.key.to_bytes().0), &home, 0).await.unwrap().expect("something to send");
     assert!(!id.is_empty());
     for _ in 0..40 {
         if balance(&url, &home).await >= amount {

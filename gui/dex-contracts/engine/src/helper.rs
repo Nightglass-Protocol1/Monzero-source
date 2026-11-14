@@ -41,6 +41,10 @@ pub struct Request {
     /// `payout` only: where the trade's account sends what it holds
     #[serde(default)]
     pub payout_address: Option<String>,
+    /// `payout` and `withdraw`: leave this much (wei or lamports, decimal) in the trade account,
+    /// for the network fees of its next trade (the liquidity bot). Default: send everything.
+    #[serde(default)]
+    pub keep_wei: Option<String>,
     /// Market commands: the open relays to use
     #[serde(default)]
     pub relays: Option<Vec<String>>,
@@ -180,7 +184,10 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         Command::Status => status(&r.trade_dir),
         Command::Approve => approve(&r.trade_dir, r.commitment),
         Command::Tick => tick(&r.trade_dir, r.tick).await,
-        Command::Payout => payout(&r.trade_dir, r.tick, r.payout_address.as_deref()).await,
+        Command::Payout => {
+            let keep = keep_wei(&r)?;
+            payout(&r.trade_dir, r.tick, r.payout_address.as_deref(), keep).await
+        }
         Command::Listings => market_listings(&r).await,
         Command::Post => match (&r.tick, &r.offer) {
             (Some(t), Some(o)) => crate::helper_market::post(&r.trade_dir, t, relays(&r)?, o, r.local_contract).await,
@@ -195,7 +202,7 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         Command::Withdraw => {
             let to = r.payout_address.as_deref().ok_or("withdraw needs payoutAddress")?;
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            crate::helper_market::withdraw(&r.trade_dir, r.tick.as_ref().ok_or("withdraw needs tick")?, r.chain_id.ok_or("withdraw needs chainId")?, to, now).await
+            crate::helper_market::withdraw(&r.trade_dir, r.tick.as_ref().ok_or("withdraw needs tick")?, r.chain_id.ok_or("withdraw needs chainId")?, to, now, keep_wei(&r)?).await
         }
         Command::XmzWallet => crate::helper_wallet::run(r.xmz_wallet.as_ref().ok_or("xmzWallet needs xmzWallet")?).await,
     }
@@ -374,7 +381,18 @@ pub(crate) fn trade_chain(
 }
 
 /// After the trade is done, send the trade account's balance to the user's own address.
-async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>) -> Result<Value, String> {
+/// What a payout leaves in the trade account (`keepWei`), 0 when not given
+fn keep_wei(r: &Request) -> Result<alloy::primitives::U256, String> {
+    match r.keep_wei.as_deref() {
+        None => Ok(alloy::primitives::U256::ZERO),
+        Some(t) if !t.is_empty() && t.len() <= 40 && t.bytes().all(|b| b.is_ascii_digit()) => {
+            alloy::primitives::U256::from_str_radix(t, 10).map_err(|_| "keepWei is not a number".to_string())
+        }
+        Some(_) => Err("keepWei must be a decimal amount".into()),
+    }
+}
+
+async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>, keep: alloy::primitives::U256) -> Result<Value, String> {
     let cfg = cfg.ok_or("payout needs the tick configuration")?;
     let to_text = to.ok_or("payout needs payoutAddress")?;
     let (swap_seed, key) = keys(&cfg)?;
@@ -387,7 +405,8 @@ async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>) -> Result
             }
             saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
             let to = crate::sol::from_base58(to_text).map_err(|e| e.to_string())?;
-            let sent = crate::sol::pay_out(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to).await.map_err(|e| e.to_string())?;
+            let keep = u64::try_from(keep).map_err(|_| "keepWei is too large for Solana")?;
+            let sent = crate::sol::pay_out(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to, keep).await.map_err(|e| e.to_string())?;
             let mut v = status(dir)?;
             v["payout"] = match sent {
                 Some((tx, amount)) => {
@@ -410,7 +429,7 @@ async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>) -> Result
     saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
     let chain_kind = Chain::from_id(saved.offer.chain_id).ok_or("unknown chain")?;
     let chain = AlloyChain::new(&cfg.evm_rpc, chain_kind, saved.offer.contract, saved.evm_from_block, key).map_err(|e| e.to_string())?;
-    let sent = chain.pay_out(to).await.map_err(|e| e.to_string())?;
+    let sent = chain.pay_out(to, keep).await.map_err(|e| e.to_string())?;
     let mut v = status(dir)?;
     v["payout"] = match sent {
         Some((tx, amount)) => {

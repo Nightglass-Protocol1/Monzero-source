@@ -485,7 +485,7 @@ pub fn xmz_needed(atoms: u64) -> u64 {
 /// Send what the trade account holds on this chain back to the user's own wallet (for example
 /// MetaMask), when nothing of ours needs it: coin paid in for an offer that was cancelled, never
 /// taken, or refused.
-pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: &str, now: u64) -> Result<Value, String> {
+pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: &str, now: u64, keep: U256) -> Result<Value, String> {
     if let Some(why) = funds_in_use(root, now)? {
         return Err(why);
     }
@@ -493,7 +493,8 @@ pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: &str, no
     let kind = Chain::from_id(chain_id).ok_or("unknown chain")?;
     if kind.is_solana() {
         let to_key = crate::sol::from_base58(to).map_err(|e| e.to_string())?;
-        let sent = crate::sol::pay_out(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to_key).await.map_err(|e| e.to_string())?;
+        let keep = u64::try_from(keep).map_err(|_| "keepWei is too large for Solana")?;
+        let sent = crate::sol::pay_out(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to_key, keep).await.map_err(|e| e.to_string())?;
         return Ok(match sent {
             Some((tx, amount)) => json!({"withdrawn": {"to": to.trim(), "tx": tx, "amountWei": amount.to_string()}}),
             None => json!({"withdrawn": null, "reason": "nothing to send, or a payment is still pending"}),
@@ -501,7 +502,7 @@ pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: &str, no
     }
     let to = crate::helper::parse_address(to)?;
     let chain = AlloyChain::new(&cfg.evm_rpc, kind, Address::ZERO, 0, key).map_err(|e| e.to_string())?;
-    Ok(match chain.pay_out(to).await.map_err(|e| e.to_string())? {
+    Ok(match chain.pay_out(to, keep).await.map_err(|e| e.to_string())? {
         Some((tx, amount)) => json!({"withdrawn": {"to": to.to_string(), "tx": tx.to_string(), "amountWei": amount.to_string()}}),
         None => json!({"withdrawn": null, "reason": "nothing to send, or a payment is still pending"}),
     })

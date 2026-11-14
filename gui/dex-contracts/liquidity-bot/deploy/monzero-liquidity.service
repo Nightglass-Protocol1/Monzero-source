@@ -1,0 +1,22 @@
+[Unit]
+Description=Monzero DEX liquidity bot (sell offers from the pool fee share)
+After=network-online.target xmzpool.service
+Wants=network-online.target
+
+[Service]
+User=monzero-liquidity
+Group=monzero-liquidity
+ExecStart=/usr/bin/python3 -I /opt/monzero-liquidity/liquidity_bot.py /etc/monzero-liquidity/config.json run
+Restart=on-failure
+RestartSec=60
+# Wallet services get time to save their wallets
+TimeoutStopSec=120
+KillMode=mixed
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/monzero-liquidity
+
+[Install]
+WantedBy=multi-user.target

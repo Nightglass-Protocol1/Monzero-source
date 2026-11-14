@@ -360,11 +360,11 @@ async fn nothing_is_locked_until_each_account_is_funded() {
     let metamask: Address = "0x00000000000000000000000000000000000Ad0E5".parse().unwrap();
     let before = balance(&w.url, metamask).await;
     let held = balance(&w.url, claimer_addr).await;
-    let (_, amount) = w.chain(CLAIMER_KEY).pay_out(metamask).await.unwrap().expect("a payout");
+    let (_, amount) = w.chain(CLAIMER_KEY).pay_out(metamask, U256::ZERO).await.unwrap().expect("a payout");
     assert_eq!(balance(&w.url, metamask).await - before, amount);
     assert!(amount < held && held - amount < U256::from(10u64.pow(16)), "only the transfer fee stays behind");
     assert!(balance(&w.url, claimer_addr).await < U256::from(10u64.pow(15)));
-    assert_eq!(w.chain(CLAIMER_KEY).pay_out(metamask).await.unwrap(), None, "nothing left: repeating sends nothing");
+    assert_eq!(w.chain(CLAIMER_KEY).pay_out(metamask, U256::ZERO).await.unwrap(), None, "nothing left: repeating sends nothing");
     set_balance(&w.url, claimer_addr, rich).await;
 
     // A smart or delegated account (as MetaMask smart accounts are) runs code when paid: this one
@@ -372,13 +372,13 @@ async fn nothing_is_locked_until_each_account_is_funded() {
     let smart: Address = "0x00000000000000000000000000000000005Ad0E5".parse().unwrap();
     rpc(&w.url, "hardhat_setCode", json!([smart.to_string(), "0x600160005500"])).await;
     let before = balance(&w.url, smart).await;
-    let (_, amount) = w.chain(CLAIMER_KEY).pay_out(smart).await.unwrap().expect("a payout to a smart account");
+    let (_, amount) = w.chain(CLAIMER_KEY).pay_out(smart, U256::ZERO).await.unwrap().expect("a payout to a smart account");
     assert_eq!(balance(&w.url, smart).await - before, amount);
     // One that burns gas without end is refused, not paid for
     let greedy: Address = "0x00000000000000000000000000000000006Ad0E5".parse().unwrap();
     rpc(&w.url, "hardhat_setCode", json!([greedy.to_string(), "0x5b600056"])).await;
     set_balance(&w.url, claimer_addr, rich).await;
-    assert!(w.chain(CLAIMER_KEY).pay_out(greedy).await.is_err(), "no payout into an account that cannot take it");
+    assert!(w.chain(CLAIMER_KEY).pay_out(greedy, U256::ZERO).await.is_err(), "no payout into an account that cannot take it");
     set_balance(&w.url, claimer_addr, rich).await;
 }
 

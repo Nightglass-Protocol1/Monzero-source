@@ -179,7 +179,8 @@ impl AlloyChain {
     /// After a trade: send everything our account holds, less the fee of this transfer, to
     /// `to` (the user's own wallet, e.g. MetaMask). Returns the transaction and the amount, or
     /// None when a payout is still pending or nothing is left to send. Repeating it is safe.
-    pub async fn pay_out(&self, to: Address) -> Result<Option<(B256, U256)>, DriverError> {
+    /// Sends the account's balance to `to`, less the fee and less `keep` (left for later fees)
+    pub async fn pay_out(&self, to: Address, keep: U256) -> Result<Option<(B256, U256)>, DriverError> {
         let latest = self.reader.get_transaction_count(self.from).block_id(BlockId::latest()).await.map_err(chain_err)?;
         let pending = self.reader.get_transaction_count(self.from).pending().await.map_err(chain_err)?;
         if pending > latest {
@@ -199,10 +200,10 @@ impl AlloyChain {
         }
         // Pay the full max fee up front so the amount plus fee never exceeds the balance
         let fee = U256::from(gas) * U256::from(fees.max_fee_per_gas);
-        if balance <= fee {
+        if balance <= fee + keep {
             return Ok(None);
         }
-        let amount = balance - fee;
+        let amount = balance - fee - keep;
         let tx = TransactionRequest::default()
             .with_from(self.from)
             .with_to(to)
