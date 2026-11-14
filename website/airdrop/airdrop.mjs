@@ -57,7 +57,7 @@ function render(status, token) {
   const refLink = `${location.origin}/airdrop/?ref=${status.ref_code}`;
   $("ad-reflink").value = refLink;
   $("ad-refcount").textContent = `${status.referrals} (${status.referral_earned}/${status.referral_cap} XMZ)`;
-  $("ad-refpts").textContent = (CFG?.rewards?.referral ?? 1);
+  $("ad-refpts").textContent = (CFG?.rewards?.referral ?? 0.5);
   // one-tap sharing of the referral link
   { const msg = "Join the Monzero airdrop and earn XMZ — private, CPU-mined crypto, no premine. Use my link:";
     const enc = encodeURIComponent, L = refLink;

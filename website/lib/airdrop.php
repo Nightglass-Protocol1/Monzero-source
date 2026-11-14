@@ -26,12 +26,12 @@ function adConfig(): array {
         'starts_at'    => $int('starts_at', 0),
         'ends_at'      => $int('ends_at', 0),                 // 0 = open-ended
         'rewards'      => is_array($c['rewards'] ?? null) ? $c['rewards'] : (is_array($c['points'] ?? null) ? $c['points'] : []),
-        'per_person_cap' => isset($c['per_person_cap']) && is_numeric($c['per_person_cap']) ? (float)$c['per_person_cap'] : 50.0,
+        'per_person_cap' => isset($c['per_person_cap']) && is_numeric($c['per_person_cap']) ? (float)$c['per_person_cap'] : 25.0,
         'auto_renew'   => ($c['auto_renew'] ?? false) === true,
         'mining_days_required' => isset($c['mining_days_required']) && is_int($c['mining_days_required']) && $c['mining_days_required'] >= 1 && $c['mining_days_required'] <= 31 ? $c['mining_days_required'] : 7,
         'max_per_ip'     => isset($c['max_per_ip']) && is_int($c['max_per_ip']) && $c['max_per_ip'] >= 0 ? $c['max_per_ip'] : 3,
         'trusted_proxies' => is_array($c['trusted_proxies'] ?? null) ? $c['trusted_proxies'] : [],
-        'referral_cap'   => isset($c['referral_cap']) && is_numeric($c['referral_cap']) ? (float)$c['referral_cap'] : 25.0,
+        'referral_cap'   => isset($c['referral_cap']) && is_numeric($c['referral_cap']) ? (float)$c['referral_cap'] : 12.5,
         'admin_reward_xmz' => isset($c['admin_reward_xmz']) && is_numeric($c['admin_reward_xmz']) ? (float)$c['admin_reward_xmz'] : 0.0,
         'admins'         => adParseAdmins($c['admins'] ?? null),
         'admin_token'  => is_string($c['admin_token'] ?? null) ? $c['admin_token'] : null,
@@ -43,10 +43,10 @@ function adConfig(): array {
 }
 
 // XMZ each task pays (owner can override in config['rewards']). Harder tasks pay more; the
-// core tasks sum to 45 XMZ and up to 5 referrals (1 XMZ each) reach the 50 XMZ per-person cap.
+// core tasks sum to 22.5 XMZ (per-person task cap 25); referrals pay 0.5 XMZ each, capped at 12.5.
 function adRewardXmz(string $task): float {
-    $defaults = ['wallet' => 2, 'telegram' => 2, 'mining' => 12, 'forum_post' => 5, 'forum_active' => 10,
-        'run_node' => 8, 'share_x' => 3, 'share_instagram' => 3, 'referral' => 1];
+    $defaults = ['wallet' => 1, 'telegram' => 1, 'mining' => 6, 'forum_post' => 2.5, 'forum_active' => 5,
+        'run_node' => 4, 'share_x' => 1.5, 'share_instagram' => 1.5, 'referral' => 0.5];
     $v = adConfig()['rewards'][$task] ?? ($defaults[$task] ?? 0);
     return is_numeric($v) && $v >= 0 && $v <= 10000 ? (float)$v : (float)($defaults[$task] ?? 0);
 }

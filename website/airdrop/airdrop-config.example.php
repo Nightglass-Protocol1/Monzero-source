@@ -6,9 +6,9 @@
 return [
     'enabled'        => false,            // set true to open the airdrop
     'pool_xmz'       => 8000,             // budget for this round (from the pool fee); auto-renewed
-    'per_person_cap' => 50,               // most XMZ one participant can earn from TASKS (they sum to this)
-    'referral_cap'   => 25,               // max XMZ one participant can earn from referrals (separate track)
-    'admin_reward_xmz' => 0.5,            // XMZ paid to a moderator for each confirmed (approved) submission
+    'per_person_cap' => 25,               // most XMZ one participant can earn from TASKS (they sum to this)
+    'referral_cap'   => 12.5,              // max XMZ one participant can earn from referrals (separate track)
+    'admin_reward_xmz' => 0.25,           // XMZ paid to a moderator for each confirmed (approved) submission
     'auto_renew'     => true,             // let airdrop-topup.sh keep pool_xmz funded from the fee
     'mining_days_required' => 7,          // distinct days a miner must be active to earn the mining reward
     'max_per_ip'     => 3,                // max airdrop entries per IP (0 = no limit). Lenient for shared NAT.
@@ -24,12 +24,12 @@ return [
         // ['name' => 'alice', 'address' => 'FW6V...alice', 'telegram' => '@alice', 'password' => 'change-me', 'pin' => '1234'],
         // ['name' => 'bob',   'address' => 'FW6V...bob',   'telegram' => '@bob',   'password' => 'change-me', 'pin' => '5678'],
     ],
-    // XMZ each task pays (harder = more). Core tasks sum to 45 (cap 50). Referrals are a separate
+    // XMZ each task pays (harder = more). Core tasks sum to 22.5 (cap 25). Referrals are a separate
     // track: referral XMZ per verified referral, up to referral_cap.
     'rewards'        => [
-        'wallet' => 2, 'telegram' => 2, 'mining' => 12,
-        'forum_post' => 5, 'forum_active' => 10, 'run_node' => 8,
-        'share_x' => 3, 'share_instagram' => 3, 'referral' => 1,
+        'wallet' => 1, 'telegram' => 1, 'mining' => 6,
+        'forum_post' => 2.5, 'forum_active' => 5, 'run_node' => 4,
+        'share_x' => 1.5, 'share_instagram' => 1.5, 'referral' => 0.5,
     ],
     'x'         => 'MonzeroXMZ',
     'instagram' => 'monzeroxmz',
