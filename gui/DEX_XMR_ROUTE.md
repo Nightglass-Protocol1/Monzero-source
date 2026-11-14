@@ -51,8 +51,8 @@ XMR offers on the main networks are refused by apps and relays until switched on
 default. Test networks always accept XMR. Opening needs, in order:
 
 1. Local Monero fakechain: `bash dex-contracts/engine/tests/run-xmr-local.sh` (wallet-level
-   lock/sweep, full swaps, refunds, restarts). **Not yet run**: written 2026-11-13, needs the
-   owner's go-ahead to run the downloaded Monero programs.
+   lock/sweep, full swaps, refunds, restarts). **Passed 2026-11-14** on official Monero
+   0.18.5.4 (owner's run): wallet-level test 1/1, swap tests 11/11.
 2. Public test networks: Sepolia + Monero stagenet through the helper's commands and a relay,
    `COIN=xmr cargo run --example market_e2e -- <run dir>` (needs stagenet XMR in a funder wallet).
 3. App integration (below), then an app-to-app stagenet trade and a refund run.
@@ -66,8 +66,8 @@ default. Test networks always accept XMR. Opening needs, in order:
 - Relay: XMR pairs with their own boards, prices and candles in XMR units, `xmrMainnet` switch,
   `pairs` in `/v1/info`.
 - Tests: engine 94 unit tests, relay 13; the local-chain integration tests run on either coin
-  (`MONZERO_PRIVATE_COIN=xmr`, `MONZERO_XMR_BIN`). On XMZ they all pass with the chain's node as
-  witness.
+  (`MONZERO_PRIVATE_COIN=xmr`, `MONZERO_XMR_BIN`). They pass on XMZ and on Monero (2026-11-14),
+  with the chain's node as witness.
 - Official Monero 0.18.5.4 (Linux x64 and Android arm64), checked against the release's signed
   hash list, in `core/build/monero-official/`.
 
