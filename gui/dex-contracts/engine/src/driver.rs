@@ -400,7 +400,10 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
             }
             Action::SendSetReady(swap) => {
                 if self.gas_advance == GasAdvance::Give {
-                    self.advance_gas().await?;
+                    // An advance that cannot be sent now (fees jumped past what we hold, the
+                    // node refused it) must not hold `setReady` back: the swap goes on, and the
+                    // claimer can still pay for its own claim. Tried again on the next round.
+                    let _ = self.advance_gas().await;
                 }
                 self.evm("set_ready", EvmCall::SetReady((&swap).into())).await
             }
