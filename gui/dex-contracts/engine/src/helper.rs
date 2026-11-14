@@ -66,6 +66,9 @@ pub struct Request {
     /// `withdraw`: the chain whose trade account is emptied
     #[serde(default)]
     pub chain_id: Option<u64>,
+    /// `take` of an offer that sells XMR: the transaction that paid our account for selling XMZ
+    #[serde(default)]
+    pub xmz_sale: Option<B256>,
     /// `routes`: the chain's RPC, to price the network fees a route keeps back
     #[serde(default)]
     pub evm_rpc: Option<String>,
@@ -185,7 +188,7 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         },
         Command::Serve => crate::helper_market::serve(&r.trade_dir, r.tick.as_ref().ok_or("serve needs tick")?, relays(&r)?).await,
         Command::Take => {
-            crate::helper_market::take(&r.trade_dir, r.tick.as_ref().ok_or("take needs tick")?, relays(&r)?, r.listing.clone(), accept(&r)).await
+            crate::helper_market::take(&r.trade_dir, r.tick.as_ref().ok_or("take needs tick")?, relays(&r)?, r.listing.clone(), accept(&r), r.xmz_sale).await
         }
         Command::Cancel => crate::helper_market::cancel(&r.trade_dir, r.tick.as_ref().ok_or("cancel needs tick")?, relays(&r)?).await,
         Command::Report => crate::helper_market::report(&r.trade_dir, relays(&r)?).await,

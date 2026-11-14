@@ -40,6 +40,19 @@ pub fn check_relay(url: &str) -> Result<String, String> {
     Ok(u.to_string())
 }
 
+/// A completed swap as a relay recorded it from the chain
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Print {
+    pub pair: String,
+    pub chain_id: u64,
+    pub tx: String,
+    /// Block time of the claim
+    pub at: u64,
+    /// Coin amount (wei)
+    pub value: alloy::primitives::U256,
+}
+
 pub struct RelayClient {
     http: reqwest::Client,
     pub relays: Vec<String>,
@@ -96,6 +109,22 @@ impl RelayClient {
         } else {
             Err(v.get("error").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("HTTP {status}")))
         }
+    }
+
+    /// Completed swaps of a pair since `since`, from every relay that answers (duplicates kept:
+    /// the caller looks for one transaction)
+    pub async fn prints(&self, pair: &str, since: u64) -> Vec<Print> {
+        #[derive(Deserialize)]
+        struct Prints {
+            prints: Vec<Print>,
+        }
+        let mut out = vec![];
+        for r in &self.relays {
+            if let Ok(p) = self.get::<Prints>(&format!("{r}/v1/prints?pair={}&since={since}", pair.replace('/', "%2F"))).await {
+                out.extend(p.prints.into_iter().take(5000));
+            }
+        }
+        out
     }
 
     /// Posts to every relay; the result per relay

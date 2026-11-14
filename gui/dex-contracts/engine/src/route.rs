@@ -56,6 +56,24 @@ pub fn buy_xmr_routes(listings: &[SignedListing], chain: Chain, reserve: U256) -
     routes
 }
 
+/// How long after selling XMZ the coin may be spent on XMR
+pub const SALE_WINDOW_SECS: u64 = 24 * 3600;
+
+/// XMR is sold only to an account that has just sold XMZ (the owner's rule): an offer that
+/// sells XMR asks its taker for that sale. Local test chains have no relay record to ask.
+pub fn needs_xmz_sale(listing: &crate::listing::Listing) -> bool {
+    listing.side == Side::SellXmz && listing.xmz_network.coin() == PrivateCoin::Xmr && Chain::from_id(listing.chain_id).is_some_and(|c| c != Chain::Local)
+}
+
+/// Does this recorded swap pay for taking `listing`: an XMZ sale on the same chain, recent, and
+/// for at least what the XMR costs?
+pub fn sale_covers(print: &crate::relay_client::Print, listing: &crate::listing::Listing, now: u64) -> bool {
+    Chain::from_id(listing.chain_id).is_some_and(|c| print.pair == c.pair())
+        && print.chain_id == listing.chain_id
+        && print.value >= listing.value
+        && print.at + SALE_WINDOW_SECS >= now
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +124,22 @@ mod tests {
         let routes = buy_xmr_routes(&offers, Chain::BscMainnet, U256::from(101));
         assert_eq!(routes.iter().map(|r| (r.leg1.listing.id[0], r.leg2.listing.id[0])).collect::<Vec<_>>(), vec![(2, 6)]);
         assert!(buy_xmr_routes(&offers, Chain::EthMainnet, U256::ZERO).is_empty(), "another chain");
+    }
+
+    #[test]
+    fn xmr_is_sold_only_against_a_recent_xmz_sale_that_covers_it() {
+        use crate::relay_client::Print;
+        use XmzNetwork::{Mainnet, XmrMainnet};
+        let xmr = offer(5, Side::SellXmz, XmrMainnet, 900, 30).listing;
+        assert!(needs_xmz_sale(&xmr));
+        assert!(!needs_xmz_sale(&offer(1, Side::SellXmz, Mainnet, 900, 30).listing), "XMZ offers ask for nothing");
+        assert!(!needs_xmz_sale(&offer(7, Side::BuyXmz, XmrMainnet, 900, 30).listing), "selling XMR to a maker ends in XMZ by the route, not by proof");
+        let sale = |pair: &str, chain_id, value: u64, at| Print { pair: pair.into(), chain_id, tx: String::new(), at, value: U256::from(value) };
+        let now = 1_000_000;
+        assert!(sale_covers(&sale("BNB/XMZ", 56, 900, now - 3600), &xmr, now));
+        assert!(!sale_covers(&sale("BNB/XMZ", 56, 899, now - 3600), &xmr, now), "too small");
+        assert!(!sale_covers(&sale("BNB/XMZ", 56, 900, now - SALE_WINDOW_SECS - 1), &xmr, now), "too old");
+        assert!(!sale_covers(&sale("BNB/XMR", 56, 900, now - 3600), &xmr, now), "selling XMR does not count");
+        assert!(!sale_covers(&sale("ETH/XMZ", 1, 900, now - 3600), &xmr, now), "another chain");
     }
 }

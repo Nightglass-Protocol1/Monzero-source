@@ -89,6 +89,11 @@ pub struct Take {
     /// Where the maker's answer goes
     pub reply_to: B256,
     pub request: KeyRequest,
+    /// Taking an XMR-for-coin offer: the transaction in which this taker's account was paid for
+    /// selling XMZ (leg 1 of the XMZ → XMR route). Absent on every other take, which then
+    /// reads exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xmz_sale: Option<B256>,
 }
 
 /// The maker's answer to a take

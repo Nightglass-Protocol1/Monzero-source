@@ -129,7 +129,7 @@ impl Taker {
             Role::Claimer => Role::Owner,
         };
         let session = Session::start(seed, offer_for(listing, key.address()), role, key, now)?;
-        let take = Take { listing: listing.id, taker: key.address(), reply_to: seed.mailbox(listing.id, false).address(), request: session.request() };
+        let take = Take { listing: listing.id, taker: key.address(), reply_to: seed.mailbox(listing.id, false).address(), request: session.request(), xmz_sale: None };
         Ok((Taker { session, listing: listing.clone() }, take))
     }
 

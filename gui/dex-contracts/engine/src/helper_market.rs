@@ -66,6 +66,43 @@ struct TakerFile {
     /// The chain search starts before our first take: the maker may lock once it answered
     evm_from_block: u64,
     sent_at: u64,
+    /// Our XMZ sale shown to a maker that sells XMR (see `route::needs_xmz_sale`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xmz_sale: Option<B256>,
+}
+
+/// XMR is sold only to an account that has just sold XMZ. The taker names the transaction that
+/// paid it; the maker checks three things: a relay recorded that transaction as a completed
+/// XMZ swap on this chain, recent and at least as large as this purchase; on the chain it is a
+/// claim by this taker's account from the pinned contract; and it has not already paid for
+/// another purchase from us. An Err is the refusal the taker is shown.
+async fn check_xmz_sale(cfg: &TickConfig, client: &RelayClient, listing: &Listing, taker: Address, sale: Option<B256>, now: u64, used: &Path) -> Result<(), String> {
+    use alloy::sol_types::SolCall;
+    let chain = chain_of_id(listing.chain_id)?;
+    let tx = sale.ok_or("XMR is sold only to an account that has just sold XMZ: take this offer through the XMZ → XMR route")?;
+    if chain.is_solana() {
+        return Err("XMR is not sold through Solana yet".into());
+    }
+    let spent: BTreeMap<B256, B256> = read(used)?.unwrap_or_default();
+    if spent.get(&tx).is_some_and(|by| *by != listing.id) {
+        return Err("that XMZ sale already paid for another XMR purchase".into());
+    }
+    crate::helper::step("checking the taker's XMZ sale on the relays");
+    let text = tx.to_string();
+    let prints = client.prints(chain.pair(), now.saturating_sub(crate::route::SALE_WINDOW_SECS)).await;
+    if !prints.iter().any(|p| p.tx.eq_ignore_ascii_case(&text) && crate::route::sale_covers(p, listing, now)) {
+        return Err("the relays show no XMZ sale of at least this amount in the last 24 hours for that transaction".into());
+    }
+    crate::helper::step("checking the taker's XMZ sale on the chain");
+    let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
+    let sent = provider.get_transaction_by_hash(tx).await.map_err(|e| e.to_string())?.ok_or("that XMZ sale is not on the chain")?;
+    use alloy::consensus::Transaction as _;
+    let input = sent.input();
+    let swap = crate::XmzSwap::claimCall::abi_decode(input).map(|c| c.swap).or_else(|_| crate::XmzSwap::claimRelayerCall::abi_decode(input).map(|c| c.swap));
+    match swap {
+        Ok(swap) if sent.to() == Some(listing.contract) && swap.claimer == taker => Ok(()),
+        _ => Err("that transaction did not pay this account for selling XMZ".into()),
+    }
 }
 
 /// What the app accepts beyond the pinned rules.
@@ -323,8 +360,22 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
         let heights = at.expect("set");
         // A taker with code on chain could not receive the payout: refuse before answering
         let plain = check_chain(cfg, &file.listing.listing, heights.evm_from_block, &key, &[take.taker]).await.is_ok();
-        let (answer, saved) = if plain {
-            maker.answer(&take, &seed, &key, heights)
+        let used = dir.parent().unwrap_or(dir).join("xmz-sales-used.json");
+        let sale = match crate::route::needs_xmz_sale(&file.listing.listing) {
+            true => check_xmz_sale(cfg, &client, &file.listing.listing, take.taker, take.xmz_sale, heights.now, &used).await,
+            false => Ok(()),
+        };
+        let (answer, saved) = if let Err(why) = sale {
+            (crate::mail::Answer { listing: id, response: crate::exchange::KeyResponse::Refused(why) }, None)
+        } else if plain {
+            let (answer, saved) = maker.answer(&take, &seed, &key, heights);
+            // The sale is spent once we agree to the trade it pays for
+            if let (Some(_), Some(tx)) = (&saved, take.xmz_sale) {
+                let mut spent: BTreeMap<B256, B256> = read(&used)?.unwrap_or_default();
+                spent.insert(tx, id);
+                write(&used, &spent)?;
+            }
+            (answer, saved)
         } else {
             (crate::mail::Answer { listing: id, response: crate::exchange::KeyResponse::Refused("the taker's account has code on chain".into()) }, None)
         };
@@ -376,7 +427,7 @@ async fn close_taken(dir: &Path, file: &mut MakerFile, cfg: &TickConfig, relays:
     }
 }
 
-pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Option<SignedListing>, accept: Accept) -> Result<Value, String> {
+pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Option<SignedListing>, accept: Accept, xmz_sale: Option<B256>) -> Result<Value, String> {
     if journal_has_trade(dir) {
         let mut v = status(dir)?;
         v["agreed"] = json!(true);
@@ -403,14 +454,18 @@ pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Opti
             check_chain(cfg, l, at.evm_from_block, &key, &[key.address(), l.maker]).await?;
             check_funds(ours, l, &key, cfg).await?;
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            let f = TakerFile { listing: signed, evm_from_block: at.evm_from_block, sent_at: 0 };
+            if crate::route::needs_xmz_sale(l) && xmz_sale.is_none() {
+                return Err("XMR is bought through the XMZ → XMR route: sell XMZ first, then take this offer with that sale".into());
+            }
+            let f = TakerFile { listing: signed, evm_from_block: at.evm_from_block, sent_at: 0, xmz_sale };
             write(&path, &f)?;
             f
         }
     };
     let l = file.listing.listing.clone();
     let at = heights(cfg, chain_of_id(l.chain_id)?, Some(file.evm_from_block)).await?;
-    let (mut taker, letter) = Taker::start(&l, &seed, &key, at.now).map_err(|e| e.to_string())?;
+    let (mut taker, mut letter) = Taker::start(&l, &seed, &key, at.now).map_err(|e| e.to_string())?;
+    letter.xmz_sale = file.xmz_sale;
     // An answer first: it may already be waiting
     let mailbox = seed.mailbox(l.id, false);
     let mut refusal = None;
