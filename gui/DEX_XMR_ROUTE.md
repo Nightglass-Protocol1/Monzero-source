@@ -57,7 +57,11 @@ route, not by a new swap:
 Limit, stated plainly: someone running changed software could still sell their XMR to a taker
 who never held XMZ; the rule binds the project's apps, page and relays, not the two chains.
 
-Not built yet; it belongs to the app integration below.
+Built in the engine (2026-11-14): the route finder (`route::buy_xmr_routes`, helper command
+`routes`) and the seller's check (`helper_market::check_xmz_sale`; the taker's `take` request
+carries `xmzSale`, the transaction that paid it). The pure parts are unit-tested; the whole
+check against a relay and a chain is not yet run end to end. Still to build: running the two
+legs as one trade in the apps, and the same check on the relays.
 
 ## One wallet, nothing else in hand (owner direction, 2026-11-14)
 
