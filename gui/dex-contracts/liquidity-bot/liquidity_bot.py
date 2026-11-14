@@ -45,7 +45,7 @@ PAIR_DEFAULTS = {
 }
 DEFAULTS = {
     "network": "mainnet",
-    "relays": ["https://relay1.monzero.org"],
+    "relays": ["https://relay1.monzero.org", "https://relay2.monzero.org"],
     "price_api": "https://monzero.org/markets/api.php?only=coins",
     "control_base": "https://monzero.org/dex/control/",
     "control_key": "9eba2b1784ddfc23f028c03c78f862fecc81af81616722b56e671e6662e0a6fb",
@@ -168,7 +168,7 @@ def read_json(path, default=None):
 
 
 def units(atoms, places):
-    return str((Decimal(int(atoms)) / (Decimal(10) ** places)).normalize())
+    return format((Decimal(int(atoms)) / (Decimal(10) ** places)).normalize(), "f")
 
 
 def load_config(path):
