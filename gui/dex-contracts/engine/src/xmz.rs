@@ -149,7 +149,7 @@ pub struct WalletRpc {
 impl WalletRpc {
     /// `url` is the wallet RPC root, e.g. `http://127.0.0.1:18083`.
     pub fn new(url: &str, login: Option<(String, String)>) -> Self {
-        WalletRpc { url: format!("{}/json_rpc", url.trim_end_matches('/')), login, http: reqwest::Client::new() }
+        WalletRpc { url: format!("{}/json_rpc", url.trim_end_matches('/')), login, http: crate::chain::http_client() }
     }
 
     /// Login from the `monzero-wallet-rpc.<port>.login` file the RPC writes at start.

@@ -288,7 +288,7 @@ struct Rpc {
 
 impl Rpc {
     fn new(url: &str) -> Result<Self, DriverError> {
-        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(sol_err)?;
+        let http = crate::chain::http_client_builder().timeout(std::time::Duration::from_secs(30)).build().map_err(sol_err)?;
         Ok(Rpc { url: url.to_string(), http })
     }
 

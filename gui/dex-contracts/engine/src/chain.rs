@@ -55,8 +55,14 @@ fn retrying_client(url: alloy::transports::http::reqwest::Url) -> alloy::rpc::cl
 /// On Android the helper is a stand-alone program: the system's certificate checker is reachable
 /// only from an app's Java side, and the default client stops ("rustls-platform-verifier to be
 /// initialized"). There, servers are checked against the built-in Mozilla root certificates, as
-/// the relay client does on every system.
+/// the relay client does on every system. Every client of alloy's reqwest (EVM, Solana, the XMZ
+/// wallet) is made here, never with `reqwest::Client::new()` or `::builder()`.
 pub(crate) fn http_client() -> alloy::transports::http::reqwest::Client {
+    http_client_builder().build().expect("TLS client")
+}
+
+/// `http_client`, for callers that add settings (a timeout)
+pub(crate) fn http_client_builder() -> alloy::transports::http::reqwest::ClientBuilder {
     #[cfg(target_os = "android")]
     {
         let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
@@ -65,11 +71,11 @@ pub(crate) fn http_client() -> alloy::transports::http::reqwest::Client {
             .expect("TLS protocol versions")
             .with_root_certificates(roots)
             .with_no_client_auth();
-        alloy::transports::http::reqwest::Client::builder().tls_backend_preconfigured(tls).build().expect("TLS client")
+        alloy::transports::http::reqwest::Client::builder().tls_backend_preconfigured(tls)
     }
     #[cfg(not(target_os = "android"))]
     {
-        alloy::transports::http::reqwest::Client::new()
+        alloy::transports::http::reqwest::Client::builder()
     }
 }
 
