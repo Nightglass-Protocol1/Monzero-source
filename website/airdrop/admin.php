@@ -51,12 +51,13 @@ if ($authed && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['id
     header('Location: ' . $self); exit; // PRG so a refresh doesn't resubmit
 }
 
-// CSV export
+// CSV export: the final, budget-capped payout list (participants + moderators) in atomic units.
+// Feed it to utils/website/airdrop_payout.py.
 if ($authed && ($_GET['export'] ?? '') === 'csv') {
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="monzero-airdrop-payouts.csv"');
-    echo "address,xmz\n";
-    foreach (adPayouts() as $row) printf("%s,%.8f\n", $row['address'], $row['xmz']);
+    echo "kind,address,atomic,xmz\n";
+    foreach (adFinalPayouts() as $row) printf("%s,%s,%d,%.11f\n", $row['kind'], $row['address'], $row['atomic'], $row['atomic'] / 1e11);
     exit;
 }
 ?>
@@ -79,7 +80,9 @@ if ($authed && ($_GET['export'] ?? '') === 'csv') {
   <?php
     $pool = (float)$cfg['pool_xmz'];
     $payouts = adPayouts();
-    $totalXmz = array_sum(array_column($payouts, 'xmz'));
+    $budget = adBudget();
+    $totalXmz = $budget['committed'];
+    $closed = adClosedReason();
     $pending = adDb()->query("SELECT s.id, s.platform, s.url, s.created_at, p.address FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.status = 'pending' ORDER BY s.created_at")->fetchAll();
   ?>
   <div class="stats">
@@ -87,7 +90,9 @@ if ($authed && ($_GET['export'] ?? '') === 'csv') {
     <div><span>Participants earning</span><strong><?= $e((string)count($payouts)) ?></strong></div>
     <div><span>Committed so far</span><strong><?= $e(number_format($totalXmz, 2)) ?> XMZ</strong></div>
     <div><span>Pending reviews</span><strong><?= $e((string)count($pending)) ?></strong></div>
+    <div><span>Campaign</span><strong><?= $closed === null ? 'Open' : 'Closed: ' . $e($closed) ?></strong></div>
   </div>
+  <?php if ($budget['scale'] < 1): ?><p class="err">Earned rewards exceed the budget. Payouts are scaled to <?= $e(number_format($budget['scale'] * 100, 2)) ?>% and registrations are closed.</p><?php endif; ?>
   <p><a class="btn" href="<?= $e($self) ?>?export=csv">Export payout CSV</a></p>
 
   <h2>Pending share submissions</h2>

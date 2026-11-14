@@ -92,7 +92,7 @@ Private, mined, community-run digital cash.
     + snip("""⚠️ Scam warning
 
 • Nobody from Monzero will ever DM you first or ask for your recovery phrase, private keys or passwords.
-• There is NO live airdrop or giveaway. Anything asking you to "claim", "validate" or "sync your wallet" is a scam.
+• The only official airdrop is at monzero.org/airdrop/. Anything else asking you to "claim", "validate" or "sync your wallet" is a scam.
 • Monzero has NO token on Solana, Ethereum, BNB Chain, Pump.fun or anywhere else. XMZ exists only on the Monzero blockchain.
 • Only download wallets from monzero.org and use the web wallet only at wallet.monzero.org.
 

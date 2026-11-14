@@ -16,7 +16,7 @@ $cfg = adConfig();
 $action = (string)($_GET['action'] ?? '');
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $now = time();
-$live = $cfg['enabled'] && ($cfg['starts_at'] === 0 || $now >= $cfg['starts_at']) && ($cfg['ends_at'] === 0 || $now <= $cfg['ends_at']);
+$live = adLive($now);   // needs enabled + a budget + a real end date
 
 // ---- Admin actions (gated by a shared secret from the config) ----
 if (str_starts_with($action, 'admin.')) {
@@ -41,11 +41,10 @@ if (str_starts_with($action, 'admin.')) {
         out(200, ['ok' => true, 'reviewer' => $reviewer]);
     }
     if ($action === 'admin.export') {
-        $rows = adPayouts();
-        $admins = adAdminPayouts();
-        out(200, ['pool_xmz' => (float)$cfg['pool_xmz'], 'per_person_cap' => $cfg['per_person_cap'],
-            'participant_xmz' => round(array_sum(array_column($rows, 'xmz')), 8), 'participants' => count($rows), 'payouts' => $rows,
-            'admin_reward_xmz' => $cfg['admin_reward_xmz'], 'admin_xmz' => round(array_sum(array_column($admins, 'xmz')), 8), 'admin_payouts' => $admins]);
+        // payouts: final amounts in atomic units, scaled so the total never exceeds the budget.
+        $b = adBudget();
+        out(200, ['pool_xmz' => $b['pool'], 'per_person_cap' => $cfg['per_person_cap'], 'earned_xmz' => $b['participant_xmz'],
+            'admin_xmz' => $b['admin_xmz'], 'scale' => $b['scale'], 'payouts' => adFinalPayouts()]);
     }
     out(404, ['error' => 'Unknown admin action']);
 }
@@ -54,7 +53,9 @@ if (str_starts_with($action, 'admin.')) {
 if ($action === 'config') {
     $rewards = ['wallet' => adRewardXmz('wallet'), 'telegram' => adRewardXmz('telegram'), 'mining' => adRewardXmz('mining'), 'referral' => adRewardXmz('referral')];
     foreach (adReviewTasks() as $rt) $rewards[$rt] = adRewardXmz($rt);
+    $b = adBudget();
     out(200, ['enabled' => $cfg['enabled'], 'live' => $live, 'pool_xmz' => $cfg['pool_xmz'], 'per_person_cap' => $cfg['per_person_cap'],
+        'full' => $b['pool'] > 0 && $b['committed'] >= $b['pool'], 'participants' => adParticipantCount(),
         'starts_at' => $cfg['starts_at'], 'ends_at' => $cfg['ends_at'],
         'telegram' => $cfg['telegram'], 'x' => $cfg['x'], 'instagram' => $cfg['instagram'],
         'rewards' => $rewards]);

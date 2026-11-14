@@ -32,7 +32,7 @@ function shareText(refLink) {
 }
 
 const TASKS = [
-  { key: "wallet", title: "Create a wallet", desc: "You're in — your XMZ address is registered as your reward address." },
+  { key: "wallet", title: "Create a wallet", desc: "Your XMZ address is registered. This reward unlocks once you verify Telegram or mining." },
   { key: "telegram", title: "Join the Telegram", desc: "Join the channel, then verify in one tap." },
   { key: "mining", title: "Mine XMZ", desc: "Mine on the pool for 7 days over the month (they don't have to be in a row). Highest reward — real work for the network." },
   { key: "forum_post", title: "Join the forum & post", desc: "Sign up to the Monzero forum and make your first genuine post. A mod checks it.", review: true, openHref: "/community/board/", openLabel: "Open the forum ↗", placeholder: "Your forum username or post link" },
@@ -123,8 +123,15 @@ async function refresh(token) {
 
 function showRegister() {
   $("ad-dash").hidden = true;
-  $("ad-register").hidden = !(CFG && CFG.live);
+  const open = !!(CFG && CFG.live && !CFG.full);
+  $("ad-register").hidden = !open;
   if (CFG && !CFG.live) $("ad-register-error").textContent = "The airdrop isn't open right now — check back soon.";
+  else if (CFG && CFG.full) $("ad-register-error").textContent = "This round's budget is fully committed, so new entries are closed.";
+}
+
+function fmtEnd(ts) {
+  if (!ts) return "—";
+  try { return new Date(ts * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }); } catch { return "—"; }
 }
 
 async function registerFlow() {
@@ -162,7 +169,9 @@ async function init() {
 
   try { CFG = await api("config"); } catch { CFG = { live: false, points: {} }; }
   $("ad-pool").textContent = fmtPool(CFG.pool_xmz || 0);
-  $("ad-state").textContent = CFG.live ? "Open" : "Not open yet";
+  $("ad-state").textContent = !CFG.live ? (CFG.ends_at && Date.now() / 1000 > CFG.ends_at ? "Ended" : "Not open yet") : CFG.full ? "Budget full" : "Open";
+  $("ad-ends").textContent = fmtEnd(CFG.ends_at);
+  $("ad-count").textContent = Number.isInteger(CFG.participants) ? CFG.participants.toLocaleString() : "—";
   $("ad-summary").hidden = false;
   try { const t = await fetch("/api/telegram/", { cache: "no-store" }).then((r) => r.json()); if (t && t.username) BOT = t.username; } catch { /* keep default */ }
 
@@ -176,8 +185,6 @@ async function init() {
   const token = (/^[a-f0-9]{32}$/.test(hashTok) ? hashTok : null) || ls.get(TOKEN_KEY);
   if (token) { ls.set(TOKEN_KEY, token); await refresh(token); } else showRegister();
   loadLeaderboard();
-  // count towards participants shown in the summary
-  try { const { leaderboard } = await api("leaderboard"); $("ad-count").textContent = leaderboard.length ? `${leaderboard.length}+` : "0"; } catch { /* ignore */ }
 }
 
 init();

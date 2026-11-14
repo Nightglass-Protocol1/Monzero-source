@@ -1,10 +1,11 @@
 <?php
 declare(strict_types=1);
-// Monzero community airdrop: quest tasks earn points; a fixed XMZ pool (set by the owner)
-// is split proportionally at the end. Identity is the participant's XMZ payout address plus a
-// secret dashboard token. No seed or private key is ever requested. Verifiable tasks (valid
-// address, mining on the pool, Telegram membership) are checked automatically; social shares
-// are submitted as links and approved by a moderator.
+// Monzero community airdrop: each task pays a fixed amount of XMZ (capped per person) out of a
+// budget funded by the mining pool's fee. If what has been earned ever exceeds the budget, the
+// final payout is scaled down so it never pays more than the budget. Identity is the
+// participant's XMZ payout address plus a secret dashboard token. No seed or private key is ever
+// requested. Telegram membership and sustained mining are checked automatically (the wallet
+// reward unlocks with either one); social shares and forum/node tasks are approved by a moderator.
 require_once __DIR__ . '/xmz-address.php';
 
 function adPrivateDir(): string { $d = getenv('MONZERO_PRIVATE_DIR'); return is_string($d) && $d !== '' ? $d : dirname(__DIR__, 2) . '/monzero-private'; }
@@ -12,6 +13,11 @@ function adPrivateDir(): string { $d = getenv('MONZERO_PRIVATE_DIR'); return is_
 // Owner-set config (monzero-private/airdrop-config.php). Everything has a safe default so the
 // campaign can be previewed before the owner funds a pool.
 function adConfig(): array {
+    static $cache = null;                    // read once per request
+    if ($cache !== null) return $cache;
+    return $cache = adLoadConfig();
+}
+function adLoadConfig(): array {
     $path = adPrivateDir() . '/airdrop-config.php';
     $c = is_file($path) && !is_link($path) ? (static fn() => require $path)() : [];
     if (!is_array($c)) $c = [];
@@ -19,15 +25,19 @@ function adConfig(): array {
     // The auto-renew cron (airdrop-topup.sh) writes the live budget here so it tracks the fee.
     $poolFile = adPrivateDir() . '/airdrop-pool.txt';
     $override = is_file($poolFile) ? trim((string)@file_get_contents($poolFile, false, null, 0, 64)) : '';
-    $pool = is_numeric($override) ? (float)$override : (isset($c['pool_xmz']) && is_numeric($c['pool_xmz']) ? (float)$c['pool_xmz'] : 0.0);
+    $base = isset($c['pool_xmz']) && is_numeric($c['pool_xmz']) ? max(0.0, (float)$c['pool_xmz']) : 0.0;
+    $autoRenew = ($c['auto_renew'] ?? false) === true;
+    $pool = $autoRenew && is_numeric($override) ? max(0.0, (float)$override) : $base;
     return [
         'enabled'      => ($c['enabled'] ?? false) === true,
-        'pool_xmz'     => $pool,
+        'pool_xmz'     => $pool,                              // live budget (base, or the renewed figure)
+        'base_pool_xmz' => $base,
+        'topup_buffer' => isset($c['topup_buffer']) && is_numeric($c['topup_buffer']) ? max(0.0, (float)$c['topup_buffer']) : 1000.0,
         'starts_at'    => $int('starts_at', 0),
         'ends_at'      => $int('ends_at', 0),                 // 0 = open-ended
         'rewards'      => is_array($c['rewards'] ?? null) ? $c['rewards'] : (is_array($c['points'] ?? null) ? $c['points'] : []),
         'per_person_cap' => isset($c['per_person_cap']) && is_numeric($c['per_person_cap']) ? (float)$c['per_person_cap'] : 25.0,
-        'auto_renew'   => ($c['auto_renew'] ?? false) === true,
+        'auto_renew'   => $autoRenew,
         'mining_days_required' => isset($c['mining_days_required']) && is_int($c['mining_days_required']) && $c['mining_days_required'] >= 1 && $c['mining_days_required'] <= 31 ? $c['mining_days_required'] : 7,
         'max_per_ip'     => isset($c['max_per_ip']) && is_int($c['max_per_ip']) && $c['max_per_ip'] >= 0 ? $c['max_per_ip'] : 3,
         'trusted_proxies' => is_array($c['trusted_proxies'] ?? null) ? $c['trusted_proxies'] : [],
@@ -41,6 +51,18 @@ function adConfig(): array {
         'instagram'    => is_string($c['instagram'] ?? null) ? $c['instagram'] : 'monzeroxmz',
     ];
 }
+
+// Why the campaign is not open, or null when it is. It needs a budget and a real end date.
+function adClosedReason(?int $now = null): ?string {
+    $c = adConfig(); $now ??= time();
+    if (!$c['enabled']) return 'disabled in the config';
+    if ($c['pool_xmz'] <= 0) return 'no budget (pool_xmz) set';
+    if ($c['ends_at'] <= 0) return 'no end date (ends_at) set';
+    if ($c['starts_at'] > 0 && $now < $c['starts_at']) return 'not started yet';
+    if ($now > $c['ends_at']) return 'ended';
+    return null;
+}
+function adLive(?int $now = null): bool { return adClosedReason($now) === null; }
 
 // XMZ each task pays (owner can override in config['rewards']). Harder tasks pay more; the
 // core tasks sum to 22.5 XMZ (per-person task cap 25); referrals pay 0.5 XMZ each, capped at 12.5.
@@ -148,6 +170,14 @@ function adDb(): PDO {
     if ((int)$db->query('PRAGMA user_version')->fetchColumn() < 4) {
         $db->exec('ALTER TABLE participants ADD COLUMN ip_hash TEXT; CREATE INDEX IF NOT EXISTS ix_participants_ip ON participants(ip_hash); PRAGMA user_version = 4;');
     }
+    if ((int)$db->query('PRAGMA user_version')->fetchColumn() < 5) {
+        // mining_seen: last pool earnings total (pending + paid, atomic units) seen per participant,
+        // so a mining day is only counted when earnings actually grow. tick_nonces: replay guard.
+        $db->exec('CREATE TABLE IF NOT EXISTS mining_seen (participant_id INTEGER PRIMARY KEY, earned INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS tick_nonces (nonce TEXT PRIMARY KEY, at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_participants_ref ON participants(referred_by);
+            PRAGMA user_version = 5;');
+    }
     return $db;
 }
 
@@ -205,6 +235,9 @@ function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null): a
     $p = $row->fetch();
     if ($p) return ['participant' => $p, 'token' => null, 'existing' => true];
 
+    $budget = adBudget();
+    if ($budget['pool'] <= 0 || $budget['committed'] >= $budget['pool'])
+        return ['error' => 'The airdrop budget is fully committed, so new entries are closed. Follow the Telegram for the next round.'];
     // Per-IP cap to deter one person farming many wallets (shared NAT gets a few slots).
     $max = adConfig()['max_per_ip'];
     if (is_string($ipHash) && $ipHash !== '' && $max > 0) {
@@ -222,8 +255,8 @@ function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null): a
     }
     $db->prepare('INSERT INTO participants (address, token_hash, ref_code, referred_by, ip_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)')
         ->execute([$address, adHash($token), $code, $referrer, is_string($ipHash) ? $ipHash : null, time()]);
-    $id = (int)$db->lastInsertId();
-    adAward($id, 'wallet');                 // valid address submitted
+    // The wallet reward is NOT paid here: it unlocks once Telegram or mining is verified, so a
+    // bare address (which costs nothing to make) earns nothing on its own.
     $row->execute([$address]); $p = $row->fetch();
     return ['participant' => $p, 'token' => $token, 'existing' => false];
 }
@@ -236,9 +269,13 @@ function adParticipantByToken(string $token): ?array {
 }
 
 function adAward(int $pid, string $task): void {
-    adDb()->prepare('INSERT INTO progress (participant_id, task, points, updated_at) VALUES (?, ?, ?, ?)
-        ON CONFLICT (participant_id, task) DO UPDATE SET points = excluded.points, updated_at = excluded.updated_at')
-        ->execute([$pid, $task, adPoints($task), time()]);
+    $ins = adDb()->prepare('INSERT INTO progress (participant_id, task, points, updated_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT (participant_id, task) DO UPDATE SET points = excluded.points, updated_at = excluded.updated_at');
+    $ins->execute([$pid, $task, adPoints($task), time()]);
+    // A verified Telegram account or real mining unlocks the wallet reward.
+    if (in_array($task, ['telegram', 'mining'], true))
+        adDb()->prepare('INSERT OR IGNORE INTO progress (participant_id, task, points, updated_at) VALUES (?, ?, ?, ?)')
+            ->execute([$pid, 'wallet', adPoints('wallet'), time()]);
 }
 
 // Number of distinct days a participant has been seen mining.
@@ -248,28 +285,50 @@ function adMiningDays(int $pid): int {
     return (int)$s->fetchColumn();
 }
 
-// Mining must be SUSTAINED: a participant must be seen mining on at least
-// mining_days_required distinct days (a week's worth) over the campaign. Each call records
-// today if they are currently mining, and credits the task once the day count is reached.
-// A scheduled job (utils/website/airdrop-mining-check.php) calls this for every participant so
-// the count accrues even when they are not looking at their dashboard.
+// Mining must be SUSTAINED: a participant must be seen mining on at least mining_days_required
+// distinct (UTC) days during the campaign. A day counts when, that day, either
+//   - the pool's earnings total for the address (pending + paid) has grown since the last look, or
+//   - the pool reports live hashrate / connected workers for it right now.
+// An unpaid balance on its own does NOT count: a few minutes of mining leaves a balance below the
+// pool's payout threshold that never moves, and must not earn a "day" every day after.
+// $earned: pool earnings total in atomic units (null = unknown). Returns true once credited.
+function adObserveMining(int $pid, ?int $earned, bool $activeNow, ?int $now = null): bool {
+    $db = adDb(); $now ??= time();
+    $done = $db->prepare('SELECT 1 FROM progress WHERE participant_id = ? AND task = ?');
+    $done->execute([$pid, 'mining']);
+    if ($done->fetchColumn()) return true;
+    $counts = adLive($now);                  // days only accrue while the campaign is open
+    $grew = false;
+    if ($earned !== null && $earned >= 0) {
+        $s = $db->prepare('SELECT earned FROM mining_seen WHERE participant_id = ?');
+        $s->execute([$pid]);
+        $prev = $s->fetchColumn();
+        // First sighting only sets the baseline: earnings from before joining don't count.
+        if ($prev !== false && $earned > (int)$prev) $grew = true;
+        if ($prev === false || $earned > (int)$prev)   // only ever moves up, so growth is never counted twice
+            $db->prepare('INSERT INTO mining_seen (participant_id, earned, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT (participant_id) DO UPDATE SET earned = excluded.earned, updated_at = excluded.updated_at')
+                ->execute([$pid, $earned, $now]);
+    }
+    if ($counts && ($grew || $activeNow))
+        $db->prepare('INSERT OR IGNORE INTO mining_days (participant_id, day) VALUES (?, ?)')->execute([$pid, intdiv($now, 86400)]);
+    if ($counts && adMiningDays($pid) >= adConfig()['mining_days_required']) { adAward($pid, 'mining'); return true; }
+    return false;
+}
+
+// On-view check against the public pool API (the scheduled tick covers everyone else).
 function adCheckMining(array $p): bool {
     $db = adDb();
     $done = $db->prepare('SELECT 1 FROM progress WHERE participant_id = ? AND task = ?');
     $done->execute([$p['id'], 'mining']);
     if ($done->fetchColumn()) return true;
-    $cfg = adConfig();
-    $url = rtrim($cfg['pool_stats'], '/') . '?address=' . rawurlencode($p['address']);
+    $url = rtrim(adConfig()['pool_stats'], '/') . '?address=' . rawurlencode($p['address']);
     $ctx = stream_context_create(['http' => ['timeout' => 6, 'ignore_errors' => true, 'follow_location' => 0]]);
     $body = @file_get_contents($url, false, $ctx, 0, 262144);
-    if ($body !== false && is_array($d = json_decode($body, true))) {
-        // "active today" = currently mining or holding a recent unpaid balance (not cumulative paid).
-        $active = ((float)($d['hashrate'] ?? 0) > 0) || ((int)($d['pending'] ?? 0) > 0)
-            || (is_array($d['workers'] ?? null) && count($d['workers']) > 0);
-        if ($active) $db->prepare('INSERT OR IGNORE INTO mining_days (participant_id, day) VALUES (?, ?)')->execute([(int)$p['id'], intdiv(time(), 86400)]);
-    }
-    if (adMiningDays((int)$p['id']) >= $cfg['mining_days_required']) { adAward((int)$p['id'], 'mining'); return true; }
-    return false;
+    if ($body === false || !is_array($d = json_decode($body, true))) return false;
+    $active = ((float)($d['hashrate'] ?? 0) > 0) || (is_array($d['workers'] ?? null) && count($d['workers']) > 0);
+    $earned = is_numeric($d['pending'] ?? null) && is_numeric($d['paid'] ?? null) ? (int)$d['pending'] + (int)$d['paid'] : null;
+    return adObserveMining((int)$p['id'], $earned, $active);
 }
 
 // A participant counts toward a referrer once they have an auto-verified task (telegram or mining).
@@ -367,44 +426,124 @@ function adAdminPayouts(): array {
     return $out;
 }
 
-// Final payout list: each participant's full address and capped XMZ earned.
-function adPayouts(): array {
+// Every participant's capped total in centi-XMZ, in one query.
+function adTotals(): array {
     $db = adDb();
+    $rows = $db->query("SELECT p.id, p.address,
+        COALESCE((SELECT SUM(points) FROM progress WHERE participant_id = p.id), 0)
+        + COALESCE((SELECT SUM(points) FROM submissions WHERE participant_id = p.id AND status = 'approved'), 0) AS base,
+        (SELECT COUNT(*) FROM participants c WHERE c.referred_by = p.ref_code
+            AND EXISTS (SELECT 1 FROM progress pr WHERE pr.participant_id = c.id AND pr.task IN ('telegram','mining'))) AS refs
+        FROM participants p")->fetchAll();
     $cap = adCapCenti();
     $refCap = (int)round(adConfig()['referral_cap'] * 100);
-    $rows = $db->query('SELECT p.id, p.address, p.ref_code,
-        COALESCE((SELECT SUM(points) FROM progress WHERE participant_id = p.id), 0)
-        + COALESCE((SELECT SUM(points) FROM submissions WHERE participant_id = p.id AND status = \'approved\'), 0) AS base
-        FROM participants p')->fetchAll();
     $out = [];
-    foreach ($rows as $r) {
-        $ref = (int)$db->query('SELECT COUNT(DISTINCT pr.participant_id) FROM participants c
-            JOIN progress pr ON pr.participant_id = c.id AND pr.task IN (\'telegram\',\'mining\')
-            WHERE c.referred_by = ' . $db->quote($r['ref_code']))->fetchColumn();
-        $centi = min($cap, (int)$r['base']) + min($refCap, $ref * adPoints('referral'));
-        if ($centi > 0) $out[] = ['address' => $r['address'], 'xmz' => $centi / 100];
-    }
+    foreach ($rows as $r) $out[] = ['id' => (int)$r['id'], 'address' => $r['address'],
+        'centi' => min($cap, (int)$r['base']) + min($refCap, (int)$r['refs'] * adPoints('referral'))];
+    return $out;
+}
+
+// Earned (unscaled) per participant, largest first.
+function adPayouts(): array {
+    $out = [];
+    foreach (adTotals() as $t) if ($t['centi'] > 0) $out[] = ['address' => $t['address'], 'xmz' => $t['centi'] / 100];
     usort($out, fn($a, $b) => $b['xmz'] <=> $a['xmz']);
     return $out;
 }
 
-function adLeaderboard(int $limit = 20): array {
-    // Recompute totals from progress + approved submissions; referral points approximated by count.
-    $db = adDb();
-    $rows = $db->query('SELECT p.address, p.ref_code,
-        COALESCE((SELECT SUM(points) FROM progress WHERE participant_id = p.id), 0)
-        + COALESCE((SELECT SUM(points) FROM submissions WHERE participant_id = p.id AND status = \'approved\'), 0) AS base
-        FROM participants p')->fetchAll();
-    $cap = adCapCenti();
-    $refCap = (int)round(adConfig()['referral_cap'] * 100);
+// Budget position. Moderator rewards are paid first; participants share what is left, scaled
+// down (never up) if they have earned more than that.
+function adBudget(): array {
+    $pool = (float)adConfig()['pool_xmz'];
+    $participants = array_sum(array_column(adTotals(), 'centi')) / 100;
+    $admins = array_sum(array_column(adAdminPayouts(), 'xmz'));
+    $avail = max(0.0, $pool - $admins);
+    $scale = $participants > 0 ? min(1.0, $avail / $participants) : 1.0;
+    return ['pool' => $pool, 'participant_xmz' => round($participants, 8), 'admin_xmz' => round($admins, 8),
+        'committed' => round($participants + $admins, 8), 'remaining' => round(max(0.0, $pool - $participants - $admins), 8), 'scale' => $scale];
+}
+
+// Final payout list in atomic units (1 XMZ = 1e11), never more than the budget in total.
+// kind = participant | moderator. Moderators without an address are left out (paid by hand).
+function adFinalPayouts(): array {
+    $b = adBudget();
     $out = [];
-    foreach ($rows as $r) {
-        $ref = (int)$db->query('SELECT COUNT(DISTINCT pr.participant_id) FROM participants c
-            JOIN progress pr ON pr.participant_id = c.id AND pr.task IN (\'telegram\',\'mining\')
-            WHERE c.referred_by = ' . $db->quote($r['ref_code']))->fetchColumn();
-        $centi = min($cap, (int)$r['base']) + min($refCap, $ref * adPoints('referral'));
-        $out[] = ['address' => adShort($r['address']), 'xmz' => $centi / 100];
+    foreach (adTotals() as $t) {
+        if ($t['centi'] <= 0) continue;
+        $atomic = (int)floor($t['centi'] * 1e9 * $b['scale']);
+        if ($atomic > 0) $out[] = ['kind' => 'participant', 'address' => $t['address'], 'atomic' => $atomic, 'xmz' => $atomic / 1e11];
     }
+    foreach (adAdminPayouts() as $a) {
+        if ($a['address'] === '' || $a['xmz'] <= 0) continue;
+        $atomic = (int)round($a['xmz'] * 1e11);
+        $out[] = ['kind' => 'moderator', 'address' => $a['address'], 'atomic' => $atomic, 'xmz' => $atomic / 1e11];
+    }
+    usort($out, fn($a, $b) => $b['atomic'] <=> $a['atomic']);
+    return $out;
+}
+
+function adLeaderboard(int $limit = 20): array {
+    $out = [];
+    foreach (adTotals() as $t) $out[] = ['address' => adShort($t['address']), 'xmz' => $t['centi'] / 100];
     usort($out, fn($a, $b) => $b['xmz'] <=> $a['xmz']);
     return array_slice($out, 0, max(1, min(100, $limit)));
+}
+function adParticipantCount(): int { return (int)adDb()->query('SELECT COUNT(*) FROM participants')->fetchColumn(); }
+
+// ---- Scheduled tick from monzero-eu (utils/website/airdrop_tick.py) ----
+
+function adTickSecret(): ?string {
+    $path = adPrivateDir() . '/airdrop-tick-secret';
+    $s = is_file($path) && !is_link($path) ? trim((string)@file_get_contents($path, false, null, 0, 256)) : '';
+    return preg_match('/\A[0-9a-f]{64}\z/', $s) ? $s : null;
+}
+
+// Verify an HMAC-signed tick (same scheme as /api/status/). Returns an error string or null.
+function adTickVerify(string $ts, string $nonce, string $signature, string $body, ?int $now = null): ?string {
+    $now ??= time();
+    $secret = adTickSecret();
+    if ($secret === null) return 'not configured';
+    if (!preg_match('/\A\d{1,12}\z/', $ts) || abs($now - (int)$ts) > 300 || !preg_match('/\A[0-9a-f]{32}\z/', $nonce)
+        || !hash_equals(hash_hmac('sha256', "$ts\n$nonce\n" . $body, $secret), $signature)) return 'bad signature';
+    $db = adDb();
+    $db->prepare('DELETE FROM tick_nonces WHERE at < ?')->execute([$now - 900]);
+    $ins = $db->prepare('INSERT OR IGNORE INTO tick_nonces (nonce, at) VALUES (?, ?)');
+    $ins->execute([$nonce, $now]);
+    return $ins->rowCount() === 1 ? null : 'replayed';
+}
+
+// $payload: {"fee_atomic": int|null, "balances": {address: pending+paid atomic}}.
+// Records mining days for every participant and renews the budget from the collected fee:
+//   budget = max(base, committed + buffer), never more than the fee collected.
+function adTick(array $payload, ?int $now = null): array {
+    $now ??= time();
+    $db = adDb();
+    $balances = is_array($payload['balances'] ?? null) ? $payload['balances'] : null;
+    $checked = 0; $credited = 0;
+    if ($balances !== null) {
+        $db->beginTransaction();
+        try {
+            $rows = $db->query("SELECT p.id, p.address, EXISTS (SELECT 1 FROM progress pr WHERE pr.participant_id = p.id AND pr.task = 'mining') AS done FROM participants p")->fetchAll();
+            foreach ($rows as $r) {
+                if ($r['done']) continue;
+                $v = $balances[$r['address']] ?? 0;   // absent = never earned on the pool
+                if (!is_int($v) || $v < 0) continue;
+                $checked++;
+                if (adObserveMining((int)$r['id'], $v, false, $now)) $credited++;
+            }
+            $db->commit();
+        } catch (Throwable $e) { $db->rollBack(); throw $e; }
+    }
+    $cfg = adConfig();
+    $pool = $cfg['pool_xmz'];
+    $fee = $payload['fee_atomic'] ?? null;
+    if ($cfg['auto_renew'] && is_int($fee) && $fee >= 0) {
+        $b = adBudget();
+        $target = min(max($cfg['base_pool_xmz'], $b['committed'] + $cfg['topup_buffer']), $fee / 1e11);
+        $target = round($target, 2);
+        $file = adPrivateDir() . '/airdrop-pool.txt';
+        $tmp = $file . '.tmp';
+        if (@file_put_contents($tmp, $target . "\n") !== false) { @chmod($tmp, 0600); @rename($tmp, $file); $pool = $target; }
+    }
+    return ['ok' => true, 'checked' => $checked, 'newly_credited' => $credited, 'pool_xmz' => $pool];
 }

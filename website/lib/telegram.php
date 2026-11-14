@@ -392,8 +392,8 @@ const TG_MODHELP = "Moderator commands (admins only; reply to the user's message
     . "Info commands anyone can use: /rules /scam /faq /mining /wallet /dex /pool /explorer /security /links /price";
 
 function tgInfoResponses(): array {
-    $rules = "Monzero group rules\n\n1. Be civil. No spam, no flooding, no NSFW.\n2. No price talk, pumping or shilling other coins.\n3. No scams, fake support, giveaways or \"airdrops\".\n4. No referral or invite-farming links.\n5. English in the main group so mods can moderate.\n6. Admins never DM you first.\n\nFull community info: https://monzero.org/community/";
-    $scam = "⚠️ Stay safe\n\n- Admins and \"support\" NEVER DM you first. Anyone who does is a scammer.\n- There is NO live airdrop and NO Monzero token on other chains (no ETH/BSC/SOL token).\n- Never share your 25-word seed or private keys. No one needs them.\n- Only trust links to monzero.org (and its subdomains like pool.monzero.org).\n- Report scammers to the mods with /report (reply to their message).";
+    $rules = "Monzero group rules\n\n1. Be civil. No spam, no flooding, no NSFW.\n2. No price talk, pumping or shilling other coins.\n3. No scams, fake support or fake giveaways/\"airdrops\". The only official airdrop is https://monzero.org/airdrop/\n4. No referral or invite-farming links.\n5. English in the main group so mods can moderate.\n6. Admins never DM you first.\n\nFull community info: https://monzero.org/community/";
+    $scam = "⚠️ Stay safe\n\n- Admins and \"support\" NEVER DM you first. Anyone who does is a scammer.\n- The ONLY official airdrop is at https://monzero.org/airdrop/ and it never asks for your seed, keys or any payment. Any other \"airdrop\" is a scam.\n- There is NO Monzero token on other chains (no ETH/BSC/SOL token).\n- Never share your 25-word seed or private keys. No one needs them.\n- Only trust links to monzero.org (and its subdomains like pool.monzero.org).\n- Report scammers to the mods with /report (reply to their message).";
     $links = "Official Monzero links\n\n- Website: https://monzero.org\n- Downloads: https://monzero.org/download/\n- Web wallet: https://wallet.monzero.org\n- Mining: https://monzero.org/mining/\n- Pool: https://pool.monzero.org\n- Explorer: https://monzero.org/explorer/\n- DEX: https://monzero.org/dex/\n- Source: https://github.com/Nightglass-Protocol1/Monzero-source\n- Telegram: https://t.me/MonzeroOfficial  X: https://x.com/MonzeroXMZ\n\nAnything not under monzero.org is unofficial.";
     return [
         '/rules' => $rules,
@@ -587,10 +587,13 @@ function tgHandle(array $update): ?string {
             require_once __DIR__ . '/airdrop.php';
             $token = strtolower(trim($parts[1] ?? ''));
             if (!preg_match('/\\A[a-f0-9]{32}\\z/', $token)) return 'Send: /airdrop YOUR-CODE  (get the code from https://monzero.org/airdrop/ after you register your XMZ address).';
+            if (!adLive()) return 'The airdrop is not open right now. See https://monzero.org/airdrop/';
             $pt = adParticipantByToken($token);
             if (!$pt) return 'That airdrop code is not recognised. Register your XMZ address at https://monzero.org/airdrop/ first.';
             $verifyChat = $config['verify_chat'] ?? null;
-            if (is_string($verifyChat) && $verifyChat !== '') {
+            // Fail closed: without a chat to check membership against, nothing is verified.
+            if (!is_string($verifyChat) || $verifyChat === '') return 'Airdrop Telegram verification is not set up yet. Please try again later.';
+            {
                 $m = tgApi($config, 'getChatMember', ['chat_id' => $verifyChat, 'user_id' => $chat]);
                 $status = $m['result']['status'] ?? 'left';
                 if (!in_array($status, ['member', 'administrator', 'creator', 'restricted'], true))
@@ -601,7 +604,7 @@ function tgHandle(array $update): ?string {
             if ($used->fetchColumn()) return 'This Telegram account is already linked to another airdrop entry. One entry per Telegram account.';
             adDb()->prepare('UPDATE participants SET telegram_id = ? WHERE id = ?')->execute([$chat, $pt['id']]);
             adAward((int)$pt['id'], 'telegram');
-            return 'Telegram task complete ✅ Points updated — see them at https://monzero.org/airdrop/';
+            return 'Telegram task complete ✅ Your rewards are updated — see them at https://monzero.org/airdrop/';
         default:
             return 'Send /help to see the commands.';
     }

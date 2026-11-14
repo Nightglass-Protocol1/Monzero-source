@@ -2,19 +2,23 @@
 // Copy to  <monzero-private>/airdrop-config.php  on the web server and edit.
 // Model: each task pays a fixed amount of XMZ (harder tasks pay more); a participant can earn
 // at most 'per_person_cap' XMZ. The 'pool_xmz' budget is funded by the mining pool's 1% fee and
-// topped up automatically (see utils/website/airdrop-topup.sh). Payout is one batch at the end.
+// renewed by the 15-minute tick from monzero-eu (utils/website/deploy-airdrop-tick.sh), which also
+// counts mining days. If earnings ever exceed the budget, registrations close and the payout CSV is
+// scaled down to fit. Pay at the end with utils/website/airdrop_payout.py.
+// The campaign only opens with enabled = true, pool_xmz > 0 AND a real ends_at.
 return [
     'enabled'        => false,            // set true to open the airdrop
-    'pool_xmz'       => 8000,             // budget for this round (from the pool fee); auto-renewed
+    'pool_xmz'       => 8000,             // base budget for this round (from the pool fee)
     'per_person_cap' => 25,               // most XMZ one participant can earn from TASKS (they sum to this)
     'referral_cap'   => 12.5,              // max XMZ one participant can earn from referrals (separate track)
     'admin_reward_xmz' => 0.25,           // XMZ paid to a moderator for each confirmed (approved) submission
-    'auto_renew'     => true,             // let airdrop-topup.sh keep pool_xmz funded from the fee
+    'auto_renew'     => true,             // budget = max(pool_xmz, committed + topup_buffer), never above the fee collected
+    'topup_buffer'   => 1000,             // headroom kept above what is already committed
     'mining_days_required' => 7,          // distinct days a miner must be active to earn the mining reward
     'max_per_ip'     => 3,                // max airdrop entries per IP (0 = no limit). Lenient for shared NAT.
     'trusted_proxies' => [],              // e.g. ['173.245.48.0/20'] if a CDN sets CF-Connecting-IP / X-Real-IP
     'starts_at'      => 0,                // unix time, 0 = now
-    'ends_at'        => 0,                // unix time ~30 days out, e.g. time()+2592000 — set a real end
+    'ends_at'        => 0,                // REQUIRED unix end time (the airdrop stays closed while 0), e.g. date -d '+30 days' +%s
     'admin_token'    => '',               // optional master key; then open /airdrop/admin.php?key=THAT
     // Moderators sign in at /airdrop/admin.php with their XMZ address + Telegram handle +
     // password + PIN (all four must match). Approvals are credited to them and paid to 'address'.
