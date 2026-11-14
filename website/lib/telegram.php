@@ -68,6 +68,13 @@ function tgDb(): PDO {
 }
 
 function tgApi(array $config, string $method, array $params): ?array {
+    // Link previews (the site's banner card under a message) are off unless a caller asks for one.
+    // Telegram's current switch is link_preview_options; the older disable_web_page_preview is
+    // sent in its place, never beside it.
+    if ($method === 'sendMessage') {
+        $params['link_preview_options'] = ['is_disabled' => ($params['disable_web_page_preview'] ?? true) !== false];
+        unset($params['disable_web_page_preview']);
+    }
     $context = stream_context_create(['http' => ['method' => 'POST', 'header' => 'Content-Type: application/json', 'timeout' => 8, 'ignore_errors' => true,
         'content' => json_encode($params, JSON_UNESCAPED_UNICODE)]]);
     $body = @file_get_contents(rtrim($config['api'], '/') . '/bot' . $config['bot_token'] . '/' . $method, false, $context, 0, 1048576);
