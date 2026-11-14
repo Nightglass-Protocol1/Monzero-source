@@ -88,10 +88,28 @@ with tempfile.TemporaryDirectory() as tmp:
   assert owner.post(A+'airdrop-mod-remove',data={'csrf':csrf(),'id':mid,'confirm':'Moon Crypto'},allow_redirects=False).status_code==303
   assert 'Moon Crypto' not in owner.get(base+'/admin/?view=airdrop&tab=moderators').text.split('Add a moderator')[0].split('<h2>Moderators</h2>')[1]
 
+  import sqlite3 as _sq
+  def db_row(i):
+   c=_sq.connect(private/'airdrop.sqlite');r=c.execute('SELECT status,reviewer FROM submissions WHERE id=?',(i,)).fetchone();c.close();return r
+
   # Sign-in throttle: 10 failures in 15 minutes locks out even the right details.
   for _ in range(10):mod_login('wrong-password','000000',ADDR[2],'second_mod')
   s=requests.Session();r=s.post(base+'/airdrop/admin.php',data={'action':'login','address':ADDR[2],'telegram':'second_mod','password':'my-own-pass-123','pin':'080015'})
   assert 'Too many failed sign-ins' in r.text
+
+  # Owner review queue: no-referral work first; moderators see it tagged; first decision wins.
+  q=owner.get(base+'/admin/?view=airdrop&tab=queue').text
+  assert 'Review queue (1)' in q and 'https://x.com/a/status/1' in q and 'no referral' in q
+  owner.post(A+'airdrop-mod-add',data={'csrf':csrf(),'name':'Third','address':ADDR[1],'telegram':'@third_mod','password':'third-mod-pass','pin':'123456'})
+  c=_sq.connect(private/'airdrop.sqlite');c.execute('DELETE FROM mod_login_fails');c.commit();c.close()  # the throttle test above locked this client
+  third=mod_login('third-mod-pass','123456',ADDR[1],'third_mod');tp=third.get(base+'/airdrop/admin.php').text
+  assert 'No referral' in tp
+  qc=re.search(r'name="csrf" value="([^"]+)"',q).group(1)
+  r=owner.post(A+'airdrop-q-review',data={'csrf':qc,'submission':ids[0],'decision':'approve'},allow_redirects=False);assert 'ad-q-done' in r.headers['Location']
+  assert db_row(ids[0])==('approved','console')
+  r=owner.post(A+'airdrop-q-review',data={'csrf':qc,'submission':ids[0],'decision':'reject'},allow_redirects=False);assert 'ad-q-gone' in r.headers['Location']
+  assert 'Nothing waiting' in owner.get(base+'/admin/?view=airdrop&tab=queue').text
+  assert 'airdrop.queue_approved' in owner.get(base+'/admin/?view=audit').text
 
   # Participants: list (default = joined without a referral link), detail, adjust, revoke, disqualify.
   import sqlite3

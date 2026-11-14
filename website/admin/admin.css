@@ -102,3 +102,9 @@ select { font:inherit; color:var(--ink); background:var(--surface); border:1px s
 .adr-manage .adr-mgrid > div { padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--surface); }
 .adr-manage h3 { margin:0 0 6px; } .adr-act { max-width:none; }
 .adr-list { padding-left:18px; display:grid; gap:6px; }
+
+.adr-queue { display:grid; gap:12px; }
+.adr-q { display:grid; gap:10px; padding:16px 18px; border:1px solid var(--line); border-radius:14px; background:var(--surface); }
+.adr-qhead { display:flex; flex-wrap:wrap; align-items:center; gap:6px; } .adr-qhead .reward { font:600 13px var(--mono); color:var(--accent); margin-right:6px; }
+.adr-qlink { font-weight:600; overflow-wrap:anywhere; } .adr-q .actions { margin:0; } .adr-q .adr-note { margin:6px 0 0; }
+.adr-empty { padding:40px; text-align:center; border:1px dashed var(--line); border-radius:14px; }

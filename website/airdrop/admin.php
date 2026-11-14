@@ -66,7 +66,7 @@ $ago = function (int $t): string {
     return $d < 3600 ? max(1, intdiv($d, 60)) . ' min ago' : ($d < 86400 ? intdiv($d, 3600) . ' h ago' : intdiv($d, 86400) . ' d ago');
 };
 ?>
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Airdrop moderators · Monzero</title><link rel="icon" href="/assets/monzero-emblem-20261026-96.webp"><link rel="stylesheet" href="/airdrop/admin.css?v=20261114"></head><body class="adm-body">
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Airdrop moderators · Monzero</title><link rel="icon" href="/assets/monzero-emblem-20261026-96.webp"><link rel="stylesheet" href="/airdrop/admin.css?v=20261114b"></head><body class="adm-body">
 <?php if (!$authed): ?>
 <main class="login-wrap">
   <div class="login-card">
@@ -90,7 +90,7 @@ $ago = function (int $t): string {
     $budget = adBudget();
     $payouts = adPayouts();
     $closed = adClosedReason();
-    $pending = $db->query("SELECT s.id, s.platform, s.url, s.created_at, p.address FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.status = 'pending' ORDER BY s.created_at")->fetchAll();
+    $pending = $db->query("SELECT s.id, s.platform, s.url, s.created_at, p.address, p.referred_by FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.status = 'pending' AND p.status = 'active' ORDER BY s.created_at")->fetchAll();
     $participants = adParticipantCount();
     $done = [];
     foreach ($db->query('SELECT task, COUNT(*) AS n FROM progress GROUP BY task')->fetchAll() as $r) $done[$r['task']] = (int)$r['n'];
@@ -178,7 +178,7 @@ $ago = function (int $t): string {
   <div class="queue">
     <?php foreach ($pending as $row): [$label, $hint] = $TASKS[$row['platform']] ?? [$row['platform'], '']; $u = (string)$row['url']; ?>
     <article class="qcard">
-      <div class="qhead"><span class="tag t-<?= $e($row['platform']) ?>"><?= $e($label) ?></span><span class="reward">+<?= $e((string)adRewardXmz((string)$row['platform'])) ?> XMZ</span><span class="muted small">#<?= $e($row['id']) ?> · <?= $e($ago((int)$row['created_at'])) ?></span></div>
+      <div class="qhead"><span class="tag t-<?= $e($row['platform']) ?>"><?= $e($label) ?></span><span class="reward">+<?= $e((string)adRewardXmz((string)$row['platform'])) ?> XMZ</span><?php if (empty($row['referred_by'])): ?><span class="tag noref" title="Joined without a referral code. The owner may check this one too.">No referral</span><?php endif; ?><span class="muted small">#<?= $e($row['id']) ?> · <?= $e($ago((int)$row['created_at'])) ?></span></div>
       <div class="qbody">
         <?php if (preg_match('#^https?://#', $u)): ?><a class="detail" href="<?= $e($u) ?>" target="_blank" rel="noopener noreferrer nofollow"><?= $e(mb_strimwidth($u, 0, 80, '…')) ?> ↗</a>
         <?php else: ?><code class="detail"><?= $e($u) ?></code><?php endif; ?>

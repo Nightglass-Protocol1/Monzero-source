@@ -921,3 +921,19 @@ function adRevokeTask(int $id, string $task, string $reason, string $actor): ?st
     adParticipantLog($id, $actor, 'revoked ' . $task, $reason);
     return null;
 }
+
+// Pending work for the owner's review queue. $organicOnly: only people who joined without a referral link.
+function adPendingSubmissions(bool $organicOnly = true): array {
+    $sql = "SELECT s.id, s.platform, s.url, s.created_at, p.id AS pid, p.address, p.referred_by, p.created_at AS joined,
+        CASE WHEN p.ip_hash IS NULL THEN 1 ELSE (SELECT COUNT(*) FROM participants o WHERE o.ip_hash = p.ip_hash) END AS same_network,
+        (SELECT COUNT(*) FROM submissions a WHERE a.participant_id = p.id AND a.status = 'approved') AS approved_before,
+        (SELECT COUNT(*) FROM submissions r WHERE r.participant_id = p.id AND r.status = 'rejected') AS rejected_before
+        FROM submissions s JOIN participants p ON p.id = s.participant_id
+        WHERE s.status = 'pending' AND p.status = 'active'" . ($organicOnly ? " AND (p.referred_by IS NULL OR p.referred_by = '')" : '') . ' ORDER BY s.created_at';
+    return adDb()->query($sql)->fetchAll();
+}
+function adPendingCounts(): array {
+    $db = adDb();
+    return ['organic' => (int)$db->query("SELECT COUNT(*) FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.status = 'pending' AND p.status = 'active' AND (p.referred_by IS NULL OR p.referred_by = '')")->fetchColumn(),
+        'all' => (int)$db->query("SELECT COUNT(*) FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.status = 'pending' AND p.status = 'active'")->fetchColumn()];
+}

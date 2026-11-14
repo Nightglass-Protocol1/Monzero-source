@@ -173,3 +173,4 @@ tr.me td { background: rgba(63,223,232,.06); }
 .meter .w90, .bar .w90 { width: 90%; }
 .meter .w95, .bar .w95 { width: 95%; }
 .meter .w100, .bar .w100 { width: 100%; }
+.tag.noref { color: var(--gold); border-color: rgba(255,211,107,.45); }

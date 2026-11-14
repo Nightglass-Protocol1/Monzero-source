@@ -10,7 +10,7 @@ require_once dirname(__DIR__) . '/lib/airdrop.php';
 const AIRDROP_ADMIN_MESSAGES = [
     'ad-saved' => 'Saved.', 'ad-suspended' => 'Moderator suspended. They are signed out and cannot review.',
     'ad-activated' => 'Moderator reactivated.', 'ad-removed' => 'Moderator removed.', 'ad-overridden' => 'Decision changed.',
-    'ad-p-saved' => 'Saved.', 'ad-p-disqualified' => 'Entry disqualified: it earns nothing and cannot submit work.', 'ad-p-reinstated' => 'Entry reinstated.',
+    'ad-p-saved' => 'Saved.', 'ad-q-done' => 'Decision saved.', 'ad-q-gone' => 'Someone already reviewed that one.', 'ad-p-disqualified' => 'Entry disqualified: it earns nothing and cannot submit work.', 'ad-p-reinstated' => 'Entry reinstated.',
 ];
 const AIRDROP_TASK_LABELS = ['share_x' => 'Share on X', 'share_instagram' => 'Share on Instagram', 'forum_post' => 'Forum post',
     'forum_active' => 'Forum regular', 'run_node' => 'Run a node'];
@@ -82,6 +82,11 @@ function airdropAdminAction(string $do, array $user): bool {
             adminAudit($actor, 'airdrop.review_overridden', ['submission' => (int)$_POST['submission'], 'to' => $to]);
             if ((int)($_POST['back'] ?? 0) > 0) airdropAdminBack('ad-overridden', 'participant', ['id' => (int)$_POST['back']]);
             airdropAdminBack('ad-overridden', 'activity', array_filter(['mod' => (string)($_POST['mod'] ?? ''), 'status' => (string)($_POST['fstatus'] ?? '')]));
+        case 'airdrop-q-review':
+            $sid = (int)($_POST['submission'] ?? 0); $decision = (string)($_POST['decision'] ?? '');
+            $err = adReview($sid, $decision === 'approve' ? 'approve' : 'reject', 'console');
+            if ($err === null) adminAudit($actor, 'airdrop.queue_' . ($decision === 'approve' ? 'approved' : 'rejected'), ['submission' => $sid]);
+            airdropAdminBack($err === null ? 'ad-q-done' : 'ad-q-gone', 'queue', array_filter(['show' => (string)($_POST['show'] ?? '')]));
         case 'airdrop-p-disqualify':
         case 'airdrop-p-reinstate':
         case 'airdrop-p-adjust':
@@ -110,7 +115,7 @@ function airdropCredentialPanel(array $c): string {
 }
 
 function airdropAdminView(array $user, string $tab = 'overview', string $error = '', ?array $cred = null, array $form = []): void {
-    $tab = in_array($tab, ['overview', 'moderators', 'activity', 'participants'], true) ? $tab : 'overview';
+    $tab = in_array($tab, ['overview', 'moderators', 'activity', 'participants', 'queue'], true) ? $tab : 'overview';
     $cfg = adConfig();
     $budget = adBudget();
     $closed = adClosedReason();
@@ -132,7 +137,7 @@ function airdropAdminView(array $user, string $tab = 'overview', string $error =
         . '<div><span>Campaign</span><strong class="' . ($closed === null ? 'ok' : 'warn') . '">' . ($closed === null ? 'Open' : 'Closed') . '</strong><em>' . ($closed === null ? 'ends ' . adminH(gmdate('j M Y', (int)$cfg['ends_at'])) : adminH($closed)) . '</em></div>'
         . '<div><span>Budget used</span><strong>' . adminH(number_format($pct, 1)) . '%</strong><em>' . adminH(number_format($budget['committed'], 2)) . ' of ' . adminH(number_format($budget['pool'])) . ' XMZ</em></div>'
         . '<div><span>Participants</span><strong>' . adParticipantCount() . '</strong><em>' . count(adPayouts()) . ' earning</em></div>'
-        . '<a href="/airdrop/admin.php#review" target="_blank" rel="noopener"><span>Waiting for review</span><strong>' . $pending . '</strong><em>in the moderator queue</em></a>'
+        . '<a href="/admin/?view=airdrop&amp;tab=queue"><span>Waiting for review</span><strong>' . $pending . '</strong><em>' . adPendingCounts()['organic'] . ' from people with no referral</em></a>'
         . '<a href="/admin/?view=airdrop&amp;tab=moderators"><span>Active moderators</span><strong>' . $active . '</strong><em>' . (count($mods) - $active) . ' suspended</em></a>'
         . '<a href="/admin/?view=airdrop&amp;tab=activity"><span>Warning flags</span><strong class="' . ($flagged ? 'warn' : 'ok') . '">' . $flagged . '</strong><em>own entry or own referrals approved</em></a>'
         . '</div>';
@@ -205,6 +210,7 @@ function airdropAdminView(array $user, string $tab = 'overview', string $error =
     }
 
     if ($tab === 'participants') $body .= airdropParticipantsSection($user);
+    if ($tab === 'queue') $body .= airdropQueueSection($user);
 
     if ($tab === 'activity') {
         $fmod = is_string($_GET['mod'] ?? null) ? $_GET['mod'] : '';
@@ -252,7 +258,8 @@ function airdropAdminLinks(array $user): string {
 function airdropTabs(string $tab, ?int $mods = null): string {
     $mods ??= count(adModerators());
     $tabs = '<nav class="adr-tabs" aria-label="Airdrop sections">';
-    foreach (['overview' => 'Overview', 'participants' => 'Participants (' . adParticipantCount() . ')', 'moderators' => 'Moderators (' . $mods . ')', 'activity' => 'Review activity'] as $k => $label)
+    $pc = adPendingCounts();
+    foreach (['overview' => 'Overview', 'queue' => 'Review queue (' . $pc['organic'] . ')', 'participants' => 'Participants (' . adParticipantCount() . ')', 'moderators' => 'Moderators (' . $mods . ')', 'activity' => 'Review activity'] as $k => $label)
         $tabs .= '<a href="/admin/?view=airdrop&amp;tab=' . $k . '"' . ($k === $tab ? ' aria-current="page"' : '') . '>' . adminH($label) . '</a>';
     return $tabs . '<a href="/airdrop/admin.php" target="_blank" rel="noopener">Moderator panel ↗</a></nav>';
 }
@@ -341,4 +348,32 @@ function airdropParticipantView(array $user, int $id, string $error = ''): void 
         . '<div class="adr-mgrid"><section><h2>Adjustments</h2>' . ($adj ? '<ul class="adr-list">' . $adj . '</ul>' : '<p>None.</p>') . '</section>'
         . '<section><h2>History</h2>' . ($log ? '<ul class="adr-list">' . $log . '</ul>' : '<p>No owner actions yet.</p>') . '</section></div>';
     adminPage('Airdrop participant', $body, $user);
+}
+
+// Owner review queue: pending work, by default only from people who joined without a referral link.
+// Moderators can review the same items; whoever decides first wins. Owner decisions are credited to
+// "console" (no moderator reward).
+function airdropQueueSection(array $user): string {
+    $show = ($_GET['show'] ?? '') === 'all' ? 'all' : 'organic';
+    $counts = adPendingCounts();
+    $chips = '<div class="adr-chips"><a class="adr-chip' . ($show === 'organic' ? ' on' : '') . '" href="/admin/?view=airdrop&amp;tab=queue">No referral code <span>' . $counts['organic'] . '</span></a>'
+        . '<a class="adr-chip' . ($show === 'all' ? ' on' : '') . '" href="/admin/?view=airdrop&amp;tab=queue&amp;show=all">Everyone <span>' . $counts['all'] . '</span></a></div>';
+    $hints = ['share_x' => 'Public post, about Monzero, not deleted, not a bot account', 'share_instagram' => 'Public post about Monzero',
+        'forum_post' => 'A genuine first post on the Monzero board under that username', 'forum_active' => '5+ real posts over a week, no spam',
+        'run_node' => 'The node answers on that host/port and is not an official seed'];
+    $cards = '';
+    foreach (adPendingSubmissions($show === 'organic') as $r) {
+        $u = (string)$r['url'];
+        $detail = preg_match('#^https?://#', $u) ? '<a class="adr-qlink" href="' . adminH($u) . '" target="_blank" rel="noopener noreferrer nofollow">' . adminH(mb_strimwidth($u, 0, 90, '…')) . ' ↗</a>' : '<code class="adr-qlink">' . adminH($u) . '</code>';
+        $fields = ['submission' => $r['id'], 'show' => $show === 'all' ? 'all' : ''];
+        $cards .= '<article class="adr-q"><div class="adr-qhead"><span class="adr-badge ok">' . adminH(AIRDROP_TASK_LABELS[$r['platform']] ?? $r['platform']) . '</span><span class="reward">+' . adminH((string)adRewardXmz((string)$r['platform'])) . ' XMZ</span>'
+            . ($r['referred_by'] ? '<span class="adr-badge">via referral</span>' : '<span class="adr-badge warn">no referral</span>')
+            . ($r['same_network'] > 1 ? '<span class="adr-badge warn">' . ($r['same_network'] - 1) . ' other entr' . ($r['same_network'] > 2 ? 'ies' : 'y') . ' on same network</span>' : '')
+            . '<span class="adr-when">#' . (int)$r['id'] . ' · submitted ' . adminH(airdropWhen((int)$r['created_at'])) . '</span></div>'
+            . '<div class="adr-qbody">' . $detail . '<p class="adr-note">From <a href="/admin/?view=airdrop&amp;tab=participant&amp;id=' . (int)$r['pid'] . '"><code>' . adminH(adShort($r['address'])) . '</code></a> · joined ' . adminH(airdropWhen((int)$r['joined']))
+            . ' · ' . (int)$r['approved_before'] . ' approved, ' . (int)$r['rejected_before'] . ' rejected before · Check: ' . adminH($hints[$r['platform']] ?? '') . '</p></div>'
+            . '<div class="actions">' . airdropAdminBtn($user, 'airdrop-q-review', $fields + ['decision' => 'approve'], 'Approve') . airdropAdminBtn($user, 'airdrop-q-review', $fields + ['decision' => 'reject'], 'Reject', 'danger') . '</div></article>';
+    }
+    return '<section><h2>Review queue</h2><p>Work waiting for a decision. It opens on people who joined <strong>without a referral code</strong>; moderators see the same items marked "No referral", and whoever decides first wins. Your decisions are logged as yours and pay no moderator reward. You can still change any decision later in Review activity or on the person\'s page.</p>'
+        . $chips . ($cards ? '<div class="adr-queue">' . $cards . '</div>' : '<p class="adr-empty">Nothing waiting. 🎉</p>') . '</section>';
 }
