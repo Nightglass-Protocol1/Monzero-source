@@ -20,6 +20,9 @@ Trading on the DEX
   Send the coin you pay with to the trade account shown under Funds. Read RELEASE_NOTES.md
   first. The DEX page https://monzero.org/dex/ also still works with this wallet.
 
+Your own look
+  Settings > Layout > Appearance: colour sets, your own colours and a picture on the wallet card.
+
 Node and command-line tools
   monzerod, monzero-wallet-cli and monzero-wallet-rpc are the same as in the command-line
   package. See README.md and README-SYSTEMD.md.

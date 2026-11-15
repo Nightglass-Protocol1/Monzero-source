@@ -1,3 +1,54 @@
+# Monzero v1.3.0 release notes
+
+Release label: v1.3.0
+
+Monzero v1.3.0 is a Linux wallet update. It changes no consensus rule: the chain, blocks, coins,
+wallets, seeds and addresses are the same as in v1.0.0 to v1.2.0, and **nobody has to upgrade to stay
+on the network**.
+
+## What is new
+
+- **Offers that stay open longer.** On the Exchange page a limit order can stay open for 1 hour,
+  6 hours, a day, a week, a month, or a custom number of hours or days (up to 31 days). The review
+  shows when it ends. An offer is answered only while your wallet runs, so keep it running when you
+  can. The DEX page offers the same choices with this wallet.
+- **Your own look.** Settings > Layout > Appearance: six ready-made colour sets (Monzero, Ocean,
+  Sunset, Forest, Violet, Mono) or any of twelve colours by hand, and a picture of your choice on the
+  wallet card, darkened as much as you like so the balance stays readable. One click returns to the
+  standard look.
+- **Partial fills.** The project's liquidity offers can now be taken in parts from 50 XMZ; this
+  wallet takes and posts partial offers as in v1.2.0.
+
+Offers open longer than a day are written in the newer offer format; wallets from before v1.2.0
+never see them. They need the updated relays, which the project runs.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Trades stay inside the limits of the project's signed control document. A long-lived offer can
+  be taken only while a valid document is published.
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
+| Complete source | Exact repository commit and recursive pinned submodules |
+
+The DEX helper programs are the v1.1.0 ones except `monzero-dex-evm-helper`, rebuilt from
+`gui/dex-contracts/engine` in the complete source.
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.0 and start it; it uses the same wallet files, node data, trading
+keys and trading wallet. Coming from a separate folder, the Exchange page asks once to let this copy's
+key helper take over. Finish or refund a running trade first.
+
+---
+
 # Monzero v1.2.0 release notes
 
 Release label: v1.2.0
