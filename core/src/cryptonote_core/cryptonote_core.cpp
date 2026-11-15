@@ -89,7 +89,7 @@ namespace cryptonote
   };
   const command_line::arg_descriptor<bool> arg_regtest_asset_hard_fork = {
     "regtest-asset-hard-fork"
-  , "Activate experimental Monzero Assets HF17 at height 2 (regtest only)."
+  , "Activate experimental Monzero Assets HF18 at height 2 (regtest only)."
   , false
   };
   const command_line::arg_descriptor<bool> arg_keep_fakechain = {

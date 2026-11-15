@@ -65,7 +65,7 @@ wallet_extra = [
   ["--offline"],
 ]
 
-# HF17 remains inactive in normal regtest runs. The dedicated asset scenario
+# HF18 remains inactive in normal regtest runs. The dedicated asset scenario
 # opts one disposable daemon into the experimental fork without changing any
 # public-network schedule or the default functional suite.
 if 'assets' in tests:

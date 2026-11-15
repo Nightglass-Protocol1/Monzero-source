@@ -19,7 +19,7 @@ may proceed, but asset transaction formats must not be accepted by mainnet.
 - Only one official publicly reachable bootstrap node is currently established.
 - Wallet creation, mining, synchronization, transfers, the public explorer, and
   website have received manual testing.
-- A dedicated regtest-only HF17 fixture covers NFT issuance, discovery,
+- A dedicated regtest-only HF18 fixture covers NFT issuance, discovery,
   confidential transfer, burn, seed restoration, and reorganisation rollback;
   public-network hard-fork schedules remain unchanged.
 - The inherited release checklist and portions of user-facing utility text still

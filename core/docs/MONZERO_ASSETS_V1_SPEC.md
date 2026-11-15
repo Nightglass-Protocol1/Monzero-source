@@ -5,7 +5,7 @@ Native coin: XMZ
 Proposed feature: fixed-function private assets
 
 This document records product decisions, implemented consensus rules, and
-unresolved review questions. Hard-fork version 17 is intentionally unscheduled;
+unresolved review questions. Hard-fork version 18 is intentionally unscheduled;
 this document does not authorize activation or claim that the construction is
 safe for mainnet.
 
@@ -153,7 +153,7 @@ operations, network disagreement, a missing carrier commitment, malformed
 lengths, truncated prefixes, invalid nested signatures, and trailing data.
 Changing the carrier commitment changes the extension ID. The extension has a
 native `tx_extra` envelope with tag `0x7a`, but nodes reject that envelope below
-hard-fork version 17. Version 17 is deliberately not present in any network's
+hard-fork version 18. Version 18 is deliberately not present in any network's
 hard-fork schedule, so the envelope remains inactive on every network.
 
 The block adapter receives independently computed native
@@ -283,7 +283,7 @@ against those records before CLSAG verification, and block detach removes
 outputs and key images at or above the detached height. Restart, transaction
 abort, duplicate-key-image, and chain-pop tests cover this storage layer.
 
-HF17 block validation resolves ownership proofs against authoritative outputs,
+HF18 block validation resolves ownership proofs against authoritative outputs,
 rejects spent key images, and applies issuance, outputs, and key images in the
 same LMDB batch as the native block. Mempool admission performs the same
 read-only validation and rejects pending duplicate issuance IDs or asset key
@@ -295,7 +295,7 @@ transaction valid on any currently configured Monzero network.
 The source tree contains a version-2 canonical binary payload and a native
 transaction-envelope parser. The envelope uses `tx_extra` tag `0x7a`, is capped
 at 256 KiB, must occur exactly once, and is rejected before hard-fork version
-17. Its byte order and field order are fixed as follows:
+18. Its byte order and field order are fixed as follows:
 
 1. one-byte payload version and one-byte network type;
 2. 32-byte carrier-prefix hash;

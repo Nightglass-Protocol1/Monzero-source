@@ -101,7 +101,7 @@ confirmation before submission.
 The current constructor is intentionally limited to one asset input. A wallet
 therefore needs one unspent asset output large enough for the transfer plus
 burn amount. Light, watch-only, background, multisig, and hardware wallets are
-not supported. These paths fail closed before HF17 activates and still require
+not supported. These paths fail closed before HF18 activates and still require
 activated-chain restoration/reorg tests and independent cryptographic review.
 
 ## Wallet RPC

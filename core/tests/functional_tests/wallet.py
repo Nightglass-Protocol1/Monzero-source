@@ -65,7 +65,7 @@ class WalletTest():
             wallet.create_asset(address, 'nft', 1, 0, '11' * 32,
                                 'ipfs://inactive-functional-test', '',
                                 do_not_relay = True)
-            assert False, 'asset creation unexpectedly succeeded before HF17'
+            assert False, 'asset creation unexpectedly succeeded before HF18'
         except AssertionError as e:
             message = str(e)
             assert 'assets are not active' in message or 'hard fork' in message, message

@@ -381,7 +381,7 @@ when they are outside the source repository.
   commit `4c13905f1` adds an asynchronous fungible issuance form and retains
   the existing password and transaction-confirmation path before relay. The
   native Linux GUI target links successfully, but runtime QML interaction
-  testing and the inactive-HF17 release gates remain outstanding.
+  testing and the inactive-HF18 release gates remain outstanding.
 - New GUI wallets default to the branded `Monzero/wallets` directory on
   supported desktop/mobile paths and `Persistent/Monzero/wallets` under Tails
   persistence. The wallet picker scans both that directory and the legacy
@@ -412,7 +412,7 @@ when they are outside the source repository.
   sensitive wallet operations. The harness now launches Monzero executables,
   uses Monzero network address fixtures, and applies XMZ precision and genesis
   expectations.
-- A separate regtest-only HF17 scenario passes the complete live NFT lifecycle:
+- A separate regtest-only HF18 scenario passes the complete live NFT lifecycle:
   wallet RPC issuance, confirmed discovery, confidential transfer, explicit
   burn, restoration from seed, and reorganisation rollback. It also splits a
   fungible holding into two one-unit outputs and spends both in one burn,
@@ -435,7 +435,7 @@ when they are outside the source repository.
   issuance after native inputs, outputs, and public keys are finalized but
   before RingCT signs the prefix. `asset_issue` exposes this as a confirmation-
   gated CLI workflow and reparses the completed envelope before returning it.
-  It fails closed while HF17 is inactive and on light, watch-only, background,
+  It fails closed while HF18 is inactive and on light, watch-only, background,
   multisig, hardware, and cross-network wallets.
 - Wallet payment URIs use `monzero:` consistently in the core and functional
   tests; inherited `monero:` payment links are no longer accepted as Monzero
@@ -446,7 +446,7 @@ when they are outside the source repository.
   inherited Monero donation address.
 - The root README identifies Monzero as an independent, experimental network,
   warns against cross-fork seed reuse, and describes the inactive status of
-  hard-fork version 17 assets.
+  hard-fork version 18 assets.
 - Website and explorer JavaScript and PHP pass syntax checks. Local homepage
   and explorer smoke tests pass, and the node-status API returns a successful
   response from the configured public node.
@@ -484,7 +484,7 @@ when they are outside the source repository.
   and editions, enumerate confirmed holdings, and construct transfers or burns
   through `create_asset`, `get_assets`, and `transfer_asset`. Mutating calls
   reject restricted mode, integrated destinations, unsupported wallet modes,
-  and inactive HF17; non-relay raw transaction export is supported. The live
+  and inactive HF18; non-relay raw transaction export is supported. The live
   wallet functional test covers holdings and the inactive activation gate.
 - Website copies of the Genesis pre2 Linux and Windows archives are byte-for-
   byte identical to `dist/`; their outer SHA-256 files verify and all website
@@ -992,7 +992,7 @@ unsigned, unaudited prerelease with the same external production gates.
   such evidence must come from a separately authorized independent review.
 - Add the asset creation/inspection workflow to the desktop GUI. The CLI can export and
   validate canonical signed fungible, NFT, collection, and edition artifacts,
-  and its direct issuance command becomes usable only after HF17 activation.
+  and its direct issuance command becomes usable only after HF18 activation.
 - Complete authenticated metadata retrieval and richer ownership workflows for
   fungible tokens, NFTs, collections, and
   editions. Direct fixed-supply creation, confirmed owned-output discovery,

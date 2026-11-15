@@ -44,7 +44,7 @@ class AssetTest:
         for wallet in wallets:
             wallet.refresh()
 
-        fork = daemon.hard_fork_info(17)
+        fork = daemon.hard_fork_info(18)
         assert fork.enabled, fork
 
         issued = wallets[0].create_asset(
