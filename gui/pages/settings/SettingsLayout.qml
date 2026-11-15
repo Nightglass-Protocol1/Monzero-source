@@ -306,6 +306,12 @@ Rectangle {
                 appWindow.toggleLanguageView();
             }
         }
+
+        MonzeroComponents.AppearanceEditor {
+            objectName: "appearanceEditor"
+            Layout.fillWidth: true
+            Layout.topMargin: 24
+        }
     }
 
     ListModel {

@@ -4,6 +4,10 @@ import QtQuick 2.5
 
 QtObject {
     property bool blackTheme: true
+    // The user's own colours (Settings > Layout > Appearance), by role: accent, accentSoft,
+    // background, sidebar, surface, text, dimmed, buttonText, positive, warning, and for the wallet
+    // card cardStart, cardEnd, cardImage (a file URL) and cardDim (0..0.8). Empty: the theme's own.
+    property var custom: ({})
     property QtObject fontMedium: FontLoader { id: _fontMedium; source: "qrc:/fonts/Roboto-Medium.ttf"; }
     property QtObject fontBold: FontLoader { id: _fontBold; source: "qrc:/fonts/Roboto-Bold.ttf"; }
     property QtObject fontLight: FontLoader { id: _fontLight; source: "qrc:/fonts/Roboto-Light.ttf"; }
@@ -18,75 +22,75 @@ QtObject {
     // reserved for warnings.  Keep the legacy `orange` name because it is the
     // accent token used throughout the upstream QML component set.
     property string grey: "#20383C"
-    property string orange: "#29D6CB"
+    property string orange: custom.accent || "#29D6CB"
     property string white: "#FFFFFF"
-    property string green: "#55D6A7"
+    property string green: custom.positive || "#55D6A7"
     property string moneroGrey: "#29454A"
-    property string warningColor: "#FFB454"
-    property string accent: "#29D6CB"
+    property string warningColor: custom.warning || "#FFB454"
+    property string accent: custom.accent || "#29D6CB"
     property string accentBright: "#79EEE5"
-    property string accentMuted: "#177E79"
-    property string surfaceRaised: "#10272C"
+    property string accentMuted: custom.accentSoft || "#177E79"
+    property string surfaceRaised: custom.surface || "#10272C"
 
-    property string defaultFontColor: blackTheme ? _b_defaultFontColor : _w_defaultFontColor
-    property string dimmedFontColor: blackTheme ? _b_dimmedFontColor : _w_dimmedFontColor
-    property string lightGreyFontColor: blackTheme ? _b_lightGreyFontColor : _w_lightGreyFontColor
+    property string defaultFontColor: custom.text || (blackTheme ? _b_defaultFontColor : _w_defaultFontColor)
+    property string dimmedFontColor: custom.dimmed || (blackTheme ? _b_dimmedFontColor : _w_dimmedFontColor)
+    property string lightGreyFontColor: custom.text || (blackTheme ? _b_lightGreyFontColor : _w_lightGreyFontColor)
     property string errorColor: blackTheme ? _b_errorColor : _w_errorColor
-    property string textSelectionColor: blackTheme ? _b_textSelectionColor : _w_textSelectionColor
+    property string textSelectionColor: custom.accentSoft || (blackTheme ? _b_textSelectionColor : _w_textSelectionColor)
     property string textSelectedColor: blackTheme ? _b_textSelectedColor : _w_textSelectedColor
 
-    property string inputBoxBackground: blackTheme ? _b_inputBoxBackground : _w_inputBoxBackground
+    property string inputBoxBackground: custom.surface || (blackTheme ? _b_inputBoxBackground : _w_inputBoxBackground)
     property string inputBoxBackgroundDisabled: blackTheme ? _b_inputBoxBackgroundDisabled : _w_inputBoxBackgroundDisabled
     property string inputBoxBackgroundError: blackTheme ? _b_inputBoxBackgroundError : _w_inputBoxBackgroundError
-    property string inputBoxColor: blackTheme ? _b_inputBoxColor : _w_inputBoxColor
-    property string legacy_placeholderFontColor: blackTheme ? _b_legacy_placeholderFontColor : _w_legacy_placeholderFontColor
-    property string inputBorderColorActive: blackTheme ? _b_inputBorderColorActive : _w_inputBorderColorActive
-    property string inputBorderColorInActive: blackTheme ? _b_inputBorderColorInActive : _w_inputBorderColorInActive
+    property string inputBoxColor: custom.text || (blackTheme ? _b_inputBoxColor : _w_inputBoxColor)
+    property string legacy_placeholderFontColor: custom.dimmed || (blackTheme ? _b_legacy_placeholderFontColor : _w_legacy_placeholderFontColor)
+    property string inputBorderColorActive: custom.accent || (blackTheme ? _b_inputBorderColorActive : _w_inputBorderColorActive)
+    property string inputBorderColorInActive: custom.accentSoft || (blackTheme ? _b_inputBorderColorInActive : _w_inputBorderColorInActive)
     property string inputBorderColorInvalid: blackTheme ? _b_inputBorderColorInvalid : _w_inputBorderColorInvalid
 
-    property string buttonBackgroundColor: blackTheme ? _b_buttonBackgroundColor : _w_buttonBackgroundColor
-    property string buttonBackgroundColorHover: blackTheme ? _b_buttonBackgroundColorHover : _w_buttonBackgroundColorHover
+    property string buttonBackgroundColor: custom.accent || (blackTheme ? _b_buttonBackgroundColor : _w_buttonBackgroundColor)
+    property string buttonBackgroundColorHover: custom.accent || (blackTheme ? _b_buttonBackgroundColorHover : _w_buttonBackgroundColorHover)
     property string buttonBackgroundColorDisabled: blackTheme ? _b_buttonBackgroundColorDisabled : _w_buttonBackgroundColorDisabled
     property string buttonBackgroundColorDisabledHover: blackTheme ? _b_buttonBackgroundColorDisabledHover : _w_buttonBackgroundColorDisabledHover
-    property string buttonInlineBackgroundColor: blackTheme ? _b_buttonInlineBackgroundColor : _w_buttonInlineBackgroundColor
+    property string buttonInlineBackgroundColor: custom.surface || (blackTheme ? _b_buttonInlineBackgroundColor : _w_buttonInlineBackgroundColor)
     property string buttonInlineBackgroundColorHover: blackTheme ? _b_buttonInlineBackgroundColorHover : _w_buttonInlineBackgroundColorHover
-    property string buttonTextColor: blackTheme ? _b_buttonTextColor : _w_buttonTextColor
+    property string buttonTextColor: custom.buttonText || (blackTheme ? _b_buttonTextColor : _w_buttonTextColor)
     property string buttonTextColorDisabled: blackTheme ? _b_buttonTextColorDisabled : _w_buttonTextColorDisabled
-    property string buttonSecondaryBackgroundColor: blackTheme ? _b_buttonSecondaryBackgroundColor : _w_buttonSecondaryBackgroundColor
+    property string buttonSecondaryBackgroundColor: custom.surface || (blackTheme ? _b_buttonSecondaryBackgroundColor : _w_buttonSecondaryBackgroundColor)
     property string buttonSecondaryBackgroundColorHover: blackTheme ? _b_buttonSecondaryBackgroundColorHover : _w_buttonSecondaryBackgroundColorHover
-    property string buttonSecondaryTextColor: blackTheme ? _b_buttonSecondaryTextColor : _w_buttonSecondaryTextColor
-    property string dividerColor: blackTheme ? _b_dividerColor : _w_dividerColor
+    property string buttonSecondaryTextColor: custom.text || (blackTheme ? _b_buttonSecondaryTextColor : _w_buttonSecondaryTextColor)
+    property string dividerColor: custom.accent || (blackTheme ? _b_dividerColor : _w_dividerColor)
     property real dividerOpacity: blackTheme ? _b_dividerOpacity : _w_dividerOpacity
 
-    property string titleBarBackgroundGradientStart: blackTheme ? _b_titleBarBackgroundGradientStart : _w_titleBarBackgroundGradientStart
-    property string titleBarBackgroundGradientStop: blackTheme ? _b_titleBarBackgroundGradientStop : _w_titleBarBackgroundGradientStop
-    property string titleBarBackgroundBorderColor: blackTheme ? _b_titleBarBackgroundBorderColor : _w_titleBarBackgroundBorderColor
+    property string titleBarBackgroundGradientStart: custom.sidebar || (blackTheme ? _b_titleBarBackgroundGradientStart : _w_titleBarBackgroundGradientStart)
+    property string titleBarBackgroundGradientStop: custom.sidebar || (blackTheme ? _b_titleBarBackgroundGradientStop : _w_titleBarBackgroundGradientStop)
+    property string titleBarBackgroundBorderColor: custom.accentSoft || (blackTheme ? _b_titleBarBackgroundBorderColor : _w_titleBarBackgroundBorderColor)
     property string titleBarLogoSource: blackTheme ? _b_titleBarLogoSource : _w_titleBarLogoSource
     property string titleBarMinimizeSource: blackTheme ? _b_titleBarMinimizeSource : _w_titleBarMinimizeSource
     property string titleBarFullscreenSource: blackTheme ? _b_titleBarFullscreenSource : _w_titleBarFullscreenSource
     property string titleBarCloseSource: blackTheme ? _b_titleBarCloseSource : _w_titleBarCloseSource
     property string titleBarButtonHoverColor: blackTheme ? _b_titleBarButtonHoverColor : _w_titleBarButtonHoverColor
 
-    property string wizardBackgroundGradientStart: blackTheme ? _b_wizardBackgroundGradientStart : _w_wizardBackgroundGradientStart
-    property string middlePanelBackgroundGradientStart: blackTheme ? _b_middlePanelBackgroundGradientStart : _w_middlePanelBackgroundGradientStart
-    property string middlePanelBackgroundGradientStop: blackTheme ? _b_middlePanelBackgroundGradientStop : _w_middlePanelBackgroundGradientStop
-    property string middlePanelBackgroundColor: blackTheme ? _b_middlePanelBackgroundColor : _w_middlePanelBackgroundColor
-    property string menuButtonFallbackBackgroundColor: blackTheme ? _b_menuButtonFallbackBackgroundColor : _w_menuButtonFallbackBackgroundColor
-    property string menuButtonGradientStart: blackTheme ? _b_menuButtonGradientStart : _w_menuButtonGradientStart
+    property string wizardBackgroundGradientStart: custom.background || (blackTheme ? _b_wizardBackgroundGradientStart : _w_wizardBackgroundGradientStart)
+    property string middlePanelBackgroundGradientStart: custom.background || (blackTheme ? _b_middlePanelBackgroundGradientStart : _w_middlePanelBackgroundGradientStart)
+    property string middlePanelBackgroundGradientStop: custom.background || (blackTheme ? _b_middlePanelBackgroundGradientStop : _w_middlePanelBackgroundGradientStop)
+    property string middlePanelBackgroundColor: custom.background || (blackTheme ? _b_middlePanelBackgroundColor : _w_middlePanelBackgroundColor)
+    property string menuButtonFallbackBackgroundColor: custom.accentSoft || (blackTheme ? _b_menuButtonFallbackBackgroundColor : _w_menuButtonFallbackBackgroundColor)
+    property string menuButtonGradientStart: custom.accentSoft || (blackTheme ? _b_menuButtonGradientStart : _w_menuButtonGradientStart)
     property string menuButtonGradientStop: blackTheme ? _b_menuButtonGradientStop : _w_menuButtonGradientStop
-    property string menuButtonTextColor: blackTheme ? _b_menuButtonTextColor : _w_menuButtonTextColor
-    property string menuButtonImageRightColorActive: blackTheme ? _b_menuButtonImageRightColorActive : _w_menuButtonImageRightColorActive
-    property string menuButtonImageRightColor: blackTheme ? _b_menuButtonImageRightColor : _w_menuButtonImageRightColor
+    property string menuButtonTextColor: custom.text || (blackTheme ? _b_menuButtonTextColor : _w_menuButtonTextColor)
+    property string menuButtonImageRightColorActive: custom.accent || (blackTheme ? _b_menuButtonImageRightColorActive : _w_menuButtonImageRightColorActive)
+    property string menuButtonImageRightColor: custom.dimmed || (blackTheme ? _b_menuButtonImageRightColor : _w_menuButtonImageRightColor)
     property string menuButtonImageRightSource: blackTheme ? _b_menuButtonImageRightSource : _w_menuButtonImageRightSource
     property string menuButtonImageDotArrowSource: blackTheme ? _b_menuButtonImageDotArrowSource : _w_menuButtonImageDotArrowSource
-    property string inlineButtonTextColor: blackTheme ? _b_inlineButtonTextColor : _w_inlineButtonTextColor
-    property string inlineButtonBorderColor: blackTheme ? _b_inlineButtonBorderColor : _w_inlineButtonBorderColor
-    property string appWindowBackgroundColor: blackTheme ? _b_appWindowBackgroundColor : _w_appWindowBackgroundColor
-    property string appWindowBorderColor: blackTheme ? _b_appWindowBorderColor : _w_appWindowBorderColor
+    property string inlineButtonTextColor: custom.accent || (blackTheme ? _b_inlineButtonTextColor : _w_inlineButtonTextColor)
+    property string inlineButtonBorderColor: custom.accentSoft || (blackTheme ? _b_inlineButtonBorderColor : _w_inlineButtonBorderColor)
+    property string appWindowBackgroundColor: custom.background || (blackTheme ? _b_appWindowBackgroundColor : _w_appWindowBackgroundColor)
+    property string appWindowBorderColor: custom.accentSoft || (blackTheme ? _b_appWindowBorderColor : _w_appWindowBorderColor)
     property bool progressBarProgressTextBold: blackTheme ? _b_progressBarProgressTextBold : _w_progressBarProgressTextBold
     property string progressBarBackgroundColor: blackTheme ? _b_progressBarBackgroundColor : _w_progressBarBackgroundColor
-    property string leftPanelBackgroundGradientStart: blackTheme ? _b_leftPanelBackgroundGradientStart : _w_leftPanelBackgroundGradientStart
-    property string leftPanelBackgroundGradientStop: blackTheme ? _b_leftPanelBackgroundGradientStop : _w_leftPanelBackgroundGradientStop
+    property string leftPanelBackgroundGradientStart: custom.sidebar || (blackTheme ? _b_leftPanelBackgroundGradientStart : _w_leftPanelBackgroundGradientStart)
+    property string leftPanelBackgroundGradientStop: custom.sidebar || (blackTheme ? _b_leftPanelBackgroundGradientStop : _w_leftPanelBackgroundGradientStop)
     property string historyHeaderTextColor: blackTheme ? _b_historyHeaderTextColor : _w_historyHeaderTextColor
     property var accountColors: blackTheme ? _b_accountColors : _w_accountColors
 

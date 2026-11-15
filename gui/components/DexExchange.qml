@@ -22,9 +22,9 @@ ColumnLayout {
     spacing: 12
 
     // ---- state from the engine
-    readonly property var wallet: dex.dexWalletStatus || ({})
-    readonly property var markets: dex.evmMarketStatus || ({})
-    readonly property var trade: dex.evmTradeStatus || ({})
+    readonly property var wallet: (dex && dex.dexWalletStatus) || ({})
+    readonly property var markets: (dex && dex.evmMarketStatus) || ({})
+    readonly property var trade: (dex && dex.evmTradeStatus) || ({})
     readonly property var market: markets[coin] || ({})
     readonly property bool keysReady: wallet.keysReady === true
     readonly property var allCoins: ["ETH", "BNB", "SOL"]

@@ -1619,6 +1619,8 @@ ApplicationWindow {
         property int walletMode: 2
         property int lockOnUserInActivityInterval: 10  // minutes
         property bool blackTheme: MonzeroComponents.Style.blackTheme
+        // The user's own colours and wallet-card picture (JSON; see Style.custom)
+        property string customTheme: "{}"
         property bool checkForUpdates: true
         property bool autosave: true
         property int autosaveMinutes: 10
@@ -1657,6 +1659,7 @@ ApplicationWindow {
 
         Component.onCompleted: {
             MonzeroComponents.Style.blackTheme = persistentSettings.blackTheme
+            try { MonzeroComponents.Style.custom = JSON.parse(persistentSettings.customTheme || "{}") || {} } catch (e) { MonzeroComponents.Style.custom = {} }
         }
     }
 
@@ -2550,8 +2553,8 @@ ApplicationWindow {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-            whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
         }
     }
 
@@ -2566,8 +2569,8 @@ ApplicationWindow {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-            whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
         }
     }
 
@@ -2582,8 +2585,8 @@ ApplicationWindow {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-            whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
         }
     }
 
@@ -2598,8 +2601,8 @@ ApplicationWindow {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-            whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
         }
     }
 

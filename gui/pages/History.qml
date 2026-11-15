@@ -1326,8 +1326,8 @@ Rectangle {
 
                     MonzeroEffects.ColorTransition {
                         targetObj: parent
-                        blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-                        whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+                        blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+                        whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
                     }
                 }
 
@@ -1340,8 +1340,8 @@ Rectangle {
 
                     MonzeroEffects.ColorTransition {
                         targetObj: parent
-                        blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-                        whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+                        blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+                        whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
                     }
                 }
             }
