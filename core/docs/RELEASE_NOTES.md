@@ -1,6 +1,65 @@
-# Monzero v1.0.0 release notes
+# Monzero v1.1.0 release notes
 
-Release label: v1.0.0
+Release label: v1.1.0
+
+Monzero v1.1.0 is the first release whose wallet can trade on the Monzero DEX. It changes no
+consensus rule: the chain, blocks, coins, wallets, seeds and addresses are the same as in v1.0.0,
+and **nobody has to upgrade to stay on the network**. Upgrade if you want to trade.
+
+## What is new
+
+- **Trading from the DEX page.** With the wallet open on your computer, the page at
+  https://monzero.org/dex/ can post and take offers for XMZ against **ETH, BNB and SOL**. The page
+  is only the screen: MetaMask (ETH, BNB) or Phantom (SOL) pays the other coin in, and the wallet
+  holds the XMZ, runs the atomic swap and asks you to approve each step.
+- **Prompts, not a trading page.** The wallet shows a prompt when the page asks to connect (compare
+  the code), when it needs your trading password, when a trade needs your approval, and when XMZ
+  is to move into or out of the trading wallet.
+- **Trading keys and a trading wallet.** The first connection asks for a new trading password. It
+  protects the trading keys, which are separate from your main wallet's keys. XMZ you want to
+  trade is moved to the wallet's own trading wallet with "Add XMZ" and back with "Move back";
+  your main wallet's keys are never used by the page.
+- **Limits while the DEX is new.** The wallet starts a new trade only inside the limits of a
+  control document signed by the project (per trade and per day, per network), fetched from
+  monzero.org and checked against a key compiled into the wallet. Without a valid document no new
+  trade starts. A trade that has started always finishes or refunds, whatever the document says.
+- **Offers through open relays.** Signed offers are published to relays anyone can run
+  (`relay1.monzero.org`, `relay2.monzero.org`). A relay cannot forge or alter an offer.
+
+Not in this release: Bitcoin and Litecoin trading (being finished), trading from the Android
+wallet, and an in-wallet order book.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+- Do not leave coins in the trading accounts. The trading keys are stored on this computer,
+  protected by your trading password, and this release does not show recovery words for them.
+  After a trade, send the other coin back to MetaMask or Phantom and move XMZ back to your wallet.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
+| Complete source | Exact repository commit and recursive pinned submodules |
+| DEX helper source | The adapted swap engine the bundled helper programs are built from (GPL-3.0) |
+
+The Linux package contains the graphical wallet, `monzerod`, the command-line wallet, wallet RPC
+and, in `monzero-dex/` and `monzero-light/`, three helper programs the wallet runs for swaps. The
+wallet runs a helper only if its SHA-256 matches the value compiled into the wallet. Other
+platforms keep their v1.0.0 packages, which cannot trade.
+
+## Upgrading
+
+Replace the v1.0.0 files with the v1.1.0 ones, or unpack v1.1.0 next to them; both use the same
+wallet files and node data. See `UPGRADE.md`.
+
+---
+
+# Monzero v1.0.0 release notes
 
 Monzero v1.0.0 is the first stable release. It continues the same chain as the
 Genesis pre10–pre16 prereleases: no reset, no new genesis block, and every

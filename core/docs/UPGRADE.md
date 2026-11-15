@@ -4,6 +4,14 @@ Back up wallet files, mnemonic seeds and the node data directory before
 replacing any binary. Never enter a Monero seed into Monzero or a Monzero seed
 into Monero.
 
+## v1.1.0: optional, adds DEX trading
+
+Monzero v1.1.0 changes no consensus rule. A v1.0.0 node or wallet keeps working and nothing has
+to be done before any block height. Install v1.1.0 if you want the wallet to trade on the DEX
+page: unpack it, close the v1.0.0 wallet and node, and start the v1.1.0 ones. They use the same
+wallet files and the same node data directory. To go back, start the v1.0.0 files again; a trade
+that is still running must be finished or refunded in v1.1.0 first.
+
 ## v1.0.0: upgrade before block 21,000
 
 Monzero v1.0.0 schedules hard fork 17 at block 21,000, which changes how
