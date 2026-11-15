@@ -18,6 +18,15 @@
     'mainnet-beta': { url: 'https://solana-rpc.publicnode.com', label: 'Mainnet', explorer: '' },
   };
   const MINT_SIZE = 82; // SPL mint account size
+  // The Studio fee, in SOL, by what is created. Charged on Mainnet only; Devnet is free. It is a
+  // plain transfer added to the same transaction as the creation, so it is paid only if the
+  // creation succeeds, and the wallet shows it before the creator approves.
+  const FEE_WALLET = '5LpU8TxNqWvs5ACyhxCXNVFXNMq6mnvvK1YvMGkBWXog'; // the project's Ledger
+  const FEES = { fungible: '0.1', collection: '0.05', nft: '0.01', edition: '0.01' };
+  const LAMPORTS = { '0.1': 100000000, '0.05': 50000000, '0.01': 10000000 };
+  function feeFor(kind, net) {
+    return net === 'mainnet-beta' ? (FEES[kind] || FEES.nft) : null;
+  }
   let loaded = false;
 
   function loadScript(src) {
@@ -92,8 +101,8 @@
       <div class="st-create-head"><p class="eyebrow">Create on Solana</p>
       <h2>Mint to Solana</h2>
       <p class="st-help">Optionally publish this token or NFT to Solana. Libraries are served
-      from monzero.org and load only when you connect. Starts on Devnet; switch to Mainnet to
-      spend real SOL. The mint happens in your wallet — Studio never sees your keys.</p></div>
+      from monzero.org and load only when you connect. Starts on Devnet, which is free; switch to Mainnet to
+      create the real thing with real SOL. The mint happens in your wallet — Studio never sees your keys.</p></div>
       <div class="st-sol-row">
         <label>Network <select id="sol-net">
           <option value="devnet">Devnet (test)</option>
@@ -101,6 +110,7 @@
         <button type="button" class="st-btn" id="sol-connect">Connect wallet</button>
         <button type="button" class="st-btn" id="sol-create-btn" disabled>Create on Solana</button>
       </div>
+      <p class="st-sol-fee" id="sol-fee"></p>
       <p class="st-sol-status" id="sol-status" role="status"></p>`;
     return box;
   }
@@ -114,6 +124,17 @@
     const createBtn = p.querySelector('#sol-create-btn');
     const say = (m, err) => { status.textContent = m; status.style.color = err ? '#c0392b' : ''; };
     let pub = null;
+    const feeLine = p.querySelector('#sol-fee');
+    const showFee = () => {
+      const fee = feeFor(currentKind(), p.querySelector('#sol-net').value);
+      feeLine.textContent = fee
+        ? 'Studio fee: ' + fee + ' SOL, paid in the same transaction and only if the creation succeeds. Solana\'s own network costs are extra (about 0.002 to 0.02 SOL).'
+        : 'Free on Devnet. On Mainnet the Studio fee is ' + FEES.fungible + ' SOL for a token, ' + FEES.collection + ' SOL for a collection and ' + FEES.nft + ' SOL for an NFT or edition.';
+    };
+    showFee();
+    p.querySelector('#sol-net').addEventListener('change', showFee);
+    // The kind buttons live in the form above; a click there changes the fee shown here
+    document.addEventListener('click', () => setTimeout(showFee, 0));
 
     p.querySelector('#sol-connect').addEventListener('click', async () => {
       try {
@@ -168,6 +189,10 @@
         const tx = new web3.Transaction()
           .add(web3.ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }))
           .add(...built.instructions);
+        const fee = feeFor(kind, net);
+        if (fee) {
+          tx.add(web3.SystemProgram.transfer({ fromPubkey: pub, toPubkey: new web3.PublicKey(FEE_WALLET), lamports: LAMPORTS[fee] }));
+        }
         tx.feePayer = pub;
         const latest = await conn.getLatestBlockhash('confirmed');
         tx.recentBlockhash = latest.blockhash;
@@ -179,7 +204,7 @@
         await waitConfirmed(conn, sig, latest.lastValidBlockHeight);
         const mint = built.mint.publicKey.toBase58();
         say('');
-        status.innerHTML = `Created ${what}. Mint <code>${mint}</code> · ` +
+        status.innerHTML = `Created ${what}${fee ? ' (Studio fee ' + fee + ' SOL paid)' : ''}. Mint <code>${mint}</code> · ` +
           `<a href="https://explorer.solana.com/address/${mint}${cluster.explorer}" target="_blank" rel="noopener">view on explorer</a>`;
       } catch (e) { say('Create failed: ' + reason(e), true); }
     });
