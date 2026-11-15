@@ -1,7 +1,7 @@
 MONZERO STUDIO — CREATOR KIT
 https://monzero.org/app/creators/
 
-Assets are not active yet. Prepare now; issue only after hard fork 17,
+Assets are not active yet. Prepare now; issue only after hard fork 18,
 following a public testnet and independent review. Nothing can be minted,
 bought or sold today.
 

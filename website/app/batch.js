@@ -291,7 +291,7 @@
       'manifest.csv    Each piece: number, source image, name, image and metadata hashes, addresses and traits.',
       '',
       'These are design files, not issued assets. Issuing becomes possible only when assets',
-      'activate (hard fork 17).',
+      'activate (hard fork 18).',
       '',
       'Keep your original images: their SHA-256 must match image_sha256 in each metadata file.',
       'Anyone can check a piece at https://monzero.org/app/#verify',
