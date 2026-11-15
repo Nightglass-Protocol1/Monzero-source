@@ -35,7 +35,11 @@ Rectangle {
     readonly property real limitPrice: Number(priceInput.text)
     readonly property string limitCoin: amountAtoms > 0 && limitPrice > 0 ? X.limitCoin(limitPrice, amountAtoms, coinDecimals) : ""
     readonly property real minXmz: partialToggle.on ? Number(minInput.text || X.defaultMin(amountAtoms)) : 0
-    property int hours: 6
+    // How long a limit order stays open: a preset, or custom (an amount in hours or days)
+    property int presetHours: 6
+    property bool customLife: false
+    property string customUnit: "d"
+    readonly property int hours: customLife ? X.customHours(lifeInput.text, customUnit) : presetHours
 
     // What the order pays and gets, for the button and the review
     readonly property real payCoin: type === "market" ? (plan && plan.ok ? plan.coin : 0) : Number(limitCoin || 0)
@@ -50,6 +54,7 @@ Rectangle {
             return ""
         }
         if (!(limitPrice > 0)) return qsTr("Enter your price")
+        if (hours < 1) return qsTr("An offer stays open from 1 hour to 31 days")
         if (limitCoin === "" || Number(limitCoin) <= 0) return qsTr("The total is too small")
         if (partialToggle.on && (!(minXmz >= 1) || minXmz * 1e11 > amountAtoms)) return qsTr("The smallest part must be at least 1 XMZ and at most the amount")
         if (!buying && xmzBalance >= 0 && amountAtoms / 1e11 > xmzBalance) return qsTr("Not enough XMZ in your trading wallet")
@@ -231,18 +236,47 @@ Rectangle {
                 }
                 Text { visible: partialToggle.on; text: "XMZ"; font.pixelSize: 12; color: M.Style.dimmedFontColor }
             }
-            RowLayout {
+            Text { text: qsTr("Open for"); font.pixelSize: 12; color: M.Style.dimmedFontColor }
+            Flow {
+                Layout.fillWidth: true
                 spacing: 6
-                Text { text: qsTr("Open for"); font.pixelSize: 12; color: M.Style.dimmedFontColor }
                 Repeater {
-                    model: [1, 6, 12, 24]
+                    model: [ { h: 1, t: qsTr("1 h") }, { h: 6, t: qsTr("6 h") }, { h: 24, t: qsTr("1 day") },
+                             { h: 168, t: qsTr("1 week") }, { h: 744, t: qsTr("1 month") }, { h: 0, t: qsTr("Custom") } ]
                     delegate: Rectangle {
-                        width: 38; height: 22; radius: 4
-                        color: form.hours === modelData ? M.Style.accentMuted : "transparent"; border.color: M.Style.accentMuted
-                        Text { anchors.centerIn: parent; text: modelData + "h"; font.pixelSize: 11; color: M.Style.defaultFontColor }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: form.hours = modelData }
+                        objectName: "life_" + modelData.h
+                        readonly property bool active: modelData.h === 0 ? form.customLife : !form.customLife && form.presetHours === modelData.h
+                        width: lifeText.implicitWidth + 16; height: 24; radius: 4
+                        color: active ? M.Style.accentMuted : "transparent"; border.color: M.Style.accentMuted
+                        Text { id: lifeText; anchors.centerIn: parent; text: modelData.t; font.pixelSize: 11; color: M.Style.defaultFontColor }
+                        MouseArea {
+                            anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                            onClicked: { form.reviewing = false; if (modelData.h === 0) form.customLife = true; else { form.customLife = false; form.presetHours = modelData.h } }
+                        }
                     }
                 }
+            }
+            RowLayout {
+                visible: form.customLife
+                Layout.fillWidth: true; spacing: 6
+                M.LineEdit {
+                    id: lifeInput; objectName: "customLife"
+                    Layout.preferredWidth: 90; Layout.maximumHeight: 34; fontSize: 13; inputPaddingTop: 4; inputPaddingBottom: 4
+                    placeholderText: form.customUnit === "d" ? "14" : "48"; placeholderFontSize: 13
+                    validator: RegExpValidator { regExp: /^[0-9]{0,4}(\.[0-9]{0,2})?$/ }
+                    onTextChanged: form.reviewing = false
+                }
+                Repeater {
+                    model: [ { u: "h", t: qsTr("hours") }, { u: "d", t: qsTr("days") } ]
+                    delegate: Rectangle {
+                        objectName: "lifeUnit_" + modelData.u
+                        width: unitText.implicitWidth + 16; height: 24; radius: 4
+                        color: form.customUnit === modelData.u ? M.Style.accentMuted : "transparent"; border.color: M.Style.accentMuted
+                        Text { id: unitText; anchors.centerIn: parent; text: modelData.t; font.pixelSize: 11; color: M.Style.defaultFontColor }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { form.customUnit = modelData.u; form.reviewing = false } }
+                    }
+                }
+                Text { text: qsTr("up to 31 days"); font.pixelSize: 11; color: M.Style.dimmedFontColor; Layout.fillWidth: true }
             }
         }
 
@@ -354,6 +388,7 @@ Rectangle {
         if (limitCoin === "") return []
         var rows = [[buying ? qsTr("You pay") : qsTr("You receive"), limitCoin + " " + coin + usdText(Number(limitCoin))]]
         if (partialToggle.on) rows.push([qsTr("Partial fills"), qsTr("from %1 XMZ").arg(X.amount(minXmz, 4))])
+        if (hours > 0) rows.push([qsTr("Open until"), Qt.formatDateTime(new Date(Date.now() + hours * 3600000), "d MMM yyyy HH:mm")])
         return rows
     }
     function matchNote() {
@@ -387,8 +422,9 @@ Rectangle {
                  + " " + qsTr("The app agrees the swap with the offer's maker; you then approve the lock in the trade panel below. Network fees are extra.")
         }
         if (type === "limit" && limitCoin !== "") {
-            return (buying ? qsTr("Your offer: buy %1 XMZ for %2 %3, open for %4 h.") : qsTr("Your offer: sell %1 XMZ for %2 %3, open for %4 h."))
-                       .arg(X.amount(amountAtoms / 1e11, 4)).arg(limitCoin).arg(coin).arg(hours)
+            return (buying ? qsTr("Your offer: buy %1 XMZ for %2 %3, open for %4.") : qsTr("Your offer: sell %1 XMZ for %2 %3, open for %4."))
+                       .arg(X.amount(amountAtoms / 1e11, 4)).arg(limitCoin).arg(coin).arg(X.lifetimeText(hours))
+                 + (hours > 24 ? " " + qsTr("Keep this wallet running when you can: a taker is answered only while it runs.") : "")
                  + (partialToggle.on ? " " + qsTr("Others may take any part from %1 XMZ.").arg(X.amount(minXmz, 4)) : "")
                  + " " + qsTr("You can cancel it while it is open.")
         }

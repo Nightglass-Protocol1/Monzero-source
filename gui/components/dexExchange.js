@@ -6,6 +6,8 @@
 
 var XMZ_PLACES = 11
 var ATOMS = 1e11
+// The longest an offer may stay open: 31 days (version-2 offers; a day for the first version)
+var MAX_HOURS = 31 * 24
 
 // "123450000000", 11 -> "1.2345"
 function units(text, places) {
@@ -77,6 +79,8 @@ function book(listings, coin, decimals, myAccount, now) {
         if (!(atoms > 0) || !(wei > 0)) continue
         var xmz = atoms / ATOMS, value = wei / Math.pow(10, decimals)
         var min = l.minXmzAtoms ? Number(l.minXmzAtoms) : 0
+        // A minimum of all of it is a whole offer (a long-lived whole offer is written that way)
+        if (min >= atoms) min = 0
         var row = { id: l.id, price: value / xmz, xmz: xmz, atoms: atoms, coin: value, valueWei: String(l.valueWei),
                     partial: min > 0, minAtoms: min, min: min / ATOMS, mine: me !== "" && String(l.maker).toLowerCase() === me,
                     expiresAt: Number(l.expiresAt), side: l.side, total: 0 }
@@ -214,4 +218,26 @@ function trades(prints, decimals) {
     }
     out.sort(function (a, b) { return b.at - a.at })
     return out
+}
+
+// "6 h", "1 day", "2 weeks", "31 days": how long an offer stays open
+function lifetimeText(hours) {
+    if (hours < 24) return hours + " h"
+    var days = hours / 24
+    if (days === 7 || days === 14 || days === 21 || days === 28) return days / 7 === 1 ? "1 week" : (days / 7) + " weeks"
+    if (Math.floor(days) === days) return days === 1 ? "1 day" : days + " days"
+    return plain(days, 1) + " days"
+}
+// Hours from a custom amount and unit ("h" or "d"); 0 when not between an hour and 31 days
+function customHours(text, unit) {
+    var n = Number(String(text).trim())
+    if (!/^[0-9]+(\.[0-9]+)?$/.test(String(text).trim()) || !(n > 0)) return 0
+    var h = Math.round(unit === "d" ? n * 24 : n)
+    return h >= 1 && h <= MAX_HOURS ? h : 0
+}
+// "5.8 h left", "6 days left" for an offer expiring at `expiresAt` (seconds)
+function timeLeft(expiresAt, now) {
+    var s = Math.max(0, expiresAt - now)
+    if (s < 48 * 3600) return plain(Math.round(s / 360) / 10, 1) + " h left"
+    return Math.floor(s / 86400) + " days left"
 }

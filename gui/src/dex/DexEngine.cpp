@@ -1083,7 +1083,7 @@ bool DexEngine::refreshEvmOffers(const QString &pair) {
 }
 bool DexEngine::postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours,const QString &minXmzAmount) {
     const auto wei=atomic(coinAmount,DexChains::decimals(chainId)),atoms=atomic(xmzAmount,11);
-    if (wei.isEmpty() || atoms.isEmpty() || lifetimeHours<1 || lifetimeHours>24) {m_marketMessage=tr("Check the amounts and how long the offer stays open (1-24 hours).");emit evmMarketChanged();return false;}
+    if (wei.isEmpty() || atoms.isEmpty() || lifetimeHours<1 || lifetimeHours>31*24) {m_marketMessage=tr("Check the amounts and how long the offer stays open (1 hour to 31 days).");emit evmMarketChanged();return false;}
     QString minAtoms;
     if (!minXmzAmount.trimmed().isEmpty()) {
         minAtoms=atomic(minXmzAmount,11);

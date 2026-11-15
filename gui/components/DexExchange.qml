@@ -542,7 +542,7 @@ ColumnLayout {
                         Text {
                             Layout.fillWidth: true; Layout.preferredWidth: 5; elide: Text.ElideRight
                             font.pixelSize: 12; color: M.Style.dimmedFontColor
-                            text: (modelData.state === "open" ? (modelData.kind === "offer" ? qsTr("open · %1 h left").arg(Math.max(0, Math.round((modelData.expiresAt - ex.now) / 360) / 10)) : qsTr("waiting for the maker"))
+                            text: (modelData.state === "open" ? (modelData.kind === "offer" ? qsTr("open · %1").arg(X.timeLeft(modelData.expiresAt, ex.now)) : qsTr("waiting for the maker"))
                                   : modelData.state === "agreed" ? qsTr("matched: see the trade above")
                                   : modelData.state === "expired" ? qsTr("expired") : modelData.state === "cancelled" ? qsTr("cancelled") : modelData.state)
                                   + (modelData.detail ? " · " + modelData.detail : "")

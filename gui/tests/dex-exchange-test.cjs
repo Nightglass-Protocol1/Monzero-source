@@ -82,4 +82,16 @@ t('trades from relay prints', () => {
   const tr = X.trades([{ at: 5, value: '0x1714340', xmz: '200000000000000', tx: 'abc' }, { at: 9, value: '0x0', xmz: '1' }], 9)
   assert.equal(tr.length, 1); assert.ok(Math.abs(tr[0].coin - 0.0242) < 1e-12); assert.equal(tr[0].xmz, 2000); assert.ok(Math.abs(tr[0].price - 0.0000121) < 1e-15)
 })
+t('offer lifetimes', () => {
+  assert.equal(X.lifetimeText(6), '6 h'); assert.equal(X.lifetimeText(24), '1 day'); assert.equal(X.lifetimeText(168), '1 week')
+  assert.equal(X.lifetimeText(336), '2 weeks'); assert.equal(X.lifetimeText(744), '31 days'); assert.equal(X.lifetimeText(36), '1.5 days')
+  assert.equal(X.customHours('14', 'd'), 336); assert.equal(X.customHours('48', 'h'), 48); assert.equal(X.customHours('31', 'd'), 744)
+  assert.equal(X.customHours('32', 'd'), 0); assert.equal(X.customHours('0', 'h'), 0); assert.equal(X.customHours('abc', 'd'), 0)
+  assert.equal(X.timeLeft(now + 21000, now), '5.8 h left'); assert.equal(X.timeLeft(now + 6.5 * 86400, now), '6 days left')
+})
+t('a whole offer written as version 2 (minimum = all) is whole in the book', () => {
+  const l = [{ id: 'w', pair: 'SOL/XMZ', side: 'sell-xmz', valueWei: '1000', xmzAtoms: String(100e11), minXmzAtoms: String(100e11), maker: '0xz', expiresAt: now + 9e5 }]
+  const r = X.book(l, 'SOL', 9, '', now).asks[0]
+  assert.equal(r.partial, false); assert.equal(X.fillOk(r, 100e11), true); assert.equal(X.fillOk(r, 50e11), false)
+})
 console.log('dex exchange: ' + n + ' checks passed')

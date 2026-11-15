@@ -108,6 +108,22 @@ Item {
             press("orderButton"); press("orderButton")
             compare(JSON.stringify(engine.calls), JSON.stringify([["post", 501000101, "buy-xmz", "0.1", "1000", 6, "100"]]))
         }
+        function test_limit_orders_can_stay_open_a_week_a_month_or_a_custom_time() {
+            var f = find(ex, "exchangeForm")
+            f.type = "limit"; f.side = "buy"
+            find(ex, "limitPrice").text = "0.0001"
+            find(ex, "orderAmount").text = "1000"
+            press("life_168"); press("orderButton"); press("orderButton")
+            press("life_744"); press("orderButton"); press("orderButton")
+            press("life_0"); press("lifeUnit_d"); find(ex, "customLife").text = "10"
+            press("orderButton"); press("orderButton")
+            press("lifeUnit_h"); find(ex, "customLife").text = "36"
+            press("orderButton"); press("orderButton")
+            compare(engine.calls.map(function (c) { return c[5] }).join(), "168,744,240,36")
+            find(ex, "customLife").text = "800"           // past 31 days
+            verify(!f.ready)
+            press("life_6"); verify(f.ready)
+        }
         function test_selling_more_than_the_trading_wallet_holds_is_blocked() {
             var f = find(ex, "exchangeForm")
             f.type = "limit"; f.side = "sell"

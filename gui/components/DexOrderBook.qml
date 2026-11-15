@@ -78,7 +78,7 @@ Rectangle {
             text: !ob.hovered ? qsTr("▪ taken whole only · • your offer · click an offer to trade it")
                 : (ob.hovered.mine ? qsTr("Your offer") + " · " : "")
                   + (ob.hovered.partial ? qsTr("any part from %1 XMZ").arg(X.amount(ob.hovered.min, 2)) : qsTr("taken whole only"))
-                  + " · " + qsTr("%1 h left").arg(Math.max(0, Math.round((ob.hovered.expiresAt - Date.now() / 1000) / 360) / 10))
+                  + " · " + X.timeLeft(ob.hovered.expiresAt, Date.now() / 1000)
         }
         Text {
             visible: ob.book.bids.length === 0
