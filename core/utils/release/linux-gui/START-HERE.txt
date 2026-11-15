@@ -15,9 +15,10 @@ Keep the files together
   from this folder. Do not move them apart or rename them.
 
 Trading on the DEX
-  Open https://monzero.org/dex/ in a browser on this computer while the wallet is open.
-  ETH and BNB need MetaMask in that browser; SOL needs Phantom. The page shows a code and
-  the wallet asks you to accept the connection. Read RELEASE_NOTES.md first.
+  Open "Exchange" in the wallet's menu: XMZ against ETH, BNB and SOL with a price chart,
+  order book and buy/sell, no browser needed. Choose a trading password the first time.
+  Send the coin you pay with to the trade account shown under Funds. Read RELEASE_NOTES.md
+  first. The DEX page https://monzero.org/dex/ also still works with this wallet.
 
 Node and command-line tools
   monzerod, monzero-wallet-cli and monzero-wallet-rpc are the same as in the command-line

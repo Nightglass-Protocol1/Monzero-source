@@ -1,3 +1,58 @@
+# Monzero v1.2.0 release notes
+
+Release label: v1.2.0
+
+Monzero v1.2.0 puts a full exchange inside the Linux wallet. It changes no consensus rule: the
+chain, blocks, coins, wallets, seeds and addresses are the same as in v1.0.0 and v1.1.0, and
+**nobody has to upgrade to stay on the network**. Upgrade if you want to trade from the wallet.
+
+## What is new
+
+- **Exchange page in the Linux wallet.** A new "Exchange" entry trades XMZ against **ETH, BNB and
+  SOL** without opening the DEX website: pair tabs with the last price and 24 h change, a price
+  chart (candles or line, 1H/4H/1D, volume, best bid and ask), an order book with depth, and a
+  buy/sell form.
+- **Market and limit orders.** A market order takes the best offer that fills your amount now; a
+  limit order posts your own offer at your price for 1 to 24 hours. Every order is shown in plain
+  words before it is sent, and each swap still asks for your approval before anything is locked.
+- **Partial fills.** Offers may allow any part from a smallest amount; the wallet can take part of
+  such an offer, and post its own with partial fills allowed. The rest stays on offer.
+- **Your orders and funds on one page.** Open offers (with cancel), the running trade, recent
+  market trades, the trading wallet (move XMZ in and out) and each coin's trade account (deposit
+  address with QR code, and withdraw to your own wallet).
+- The DEX website keeps working with this wallet as before.
+
+The price chart, recent trades, balances and USD estimates are read from the open relays, the
+chains' public RPC nodes the swaps already use, and monzero.org. The wallet's screens still cannot
+reach the network themselves.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Trades stay inside the limits of the project's signed control document, as in v1.1.0.
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+- Do not leave coins in the trading accounts longer than needed: withdraw them from Funds.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
+| Complete source | Exact repository commit and recursive pinned submodules |
+
+The DEX helper programs are the v1.1.0 ones except `monzero-dex-evm-helper`, rebuilt for partial
+offers from `gui/dex-contracts/engine` in the complete source. Other platforms keep their earlier
+packages; the in-wallet exchange is for Linux.
+
+## Upgrading
+
+Replace the v1.1.0 files with the v1.2.0 ones, or unpack v1.2.0 next to them; both use the same
+wallet files, node data, trading keys and trading wallet. Finish or refund a running trade first.
+
+---
+
 # Monzero v1.1.0 release notes
 
 Release label: v1.1.0

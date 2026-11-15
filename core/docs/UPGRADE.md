@@ -4,6 +4,13 @@ Back up wallet files, mnemonic seeds and the node data directory before
 replacing any binary. Never enter a Monero seed into Monzero or a Monzero seed
 into Monero.
 
+## v1.2.0: optional, adds the exchange page to the Linux wallet
+
+Monzero v1.2.0 changes no consensus rule. Install it on Linux to trade from the wallet's own
+Exchange page: close the old wallet and node, unpack v1.2.0 and start it. It uses the same wallet
+files, node data, trading keys and trading wallet. Finish or refund a running trade before
+switching versions; to go back, start the v1.1.0 files again.
+
 ## v1.1.0: optional, adds DEX trading
 
 Monzero v1.1.0 changes no consensus rule. A v1.0.0 node or wallet keeps working and nothing has
