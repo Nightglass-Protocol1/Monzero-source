@@ -399,3 +399,22 @@ async fn partial_offers_are_shown_only_to_apps_that_ask_and_a_part_taken_is_a_pr
     assert!((prints[0].price() - 0.01 / 10_000.0).abs() < 1e-15);
     assert_eq!(r.listings(None, true, NOW).len(), 1, "only the whole offer is left");
 }
+
+#[tokio::test]
+async fn a_month_long_offer_is_accepted_and_hidden_from_apps_before_it() {
+    let r = relay();
+    let maker = PrivateKeySigner::random();
+    fund(&r, maker.address(), 1);
+    // Whole but open for a month: a version-2 listing whose minimum is all of it
+    let mut l = offer(&maker, 3, Side::SellXmz, ETH / 100, 10_000).listing;
+    l.schema = monzero_dex_evm::listing::PARTIAL_SCHEMA.into();
+    l.min_xmz = Some(l.xmz);
+    l.expires_at = NOW + 30 * 24 * 3600;
+    assert_eq!(r.post(l.clone().sign(&maker), NOW).await, Ok(true));
+    assert!(r.listings(None, false, NOW).is_empty(), "apps from before version-2 listings never see it");
+    assert_eq!(r.listings(None, true, NOW).len(), 1);
+    // A first-version listing still lives a day at most
+    let mut old = offer(&maker, 4, Side::SellXmz, ETH / 100, 10_000).listing;
+    old.expires_at = NOW + 2 * 24 * 3600;
+    assert!(r.post(old.sign(&maker), NOW).await.is_err());
+}

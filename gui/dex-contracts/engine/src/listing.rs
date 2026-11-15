@@ -25,8 +25,11 @@ pub const PARTIAL_SCHEMA: &str = "monzero-dex-listing/2";
 pub const MIN_FILL_FLOOR: u64 = 100_000_000_000;
 pub const CANCEL_SCHEMA: &str = "monzero-dex-cancel/1";
 pub const SOL_ACCOUNT_SCHEMA: &str = "monzero-dex-sol-account/1";
-/// The longest a listing may stay open
+/// The longest a first-version listing may stay open (what every app since the opening accepts)
 pub const MAX_LIFETIME: u64 = 24 * 3600;
+/// The longest a version-2 listing may stay open: a month. Apps older than partial offers never
+/// see version-2 listings (relays hide them), so a longer life cannot reach an app that refuses it.
+pub const MAX_LIFETIME_V2: u64 = 31 * 24 * 3600;
 /// How far in the future a maker's clock may be
 pub const CLOCK_SKEW: u64 = 300;
 
@@ -229,9 +232,14 @@ impl Listing {
         U256::from_be_slice(&self.id[..8])
     }
 
-    /// Whether takers may take part of it
+    /// Whether takers may take part of it (a version-2 listing whose minimum is all of it is whole)
     pub fn is_partial(&self) -> bool {
-        self.min_xmz.is_some()
+        self.min_xmz.is_some_and(|m| m < self.xmz)
+    }
+
+    /// The longest this listing's kind may stay open
+    pub fn max_lifetime(&self) -> u64 {
+        if self.schema == PARTIAL_SCHEMA { MAX_LIFETIME_V2 } else { MAX_LIFETIME }
     }
 
     /// Whether `xmz` atoms may be taken: all of it, or (partial offers) at least the minimum while
@@ -304,7 +312,7 @@ impl Listing {
         if rules.max_value.get(&self.chain_id).is_some_and(|max| self.value > *max) {
             return Err(ListingError::TooLarge);
         }
-        if self.created_at > now + CLOCK_SKEW || self.expires_at <= now || self.expires_at <= self.created_at || self.expires_at - self.created_at > MAX_LIFETIME {
+        if self.created_at > now + CLOCK_SKEW || self.expires_at <= now || self.expires_at <= self.created_at || self.expires_at - self.created_at > self.max_lifetime() {
             return Err(ListingError::Time);
         }
         if self.mailbox == B256::ZERO {

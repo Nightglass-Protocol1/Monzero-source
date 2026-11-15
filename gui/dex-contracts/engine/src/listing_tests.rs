@@ -153,3 +153,19 @@ fn a_partial_listing_needs_its_schema_and_a_sane_minimum() {
     assert_eq!(check(Listing { min_xmz: Some(base.xmz + 1), ..base.clone() }), Err(ListingError::Minimum));
     assert!(check(Listing { min_xmz: Some(base.xmz), ..base.clone() }).is_ok(), "a minimum of all of it is a whole offer in effect");
 }
+
+#[test]
+fn a_version_2_listing_may_stay_open_a_month_a_first_version_one_a_day() {
+    let key = PrivateKeySigner::random();
+    let check = |l: Listing| l.check(&rules(), NOW + 10);
+    let whole = listing(&key);
+    let month = MAX_LIFETIME_V2;
+    assert_eq!(check(Listing { expires_at: whole.created_at + MAX_LIFETIME + 1, ..whole.clone() }), Err(ListingError::Time));
+    let long = Listing { schema: PARTIAL_SCHEMA.into(), min_xmz: Some(whole.xmz), expires_at: whole.created_at + month, ..whole.clone() };
+    assert!(check(long.clone()).is_ok(), "a month, as a version-2 offer");
+    assert_eq!(check(Listing { expires_at: whole.created_at + month + 1, ..long.clone() }), Err(ListingError::Time));
+    // A minimum of all of it: whole, taken only whole
+    assert!(!long.is_partial());
+    assert!(long.fill_ok(long.xmz) && !long.fill_ok(long.xmz / 2));
+    assert!(partial(&key).is_partial());
+}

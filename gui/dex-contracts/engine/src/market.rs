@@ -101,7 +101,8 @@ impl Maker {
         }
         // A whole offer is taken whole; a partial one for any amount its rules allow
         let xmz = take.xmz.unwrap_or(l.xmz);
-        if take.xmz.is_some() && !l.is_partial() || !l.fill_ok(xmz) {
+        // A whole offer only for all of it (an app may name that amount explicitly)
+        if take.xmz.is_some_and(|x| x != l.xmz) && !l.is_partial() || !l.fill_ok(xmz) {
             return refuse("this amount cannot be taken from this offer");
         }
         if self.taken_by.is_some_and(|t| t != take.taker) || self.taken_xmz.is_some_and(|x| x != xmz) {

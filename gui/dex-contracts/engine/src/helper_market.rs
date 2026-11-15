@@ -11,7 +11,7 @@ use crate::chain::AlloyChain;
 use crate::driver::{durable_write, Driver, FileJournal, Journal};
 use crate::exchange::SavedTrade;
 use crate::helper::{keys, rpc, status, xmz_parts, TickConfig};
-use crate::listing::{Cancel, Listing, Rules, Side, SignedListing, CANCEL_SCHEMA, LISTING_SCHEMA, MAX_LIFETIME, PARTIAL_SCHEMA};
+use crate::listing::{Cancel, Listing, Rules, Side, SignedListing, CANCEL_SCHEMA, LISTING_SCHEMA, MAX_LIFETIME, MAX_LIFETIME_V2, PARTIAL_SCHEMA};
 use crate::mail::{Envelope, Letter};
 use crate::market::{Heights, Maker, Taker};
 use crate::negotiation::Role;
@@ -229,12 +229,15 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
     let chain_kind = Chain::from_id(params.chain_id).ok_or("unknown chain")?;
     let rules = rules(local_contract);
     let contract = *rules.contracts.get(&params.chain_id).ok_or("no pinned contract for this chain")?;
-    if params.lifetime_secs == 0 || params.lifetime_secs > MAX_LIFETIME {
-        return Err("an offer stays open for at most 24 hours".into());
+    if params.lifetime_secs == 0 || params.lifetime_secs > MAX_LIFETIME_V2 {
+        return Err("an offer stays open for at most 31 days".into());
     }
     let xmz_atoms: u64 = parse_amount(&params.xmz_atoms, "xmzAtoms")?.try_into().map_err(|_| "xmzAtoms is out of range")?;
     let min_xmz: Option<u64> = match &params.min_xmz_atoms {
         Some(m) => Some(parse_amount(m, "minXmzAtoms")?.try_into().map_err(|_| "minXmzAtoms is out of range")?),
+        // Open longer than a day: a version-2 listing (only apps that accept the longer life see
+        // it), taken whole: its minimum is all of it
+        None if params.lifetime_secs > MAX_LIFETIME => Some(xmz_atoms),
         None => None,
     };
     let at = heights(cfg, chain_kind, None).await?;
@@ -456,7 +459,7 @@ pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Opti
                 Role::Owner => Role::Claimer,
                 Role::Claimer => Role::Owner,
             };
-            if xmz.is_some() && !l.is_partial() || !l.fill_ok(xmz.unwrap_or(l.xmz)) {
+            if xmz.is_some_and(|x| x != l.xmz) && !l.is_partial() || !l.fill_ok(xmz.unwrap_or(l.xmz)) {
                 return Err(match l.min_xmz {
                     None => "this offer can only be taken whole".into(),
                     Some(min) => format!("take at least {} XMZ and at most all {} XMZ, leaving none or at least {} XMZ", xmz_text(min), xmz_text(l.xmz), xmz_text(min)),

@@ -1,5 +1,5 @@
 use super::*;
-use crate::listing::{Side, LISTING_SCHEMA};
+use crate::listing::{Side, LISTING_SCHEMA, PARTIAL_SCHEMA};
 use crate::mail::Letter;
 use crate::xmz::XmzNetwork;
 use alloy::primitives::{B256, U256};
@@ -174,6 +174,16 @@ fn a_partial_offer_takes_only_amounts_its_rules_allow() {
     let (_, mut letter) = Taker::start(&whole, None, &taker.seed, &taker.key, NOW).unwrap();
     letter.xmz = Some(whole.xmz / 2);
     assert!(whole_book.answer(&letter, &maker.seed, &maker.key, at(NOW)).1.is_none());
+    // An app from before month-long offers names all of a whole version-2 offer: still the same trade
+    let mut long = listing(&maker, Side::SellXmz);
+    long.listing.schema = PARTIAL_SCHEMA.into();
+    long.listing.min_xmz = Some(long.listing.xmz);
+    let long = long.listing.sign(&maker.key);
+    let mut long_book = Maker::new(long.clone(), None, None);
+    let (_, mut named) = Taker::start(&long.listing, None, &taker.seed, &taker.key, NOW).unwrap();
+    assert_eq!(named.xmz, None, "a whole offer is taken without an amount");
+    named.xmz = Some(long.listing.xmz);
+    assert!(long_book.answer(&named, &maker.seed, &maker.key, at(NOW)).1.is_some());
 }
 
 #[test]
