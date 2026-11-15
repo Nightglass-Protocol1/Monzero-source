@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Practical guides, a supply calculator and free materials for NFT artists and token creators. Prepare your Monzero Studio drafts before assets activate.">
+  <meta name="description" content="Practical guides, a supply calculator and free materials for NFT artists and token creators using Monzero Studio to mint on Solana.">
   <meta name="theme-color" content="#0b1118">
-  <title>Creator hub · Monzero Studio</title><!-- seo:begin --><link rel="canonical" href="https://monzero.org/app/creators/"><meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/app/creators/"><meta property="og:title" content="Creator hub · Monzero Studio"><meta property="og:description" content="Practical guides, a supply calculator and free materials for NFT artists and token creators. Prepare your Monzero Studio drafts before assets activate."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="Monzero MZ emblem and wordmark: Join the Monzero community. Privacy focused, independent blockchain, CPU mineable."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="Creator hub · Monzero Studio"><meta name="twitter:description" content="Practical guides, a supply calculator and free materials for NFT artists and token creators. Prepare your Monzero Studio drafts before assets activate."><meta name="twitter:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><!-- seo:end -->
+  <title>Creator hub · Monzero Studio</title><!-- seo:begin --><link rel="canonical" href="https://monzero.org/app/creators/"><meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/app/creators/"><meta property="og:title" content="Creator hub · Monzero Studio"><meta property="og:description" content="Practical guides, a supply calculator and free materials for NFT artists and token creators using Monzero Studio to mint on Solana."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="Monzero MZ emblem and wordmark: Join the Monzero community. Privacy focused, independent blockchain, CPU mineable."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="Creator hub · Monzero Studio"><meta name="twitter:description" content="Practical guides, a supply calculator and free materials for NFT artists and token creators using Monzero Studio to mint on Solana."><meta name="twitter:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><!-- seo:end -->
   <link rel="icon" href="/assets/monzero-emblem-20261026-96.webp" type="image/webp">
   <link rel="stylesheet" href="/theme.css?v=20261026-brand">
   <link rel="stylesheet" href="/site-nav.css?v=20261026-brand">
@@ -25,12 +25,12 @@
           <a class="ch-button" href="/app/?tour=1">Take the 2-minute tour <span aria-hidden="true">↗</span></a>
           <a class="ch-button ch-secondary" href="/app/">Open the Studio</a>
         </div>
-        <p class="ch-notice"><strong>Prepare now. Issue after activation.</strong> Assets are not live yet. Drafts made now will be ready for activation with hard fork 18, after a public testnet and independent review. Nothing can be minted, bought or sold today.</p>
+        <p class="ch-notice"><strong>Design here. Mint on Solana.</strong> Studio prepares your artwork and metadata, then mints from your own Solana wallet. Practise for free on Devnet first; on Mainnet a mint costs 0.01 to 0.1 SOL plus Solana’s network costs.</p>
       </div>
       <aside class="ch-sample" aria-label="An example artwork and its preparation steps">
         <div class="ch-sample-top"><span>FROM ARTWORK TO ASSET</span><span aria-hidden="true">01 / 04</span></div>
         <div class="ch-art" aria-hidden="true"><div class="ch-orbit"></div><div class="ch-glass"></div><span>TIDE / GLASS</span></div>
-        <div class="ch-sample-body"><span class="ch-kicker">AN EXAMPLE, NOT AN ISSUED ASSET</span><h2>Tide Glass #1</h2><p>One artwork. A description. A fingerprint you can check.</p><div class="ch-chips"><span>Artwork</span><span>Metadata</span><span>Verify</span></div></div>
+        <div class="ch-sample-body"><span class="ch-kicker">AN EXAMPLE, NOT A MINTED ASSET</span><h2>Tide Glass #1</h2><p>One artwork. A description. A fingerprint you can check.</p><div class="ch-chips"><span>Artwork</span><span>Metadata</span><span>Verify</span></div></div>
       </aside>
     </section>
 
@@ -44,7 +44,7 @@
         <a id="tab-describe" href="#step-describe"><span>02</span>Describe it</a>
         <a id="tab-host" href="#step-host"><span>03</span>Host the files</a>
         <a id="tab-check" href="#step-check"><span>04</span>Check the fingerprint</a>
-        <a id="tab-issue" href="#step-issue"><span>05</span>Issue <small>(after activation)</small></a>
+        <a id="tab-issue" href="#step-issue"><span>05</span>Mint <small>(on Solana)</small></a>
       </div>
       <div class="ch-step-panels">
         <section class="ch-step" id="step-artwork" aria-labelledby="step-artwork-title">
@@ -65,10 +65,10 @@
         </section>
         <section class="ch-step" id="step-issue" aria-labelledby="step-issue-title">
           <svg class="ch-illustration" viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="16" y="12" width="68" height="76" rx="8"/><path d="M16 33h68M32 7v12M68 7v12M35 59h30M50 44v30"/></svg>
-          <div><p class="ch-kicker">STEP 05 · AFTER ACTIVATION</p><h3 id="step-issue-title">Issue when assets activate</h3><p>Studio gives you the metadata hash; it never signs or issues anything. Today, the wallet's <code>asset_create</code> command works in <code>monzero-wallet-cli</code> and saves a <code>.mzi</code> file. That file cannot be broadcast yet. <code>asset_issue &lt;address&gt; …</code> is for after activation.</p><p>Prepare a draft now. Wait for hard fork 18 before issuing.</p><a href="/app/?kind=nft#create">Try this step <span aria-hidden="true">→</span></a></div>
+          <div><p class="ch-kicker">STEP 05 · ON SOLANA</p><h3 id="step-issue-title">Mint from your own wallet</h3><p>Open your draft in Studio and go to “Mint to Solana”. Connect Phantom or Solflare, choose Devnet to practise for free or Mainnet for the real thing, and press “Create on Solana”. Your wallet shows the transaction, including the Studio fee, before you approve it. Studio never sees your keys.</p><p>An NFT, collection or edition needs its hosted metadata address first (step 03). A token needs only a name, supply and decimals.</p><a href="/app/?kind=nft#create">Try this step <span aria-hidden="true">→</span></a></div>
         </section>
       </div>
-      <details class="ch-command"><summary>The wallet command, explained</summary><pre><code>asset_create &lt;class&gt; &lt;atomic_supply&gt; &lt;decimals&gt; &lt;metadata_hash&gt; &lt;metadata_reference|none&gt; &lt;collection_id|none&gt; &lt;file&gt;.mzi</code></pre><p>Use the metadata hash and addresses from your Studio project. The supply is counted in smallest units. The reference is the hosted metadata address, or <code>none</code>. A member points to its collection ID; otherwise use <code>none</code>. Creating this file is preparation, not issuance.</p></details>
+      
     </section>
 
     <section id="choose" aria-labelledby="choose-title">
@@ -83,7 +83,7 @@
         <button id="quiz-submit" class="ch-button" type="submit" hidden>Show my starting point</button>
         <div id="quiz-result" class="ch-result" role="status" aria-live="polite" aria-atomic="true" hidden><p class="ch-kicker">YOUR STARTING POINT</p><h3 id="quiz-kind">NFT</h3><p id="quiz-reason"></p><a id="quiz-link" href="/app/?kind=nft#create">Start an NFT draft →</a></div>
       </form>
-      <div class="ch-kind-guide"><p><a href="/app/?kind=nft#create"><strong>NFT</strong></a> — one of one.</p><p><a href="/app/?kind=edition#create"><strong>Edition</strong></a> — 2 to 1,000,000 numbered copies.</p><p><a href="/app/?kind=collection#create"><strong>Collection</strong></a> — a group of NFTs.</p><p><a href="/app/?kind=fungible#create"><strong>Token</strong></a> — a fixed supply, with 0–11 decimals.</p></div>
+      <div class="ch-kind-guide"><p><a href="/app/?kind=nft#create"><strong>NFT</strong></a> — one of one.</p><p><a href="/app/?kind=edition#create"><strong>Edition</strong></a> — 2 to 1,000,000 numbered copies.</p><p><a href="/app/?kind=collection#create"><strong>Collection</strong></a> — a group of NFTs.</p><p><a href="/app/?kind=fungible#create"><strong>Token</strong></a> — a fixed supply, with 0–9 decimals.</p></div>
     </section>
 
     <section id="guides" aria-labelledby="guides-title">
@@ -115,20 +115,20 @@
           <p>Image and metadata addresses must have no spaces and be at most 256 bytes in UTF-8. Bytes are not always the same as characters. Hashes prove that files have not changed, so the host need not be trusted for integrity. They cannot keep an offline file available. Keep backups and maintain hosting or pinning.</p>
         </article>
         <article class="ch-panel" id="collections" aria-labelledby="collections-title">
-          <p class="ch-kicker">GUIDE 05</p><h3 id="collections-title">Planning a collection</h3><p>A Collection groups NFTs. Each member references its collection’s 64-hex-character ID. Plan the collection first. After activation, issue the collection and use its ID when preparing final member metadata.</p>
+          <p class="ch-kicker">GUIDE 05</p><h3 id="collections-title">Planning a collection</h3><p>A Collection groups NFTs. Each member references its collection’s 64-hex-character ID. Plan the collection first, then prepare its members. On Solana, Studio mints the collection itself; adding members to it on chain is done afterwards with a Solana tool of your choice.</p>
           <ol><li>Set a naming pattern, such as <code>Tide Glass #{n}</code>.</li><li>Choose consistent traits. If a trait is rare, make that an intentional count in your plan. Rarity is simply how often a trait appears.</li><li>Prepare an optional CSV: a <code>file</code> column with the exact image filename, then one column per trait.</li><li>Open the batch builder and drop in your images. Add the name pattern and optional traits CSV.</li><li>Download the zip of numbered metadata files and a manifest CSV of fingerprints. Review the names, traits and fingerprints before hosting.</li></ol>
-          <p>The batch builder helps prepare files. It does not issue assets or host your images.</p><div class="ch-actions"><a class="ch-button ch-secondary" href="/app/#batch">Open the batch builder</a><a href="materials/traits-template.csv" download>Download the traits CSV</a></div>
+          <p>The batch builder helps prepare files. It does not mint or host your images.</p><div class="ch-actions"><a class="ch-button ch-secondary" href="/app/#batch">Open the batch builder</a><a href="materials/traits-template.csv" download>Download the traits CSV</a></div>
         </article>
         <article class="ch-panel" id="editions" aria-labelledby="editions-title">
           <p class="ch-kicker">GUIDE 06</p><h3 id="editions-title">Editions vs one-of-ones</h3><p>Choose an <strong>NFT</strong> for one of one: a single work with a single copy. Choose an <strong>Edition</strong> for 2 to 1,000,000 numbered copies of the same work.</p><p>For example, one shoreline drawing can be an NFT. A run of 25 numbered copies can be an Edition. A group of different drawings can belong to a Collection.</p><p>Decide the edition size before issuing. Keep its name, description and licence clear so people know what the numbered copies represent.</p><div class="ch-actions"><a href="/app/?kind=nft#create">Start an NFT →</a><a href="/app/?kind=edition#create">Start an Edition →</a></div>
         </article>
         <article class="ch-panel ch-wide" id="tokens" aria-labelledby="tokens-title">
           <p class="ch-kicker">GUIDE 07</p><h3 id="tokens-title">Tokens: supply and decimals</h3>
-          <div class="ch-two-col"><div><p>A Token has a fixed supply. Nobody can mint more. Decimals, from 0 to 11, set the smallest unit: 0 means whole units; 2 means hundredths; 11 means 0.00000000001.</p><p>The smallest-unit supply is the total supply × 10<sup>decimals</sup>. It must be a positive whole number no greater than <strong>18,446,744,073,709,551,615</strong> (2<sup>64</sup>−1).</p><p>Example: 1,000 tokens with 2 decimals use 100,000 smallest units. Decimals divide the supply more finely; they do not create more tokens.</p><a href="/app/?kind=fungible#create">Start a Token draft →</a></div>
+          <div class="ch-two-col"><div><p>A Token has a fixed supply. Nobody can mint more. Decimals, from 0 to 9 on Solana, set the smallest unit: 0 means whole units; 2 means hundredths; 9 means 0.000000001.</p><p>The smallest-unit supply is the total supply × 10<sup>decimals</sup>. It must be a positive whole number no greater than <strong>18,446,744,073,709,551,615</strong> (2<sup>64</sup>−1).</p><p>Example: 1,000 tokens with 2 decimals use 100,000 smallest units. Decimals divide the supply more finely; they do not create more tokens.</p><a href="/app/?kind=fungible#create">Start a Token draft →</a></div>
           <form id="supply-calculator" class="ch-calculator" aria-labelledby="calculator-title" novalidate><h4 id="calculator-title">Try your supply</h4><label for="token-supply">Total supply <input id="token-supply" name="supply" type="text" inputmode="decimal" value="1000" maxlength="80" autocomplete="off" spellcheck="false" aria-describedby="supply-help supply-status"></label><p id="supply-help" class="ch-small">Use plain digits and a decimal point, without commas or exponent notation.</p><label for="token-decimals">Decimals <input id="token-decimals" name="decimals" type="number" min="0" max="11" step="1" value="2" aria-describedby="supply-status"></label><button id="calculate-button" class="ch-button ch-secondary" type="submit" hidden>Calculate</button><div class="ch-calculation" role="status" aria-live="polite" aria-atomic="true"><dl><div><dt>Smallest-unit supply</dt><dd id="atomic-result">100000</dd></div><div><dt>Smallest unit</dt><dd id="unit-result">0.01</dd></div></dl><p id="supply-status">Example: valid — 100000 is within the fixed-supply limit.</p></div><noscript><p>JavaScript is needed to calculate other values. The example above remains available.</p></noscript></form></div>
         </article>
         <article class="ch-panel ch-wide" id="protect" aria-labelledby="protect-title">
-          <p class="ch-kicker">GUIDE 08</p><h3 id="protect-title">Protecting yourself and your collectors</h3><div class="ch-two-col"><div><p><strong>Assets are not active yet.</strong> They switch on with hard fork 18, after a public testnet and independent review. Nothing can be minted, bought or sold today.</p><p>Anyone selling Monzero NFTs or tokens, “pre-mints”, “whitelist spots” or “listing” now is a scammer. The team never asks for seed phrases or passwords and never DMs first.</p></div><div><p>Share your metadata hash and point collectors to <a href="/app/#verify">Verify</a>. Compare the metadata against the expected hash, then the image against its fingerprint. Also check the creator and their permission to use the work.</p><p>Nobody, including the founder, can mint, freeze or edit assets after launch. Keep backups. Do not rely on someone being able to change an issued asset later.</p></div></div>
+          <p class="ch-kicker">GUIDE 08</p><h3 id="protect-title">Protecting yourself and your collectors</h3><div class="ch-two-col"><div><p><strong>Practise on Devnet first.</strong> It is free and uses test SOL. On Mainnet a mint cannot be undone, so check the name, supply and metadata address before you approve it.</p><p>The Monzero team does not sell NFTs or tokens and never runs “pre-mints” or “whitelists”. Anything minted through Studio belongs to its creator, not to the project: check the creator before you buy. The team never asks for seed phrases or passwords and never DMs first.</p></div><div><p>Share your metadata hash and point collectors to <a href="/app/#verify">Verify</a>. Compare the metadata against the expected hash, then the image against its fingerprint. Also check the creator and their permission to use the work.</p><p>A token’s supply is fixed when it is minted: nobody, including you, can mint more. The wallet that mints an NFT keeps the right to update its on-chain name and metadata address, so tell collectors if you intend to use it. Keep backups.</p></div></div>
         </article>
       </div>
     </section>
@@ -140,7 +140,7 @@
         <article class="ch-panel"><p class="ch-kicker">02 / PLAN YOUR FILES</p><h3>Templates to keep</h3><ul class="ch-downloads"><li><a href="materials/traits-template.csv" download>Traits CSV <span>5 example rows</span></a></li><li><a href="materials/launch-checklist.txt" download>Launch checklist <span>Plain text</span></a></li><li><a href="materials/announcement-template.txt" download>Announcement template <span>Plain text</span></a></li><li><a href="materials/README.txt" download>Readme <span>What each file is for</span></a></li></ul></article>
         <article class="ch-panel"><p class="ch-kicker">03 / A SMALL SIGNATURE</p><h3>Made with Studio</h3><p>Optional badges for your website or project notes.</p><a class="ch-badge" href="materials/made-with-monzero-studio-dark.svg" download><img src="materials/made-with-monzero-studio-dark.svg" width="260" height="44" alt="Made with Monzero Studio — download dark SVG"></a><a class="ch-badge" href="materials/made-with-monzero-studio-light.svg" download><img src="materials/made-with-monzero-studio-light.svg" width="260" height="44" alt="Made with Monzero Studio — download light SVG"></a><p class="ch-small">SVG files with system fonts. A badge is a creator credit, not team approval or proof of issuance.</p></article>
       </div>
-      <section id="launch-checklist" class="ch-panel ch-checklist" aria-labelledby="checklist-title"><div class="ch-section-head"><p class="eyebrow">TAKE YOUR TIME</p><h3 id="checklist-title">Your launch checklist</h3><p>Preparation now. Issuance only after activation.</p></div><p id="checklist-storage" class="ch-small" role="status">With JavaScript enabled, checked items are saved only in this browser. Keep a downloaded copy too.</p><div class="ch-check-items"><label><input type="checkbox" name="rights" id="check-rights"><span>Confirm I made the artwork or have permission to use it.</span></label>
+      <section id="launch-checklist" class="ch-panel ch-checklist" aria-labelledby="checklist-title"><div class="ch-section-head"><p class="eyebrow">TAKE YOUR TIME</p><h3 id="checklist-title">Your launch checklist</h3><p>Prepare, practise on Devnet, then mint.</p></div><p id="checklist-storage" class="ch-small" role="status">With JavaScript enabled, checked items are saved only in this browser. Keep a downloaded copy too.</p><div class="ch-check-items"><label><input type="checkbox" name="rights" id="check-rights"><span>Confirm I made the artwork or have permission to use it.</span></label>
 <label><input type="checkbox" name="artwork" id="check-artwork"><span>Export the final artwork, remove location data and keep it under 25 MB.</span></label>
 <label><input type="checkbox" name="details" id="check-details"><span>Review names, descriptions, traits and the licence.</span></label>
 <label><input type="checkbox" name="supply" id="check-supply"><span>Check the kind, edition size or fixed token supply and decimals.</span></label>
@@ -148,16 +148,16 @@
 <label><input type="checkbox" name="hosting" id="check-hosting"><span>Host the final image and metadata; arrange pinning or ongoing hosting.</span></label>
 <label><input type="checkbox" name="verify" id="check-verify"><span>Verify the exact hosted metadata and image against their expected hashes.</span></label>
 <label><input type="checkbox" name="backups" id="check-backups"><span>Keep backups of artwork, metadata, hashes and project backups outside the browser.</span></label>
-<label><input type="checkbox" name="activation" id="check-activation"><span>Wait for hard fork 18 after the public testnet and independent review before issuing.</span></label>
-<label><input type="checkbox" name="announcement" id="check-announcement"><span>After activation, share the asset ID, metadata hash and Verify link. Never share seeds or passwords.</span></label></div><div class="ch-actions"><button id="print-checklist" class="ch-button ch-secondary" type="button" hidden>Print checklist</button><a href="materials/launch-checklist.txt" download>Download checklist</a><span id="checklist-progress" role="status" aria-live="polite"></span></div><p class="ch-print-only">Monzero Studio · https://monzero.org/app/creators/<br>The team never asks for seed phrases or passwords.</p></section>
-      <section class="ch-panel ch-announcement" aria-labelledby="announcement-title"><p class="ch-kicker">WRITE IT IN YOUR OWN WORDS</p><h3 id="announcement-title">An announcement to start from</h3><p>Save this for after activation. Replace every placeholder and verify the final files before sharing.</p><label for="announcement-text">Your announcement template</label><textarea id="announcement-text" rows="19" spellcheck="false">[DRAFT — for use only after asset activation. Replace every placeholder.]
+<label><input type="checkbox" name="activation" id="check-activation"><span>Mint once on Solana Devnet and check the result in a Solana explorer before using Mainnet.</span></label>
+<label><input type="checkbox" name="announcement" id="check-announcement"><span>After minting, share the mint address, metadata hash and Verify link. Never share seeds or passwords.</span></label></div><div class="ch-actions"><button id="print-checklist" class="ch-button ch-secondary" type="button" hidden>Print checklist</button><a href="materials/launch-checklist.txt" download>Download checklist</a><span id="checklist-progress" role="status" aria-live="polite"></span></div><p class="ch-print-only">Monzero Studio · https://monzero.org/app/creators/<br>The team never asks for seed phrases or passwords.</p></section>
+      <section class="ch-panel ch-announcement" aria-labelledby="announcement-title"><p class="ch-kicker">WRITE IT IN YOUR OWN WORDS</p><h3 id="announcement-title">An announcement to start from</h3><p>For use after you have minted. Replace every placeholder and verify the final files before sharing.</p><label for="announcement-text">Your announcement template</label><textarea id="announcement-text" rows="19" spellcheck="false">[DRAFT — for use after minting. Replace every placeholder.]
 
 Introducing [work or collection name] by [creator].
 [One short sentence about the artwork or the purpose of the token.]
 Kind: [NFT / Edition / Collection / Token]
 Edition size or fixed supply and decimals, if relevant: [details]
 Licence: [licence]
-Asset ID: [asset ID after issuance]
+Solana mint address: [mint address]
 Collection ID, if relevant: [collection ID]
 Image address: [image address]
 Metadata address: [metadata address]
@@ -166,8 +166,7 @@ Metadata SHA-256: [64-character metadata hash]
 Verify the metadata and image at https://monzero.org/app/#verify before trusting the files.
 The Monzero team never DMs first and never asks for seed phrases or passwords.
 
-Before activation: assets are not active. Nothing can be minted, bought or sold today.
-Anyone selling Monzero NFTs or tokens, “pre-mints”, “whitelist spots” or “listing” now is a scammer.
+This is a creator’s own work minted on Solana with Monzero Studio. It is not issued or endorsed by the Monzero project.
 </textarea><div class="ch-actions"><button id="copy-announcement" class="ch-button" type="button" hidden>Copy announcement</button><a href="materials/announcement-template.txt" download>Download the template</a><span id="copy-status" role="status" aria-live="polite"></span></div><p class="ch-small">Edits here are not saved. Copy your text before leaving this page.</p></section>
     </section>
 
@@ -178,19 +177,20 @@ Anyone selling Monzero NFTs or tokens, “pre-mints”, “whitelist spots” or
       <div><dt>Canonical JSON</dt><dd>A consistent way to write JSON: sorted keys, no extra whitespace and UTF-8 bytes. It makes the metadata hash reproducible.</dd></div>
       <div><dt>Edition</dt><dd>2 to 1,000,000 numbered copies of one work.</dd></div>
       <div><dt>Collection ID</dt><dd>The 64-hex-character ID of a Collection. Members reference it to belong to the group.</dd></div>
-      <div><dt>Asset ID</dt><dd>The identifier for an issued asset. It is different from a metadata file’s hash.</dd></div>
+      <div><dt>Mint address</dt><dd>The Solana address that identifies a minted token or NFT. It is different from a metadata file’s hash.</dd></div>
       <div><dt>IPFS / CID</dt><dd>IPFS addresses content using a content identifier, or CID. Keep the content pinned and available so others can retrieve it.</dd></div>
       <div><dt>Atomic units</dt><dd>The smallest indivisible units of a token. With 2 decimals, one full token is 100 atomic units.</dd></div>
-      <div><dt>Hard fork 18</dt><dd>The network upgrade that activates assets, after a public testnet and independent review.</dd></div>
+      <div><dt>Devnet</dt><dd>Solana’s free test network. Mints there use test SOL and have no value; use it to practise.</dd></div>
     </dl></section>
 
     <section id="faq" aria-labelledby="faq-title"><div class="ch-section-head"><p class="eyebrow">BEFORE YOU GO</p><h2 id="faq-title">Common questions</h2></div><div class="ch-faq">
-      <details><summary>Can I issue an asset today?</summary><p>No. Assets activate with hard fork 18 after a public testnet and independent review. You can prepare metadata, hashes and projects now, and the wallet's <code>asset_create</code> command can save an asset file. The file cannot be broadcast yet.</p></details>
+      <details><summary>Can I mint today?</summary><p>Yes, on Solana. Design your asset in Studio, then use “Mint to Solana” with Phantom or Solflare. Devnet is free. On Mainnet the Studio fee is 0.1 SOL for a token, 0.05 SOL for a collection and 0.01 SOL for an NFT or edition, plus Solana’s own network costs, and it is charged only if the mint succeeds.</p></details>
+      <details><summary>Are these assets on the Monzero chain?</summary><p>No. They are Solana tokens and NFTs. The Monzero chain carries XMZ only.</p></details>
       <details><summary>Does Studio upload my artwork?</summary><p>No. Studio fingerprints it in your browser. You choose where to upload the final image and metadata yourself.</p></details>
       <details><summary>Where are my projects saved?</summary><p>Only in the browser where you save them, under My projects. They do not sync to another device, and clearing site data removes them. Use “Download project backup” to keep or move your work; it includes the original artwork.</p></details>
       <details><summary>What if I change my image or metadata?</summary><p>Its hash changes. Before issuance, update the draft, export fresh metadata and verify the new files. Issued assets cannot be edited. Do not overwrite a hosted file that an issued asset references.</p></details>
       <details><summary>Does a matching hash prove a work is mine?</summary><p>No. It proves the file matches the expected bytes. It does not prove authorship or permission. Use your own work or get the rights you need.</p></details>
-      <details><summary>Can I make a whole collection at once?</summary><p>The <a href="/app/#batch">batch builder</a> prepares numbered metadata files and a manifest CSV from many images, a name pattern and optional traits CSV. It does not issue assets. Members need the correct collection ID.</p></details>
+      <details><summary>Can I make a whole collection at once?</summary><p>The <a href="/app/#batch">batch builder</a> prepares numbered metadata files and a manifest CSV from many images, a name pattern and optional traits CSV. It does not mint them: open each piece in Studio to mint it.</p></details>
       <details><summary>What happens if my host goes offline?</summary><p>The hash remains useful, but it cannot retrieve missing files. Keep backups and maintain pinning or hosting so the exact files stay available.</p></details>
       <details><summary>Can anyone add to my token supply later?</summary><p>No. A Token has a fixed supply. Nobody can mint more. Check the supply and decimals carefully before issuance.</p></details>
     </div></section>

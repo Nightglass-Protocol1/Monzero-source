@@ -1,6 +1,6 @@
 MONZERO STUDIO — LAUNCH CHECKLIST
 
-Assets are not active yet. Prepare now; issue only after hard fork 18, following a public testnet and independent review.
+Design in Studio, practise on Solana Devnet for free, then mint on Solana Mainnet from your own wallet.
 
 [ ] Confirm I made the artwork or have permission to use it.
 [ ] Export the final artwork, remove location data and keep it under 25 MB.
@@ -10,8 +10,8 @@ Assets are not active yet. Prepare now; issue only after hard fork 18, following
 [ ] Host the final image and metadata; arrange pinning or ongoing hosting.
 [ ] Verify the exact hosted metadata and image against their expected hashes.
 [ ] Keep backups of artwork, metadata, hashes and project backups outside the browser.
-[ ] Wait for hard fork 18 after the public testnet and independent review before issuing.
-[ ] After activation, share the asset ID, metadata hash and Verify link. Never share seeds or passwords.
+[ ] Mint once on Solana Devnet and check the result in a Solana explorer before using Mainnet.
+[ ] After minting, share the mint address, metadata hash and Verify link. Never share seeds or passwords.
 
 Studio: https://monzero.org/app/
 Verify: https://monzero.org/app/#verify

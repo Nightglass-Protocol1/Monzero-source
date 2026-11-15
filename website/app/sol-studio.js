@@ -100,7 +100,7 @@
     box.innerHTML = `
       <div class="st-create-head"><p class="eyebrow">Create on Solana</p>
       <h2>Mint to Solana</h2>
-      <p class="st-help">Optionally publish this token or NFT to Solana. Libraries are served
+      <p class="st-help">Publish this token or NFT to Solana. Libraries are served
       from monzero.org and load only when you connect. Starts on Devnet, which is free; switch to Mainnet to
       create the real thing with real SOL. The mint happens in your wallet — Studio never sees your keys.</p></div>
       <div class="st-sol-row">
@@ -116,10 +116,11 @@
   }
 
   function mount() {
-    const anchor = document.getElementById('activation') || document.getElementById('create');
-    if (!anchor || document.getElementById('sol-create')) return;
+    // Directly under the creation form: minting is the step after designing
+    const create = document.getElementById('create');
+    if (!create || document.getElementById('sol-create')) return;
     const p = panel();
-    anchor.parentNode.insertBefore(p, anchor);
+    create.parentNode.insertBefore(p, create.nextSibling);
     const status = p.querySelector('#sol-status');
     const createBtn = p.querySelector('#sol-create-btn');
     const say = (m, err) => { status.textContent = m; status.style.color = err ? '#c0392b' : ''; };

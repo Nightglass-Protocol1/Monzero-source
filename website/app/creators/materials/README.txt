@@ -1,9 +1,8 @@
 MONZERO STUDIO — CREATOR KIT
 https://monzero.org/app/creators/
 
-Assets are not active yet. Prepare now; issue only after hard fork 18,
-following a public testnet and independent review. Nothing can be minted,
-bought or sold today.
+Design in Studio, practise on Solana Devnet for free, then mint on Solana
+Mainnet from your own wallet. The Monzero team does not sell NFTs or tokens.
 
 metadata-example.json
   An example NFT in the monzero-metadata/1 standard. It uses UTF-8, sorted
@@ -11,7 +10,7 @@ metadata-example.json
   newline. Do not reformat it before checking its SHA-256 in Verify.
   Expected metadata SHA-256:
   c296bb6741a001e54f824261d6d9ea99cacfd5e3845818ffd6f1cfa9b25b26a3
-  This is not an issued asset. The image hash is illustrative, as are the
+  This is not a minted asset. The image hash is illustrative, as are the
   image address, size and dimensions. There is no matching image in this
   kit. Use this file to practise checking metadata only.
 
@@ -31,10 +30,10 @@ made-with-monzero-studio-dark.svg
 made-with-monzero-studio-light.svg
   Small optional badges for dark and light backgrounds. Both use system
   fonts and a mint circle mark. They are creator credits, not team approval
-  or proof that an asset has been issued.
+  or proof that an asset has been minted.
 
 announcement-template.txt
-  A draft announcement for use after activation. Replace every placeholder.
+  A draft announcement for use after minting. Replace every placeholder.
   Include the metadata hash and point collectors to Verify. A matching hash
   proves file integrity, not authorship or permission to use the work.
 
