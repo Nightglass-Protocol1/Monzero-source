@@ -13,7 +13,9 @@
 (function () {
   const CLUSTERS = {
     devnet: { url: 'https://api.devnet.solana.com', label: 'Devnet (test)', explorer: '?cluster=devnet' },
-    'mainnet-beta': { url: 'https://api.mainnet-beta.solana.com', label: 'Mainnet', explorer: '' },
+    // Solana's own main-network address refuses requests from web pages (403); this public
+    // node accepts them. The DEX page uses the same one.
+    'mainnet-beta': { url: 'https://solana-rpc.publicnode.com', label: 'Mainnet', explorer: '' },
   };
   const MINT_SIZE = 82; // SPL mint account size
   let loaded = false;
@@ -32,6 +34,29 @@
     await loadScript('/app/sol-mint.bundle.js?v=4');   // -> window.SolMintClient (self-contained: web3 aliased to the global, Buffer polyfilled in)
     if (!window.solanaWeb3 || !window.SolMintClient) throw new Error('Solana libraries did not load');
     loaded = true;
+  }
+  // Wait until the network has the transaction. Asked over plain HTTPS: the library's own
+  // confirmTransaction opens a WebSocket, which this page's security policy does not allow, so
+  // it reported every mint as failed after 30 seconds, including the ones that had gone through.
+  async function waitConfirmed(conn, sig, lastValidBlockHeight) {
+    for (;;) {
+      const st = (await conn.getSignatureStatuses([sig])).value[0];
+      if (st && st.err) throw new Error('the network rejected the transaction (' + JSON.stringify(st.err) + '). Nothing was created.');
+      if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) return;
+      if (!st && (await conn.getBlockHeight('confirmed')) > lastValidBlockHeight) {
+        throw new Error('the transaction expired before the network took it. Nothing was created; try again.');
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  // What went wrong, in words a creator can act on
+  function reason(e) {
+    const m = String((e && e.message) || e);
+    if (/may not be used to pay transaction fees|insufficient (funds|lamports)|no record of a prior credit/i.test(m)) {
+      return 'this wallet does not hold enough SOL on the chosen network to pay for it. Nothing was created.';
+    }
+    if (/reject|denied|cancel/i.test(m)) return 'you declined it in your wallet. Nothing was created.';
+    return m.split('\n')[0];
   }
   function wallet() {
     // Phantom injects window.phantom.solana (and window.solana); Solflare injects
@@ -100,7 +125,7 @@
         pub = (res && res.publicKey) || w.publicKey;
         createBtn.disabled = false;
         say('Connected ' + pub.toBase58().slice(0, 4) + '…' + pub.toBase58().slice(-4));
-      } catch (e) { say('Connect failed: ' + (e.message || e), true); }
+      } catch (e) { say('Connect failed: ' + reason(e), true); }
     });
 
     createBtn.addEventListener('click', async () => {
@@ -142,17 +167,19 @@
           .add(web3.ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }))
           .add(...built.instructions);
         tx.feePayer = pub;
-        tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+        const latest = await conn.getLatestBlockhash('confirmed');
+        tx.recentBlockhash = latest.blockhash;
         tx.partialSign(...built.signers);           // the new mint keypair co-signs
         const signed = await w.signTransaction(tx); // the wallet signs as payer
         say('Submitting…');
         const sig = await conn.sendRawTransaction(signed.serialize());
-        await conn.confirmTransaction(sig, 'confirmed');
+        say('Sent. Waiting for the network to confirm…');
+        await waitConfirmed(conn, sig, latest.lastValidBlockHeight);
         const mint = built.mint.publicKey.toBase58();
         say('');
         status.innerHTML = `Created ${what}. Mint <code>${mint}</code> · ` +
           `<a href="https://explorer.solana.com/address/${mint}${cluster.explorer}" target="_blank" rel="noopener">view on explorer</a>`;
-      } catch (e) { say('Create failed: ' + (e.message || e), true); }
+      } catch (e) { say('Create failed: ' + reason(e), true); }
     });
   }
 
