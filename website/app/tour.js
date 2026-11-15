@@ -71,7 +71,7 @@
     {
       target: '.st-hash',
       title: '9. The metadata hash is its fingerprint',
-      body: 'This hash is computed from your exact metadata. Change one letter and it changes. Once assets are live, the hash is recorded on chain, so anyone can prove the files are genuine.',
+      body: 'This hash is computed from your exact metadata. Change one letter and it changes. Publish it with your work, so anyone can prove the files are genuine.',
       enter: () => studio.showStep(3),
     },
     {

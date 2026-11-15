@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="styles.css?v=20261026-brand">
   <link rel="stylesheet" href="../theme.css?v=20261026-brand">
   <link rel="stylesheet" href="studio-20261025.css?v=20261026-brand">
-  <link rel="stylesheet" href="studio-extras.css?v=20261115-fee">
+  <link rel="stylesheet" href="studio-extras.css?v=20261115-sol">
   <link rel="stylesheet" href="../site-nav.css?v=20261026-brand">
 <link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261026-brand"></noscript></head>
 <body data-page="studio" class="site-shell">
@@ -22,7 +22,7 @@
       <div>
         <p class="eyebrow">Monzero Studio</p>
         <h1>Create something<br><em>worth keeping.</em></h1>
-        <p class="st-lead">Design NFTs, editions, collections and fixed-supply tokens. Keep your original artwork, organise your projects and export verifiable metadata. When it is ready you can mint it on Solana from your own wallet; Studio never holds your keys. Native Monzero assets come with a later network upgrade.</p>
+        <p class="st-lead">Design NFTs, editions, collections and fixed-supply tokens. Keep your original artwork, organise your projects and export verifiable metadata. When it is ready, mint it on Solana from your own wallet; Studio never holds your keys.</p>
         <div class="st-hero-actions">
           <a class="st-btn" href="#create">Start creating</a>
           <a class="st-btn ghost" href="#sol-create">Mint on Solana</a>
@@ -31,14 +31,15 @@
         </div>
       </div>
       <aside class="st-status" aria-live="polite">
-        <div class="st-status-top"><i id="node-dot"></i><span id="node-state">Checking network…</span></div>
+        <div class="st-status-top"><i class="ready"></i><span>Minting on Solana</span></div>
         <dl>
-          <div><dt>Block height</dt><dd id="height">—</dd></div>
-          <div><dt>Minting on Solana</dt><dd>Available</dd></div>
-          <div><dt>Native XMZ assets issued</dt><dd id="asset-count">—</dd></div>
-          <div><dt>Native XMZ assets</dt><dd id="asset-state" class="amber">Not yet active</dd></div>
+          <div><dt>Token</dt><dd>0.1 SOL</dd></div>
+          <div><dt>Collection</dt><dd>0.05 SOL</dd></div>
+          <div><dt>NFT or edition</dt><dd>0.01 SOL</dd></div>
+          <div><dt>Devnet (practice)</dt><dd>Free</dd></div>
         </dl>
-        <p>A draft is a local design file until you mint it. Minting on Solana works today. Assets on the Monzero chain itself wait for a network upgrade. <a href="#activation">What's left before that</a></p>
+        <p>A draft is a local design file until you mint it. Minting happens in your own Solana wallet, and the fee is paid only if the mint succeeds. <a href="#sol-create">Mint on Solana</a></p>
+        <div hidden><i id="node-dot"></i><span id="node-state"></span><span id="height"></span><span id="asset-count"></span><span id="asset-state"></span></div>
       </aside>
     </section>
 
@@ -81,7 +82,7 @@
             <label id="name-field">Name <input name="name" maxlength="80" required placeholder="Nightshade #001" autocomplete="off"></label>
             <div class="st-split" data-only="fungible">
               <label>Symbol <input name="symbol" maxlength="12" placeholder="NSC" autocomplete="off"></label>
-              <label>Decimals <input name="decimals" type="number" min="0" max="11" value="8"></label>
+              <label>Decimals <input name="decimals" type="number" min="0" max="9" value="8"></label>
             </div>
             <label data-only="fungible">Total supply <input name="supply" inputmode="decimal" placeholder="1000000" autocomplete="off"></label>
             <label data-only="edition">Number of copies <input name="edition_size" type="number" min="2" max="1000000" value="100"></label>
@@ -100,7 +101,7 @@
             </div>
             <label>Website <input name="external_url" type="url" maxlength="200" placeholder="https://" autocomplete="off"></label>
             <label data-hide="fungible collection">Local collection workspace<select name="local_collection" id="local-collection"><option value="">No local collection</option></select></label>
-            <label data-hide="fungible collection">On-chain collection ID <input name="collection" maxlength="64" placeholder="Collection asset ID (optional)" autocomplete="off" spellcheck="false"></label>
+            <label data-hide="fungible collection">Collection ID <input name="collection" maxlength="64" placeholder="Optional 64-character collection ID" autocomplete="off" spellcheck="false"></label>
             <div class="st-traits" data-hide="fungible">
               <div class="st-traits-head"><span>Traits</span><button type="button" class="st-link" id="add-trait">+ Add trait</button></div>
               <div id="traits"></div>
@@ -145,7 +146,7 @@
             </div>
           </div>
           <button type="button" class="st-btn ghost" id="share-card">Download card image</button>
-          <p class="st-preview-note">A preview of your metadata. Other galleries may present it differently. Your draft has not been issued on chain.</p>
+          <p class="st-preview-note">A preview of your metadata. Other galleries may present it differently. A draft is not on any chain until you mint it.</p>
         </aside>
       </div>
     </section>
@@ -157,7 +158,7 @@
       </div>
       <div class="st-library-tools"><label>Find a project<input id="draft-search" type="search" placeholder="Search names…"></label><label>Filter by collection<select id="draft-filter"><option value="">All projects</option></select></label><label class="st-btn ghost st-import">Import project backup<input id="import-project" type="file" accept=".json,application/json"></label></div>
       <p id="library-status" class="st-help" role="status"></p><div class="st-grid" id="drafts"></div>
-      <section class="st-collection-workspace" aria-labelledby="collection-heading"><h3 id="collection-heading">Collection workspace</h3><p class="st-help">Choose a saved collection, then add multiple artworks as individual NFT drafts. Each starts with the collection’s creator, description, license and traits. A local collection link is not an on-chain collection ID.</p><div class="st-library-tools"><label>Collection<select id="batch-collection"><option value="">Choose a collection</option></select></label><label>Artwork files<input id="batch-art" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" multiple></label><button class="st-btn" type="button" id="batch-create">Add artworks</button><button class="st-btn ghost" type="button" id="export-collection">Back up collection</button></div><p class="st-help">Up to 20 files and 50 MB per batch. You can edit each draft independently.</p><p id="batch-status" role="status"></p></section>
+      <section class="st-collection-workspace" aria-labelledby="collection-heading"><h3 id="collection-heading">Collection workspace</h3><p class="st-help">Choose a saved collection, then add multiple artworks as individual NFT drafts. Each starts with the collection’s creator, description, license and traits. A local collection link only groups your drafts.</p><div class="st-library-tools"><label>Collection<select id="batch-collection"><option value="">Choose a collection</option></select></label><label>Artwork files<input id="batch-art" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" multiple></label><button class="st-btn" type="button" id="batch-create">Add artworks</button><button class="st-btn ghost" type="button" id="export-collection">Back up collection</button></div><p class="st-help">Up to 20 files and 50 MB per batch. You can edit each draft independently.</p><p id="batch-status" role="status"></p></section>
     </section>
 
     <section class="st-batch" id="batch" aria-labelledby="batch-title">
@@ -207,7 +208,7 @@
               </label>
             </div>
             <label>Website <input name="external_url" type="url" maxlength="200" placeholder="https://" autocomplete="off"></label>
-            <label>Part of collection <input name="collection" maxlength="64" placeholder="Collection asset ID (optional)" autocomplete="off" spellcheck="false"></label>
+            <label>Part of collection <input name="collection" maxlength="64" placeholder="Optional 64-character collection ID" autocomplete="off" spellcheck="false"></label>
           </fieldset>
 
           <fieldset>
@@ -236,18 +237,18 @@
       <div class="st-section-head">
         <p class="eyebrow">Verify</p>
         <h2 id="verify-title">Is this NFT what it claims to be?</h2>
-        <p class="st-help">Select metadata and artwork to check their fingerprints locally. Optionally look up an asset ID through the public node to compare against its recorded metadata hash.</p>
+        <p class="st-help">Select metadata and artwork to check their fingerprints. Everything is checked in your browser; nothing is uploaded.</p>
       </div>
-      <div class="st-lookup"><label>Asset ID (optional)<input id="verify-asset-id" maxlength="64" placeholder="64-character asset ID" autocomplete="off" spellcheck="false"></label><button type="button" class="st-btn ghost" id="lookup-asset">Look up on chain</button></div><p id="lookup-status" class="st-help" role="status">No on-chain lookup performed.</p>
+      <div class="st-lookup" hidden><label>Asset ID (optional)<input id="verify-asset-id" maxlength="64" placeholder="64-character asset ID" autocomplete="off" spellcheck="false"></label><button type="button" class="st-btn ghost" id="lookup-asset">Look up on chain</button></div><p id="lookup-status" class="st-help" role="status" hidden></p>
       <div class="st-verify-grid">
         <label class="st-drop small"><input type="file" id="verify-meta" accept="application/json,.json"><span class="st-drop-text"><strong>Metadata file</strong><small>metadata.json</small></span></label>
         <label class="st-drop small"><input type="file" id="verify-image" accept="image/*"><span class="st-drop-text"><strong>Image file</strong><small>optional</small></span></label>
-        <label class="st-verify-hash">Expected metadata hash (manual or retrieved) <input id="verify-expected" maxlength="64" placeholder="64-character hash from the asset" spellcheck="false" autocomplete="off"></label>
+        <label class="st-verify-hash">Expected metadata hash <input id="verify-expected" maxlength="64" placeholder="64-character hash published by the creator" spellcheck="false" autocomplete="off"></label>
       </div>
       <ul class="st-results" id="verify-results" aria-live="polite"></ul>
     </section>
 
-    <section class="st-onchain" aria-labelledby="onchain-title">
+    <section class="st-onchain" aria-labelledby="onchain-title" hidden>
       <div class="st-section-head row">
         <div><p class="eyebrow">On the Monzero chain</p><h2 id="onchain-title">Issued native assets</h2></div>
         <a class="st-link" href="../explorer/">Open the explorer →</a>
@@ -256,26 +257,11 @@
       <div class="st-grid" id="onchain"><p class="st-empty">Loading…</p></div>
     </section>
 
-    <section class="st-gates" id="activation" aria-labelledby="gates-title">
-      <div class="st-section-head">
-        <p class="eyebrow">Activation</p>
-        <h2 id="gates-title">What's left before native Monzero assets go live.</h2>
-        <p class="st-help">Assets switch on with a network upgrade (hard fork 17), and only after these steps. Nobody, including the founder, can mint, freeze or edit assets after launch.</p>
-      </div>
-      <ol>
-        <li class="done"><span>01</span><div><strong>Persistent, reorg-safe asset state</strong><small>Implemented and covered by activation-gated tests</small></div></li>
-        <li class="done"><span>02</span><div><strong>Confidential ownership and conservation proofs</strong><small>Implemented; independent cryptographic review still required</small></div></li>
-        <li class="done"><span>03</span><div><strong>Wallet scanning, restoration and signing</strong><small>CLI and RPC paths implemented and tested</small></div></li>
-        <li><span>04</span><div><strong>Public testnet and independent review</strong><small>Required before activation or any funds are accepted</small></div></li>
-      </ol>
-      <p class="st-help">Trading happens through atomic swaps in the wallet: no deposits, no custody. <a href="../roadmap/">See the DEX roadmap →</a></p>
-    </section>
-
     <section class="st-standard" aria-labelledby="standard-title">
       <details>
         <summary><span class="eyebrow">For developers</span> <strong id="standard-title">The monzero-metadata/1 standard</strong></summary>
         <div class="st-standard-body">
-          <p>The metadata hash committed on chain is the SHA-256 of the exact bytes of <code>metadata.json</code>. Studio writes the file canonically (keys sorted, no extra whitespace, UTF-8), so the same inputs always produce the same hash.</p>
+          <p>The metadata hash is the SHA-256 of the exact bytes of <code>metadata.json</code>. Studio writes the file canonically (keys sorted, no extra whitespace, UTF-8), so the same inputs always produce the same hash.</p>
           <ul>
             <li><code>standard</code>: always <code>"monzero-metadata/1"</code></li>
             <li><code>class</code>: <code>nft</code>, <code>edition</code>, <code>collection</code> or <code>fungible</code></li>
@@ -284,7 +270,7 @@
             <li><code>attributes</code>: a list of <code>{"trait_type", "value"}</code></li>
             <li><code>edition_size</code> (editions), <code>symbol</code> and <code>decimals</code> (tokens), <code>collection</code> (member NFTs)</li>
           </ul>
-          <p>Galleries must download the metadata, check its SHA-256 against the on-chain hash, then check the image against <code>image_sha256</code> before showing anything. Treat every field as untrusted text. Never render SVG or HTML from metadata.</p>
+          <p>Galleries must download the metadata, check its SHA-256 against the hash the creator published, then check the image against <code>image_sha256</code> before showing anything. Treat every field as untrusted text. Never render SVG or HTML from metadata.</p>
         </div>
       </details>
     </section>
@@ -295,9 +281,9 @@
   <script src="studio-core.js?v=1"></script>
   <script src="studio-20261025.js?v=2"></script>
   <script src="studio-extras.js?v=1"></script>
-  <script src="batch.js?v=2"></script>
-  <script src="tour.js?v=2"></script>
+  <script src="batch.js?v=4"></script>
+  <script src="tour.js?v=3"></script>
   <script src="../site-nav.js?v=20261113-noticker" defer></script>
-<script defer src="/app/sol-studio.js?v=9"></script>
+<script defer src="/app/sol-studio.js?v=10"></script>
 </body>
 </html>
