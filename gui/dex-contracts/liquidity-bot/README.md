@@ -7,7 +7,7 @@ to the project's vault addresses. Its XMZ comes from a share of the pool's own f
 ## How it works
 
 * **Ladder:** for each pair, one offer per step of `ladder_percent` above `reference_usd`
-  (default $0.001: +2%, +5%, +10%, +20%), each `offer_xmz` XMZ (default 2,000), converted to the
+  (default $0.01, since 2026-11-15; first $0.001: +2%, +5%, +10%, +20%), each `offer_xmz` XMZ (default 2,000), converted to the
   coin at its live price (monzero.org/markets). Offers last `offer_hours`, and are re-posted when the
   coin moves more than `reprice_percent`.
 * **Limits:** a new offer needs a valid control document for its network, signed with the pinned key

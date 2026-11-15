@@ -68,6 +68,8 @@ class BotTest(unittest.TestCase):
         cfg_path = self.tmp / "c.json"
         cfg_path.write_text(json.dumps({"helper": str(helper), "wallet_rpc_bin": "/bin/false", "state_dir": str(self.tmp / "state"),
                                         "ladder_percent": [2, 10], "offer_xmz": "2000",
+                                        # The figures below were worked out at the first $0.001 price
+                                        "reference_usd": "0.001", "dynamic_price": {"floor_usd": "0.001"},
                                         "pairs": {"ETH": {"vault": "0x" + "d0" * 20}}}))
         self.bot = lb.Bot(lb.load_config(cfg_path))
         (self.tmp / "state" / "keys").mkdir(parents=True)

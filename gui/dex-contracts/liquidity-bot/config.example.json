@@ -3,7 +3,7 @@
  "wallet_rpc_bin": "/usr/bin/monzero-wallet-rpc",
  "state_dir": "/var/lib/monzero-liquidity",
  "daemon": "127.0.0.1:6175",
- "reference_usd": "0.001",
+ "reference_usd": "0.01",
  "ladder_percent": [2, 5, 10, 20],
  "offer_xmz": "2000",
  "offer_hours": 6,

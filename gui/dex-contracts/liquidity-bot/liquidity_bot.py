@@ -51,10 +51,10 @@ DEFAULTS = {
     "control_base": "https://monzero.org/dex/control/",
     "control_key": "9eba2b1784ddfc23f028c03c78f862fecc81af81616722b56e671e6662e0a6fb",
     "daemon": "127.0.0.1:6175",
-    "reference_usd": "0.001",
+    "reference_usd": "0.01",
     # The reference price follows demand: +up% per sale, -down% after every down_every_hours
     # without a sale or change, never below floor_usd. Its state is in price.json.
-    "dynamic_price": {"enabled": True, "up_percent_per_sale": 2, "down_percent": 1, "down_every_hours": 12, "floor_usd": "0.001"},
+    "dynamic_price": {"enabled": True, "up_percent_per_sale": 2, "down_percent": 1, "down_every_hours": 12, "floor_usd": "0.01"},
     "ladder_percent": [2, 5, 10, 20],
     "offer_xmz": "2000",
     "offer_hours": 6,
