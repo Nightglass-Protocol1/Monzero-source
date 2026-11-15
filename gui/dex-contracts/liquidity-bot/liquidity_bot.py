@@ -57,6 +57,9 @@ DEFAULTS = {
     "dynamic_price": {"enabled": True, "up_percent_per_sale": 2, "down_percent": 1, "down_every_hours": 12, "floor_usd": "0.01"},
     "ladder_percent": [2, 5, 10, 20],
     "offer_xmz": "2000",
+    # Buyers may take any part of an offer from this much XMZ (the rest stays on offer as a new
+    # offer); "0" posts whole offers only
+    "min_part_xmz": "50",
     "offer_hours": 6,
     "reprice_percent": 3,
     "keep_xmz": "0",
@@ -290,6 +293,16 @@ class Bot:
         self.prices = {}
         self.prices_at = 0
         self.slots = read_json(self.slots_file, {}) or {}
+        # Running trades by folder, apart from the offers: with partial offers a slot can have its
+        # offer's rest open while a part of it is being swapped
+        self.trades_file = self.state_dir / "trades.json"
+        self.trades = read_json(self.trades_file, {}) or {}
+        for key, s in list(self.slots.items()):    # state from before partial offers: one trade per slot
+            if s.get("state") in ("trading", "payout") and s.get("folder"):
+                pair, slot = key.rsplit("-", 1)
+                self.trades.setdefault(s["folder"], {"pair": pair, "slot": int(slot), "state": s["state"], "valueAtoms": s["valueAtoms"],
+                                                     "xmzAtoms": s["xmzAtoms"], "account": s.get("account"), "note": s.get("note", "")})
+                self.slots[key] = {"state": "idle", "account": s.get("account"), "note": ""}
         self.price_file = self.state_dir / "price.json"
         self.price = read_json(self.price_file, None)
         self.alerts = []
@@ -433,6 +446,7 @@ class Bot:
     # --- book-keeping
     def save_slots(self):
         atomic_write(self.slots_file, json.dumps(self.slots, indent=1, sort_keys=True))
+        atomic_write(self.trades_file, json.dumps(self.trades, indent=1, sort_keys=True))
 
     def record(self, event):
         event = {"ts": int(time.time()), **event}
@@ -481,13 +495,17 @@ class Bot:
         self.price.update(referenceUsd=str(value), changedAt=int(time.time()))
         self.save_price(why)
 
-    def price_after_sale(self, pair):
+    def price_after_sale(self, pair, share=Decimal(1)):
+        """+up% for a whole offer sold; a part of one moves it by its share (so small buys do not
+        push the price up as fast as whole offers)."""
         d = self.cfg["dynamic_price"]
         if not d["enabled"]:
             return
         self.reference()
         self.price["sales"] = int(self.price.get("sales", 0)) + 1
-        self.set_reference(Decimal(self.price["referenceUsd"]) * (1 + Decimal(str(d["up_percent_per_sale"])) / 100), f"sale on {pair}")
+        share = min(Decimal(1), max(Decimal(0), share))
+        why = f"sale on {pair}" if share == 1 else f"sale on {pair} ({float(share) * 100:.0f}% of an offer)"
+        self.set_reference(Decimal(self.price["referenceUsd"]) * (1 + Decimal(str(d["up_percent_per_sale"])) / 100 * share), why)
 
     def price_decay(self, now=None):
         """-down% for each full quiet period since the last change (no sale, no change)."""
@@ -539,7 +557,15 @@ class Bot:
         if wallet is None:
             self.alert("the XMZ wallet does not answer; nothing new is posted")
         unlocked = int(wallet["unlockedAtoms"]) if wallet else 0
+        for folder, t in list(self.trades.items()):
+            try:
+                self.trade(folder, t) if t["state"] == "trading" else self.payout(folder, t)
+            except Exception as e:   # one trade's trouble never stops the rest
+                log.exception("trade %s: %s", Path(folder).name, e)
+            self.save_slots()
+        # Open offers may be taken, and a running trade's XMZ may not be locked yet: neither is spare
         promised = sum(s["xmzAtoms"] for s in self.slots.values() if s.get("state") == "open")
+        promised += sum(t["xmzAtoms"] for t in self.trades.values())
         spare = unlocked - promised - int(Decimal(self.cfg["keep_xmz"]) * ATOMIC)
         for pair, p in self.cfg["pairs"].items():
             if not p.get("enabled", True):
@@ -560,12 +586,6 @@ class Bot:
         state = s["state"]
         if state == "open":
             return self.serve(pair, slot, step, s, doc, spare)
-        if state == "trading":
-            self.trade(pair, slot, s)
-            return spare
-        if state == "payout":
-            self.payout(pair, slot, s)
-            return spare
         # idle: post a new offer when everything allows it
         if doc is None:
             s["note"] = why
@@ -596,16 +616,20 @@ class Bot:
             log.info("dry run: %s would offer %s XMZ for %s %s", key, units(xmz, 11), units(value, self.cfg["pairs"][pair]["decimals"]), pair)
             return spare - xmz
         self.trades_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        offer = {"chainId": self.cfg["pairs"][pair]["chain_id"], "side": "sell-xmz", "valueWei": str(value),
+                 "xmzAtoms": str(xmz), "lifetimeSecs": int(self.cfg["offer_hours"]) * 3600}
+        min_part = self.min_part(xmz)
+        if min_part:
+            offer["minXmzAtoms"] = str(min_part)
         r = self.helper({"command": "post", "tradeDir": str(folder), "relays": self.cfg["relays"], "tick": self.tick_config(pair, slot),
-                         "offer": {"chainId": self.cfg["pairs"][pair]["chain_id"], "side": "sell-xmz", "valueWei": str(value),
-                                   "xmzAtoms": str(xmz), "lifetimeSecs": int(self.cfg["offer_hours"]) * 3600}})
+                         "offer": offer})
         listing = (r.get("listing") or {}).get("listing") if r.get("ok") else None
         if not listing and not (folder / "listing.json").exists():
             s["note"] = "post refused: " + str(r.get("error"))[:200]
             log.warning("%s: %s", key, s["note"])
             return spare
         s.update({"state": "open", "folder": str(folder), "valueAtoms": value, "xmzAtoms": xmz, "step": step, "note": "",
-                  "refUsd": str(self.reference()),
+                  "refUsd": str(self.reference()), "fullXmzAtoms": xmz, "minXmzAtoms": min_part,
                   "postedAt": int(time.time()), "expiresAt": int(time.time()) + int(self.cfg["offer_hours"]) * 3600})
         self.record({"event": "posted", "pair": pair, "slot": slot, "valueAtoms": str(value), "xmzAtoms": str(xmz), "folder": folder.name})
         log.info("%s: offered %s XMZ for %s %s", key, units(xmz, 11), units(value, self.cfg["pairs"][pair]["decimals"]), pair)
@@ -618,16 +642,15 @@ class Bot:
             s["note"] = "serve: " + str(r.get("error"))[:200]
             return spare
         if r.get("taken"):
-            s["state"] = "trading"
-            s["note"] = ""
-            self.record({"event": "taken", "pair": pair, "slot": slot, "valueAtoms": str(s["valueAtoms"]), "xmzAtoms": str(s["xmzAtoms"]),
-                         "folder": Path(s["folder"]).name})
-            log.info("%s: offer taken", key)
-            self.price_after_sale(pair)
-            self.trade(pair, slot, s)
-            return spare
+            return self.taken(pair, slot, s, r, spare)
         if r.get("expired"):
             self.close(pair, slot, s, "expired")
+            return spare
+        # An offer from before partial offers (or from another setting): replace it
+        if not self.dry_run and bool(self.min_part(s["xmzAtoms"])) != bool(s.get("minXmzAtoms")):
+            c = self.helper({"command": "cancel", "tradeDir": s["folder"], "relays": self.cfg["relays"], "tick": self.tick_config(pair, slot)})
+            if c.get("ok"):
+                self.close(pair, slot, s, "cancelled to change partial fills")
             return spare
         # Re-price when the coin moved, or when the operator paused new trades
         fresh = self.offer_for(pair, step, doc) if doc else None
@@ -644,6 +667,45 @@ class Bot:
                 s["note"] = "cancel: " + str(c.get("error"))[:200]
         return spare
 
+    def min_part(self, xmz):
+        """The smallest part buyers may take of an offer of `xmz` atoms; 0 for a whole offer"""
+        m = int(Decimal(str(self.cfg.get("min_part_xmz", "0"))) * ATOMIC)
+        if m <= 0:
+            return 0
+        m = max(m, ATOMIC)            # the DEX's floor: 1 XMZ
+        return m if m * 2 <= xmz else 0   # a part must leave room for another; smaller offers stay whole
+
+    def taken(self, pair, slot, s, r, spare):
+        """All or part of the slot's offer was taken: the part becomes a trade; any rest is the
+        slot's open offer from now on (the helper posted it in its own folder)."""
+        key = f"{pair}-{slot}"
+        part = int(r.get("takenXmz") or s["xmzAtoms"])
+        if part <= 0 or part > s["xmzAtoms"]:
+            self.alert(f"{key}: the helper reports {part} XMZ atoms taken of an offer of {s['xmzAtoms']}; nothing approved")
+            return spare
+        # The coin for the part at the offer's price, rounded up for us as the helper does
+        value = s["valueAtoms"] if part == s["xmzAtoms"] else -(-s["valueAtoms"] * part // s["xmzAtoms"])
+        self.trades[s["folder"]] = {"pair": pair, "slot": slot, "state": "trading", "valueAtoms": value, "xmzAtoms": part,
+                                    "account": s.get("account"), "note": ""}
+        self.record({"event": "taken", "pair": pair, "slot": slot, "valueAtoms": str(value), "xmzAtoms": str(part),
+                     "of": str(s["xmzAtoms"]), "folder": Path(s["folder"]).name})
+        log.info("%s: %s XMZ of %s taken", key, units(part, 11), units(s["xmzAtoms"], 11))
+        self.price_after_sale(pair, Decimal(part) / Decimal(s.get("fullXmzAtoms") or s["xmzAtoms"]))
+        rest = r.get("remainder") or {}
+        listing = (rest.get("listing") or {}).get("listing") or {}
+        if rest.get("folder") and listing:
+            rest_xmz, rest_value = int(listing["xmz"]), int(str(listing["value"]), 0)
+            self.slots[key] = {**s, "folder": rest["folder"], "xmzAtoms": rest_xmz, "valueAtoms": rest_value,
+                               "minXmzAtoms": int(listing.get("minXmz") or 0), "expiresAt": int(listing.get("expiresAt") or s.get("expiresAt", 0)),
+                               "note": ""}
+            self.record({"event": "rest", "pair": pair, "slot": slot, "valueAtoms": str(rest_value), "xmzAtoms": str(rest_xmz),
+                         "folder": Path(rest["folder"]).name})
+            log.info("%s: %s XMZ stay on offer", key, units(rest_xmz, 11))
+        else:
+            self.slots[key] = {"state": "idle", "account": s.get("account"), "note": ""}
+        self.trade(s["folder"], self.trades[s["folder"]])
+        return spare
+
     def close(self, pair, slot, s, why):
         self.record({"event": "closed", "pair": pair, "slot": slot, "why": why, "folder": Path(s["folder"]).name})
         log.info("%s-%d: offer %s", pair, slot, why)
@@ -658,17 +720,18 @@ class Bot:
             svc = self.trade_services[folder] = WalletService(self.cfg, Path(folder) / "swap-service", port)
         return svc if svc.start() else None
 
-    def trade(self, pair, slot, s):
-        key = f"{pair}-{slot}"
-        status = self.helper({"command": "status", "tradeDir": s["folder"]})
+    def trade(self, folder, s):
+        pair, slot = s["pair"], s["slot"]
+        key = f"{pair}-{slot} {Path(folder).name}"
+        status = self.helper({"command": "status", "tradeDir": folder})
         if status.get("ok") and status.get("done"):
             s["state"] = "payout"
-            return self.payout(pair, slot, s)
-        svc = self.trade_service(s["folder"], s)
+            return self.payout(folder, s)
+        svc = self.trade_service(folder, s)
         if svc is None:
             s["note"] = "the trade's wallet service did not start"
             return
-        r = self.helper({"command": "tick", "tradeDir": s["folder"], "tick": self.tick_config(pair, slot, svc.endpoint())}, timeout=330)
+        r = self.helper({"command": "tick", "tradeDir": folder, "tick": self.tick_config(pair, slot, svc.endpoint())}, timeout=330)
         if not r.get("ok"):
             s["note"] = "tick: " + str(r.get("error"))[:200]
             log.warning("%s: %s", key, s["note"])
@@ -681,33 +744,34 @@ class Bot:
             # Only the trade we offered: our side, our chain, our amounts
             if (r.get("role") == "claimer" and int(offer.get("chainId", 0)) == self.cfg["pairs"][pair]["chain_id"]
                     and int(offer.get("value", "0"), 0) == s["valueAtoms"] and int(offer.get("xmzAmount", "0"), 0) == s["xmzAtoms"]):
-                a = self.helper({"command": "approve", "tradeDir": s["folder"], "commitment": r["commitment"]})
+                a = self.helper({"command": "approve", "tradeDir": folder, "commitment": r["commitment"]})
                 log.info("%s: approved the trade%s", key, "" if a.get("ok") else ": " + str(a.get("error")))
             else:
                 self.alert(f"{key}: the trade does not match the offer; NOT approved (role {r.get('role')}, {offer})")
         if r.get("done"):
             s["state"] = "payout"
-            self.payout(pair, slot, s)
+            self.payout(folder, s)
 
-    def payout(self, pair, slot, s):
-        key = f"{pair}-{slot}"
+    def payout(self, folder, s):
+        pair, slot = s["pair"], s["slot"]
+        key = f"{pair}-{slot} {Path(folder).name}"
         p = self.cfg["pairs"][pair]
-        svc = self.trade_services.pop(s["folder"], None)
+        svc = self.trade_services.pop(folder, None)
         if svc:
             svc.stop()
-        r = self.helper({"command": "payout", "tradeDir": s["folder"], "tick": self.tick_config(pair, slot),
+        r = self.helper({"command": "payout", "tradeDir": folder, "tick": self.tick_config(pair, slot),
                          "payoutAddress": p["vault"], "keepWei": str(p["keep"])})
         if not r.get("ok"):
             s["note"] = "payout: " + str(r.get("error"))[:200]
             log.warning("%s: %s", key, s["note"])
             return
         paid = r.get("payout") or {}
-        self.helper({"command": "report", "tradeDir": s["folder"], "relays": self.cfg["relays"]})
+        self.helper({"command": "report", "tradeDir": folder, "relays": self.cfg["relays"]})
         self.record({"event": "finished", "pair": pair, "slot": slot, "stage": r.get("stage"), "payoutTx": paid.get("tx"),
-                     "paidAtoms": paid.get("amountWei"), "folder": Path(s["folder"]).name})
+                     "paidAtoms": paid.get("amountWei"), "folder": Path(folder).name})
         log.info("%s: trade finished (%s); %s %s to the vault%s", key, r.get("stage"),
                  units(paid.get("amountWei", 0), p["decimals"]), pair, f" ({paid['tx']})" if paid.get("tx") else "")
-        self.slots[key] = {"state": "idle", "account": s.get("account"), "note": ""}
+        del self.trades[folder]
 
     def write_status(self, wallet):
         atomic_write(self.state_dir / "status.json", json.dumps({
@@ -717,7 +781,10 @@ class Bot:
                     "unlocked": units((wallet or {}).get("unlockedAtoms", 0), 11)},
             "prices": {k: str(v) for k, v in self.prices.items()},
             "slots": {k: {"state": v.get("state"), "xmz": units(v.get("xmzAtoms", 0), 11) if v.get("state") == "open" else None,
+                          "fromXmz": units(v["minXmzAtoms"], 11) if v.get("state") == "open" and v.get("minXmzAtoms") else None,
                           "note": v.get("note", "")} for k, v in sorted(self.slots.items())},
+            "trades": {Path(f).name: {"pair": t["pair"], "state": t["state"], "xmz": units(t["xmzAtoms"], 11), "note": t.get("note", "")}
+                       for f, t in sorted(self.trades.items())},
             "alerts": self.alerts}, indent=1), mode=0o644)
 
     def shutdown(self):
