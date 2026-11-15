@@ -32,12 +32,25 @@ if cmd == "post":
 offer = json.loads((Path(req["tradeDir"]) / "offer.json").read_text()) if (Path(req["tradeDir"]) / "offer.json").exists() else {}
 taken = scen.get("taken", False)
 if cmd == "serve":
-    out({"taken": taken, "expired": False})
+    d = Path(req["tradeDir"])
+    part = scen.get("taken_xmz")
+    if taken and part and int(part) < int(offer["xmzAtoms"]) and not d.name.endswith("-rest"):
+        whole_v, whole_x, part = int(offer["valueWei"]), int(offer["xmzAtoms"]), int(part)
+        v = -(-whole_v * part // whole_x)                     # rounded up for the maker, as the engine does
+        (d / "taken.json").write_text(json.dumps({"valueWei": str(v), "xmzAtoms": str(part)}))
+        rest = d.parent / (d.name + "-rest"); rest.mkdir(exist_ok=True)
+        r = {**offer, "valueWei": str(whole_v - v), "xmzAtoms": str(whole_x - part)}
+        (rest / "offer.json").write_text(json.dumps(r)); (rest / "listing.json").write_text(json.dumps(r))
+        out({"taken": True, "takenXmz": str(part), "remainder": {"folder": str(rest), "listing": {"listing": {
+            "xmz": r["xmzAtoms"], "value": hex(int(r["valueWei"])), "minXmz": offer.get("minXmzAtoms"), "expiresAt": 1}}}})
+    out({"taken": taken and not (scen.get("rest_waits") and d.name.endswith("-rest")), "expired": False})
 if cmd == "cancel":
     out({"cancelled": True})
-value = scen.get("trade_value") or offer.get("valueWei")
+tk = Path(req["tradeDir"]) / "taken.json"
+part = json.loads(tk.read_text()) if tk.exists() else offer
+value = scen.get("trade_value") or part.get("valueWei")
 trade = {"role": scen.get("role", "claimer"), "commitment": "0x" + "ab" * 32, "stage": "Agreed",
-         "offer": {"chainId": offer.get("chainId"), "value": value, "xmzAmount": offer.get("xmzAtoms")}}
+         "offer": {"chainId": offer.get("chainId"), "value": value, "xmzAmount": part.get("xmzAtoms")}}
 approved = (Path(req["tradeDir"]) / "approved").exists()
 if cmd == "status":
     out({**trade, "done": scen.get("done", False), "approved": approved})
@@ -138,7 +151,8 @@ class BotTest(unittest.TestCase):
         self.assertEqual(len(payouts), 2)
         self.assertEqual({p["payoutAddress"] for p in payouts}, {"0x" + "d0" * 20})
         self.assertEqual({p["keepWei"] for p in payouts}, {"2000000000000000"}, "fees for the next trade stay")
-        self.assertEqual({s["state"] for s in self.bot.slots.values()}, {"idle"})
+        self.assertEqual(self.bot.trades, {}, "both trades finished")
+        self.assertEqual({s["state"] for s in self.bot.slots.values()}, {"open"}, "the slots offer again")
         events = [json.loads(x)["event"] for x in self.bot.ledger_file.read_text().splitlines()]
         self.assertEqual(events.count("taken"), 2)
         self.assertEqual(events.count("finished"), 2)
@@ -176,6 +190,77 @@ class BotTest(unittest.TestCase):
         self.bot.dry_run = True
         self.bot.round()
         self.assertEqual(self.requests("post"), [])
+
+
+class PartialOffers(BotTest):
+    def test_offers_allow_parts_from_the_minimum(self):
+        self.bot.round()
+        self.assertEqual({p["offer"]["minXmzAtoms"] for p in self.requests("post")}, {str(50 * lb.ATOMIC)})
+
+    def test_whole_offers_when_switched_off_or_too_small(self):
+        self.bot.cfg["min_part_xmz"] = "0"
+        self.bot.round()
+        self.assertTrue(all("minXmzAtoms" not in p["offer"] for p in self.requests("post")))
+        self.assertEqual(self.bot.min_part(90 * lb.ATOMIC), 0, "a part of 50 must leave room for another")
+        self.bot.cfg["min_part_xmz"] = "0.1"
+        self.assertEqual(self.bot.min_part(2000 * lb.ATOMIC), lb.ATOMIC, "never below the DEX's 1 XMZ")
+
+    def test_a_part_is_sold_and_the_rest_stays_on_offer(self):
+        self.bot.cfg["ladder_percent"] = [2]
+        self.bot.round()
+        whole = self.bot.slots["ETH-0"]
+        self.scenario({"unlocked": 100000 * lb.ATOMIC, "taken": True, "taken_xmz": str(500 * lb.ATOMIC), "rest_waits": True})
+        self.bot.round()
+        # The part: a quarter of 2000 XMZ at 0.00204 ETH, rounded up for the bot
+        (folder, t), = self.bot.trades.items()
+        self.assertEqual(t["xmzAtoms"], 500 * lb.ATOMIC)
+        self.assertEqual(t["valueAtoms"], -(-whole["valueAtoms"] * 500 // 2000))
+        self.assertEqual(len(self.requests("approve")), 1, "the trade for the part is approved")
+        slot = self.bot.slots["ETH-0"]
+        self.assertEqual((slot["state"], slot["xmzAtoms"]), ("open", 1500 * lb.ATOMIC))
+        self.assertTrue(slot["folder"].endswith("-rest"))
+        self.assertEqual(slot["valueAtoms"] + t["valueAtoms"], whole["valueAtoms"])
+        # The price moves by the part's share: a quarter of 2%
+        self.assertEqual(self.bot.reference(), Decimal("0.001005"))
+        taken = [json.loads(x) for x in self.bot.ledger_file.read_text().splitlines() if '"taken"' in x]
+        self.assertEqual([e["valueAtoms"] for e in taken], [str(t["valueAtoms"])], "the day limit counts the part")
+        # The rest is served (not posted again) while the part is swapped
+        self.scenario({"unlocked": 100000 * lb.ATOMIC, "taken": True, "rest_waits": True, "done": True})
+        self.bot.round()
+        self.assertEqual(self.bot.trades, {})
+        self.assertEqual(len(self.requests("payout")), 1)
+        self.assertEqual(len(self.requests("post")), 1)
+        self.assertTrue(any(r["tradeDir"].endswith("-rest") for r in self.requests("serve")))
+
+    def test_a_part_with_other_amounts_is_not_approved(self):
+        self.bot.cfg["ladder_percent"] = [2]
+        self.bot.round()
+        self.scenario({"unlocked": 100000 * lb.ATOMIC, "taken": True, "taken_xmz": str(500 * lb.ATOMIC), "rest_waits": True,
+                       "trade_value": "1"})
+        self.bot.round()
+        self.assertEqual(self.requests("approve"), [])
+        self.assertTrue(any("NOT approved" in a for a in self.bot.alerts))
+
+    def test_whole_offers_from_before_are_replaced(self):
+        self.bot.cfg["min_part_xmz"] = "0"
+        self.bot.round()
+        self.bot.cfg["min_part_xmz"] = "50"
+        self.bot.round()
+        self.assertEqual(len(self.requests("cancel")), 2)
+        self.bot.round()
+        self.assertEqual([p["offer"].get("minXmzAtoms") for p in self.requests("post")][2:], [str(50 * lb.ATOMIC)] * 2)
+
+    def test_a_trade_running_in_a_slot_from_before_carries_on(self):
+        self.bot.round()
+        self.scenario({"unlocked": 100000 * lb.ATOMIC, "taken": True})
+        self.bot.cfg["ladder_percent"] = [2]
+        s = self.bot.slots["ETH-0"]
+        old = {"ETH-0": {**s, "state": "trading"}}
+        self.bot.slots_file.write_text(json.dumps(old))
+        self.bot.trades_file.unlink(missing_ok=True)
+        bot = lb.Bot(self.bot.cfg)
+        self.assertEqual(list(bot.trades), [s["folder"]])
+        self.assertEqual(bot.slots["ETH-0"]["state"], "idle")
 
 
 class DynamicPrice(BotTest):

@@ -355,7 +355,7 @@ impl<C: ChainView> Relay<C> {
         let mut out: Vec<_> = s
             .active
             .values()
-            .filter(|o| o.listing.expires_at > now && pair.is_none_or(|p| o.listing.pair == p) && (partial || !o.listing.is_partial()))
+            .filter(|o| o.listing.expires_at > now && pair.is_none_or(|p| o.listing.pair == p) && (partial || o.listing.schema == monzero_dex_evm::listing::LISTING_SCHEMA))
             .cloned()
             .collect();
         // a.value / a.xmz against b.value / b.xmz, without rounding
