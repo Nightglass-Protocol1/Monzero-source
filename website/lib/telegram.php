@@ -230,6 +230,9 @@ function tgDexOffer(array $l, int $now): ?array {
     // Short on purpose: whole XMZ, the coin to 4 places, no per-XMZ price (it is all zeros)
     $line = ($selling ? '🟢 Sell ' : '🔵 Buy ') . tgDexAmount($xmz, 11, $xmz >= 100 * 10 ** 11 ? 0 : 2) . ' XMZ for ' . tgDexAmount($value, $places, 4) . " $coin"
         . ' (' . ($left >= 5400 ? round($left / 3600) . 'h' : max(1, (int)round($left / 60)) . 'm') . ')';
+    // A partial offer: any part from its smallest may be taken
+    if (is_string($l['minXmz'] ?? null) && preg_match('/\A[1-9]\d{0,17}\z/', $l['minXmz']) && (int)$l['minXmz'] < $xmz)
+        $line .= ', from ' . tgDexAmount((int)$l['minXmz'], 11, 0) . ' XMZ';
     return ['coin' => $coin, 'selling' => $selling, 'xmz' => $xmz, 'price' => $price, 'line' => $line];
 }
 
@@ -268,7 +271,7 @@ function tgFeedDex(array $config, int $now): bool {
     $context = stream_context_create(['http' => ['timeout' => 5, 'ignore_errors' => true, 'follow_location' => 0]]);
     $text = null; $board = '';
     foreach (tgDexRelays() as $base) {
-        $data = json_decode((string)@file_get_contents(rtrim($base, '/') . '/v1/listings', false, $context, 0, 4194304), true);
+        $data = json_decode((string)@file_get_contents(rtrim($base, '/') . '/v1/listings?partial=1', false, $context, 0, 4194304), true);
         if (is_array($data) && is_array($data['listings'] ?? null)) {
             $shown = tgDexAnnounced($data['listings'], tgDexQuietMakers());
             $text = tgDexSummary($shown, $now);
