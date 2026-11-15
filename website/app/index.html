@@ -34,10 +34,11 @@
         <div class="st-status-top"><i id="node-dot"></i><span id="node-state">Checking network…</span></div>
         <dl>
           <div><dt>Block height</dt><dd id="height">—</dd></div>
-          <div><dt>On-chain assets</dt><dd id="asset-count">—</dd></div>
-          <div><dt>Asset protocol</dt><dd id="asset-state" class="amber">Not yet active</dd></div>
+          <div><dt>Minting on Solana</dt><dd>Available</dd></div>
+          <div><dt>Native XMZ assets issued</dt><dd id="asset-count">—</dd></div>
+          <div><dt>Native XMZ assets</dt><dd id="asset-state" class="amber">Not yet active</dd></div>
         </dl>
-        <p>Drafts are local design files, not issued assets. Network support must be confirmed separately. <a href="#activation">What's left before activation</a></p>
+        <p>A draft is a local design file until you mint it. Minting on Solana works today. Assets on the Monzero chain itself wait for a network upgrade. <a href="#activation">What's left before that</a></p>
       </aside>
     </section>
 
@@ -248,7 +249,7 @@
 
     <section class="st-onchain" aria-labelledby="onchain-title">
       <div class="st-section-head row">
-        <div><p class="eyebrow">On chain</p><h2 id="onchain-title">Issued assets</h2></div>
+        <div><p class="eyebrow">On the Monzero chain</p><h2 id="onchain-title">Issued native assets</h2></div>
         <a class="st-link" href="../explorer/">Open the explorer →</a>
       </div>
       <button type="button" class="st-btn ghost" id="retry-network">Refresh network status</button><p id="network-note" class="st-help" role="status"></p>
@@ -258,7 +259,7 @@
     <section class="st-gates" id="activation" aria-labelledby="gates-title">
       <div class="st-section-head">
         <p class="eyebrow">Activation</p>
-        <h2 id="gates-title">What's left before assets go live.</h2>
+        <h2 id="gates-title">What's left before native Monzero assets go live.</h2>
         <p class="st-help">Assets switch on with a network upgrade (hard fork 17), and only after these steps. Nobody, including the founder, can mint, freeze or edit assets after launch.</p>
       </div>
       <ol>
@@ -297,6 +298,6 @@
   <script src="batch.js?v=2"></script>
   <script src="tour.js?v=2"></script>
   <script src="../site-nav.js?v=20261113-noticker" defer></script>
-<script defer src="/app/sol-studio.js?v=7"></script>
+<script defer src="/app/sol-studio.js?v=8"></script>
 </body>
 </html>

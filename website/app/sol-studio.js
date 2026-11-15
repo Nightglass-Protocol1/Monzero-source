@@ -124,7 +124,9 @@
         const res = await w.connect();
         pub = (res && res.publicKey) || w.publicKey;
         createBtn.disabled = false;
-        say('Connected ' + pub.toBase58().slice(0, 4) + '…' + pub.toBase58().slice(-4));
+        // A wallet that already trusts monzero.org (from the DEX page, say) connects without asking
+        say('Connected ' + pub.toBase58().slice(0, 4) + '…' + pub.toBase58().slice(-4) +
+          '. Nothing is sent until you approve it in your wallet.');
       } catch (e) { say('Connect failed: ' + reason(e), true); }
     });
 
