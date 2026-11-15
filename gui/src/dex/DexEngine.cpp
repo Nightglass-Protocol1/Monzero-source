@@ -1064,26 +1064,58 @@ bool DexEngine::refreshEvmOffers(const QString &pair) {
     auto *job=evmMarketForCoin(pair.section('/',0,0));
     return job && job->refreshListings(pair);
 }
-bool DexEngine::postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours) {
+bool DexEngine::postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours,const QString &minXmzAmount) {
     const auto wei=atomic(coinAmount,DexChains::decimals(chainId)),atoms=atomic(xmzAmount,11);
     if (wei.isEmpty() || atoms.isEmpty() || lifetimeHours<1 || lifetimeHours>24) {m_marketMessage=tr("Check the amounts and how long the offer stays open (1-24 hours).");emit evmMarketChanged();return false;}
+    QString minAtoms;
+    if (!minXmzAmount.trimmed().isEmpty()) {
+        minAtoms=atomic(minXmzAmount,11);
+        if (minAtoms.isEmpty() || minAtoms.toULongLong()<100000000000ULL || minAtoms.toULongLong()>atoms.toULongLong()) {
+            m_marketMessage=tr("The smallest part must be at least 1 XMZ and at most the whole offer.");emit evmMarketChanged();return false;
+        }
+    }
     const auto refusal=evmOfferRefusal(chainId,wei,atoms);
     if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
     auto *job=m_evmMarkets.value(chainId);
     if (!job) return false;
     QByteArray seed=evmSeed();
-    const bool started=job->post(seed,chainId,side,wei,atoms,qint64(lifetimeHours)*3600);
+    const bool started=job->post(seed,chainId,side,wei,atoms,minAtoms,qint64(lifetimeHours)*3600);
     m_marketMessage=started ? QString() : tr("The offer could not be posted now.");
     emit evmMarketChanged();return started;
 }
-bool DexEngine::takeEvmOffer(const QString &listingId) {
+QString DexEngine::evmPartValue(const QVariantMap &l,const QString &atomsText) {
+    bool ok1=false,ok2=false,ok3=false;
+    const quint64 total=l.value("xmzAtoms").toString().toULongLong(&ok1),value=l.value("valueWei").toString().toULongLong(&ok2),atoms=atomsText.toULongLong(&ok3);
+    if (!ok1 || !ok2 || !ok3 || total==0) return {};
+    if (atoms==total) return QString::number(value);
+    if (!l.contains("minXmzAtoms")) return {};
+    const quint64 min=l.value("minXmzAtoms").toString().toULongLong(&ok1);
+    if (!ok1 || atoms<min || atoms>=total || total-atoms<min) return {};
+    const unsigned __int128 product=(unsigned __int128)value*atoms;
+    unsigned __int128 part=product/total;
+    if (l.value("side")=="sell-xmz" && part*total!=product) part+=1;
+    return QString::number(quint64(part));
+}
+bool DexEngine::takeEvmOffer(const QString &listingId,const QString &xmzAmount) {
     for (auto *job:m_evmMarkets) for (const auto &v:job->status().value("listings").toList()) {
         const auto l=v.toMap();
         if (l.value("id")!=listingId) continue;
-        const auto refusal=evmOfferRefusal(qint64(l.value("chainId").toDouble()),l.value("valueWei").toString(),l.value("xmzAtoms").toString());
+        QString atoms,wei=l.value("valueWei").toString();
+        if (!xmzAmount.trimmed().isEmpty()) {
+            atoms=atomic(xmzAmount,11);
+            const auto part=atoms.isEmpty() ? QString() : evmPartValue(l,atoms);
+            if (part.isEmpty()) {
+                const auto min=l.value("minXmz").toString();
+                m_marketMessage=min.isEmpty() ? tr("This offer can only be taken whole.")
+                    : tr("Take at least %1 XMZ and at most %2 XMZ, leaving none or at least %1 XMZ.").arg(min,l.value("xmz").toString());
+                emit evmMarketChanged();return false;
+            }
+            if (atoms==l.value("xmzAtoms").toString()) atoms.clear(); else wei=part;
+        }
+        const auto refusal=evmOfferRefusal(qint64(l.value("chainId").toDouble()),wei,atoms.isEmpty() ? l.value("xmzAtoms").toString() : atoms);
         if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
         QByteArray seed=evmSeed();
-        const bool started=job->take(seed,listingId);
+        const bool started=job->take(seed,listingId,atoms);
         m_marketMessage=started ? QString() : tr("The offer could not be taken now.");
         emit evmMarketChanged();return started;
     }

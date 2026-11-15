@@ -11,7 +11,7 @@ use crate::chain::AlloyChain;
 use crate::driver::{durable_write, Driver, FileJournal, Journal};
 use crate::exchange::SavedTrade;
 use crate::helper::{keys, rpc, status, xmz_parts, TickConfig};
-use crate::listing::{Cancel, Listing, Rules, Side, SignedListing, CANCEL_SCHEMA, LISTING_SCHEMA, MAX_LIFETIME};
+use crate::listing::{Cancel, Listing, Rules, Side, SignedListing, CANCEL_SCHEMA, LISTING_SCHEMA, MAX_LIFETIME, PARTIAL_SCHEMA};
 use crate::mail::{Envelope, Letter};
 use crate::market::{Heights, Maker, Taker};
 use crate::negotiation::Role;
@@ -42,6 +42,9 @@ pub struct OfferParams {
     pub xmz_atoms: String,
     /// How long the offer stays open (at most 24 h)
     pub lifetime_secs: u64,
+    /// A partial offer: the least XMZ (atoms, decimal) one take may be. Absent: whole offers only.
+    #[serde(default)]
+    pub min_xmz_atoms: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,6 +57,12 @@ struct MakerFile {
     /// The relays were told the taken offer is closed (so it leaves the board before it expires)
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     closed: bool,
+    /// Partial offers: the XMZ (atoms) the taker took
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taken_xmz: Option<u64>,
+    /// Partial offers: the folder of the offer for what was left (once it is written)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remainder: Option<std::path::PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,6 +72,9 @@ struct TakerFile {
     /// The chain search starts before our first take: the maker may lock once it answered
     evm_from_block: u64,
     sent_at: u64,
+    /// Partial offers: the XMZ (atoms) we take. Absent: all of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xmz: Option<u64>,
 }
 
 fn rules(local_contract: Option<Address>) -> Rules {
@@ -123,12 +135,14 @@ async fn heights(cfg: &TickConfig, chain: Chain, evm_from_block: Option<u64>) ->
 }
 
 /// Our side can pay for its part before we offer or take: the coin (owner) or XMZ (claimer)
-async fn check_funds(role: Role, listing: &Listing, key: &PrivateKeySigner, cfg: &TickConfig) -> Result<(), String> {
+/// for `xmz` atoms of the listing (all of it when we make the offer).
+async fn check_funds(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySigner, cfg: &TickConfig) -> Result<(), String> {
+    let value = listing.fill_value(xmz);
     match role {
         Role::Owner if Chain::from_id(listing.chain_id).is_some_and(Chain::is_solana) => {
             let account = crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes();
             let have = crate::sol::balance(&cfg.evm_rpc, &account).await.map_err(|e| e.to_string())?;
-            let need = u64::try_from(listing.value).map_err(|_| "the amount does not fit Solana's lamports")?;
+            let need = u64::try_from(value).map_err(|_| "the amount does not fit Solana's lamports")?;
             if have < need {
                 let sol = |lamports: u64| format!("{}.{:09}", lamports / 1_000_000_000, lamports % 1_000_000_000);
                 return Err(format!(
@@ -140,12 +154,12 @@ async fn check_funds(role: Role, listing: &Listing, key: &PrivateKeySigner, cfg:
         Role::Owner => {
             let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
             let have = provider.get_balance(key.address()).await.map_err(|e| e.to_string())?;
-            if have < listing.value {
+            if have < value {
                 // In coins, not wei: this is what the person reads before sending from their wallet
                 let coins = alloy::primitives::utils::format_ether;
                 return Err(format!(
                     "the trade account {} holds {}; this offer needs {} plus network fees. Send at least {} more to it (for example from MetaMask), then try again",
-                    key.address(), coins(have), coins(listing.value), coins(listing.value - have)
+                    key.address(), coins(have), coins(value), coins(value - have)
                 ));
             }
         }
@@ -154,7 +168,7 @@ async fn check_funds(role: Role, listing: &Listing, key: &PrivateKeySigner, cfg:
             let main = rpc(&cfg.main_wallet)?;
             main.call("refresh", json!({})).await.map_err(|e| e.to_string())?;
             let unlocked = main.call("get_balance", json!({})).await.map_err(|e| e.to_string())?["unlocked_balance"].as_u64().unwrap_or(0);
-            let needed = xmz_needed(listing.xmz);
+            let needed = xmz_needed(xmz);
             if unlocked < needed {
                 return Err(format!("the XMZ wallet has {unlocked} atoms unlocked; this offer needs {needed} (the amount plus a margin for fees)"));
             }
@@ -199,9 +213,10 @@ fn listing_json(s: &SignedListing, relays: &[String]) -> Value {
     json!({"signed": s, "relays": relays})
 }
 
-pub async fn listings(relays: &[String], pair: Option<&str>, local_contract: Option<Address>, now: u64) -> Result<Value, String> {
+/// `partial`: also offers that may be partly taken (the caller can take part of an offer)
+pub async fn listings(relays: &[String], pair: Option<&str>, partial: bool, local_contract: Option<Address>, now: u64) -> Result<Value, String> {
     let client = RelayClient::new(relays)?;
-    let (found, errors) = client.listings(pair, &rules(local_contract), now).await;
+    let (found, errors) = client.listings(pair, partial, &rules(local_contract), now).await;
     Ok(json!({"listings": found.iter().map(|(s, r)| listing_json(s, r)).collect::<Vec<_>>(), "relayErrors": errors}))
 }
 
@@ -218,12 +233,17 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
         return Err("an offer stays open for at most 24 hours".into());
     }
     let xmz_atoms: u64 = parse_amount(&params.xmz_atoms, "xmzAtoms")?.try_into().map_err(|_| "xmzAtoms is out of range")?;
+    let min_xmz: Option<u64> = match &params.min_xmz_atoms {
+        Some(m) => Some(parse_amount(m, "minXmzAtoms")?.try_into().map_err(|_| "minXmzAtoms is out of range")?),
+        None => None,
+    };
     let at = heights(cfg, chain_kind, None).await?;
     let mut id = [0u8; 32];
     OsRng.fill_bytes(&mut id);
     let id = B256::from(id);
     let listing = Listing {
-        schema: LISTING_SCHEMA.into(),
+        schema: if min_xmz.is_some() { PARTIAL_SCHEMA } else { LISTING_SCHEMA }.into(),
+        min_xmz,
         id,
         pair: chain_kind.pair().into(),
         chain_id: params.chain_id,
@@ -242,19 +262,56 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
     };
     listing.check(&rules, at.now).map_err(|e| e.to_string())?;
     check_chain(cfg, &listing, at.evm_from_block, &key, &[key.address()]).await?;
-    check_funds(listing.maker_role(), &listing, &key, cfg).await?;
+    check_funds(listing.maker_role(), &listing, listing.xmz, &key, cfg).await?;
     let signed = listing.sign(&key);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    write(&dir.join("listing.json"), &MakerFile { listing: signed.clone(), taken_by: None, answered: BTreeSet::new(), closed: false })?;
-    // On Solana the relays also want the maker's Solana trade account, signed (see `SolAccount`)
-    let account = chain_kind.is_solana().then(|| {
-        let account = B256::from(crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes());
-        crate::listing::SolAccount { schema: crate::listing::SOL_ACCOUNT_SCHEMA.into(), id: signed.listing.id, account }.sign(&key)
-    });
-    crate::helper::step("sending the offer to the relays");
-    let posted = client.post_listing(&signed, account.as_ref()).await;
+    write(&dir.join("listing.json"), &MakerFile::open(signed.clone()))?;
+    let posted = send_offer(&client, &signed, &key).await;
     mark_posted(dir, &posted);
     Ok(json!({"listing": signed, "posted": posted}))
+}
+
+impl MakerFile {
+    fn open(listing: SignedListing) -> Self {
+        MakerFile { listing, taken_by: None, answered: BTreeSet::new(), closed: false, taken_xmz: None, remainder: None }
+    }
+}
+
+/// Sends a signed offer of ours to the relays; on Solana with our signed Solana trade account
+/// (see `SolAccount`), which the relays want next to it
+async fn send_offer(client: &RelayClient, signed: &SignedListing, key: &PrivateKeySigner) -> Vec<Value> {
+    let account = Chain::from_id(signed.listing.chain_id).is_some_and(Chain::is_solana).then(|| {
+        let account = B256::from(crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes());
+        crate::listing::SolAccount { schema: crate::listing::SOL_ACCOUNT_SCHEMA.into(), id: signed.listing.id, account }.sign(key)
+    });
+    crate::helper::step("sending the offer to the relays");
+    client.post_listing(signed, account.as_ref()).await
+}
+
+/// After part of a partial offer was taken: what is left becomes a new offer of ours, at the
+/// same price, minimum and expiry, in a folder next to this one (the apps find it as they find
+/// every offer of ours). Its id and folder follow from this offer's id, so it is made once however
+/// often `serve` runs or stops part way; the new folder's own `serve` sends it again until a
+/// relay has it. None when nothing is left or the offer has expired.
+fn write_remainder(dir: &Path, file: &mut MakerFile, seed: &SwapSeed, key: &PrivateKeySigner, now: u64) -> Result<Option<(std::path::PathBuf, SignedListing)>, String> {
+    let l = &file.listing.listing;
+    let Some(taken) = file.taken_xmz.filter(|x| l.is_partial() && *x < l.xmz) else { return Ok(None) };
+    let id = keccak256([b"monzero-dex-rest/1".as_slice(), l.id.as_slice()].concat());
+    let name = format!("{}-rest-{}", dir.file_name().and_then(|n| n.to_str()).unwrap_or("offer"), hex::encode(&id[..4]));
+    let path = dir.parent().ok_or("the offer's folder has no parent")?.join(name);
+    if let Some(made) = read::<MakerFile>(&path.join("listing.json"))? {
+        return Ok(Some((path, made.listing)));
+    }
+    if now >= l.expires_at {
+        return Ok(None);
+    }
+    let Some(rest) = l.remainder(taken, id, seed.mailbox(id, true).address(), now) else { return Ok(None) };
+    let signed = rest.sign(key);
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    write(&path.join("listing.json"), &MakerFile::open(signed.clone()))?;
+    file.remainder = Some(path.clone());
+    write(&dir.join("listing.json"), file)?;
+    Ok(Some((path, signed)))
 }
 
 /// `posted` in the offer's folder once a relay has it. Until then `serve` sends the offer again,
@@ -268,11 +325,7 @@ fn mark_posted(dir: &Path, posted: &[Value]) {
 pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Value, String> {
     let mut file: MakerFile = read(&dir.join("listing.json"))?.ok_or("this folder holds no offer of ours")?;
     if journal_has_trade(dir) && file.taken_by.is_some() {
-        close_taken(dir, &mut file, cfg, relays).await;
-        let mut v = status(dir)?;
-        v["taken"] = json!(true);
-        v["takenBy"] = json!(file.taken_by);
-        return Ok(v);
+        return taken(dir, &mut file, cfg, relays, None, 0).await;
     }
     let client = RelayClient::new(relays)?;
     let (seed, key) = keys(cfg)?;
@@ -281,16 +334,11 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
     }
     let id = file.listing.listing.id;
     if !dir.join("posted").exists() && file.taken_by.is_none() && !file.closed {
-        crate::helper::step("sending the offer to the relays");
-        let account = chain_of_id(file.listing.listing.chain_id)?.is_solana().then(|| {
-            let account = B256::from(crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes());
-            crate::listing::SolAccount { schema: crate::listing::SOL_ACCOUNT_SCHEMA.into(), id, account }.sign(&key)
-        });
-        mark_posted(dir, &client.post_listing(&file.listing, account.as_ref()).await);
+        mark_posted(dir, &send_offer(&client, &file.listing, &key).await);
     }
     crate::helper::step("reading the offer's mail on the relays");
     let mailbox = seed.mailbox(id, true);
-    let mut maker = Maker::new(file.listing.clone(), file.taken_by);
+    let mut maker = Maker::new(file.listing.clone(), file.taken_by, file.taken_xmz);
     let mut at: Option<Heights> = None;
     let mut answered = 0;
     for (_, sealed) in client.mail(mailbox.address()).await {
@@ -315,6 +363,7 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
                 start_trade(dir, saved, &seed, &key, cfg)?;
             }
             file.taken_by = maker.taken_by;
+            file.taken_xmz = maker.taken_xmz;
         }
         file.answered.insert(digest);
         write(&dir.join("listing.json"), &file)?;
@@ -328,14 +377,39 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
         None => heights(cfg, chain_of_id(file.listing.listing.chain_id)?, None).await.map(|h| h.now).unwrap_or(0),
     };
     if file.taken_by.is_some() && journal_has_trade(dir) {
-        close_taken(dir, &mut file, cfg, relays).await;
-        let mut v = status(dir)?;
-        v["taken"] = json!(true);
-        v["takenBy"] = json!(file.taken_by);
-        v["answered"] = json!(answered);
-        return Ok(v);
+        return taken(dir, &mut file, cfg, relays, Some(now), answered).await;
     }
     Ok(json!({"taken": false, "answered": answered, "expired": now >= file.listing.listing.expires_at, "listing": file.listing}))
+}
+
+/// The answer for a taken offer: the trade's status, and for a partial offer the new offer for
+/// what was left (`remainder`: its folder and listing, sent to the relays here the first time)
+async fn taken(dir: &Path, file: &mut MakerFile, cfg: &TickConfig, relays: &[String], now: Option<u64>, answered: usize) -> Result<Value, String> {
+    close_taken(dir, file, cfg, relays).await;
+    let mut v = status(dir)?;
+    v["taken"] = json!(true);
+    v["takenBy"] = json!(file.taken_by);
+    v["answered"] = json!(answered);
+    if let Some(x) = file.taken_xmz {
+        v["takenXmz"] = json!(x.to_string());
+    }
+    if file.listing.listing.is_partial() && file.taken_xmz.is_some_and(|x| x < file.listing.listing.xmz) {
+        let fresh = file.remainder.is_none();
+        let now = match now {
+            Some(n) => n,
+            None if fresh => heights(cfg, chain_of_id(file.listing.listing.chain_id)?, None).await?.now,
+            None => u64::MAX,
+        };
+        let (seed, key) = keys(cfg)?;
+        if let Some((path, signed)) = write_remainder(dir, file, &seed, &key, now)? {
+            if fresh {
+                let posted = send_offer(&RelayClient::new(relays)?, &signed, &key).await;
+                mark_posted(&path, &posted);
+            }
+            v["remainder"] = json!({"folder": path, "listing": signed});
+        }
+    }
+    Ok(v)
 }
 
 /// A taken offer is no longer on offer: the maker closes it on the relays with a signed cancel,
@@ -358,7 +432,8 @@ async fn close_taken(dir: &Path, file: &mut MakerFile, cfg: &TickConfig, relays:
     }
 }
 
-pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Option<SignedListing>, local_contract: Option<Address>) -> Result<Value, String> {
+/// `xmz`: the XMZ (atoms) to take from a partial offer (first call only; None: all of it)
+pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Option<SignedListing>, xmz: Option<u64>, local_contract: Option<Address>) -> Result<Value, String> {
     if journal_has_trade(dir) {
         let mut v = status(dir)?;
         v["agreed"] = json!(true);
@@ -381,17 +456,23 @@ pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Opti
                 Role::Owner => Role::Claimer,
                 Role::Claimer => Role::Owner,
             };
+            if xmz.is_some() && !l.is_partial() || !l.fill_ok(xmz.unwrap_or(l.xmz)) {
+                return Err(match l.min_xmz {
+                    None => "this offer can only be taken whole".into(),
+                    Some(min) => format!("take at least {} XMZ and at most all {} XMZ, leaving none or at least {} XMZ", xmz_text(min), xmz_text(l.xmz), xmz_text(min)),
+                });
+            }
             check_chain(cfg, l, at.evm_from_block, &key, &[key.address(), l.maker]).await?;
-            check_funds(ours, l, &key, cfg).await?;
+            check_funds(ours, l, xmz.unwrap_or(l.xmz), &key, cfg).await?;
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            let f = TakerFile { listing: signed, evm_from_block: at.evm_from_block, sent_at: 0 };
+            let f = TakerFile { listing: signed, evm_from_block: at.evm_from_block, sent_at: 0, xmz };
             write(&path, &f)?;
             f
         }
     };
     let l = file.listing.listing.clone();
     let at = heights(cfg, chain_of_id(l.chain_id)?, Some(file.evm_from_block)).await?;
-    let (mut taker, letter) = Taker::start(&l, &seed, &key, at.now).map_err(|e| e.to_string())?;
+    let (mut taker, letter) = Taker::start(&l, file.xmz, &seed, &key, at.now).map_err(|e| e.to_string())?;
     // An answer first: it may already be waiting
     let mailbox = seed.mailbox(l.id, false);
     let mut refusal = None;
@@ -476,6 +557,12 @@ pub fn funds_in_use(root: &Path, now: u64) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// XMZ atoms as text in whole XMZ ("12.5")
+fn xmz_text(atoms: u64) -> String {
+    let (whole, part) = (atoms / 100_000_000_000, atoms % 100_000_000_000);
+    if part == 0 { whole.to_string() } else { format!("{whole}.{:011}", part).trim_end_matches('0').to_string() }
+}
+
 /// What a seller's trading wallet must hold unlocked for an offer: the amount, plus room for the
 /// lock transaction's fee (about 0.01 XMZ): 1%, and never less than 1 XMZ.
 pub fn xmz_needed(atoms: u64) -> u64 {
@@ -530,7 +617,7 @@ pub async fn report(dir: &Path, relays: &[String]) -> Result<Value, String> {
 #[cfg(test)]
 mod withdraw_tests {
     use super::*;
-    use crate::listing::{Listing, Side, LISTING_SCHEMA};
+    use crate::listing::{Listing, Side, LISTING_SCHEMA, PARTIAL_SCHEMA};
 
     const NOW: u64 = 1_794_300_000;
 
@@ -550,11 +637,12 @@ mod withdraw_tests {
             xmz_network: XmzNetwork::Mainnet,
             created_at: NOW - 60,
             expires_at,
+            min_xmz: None,
         }
         .sign(&key);
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let file = MakerFile { listing, taken_by: taken.then(|| Address::repeat_byte(9)), answered: BTreeSet::new(), closed: false };
+        let file = MakerFile { taken_by: taken.then(|| Address::repeat_byte(9)), ..MakerFile::open(listing) };
         write(&dir.join("listing.json"), &file).unwrap();
         dir
     }
@@ -580,6 +668,57 @@ mod withdraw_tests {
         // Taken but the trade is not written yet: the taker may be waiting for our lock
         offer_folder(&r, "offer-taken", NOW - 1, true);
         assert!(funds_in_use(&r, NOW).unwrap().is_some());
+        std::fs::remove_dir_all(&r).unwrap();
+    }
+
+    #[test]
+    fn the_rest_of_a_partly_taken_offer_is_one_new_offer_of_ours_however_often_it_is_made() {
+        let r = root("rest");
+        let seed = SwapSeed::from_bytes([3; 32]);
+        let key = PrivateKeySigner::random();
+        let xmz = 100_000_000_000u64;
+        let listing = Listing {
+            schema: PARTIAL_SCHEMA.into(),
+            id: B256::repeat_byte(7),
+            pair: "SOL/XMZ".into(),
+            chain_id: 501000101,
+            contract: Address::ZERO,
+            side: Side::SellXmz,
+            value: U256::from(10_000_000u64),
+            xmz: 1_500 * xmz,
+            maker: key.address(),
+            mailbox: seed.mailbox(B256::repeat_byte(7), true).address(),
+            xmz_network: XmzNetwork::Mainnet,
+            created_at: NOW - 60,
+            expires_at: NOW + 3600,
+            min_xmz: Some(100 * xmz),
+        }
+        .sign(&key);
+        let dir = r.join("offer-abc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut file = MakerFile { taken_by: Some(Address::repeat_byte(9)), taken_xmz: Some(400 * xmz), ..MakerFile::open(listing.clone()) };
+        write(&dir.join("listing.json"), &file).unwrap();
+        let (path, rest) = write_remainder(&dir, &mut file, &seed, &key, NOW).unwrap().unwrap();
+        assert_eq!(path.parent(), Some(r.as_path()), "next to the offer, where the apps look");
+        let l = &rest.listing;
+        assert_eq!((l.xmz, l.value), (1_100 * xmz, U256::from(10_000_000u64) - listing.listing.fill_value(400 * xmz)));
+        assert_eq!((l.min_xmz, l.expires_at, l.side, l.created_at), (Some(100 * xmz), NOW + 3600, Side::SellXmz, NOW));
+        assert_ne!(l.id, listing.listing.id);
+        assert_eq!(l.mailbox, seed.mailbox(l.id, true).address(), "takes of the rest reach us");
+        rest.verify(&{ let mut x = Rules::default(); x.contracts.insert(501000101, Address::ZERO); x }, NOW).unwrap();
+        // Made again (serve runs again, or stopped part way before recording it): the same offer
+        let mut again = MakerFile { remainder: None, ..read::<MakerFile>(&dir.join("listing.json")).unwrap().unwrap() };
+        let (path2, rest2) = write_remainder(&dir, &mut again, &seed, &key, NOW + 100).unwrap().unwrap();
+        assert_eq!((path2, rest2), (path.clone(), rest));
+        assert_eq!(std::fs::read_dir(&r).unwrap().count(), 2, "one offer and its one rest");
+        // The rest is an open offer of ours: the coin stays for it
+        let rest_file: MakerFile = read(&path.join("listing.json")).unwrap().unwrap();
+        assert!(rest_file.taken_by.is_none() && rest_file.remainder.is_none());
+        // Nothing left, or expired before it was made: no new offer
+        let mut all = MakerFile { taken_xmz: Some(1_500 * xmz), remainder: None, ..MakerFile::open(listing.clone()) };
+        assert!(write_remainder(&r.join("offer-all"), &mut all, &seed, &key, NOW).unwrap().is_none());
+        let mut late = MakerFile { taken_xmz: Some(400 * xmz), ..MakerFile::open(Listing { id: B256::repeat_byte(8), ..listing.listing.clone() }.sign(&key)) };
+        assert!(write_remainder(&r.join("offer-late"), &mut late, &seed, &key, NOW + 3600).unwrap().is_none());
         std::fs::remove_dir_all(&r).unwrap();
     }
 

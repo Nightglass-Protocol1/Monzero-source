@@ -3105,6 +3105,7 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
+ "rustls",
  "secp256kfun",
  "serde",
  "serde_json",
@@ -3112,6 +3113,7 @@ dependencies = [
  "sigma_fun",
  "thiserror 2.0.21",
  "tokio",
+ "webpki-roots",
  "x25519-dalek",
  "zeroize",
 ]

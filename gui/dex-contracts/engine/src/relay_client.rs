@@ -47,7 +47,7 @@ pub struct RelayClient {
 
 #[derive(Deserialize)]
 struct Listings {
-    listings: Vec<SignedListing>,
+    listings: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -111,17 +111,23 @@ impl RelayClient {
     }
 
     /// Open offers from every relay that answers, each checked; with the relays that carry it
-    pub async fn listings(&self, pair: Option<&str>, rules: &Rules, now: u64) -> (Vec<(SignedListing, Vec<String>)>, Vec<Value>) {
+    /// (`partial`: also offers that may be partly taken; relays leave them out otherwise, as apps
+    /// from before them cannot read them)
+    pub async fn listings(&self, pair: Option<&str>, partial: bool, rules: &Rules, now: u64) -> (Vec<(SignedListing, Vec<String>)>, Vec<Value>) {
         let mut found: BTreeMap<B256, (SignedListing, Vec<String>)> = BTreeMap::new();
         let mut errors = vec![];
         for r in &self.relays {
-            let url = match pair {
+            let mut url = match pair {
                 Some(p) => format!("{r}/v1/listings?pair={}", p.replace('/', "%2F")),
                 None => format!("{r}/v1/listings"),
             };
+            if partial {
+                url.push_str(if pair.is_some() { "&partial=1" } else { "?partial=1" });
+            }
             match self.get::<Listings>(&url).await {
                 Ok(l) => {
-                    for signed in l.listings.into_iter().take(5000) {
+                    // One by one: an offer of a kind we do not know is skipped, not the whole list
+                    for signed in l.listings.into_iter().take(5000).filter_map(|v| serde_json::from_value::<SignedListing>(v).ok()) {
                         if signed.verify(rules, now).is_err() || pair.is_some_and(|p| signed.listing.pair != p) {
                             continue;
                         }

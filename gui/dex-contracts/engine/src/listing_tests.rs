@@ -28,6 +28,7 @@ fn listing(maker: &PrivateKeySigner) -> Listing {
         xmz_network: XmzNetwork::Mainnet,
         created_at: NOW,
         expires_at: NOW + 3600,
+        min_xmz: None,
     }
 }
 
@@ -82,7 +83,8 @@ fn listings_outside_the_rules_are_refused() {
     assert_eq!(check(Listing { expires_at: NOW + MAX_LIFETIME + 1, ..base.clone() }), Err(ListingError::Time));
     assert_eq!(check(Listing { mailbox: B256::ZERO, ..base.clone() }), Err(ListingError::Mailbox));
     assert_eq!(check(Listing { id: B256::ZERO, ..base.clone() }), Err(ListingError::Id));
-    assert_eq!(check(Listing { schema: "monzero-dex-listing/2".into(), ..base.clone() }), Err(ListingError::Schema));
+    assert_eq!(check(Listing { schema: "monzero-dex-listing/3".into(), ..base.clone() }), Err(ListingError::Schema));
+    assert_eq!(check(Listing { schema: PARTIAL_SCHEMA.into(), ..base.clone() }), Err(ListingError::Schema), "a /2 listing names its minimum");
 }
 
 #[test]
@@ -117,4 +119,37 @@ fn only_the_maker_can_cancel() {
     assert_eq!(cancel.clone().sign(&key).verify(), Ok(()));
     let other = PrivateKeySigner::random();
     assert_eq!(cancel.sign(&other).verify(), Err(ListingError::BadSignature));
+}
+
+fn partial(maker: &PrivateKeySigner) -> Listing {
+    Listing { schema: PARTIAL_SCHEMA.into(), min_xmz: Some(100 * MIN_FILL_FLOOR), ..listing(maker) }
+}
+
+#[test]
+fn a_partial_listing_verifies_and_a_whole_one_keeps_its_bytes() {
+    let key = PrivateKeySigner::random();
+    let signed = partial(&key).sign(&key);
+    assert_eq!(signed.verify(&rules(), NOW + 10), Ok(Chain::EthMainnet));
+    let json = serde_json::to_string(&signed).unwrap();
+    assert!(json.contains(r#""minXmz":"10000000000000""#), "{json}");
+    assert_eq!(serde_json::from_str::<SignedListing>(&json).unwrap(), signed);
+    // A whole offer has no minXmz field at all: its signed form is as before partial offers
+    let whole = serde_json::to_string(&listing(&key).sign(&key)).unwrap();
+    assert!(!whole.contains("minXmz"), "{whole}");
+    // The schema is part of what is signed: a partial offer relabelled is not the maker's
+    let mut relabelled = signed.clone();
+    relabelled.listing.min_xmz = Some(MIN_FILL_FLOOR);
+    assert_eq!(relabelled.verify(&rules(), NOW + 10), Err(ListingError::BadSignature));
+}
+
+#[test]
+fn a_partial_listing_needs_its_schema_and_a_sane_minimum() {
+    let key = PrivateKeySigner::random();
+    let check = |l: Listing| l.check(&rules(), NOW + 10);
+    let base = partial(&key);
+    assert_eq!(check(Listing { schema: LISTING_SCHEMA.into(), ..base.clone() }), Err(ListingError::Schema));
+    assert_eq!(check(Listing { min_xmz: None, ..base.clone() }), Err(ListingError::Schema));
+    assert_eq!(check(Listing { min_xmz: Some(MIN_FILL_FLOOR - 1), ..base.clone() }), Err(ListingError::Minimum));
+    assert_eq!(check(Listing { min_xmz: Some(base.xmz + 1), ..base.clone() }), Err(ListingError::Minimum));
+    assert!(check(Listing { min_xmz: Some(base.xmz), ..base.clone() }).is_ok(), "a minimum of all of it is a whole offer in effect");
 }

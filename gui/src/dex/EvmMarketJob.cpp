@@ -191,27 +191,31 @@ bool EvmMarketJob::requestAccounts(QByteArray &walletSeed) {
 
 bool EvmMarketJob::refreshListings(const QString &pair) {
     if (pair!="ETH/XMZ" && pair!="BNB/XMZ" && pair!="SOL/XMZ") return false;
-    auto r=base("listings",{});r.insert("pair",pair);
+    // Partial offers too: this wallet can take part of one
+    auto r=base("listings",{});r.insert("pair",pair);r.insert("partial",true);
     return run(r,{});
 }
 
-bool EvmMarketJob::post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,qint64 lifetimeSecs) {
+bool EvmMarketJob::post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,const QString &minXmzAtoms,qint64 lifetimeSecs) {
     if (m_busy || m_path.isEmpty() || chainId!=qint64(m_config.value("chainId").toDouble()) || (side!="sell-xmz" && side!="buy-xmz") || !Digits.match(valueWei).hasMatch()
-        || !Digits.match(xmzAtoms).hasMatch() || lifetimeSecs<=0 || lifetimeSecs>86400) {walletSeed.fill('\0');walletSeed.clear();return false;}
+        || !Digits.match(xmzAtoms).hasMatch() || lifetimeSecs<=0 || lifetimeSecs>86400 || (!minXmzAtoms.isEmpty() && !Digits.match(minXmzAtoms).hasMatch())) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
     const auto folder=m_tradesDir+"/offer-"+QString::number(QRandomGenerator::system()->generate64(),16);
     auto r=base("post",folder);r.insert("tick",t);
-    r.insert("offer",QJsonObject{{"chainId",chainId},{"side",side},{"valueWei",valueWei},{"xmzAtoms",xmzAtoms},{"lifetimeSecs",lifetimeSecs}});
+    QJsonObject offer{{"chainId",chainId},{"side",side},{"valueWei",valueWei},{"xmzAtoms",xmzAtoms},{"lifetimeSecs",lifetimeSecs}};
+    if (!minXmzAtoms.isEmpty()) offer.insert("minXmzAtoms",minXmzAtoms);
+    r.insert("offer",offer);
     return run(r,folder);
 }
 
-bool EvmMarketJob::take(QByteArray &walletSeed,const QString &listingId) {
+bool EvmMarketJob::take(QByteArray &walletSeed,const QString &listingId,const QString &xmzAtoms) {
     const auto signedListing=m_signed.value(listingId);
-    if (m_busy || m_path.isEmpty() || signedListing.isEmpty()) {walletSeed.fill('\0');walletSeed.clear();return false;}
+    if (m_busy || m_path.isEmpty() || signedListing.isEmpty() || (!xmzAtoms.isEmpty() && !Digits.match(xmzAtoms).hasMatch())) {walletSeed.fill('\0');walletSeed.clear();return false;}
     for (const auto &f:m_folders) if (f.listingId==listingId) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
     const auto folder=m_tradesDir+"/take-"+listingId.mid(2,16);
     auto r=base("take",folder);r.insert("tick",t);r.insert("listing",signedListing);
+    if (!xmzAtoms.isEmpty()) r.insert("xmzAtoms",xmzAtoms);
     return run(r,folder);
 }
 
@@ -296,16 +300,22 @@ void EvmMarketJob::finish(bool success) {
             if (wei.isEmpty()) continue;
             const auto id=l.value("id").toString();
             m_signed.insert(id,s);
-            m_listings.append(QVariantMap{{"id",id},{"pair",l.value("pair")},{"side",l.value("side")},{"chainId",l.value("chainId").toDouble()},
+            QVariantMap shown{{"id",id},{"pair",l.value("pair")},{"side",l.value("side")},{"chainId",l.value("chainId").toDouble()},
                 {"maker",l.value("maker")},{"valueWei",wei},{"xmzAtoms",l.value("xmz")},{"coin",weiToCoin(wei,places)},
                 {"xmz",units(l.value("xmz").toString(),11)},{"price",priceText(wei,l.value("xmz").toString(),places)},
-                {"expiresAt",l.value("expiresAt").toDouble()},{"relays",entry.value("relays").toArray().size()}});
+                {"expiresAt",l.value("expiresAt").toDouble()},{"relays",entry.value("relays").toArray().size()}};
+            // A partial offer: any amount from its minimum may be taken
+            if (Digits.match(l.value("minXmz").toString()).hasMatch()) {shown.insert("minXmzAtoms",l.value("minXmz").toString());shown.insert("minXmz",units(l.value("minXmz").toString(),11));}
+            m_listings.append(shown);
         }
     } else if (m_command=="post") {
         scanFolders();
     } else if (m_command=="serve" || m_command=="take") {
         // A first take creates its folder: track it, so later steps collect the maker's answer
         if (m_command=="take" && std::none_of(m_folders.cbegin(),m_folders.cend(),[this](const Folder &f){return f.path==m_folder;})) scanFolders();
+        // Part of a partial offer of ours was taken: the rest is a new offer in its own folder
+        const auto rest=r.value("remainder").toObject().value("folder").toString();
+        if (!rest.isEmpty() && std::none_of(m_folders.cbegin(),m_folders.cend(),[&rest](const Folder &f){return f.path==rest;})) scanFolders();
         const bool done=r.value("taken").toBool() || r.value("agreed").toBool();
         for (auto &f:m_folders) if (f.path==m_folder) {
             if (done) f.state="agreed";

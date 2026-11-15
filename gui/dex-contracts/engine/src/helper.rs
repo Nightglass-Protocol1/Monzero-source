@@ -57,6 +57,12 @@ pub struct Request {
     /// `take`: the offer to take, as `listings` returned it (first call only)
     #[serde(default)]
     pub listing: Option<crate::listing::SignedListing>,
+    /// `take` of a partial offer: the XMZ to take, in atoms (decimal; first call only). Absent: all.
+    #[serde(default)]
+    pub xmz_atoms: Option<String>,
+    /// `listings`: include partial offers (apps that can take part of an offer ask for them)
+    #[serde(default)]
+    pub partial: bool,
     /// The contract on a local test chain (31337) only; real chains use the pinned ones
     #[serde(default)]
     pub local_contract: Option<alloy::primitives::Address>,
@@ -195,7 +201,11 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         },
         Command::Serve => crate::helper_market::serve(&r.trade_dir, r.tick.as_ref().ok_or("serve needs tick")?, relays(&r)?).await,
         Command::Take => {
-            crate::helper_market::take(&r.trade_dir, r.tick.as_ref().ok_or("take needs tick")?, relays(&r)?, r.listing.clone(), r.local_contract).await
+            let xmz = match &r.xmz_atoms {
+                Some(t) => Some(t.trim().parse::<u64>().ok().filter(|x| *x > 0 && t.trim().bytes().all(|b| b.is_ascii_digit())).ok_or("xmzAtoms must be a whole number of atoms above zero")?),
+                None => None,
+            };
+            crate::helper_market::take(&r.trade_dir, r.tick.as_ref().ok_or("take needs tick")?, relays(&r)?, r.listing.clone(), xmz, r.local_contract).await
         }
         Command::Cancel => crate::helper_market::cancel(&r.trade_dir, r.tick.as_ref().ok_or("cancel needs tick")?, relays(&r)?).await,
         Command::Report => crate::helper_market::report(&r.trade_dir, relays(&r)?).await,
@@ -214,7 +224,7 @@ fn relays(r: &Request) -> Result<&[String], String> {
 
 async fn market_listings(r: &Request) -> Result<Value, String> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    crate::helper_market::listings(relays(r)?, r.pair.as_deref(), r.local_contract, now).await
+    crate::helper_market::listings(relays(r)?, r.pair.as_deref(), r.partial, r.local_contract, now).await
 }
 
 fn journal(dir: &Path) -> FileJournal {

@@ -84,6 +84,8 @@ fn limited() -> Failure {
 struct PairQuery {
     pair: Option<String>,
     since: Option<u64>,
+    /// `listings`: "1" to include offers that may be partly taken
+    partial: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,7 +154,8 @@ async fn info<C: ChainView>(State(api): State<Arc<Api<C>>>) -> Json<Value> {
 }
 
 async fn listings<C: ChainView>(State(api): State<Arc<Api<C>>>, Query(q): Query<PairQuery>) -> Json<Value> {
-    Json(json!({ "listings": api.relay.listings(q.pair.as_deref(), now()) }))
+    let partial = q.partial.as_deref().is_some_and(|p| p == "1" || p == "true");
+    Json(json!({ "listings": api.relay.listings(q.pair.as_deref(), partial, now()) }))
 }
 
 async fn listing<C: ChainView>(State(api): State<Arc<Api<C>>>, Path(id): Path<B256>) -> Result<Json<SignedListing>, Failure> {

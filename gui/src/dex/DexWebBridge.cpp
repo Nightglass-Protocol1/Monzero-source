@@ -109,13 +109,14 @@ void DexWebBridge::disconnectPage() {
 bool DexWebBridge::call(const char *method,const QVariantList &args) const {
     if (!m_engine) return false;
     bool result=false;
-    QGenericArgument a[5];
-    QList<QString> strings;QList<int> ints;strings.reserve(5);ints.reserve(5);
-    for (int i=0;i<args.size() && i<5;++i) {
+    QGenericArgument a[6];
+    // Reserved up front: the arguments point into these lists
+    QList<QString> strings;QList<int> ints;strings.reserve(6);ints.reserve(6);
+    for (int i=0;i<args.size() && i<6;++i) {
         if (args[i].type()==QVariant::Int) {ints.append(args[i].toInt());a[i]=Q_ARG(int,ints.last());}
         else {strings.append(args[i].toString());a[i]=Q_ARG(QString,strings.last());}
     }
-    return QMetaObject::invokeMethod(m_engine,method,Qt::DirectConnection,Q_RETURN_ARG(bool,result),a[0],a[1],a[2],a[3],a[4]) && result;
+    return QMetaObject::invokeMethod(m_engine,method,Qt::DirectConnection,Q_RETURN_ARG(bool,result),a[0],a[1],a[2],a[3],a[4],a[5]) && result;
 }
 
 QVariantMap DexWebBridge::statusFor() const {
@@ -128,7 +129,9 @@ QVariantMap DexWebBridge::statusFor() const {
     auto tradeOut=pick(trade,{"configured","busy","state","tradeId","commitment","awaitingApproval","awaitingFunding","startRefusal","error","payout","account","solAccount"});
     tradeOut.insert("snapshot",pick(trade.value("snapshot").toMap(),{"stage","role","done","offer","evmTxs","xmzSweeps","approved","progress","deadlines"}));
     return {{"wallet",pick(wallet,{"state","balance","unlocked","address","keysReady","keysExist","keysBusy","tradeAccount","solTradeAccount","error"})},
-        {"markets",marketOut},{"trade",tradeOut},{"account",m_account},{"solAccount",m_solAccount}};
+        {"markets",marketOut},{"trade",tradeOut},{"account",m_account},{"solAccount",m_solAccount},
+        // What this wallet can do beyond the first page protocol: the page offers only these
+        {"features",QStringList{"partial"}}};
 }
 
 void DexWebBridge::watchTrade() {
@@ -209,13 +212,13 @@ QByteArray DexWebBridge::respond(const Request &r,int *status) {
         const int chainId=body.value("chainId").toInt(),hours=body.value("hours").toInt(6);
         const auto side=body.value("side").toString();
         if (side!="buy-xmz" && side!="sell-xmz") return fail(400,"side");
-        const bool ok=call("postEvmOffer",{chainId,side,body.value("coin").toString(),body.value("xmz").toString(),hours});
+        const bool ok=call("postEvmOffer",{chainId,side,body.value("coin").toString(),body.value("xmz").toString(),hours,body.value("minXmz").toString()});
         return json({{"ok",ok},{"message",message(coinOf(chainId))}});
     }
     if (r.path=="/v1/take") {
         const auto id=body.value("id").toString();
         if (!QRegularExpression("\\A0x[0-9a-fA-F]{64}\\z").match(id).hasMatch()) return fail(400,"id");
-        const bool ok=call("takeEvmOffer",{id});
+        const bool ok=call("takeEvmOffer",{id,body.value("xmz").toString()});
         return json({{"ok",ok},{"message",ok ? QString() : message("ETH")}});   // the engine's message is one for all coins
     }
     if (r.path=="/v1/cancel") return json({{"ok",call("cancelEvmOffer",{body.value("folder").toString()})}});

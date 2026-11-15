@@ -19,8 +19,10 @@ public:
     // Private config (0600): monzero-private-xmz-evm-market-v1
     bool configure(const QString &path);
     bool refreshListings(const QString &pair);
-    bool post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,qint64 lifetimeSecs);
-    bool take(QByteArray &walletSeed,const QString &listingId);
+    // minXmzAtoms: empty for a whole offer, else the least one take may be (a partial offer)
+    bool post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,const QString &minXmzAtoms,qint64 lifetimeSecs);
+    // xmzAtoms: empty to take all of it, else how much of a partial offer
+    bool take(QByteArray &walletSeed,const QString &listingId,const QString &xmzAtoms=QString());
     bool cancel(QByteArray &walletSeed,const QString &folder);
     bool report(const QString &folder);
     // Send the trade account's unused coin to the user's own wallet; the helper refuses while a

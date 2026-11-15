@@ -2877,11 +2877,17 @@ Later addresses may be missing from this backup. Payment and active swap recover
                         text: (modelData.side === "sell-xmz" ? qsTr("Sells %1 XMZ for %2 %3") : qsTr("Buys %1 XMZ for %2 %3")).arg(modelData.xmz).arg(modelData.coin).arg(offerBoard.coin)
                             + "  ·  " + qsTr("%1 %2 per XMZ").arg(modelData.price).arg(offerBoard.coin)
                             + "  ·  " + qsTr("%1 h left").arg(offerBoard.hoursLeft(modelData.expiresAt))
+                            + (modelData.minXmz ? "  ·  " + qsTr("any part from %1 XMZ").arg(modelData.minXmz) : "")
+                    }
+                    // A partial offer: the XMZ to take (empty: all of it)
+                    M.LineEdit {
+                        id: takePart; visible: !!modelData.minXmz; Layout.preferredWidth: 110
+                        placeholderText: qsTr("all")
                     }
                     M.StandardButton {
                         text: modelData.side === "sell-xmz" ? qsTr("Buy this XMZ") : qsTr("Sell XMZ here")
                         enabled: root.evmMarket.busy !== true
-                        onClicked: root.evmMarketError = root.dex.takeEvmOffer(modelData.id) ? "" : (root.evmMarket.message || qsTr("The offer could not be taken now."))
+                        onClicked: root.evmMarketError = root.dex.takeEvmOffer(modelData.id, takePart.visible ? takePart.text : "") ? "" : (root.evmMarket.message || qsTr("The offer could not be taken now."))
                     }
                 }
             }
@@ -2899,11 +2905,13 @@ Later addresses may be missing from this backup. Payment and active swap recover
                 M.LineEdit { id: offerXmz; Layout.fillWidth: true; placeholderText: qsTr("XMZ amount") }
                 M.LineEdit { id: offerCoin; Layout.fillWidth: true; placeholderText: qsTr("%1 amount").arg(offerBoard.coin) }
                 M.LineEdit { id: offerHours; Layout.preferredWidth: 80; text: "6"; placeholderText: qsTr("hours") }
+                // Optional: with a smallest part, others may take any amount from it; the rest stays on offer
+                M.LineEdit { id: offerMin; Layout.preferredWidth: 150; placeholderText: qsTr("smallest part (optional)") }
                 M.StandardButton {
                     objectName: "evmOfferPost"; text: qsTr("Post")
                     enabled: root.evmMarket.busy !== true && offerXmz.text !== "" && offerCoin.text !== ""
                     onClicked: root.evmMarketError = root.dex.postEvmOffer(root.evmMarket.chainId, offerSide.sell ? "sell-xmz" : "buy-xmz",
-                        offerCoin.text, offerXmz.text, parseInt(offerHours.text) || 0) ? "" : (root.evmMarket.message || qsTr("The offer could not be posted now."))
+                        offerCoin.text, offerXmz.text, parseInt(offerHours.text) || 0, offerMin.text) ? "" : (root.evmMarket.message || qsTr("The offer could not be posted now."))
                 }
             }
             Repeater {

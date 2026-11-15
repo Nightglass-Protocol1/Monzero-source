@@ -5,6 +5,10 @@
 //! nonce ties a claim to the listing), and timeouts are fixed per chain. A listing is filled
 //! once: the maker answers only the first taker whose frame passes every check, and answers
 //! that taker again after a restart (frames are the same bytes from the swap seed).
+//!
+//! A partial listing (`minXmz`) is still taken once, but for the amount the taker names; the
+//! coin follows at the listing's price ([`Listing::fill_value`]). The maker then offers what is
+//! left as a new listing (`helper_market::serve`), so every fill keeps its own trade id.
 
 use crate::exchange::{ExchangeError, SavedTrade, Session};
 use crate::listing::{Listing, SignedListing};
@@ -36,8 +40,8 @@ pub fn lock_wait(chain: Chain) -> u64 {
     }
 }
 
-/// The trade a listing becomes when `taker` takes it
-pub fn offer_for(listing: &Listing, taker: Address) -> Offer {
+/// The trade a listing becomes when `taker` takes `xmz` atoms of it (all of it for a whole offer)
+pub fn offer_for(listing: &Listing, taker: Address, xmz: u64) -> Offer {
     let (owner, claimer) = match listing.maker_role() {
         Role::Claimer => (taker, listing.maker),
         Role::Owner => (listing.maker, taker),
@@ -49,10 +53,10 @@ pub fn offer_for(listing: &Listing, taker: Address) -> Offer {
         owner,
         claimer,
         asset: Address::ZERO,
-        value: listing.value,
+        value: listing.fill_value(xmz),
         duration1: DURATION,
         duration2: DURATION,
-        xmz_amount: listing.xmz,
+        xmz_amount: xmz,
         xmz_network: listing.xmz_network,
         expires_at: listing.expires_at,
     }
@@ -75,11 +79,13 @@ pub struct Maker {
     pub listing: SignedListing,
     /// The taker this listing went to, once one was answered
     pub taken_by: Option<Address>,
+    /// The XMZ (atoms) that taker took
+    pub taken_xmz: Option<u64>,
 }
 
 impl Maker {
-    pub fn new(listing: SignedListing, taken_by: Option<Address>) -> Self {
-        Maker { listing, taken_by }
+    pub fn new(listing: SignedListing, taken_by: Option<Address>, taken_xmz: Option<u64>) -> Self {
+        Maker { listing, taken_by, taken_xmz }
     }
 
     /// Answers a take: our frame once the taker's passes, else a refusal. The saved trade comes
@@ -93,14 +99,19 @@ impl Maker {
         if take.taker == l.maker || take.taker == Address::ZERO {
             return refuse("the taker must be another account");
         }
-        if self.taken_by.is_some_and(|t| t != take.taker) {
+        // A whole offer is taken whole; a partial one for any amount its rules allow
+        let xmz = take.xmz.unwrap_or(l.xmz);
+        if take.xmz.is_some() && !l.is_partial() || !l.fill_ok(xmz) {
+            return refuse("this amount cannot be taken from this offer");
+        }
+        if self.taken_by.is_some_and(|t| t != take.taker) || self.taken_xmz.is_some_and(|x| x != xmz) {
             return refuse("this offer was already taken");
         }
         if at.now >= l.expires_at {
             return refuse("this offer has expired");
         }
         let Ok(chain) = chain_of(l) else { return refuse("unknown chain") };
-        let mut session = match Session::start(seed, offer_for(l, take.taker), l.maker_role(), key, at.now) {
+        let mut session = match Session::start(seed, offer_for(l, take.taker, xmz), l.maker_role(), key, at.now) {
             Ok(s) => s,
             Err(e) => return refuse(&e.to_string()),
         };
@@ -111,6 +122,7 @@ impl Maker {
         };
         if saved.is_some() {
             self.taken_by = Some(take.taker);
+            self.taken_xmz = Some(xmz);
         }
         (Answer { listing: l.id, response }, saved)
     }
@@ -123,13 +135,20 @@ pub struct Taker {
 }
 
 impl Taker {
-    pub fn start(listing: &Listing, seed: &SwapSeed, key: &PrivateKeySigner, now: u64) -> Result<(Taker, Take), ExchangeError> {
+    /// Our take of `xmz` atoms (None: all of it, the only choice on a whole offer)
+    pub fn start(listing: &Listing, xmz: Option<u64>, seed: &SwapSeed, key: &PrivateKeySigner, now: u64) -> Result<(Taker, Take), ExchangeError> {
         let role = match listing.maker_role() {
             Role::Owner => Role::Claimer,
             Role::Claimer => Role::Owner,
         };
-        let session = Session::start(seed, offer_for(listing, key.address()), role, key, now)?;
-        let take = Take { listing: listing.id, taker: key.address(), reply_to: seed.mailbox(listing.id, false).address(), request: session.request() };
+        let amount = xmz.unwrap_or(listing.xmz);
+        if xmz.is_some() && !listing.is_partial() || !listing.fill_ok(amount) {
+            return Err(ExchangeError::Refused("this amount cannot be taken from this offer".into()));
+        }
+        // All of a partial offer is sent as an amount too: the maker then knows we chose it
+        let xmz = listing.is_partial().then_some(amount);
+        let session = Session::start(seed, offer_for(listing, key.address(), amount), role, key, now)?;
+        let take = Take { listing: listing.id, taker: key.address(), reply_to: seed.mailbox(listing.id, false).address(), request: session.request(), xmz };
         Ok((Taker { session, listing: listing.clone() }, take))
     }
 

@@ -430,6 +430,15 @@ private slots:
         QCOMPARE(EvmMarketJob::priceText("5000000000000000","1119300000000000"),QString("0.000000446708"));
         QCOMPARE(EvmMarketJob::priceText("5000000000000000","10000000000000"),QString("0.00005"));
         QVERIFY(EvmMarketJob::priceText("0","1").isEmpty());
+        // A part of a partial offer costs its share at the offer's price, rounded for the maker
+        const QVariantMap part{{"xmzAtoms","100000000000000"},{"valueWei","1000000007"},{"side","sell-xmz"},{"minXmzAtoms","10000000000000"}};
+        QCOMPARE(DexEngine::evmPartValue(part,"33300000000000"),QString("333000003"));
+        auto buying=part;buying.insert("side","buy-xmz");
+        QCOMPARE(DexEngine::evmPartValue(buying,"33300000000000"),QString("333000002"));
+        QCOMPARE(DexEngine::evmPartValue(part,"100000000000000"),QString("1000000007"));
+        for (const auto &bad:{"9900000000000","95000000000000","100000000000001"}) QVERIFY2(DexEngine::evmPartValue(part,bad).isEmpty(),bad);
+        auto whole=part;whole.remove("minXmzAtoms");
+        QVERIFY(DexEngine::evmPartValue(whole,"50000000000000").isEmpty());
     }
     void evmNetworkControlDocument() {
         QVERIFY(sodium_init()>=0);

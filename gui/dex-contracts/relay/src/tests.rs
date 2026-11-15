@@ -59,8 +59,17 @@ fn offer(maker: &PrivateKeySigner, id: u8, side: Side, value: u64, xmz_coins: u6
         xmz_network: XmzNetwork::Mainnet,
         created_at: NOW,
         expires_at: NOW + 3600,
+        min_xmz: None,
     }
     .sign(maker)
+}
+
+/// As `offer`, partly takeable from `min_coins` XMZ
+fn partial_offer(maker: &PrivateKeySigner, id: u8, side: Side, value: u64, xmz_coins: u64, min_coins: u64) -> SignedListing {
+    let mut l = offer(maker, id, side, value, xmz_coins).listing;
+    l.schema = monzero_dex_evm::listing::PARTIAL_SCHEMA.into();
+    l.min_xmz = Some(min_coins * 100_000_000_000);
+    l.sign(maker)
 }
 
 fn swap_for(l: &Listing, taker: Address) -> Swap {
@@ -91,16 +100,16 @@ async fn offers_are_listed_cheapest_first_and_cancelled_only_by_their_maker() {
     assert_eq!(r.post(offer(&a, 1, Side::SellXmz, ETH / 100, 10_000), NOW).await, Ok(true));
     assert_eq!(r.post(offer(&b, 2, Side::BuyXmz, ETH / 250, 5_000), NOW).await, Ok(true));
     assert_eq!(r.post(offer(&a, 1, Side::SellXmz, ETH / 100, 10_000), NOW).await, Ok(false), "the same offer again");
-    let ids: Vec<_> = r.listings(Some("ETH/XMZ"), NOW).iter().map(|o| o.listing.id).collect();
+    let ids: Vec<_> = r.listings(Some("ETH/XMZ"), true, NOW).iter().map(|o| o.listing.id).collect();
     assert_eq!(ids, [B256::repeat_byte(2), B256::repeat_byte(1)]);
-    assert!(r.listings(Some("BNB/XMZ"), NOW).is_empty());
-    assert!(r.listings(None, NOW + 3600).is_empty(), "expired offers are not shown");
+    assert!(r.listings(Some("BNB/XMZ"), true, NOW).is_empty());
+    assert!(r.listings(None, true, NOW + 3600).is_empty(), "expired offers are not shown");
 
     let by_b = Cancel { schema: CANCEL_SCHEMA.into(), id: B256::repeat_byte(1), maker: b.address(), at: NOW }.sign(&b);
     assert_eq!(r.cancel(&by_b, NOW), Err(RelayError::NotFound));
     let by_a = Cancel { schema: CANCEL_SCHEMA.into(), id: B256::repeat_byte(1), maker: a.address(), at: NOW }.sign(&a);
     assert_eq!(r.cancel(&by_a, NOW), Ok(()));
-    assert_eq!(r.listings(None, NOW).len(), 1);
+    assert_eq!(r.listings(None, true, NOW).len(), 1);
     assert_eq!(r.post(offer(&a, 1, Side::SellXmz, ETH / 100, 10_000), NOW).await, Err(RelayError::Closed), "a cancelled offer cannot come back");
 }
 
@@ -140,7 +149,7 @@ async fn a_claim_on_chain_becomes_a_print_and_fills_the_offer() {
     assert_eq!(prints.len(), 1);
     assert_eq!((prints[0].at, prints[0].xmz, prints[0].listing), (at, 11_193 * 100_000_000_000, B256::repeat_byte(5)));
     assert!((prints[0].price() - 0.005 / 11_193.0).abs() < 1e-15);
-    assert!(r.listings(None, NOW).is_empty(), "filled offers close");
+    assert!(r.listings(None, true, NOW).is_empty(), "filled offers close");
     assert_eq!(r.report(1, tx.clone(), NOW).await, Ok(PrintStatus::Recorded), "reporting twice is harmless");
     assert_eq!(r.prints(None, 0).len(), 1);
     assert_eq!(r.post(signed, NOW).await, Err(RelayError::Closed));
@@ -170,7 +179,7 @@ async fn claims_that_do_not_match_an_offer_are_refused() {
     assert_eq!(r.report(1, tx.clone(), NOW).await, Err(RelayError::NotAClaim("reverted".into())));
     assert_eq!(r.report(56, tx.clone(), NOW).await, Err(RelayError::Chain(56)));
     assert!(r.prints(None, 0).is_empty());
-    assert_eq!(r.listings(None, NOW).len(), 1, "the offer stays open");
+    assert_eq!(r.listings(None, true, NOW).len(), 1, "the offer stays open");
 }
 
 #[tokio::test]
@@ -181,7 +190,7 @@ async fn trades_still_match_after_their_offer_expired() {
     let signed = offer(&maker, 8, Side::SellXmz, ETH / 100, 10_000);
     r.post(signed.clone(), NOW).await.unwrap();
     r.prune(NOW + 4000);
-    assert!(r.listings(None, NOW + 4000).is_empty());
+    assert!(r.listings(None, true, NOW + 4000).is_empty());
     let tx: TxId = B256::repeat_byte(0x88).into();
     r.chains[&1].claims.lock().unwrap().insert(tx.clone(), ClaimLookup::Final { swap: swap_for(&signed.listing, taker.address()), at: NOW + 5000 });
     assert_eq!(r.report(1, tx.clone(), NOW + 5000).await, Ok(PrintStatus::Recorded));
@@ -232,7 +241,7 @@ async fn state_survives_a_restart() {
     let json = serde_json::to_vec(&r.snapshot()).unwrap();
     let back = relay();
     back.restore(serde_json::from_slice(&json).unwrap());
-    assert_eq!(back.listings(None, NOW), vec![open]);
+    assert_eq!(back.listings(None, true, NOW), vec![open]);
     assert_eq!(back.prints(None, 0), r.prints(None, 0));
     assert_eq!(back.post(filled, NOW).await, Err(RelayError::Closed));
     // A tampered saved offer is dropped on load
@@ -240,7 +249,7 @@ async fn state_survives_a_restart() {
     snap.active[0].listing.xmz += 1;
     let tampered = relay();
     tampered.restore(snap);
-    assert!(tampered.listings(None, NOW).is_empty());
+    assert!(tampered.listings(None, true, NOW).is_empty());
 }
 
 #[test]
@@ -338,7 +347,7 @@ async fn a_solana_claim_is_a_trade_only_with_the_makers_account_on_the_makers_si
         r.chains[&SOL_CHAIN].claims.lock().unwrap().insert(tx.clone(), wrong);
         assert_eq!(r.report(SOL_CHAIN, tx, NOW).await, Err(RelayError::UnknownListing), "case {i}");
     }
-    assert_eq!(r.listings(None, NOW).len(), 1);
+    assert_eq!(r.listings(None, true, NOW).len(), 1);
     assert_eq!(r.report(SOL_CHAIN, B256::repeat_byte(1).into(), NOW).await, Ok(PrintStatus::Pending), "the mock knows no such claim");
     let tx = sol_tx(0x55);
     r.chains[&SOL_CHAIN].claims.lock().unwrap().insert(tx.clone(), claim(theirs, mine, 50_000_000, nonce));
@@ -347,7 +356,7 @@ async fn a_solana_claim_is_a_trade_only_with_the_makers_account_on_the_makers_si
     assert_eq!((prints.len(), &prints[0].tx, prints[0].value), (1, &tx, U256::from(50_000_000u64)));
     // 0.05 SOL for 20 XMZ, in SOL per XMZ (lamports have 9 places)
     assert!((prints[0].price() - 0.0025).abs() < 1e-12, "{}", prints[0].price());
-    assert!(r.listings(None, NOW).is_empty(), "filled");
+    assert!(r.listings(None, true, NOW).is_empty(), "filled");
     // The same swap made and claimed again is not a second trade
     let again = sol_tx(0x56);
     r.chains[&SOL_CHAIN].claims.lock().unwrap().insert(again.clone(), claim(theirs, mine, 50_000_000, nonce));
@@ -356,4 +365,37 @@ async fn a_solana_claim_is_a_trade_only_with_the_makers_account_on_the_makers_si
     // The id reads the same as text
     assert_eq!(serde_json::to_value(&tx).unwrap(), serde_json::json!(bs58::encode([0x55u8; 64]).into_string()));
     assert!(TxId::try_from("0x12".to_string()).is_err());
+}
+
+#[tokio::test]
+async fn partial_offers_are_shown_only_to_apps_that_ask_and_a_part_taken_is_a_print() {
+    let r = relay();
+    let (maker, taker) = (PrivateKeySigner::random(), PrivateKeySigner::random());
+    fund(&r, maker.address(), 1);
+    let whole = offer(&maker, 1, Side::SellXmz, ETH / 100, 10_000);
+    let part = partial_offer(&maker, 2, Side::SellXmz, ETH / 100, 10_000, 1_000);
+    assert_eq!(r.post(whole, NOW).await, Ok(true));
+    assert_eq!(r.post(part.clone(), NOW).await, Ok(true));
+    // Apps from before partial offers read the whole list or nothing: they get none of them
+    assert_eq!(r.listings(None, false, NOW).len(), 1);
+    assert_eq!(r.listings(None, true, NOW).len(), 2);
+
+    // A claim for less than the minimum, or for an amount above the offer, is no trade of it
+    let l = &part.listing;
+    let mut swap = swap_for(l, taker.address());
+    for (byte, value) in [(0xb1u8, l.fill_value(999 * 100_000_000_000) ), (0xb2, l.value + U256::from(1))] {
+        swap.value = value;
+        let tx: TxId = B256::repeat_byte(byte).into();
+        r.chains[&1].claims.lock().unwrap().insert(tx.clone(), ClaimLookup::Final { swap: swap.clone(), at: NOW + 100 });
+        assert_eq!(r.report(1, tx, NOW).await, Err(RelayError::UnknownListing));
+    }
+    // A quarter taken: a print of 2,500 XMZ at the offer's price, and the offer closes (the rest is a new offer)
+    swap.value = l.fill_value(2_500 * 100_000_000_000);
+    let tx: TxId = B256::repeat_byte(0xb3).into();
+    r.chains[&1].claims.lock().unwrap().insert(tx.clone(), ClaimLookup::Final { swap, at: NOW + 100 });
+    assert_eq!(r.report(1, tx, NOW).await, Ok(PrintStatus::Recorded));
+    let prints = r.prints(None, 0);
+    assert_eq!((prints.len(), prints[0].xmz), (1, 2_500 * 100_000_000_000));
+    assert!((prints[0].price() - 0.01 / 10_000.0).abs() < 1e-15);
+    assert_eq!(r.listings(None, true, NOW).len(), 1, "only the whole offer is left");
 }

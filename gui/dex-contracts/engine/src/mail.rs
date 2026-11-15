@@ -89,6 +89,10 @@ pub struct Take {
     /// Where the maker's answer goes
     pub reply_to: B256,
     pub request: KeyRequest,
+    /// Partial offers: the XMZ (atoms) taken. Absent means all of it, so a whole take is the bytes
+    /// it always was (and makers from before partial offers still read it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xmz: Option<u64>,
 }
 
 /// The maker's answer to a take

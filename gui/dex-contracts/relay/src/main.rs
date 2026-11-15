@@ -87,7 +87,8 @@ async fn fetch<T: serde::de::DeserializeOwned>(client: &reqwest::Client, url: &s
 
 #[derive(Deserialize)]
 struct Listings {
-    listings: Vec<SignedListing>,
+    /// One by one: a peer may hold offers of a kind this relay does not know
+    listings: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -113,7 +114,8 @@ async fn sync(relay: &Relay<View>, client: &reqwest::Client, peer: &str) -> Resu
     // Offers on Solana come with their makers' signed Solana accounts (a peer that predates them has none)
     let mut accounts: std::collections::HashMap<B256, SignedSolAccount> =
         fetch::<SolAccounts>(client, &format!("{base}/v1/sol-accounts")).await.map(|a| a.accounts).unwrap_or_default().into_iter().take(10000).map(|a| (a.note.id, a)).collect();
-    for signed in fetch::<Listings>(client, &format!("{base}/v1/listings")).await?.listings.into_iter().take(2000) {
+    let listed = fetch::<Listings>(client, &format!("{base}/v1/listings?partial=1")).await?.listings;
+    for signed in listed.into_iter().take(2000).filter_map(|v| serde_json::from_value::<SignedListing>(v).ok()) {
         let account = accounts.get(&signed.listing.id).cloned();
         if relay.listing(signed.listing.id).is_none() && relay.post_with(signed, account, now).await == Ok(true) {
             offers += 1;

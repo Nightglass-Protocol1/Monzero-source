@@ -36,14 +36,28 @@ fn listing(maker: &Trader, side: Side) -> SignedListing {
         xmz_network: XmzNetwork::Testnet,
         created_at: NOW,
         expires_at: NOW + 3600,
+        min_xmz: None,
     }
     .sign(&maker.key)
 }
 
+/// A partial offer: 1,000 XMZ, at least 100 a take
+fn partial(maker: &Trader, side: Side) -> SignedListing {
+    let mut l = listing(maker, side).listing;
+    l.schema = crate::listing::PARTIAL_SCHEMA.into();
+    l.xmz = 1_000 * 100_000_000_000;
+    l.min_xmz = Some(100 * 100_000_000_000);
+    l.sign(&maker.key)
+}
+
 /// The whole take, as the letters travel through relay mail
 fn take(maker: &Trader, book: &mut Maker, taker: &Trader, now: u64) -> (Result<SavedTrade, ExchangeError>, Option<SavedTrade>) {
+    take_some(maker, book, taker, None, now)
+}
+
+fn take_some(maker: &Trader, book: &mut Maker, taker: &Trader, xmz: Option<u64>, now: u64) -> (Result<SavedTrade, ExchangeError>, Option<SavedTrade>) {
     let l = book.listing.listing.clone();
-    let (mut t, request) = Taker::start(&l, &taker.seed, &taker.key, now).unwrap();
+    let (mut t, request) = Taker::start(&l, xmz, &taker.seed, &taker.key, now).unwrap();
     let sealed = Letter::Take(request).seal(l.mailbox, &mut OsRng).unwrap();
     let Some(Letter::Take(received)) = Letter::open(&maker.seed.mailbox(l.id, true), &sealed) else { panic!("the maker opens the take") };
     let (answer, maker_saved) = book.answer(&received, &maker.seed, &maker.key, at(now));
@@ -56,7 +70,7 @@ fn take(maker: &Trader, book: &mut Maker, taker: &Trader, now: u64) -> (Result<S
 fn a_taken_listing_is_the_same_trade_on_both_sides() {
     for side in [Side::SellXmz, Side::BuyXmz] {
         let (maker, taker) = (trader(1), trader(2));
-        let mut book = Maker::new(listing(&maker, side), None);
+        let mut book = Maker::new(listing(&maker, side), None, None);
         let (taker_saved, maker_saved) = take(&maker, &mut book, &taker, NOW + 10);
         let (t, m) = (taker_saved.unwrap(), maker_saved.unwrap());
         assert_eq!(t.offer, m.offer);
@@ -76,7 +90,7 @@ fn a_taken_listing_is_the_same_trade_on_both_sides() {
 #[test]
 fn a_listing_is_filled_once() {
     let (maker, first, second) = (trader(1), trader(2), trader(3));
-    let mut book = Maker::new(listing(&maker, Side::SellXmz), None);
+    let mut book = Maker::new(listing(&maker, Side::SellXmz), None, None);
     let (a, _) = take(&maker, &mut book, &first, NOW);
     a.unwrap();
     let (b, saved) = take(&maker, &mut book, &second, NOW);
@@ -86,16 +100,16 @@ fn a_listing_is_filled_once() {
     let (again, saved) = take(&maker, &mut book, &first, NOW + 5);
     assert_eq!(again.unwrap().transcript, saved.unwrap().transcript);
     // After a restart the maker knows who took it
-    let mut restarted = Maker::new(book.listing.clone(), book.taken_by);
+    let mut restarted = Maker::new(book.listing.clone(), book.taken_by, book.taken_xmz);
     assert!(take(&maker, &mut restarted, &second, NOW).0.is_err());
 }
 
 #[test]
 fn bad_takes_are_refused_without_our_frame() {
     let (maker, taker, other) = (trader(1), trader(2), trader(3));
-    let mut book = Maker::new(listing(&maker, Side::BuyXmz), None);
+    let mut book = Maker::new(listing(&maker, Side::BuyXmz), None, None);
     let l = book.listing.listing.clone();
-    let (_, good) = Taker::start(&l, &taker.seed, &taker.key, NOW).unwrap();
+    let (_, good) = Taker::start(&l, None, &taker.seed, &taker.key, NOW).unwrap();
     let refused = |a: &Answer| matches!(a.response, KeyResponse::Refused(_));
     // Claims another account than the one that signed its frame
     let lie = Take { taker: other.key.address(), ..good.clone() };
@@ -110,4 +124,97 @@ fn bad_takes_are_refused_without_our_frame() {
     assert_eq!(book.taken_by, None, "nothing was taken");
     // The honest take still works afterwards
     assert!(book.answer(&good, &maker.seed, &maker.key, at(NOW)).1.is_some());
+}
+
+const XMZ: u64 = 100_000_000_000;
+
+#[test]
+fn part_of_a_partial_offer_is_the_same_trade_on_both_sides_at_the_offer_price() {
+    for side in [Side::SellXmz, Side::BuyXmz] {
+        let (maker, taker) = (trader(1), trader(2));
+        let mut book = Maker::new(partial(&maker, side), None, None);
+        let l = book.listing.listing.clone();
+        let (t, m) = take_some(&maker, &mut book, &taker, Some(250 * XMZ), NOW + 10);
+        let (t, m) = (t.unwrap(), m.unwrap());
+        assert_eq!(t.offer, m.offer);
+        assert_eq!(t.offer.xmz_amount, 250 * XMZ);
+        assert_eq!(t.offer.value, l.value / U256::from(4), "a quarter of the XMZ for a quarter of the coin");
+        assert_eq!(t.offer.trade_id, l.id, "the claim still ties to the listing");
+        assert_eq!((book.taken_by, book.taken_xmz), (Some(taker.key.address()), Some(250 * XMZ)));
+        m.agreed(&maker.seed, &maker.key).unwrap();
+    }
+}
+
+#[test]
+fn a_partial_offer_takes_only_amounts_its_rules_allow() {
+    let (maker, taker) = (trader(1), trader(2));
+    let l = partial(&maker, Side::SellXmz).listing;
+    // Below the minimum, above the offer, and a take that would leave less than the minimum
+    for bad in [99 * XMZ, 1_001 * XMZ, 950 * XMZ, 0] {
+        assert!(Taker::start(&l, Some(bad), &taker.seed, &taker.key, NOW).is_err(), "{bad}");
+    }
+    for good in [100 * XMZ, 900 * XMZ, 1_000 * XMZ] {
+        assert!(Taker::start(&l, Some(good), &taker.seed, &taker.key, NOW).is_ok(), "{good}");
+    }
+    // A whole offer takes no amount but all of it
+    let whole = listing(&maker, Side::SellXmz).listing;
+    assert!(Taker::start(&whole, Some(whole.xmz / 2), &taker.seed, &taker.key, NOW).is_err());
+    assert!(Taker::start(&whole, Some(whole.xmz), &taker.seed, &taker.key, NOW).is_err(), "no amount on a whole offer");
+    // The maker checks too: a take letter naming an amount the offer does not allow is refused
+    let mut book = Maker::new(partial(&maker, Side::SellXmz), None, None);
+    let (_, mut letter) = Taker::start(&l, Some(200 * XMZ), &taker.seed, &taker.key, NOW).unwrap();
+    letter.xmz = Some(50 * XMZ);
+    let (answer, saved) = book.answer(&letter, &maker.seed, &maker.key, at(NOW));
+    assert!(matches!(answer.response, KeyResponse::Refused(_)) && saved.is_none());
+    // A different amount than the frame was made for: the frames do not match the maker's offer
+    letter.xmz = Some(300 * XMZ);
+    assert!(book.answer(&letter, &maker.seed, &maker.key, at(NOW)).1.is_none());
+    assert_eq!(book.taken_by, None);
+    let mut whole_book = Maker::new(listing(&maker, Side::SellXmz), None, None);
+    let (_, mut letter) = Taker::start(&whole, None, &taker.seed, &taker.key, NOW).unwrap();
+    letter.xmz = Some(whole.xmz / 2);
+    assert!(whole_book.answer(&letter, &maker.seed, &maker.key, at(NOW)).1.is_none());
+}
+
+#[test]
+fn a_partial_offer_is_still_taken_once() {
+    let (maker, first, second) = (trader(1), trader(2), trader(3));
+    let mut book = Maker::new(partial(&maker, Side::SellXmz), None, None);
+    take_some(&maker, &mut book, &first, Some(300 * XMZ), NOW).0.unwrap();
+    assert!(take_some(&maker, &mut book, &second, Some(300 * XMZ), NOW).0.is_err(), "the rest is a new offer");
+    // The first taker asking again for another amount is refused; the same amount is answered again
+    assert!(take_some(&maker, &mut book, &first, Some(400 * XMZ), NOW).1.is_none());
+    assert!(take_some(&maker, &mut book, &first, Some(300 * XMZ), NOW + 5).1.is_some());
+}
+
+#[test]
+fn the_rest_of_a_partial_offer_keeps_its_price_and_never_adds_up_to_more() {
+    for side in [Side::SellXmz, Side::BuyXmz] {
+        let maker = trader(1);
+        let mut l = partial(&maker, side).listing;
+        // An awkward price: rounding must still be exact across fills
+        l.value = U256::from(1_000_000_007u64);
+        let mut paid = U256::ZERO;
+        let mut taken = 0;
+        let mut current = l.clone();
+        for (i, part) in [333 * XMZ, 100 * XMZ, 167 * XMZ].into_iter().enumerate() {
+            paid += current.fill_value(part);
+            taken += part;
+            current = current.remainder(part, B256::repeat_byte(i as u8 + 1), B256::repeat_byte(0x77), NOW + 60).unwrap();
+            assert_eq!(current.min_xmz, l.min_xmz);
+            assert_eq!(current.expires_at, l.expires_at);
+            assert_eq!(current.schema, l.schema);
+        }
+        assert_eq!(current.xmz, l.xmz - taken);
+        assert_eq!(paid + current.value, l.value, "fills and what is left add up to the offer exactly");
+        assert_eq!(current.fill_value(current.xmz), current.value);
+        assert!(current.remainder(current.xmz, B256::repeat_byte(9), B256::repeat_byte(9), NOW).is_none(), "nothing left");
+        // Rounding is in the maker's favour
+        let third = l.fill_value(333 * XMZ);
+        let exact = U256::from(1_000_000_007u64) * U256::from(333u64) / U256::from(1000u64);
+        match side {
+            Side::SellXmz => assert_eq!(third, exact + U256::from(1)),
+            Side::BuyXmz => assert_eq!(third, exact),
+        }
+    }
 }

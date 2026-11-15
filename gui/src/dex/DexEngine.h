@@ -262,8 +262,13 @@ public:
     QVariantMap evmMarketStatus() const;
     Q_INVOKABLE bool refreshEvmOffers(const QString &pair);
     // side: "sell-xmz" (we sell XMZ for the coin) or "buy-xmz"; amounts as decimal text in coins
-    Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours);
-    Q_INVOKABLE bool takeEvmOffer(const QString &listingId);
+    // minXmzAmount: empty for a whole offer, else the least XMZ one take may be (a partial offer)
+    Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours,const QString &minXmzAmount=QString());
+    // xmzAmount: empty to take all of the offer, else how much of a partial offer
+    Q_INVOKABLE bool takeEvmOffer(const QString &listingId,const QString &xmzAmount=QString());
+    // The coin for `atoms` XMZ of a listing as the market shows it, at its price, rounded in the
+    // maker's favour as the helper does; empty when the offer does not allow that amount
+    static QString evmPartValue(const QVariantMap &listing,const QString &atoms);
     Q_INVOKABLE bool cancelEvmOffer(const QString &folder);
     // Coin paid into the trade account that no trade or open offer needs goes back to the user's wallet
     Q_INVOKABLE bool returnEvmFunds(int chainId,const QString &address);
