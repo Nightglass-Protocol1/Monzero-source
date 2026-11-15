@@ -418,6 +418,12 @@ when they are outside the source repository.
   fungible holding into two one-unit outputs and spends both in one burn,
   proving activated multi-input wallet selection. The opt-in fixture does not
   modify any public-network hard-fork schedule.
+- A two-node regtest HF18 scenario (`assets_p2p`, 2026-11-15) passes: an
+  issuance made on one node is relayed and mined by the other; an issuance and
+  an NFT transfer confirmed on one node only are removed from its registry when
+  it reorganises onto the other node's longer chain, return to its pool, and
+  take effect on both nodes once mined again; the wallet follows the rollback
+  and a wallet rebuilt from its seed shows the same holdings.
 - A dedicated asset-wire fuzz target directly exercises arbitrary payload
   decoding, successful encode/decode round trips, and activated native asset
   envelope parsing. It builds and completes local smoke inputs; a sustained

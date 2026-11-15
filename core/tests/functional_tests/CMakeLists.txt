@@ -76,9 +76,12 @@ if (REQUESTS_OUTPUT STREQUAL "OK")
     NAME    functional_tests_assets
     COMMAND ${PYTHON3_FOUND} "${CMAKE_CURRENT_SOURCE_DIR}/functional_tests_rpc.py" "${PYTHON3_FOUND}" "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}" assets)
   add_test(
+    NAME    functional_tests_assets_p2p
+    COMMAND ${PYTHON3_FOUND} "${CMAKE_CURRENT_SOURCE_DIR}/functional_tests_rpc.py" "${PYTHON3_FOUND}" "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}" assets_p2p)
+  add_test(
     NAME    check_missing_rpc_methods
     COMMAND ${PYTHON3_FOUND} "${CMAKE_CURRENT_SOURCE_DIR}/check_missing_rpc_methods.py" "${CMAKE_SOURCE_DIR}")
 else()
   message(WARNING "functional_tests_rpc and check_missing_rpc_methods skipped, needs the 'requests', 'psutil', 'monotonic', 'zmq', and 'deepdiff' python modules")
-  set(CTEST_CUSTOM_TESTS_IGNORE ${CTEST_CUSTOM_TESTS_IGNORE} functional_tests_rpc functional_tests_assets check_missing_rpc_methods)
+  set(CTEST_CUSTOM_TESTS_IGNORE ${CTEST_CUSTOM_TESTS_IGNORE} functional_tests_rpc functional_tests_assets functional_tests_assets_p2p check_missing_rpc_methods)
 endif()

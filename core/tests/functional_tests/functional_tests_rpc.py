@@ -70,6 +70,9 @@ wallet_extra = [
 # public-network schedule or the default functional suite.
 if 'assets' in tests:
   monerod_extra[0].append('--regtest-asset-hard-fork')
+if 'assets_p2p' in tests:
+  monerod_extra[2].append('--regtest-asset-hard-fork')
+  monerod_extra[3].append('--regtest-asset-hard-fork')
 
 command_lines = []
 processes = []
