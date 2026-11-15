@@ -41,6 +41,8 @@ switch ($what) {
         $utxo = $pair === 'BTC/XMZ' || $pair === 'LTC/XMZ';
         $path = ($utxo && $what === 'listings') ? '/v1/utxo/listings' : '/v1/' . $what;
         $query['pair'] = $pair;
+        // Partial offers too (any part from their smallest may be taken); BTC/LTC offers are whole
+        if ($what === 'listings' && !$utxo) $query['partial'] = 1;
         if ($what === 'candles') {
             $interval = (int)($_GET['interval'] ?? 3600);
             if (!in_array($interval, [3600, 14400, 86400], true)) relayFail(400, 'interval must be 3600, 14400 or 86400');
