@@ -4,8 +4,8 @@
  * Monzero swap-pair market-price API.
  *
  * Serves live USD market prices (and 30-day history) for the assets that Monzero's
- * atomic-swap DEX trades XMZ against: BTC, LTC, BNB, ETH, SOL. XMZ itself has NO
- * verified market price and is deliberately not invented here — see /markets/.
+ * atomic-swap DEX trades XMZ against: BTC, LTC, BNB, ETH, SOL. The XMZ price itself is served by
+ * /markets/xmz.php (NoirTrade).
  *
  * Public + CORS-enabled so other sites may use it as a price tracker.
  * Upstream: CoinGecko. Responses are cached ~5 min to stay well inside rate limits.
@@ -108,12 +108,12 @@ foreach ($coinsOut as $c) {
 $payload = [
     'updated' => gmdate('c'),
     'source' => 'CoinGecko',
-    'note' => 'Live USD market prices for the assets Monzero XMZ atomically swaps against. XMZ itself has no verified market price.',
+    'note' => 'Live USD market prices for the assets Monzero XMZ atomically swaps against. The XMZ price is at /markets/xmz.php.',
     'openingRate' => [
         'perXmzUsd' => $openingUsd,
         'type' => 'dex-opening-quote',
         'basis' => '2026-10-31 mainnet test: 0.01 BNB for 7000 XMZ at BNB ~$700',
-        'note' => 'The rate the Monzero DEX will first offer XMZ at, set by the project. NOT a market price; real swaps move it from here. Every pair below is this one rate priced in each coin live.',
+        'note' => 'The opening quote the project set for XMZ on the Monzero DEX. NOT a market price; see /markets/xmz.php for that. Every pair below is this one rate priced in each coin live.',
         'pairs' => $openingPairs,
     ],
     'coins' => $coinsOut,
