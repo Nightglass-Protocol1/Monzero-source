@@ -312,7 +312,7 @@ a.trade-row:hover, a.trade-row:focus-visible { background: color-mix(in srgb, va
 .tp-take .tp-part { width: 84px; box-sizing: border-box; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--text); font: 500 13px var(--mono); }
 .tp-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 6px; }
 .tp-form label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
-.tp-form input { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--line, #2c3a47); background: transparent; color: var(--text); font: 500 14px var(--mono); }
+.tp-form input, .tp-form select { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--line, #2c3a47); background: transparent; color: var(--text); font: 500 14px var(--mono); }
 .tp-note { color: var(--muted); font-size: 12.5px; line-height: 1.5; margin: 8px 0; }
 .tp-say { color: var(--text); font-size: 13.5px; line-height: 1.5; margin: 12px 0 0; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line, #2c3a47); }
 .tp-err { color: #ef6b6b; font-size: 13.5px; line-height: 1.5; margin: 10px 0 0; }

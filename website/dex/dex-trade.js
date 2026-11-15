@@ -40,7 +40,7 @@
 
   var st = {
     coin: "ETH", listings: [], side: "buy", link: null, account: "", status: null, wallets: null,
-    pairing: null, note: "", error: "", busy: "", paying: "", told: "", stageKey: "", stageSince: 0, limits: {}, timer: null, form: { xmz: "", price: "", min: "" }, parts: {}, dismissed: ""
+    pairing: null, note: "", error: "", busy: "", paying: "", told: "", stageKey: "", stageSince: 0, limits: {}, timer: null, form: { xmz: "", price: "", min: "", life: "6", days: "" }, parts: {}, dismissed: ""
   };
   try { st.link = JSON.parse(localStorage.getItem(STORE) || "null"); } catch (e) { st.link = null; }
   if (st.link && PORTS.indexOf(st.link.port) < 0) st.link = null;   // saved for another wallet
@@ -350,6 +350,17 @@
   }
   // A wallet from before partial offers cannot take part of one (or even see them) and posts whole offers only
   function canPart() { var f = st.status && st.status.features; return !!(f && f.indexOf && f.indexOf("partial") >= 0); }
+  // A wallet that may post offers open longer than a day (up to 31 days)
+  function canLong() { var f = st.status && st.status.features; return !!(f && f.indexOf && f.indexOf("long-offers") >= 0); }
+  // How long a new offer stays open, in hours (0: not a valid choice)
+  function lifeHours() {
+    var max = canLong() ? 744 : 24, h;
+    if (st.form.life === "c") {
+      var d = String(st.form.days || "").trim();
+      h = /^[0-9]+(\.[0-9]+)?$/.test(d) ? Math.round(Number(d) * 24) : 0;
+    } else h = Number(st.form.life) || 0;
+    return h >= 1 && h <= max ? h : 0;
+  }
   function post() {
     if (st.busy) return;
     var xmz = toUnits(st.form.xmz, 11), price = toUnits(st.form.price, dec());
@@ -359,12 +370,14 @@
     if (canPart() && String(st.form.min || "").trim() && (!min || min < 100000000000n || min > xmz)) return fail(new Error("The smallest part must be at least 1 XMZ and at most the whole offer."));
     var value = xmz * price / 100000000000n, owner = st.side === "buy";
     if (value === 0n) return fail(new Error("The total is too small."));
+    var hours = lifeHours();
+    if (!hours) return fail(new Error(canLong() ? "An offer stays open from 1 hour to 31 days." : "An offer stays open for at most a day."));
     var why = checks(owner, value, xmz);
     if (why) return fail(new Error(why));
     st.busy = "post"; say("Preparing…");
     reserve(owner).then(function (gas) { return fund(owner ? value + gas : gas); }).then(function () {
       say("Posting your offer…");
-      var offer = { chainId: chain().id, side: owner ? "buy-xmz" : "sell-xmz", coin: fromUnits(value, dec()), xmz: fromUnits(xmz, 11), hours: 6 };
+      var offer = { chainId: chain().id, side: owner ? "buy-xmz" : "sell-xmz", coin: fromUnits(value, dec()), xmz: fromUnits(xmz, 11), hours: hours };
       if (min) offer.minXmz = fromUnits(min, 11);
       return api("/v1/offer", offer);
     }).then(function (r) {
@@ -558,7 +571,9 @@
       if (l.minXmz != null && !canPart()) { hidden++; return; }
       var v = BigInt(l.value), z = BigInt(l.xmz);
       if (z === 0n) return;
-      rows.push({ id: l.id, value: v, xmz: z, price: v * 100000000000n / z, min: l.minXmz != null ? BigInt(l.minXmz) : null });
+      // A minimum of all of it is a whole offer (how a whole offer open longer than a day is written)
+      var min = l.minXmz != null ? BigInt(l.minXmz) : null;
+      rows.push({ id: l.id, value: v, xmz: z, price: v * 100000000000n / z, min: min != null && min < z ? min : null, ends: Number(l.expiresAt) });
     });
     rows.sort(function (a, b) { return st.side === "buy" ? (a.price < b.price ? -1 : 1) : (a.price > b.price ? -1 : 1); });
     var older = hidden ? '<p class="tp-note">' + hidden + (hidden === 1 ? " offer" : " offers") + " can be taken in parts; update your Monzero wallet to take " + (hidden === 1 ? "it" : "them") + ".</p>" : "";
@@ -567,10 +582,26 @@
       // A partial offer: any amount from its smallest part, typed here (empty takes all of it)
       var part = r.min == null ? "" : '<input class="tp-part" id="tp-part-' + esc(r.id) + '" data-id="' + esc(r.id) + '" inputmode="decimal" autocomplete="off" placeholder="all" aria-label="XMZ to ' +
         (st.side === "buy" ? "buy" : "sell") + '" value="' + esc(st.parts[r.id] || "") + '">';
+      var left = r.ends - Date.now() / 1000, until = left > 2 * 86400 ? Math.floor(left / 86400) + " days left" : left > 0 ? (Math.round(left / 360) / 10) + " h left" : "";
       return "<li><span><strong>" + esc(fromUnits(r.xmz, 11, 2)) + " XMZ</strong> for " + esc(fromUnits(r.value, dec(), 8)) + " " + st.coin +
+        (until ? '<small class="tp-min">' + esc(until) + "</small>" : "") +
         (r.min == null ? "" : '<small class="tp-min">any part from ' + esc(fromUnits(r.min, 11, 2)) + " XMZ</small>") +
         '</span><span class="tp-take">' + part + '<button class="button primary" type="button" data-act="take" data-id="' + esc(r.id) + '">' + (st.side === "buy" ? "Buy" : "Sell") + "</button></span></li>";
     }).join("") + "</ul>" + older;
+  }
+  // How long the offer stays open: presets, and with a wallet that allows it a week, a month or a custom number of days
+  function lifeHTML() {
+    var opts = [["1", "1 hour"], ["6", "6 hours"], ["24", "1 day"]];
+    if (canLong()) opts.push(["168", "1 week"], ["336", "2 weeks"], ["744", "1 month"], ["c", "Custom (days)"]);
+    if (!opts.some(function (o) { return o[0] === st.form.life; })) st.form.life = "6";
+    var h = '<div class="tp-form"><label>Open for<select id="tp-life">' + opts.map(function (o) {
+      return '<option value="' + o[0] + '"' + (o[0] === st.form.life ? " selected" : "") + ">" + o[1] + "</option>";
+    }).join("") + "</select></label>";
+    if (st.form.life === "c") h += '<label>Days (up to 31)<input id="tp-days" inputmode="decimal" autocomplete="off" placeholder="14" value="' + esc(st.form.days) + '"></label>';
+    h += "</div>";
+    var hrs = lifeHours();
+    if (hrs > 24) h += '<p class="tp-note">Open until ' + esc(new Date(Date.now() + hrs * 3600000).toLocaleString()) + ". Keep your Monzero wallet running when you can: a taker is answered only while it runs.</p>";
+    return h;
   }
   function render() {
     var h = "", c = chain();
@@ -631,6 +662,7 @@
           "<label>Price (" + st.coin + ' per XMZ)<input id="tp-price" inputmode="decimal" autocomplete="off" value="' + esc(st.form.price) + '"></label>' +
           (canPart() ? '<label>Smallest part (XMZ, optional)<input id="tp-min" inputmode="decimal" autocomplete="off" placeholder="whole offer only" value="' + esc(st.form.min) + '"></label></div>' +
           '<p class="tp-note">With a smallest part, others can take any amount from it up to the whole offer; what is left stays on offer at your price.</p>' : "</div>") +
+          lifeHTML() +
           '<p class="tp-note" id="tp-total"></p><button class="button secondary" type="button" data-act="post"' + (st.busy ? " disabled" : "") + ">" + (st.side === "buy" ? "Post offer to buy XMZ" : "Post offer to sell XMZ") + "</button>";
         if (lim && lim.open) h += '<p class="tp-note">While the DEX is new: at most ' + esc(fromUnits(lim.coin, dec(), 6)) + " " + st.coin + " and " + esc(fromUnits(lim.xmz, 11, 0)) + " XMZ per trade.</p>";
         var open = (m.mine || []).filter(function (x) { return x.state === "open"; });
@@ -649,7 +681,7 @@
     // Keep what is being typed
     var active = document.activeElement && document.activeElement.id, pos = active && document.activeElement.selectionStart;
     box.innerHTML = h;
-    if (active === "tp-xmz" || active === "tp-price" || active === "tp-min" || (active && active.indexOf("tp-part-") === 0)) { var el = document.getElementById(active); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (e) {} } }
+    if (active === "tp-xmz" || active === "tp-price" || active === "tp-min" || active === "tp-days" || (active && active.indexOf("tp-part-") === 0)) { var el = document.getElementById(active); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (e) {} } }
     total();
   }
   function total() {
@@ -686,6 +718,8 @@
     if (e.target.id === "tp-xmz") st.form.xmz = e.target.value;
     if (e.target.id === "tp-price") st.form.price = e.target.value;
     if (e.target.id === "tp-min") st.form.min = e.target.value;
+    if (e.target.id === "tp-days") { st.form.days = e.target.value; render(); return; }
+    if (e.target.id === "tp-life") { st.form.life = e.target.value; render(); return; }
     if (e.target.classList && e.target.classList.contains("tp-part")) st.parts[e.target.getAttribute("data-id")] = e.target.value;
     total();
   });
