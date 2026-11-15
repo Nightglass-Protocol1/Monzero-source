@@ -293,6 +293,7 @@ public:
     // The key wallet's folder (app data). When it was made by another copy of the app, the review
     // of moving it to this copy's helper; approving it (its commitment) lets it be unlocked here.
     QString tradingKeysDirectory() const;
+    QString tradingKeysWallet() const;
     Q_INVOKABLE QVariantMap reviewTradingKeysHelper() const;
     Q_INVOKABLE bool approveTradingKeysHelper(const QString &commitment);
     bool dexKeysReady() const {return !m_evmAccount.isEmpty();}

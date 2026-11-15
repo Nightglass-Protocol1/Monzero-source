@@ -1164,15 +1164,23 @@ QString DexEngine::tradingKeysDirectory() const {
     return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
         .filePath(DexDeployment::mainnetStage() ? "dex/mainnet/trading-keys" : "dex/testnet/trading-keys");
 }
+// The remembered Bitcoin light wallet when it is the app's own key wallet (a folder directly
+// inside the trading-keys folder), else empty
+QString DexEngine::tradingKeysWallet() const {
+    QSettings settings(QSettings::IniFormat,QSettings::UserScope,"Monzero","LightWalletFolders");
+    const auto stored=settings.value("wallets/btc");
+    if (stored.type()!=QVariant::String || stored.toString().size()>2048) return {};
+    const auto wallet=QDir::cleanPath(stored.toString());
+    return QDir::cleanPath(QFileInfo(wallet).absolutePath())==QDir::cleanPath(tradingKeysDirectory()) ? wallet : QString();
+}
 QVariantMap DexEngine::reviewTradingKeysHelper() const {
     // Only the app's own key wallet, and only while it waits for this approval
-    const auto directory=tradingKeysDirectory();
-    QSettings settings(QSettings::IniFormat,QSettings::UserScope,"Monzero","LightWalletFolders");
-    if (QDir::cleanPath(settings.value("wallets/btc").toString())!=QDir::cleanPath(directory)) return {};
-    return reviewLightWalletHelperUpgrade("btc",directory);
+    const auto wallet=tradingKeysWallet();
+    return wallet.isEmpty() ? QVariantMap() : reviewLightWalletHelperUpgrade("btc",wallet);
 }
 bool DexEngine::approveTradingKeysHelper(const QString &commitment) {
-    const bool ok=!reviewTradingKeysHelper().isEmpty() && upgradeLightWalletHelper("btc",tradingKeysDirectory(),commitment);
+    const auto wallet=tradingKeysWallet();
+    const bool ok=!wallet.isEmpty() && !reviewTradingKeysHelper().isEmpty() && upgradeLightWalletHelper("btc",wallet,commitment);
     if (ok) m_lightSetupNotices.remove("btc");
     emit dexWalletChanged();return ok;
 }
