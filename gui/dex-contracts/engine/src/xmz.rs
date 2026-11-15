@@ -414,6 +414,26 @@ impl WalletRpcXmz {
         WalletRpcXmz { cfg, main, swap, opened: Mutex::new(None) }
     }
 
+    /// Bring a wallet up to date. When its node does not answer, the wallet service is moved to
+    /// the other nodes we know (the witnesses), one after another, and asked again. A lock still
+    /// counts only as deep as every witness reports it, whichever node the wallet reads.
+    async fn refresh(&self, rpc: &WalletRpc) -> Result<(), DriverError> {
+        let first = match rpc.call("refresh", json!({})).await {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+        if !first.to_string().contains("no connection to daemon") {
+            return Err(first);
+        }
+        for node in &self.cfg.witnesses {
+            let moved = rpc.call("set_daemon", json!({"address": node, "trusted": false})).await.is_ok();
+            if moved && rpc.call("refresh", json!({})).await.is_ok() {
+                return Ok(());
+            }
+        }
+        Err(first)
+    }
+
     pub fn record(&self) -> Result<XmzRecord, DriverError> {
         match std::fs::read_to_string(&self.cfg.record) {
             Ok(text) => serde_json::from_str(&text).map_err(xmz_err),
@@ -527,7 +547,7 @@ impl WalletRpcXmz {
 impl XmzSide for WalletRpcXmz {
     async fn lock_status(&self) -> Result<Option<XmzLock>, DriverError> {
         self.open_current().await?;
-        self.swap.call("refresh", json!({})).await?;
+        self.refresh(&self.swap).await?;
         let transfers = self.swap.call("get_transfers", json!({"in": true})).await?;
         let mut amount = 0u64;
         let mut confirmations = u64::MAX;
@@ -559,7 +579,7 @@ impl XmzSide for WalletRpcXmz {
         let tx = match &record.lock {
             Some(tx) => tx.clone(),
             None => {
-                self.main.call("refresh", json!({})).await?;
+                self.refresh(&self.main).await?;
                 let built = self
                     .main
                     .call(
@@ -596,7 +616,7 @@ impl XmzSide for WalletRpcXmz {
         let txs = match &record.sweep {
             Some(txs) => txs.clone(),
             None => {
-                self.swap.call("refresh", json!({})).await?;
+                self.refresh(&self.swap).await?;
                 let balance = self.swap.call("get_balance", json!({})).await?;
                 let (total, unlocked) = (balance["balance"].as_u64().unwrap_or(0), balance["unlocked_balance"].as_u64().unwrap_or(0));
                 // Sweep everything at once, after it has all unlocked; until then, wait
@@ -635,7 +655,7 @@ impl XmzSide for WalletRpcXmz {
             return Ok(false);
         };
         self.open(Opened::Spend, None).await?;
-        self.swap.call("refresh", json!({})).await?;
+        self.refresh(&self.swap).await?;
         let mut least = u64::MAX;
         for tx in &txs {
             let found = self.swap.call("get_transfer_by_txid", json!({"txid": tx.tx_hash})).await?;

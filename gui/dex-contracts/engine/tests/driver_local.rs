@@ -45,6 +45,8 @@ struct Ledger {
     lock: Option<XmzLock>,
     lock_sends: u32,
     swept_by: Option<&'static str>,
+    /// The wallet's node does not answer
+    down: bool,
 }
 
 /// One trader's view of the shared XMZ address. A sweep succeeds only with the exact
@@ -66,6 +68,9 @@ impl StandInXmz {
 
 impl XmzSide for StandInXmz {
     async fn lock_status(&self) -> Result<Option<XmzLock>, DriverError> {
+        if self.ledger.lock().unwrap().down {
+            return Err(DriverError::Xmz("refresh: no connection to daemon".into()));
+        }
         Ok(self.ledger.lock().unwrap().lock)
     }
 
@@ -438,6 +443,28 @@ async fn owner_refunds_early_when_no_xmz_arrives() {
     let state = owner.tick().await.unwrap();
     assert!(matches!(state, RoleState::Owner(OwnerState::Locked { .. })));
     // The claimer never locks XMZ. 30 minutes before timeout1 the owner refunds early.
+    advance(&w.url, D1 - 1800).await;
+    let state = owner.tick().await.unwrap();
+    assert!(matches!(state, RoleState::Owner(OwnerState::RefundSent { .. })));
+    let state = owner.tick().await.unwrap();
+    assert_eq!(state, RoleState::Owner(OwnerState::Done(Outcome::Refunded)));
+}
+
+/// Stagenet run, 2026-11-14: the Monero node stopped answering after the owner's lock, every
+/// round ended on that error and the owner's coins stayed locked past both timeouts.
+#[tokio::test]
+async fn the_owner_refunds_while_the_private_coins_node_is_down() {
+    let Some(url) = std::env::var("MONZERO_EVM_RPC").ok() else { return };
+    let _chain = CHAIN.lock().await;
+    let w = world(url).await;
+    let mut owner = w.owner(MemoryJournal(Record::new(RoleState::Owner(OwnerState::Start))));
+
+    owner.tick().await.unwrap(); // lock
+    let state = owner.tick().await.unwrap();
+    assert!(matches!(state, RoleState::Owner(OwnerState::Locked { .. })));
+    w.ledger.lock().unwrap().down = true;
+    // Before the refund time nothing can be decided without the other coin: the round fails
+    assert!(matches!(owner.tick().await, Err(DriverError::Xmz(_))));
     advance(&w.url, D1 - 1800).await;
     let state = owner.tick().await.unwrap();
     assert!(matches!(state, RoleState::Owner(OwnerState::RefundSent { .. })));

@@ -274,6 +274,12 @@ async fn main() {
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
 
+    // No swap (a refund or an abort): every coin is back with its owner, nothing to report
+    if !last.iter().all(|stage| stage.contains("Swapped")) {
+        println!("NO SWAP: {} / {}", last[0], last[1]);
+        std::process::exit(3);
+    }
+
     // 5. The claimer reports its claim; the relay records it once final and charts it
     let r = taker.call("report", json!({})).await;
     log(format!("taker reported: {r}"));

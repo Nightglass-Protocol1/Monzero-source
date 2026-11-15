@@ -15,14 +15,10 @@ cd "$(dirname "$0")/.."
 ROOT=${MONZERO_ROOT:-$HOME/projects/Monzero-App}
 MONERO_DIR=${MONERO_DIR:-$ROOT/core/build/monero-official}
 WORK=${WORK:-$ROOT/core/build/xmr-stagenet}
-# The Monero stagenet node: XMZ_NODE, or the first of these public ones that answers now
-NODE=${XMZ_NODE:-}
-for n in node2.monerodevs.org:38089 node3.monerodevs.org:38089 stagenet.xmr-tw.org:38081 node.monerodevs.org:38089; do
-  [ -n "$NODE" ] && break
-  curl -s -m 8 "http://$n/get_height" | grep -q '"status": *"OK"' && NODE=$n
-done
-[ -n "$NODE" ] || { echo "!! no Monero stagenet node answers; set XMZ_NODE=host:port"; exit 1; }
-echo "== Monero stagenet node: $NODE"
+# Monero stagenet nodes to try: XMZ_NODE, or these public ones. The one used is the first that
+# a wallet can really sync from (answering get_height is not enough: 2026-11-14 a node did
+# that and still gave the wallets no blocks all night).
+NODES=${XMZ_NODE:-node2.monerodevs.org:38089 node3.monerodevs.org:38089 stagenet.xmr-tw.org:38081 node.monerodevs.org:38089}
 T=$ROOT/core/build/dex-rust-toolchain-1.95.0/sysroot/usr
 export PATH=$T/bin:$PATH LD_LIBRARY_PATH=$T/lib/x86_64-linux-gnu CARGO_HOME=$ROOT/core/build/dex-cargo-home
 FUNDER_PORT=38183; RELAY_PORT=18796
@@ -36,19 +32,33 @@ field() { python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{
 
 echo "== stagenet funding wallet"
 systemctl --user stop dex-xmr-relay 2>/dev/null || true
-# A funding wallet left running by an earlier run is restarted, so it uses the node chosen now
-systemctl --user stop dex-xmr-funder 2>/dev/null || true
-for _ in $(seq 1 20); do systemctl --user is-active --quiet dex-xmr-funder || break; sleep 1; done
-systemctl --user reset-failed dex-xmr-funder 2>/dev/null || true
-systemd-run --user --quiet --unit=dex-xmr-funder --collect "$MONERO_DIR/linux-x64/monero-wallet-rpc" --stagenet \
-  --wallet-dir "$WORK/funder" --daemon-address "$NODE" --trusted-daemon --disable-rpc-login \
-  --rpc-bind-ip 127.0.0.1 --rpc-bind-port $FUNDER_PORT --non-interactive --log-file "$WORK/funder.log"
 trap 'systemctl --user stop dex-xmr-funder dex-xmr-relay 2>/dev/null || true' EXIT
-for _ in $(seq 1 60); do rpc get_version | grep -q result && break; sleep 1; done
-if [ -f "$WORK/funder/funder.keys" ]; then rpc open_wallet '{"filename":"funder","password":""}' >/dev/null
-else rpc create_wallet '{"filename":"funder","password":"","language":"English"}' >/dev/null; fi
+NODE=
+for n in $NODES; do
+  curl -s -m 8 "http://$n/get_height" | grep -q '"status": *"OK"' || { echo "   $n: no answer"; continue; }
+  # A funding wallet left running by an earlier run is restarted on the node being tried
+  systemctl --user stop dex-xmr-funder 2>/dev/null || true
+  for _ in $(seq 1 20); do systemctl --user is-active --quiet dex-xmr-funder || break; sleep 1; done
+  systemctl --user reset-failed dex-xmr-funder 2>/dev/null || true
+  systemd-run --user --quiet --unit=dex-xmr-funder --collect "$MONERO_DIR/linux-x64/monero-wallet-rpc" --stagenet \
+    --wallet-dir "$WORK/funder" --daemon-address "$n" --trusted-daemon --disable-rpc-login \
+    --rpc-bind-ip 127.0.0.1 --rpc-bind-port $FUNDER_PORT --non-interactive --log-file "$WORK/funder.log"
+  for _ in $(seq 1 60); do rpc get_version | grep -q result && break; sleep 1; done
+  if [ -f "$WORK/funder/funder.keys" ]; then rpc open_wallet '{"filename":"funder","password":""}' >/dev/null
+  else rpc create_wallet '{"filename":"funder","password":"","language":"English"}' >/dev/null; fi
+  if rpc refresh | grep -q '"result"'; then NODE=$n; break; fi
+  echo "   $n: answers, but the wallet cannot sync from it"
+done
+[ -n "$NODE" ] || { echo "!! no Monero stagenet node works now; try later or set XMZ_NODE=host:port"; exit 1; }
+echo "   node:     $NODE"
+# The other nodes that answer: they confirm the lock, and the trade's wallets move to them
+# if their own node stops answering
+OTHERS=
+for n in $NODES stagenet.xmr-tw.org:38081 node2.monerodevs.org:38089; do
+  case ",$OTHERS," in *",http://$n,"*) continue;; esac
+  curl -s -m 8 "http://$n/get_height" | grep -q '"status": *"OK"' && OTHERS=${OTHERS:+$OTHERS,}http://$n
+done
 ADDRESS=$(rpc get_address | field address)
-rpc refresh >/dev/null
 UNLOCKED=$(rpc get_balance | field unlocked_balance); TOTAL=$(rpc get_balance | field balance)
 echo "   address:  $ADDRESS"
 echo "   balance:  ${TOTAL:-0} atoms, ${UNLOCKED:-0} spendable (1 XMR = 1000000000000 atoms)"
@@ -69,7 +79,16 @@ for _ in $(seq 1 30); do curl -s -m 2 "http://127.0.0.1:$RELAY_PORT/v1/info" | g
 curl -s -m 5 "http://127.0.0.1:$RELAY_PORT/v1/info" | grep -q 'ETH/XMR' || { echo "!! the relay did not come up with the ETH/XMR pair"; exit 1; }
 
 echo "== the trade: 0.001 SepETH for $(python3 -c "print($ATOMS/1e12)") stagenet XMR (expect 40-60 minutes)"
-COIN=xmr RELAY=http://127.0.0.1:$RELAY_PORT FUNDER_RPC=127.0.0.1:$FUNDER_PORT XMZ_NODE=$NODE XMZ_ATOMS=$ATOMS \
-  WALLET_RPC_BIN=$MONERO_DIR/linux-x64/monero-wallet-rpc VALUE_WEI=${VALUE_WEI:-1000000000000000} \
-  WITNESSES=${WITNESSES:-http://stagenet.xmr-tw.org:38081,http://node2.monerodevs.org:38089} \
-  cargo run --offline --example market_e2e -- "$WORK/run" 2>&1 | tee -a "$WORK/run.log"
+for attempt in 1 2; do
+  code=0
+  COIN=xmr RELAY=http://127.0.0.1:$RELAY_PORT FUNDER_RPC=127.0.0.1:$FUNDER_PORT XMZ_NODE=$NODE XMZ_ATOMS=$ATOMS \
+    WALLET_RPC_BIN=$MONERO_DIR/linux-x64/monero-wallet-rpc VALUE_WEI=${VALUE_WEI:-1000000000000000} \
+    WITNESSES=${WITNESSES:-$OTHERS} \
+    cargo run --offline --example market_e2e -- "$WORK/run" 2>&1 | tee -a "$WORK/run.log" || code=$?
+  [ "$code" = 3 ] || exit "$code"
+  # The trade ended without a swap (refund or abort; every coin is back). Keep its files aside
+  # and trade once more from the start.
+  mv "$WORK/run" "$WORK/run-ended-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$WORK/run"
+  [ "$attempt" = 1 ] && echo "== that trade ended without a swap; starting a new one"
+done
+exit 3

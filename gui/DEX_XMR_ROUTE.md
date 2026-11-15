@@ -99,6 +99,14 @@ default. Test networks always accept XMR. Opening needs, in order:
    0.18.5.4 (owner's run): wallet-level test 1/1, swap tests 11/11.
 2. Public test networks: Sepolia + Monero stagenet through the helper's commands and a relay,
    `COIN=xmr cargo run --example market_e2e -- <run dir>` (needs stagenet XMR in a funder wallet).
+   **Not passed yet.** 2026-11-14 run: offer posted, taken, keys agreed, the Sepolia lock
+   sent; then the public stagenet node gave the trade's wallets no blocks for twelve hours.
+   The XMR seller stopped at the lock deadline with nothing locked (correct). The ETH side
+   did not refund, because every round ended on the wallet error: a fault in the engine, not
+   in the test. Fixed: the owner's refund no longer needs the private coin's wallet
+   (`the_owner_refunds_while_the_private_coins_node_is_down`), and a wallet whose node does
+   not answer is moved to the witness nodes (`WalletRpcXmz::refresh`). The script now picks
+   a node a wallet can really sync from and starts a new trade after one that ended unswapped.
 3. App integration (below), then an app-to-app stagenet trade and a refund run.
 4. Real funds: owner's own-accounts XMR/BNB swap on mainnet with small amounts, then signed
    control documents with XMR caps.

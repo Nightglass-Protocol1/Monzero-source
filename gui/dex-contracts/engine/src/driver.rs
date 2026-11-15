@@ -323,7 +323,7 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
     /// One round: observe, step, save, act. Returns the new state.
     pub async fn tick(&mut self) -> Result<RoleState, DriverError> {
         let mut record = self.journal.load()?;
-        let snap = self.snapshot(&record.state).await?;
+        let (snap, xmz_down) = self.snapshot(&record.state).await?;
         let (next, actions) = match &record.state {
             RoleState::Owner(s) => {
                 let (n, a) = owner_step(s, &self.trade, &snap);
@@ -334,6 +334,16 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
                 (RoleState::Claimer(n), a)
             }
         };
+        // The private coin's wallet or node did not answer. The owner's refund does not depend on
+        // it: the times and the contract alone decide it, and the step takes the same refund with
+        // or without a view of the other coin. Everything else waits for the wallet.
+        if let Some(e) = xmz_down {
+            let refunding = matches!(next, RoleState::Owner(OwnerState::RefundSent { .. } | OwnerState::Done(crate::machine::Outcome::Refunded)))
+                && actions.iter().all(|a| matches!(a, Action::SendRefund(_)));
+            if !refunding {
+                return Err(e);
+            }
+        }
         // A trade started with `start` locks our funds only after the user approved it
         let locks = actions.iter().any(|a| matches!(a, Action::SendNewSwap | Action::LockXmz { .. }));
         if locks && record.trade.as_ref().is_some_and(|t| record.approved != Some(t.transcript)) {
@@ -370,7 +380,9 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         Ok(next)
     }
 
-    async fn snapshot(&self, state: &RoleState) -> Result<Snapshot, DriverError> {
+    /// What both chains show now. When the private coin's side fails, the snapshot is still
+    /// returned, without a lock or sweep seen, together with the error.
+    async fn snapshot(&self, state: &RoleState) -> Result<(Snapshot, Option<DriverError>), DriverError> {
         let now = self.chain.now().await?;
         let evm_lock = self.chain.find_lock(&self.trade.terms).await?;
         // The swap: from our state once known, else from the observed lock. A lock that does
@@ -382,14 +394,12 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
             Some(swap) => (Some(self.chain.stage(swap_id(swap)).await?), self.chain.revealed(swap).await?),
             None => (None, None),
         };
-        Ok(Snapshot {
-            now,
-            evm_lock,
-            stage,
-            revealed,
-            xmz_lock: self.xmz.lock_status().await?,
-            xmz_swept: self.xmz.swept().await?,
-        })
+        let xmz = async { Ok::<_, DriverError>((self.xmz.lock_status().await?, self.xmz.swept().await?)) }.await;
+        let (xmz_lock, xmz_swept, down) = match xmz {
+            Ok((lock, swept)) => (lock, swept, None),
+            Err(e) => (None, false, Some(e)),
+        };
+        Ok((Snapshot { now, evm_lock, stage, revealed, xmz_lock, xmz_swept }, down))
     }
 
     async fn execute(&mut self, action: Action) -> Result<(), DriverError> {
