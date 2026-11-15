@@ -682,7 +682,7 @@ int main(int argc, char *argv[])
     // sell) on the same engine, with no need for the DEX website. Elsewhere the public wallet has no
     // trading page: trading is on the DEX website, and the wallet only asks (connect, password,
     // approve) in prompts. Developer builds keep the in-wallet trading screen everywhere.
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) || defined(Q_OS_WIN)
     const bool dexNativeExchange = dexPrototypeEnabled;
 #else
     const bool dexNativeExchange = false;
