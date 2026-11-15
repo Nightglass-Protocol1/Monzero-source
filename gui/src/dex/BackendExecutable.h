@@ -10,6 +10,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #elif defined(Q_OS_WIN)
+// Keep windows.h from pulling in the old WinSock.h: Qt/boost::asio include winsock2 and the two clash
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
