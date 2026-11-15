@@ -1,3 +1,4 @@
+#include "DexExchangeFeed.h"
 #include "DexChains.h"
 #include "DexEngine.h"
 #include <sodium.h>
@@ -198,6 +199,21 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     connect(m_evmTrade,&EvmTradeJob::changed,this,&DexEngine::evmTradeChanged);
     m_evmTicker->setInterval(20000);
     connect(m_evmTicker,&QTimer::timeout,this,&DexEngine::stepEvmTrade);
+    // The exchange page's public data comes only from the markets' own relays and RPC nodes, for
+    // this wallet's own trade account (see DexExchangeFeed)
+    m_exchangeFeed=new DexExchangeFeed([this](const QString &coin){
+        DexExchangeFeed::Source source;
+        if (auto *job=evmMarketForCoin(coin)) {
+            const auto config=job->config();
+            for (const auto &relay:config.value("relays").toArray()) source.relays<<relay.toString();
+            source.rpc=config.value("evmRpc").toString();
+            source.solana=DexChains::solana(qint64(config.value("chainId").toDouble()));
+            source.account=source.solana ? job->solAccount() : m_evmAccount;
+        } else {
+            source.relays=defaultRelays();
+        }
+        return source;
+    },this);
     m_marketTicker=new QTimer(this);
     m_marketTicker->setInterval(20000);
     connect(m_marketTicker,&QTimer::timeout,this,&DexEngine::stepEvmMarket);
@@ -1036,6 +1052,7 @@ bool DexEngine::configureEvmMarket(const QString &config,const QString &seedFile
     m_evmSeedFile=seedFile;
     return addEvmMarket(config);
 }
+QObject *DexEngine::exchangeFeed() const {return m_exchangeFeed;}
 QVariantMap DexEngine::evmMarketStatus() const {
     // By coin ("ETH", "BNB"); each with the shared message
     QVariantMap all;

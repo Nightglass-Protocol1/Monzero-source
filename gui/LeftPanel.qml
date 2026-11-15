@@ -423,8 +423,9 @@ Rectangle {
                 visible: dexPrototypeEnabled && (typeof dexFullPage === "undefined" || dexFullPage)
                 anchors.left: parent.left
                 anchors.right: parent.right
-                text: qsTr("Trade") + translationManager.emptyString
-                symbol: qsTr("Preview") + translationManager.emptyString
+                readonly property bool exchange: typeof dexNativeExchange !== "undefined" && dexNativeExchange === true
+                text: (exchange ? qsTr("Exchange") : qsTr("Trade")) + translationManager.emptyString
+                symbol: (exchange ? "" : qsTr("Preview")) + translationManager.emptyString
                 onClicked: {
                     parent.previousButton.checked = false
                     parent.previousButton = dexButton

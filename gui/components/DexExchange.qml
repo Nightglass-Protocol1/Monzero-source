@@ -1,0 +1,661 @@
+import QtQuick 2.9
+import QtQuick.Layouts 1.1
+
+import "." as M
+import "dexExchange.js" as X
+
+// The in-app exchange (Linux): XMZ against ETH, BNB and SOL without the DEX website. Pair tabs,
+// a stats bar, the price chart, the order book and a buy/sell form, with your orders, the running
+// trade, recent market trades and your trading funds below.
+//
+// Offers come from the open relays through the pinned swap helper (maker signature and contract
+// checked) via the engine; orders go to the same engine calls the website uses (take, post,
+// cancel), and the swap itself still asks for approval before anything is locked. The chart,
+// recent trades, coin balances and USD prices are read-only public data fetched here.
+ColumnLayout {
+    id: ex
+    property var dex: ({})                 // DexEngine
+    // Public data (chart, trades, balances, USD prices) is fetched only while this is set (tests clear it)
+    property bool fetchEnabled: true
+    // On screen: offers, chart and balances refresh only while the page is open
+    property bool active: true
+    spacing: 12
+
+    // ---- state from the engine
+    readonly property var wallet: dex.dexWalletStatus || ({})
+    readonly property var markets: dex.evmMarketStatus || ({})
+    readonly property var trade: dex.evmTradeStatus || ({})
+    readonly property var market: markets[coin] || ({})
+    readonly property bool keysReady: wallet.keysReady === true
+    readonly property var allCoins: ["ETH", "BNB", "SOL"]
+    property string coin: "ETH"
+    readonly property int coinDecimals: coin === "SOL" ? 9 : 18
+    readonly property int chainId: Number(market.chainId) || 0
+    readonly property var relays: (market.relays && market.relays.length) ? market.relays : ["https://relay1.monzero.org", "https://relay2.monzero.org"]
+    readonly property string myAccount: wallet.tradeAccount || ""
+    readonly property string coinAccount: coin === "SOL" ? (wallet.solTradeAccount || "") : myAccount
+    readonly property var tradeSnapshot: trade.snapshot || ({})
+    readonly property bool tradeRunning: trade.configured === true && tradeSnapshot.done !== true
+    readonly property string tradeCoin: {
+        var o = tradeSnapshot.offer
+        var id = o ? Number(o.chainId) : 0
+        return id >= 501000101 && id <= 501000103 ? "SOL" : id === 56 || id === 97 ? "BNB" : "ETH"
+    }
+
+    // ---- public data fetched here
+    property real now: Date.now() / 1000
+    property int interval: 3600
+    property var candles: ({})             // coin -> hourly candles (for the tabs and the stats)
+    property var chartData: []             // the chart's candles for this coin and interval
+    property bool chartLoading: false
+    property var prints: ({})              // coin -> trades, newest first
+    property var usd: ({})                 // coin -> USD price
+    property var balances: ({})            // coin -> trade account balance (coin)
+    property string localError: ""
+    property string pickedId: ""
+    property string bottomTab: "orders"
+    property var withdrawTo: {
+        var m = {}
+        try { m = JSON.parse(typeof persistentSettings !== "undefined" ? (persistentSettings.dexExternalWallets || "{}") : "{}") || {} } catch (e) { m = {} }
+        return m
+    }
+
+    readonly property var book: X.book(market.listings || [], coin, coinDecimals, myAccount, now)
+    readonly property var stats: X.dayStats(candles[coin] || [], now)
+    readonly property real coinUsd: usd[coin] || 0
+    readonly property real xmzBalance: wallet.state === "ready" && wallet.unlocked !== undefined ? Number(wallet.unlocked) : -1
+    readonly property real coinBalance: balances[coin] !== undefined ? balances[coin] : -1
+    readonly property var myOrders: {
+        var out = []
+        for (var i = 0; i < allCoins.length; ++i) {
+            var mine = (markets[allCoins[i]] || {}).mine || []
+            for (var j = 0; j < mine.length; ++j) {
+                var o = mine[j]
+                if (o.state === "cancelled" && Number(o.expiresAt) < now - 86400) continue
+                out.push({ coin: allCoins[i], kind: o.kind, state: o.state, side: o.side, xmz: o.xmz, amount: o.coin, price: o.price,
+                           expiresAt: Number(o.expiresAt), folder: o.folder, detail: o.detail || "" })
+            }
+        }
+        out.sort(function (a, b) { return (a.state === "open" ? 0 : 1) - (b.state === "open" ? 0 : 1) || b.expiresAt - a.expiresAt })
+        return out
+    }
+    readonly property int openOrders: myOrders.filter(function (o) { return o.state === "open" }).length
+
+    readonly property string blockedReason: {
+        if (wallet.state === undefined || wallet.state === "unconfigured") return qsTr("Trading is starting…")
+        if (!keysReady) return qsTr("Unlock trading first")
+        if (wallet.state !== "ready") return qsTr("The trading wallet is starting…")
+        if (market.configured !== true) return qsTr("This market is starting…")
+        return ""
+    }
+
+    function marketChain(c) { return Number((markets[c] || {}).chainId) || 0 }
+    function rpcFor(id) {
+        return ({ 1: "https://ethereum-rpc.publicnode.com", 56: "https://bsc-rpc.publicnode.com", 501000101: "https://solana-rpc.publicnode.com",
+                  11155111: "https://ethereum-sepolia-rpc.publicnode.com", 97: "https://bsc-testnet-rpc.publicnode.com", 501000102: "https://api.devnet.solana.com" })[id] || ""
+    }
+    function networkName(id) {
+        return id === 1 ? qsTr("Ethereum") : id === 56 ? qsTr("BNB Smart Chain") : id === 501000101 ? qsTr("Solana")
+             : id === 11155111 ? qsTr("Sepolia (test network)") : id === 97 ? qsTr("BNB Smart Chain Testnet") : id === 501000102 ? qsTr("Solana Devnet") : ""
+    }
+
+    // ---- fetching (read-only public data). In the app it comes through the engine's feed (QML may
+    // not use the network there); without one (tests, previews) the page fetches it itself.
+    readonly property var feed: dex && dex.exchangeFeed ? dex.exchangeFeed : null
+    Connections {
+        target: ex.feed
+        ignoreUnknownSignals: true
+        function onChanged() { ex.syncFeed() }
+    }
+    function decimalsOf(c) { return c === "SOL" ? 9 : 18 }
+    function syncFeed() {
+        var d = feed.data
+        var cs = JSON.parse(JSON.stringify(candles)), ps = JSON.parse(JSON.stringify(prints)), bs = JSON.parse(JSON.stringify(balances))
+        for (var i = 0; i < allCoins.length; ++i) {
+            var c = allCoins[i]
+            if (d["candles:" + c + ":3600"]) cs[c] = d["candles:" + c + ":3600"]
+            if (d["prints:" + c]) ps[c] = X.trades(d["prints:" + c], decimalsOf(c))
+            if (d["balance:" + c] !== undefined) bs[c] = Number(d["balance:" + c]) / Math.pow(10, decimalsOf(c))
+        }
+        candles = cs; prints = ps; balances = bs
+        if (d.usd) usd = d.usd
+        var chartKey = "candles:" + coin + ":" + interval
+        if (d[chartKey]) { chartData = d[chartKey]; chartLoading = false }
+    }
+    function get(url, done) {
+        if (!fetchEnabled) { done(null); return }
+        var xhr = new XMLHttpRequest()
+        xhr.onreadystatechange = function () {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return
+            var data = null
+            if (xhr.status === 200) { try { data = JSON.parse(xhr.responseText) } catch (e) { data = null } }
+            done(data)
+        }
+        xhr.open("GET", url); xhr.send()
+    }
+    function post(url, body, done) {
+        if (!fetchEnabled) { done(null); return }
+        var xhr = new XMLHttpRequest()
+        xhr.onreadystatechange = function () {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return
+            var data = null
+            if (xhr.status === 200) { try { data = JSON.parse(xhr.responseText) } catch (e) { data = null } }
+            done(data)
+        }
+        xhr.open("POST", url); xhr.setRequestHeader("Content-Type", "application/json"); xhr.send(JSON.stringify(body))
+    }
+    // From the first relay that answers
+    function relayGet(path, done, i) {
+        i = i || 0
+        if (i >= relays.length) { done(null); return }
+        get(String(relays[i]).replace(/\/+$/, "") + path, function (d) { if (d) done(d); else relayGet(path, done, i + 1) })
+    }
+    function loadCandles(c) {
+        if (feed) { feed.candles(c, 3600); return }
+        relayGet("/v1/candles?interval=3600&pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
+            if (!d || !d.candles) return
+            var m = JSON.parse(JSON.stringify(ex.candles)); m[c] = d.candles; ex.candles = m
+            if (c === ex.coin && ex.interval === 3600) ex.chartData = d.candles
+        })
+    }
+    function loadChart() {
+        var c = coin, iv = interval
+        chartLoading = true
+        if (feed) { if (feed.data["candles:" + c + ":" + iv]) syncFeed(); feed.candles(c, iv); return }
+        relayGet("/v1/candles?interval=" + iv + "&pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
+            if (c !== ex.coin || iv !== ex.interval) return
+            ex.chartLoading = false
+            ex.chartData = d && d.candles ? d.candles : []
+        })
+    }
+    function loadPrints(c) {
+        if (feed) { feed.prints(c); return }
+        relayGet("/v1/prints?pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
+            if (!d || !d.prints) return
+            var m = JSON.parse(JSON.stringify(ex.prints)); m[c] = X.trades(d.prints, c === "SOL" ? 9 : 18); ex.prints = m
+        })
+    }
+    function loadUsd() {
+        if (feed) { feed.usdPrices(); return }
+        get("https://monzero.org/markets/api.php", function (d) {
+            if (!d || !d.coins) return
+            var m = {}
+            for (var i = 0; i < d.coins.length; ++i) if (Number(d.coins[i].usd) > 0) m[d.coins[i].symbol] = Number(d.coins[i].usd)
+            ex.usd = m
+        })
+    }
+    function loadBalance(c) {
+        if (feed) { feed.balance(c); return }
+        var id = marketChain(c), rpc = rpcFor(id)
+        var account = c === "SOL" ? (wallet.solTradeAccount || "") : myAccount
+        if (!rpc || !account) return
+        var store = function (value) { var m = JSON.parse(JSON.stringify(ex.balances)); m[c] = value; ex.balances = m }
+        if (c === "SOL") {
+            post(rpc, { jsonrpc: "2.0", id: 1, method: "getBalance", params: [account, { commitment: "confirmed" }] }, function (d) {
+                if (d && d.result && d.result.value !== undefined) store(Number(d.result.value) / 1e9)
+            })
+        } else {
+            post(rpc, { jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [account, "latest"] }, function (d) {
+                if (d && typeof d.result === "string") store(parseInt(d.result, 16) / 1e18)
+            })
+        }
+    }
+    function refreshOffers() {
+        if (market.configured === true && market.busy !== true) dex.refreshEvmOffers(coin + "/XMZ")
+    }
+    function refreshAll() {
+        for (var i = 0; i < allCoins.length; ++i) { loadCandles(allCoins[i]); loadBalance(allCoins[i]) }
+        loadPrints(coin)
+        if (interval !== 3600) loadChart()
+    }
+    function pick(c) {
+        if (c === coin) return
+        coin = c; pickedId = ""; localError = ""
+        chartData = interval === 3600 ? (candles[c] || []) : []
+        if (interval !== 3600) loadChart()
+        loadPrints(c); loadBalance(c)
+        refreshOffers()
+    }
+    function setWithdrawTo(c, address) {
+        var m = JSON.parse(JSON.stringify(withdrawTo))
+        if (address) m[c] = address; else delete m[c]
+        if (typeof persistentSettings !== "undefined") {
+            persistentSettings.dexExternalWallets = JSON.stringify(m)
+            if (c === "BNB") persistentSettings.dexExternalWallet = address || ""
+        }
+        withdrawTo = m
+    }
+    function mainAddress() {
+        return typeof appWindow !== "undefined" && appWindow.currentWallet ? appWindow.currentWallet.address(0, 0) : ""
+    }
+
+    Timer {
+        // Offers every 20 s, the rest every minute; the clock for expiries every 5 s
+        interval: 5000; running: ex.visible && ex.active; repeat: true; triggeredOnStart: true
+        property int tick: 0
+        onRunningChanged: if (running) tick = 0     // fresh data as soon as the page opens
+        onTriggered: {
+            ex.now = Date.now() / 1000
+            if (tick % 4 === 0) ex.refreshOffers()
+            if (tick % 12 === 0) ex.refreshAll()
+            if (tick % 120 === 0) ex.loadUsd()
+            tick++
+        }
+    }
+    onIntervalChanged: { if (interval === 3600) chartData = candles[coin] || []; else loadChart() }
+    onKeysReadyChanged: if (keysReady) refreshAll()
+
+    // ---- header: title and pairs
+    RowLayout {
+        Layout.fillWidth: true
+        spacing: 12
+        Text { text: qsTr("Exchange"); font.pixelSize: 26; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+        Text {
+            text: qsTr("Atomic swaps · your coins stay yours until each swap completes or refunds")
+            font.pixelSize: 12; color: M.Style.dimmedFontColor; Layout.fillWidth: true; elide: Text.ElideRight
+        }
+    }
+    Flow {
+        Layout.fillWidth: true
+        spacing: 8
+        Repeater {
+            model: ex.allCoins
+            delegate: Rectangle {
+                objectName: "pair_" + modelData
+                readonly property bool active: ex.coin === modelData
+                readonly property var st: X.dayStats(ex.candles[modelData] || [], ex.now)
+                width: 190; height: 54; radius: 6
+                color: active ? M.Style.surfaceRaised : "transparent"
+                border.color: active ? M.Style.accent : M.Style.accentMuted
+                Column {
+                    anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                    spacing: 3
+                    Text { text: "XMZ / " + modelData; font.pixelSize: 15; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    Row {
+                        spacing: 8
+                        Text { text: st.last > 0 ? X.price(st.last) + " " + modelData : qsTr("no trades yet"); font.pixelSize: 11; color: M.Style.dimmedFontColor }
+                        Text {
+                            visible: !isNaN(st.change)
+                            text: isNaN(st.change) ? "" : (st.change >= 0 ? "+" : "") + st.change.toFixed(2) + "%"
+                            font.pixelSize: 11; color: st.change >= 0 ? M.Style.green : "#E5677A"
+                        }
+                    }
+                }
+                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pick(modelData) }
+            }
+        }
+    }
+
+    // ---- unlock trading (once per session)
+    Rectangle {
+        objectName: "unlockCard"
+        Layout.fillWidth: true
+        visible: !ex.keysReady && ex.wallet.state !== undefined && ex.wallet.state !== "unconfigured"
+        radius: 8; color: "transparent"; border.color: M.Style.accent
+        implicitHeight: unlockCol.implicitHeight + 28
+        ColumnLayout {
+            id: unlockCol
+            anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 14
+            spacing: 8
+            Text {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 14; color: M.Style.defaultFontColor
+                text: ex.wallet.keysBusy === true ? qsTr("Setting up your trading keys…")
+                    : ex.wallet.keysExist === true ? qsTr("Enter your trading password to start trading. Browsing the market needs no password.")
+                    : qsTr("Choose a trading password to start trading. Your trading keys are made and kept encrypted on this device; keep the password safe, nobody can restore it.")
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                visible: ex.wallet.keysBusy !== true
+                M.LineEdit { id: pw; objectName: "exchangePassword"; Layout.fillWidth: true; password: true; fontSize: 15; inputPaddingTop: 8; inputPaddingBottom: 8
+                             placeholderText: ex.wallet.keysExist === true ? qsTr("Trading password") : qsTr("New trading password"); placeholderFontSize: 15
+                             onAccepted: unlockButton.go() }
+                M.LineEdit { id: pw2; Layout.fillWidth: true; password: true; visible: ex.wallet.keysExist !== true; fontSize: 15; inputPaddingTop: 8; inputPaddingBottom: 8
+                             placeholderText: qsTr("Repeat the password"); placeholderFontSize: 15; onAccepted: unlockButton.go() }
+                M.StandardButton {
+                    id: unlockButton; objectName: "exchangeUnlock"
+                    text: ex.wallet.keysExist === true ? qsTr("Unlock") : qsTr("Create trading keys")
+                    enabled: pw.text !== "" && (ex.wallet.keysExist === true || pw.text === pw2.text)
+                    function go() { if (!enabled) return; ex.dex.setUpTradingKeys(pw.text); pw.text = ""; pw2.text = "" }
+                    onClicked: go()
+                }
+            }
+            Text {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.errorColor
+                visible: (ex.wallet.keysMessage || "") !== ""
+                text: ex.wallet.keysMessage || ""
+            }
+        }
+    }
+
+    // ---- the running trade, always on top while it runs
+    M.DexTradeProgress {
+        objectName: "exchangeTrade"
+        Layout.fillWidth: true
+        visible: ex.trade.configured === true
+        trade: ex.trade
+        coin: ex.tradeCoin
+        coinDecimals: ex.tradeCoin === "SOL" ? 9 : 18
+        errorText: ex.localError
+        externalWallet: ex.withdrawTo[ex.tradeCoin] || ""
+        onApprove: ex.localError = ex.dex.approveEvmTrade(commitment) ? "" : qsTr("Approval could not start.")
+        onRefresh: ex.localError = ex.dex.refreshEvmTrade() ? "" : qsTr("Refresh could not start.")
+        onPayoutRequested: ex.localError = ex.dex.payoutEvmTrade(ex.withdrawTo[ex.tradeCoin] || "") ? "" : qsTr("The payout could not start.")
+    }
+    Text {
+        objectName: "abandonTrade"
+        visible: ex.trade.configured === true && ex.trade.awaitingApproval === true
+        text: qsTr("Changed your mind? Cancel this trade (nothing is locked yet)")
+        font.pixelSize: 12; color: M.Style.dimmedFontColor; font.underline: true
+        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.localError = ex.dex.abandonEvmTrade() ? "" : qsTr("The trade could not be cancelled now.") }
+    }
+
+    // ---- stats bar
+    Rectangle {
+        Layout.fillWidth: true
+        implicitHeight: statsFlow.implicitHeight + 20
+        radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
+        Flow {
+            id: statsFlow
+            anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; anchors.margins: 14
+            spacing: 28
+            Repeater {
+                model: [
+                    { k: qsTr("Last price"), v: ex.stats.last > 0 ? X.price(ex.stats.last) + " " + ex.coin : "—",
+                      s: ex.stats.last > 0 && ex.coinUsd > 0 ? "≈ " + X.usd(ex.stats.last * ex.coinUsd) : "" },
+                    { k: qsTr("24h change"), v: isNaN(ex.stats.change) ? "—" : (ex.stats.change >= 0 ? "+" : "") + ex.stats.change.toFixed(2) + "%", c: isNaN(ex.stats.change) ? "" : ex.stats.change >= 0 ? "up" : "down" },
+                    { k: qsTr("24h high"), v: ex.stats.high > 0 ? X.price(ex.stats.high) : "—" },
+                    { k: qsTr("24h low"), v: ex.stats.low > 0 ? X.price(ex.stats.low) : "—" },
+                    { k: qsTr("24h volume"), v: X.amount(ex.stats.volume, 0) + " XMZ", s: ex.stats.volumeCoin > 0 ? X.plain(ex.stats.volumeCoin, 4) + " " + ex.coin : "" },
+                    { k: qsTr("Best bid"), v: ex.book.bestBid > 0 ? X.price(ex.book.bestBid) : "—", c: "up" },
+                    { k: qsTr("Best ask"), v: ex.book.bestAsk > 0 ? X.price(ex.book.bestAsk) : "—", c: "down" }
+                ]
+                delegate: Column {
+                    spacing: 2
+                    Text { text: modelData.k; font.pixelSize: 11; color: M.Style.dimmedFontColor }
+                    Text { text: modelData.v; font.pixelSize: 15; font.family: M.Style.fontMonoMedium.name
+                           color: modelData.c === "up" ? M.Style.green : modelData.c === "down" ? "#E5677A" : M.Style.defaultFontColor }
+                    Text { visible: !!modelData.s; text: modelData.s || ""; font.pixelSize: 11; color: M.Style.dimmedFontColor }
+                }
+            }
+        }
+    }
+
+    // Offers that could not be loaded must not look like an empty market
+    Text {
+        objectName: "marketNotice"
+        Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.warningColor
+        visible: text !== ""
+        text: ex.market.configured !== true ? ""
+            : (ex.market.state === "failed" || ex.market.state === "refused") && ex.market.command === "listings"
+              ? qsTr("The %1 offers could not be loaded from the relays: %2. Retrying…").arg(ex.coin).arg(ex.market.error || qsTr("no answer"))
+            : ""
+    }
+
+    // ---- chart, book and form: three columns when wide, otherwise stacked
+    GridLayout {
+        id: grid
+        Layout.fillWidth: true
+        columns: ex.width >= 1180 ? 3 : ex.width >= 820 ? 2 : 1
+        columnSpacing: 12; rowSpacing: 12
+        M.DexPriceChart {
+            objectName: "exchangeChart"
+            Layout.fillWidth: true
+            Layout.columnSpan: grid.columns === 2 ? 2 : 1
+            Layout.preferredHeight: grid.columns === 3 ? Math.max(460, book.implicitHeight) : 380
+            Layout.alignment: Qt.AlignTop
+            coin: ex.coin
+            candles: ex.chartData
+            interval: ex.interval
+            bestBid: ex.book.bestBid
+            bestAsk: ex.book.bestAsk
+            coinUsd: ex.coinUsd
+            loading: ex.chartLoading
+            now: ex.now
+            onIntervalPicked: ex.interval = seconds
+        }
+        M.DexOrderBook {
+            id: book
+            objectName: "exchangeBook"
+            Layout.fillWidth: grid.columns !== 3
+            Layout.preferredWidth: grid.columns === 3 ? 330 : -1
+            Layout.alignment: Qt.AlignTop
+            coin: ex.coin
+            book: ex.book
+            lastPrice: ex.stats.last
+            coinUsd: ex.coinUsd
+            pickedId: ex.pickedId
+            onPicked: {
+                if (row.mine) { ex.bottomTab = "orders"; return }
+                ex.pickedId = row.id
+                form.fillFrom(row)
+            }
+        }
+        M.DexOrderForm {
+            id: form
+            objectName: "exchangeForm"
+            Layout.fillWidth: grid.columns !== 3
+            Layout.preferredWidth: grid.columns === 3 ? 340 : -1
+            Layout.alignment: Qt.AlignTop
+            coin: ex.coin
+            coinDecimals: ex.coinDecimals
+            book: ex.book
+            coinUsd: ex.coinUsd
+            coinBalance: ex.coinBalance
+            xmzBalance: ex.xmzBalance
+            blockedReason: ex.blockedReason !== "" ? ex.blockedReason
+                         : form.type === "market" && ex.tradeRunning ? qsTr("Finish your current trade first") : ""
+            busy: ex.market.busy === true
+            message: ex.localError !== "" ? ex.localError : (ex.market.message || "")
+            pickedId: ex.pickedId
+            onClearPick: ex.pickedId = ""
+            onTakeRequested: {
+                ex.localError = ""
+                if (ex.dex.takeEvmOffer(listingId, xmz)) { ex.pickedId = ""; ex.bottomTab = "orders" }
+                else if (!(ex.market.message || "")) ex.localError = qsTr("The offer could not be taken now.")
+            }
+            onPostRequested: {
+                ex.localError = ""
+                if (ex.dex.postEvmOffer(ex.chainId, side, coinAmount, xmz, hours, minXmz)) ex.bottomTab = "orders"
+                else if (!(ex.market.message || "")) ex.localError = qsTr("The offer could not be posted now.")
+            }
+        }
+    }
+
+    // ---- below: orders, market trades, funds
+    Rectangle {
+        Layout.fillWidth: true
+        implicitHeight: bottomCol.implicitHeight + 24
+        radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
+        ColumnLayout {
+            id: bottomCol
+            anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 12
+            spacing: 10
+            RowLayout {
+                spacing: 22
+                Repeater {
+                    model: [ { k: "orders", t: qsTr("My orders") + (ex.openOrders ? " (" + ex.openOrders + ")" : "") },
+                             { k: "trades", t: qsTr("Market trades") },
+                             { k: "funds", t: qsTr("Funds") } ]
+                    delegate: Column {
+                        objectName: "tab_" + modelData.k
+                        spacing: 4
+                        Text { text: modelData.t; font.pixelSize: 14; color: ex.bottomTab === modelData.k ? M.Style.defaultFontColor : M.Style.dimmedFontColor
+                               MouseArea { anchors.fill: parent; anchors.margins: -6; cursorShape: Qt.PointingHandCursor; onClicked: ex.bottomTab = modelData.k } }
+                        Rectangle { width: parent.width; height: 2; color: ex.bottomTab === modelData.k ? M.Style.accent : "transparent" }
+                    }
+                }
+            }
+
+            // My orders: offers I posted and offers I took
+            ColumnLayout {
+                Layout.fillWidth: true; spacing: 4
+                visible: ex.bottomTab === "orders"
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: ex.myOrders.length > 0
+                    Repeater {
+                        model: [[qsTr("Pair"), 2], [qsTr("Order"), 3], [qsTr("Price"), 3], [qsTr("XMZ"), 3], [qsTr("Total"), 3], [qsTr("Status"), 5], ["", 2]]
+                        delegate: Text { text: modelData[0]; font.pixelSize: 11; color: M.Style.dimmedFontColor; Layout.fillWidth: true; Layout.preferredWidth: modelData[1] }
+                    }
+                }
+                Repeater {
+                    model: ex.myOrders
+                    delegate: RowLayout {
+                        Layout.fillWidth: true
+                        readonly property bool buys: (modelData.kind === "offer") === (modelData.side === "buy-xmz")
+                        Text { text: "XMZ/" + modelData.coin; font.pixelSize: 13; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 2 }
+                        Text { text: (parent.buys ? qsTr("Buy") : qsTr("Sell")) + " · " + (modelData.kind === "offer" ? qsTr("limit") : qsTr("market"))
+                               font.pixelSize: 13; color: parent.buys ? M.Style.green : "#E5677A"; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                        Text { text: modelData.price || "—"; font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                        Text { text: modelData.xmz; font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                        Text { text: modelData.amount + " " + modelData.coin; font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                        Text {
+                            Layout.fillWidth: true; Layout.preferredWidth: 5; elide: Text.ElideRight
+                            font.pixelSize: 12; color: M.Style.dimmedFontColor
+                            text: (modelData.state === "open" ? (modelData.kind === "offer" ? qsTr("open · %1 h left").arg(Math.max(0, Math.round((modelData.expiresAt - ex.now) / 360) / 10)) : qsTr("waiting for the maker"))
+                                  : modelData.state === "agreed" ? qsTr("matched: see the trade above")
+                                  : modelData.state === "expired" ? qsTr("expired") : modelData.state === "cancelled" ? qsTr("cancelled") : modelData.state)
+                                  + (modelData.detail ? " · " + modelData.detail : "")
+                        }
+                        Item {
+                            Layout.fillWidth: true; Layout.preferredWidth: 2; implicitHeight: 22
+                            Text {
+                                visible: modelData.kind === "offer" && modelData.state === "open"
+                                anchors.right: parent.right
+                                text: qsTr("Cancel"); font.pixelSize: 13; color: "#E5677A"
+                                MouseArea { anchors.fill: parent; anchors.margins: -4; cursorShape: Qt.PointingHandCursor
+                                            onClicked: ex.localError = ex.dex.cancelEvmOffer(modelData.folder) ? "" : qsTr("The offer could not be cancelled now.") }
+                            }
+                        }
+                    }
+                }
+                Text {
+                    visible: ex.myOrders.length === 0
+                    text: qsTr("No orders yet. Buy or sell above; your open offers and trades appear here.")
+                    font.pixelSize: 13; color: M.Style.dimmedFontColor
+                }
+            }
+
+            // Market trades: completed swaps of this pair, newest first
+            ColumnLayout {
+                Layout.fillWidth: true; spacing: 4
+                visible: ex.bottomTab === "trades"
+                readonly property var list: (ex.prints[ex.coin] || []).slice(0, 30)
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: parent.list.length > 0
+                    Repeater {
+                        model: [[qsTr("Time"), 3], [qsTr("Price (%1)").arg(ex.coin), 3], [qsTr("XMZ"), 3], [qsTr("Total"), 3], [qsTr("Transaction"), 3]]
+                        delegate: Text { text: modelData[0]; font.pixelSize: 11; color: M.Style.dimmedFontColor; Layout.fillWidth: true; Layout.preferredWidth: modelData[1] }
+                    }
+                }
+                Repeater {
+                    model: parent.list
+                    delegate: RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: Qt.formatDateTime(new Date(modelData.at * 1000), "d MMM HH:mm"); font.pixelSize: 13; color: M.Style.dimmedFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                        Text { text: X.price(modelData.price); font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                        Text { text: X.amount(modelData.xmz, 2); font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                        Text { text: X.plain(modelData.coin, 6) + " " + ex.coin; font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                        Text { text: modelData.tx.slice(0, 10) + "…"; font.pixelSize: 12; font.family: M.Style.fontMonoRegular.name; color: M.Style.dimmedFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                    }
+                }
+                Text {
+                    visible: parent.list.length === 0
+                    text: qsTr("No completed XMZ/%1 swaps yet.").arg(ex.coin)
+                    font.pixelSize: 13; color: M.Style.dimmedFontColor
+                }
+            }
+
+            // Funds: the trading wallet (XMZ) and this pair's trade account (coin)
+            GridLayout {
+                Layout.fillWidth: true
+                visible: ex.bottomTab === "funds"
+                columns: ex.width >= 900 ? 2 : 1
+                columnSpacing: 24; rowSpacing: 16
+                ColumnLayout {
+                    Layout.fillWidth: true; Layout.alignment: Qt.AlignTop; spacing: 8
+                    Text { text: qsTr("XMZ · trading wallet"); font.pixelSize: 14; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    Text {
+                        objectName: "fundsXmz"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 13; color: M.Style.defaultFontColor
+                        text: ex.wallet.state === "ready" ? qsTr("%1 XMZ available · %2 XMZ in total").arg(ex.wallet.unlocked).arg(ex.wallet.balance)
+                            : ex.wallet.state === "failed" ? qsTr("The trading wallet is not running: %1").arg(ex.wallet.error || "")
+                            : qsTr("Starting the trading wallet…")
+                    }
+                    Text {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor
+                        text: qsTr("XMZ you sell is locked from here; XMZ you buy arrives here. Move XMZ in from your main balance, and back whenever you like.")
+                    }
+                    M.LineEdit { Layout.fillWidth: true; readOnly: true; copyButton: true; fontSize: 12; text: ex.wallet.address || ""; visible: (ex.wallet.address || "") !== "" }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        visible: ex.wallet.state === "ready"
+                        M.LineEdit { id: xmzMove; Layout.fillWidth: true; fontSize: 14; inputPaddingTop: 6; inputPaddingBottom: 6; placeholderText: qsTr("XMZ (empty: all)"); placeholderFontSize: 14 }
+                        M.StandardButton {
+                            small: true; text: qsTr("Add from my wallet")
+                            onClicked: {
+                                if (typeof middlePanel === "undefined") return
+                                middlePanel.state = "Transfer"
+                                middlePanel.transferView.sendTo(ex.wallet.address, "", qsTr("XMZ for trading on the DEX"), xmzMove.text)
+                                if (typeof leftPanel !== "undefined") leftPanel.selectItem(middlePanel.state)
+                            }
+                        }
+                        M.StandardButton {
+                            small: true; primary: false; text: qsTr("Move to my wallet")
+                            enabled: ex.wallet.busy !== true && ex.mainAddress() !== ""
+                            onClicked: ex.localError = ex.dex.sendFromDexWallet(ex.mainAddress(), xmzMove.text) ? "" : qsTr("The XMZ could not be moved now.")
+                        }
+                    }
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true; Layout.alignment: Qt.AlignTop; spacing: 8
+                    Text { text: qsTr("%1 · trade account on %2").arg(ex.coin).arg(ex.networkName(ex.chainId) || ex.coin); font.pixelSize: 14; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    Text {
+                        objectName: "fundsCoin"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 13; color: M.Style.defaultFontColor
+                        text: ex.coinAccount === "" ? (ex.keysReady ? qsTr("Finding your account…") : qsTr("Unlock trading to see your account."))
+                            : ex.coinBalance >= 0 ? qsTr("%1 %2").arg(X.plain(ex.coinBalance, 8)).arg(ex.coin) + (ex.coinUsd > 0 ? "  ≈ " + X.usd(ex.coinBalance * ex.coinUsd) : "")
+                            : qsTr("Reading the balance…")
+                    }
+                    Text {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor
+                        text: qsTr("To buy XMZ, send %1 on %2 here (plus a little for network fees). It is this app's own account: only your trading keys can move it.").arg(ex.coin).arg(ex.networkName(ex.chainId) || ex.coin)
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        visible: ex.coinAccount !== ""
+                        spacing: 12
+                        Image {
+                            Layout.preferredWidth: 96; Layout.preferredHeight: 96; smooth: false; fillMode: Image.PreserveAspectFit
+                            source: !parent.visible ? "" : ex.coin === "SOL" ? "image://qrcode/solana:" + ex.coinAccount
+                                  : "image://qrcode/ethereum:" + ex.coinAccount + "@" + ex.chainId
+                        }
+                        M.LineEdit { Layout.fillWidth: true; readOnly: true; copyButton: true; fontSize: 12; text: ex.coinAccount }
+                    }
+                    Text { text: qsTr("Withdraw to your own %1 wallet").arg(ex.coin); font.pixelSize: 12; color: M.Style.dimmedFontColor; visible: ex.coinAccount !== "" }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        visible: ex.coinAccount !== ""
+                        M.LineEdit { id: withdrawAddress; Layout.fillWidth: true; fontSize: 13; inputPaddingTop: 6; inputPaddingBottom: 6
+                                     text: ex.withdrawTo[ex.coin] || ""; placeholderText: ex.coin === "SOL" ? qsTr("Solana address") : qsTr("0x… address"); placeholderFontSize: 13 }
+                        M.StandardButton {
+                            small: true; text: qsTr("Withdraw")
+                            enabled: withdrawAddress.text.trim() !== "" && ex.market.busy !== true
+                            onClicked: {
+                                var a = withdrawAddress.text.trim()
+                                ex.setWithdrawTo(ex.coin, a)
+                                ex.localError = ex.dex.returnEvmFunds(ex.chainId, a) ? "" : (ex.market.message || qsTr("The withdrawal could not start."))
+                            }
+                        }
+                    }
+                    Text {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor
+                        visible: ex.coinAccount !== ""
+                        text: qsTr("Sends what no open offer or running trade needs, less the network fee. This address is also where a finished trade pays out.")
+                    }
+                }
+            }
+        }
+    }
+}

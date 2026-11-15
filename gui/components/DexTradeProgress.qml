@@ -207,7 +207,9 @@ Rectangle {
             readonly property int chainId: card.snapshot.offer ? Number(card.snapshot.offer.chainId) : 0
             // The network to pick in MetaMask; a wrong one would send the coin somewhere the trade cannot see
             readonly property string network: chainId === 1 ? qsTr("Ethereum Mainnet") : chainId === 56 ? qsTr("BNB Smart Chain")
-                : chainId === 11155111 ? qsTr("Sepolia (test network)") : chainId === 97 ? qsTr("BNB Smart Chain Testnet") : qsTr("chain %1").arg(chainId)
+                : chainId === 11155111 ? qsTr("Sepolia (test network)") : chainId === 97 ? qsTr("BNB Smart Chain Testnet")
+                : chainId === 501000101 ? qsTr("Solana") : chainId === 501000102 ? qsTr("Solana Devnet (test network)") : qsTr("chain %1").arg(chainId)
+            readonly property bool solana: chainId >= 501000101 && chainId <= 501000103
             Layout.fillWidth: true
             visible: missing !== "" && account !== "" && chainId > 0   // never a payment request for an unknown network
             color: "transparent"; radius: 6
@@ -222,7 +224,9 @@ Rectangle {
                     Layout.preferredWidth: 132; Layout.preferredHeight: 132
                     smooth: false; fillMode: Image.PreserveAspectFit
                     // EIP-681 payment request: MetaMask mobile fills in the address, network and amount
-                    source: fundingBox.visible ? "image://qrcode/ethereum:" + fundingBox.account + "@" + fundingBox.chainId + "?value=" + fundingBox.need.missingWei : ""
+                    // Solana Pay on SOL (amount in SOL), EIP-681 elsewhere (amount in wei)
+                    source: !fundingBox.visible ? "" : fundingBox.solana ? "image://qrcode/solana:" + fundingBox.account + "?amount=" + fundingBox.missing
+                          : "image://qrcode/ethereum:" + fundingBox.account + "@" + fundingBox.chainId + "?value=" + fundingBox.need.missingWei
                 }
                 ColumnLayout {
                     Layout.fillWidth: true
@@ -234,7 +238,8 @@ Rectangle {
                     }
                     MonzeroComponents.TextPlain { themeTransition: false; color: MonzeroComponents.Style.dimmedFontColor
                         Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 12
-                        text: (card.externalWallet ? qsTr("From your MetaMask (%1): scan the code with MetaMask mobile, or send to this address from MetaMask on %2.").arg(card.externalWallet.slice(0, 6) + "…" + card.externalWallet.slice(-4)).arg(fundingBox.network)
+                        text: (fundingBox.solana ? qsTr("Scan the code with your Solana wallet, or send to this address from any wallet on %1.").arg(fundingBox.network)
+                              : card.externalWallet ? qsTr("From your MetaMask (%1): scan the code with MetaMask mobile, or send to this address from MetaMask on %2.").arg(card.externalWallet.slice(0, 6) + "…" + card.externalWallet.slice(-4)).arg(fundingBox.network)
                                                    : qsTr("Scan the code with MetaMask mobile, or send to this address from any wallet on %1.").arg(fundingBox.network))
                               + " " + qsTr("This is the trade's own account in this app; it covers the swap and its network fees. Nothing is locked until it arrives.")
                     }
@@ -257,7 +262,7 @@ Rectangle {
                 objectName: "payoutButton"
                 small: true
                 enabled: card.t.busy !== true
-                text: qsTr("Send to MetaMask (%1)").arg(card.externalWallet.slice(0, 6) + "…" + card.externalWallet.slice(-4))
+                text: qsTr("Send to your wallet (%1)").arg(card.externalWallet.slice(0, 6) + "…" + card.externalWallet.slice(-4))
                 onClicked: card.payoutRequested()
             }
             MonzeroComponents.TextPlain { themeTransition: false; color: MonzeroComponents.Style.dimmedFontColor
@@ -267,7 +272,7 @@ Rectangle {
                     var p = card.t.payout || ({})
                     if (p.tx) return qsTr("Sent %1 %2 · transaction %3").arg(card.atomic(p.amountWei, card.coinDecimals)).arg(card.coin).arg(String(p.tx).slice(0, 12) + "…")
                     if (p.sent === false) return qsTr("Nothing more to send (or a payment is still on its way).")
-                    return qsTr("Sends the %1 in this trade's account to your MetaMask, less the network fee.").arg(card.coin)
+                    return qsTr("Sends the %1 in this trade's account to your own wallet, less the network fee.").arg(card.coin)
                 }
             }
         }

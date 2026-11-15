@@ -11,8 +11,18 @@ Rectangle {
     // With the web link available the page is just "connect to the DEX website"; the full trading
     // screen (charts, offers, coin wallets) stays one click away
     readonly property bool webLinkAvailable: typeof dexWeb !== "undefined" && dexWeb !== null
-    property bool simpleView: webLinkAvailable
-    property real dexHeight: simpleView ? connectPage.height : page.height
+    // Linux: the full exchange inside the app (pairs, chart, order book, buy and sell); the website
+    // is not needed. Developer builds can still open the older trading screen and the testnet lab.
+    readonly property bool nativeExchange: dexPrototypeEnabled && typeof dexNativeExchange !== "undefined" && dexNativeExchange === true
+    readonly property bool labAvailable: typeof dexPublicEdition !== "undefined" && dexPublicEdition === false
+    property bool labView: false
+    // Shown in the middle panel (it calls these): the exchange fetches and refreshes only then
+    property bool pageOpen: false
+    function onPageCompleted() { pageOpen = true }
+    function onPageClosed() { pageOpen = false }
+    readonly property bool exchangeView: nativeExchange && !labView
+    property bool simpleView: webLinkAvailable && !nativeExchange
+    property real dexHeight: exchangeView ? exchangeColumn.implicitHeight : simpleView ? connectPage.height : page.height
     function formatLtcAtomic(value) {
         if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(value)) return "—"
         while (value.length < 9) value = "0" + value
@@ -422,6 +432,27 @@ Rectangle {
         refreshOffers()
     }
 
+    ColumnLayout {
+        id: exchangeColumn
+        objectName: "dexExchangeView"
+        anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+        visible: root.exchangeView
+        spacing: 12
+        M.DexExchange {
+            objectName: "dexExchange"
+            Layout.fillWidth: true
+            visible: root.exchangeView
+            active: root.pageOpen
+            dex: root.dex
+        }
+        M.TextPlain {
+            visible: root.labAvailable
+            themeTransition: false; color: M.Style.dimmedFontColor; font.pixelSize: 12
+            text: qsTr("Developer tools: the older trading screen and the testnet lab ›")
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.labView = true }
+        }
+    }
+
     M.DexConnect {
         id: connectPage
         objectName: "dexConnect"
@@ -437,8 +468,14 @@ Rectangle {
         id: page
         anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
         spacing: 12
-        visible: !root.simpleView
+        visible: !root.simpleView && !root.exchangeView
 
+        M.TextPlain {
+            visible: root.nativeExchange
+            themeTransition: false; color: M.Style.dimmedFontColor; font.pixelSize: 13
+            text: "‹ " + qsTr("Back to the exchange")
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.labView = false }
+        }
         M.TextPlain {
             objectName: "dexSimpleViewLink"
             visible: root.webLinkAvailable

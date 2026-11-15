@@ -10,6 +10,7 @@
 #include <QFutureWatcher>
 #include <QPointer>
 #include <QHash>
+class DexExchangeFeed;
 
 enum class OfferState { Draft, Quoted, Matched, XmzLocked, ExternalLocked, Redeemable, Settled, Refunding, Refunded, Expired, Cancelled };
 class NativeFeePreviewController;
@@ -67,6 +68,8 @@ class DexEngine : public QObject {
     Q_PROPERTY(QVariantMap evmMarketStatus READ evmMarketStatus NOTIFY evmMarketChanged)
     Q_PROPERTY(QVariantMap btcMarketStatus READ btcMarketStatus NOTIFY btcMarketChanged)
     Q_PROPERTY(QVariantMap dexWalletStatus READ dexWalletStatus NOTIFY dexWalletChanged)
+    // Read-only public data for the in-app exchange (Linux): candles, trades, balance, USD prices
+    Q_PROPERTY(QObject *exchangeFeed READ exchangeFeed CONSTANT)
     Q_PROPERTY(QVariantMap bchSuccessReleaseReviewStatus READ bchSuccessReleaseReviewStatus NOTIFY bchSuccessReleaseReviewChanged)
     Q_PROPERTY(QVariantMap bchPublicationRepairStatus READ bchPublicationRepairStatus NOTIFY bchPublicationRepairChanged)
     Q_PROPERTY(QVariantMap bchSuccessPreparationStatus READ bchSuccessPreparationStatus NOTIFY bchSuccessPreparationChanged)
@@ -558,6 +561,10 @@ private:
     QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();
     QHash<int,EvmMarketJob*> m_evmMarkets;   // by chain id
+    DexExchangeFeed *m_exchangeFeed=nullptr;
+public:
+    QObject *exchangeFeed() const;
+private:
     EvmMarketJob *evmMarketFor(const QString &tradeDir) const;
     EvmMarketJob *evmMarketForCoin(const QString &coin) const;
     QByteArray m_evmSwapSeedHex,m_evmKeyHex;
