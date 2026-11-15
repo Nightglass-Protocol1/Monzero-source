@@ -7,7 +7,7 @@
   // opening rate (not a market price); the other coins are replaced by live prices when the
   // markets feed answers.
   var COINS = {
-    XMZ: { name: "Monzero", usd: 0.001, dp: 4 },
+    XMZ: { name: "Monzero", usd: 0.01, dp: 4 },
     BNB: { name: "BNB", usd: 600, dp: 6 },
     ETH: { name: "Ethereum", usd: 3500, dp: 6 },
     SOL: { name: "Solana", usd: 190, dp: 6 }
@@ -172,7 +172,7 @@
   var UTXO = { BTC: true, LTC: true };
   var MAINNET = { BTC: "btc-mainnet", LTC: "ltc-mainnet" };
   var TF = { "1h": 3600, "4h": 14400, "1D": 86400 };
-  var OPENING_USD = 0.001; // the DEX's opening quote, not a market price
+  var OPENING_USD = 0.01; // the DEX's opening quote, not a market price
   var pro = { coin: "ETH", tf: "1h", rendered: false, timer: null, chart: null, candles: null, vol: null, ref: null, usd: {}, gen: 0 };
 
   function fmt(n, d) { if (!isFinite(n)) return "0"; var s = n.toFixed(d); return s.indexOf(".") >= 0 ? s.replace(/0+$/, "").replace(/\.$/, "") : s; }
@@ -236,7 +236,7 @@
     else {
       empty.hidden = false;
       empty.textContent = (UTXO[pro.coin] ? NAME[pro.coin] + " swaps are not reported to relays yet." : "No completed swaps yet.") +
-        (usd > 0 ? " Dashed line: the $0.001 opening rate." : "");
+        (usd > 0 ? " Dashed line: the $0.01 opening rate." : "");
     }
     pro.chart.timeScale().fitContent();
   }

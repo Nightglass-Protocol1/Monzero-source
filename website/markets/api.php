@@ -92,8 +92,8 @@ foreach ($COINS as $sym => $meta) {
     $history[$sym] = $pts;
 }
 
-// Align every implemented pair to the single $0.001/XMZ opening rate, priced live.
-$openingUsd = 0.001;
+// Align every implemented pair to the single $0.01/XMZ opening rate, priced live.
+$openingUsd = 0.01;
 $openingPairs = [];
 foreach ($coinsOut as $c) {
     if (!is_numeric($c['usd']) || $c['usd'] <= 0) { continue; }
@@ -112,7 +112,7 @@ $payload = [
     'openingRate' => [
         'perXmzUsd' => $openingUsd,
         'type' => 'dex-opening-quote',
-        'basis' => '2026-10-31 mainnet test: 0.01 BNB for 7000 XMZ at BNB ~$700',
+        'basis' => 'Set by the project on 2026-11-15 (raised from the first quote of $0.001)',
         'note' => 'The opening quote the project set for XMZ on the Monzero DEX. NOT a market price; see /markets/xmz.php for that. Every pair below is this one rate priced in each coin live.',
         'pairs' => $openingPairs,
     ],
