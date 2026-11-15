@@ -40,7 +40,7 @@
 
   var st = {
     coin: "ETH", listings: [], side: "buy", link: null, account: "", status: null, wallets: null,
-    pairing: null, note: "", error: "", busy: "", paying: "", told: "", stageKey: "", stageSince: 0, limits: {}, timer: null, form: { xmz: "", price: "" }, dismissed: ""
+    pairing: null, note: "", error: "", busy: "", paying: "", told: "", stageKey: "", stageSince: 0, limits: {}, timer: null, form: { xmz: "", price: "", min: "" }, parts: {}, dismissed: ""
   };
   try { st.link = JSON.parse(localStorage.getItem(STORE) || "null"); } catch (e) { st.link = null; }
   if (st.link && PORTS.indexOf(st.link.port) < 0) st.link = null;   // saved for another wallet
@@ -337,10 +337,26 @@
     }
     return "";
   }
+  // The coin for `part` XMZ of a partial offer at its price, rounded in the maker's favour as the
+  // wallet does (up when the maker sells XMZ); null when the offer does not allow that amount
+  function partValue(o, part) {
+    var total = BigInt(o.xmz), value = BigInt(o.value);
+    if (part === total) return value;
+    if (o.minXmz == null) return null;
+    var min = BigInt(o.minXmz);
+    if (part < min || part >= total || total - part < min) return null;
+    var v = value * part / total;
+    return o.side === "sell-xmz" && v * total !== value * part ? v + 1n : v;
+  }
+  // A wallet from before partial offers cannot take part of one (or even see them) and posts whole offers only
+  function canPart() { var f = st.status && st.status.features; return !!(f && f.indexOf && f.indexOf("partial") >= 0); }
   function post() {
     if (st.busy) return;
     var xmz = toUnits(st.form.xmz, 11), price = toUnits(st.form.price, dec());
     if (!xmz || !price || xmz === 0n || price === 0n) return fail(new Error("Enter the XMZ amount and the price."));
+    // Optional: the least one buyer or seller may take; empty means the offer is taken whole
+    var min = canPart() && String(st.form.min || "").trim() ? toUnits(st.form.min, 11) : null;
+    if (canPart() && String(st.form.min || "").trim() && (!min || min < 100000000000n || min > xmz)) return fail(new Error("The smallest part must be at least 1 XMZ and at most the whole offer."));
     var value = xmz * price / 100000000000n, owner = st.side === "buy";
     if (value === 0n) return fail(new Error("The total is too small."));
     var why = checks(owner, value, xmz);
@@ -348,7 +364,9 @@
     st.busy = "post"; say("Preparing…");
     reserve(owner).then(function (gas) { return fund(owner ? value + gas : gas); }).then(function () {
       say("Posting your offer…");
-      return api("/v1/offer", { chainId: chain().id, side: owner ? "buy-xmz" : "sell-xmz", coin: fromUnits(value, dec()), xmz: fromUnits(xmz, 11), hours: 6 });
+      var offer = { chainId: chain().id, side: owner ? "buy-xmz" : "sell-xmz", coin: fromUnits(value, dec()), xmz: fromUnits(xmz, 11), hours: 6 };
+      if (min) offer.minXmz = fromUnits(min, 11);
+      return api("/v1/offer", offer);
     }).then(function (r) {
       if (!r.ok) throw new Error(r.message || "The wallet could not post the offer. What you paid in stays in your trade account; you can send it back to " + own() + " below.");
       return untilIdle();
@@ -365,13 +383,21 @@
     st.listings.forEach(function (x) { if (x.listing && x.listing.id === id) o = x.listing; });
     if (!o) return fail(new Error("That offer is gone."));
     var value = BigInt(o.value), xmz = BigInt(o.xmz), owner = o.side === "sell-xmz";   // we pay coin when the maker sells XMZ
+    // A partial offer: the amount typed next to it (empty: all of it)
+    var typed = o.minXmz != null ? String(st.parts[id] || "").trim() : "";
+    if (typed) {
+      var part = toUnits(typed, 11), pv = part ? partValue(o, part) : null;
+      if (pv == null) return fail(new Error("Take at least " + fromUnits(BigInt(o.minXmz), 11, 4) + " XMZ and at most " + fromUnits(xmz, 11, 4) +
+        " XMZ, leaving none or at least " + fromUnits(BigInt(o.minXmz), 11, 4) + " XMZ."));
+      xmz = part; value = pv;
+    }
     var why = checks(owner, value, xmz);
     if (why) return fail(new Error(why));
     st.busy = "take"; say("Preparing…");
     reserve(owner).then(function (gas) { return fund(owner ? value + gas : gas); }).then(function () {
       say("Asking the wallet to take the offer…");
       return api("/v1/refresh", { pair: st.coin + "/XMZ" });
-    }).then(untilIdle).then(function () { return api("/v1/take", { id: id }); }).then(function (r) {
+    }).then(untilIdle).then(function () { return api("/v1/take", typed ? { id: id, xmz: fromUnits(xmz, 11) } : { id: id }); }).then(function (r) {
       if (!r.ok) throw new Error(r.message || "The wallet could not take this offer. What you paid in stays in your trade account; you can send it back to " + own() + " below.");
       st.busy = "";
       say("Offer taken. Waiting for the other side to answer; then the wallet asks you to approve the trade.");
@@ -525,20 +551,26 @@
     document.title = mark ? "(" + mark + ") " + TITLE : TITLE;
   }
   function offersHTML() {
-    var me = (st.status.wallet.tradeAccount || "").toLowerCase(), want = st.side === "buy" ? "sell-xmz" : "buy-xmz", rows = [];
+    var me = (st.status.wallet.tradeAccount || "").toLowerCase(), want = st.side === "buy" ? "sell-xmz" : "buy-xmz", rows = [], hidden = 0;
     st.listings.forEach(function (x) {
       var l = x.listing;
       if (!l || l.pair !== st.coin + "/XMZ" || Number(l.chainId) !== chain().id || l.side !== want || String(l.maker).toLowerCase() === me) return;
+      if (l.minXmz != null && !canPart()) { hidden++; return; }
       var v = BigInt(l.value), z = BigInt(l.xmz);
       if (z === 0n) return;
-      rows.push({ id: l.id, value: v, xmz: z, price: v * 100000000000n / z });
+      rows.push({ id: l.id, value: v, xmz: z, price: v * 100000000000n / z, min: l.minXmz != null ? BigInt(l.minXmz) : null });
     });
     rows.sort(function (a, b) { return st.side === "buy" ? (a.price < b.price ? -1 : 1) : (a.price > b.price ? -1 : 1); });
-    if (!rows.length) return '<p class="tp-note">No offers to take right now. Post your own below.</p>';
+    var older = hidden ? '<p class="tp-note">' + hidden + (hidden === 1 ? " offer" : " offers") + " can be taken in parts; update your Monzero wallet to take " + (hidden === 1 ? "it" : "them") + ".</p>" : "";
+    if (!rows.length) return '<p class="tp-note">No offers to take right now. Post your own below.</p>' + older;
     return '<ul class="tp-offers">' + rows.slice(0, 6).map(function (r) {
+      // A partial offer: any amount from its smallest part, typed here (empty takes all of it)
+      var part = r.min == null ? "" : '<input class="tp-part" id="tp-part-' + esc(r.id) + '" data-id="' + esc(r.id) + '" inputmode="decimal" autocomplete="off" placeholder="all" aria-label="XMZ to ' +
+        (st.side === "buy" ? "buy" : "sell") + '" value="' + esc(st.parts[r.id] || "") + '">';
       return "<li><span><strong>" + esc(fromUnits(r.xmz, 11, 2)) + " XMZ</strong> for " + esc(fromUnits(r.value, dec(), 8)) + " " + st.coin +
-        '</span><button class="button primary" type="button" data-act="take" data-id="' + esc(r.id) + '">' + (st.side === "buy" ? "Buy" : "Sell") + "</button></li>";
-    }).join("") + "</ul>";
+        (r.min == null ? "" : '<small class="tp-min">any part from ' + esc(fromUnits(r.min, 11, 2)) + " XMZ</small>") +
+        '</span><span class="tp-take">' + part + '<button class="button primary" type="button" data-act="take" data-id="' + esc(r.id) + '">' + (st.side === "buy" ? "Buy" : "Sell") + "</button></span></li>";
+    }).join("") + "</ul>" + older;
   }
   function render() {
     var h = "", c = chain();
@@ -596,7 +628,9 @@
           '<button type="button" data-act="side" data-side="sell" class="' + (st.side === "sell" ? "on" : "") + '">Sell XMZ</button></div>';
         h += "<h3>Take an offer</h3>" + offersHTML();
         h += "<h3>Or post your own</h3>" + '<div class="tp-form"><label>XMZ<input id="tp-xmz" inputmode="decimal" autocomplete="off" value="' + esc(st.form.xmz) + '"></label>' +
-          "<label>Price (" + st.coin + ' per XMZ)<input id="tp-price" inputmode="decimal" autocomplete="off" value="' + esc(st.form.price) + '"></label></div>' +
+          "<label>Price (" + st.coin + ' per XMZ)<input id="tp-price" inputmode="decimal" autocomplete="off" value="' + esc(st.form.price) + '"></label>' +
+          (canPart() ? '<label>Smallest part (XMZ, optional)<input id="tp-min" inputmode="decimal" autocomplete="off" placeholder="whole offer only" value="' + esc(st.form.min) + '"></label></div>' +
+          '<p class="tp-note">With a smallest part, others can take any amount from it up to the whole offer; what is left stays on offer at your price.</p>' : "</div>") +
           '<p class="tp-note" id="tp-total"></p><button class="button secondary" type="button" data-act="post"' + (st.busy ? " disabled" : "") + ">" + (st.side === "buy" ? "Post offer to buy XMZ" : "Post offer to sell XMZ") + "</button>";
         if (lim && lim.open) h += '<p class="tp-note">While the DEX is new: at most ' + esc(fromUnits(lim.coin, dec(), 6)) + " " + st.coin + " and " + esc(fromUnits(lim.xmz, 11, 0)) + " XMZ per trade.</p>";
         var open = (m.mine || []).filter(function (x) { return x.state === "open"; });
@@ -615,7 +649,7 @@
     // Keep what is being typed
     var active = document.activeElement && document.activeElement.id, pos = active && document.activeElement.selectionStart;
     box.innerHTML = h;
-    if (active === "tp-xmz" || active === "tp-price") { var el = document.getElementById(active); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (e) {} } }
+    if (active === "tp-xmz" || active === "tp-price" || active === "tp-min" || (active && active.indexOf("tp-part-") === 0)) { var el = document.getElementById(active); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (e) {} } }
     total();
   }
   function total() {
@@ -651,6 +685,8 @@
   box.addEventListener("input", function (e) {
     if (e.target.id === "tp-xmz") st.form.xmz = e.target.value;
     if (e.target.id === "tp-price") st.form.price = e.target.value;
+    if (e.target.id === "tp-min") st.form.min = e.target.value;
+    if (e.target.classList && e.target.classList.contains("tp-part")) st.parts[e.target.getAttribute("data-id")] = e.target.value;
     total();
   });
   document.addEventListener("monzero-dex-book", function (e) {
