@@ -1,4 +1,5 @@
 #include "../DexDeployment.h"
+#include "../DexTradeKeyStore.h"
 #include "../DexRiskControl.h"
 #include "../LightWalletProfile.h"
 #include "../DexTradeFolders.h"
@@ -1101,6 +1102,34 @@ sys.stdout.buffer.write(compact(base))
         QTRY_COMPARE(engine.bchPunishmentStatus().value("state").toString(),QString("acknowledged"));
         QVERIFY(!engine.submitBchPunishment(approval));QVERIFY(!engine.bchPunishmentStatus().value("chainObserved").toBool());
         QCOMPARE(read(c.log).count("--punish-submit-stdio-v1"),1);
+    }
+    void tradeKeyStoreEncryptsAndUnlocksTheTwoSecrets() {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        const auto path=dir.filePath("trade-keys.json");
+        DexTradeKeyStore store(path);
+        QVERIFY(!store.exists());
+        const auto made=store.create("a strong trading password");
+        QVERIFY(made.ok); QVERIFY(store.exists());
+        QCOMPARE(made.swapSeedHex.size(), 64); QCOMPARE(made.evmKeyHex.size(), 64);   // 32 bytes hex each
+        QVERIFY(made.swapSeedHex!=made.evmKeyHex);
+        static const QRegularExpression hex64("\\A[0-9a-f]{64}\\z");
+        QVERIFY(hex64.match(made.swapSeedHex).hasMatch()); QVERIFY(hex64.match(made.evmKeyHex).hasMatch());
+        // The file holds neither secret in the clear
+        QFile f(path); QVERIFY(f.open(QIODevice::ReadOnly)); const auto raw=f.readAll(); f.close();
+        QVERIFY(!raw.contains(made.swapSeedHex)); QVERIFY(!raw.contains(made.evmKeyHex));
+        QVERIFY(!raw.contains(QByteArray::fromHex(made.swapSeedHex)));
+        // The right password returns the same keys
+        const auto opened=DexTradeKeyStore(path).unlock("a strong trading password");
+        QVERIFY(opened.ok); QCOMPARE(opened.swapSeedHex, made.swapSeedHex); QCOMPARE(opened.evmKeyHex, made.evmKeyHex);
+        // A wrong password fails
+        QVERIFY(!DexTradeKeyStore(path).unlock("not the password").ok);
+        // create() refuses to overwrite an existing store
+        QVERIFY(!DexTradeKeyStore(path).create("another").ok);
+        // A tampered ciphertext fails to open
+        QVERIFY(f.open(QIODevice::ReadWrite)); auto doc=QJsonDocument::fromJson(f.readAll()).object();
+        auto box=QByteArray::fromHex(doc.value("box").toString().toLatin1()); box[0]=box[0]^0x01;
+        doc["box"]=QString::fromLatin1(box.toHex()); f.resize(0); f.write(QJsonDocument(doc).toJson()); f.close();
+        QVERIFY(!DexTradeKeyStore(path).unlock("a strong trading password").ok);
     }
     void bchPunishmentObservationIsExplicit() {
         PunishmentWorkerContext c;QVERIFY(c.create());QVERIFY(c.observationFiles());DexEngine engine;

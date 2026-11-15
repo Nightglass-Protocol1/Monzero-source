@@ -209,6 +209,7 @@ if(WITH_DEX_PROTOTYPE)
         target_compile_definitions(dex_tests PRIVATE MONZERO_DEX_TESTING)
         target_include_directories(dex_tests SYSTEM PRIVATE ${DEX_BOOST_INCLUDE_DIRS})
         target_sources(dex_tests PRIVATE dex/NativeFeePreviewReceiver.cpp dex/LitecoinLightJob.cpp dex/LitecoinLightJob.h)
+        target_sources(dex_tests PRIVATE dex/DexTradeKeyStore.cpp dex/DexTradeKeyStore.h)
         # DexEngine drives the XMZ<->BNB/ETH trade job too
         target_sources(dex_tests PRIVATE dex/EvmTradeJob.cpp dex/EvmTradeJob.h dex/EvmMarketJob.cpp dex/EvmMarketJob.h
             dex/BtcMarketJob.cpp dex/BtcMarketJob.h dex/BtcTradeSetup.cpp dex/BtcTradeSetup.h

@@ -1,4 +1,5 @@
 #include "DexExchangeFeed.h"
+#include "DexTradeKeyStore.h"
 #include "DexChains.h"
 #include "DexEngine.h"
 #include <sodium.h>
@@ -1196,12 +1197,56 @@ QVariantMap DexEngine::dexWalletStatus() const {
     // A key wallet already on this device: the user unlocks it; otherwise the app makes one
     bool exists=swapLight() && swapLight()->status().value("configured").toBool();
     for (const auto &coin:{"btc","ltc"}) if (auto *job=m_lightWallets.value(coin)) exists=exists || job->status().value("configured").toBool();
-    s.insert("keysExist",exists || !keysHelper.isEmpty());s.insert("keysSetupAvailable",m_lightWallets.contains("btc") && lightWalletSetupAvailable());
+    if (usingTradeKeyStore()) exists=DexTradeKeyStore(tradeKeyStorePath()).exists();
+    s.insert("keysExist",exists || !keysHelper.isEmpty());s.insert("keysSetupAvailable",(m_lightWallets.contains("btc") && lightWalletSetupAvailable()) || usingTradeKeyStore());
     return s;
 }
 bool DexEngine::refreshDexWallet() {return m_dexWallets->refresh();}
+// Where no light wallet holds the trade keys (e.g. Windows): keep them in a self-contained,
+// password-encrypted store next to the trading wallet.
+bool DexEngine::usingTradeKeyStore() const { return m_lightSetupHelper.isEmpty(); }
+QString DexEngine::tradeKeyStorePath() const {
+    const auto root=m_dexWallets->root();
+    return root.isEmpty() ? QString() : QDir(root).filePath("trade-keys.json");
+}
+// Hand freshly unlocked keys to the trade and market jobs. `address` is the EVM account when the
+// source already knows it (the light vault); empty from the store, where the helper derives it.
+void DexEngine::applyUnlockedTradeKeys(QByteArray seed,QByteArray key,const QString &address) {
+    m_keysBusy=false;
+    if (seed.isEmpty()||key.isEmpty()) {m_keysMessage=tr("The trading keys could not be unlocked; check the password.");emit dexWalletChanged();return;}
+    m_evmTrade->setSwapKeys(seed,key);
+    for (auto *job:m_evmMarkets) job->setSwapKeys(seed,key);
+    sodium_memzero(m_evmSwapSeedHex.data(),m_evmSwapSeedHex.size());sodium_memzero(m_evmKeyHex.data(),m_evmKeyHex.size());
+    m_evmSwapSeedHex=seed;m_evmKeyHex=key;
+    m_keysMessage.clear();
+    if (!address.isEmpty()) {m_evmAccount=address;emit dexWalletChanged();emit evmMarketChanged();resumeEvmTrades();return;}
+    // The store does not hold an address: ask the helper for the trade accounts (EVM + Solana). The
+    // keys are usable now, but keysReady waits for the EVM address the Funds panel shows.
+    if (m_evmMarkets.isEmpty()) {emit dexWalletChanged();return;}
+    m_keysBusy=true;emit dexWalletChanged();
+    auto *job=*m_evmMarkets.begin();
+    m_accountsConn=connect(job,&EvmMarketJob::changed,this,[this,job]{
+        const auto evm=job->evmAccount();
+        if (evm.isEmpty()) return;
+        QObject::disconnect(m_accountsConn);
+        m_keysBusy=false;m_evmAccount=evm;m_keysMessage.clear();
+        emit dexWalletChanged();emit evmMarketChanged();resumeEvmTrades();
+    });
+    QByteArray noSeed;job->requestAccounts(noSeed);
+}
 bool DexEngine::unlockDexKeys(const QString &password) {
     if (m_keysBusy || password.isEmpty()) return false;
+    if (usingTradeKeyStore()) {
+        const auto path=tradeKeyStorePath();
+        if (path.isEmpty()) {m_keysMessage=tr("The trading wallet is not ready yet.");emit dexWalletChanged();return false;}
+        DexTradeKeyStore store(path);
+        if (!store.exists()) {m_keysMessage=tr("Choose a trading password to create your trading keys.");emit dexWalletChanged();return false;}
+        auto keys=store.unlock(password.toUtf8());
+        if (!keys.ok) {m_keysMessage=tr("The trading keys could not be unlocked; check the password.");emit dexWalletChanged();return false;}
+        applyUnlockedTradeKeys(keys.swapSeedHex,keys.evmKeyHex,{});
+        sodium_memzero(keys.swapSeedHex.data(),keys.swapSeedHex.size());sodium_memzero(keys.evmKeyHex.data(),keys.evmKeyHex.size());
+        return true;
+    }
     // The vault that holds the user's Bitcoin (or else Litecoin) light wallet
     LitecoinLightJob *vault=nullptr;
     for (const auto &coin:{"btc","ltc"}) {
@@ -1212,21 +1257,25 @@ bool DexEngine::unlockDexKeys(const QString &password) {
     if (!vault) {m_keysMessage=tr("Set up a Bitcoin or Litecoin wallet in the app first: its recovery words also hold your trading keys.");emit dexWalletChanged();return false;}
     m_keysBusy=true;m_keysMessage.clear();emit dexWalletChanged();
     const bool started=vault->deriveEvmSwapKeys(password,0,[this](QByteArray seed,QByteArray key,QString address){
-        m_keysBusy=false;
-        if (seed.isEmpty()) {m_keysMessage=tr("The wallet could not be unlocked; check the password.");emit dexWalletChanged();return;}
-        m_evmTrade->setSwapKeys(seed,key);
-        for (auto *job:m_evmMarkets) job->setSwapKeys(seed,key);
-        sodium_memzero(m_evmSwapSeedHex.data(),m_evmSwapSeedHex.size());sodium_memzero(m_evmKeyHex.data(),m_evmKeyHex.size());
-        m_evmSwapSeedHex=seed;m_evmKeyHex=key;
-        m_evmAccount=address;m_keysMessage.clear();
-        emit dexWalletChanged();emit evmMarketChanged();
-        resumeEvmTrades();
+        if (seed.isEmpty()) {m_keysBusy=false;m_keysMessage=tr("The wallet could not be unlocked; check the password.");emit dexWalletChanged();return;}
+        applyUnlockedTradeKeys(seed,key,address);
     });
     if (!started) {m_keysBusy=false;m_keysMessage=tr("The wallet is busy; try again in a moment.");emit dexWalletChanged();}
     return started;
 }
 bool DexEngine::setUpTradingKeys(const QString &password) {
     if (m_keysBusy || !m_keysSetupPassword.isEmpty() || password.isEmpty()) return false;
+    if (usingTradeKeyStore()) {
+        const auto path=tradeKeyStorePath();
+        if (path.isEmpty()) {m_keysMessage=tr("The trading wallet is not ready yet.");emit dexWalletChanged();return false;}
+        DexTradeKeyStore store(path);
+        if (store.exists()) return unlockDexKeys(password);
+        auto keys=store.create(password.toUtf8());
+        if (!keys.ok) {m_keysMessage=tr("The trading keys could not be created.");emit dexWalletChanged();return false;}
+        applyUnlockedTradeKeys(keys.swapSeedHex,keys.evmKeyHex,{});
+        sodium_memzero(keys.swapSeedHex.data(),keys.swapSeedHex.size());sodium_memzero(keys.evmKeyHex.data(),keys.evmKeyHex.size());
+        return true;
+    }
     for (const auto &coin:{"btc","ltc"}) if (auto *job=m_lightWallets.value(coin)) if (job->vaultReady()) return unlockDexKeys(password);
     if (swapLight() && swapLight()->vaultReady()) return unlockDexKeys(password);
     if (!m_lightWallets.contains("btc") || !lightWalletSetupAvailable()) {
