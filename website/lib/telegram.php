@@ -435,7 +435,7 @@ function tgInfoResponses(): array {
         '/explorer' => "Block explorer: https://monzero.org/explorer/",
         '/security' => "Report security issues privately: security@monzero.org\nDetails: https://monzero.org/security/",
         '/website' => "https://monzero.org", '/site' => "https://monzero.org",
-        '/price' => "Monzero (XMZ) is not listed on any exchange yet, so there is no official price. Ignore anyone quoting one or offering to sell you XMZ in DMs - that's a scam.",
+        '/price' => "XMZ trades against USDT on NoirTrade. Live price, order book and trades: https://monzero.org/markets/\n\nAnyone offering to sell you XMZ in DMs is a scammer.",
     ];
 }
 

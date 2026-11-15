@@ -199,3 +199,14 @@ body{background:#02080c;letter-spacing:-.007em}
 /* Airdrop nav highlight */
 .nav-airdrop { color: var(--accent, #39d7df) !important; font-weight: 650; }
 .nav-airdrop::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 6px; border-radius: 50%; background: var(--accent, #39d7df); box-shadow: 0 0 8px var(--accent, #39d7df); vertical-align: middle; }
+/* Price band: live XMZ/USDT figures from NoirTrade (ticker.js). */
+.ticker-band.ticker-live{cursor:pointer}
+.ticker-band.ticker-live .ticker-track{gap:0;animation-duration:70s}
+.ticker-band.ticker-live:hover .ticker-track,.ticker-band.ticker-live:focus-visible .ticker-track{animation-play-state:paused}
+.ticker-band.ticker-live:focus-visible{outline:2px solid #3fdfe8;outline-offset:-2px}
+.ticker-track .tick{display:inline-flex;align-items:baseline;gap:9px;padding:0 26px;color:inherit;font-size:inherit;letter-spacing:0;border-right:1px solid rgba(219,247,240,.07)}
+.ticker-track .tick i{font:500 9px var(--mono);font-style:normal;letter-spacing:.18em;color:rgba(176,216,207,.55)}
+.ticker-track .tick b{font:600 13px var(--mono);letter-spacing:.04em;color:#dbf7f0}
+.ticker-track .tick b.tick-main{color:#3fdfe8}
+.ticker-track .tick b.tick-up{color:#93d9b6}
+.ticker-track .tick b.tick-down{color:#ff8a9f}
