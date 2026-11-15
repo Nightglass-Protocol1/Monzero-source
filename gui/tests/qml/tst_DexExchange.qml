@@ -10,6 +10,7 @@ Item {
     property var translationManager: translations
     QtObject { id: app; property bool themeTransition: false; function showStatusMessage(a, b) {} }
     QtObject { id: translations; property string emptyString: "" }
+    function releaseFocus() {}
 
     readonly property real now: Date.now() / 1000
     // SAMPLE offers, not market data
@@ -35,6 +36,7 @@ Item {
         function takeEvmOffer(id, xmz) { calls.push(["take", id, xmz]); return true }
         function postEvmOffer(chainId, side, coin, xmz, hours, min) { calls.push(["post", chainId, side, coin, xmz, hours, min]); return true }
         function cancelEvmOffer(folder) { calls.push(["cancel", folder]); return true }
+        function approveTradingKeysHelper(commitment) { calls.push(["approveHelper", commitment]); return true }
     }
     M.DexExchange { id: ex; width: root.width; dex: engine; fetchEnabled: false }
 
@@ -122,6 +124,19 @@ Item {
             verify(find(ex, "unlockCard").visible)
             w.keysReady = true; engine.dexWalletStatus = w
             verify(f.ready)
+        }
+        function test_keys_from_another_copy_ask_for_approval_first() {
+            var w = JSON.parse(JSON.stringify(engine.dexWalletStatus))
+            w.keysReady = false; w.keysExist = true
+            w.keysHelperReview = { previousHelper: "/old/monzero-light/native-ltc-light", helper: "/new/monzero-light/native-ltc-light",
+                                   previousDigest: "6b1c5ce3", helperDigest: "6b1c5ce3", commitment: "c0ffee" }
+            engine.dexWalletStatus = w
+            verify(find(ex, "keysHelperReview").visible)
+            verify(!find(ex, "exchangePassword").visible)
+            press("approveKeysHelper")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["approveHelper", "c0ffee"]]))
+            delete w.keysHelperReview; w.keysReady = true; engine.dexWalletStatus = w
+            verify(!find(ex, "unlockCard").visible)
         }
         function test_market_orders_wait_for_the_running_trade() {
             engine.evmTradeStatus = { configured: true, snapshot: { done: false, role: "owner", stage: "Locked", offer: { chainId: 501000101, value: "1", xmzAmount: "1" } } }

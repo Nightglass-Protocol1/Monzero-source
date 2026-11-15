@@ -290,6 +290,11 @@ public:
     // One step for a new user: makes the app's own key wallet (a Bitcoin light wallet kept in the
     // app's data folder) if there is none, opens it and unlocks the trade keys with this password
     Q_INVOKABLE bool setUpTradingKeys(const QString &password);
+    // The key wallet's folder (app data). When it was made by another copy of the app, the review
+    // of moving it to this copy's helper; approving it (its commitment) lets it be unlocked here.
+    QString tradingKeysDirectory() const;
+    Q_INVOKABLE QVariantMap reviewTradingKeysHelper() const;
+    Q_INVOKABLE bool approveTradingKeysHelper(const QString &commitment);
     bool dexKeysReady() const {return !m_evmAccount.isEmpty();}
     // Send XMZ from the trading wallet to `address` (amount in XMZ as text; empty sends everything)
     Q_INVOKABLE bool sendFromDexWallet(const QString &address,const QString &amount);

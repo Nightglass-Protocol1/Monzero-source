@@ -297,7 +297,37 @@ ColumnLayout {
             id: unlockCol
             anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 14
             spacing: 8
+            // Keys made by another copy of the wallet (upgraded into a new folder, or moved): its
+            // helper program is used again only after the user approves this copy's own
+            ColumnLayout {
+                objectName: "keysHelperReview"
+                readonly property var review: ex.wallet.keysHelperReview || null
+                visible: !!review
+                Layout.fillWidth: true; spacing: 6
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 14; color: M.Style.defaultFontColor
+                    text: qsTr("Your trading keys were set up by another copy of this wallet. To unlock them here, this copy's own key helper takes over.")
+                }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 12; color: M.Style.dimmedFontColor
+                    text: !parent.review ? "" : qsTr("Before: %1").arg(parent.review.previousHelper) + "\n" + qsTr("Now: %1").arg(parent.review.helper)
+                        + "\n" + (parent.review.previousDigest === parent.review.helperDigest
+                                  ? qsTr("Same program (SHA-256 %1…): only its folder changed.").arg(String(parent.review.helperDigest).slice(0, 16))
+                                  : qsTr("A newer program (SHA-256 %1…, was %2…), checked against the value built into this wallet.").arg(String(parent.review.helperDigest).slice(0, 16)).arg(String(parent.review.previousDigest).slice(0, 16)))
+                }
+                M.StandardButton {
+                    objectName: "approveKeysHelper"
+                    text: qsTr("Use this copy's key helper")
+                    onClicked: if (!ex.dex.approveTradingKeysHelper(parent.review.commitment)) ex.localError = qsTr("The key wallet could not be moved to this copy. Nothing was changed.")
+                }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.errorColor
+                    visible: ex.localError !== ""
+                    text: ex.localError
+                }
+            }
             Text {
+                visible: !ex.wallet.keysHelperReview
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 14; color: M.Style.defaultFontColor
                 text: ex.wallet.keysBusy === true ? qsTr("Setting up your trading keys…")
                     : ex.wallet.keysExist === true ? qsTr("Enter your trading password to start trading. Browsing the market needs no password.")
@@ -305,7 +335,7 @@ ColumnLayout {
             }
             RowLayout {
                 Layout.fillWidth: true
-                visible: ex.wallet.keysBusy !== true
+                visible: ex.wallet.keysBusy !== true && !ex.wallet.keysHelperReview
                 M.LineEdit { id: pw; objectName: "exchangePassword"; Layout.fillWidth: true; password: true; fontSize: 15; inputPaddingTop: 8; inputPaddingBottom: 8
                              placeholderText: ex.wallet.keysExist === true ? qsTr("Trading password") : qsTr("New trading password"); placeholderFontSize: 15
                              onAccepted: unlockButton.go() }

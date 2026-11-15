@@ -1148,6 +1148,34 @@ sys.stdout.buffer.write(compact(base))
         }
         SwapWalletRpcProcess uncertain;QVERIFY(!uncertain.startBoundWithDigest(program,digest,directory.path(),trade,1,6));
         QCOMPARE(read(binding),original);QVERIFY(read(state).contains("recovery-required"));
+        {
+            // An upgraded or moved app brings another copy of the wallet RPC: after a clean stop the
+            // folder moves to it; while a stop is uncertain it does not
+            QTemporaryDir newer;QVERIFY(newer.isValid());
+            const auto copy=newer.filePath("monzero-wallet-rpc");
+            QVERIFY(QFile::copy(program,copy));
+            QVERIFY(QFile::setPermissions(copy,QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
+            SwapWalletRpcProcess notYet;QVERIFY(!notYet.startBoundWithDigest(copy,digest,directory.path(),trade,1,6));
+            QCOMPARE(read(binding),original);
+            const auto uncertainState=read(state);
+            QVERIFY(save(state,"monzero-swap-rpc-v1\nstopped\n"));
+            SwapWalletRpcProcess otherPort;QVERIFY(!otherPort.startBoundWithDigest(copy,digest,directory.path(),trade,1,7));
+            QCOMPARE(read(binding),original);
+            {
+                SwapWalletRpcProcess upgraded;QSignalSpy stopped(&upgraded,&SwapWalletRpcProcess::stopped);
+                QVERIFY(upgraded.startBoundWithDigest(copy,digest,directory.path(),trade,1,6));
+                QTRY_VERIFY(upgraded.walletOperationAvailable());
+                QVERIFY(read(binding).contains(QFile::encodeName(copy)));
+                QCOMPARE(read(directory.filePath("wallets/retained-wallet")),QByteArray("fixture-wallet"));
+                QTRY_COMPARE(stopped.count(),1);
+            }
+            // Back to the first program for the checks below (clean stop again)
+            SwapWalletRpcProcess back;QSignalSpy backStopped(&back,&SwapWalletRpcProcess::stopped);
+            QVERIFY(back.startBoundWithDigest(program,digest,directory.path(),trade,1,6));
+            QTRY_COMPARE(backStopped.count(),1);
+            QCOMPARE(read(binding),original);
+            QVERIFY(save(state,uncertainState));
+        }
         for (const auto &interrupted:{QByteArray("active"),QByteArray("operation-pending"),QByteArray("invalid")}) {
             QVERIFY(save(state,"monzero-swap-rpc-v1\n"+interrupted+"\n"));
             SwapWalletRpcProcess blocked;QVERIFY(!blocked.startBoundWithDigest(program,digest,directory.path(),trade,1,6));

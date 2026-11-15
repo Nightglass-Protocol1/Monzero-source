@@ -1160,15 +1160,35 @@ bool DexEngine::configureDexWallets(const QString &root,const QString &walletRpc
         const QString &networkFlag,const QString &helper,const QString &helperSha256) {
     return m_dexWallets->configure(root,walletRpc,walletRpcSha256,daemonPort,networkFlag,helper,helperSha256) && m_dexWallets->start();
 }
+QString DexEngine::tradingKeysDirectory() const {
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
+        .filePath(DexDeployment::mainnetStage() ? "dex/mainnet/trading-keys" : "dex/testnet/trading-keys");
+}
+QVariantMap DexEngine::reviewTradingKeysHelper() const {
+    // Only the app's own key wallet, and only while it waits for this approval
+    const auto directory=tradingKeysDirectory();
+    QSettings settings(QSettings::IniFormat,QSettings::UserScope,"Monzero","LightWalletFolders");
+    if (QDir::cleanPath(settings.value("wallets/btc").toString())!=QDir::cleanPath(directory)) return {};
+    return reviewLightWalletHelperUpgrade("btc",directory);
+}
+bool DexEngine::approveTradingKeysHelper(const QString &commitment) {
+    const bool ok=!reviewTradingKeysHelper().isEmpty() && upgradeLightWalletHelper("btc",tradingKeysDirectory(),commitment);
+    if (ok) m_lightSetupNotices.remove("btc");
+    emit dexWalletChanged();return ok;
+}
 QVariantMap DexEngine::dexWalletStatus() const {
     auto s=m_dexWallets->status();
+    // Trading keys made by another copy of the app (upgraded into a new folder, or moved): its
+    // helper is used again only after the user approves this copy's own (see LightWalletHelperUpgrade)
+    const auto keysHelper=reviewTradingKeysHelper();
+    if (!keysHelper.isEmpty()) s.insert("keysHelperReview",keysHelper);
     s.insert("keysReady",dexKeysReady());s.insert("keysBusy",m_keysBusy || !m_keysSetupPassword.isEmpty());s.insert("tradeAccount",m_evmAccount);s.insert("keysMessage",m_keysMessage);
     // Where SOL is paid in: this wallet's trade account on Solana (known once the helper was asked)
     for (auto *job:m_evmMarkets) if (!job->solAccount().isEmpty()) s.insert("solTradeAccount",job->solAccount());
     // A key wallet already on this device: the user unlocks it; otherwise the app makes one
     bool exists=swapLight() && swapLight()->status().value("configured").toBool();
     for (const auto &coin:{"btc","ltc"}) if (auto *job=m_lightWallets.value(coin)) exists=exists || job->status().value("configured").toBool();
-    s.insert("keysExist",exists);s.insert("keysSetupAvailable",m_lightWallets.contains("btc") && lightWalletSetupAvailable());
+    s.insert("keysExist",exists || !keysHelper.isEmpty());s.insert("keysSetupAvailable",m_lightWallets.contains("btc") && lightWalletSetupAvailable());
     return s;
 }
 bool DexEngine::refreshDexWallet() {return m_dexWallets->refresh();}
@@ -1235,7 +1255,7 @@ void DexEngine::stepTradingKeysSetup() {
         const bool mainnet=DexDeployment::mainnetStage();
         const auto stage=DexDeployment::litecoinNetwork();
         const QString network=mainnet ? QStringLiteral("main") : stage.startsWith("btc-") ? stage.mid(4) : QStringLiteral("testnet4");
-        const auto directory=QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(mainnet ? "dex/mainnet/trading-keys" : "dex/testnet/trading-keys");
+        const auto directory=tradingKeysDirectory();
         ok=QDir().mkpath(directory) && QFile::setPermissions(directory,QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner)
             && prepareLocalLightWallet("btc",network,directory,QString(),0,0);
     } else if (s.value("walletCreatedOpenAvailable").toBool() && !(m_keysSetupSteps & 8)) {
