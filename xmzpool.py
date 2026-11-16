@@ -16,7 +16,7 @@ Money rules:
   restores the balances; an uncertain result (timeout, lost reply) stops all
   payouts until the operator reconciles it. Nothing is ever retried blindly.
 """
-import argparse, asyncio, hashlib, http.client, json, logging, os, secrets, sqlite3, sys, time, urllib.parse, urllib.request, urllib.error
+import argparse, asyncio, base64, hashlib, http.client, json, logging, os, secrets, sqlite3, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 
 ATOMIC = 10**11
@@ -167,6 +167,13 @@ CREATE TABLE IF NOT EXISTS pool_fee (height INTEGER PRIMARY KEY, amount INTEGER)
 CREATE INDEX IF NOT EXISTS payment_items_address ON payment_items(address);
 CREATE TABLE IF NOT EXISTS liquidity_state (key TEXT PRIMARY KEY, value INTEGER);
 CREATE TABLE IF NOT EXISTS liquidity_transfers (id INTEGER PRIMARY KEY, ts REAL, status TEXT, txid TEXT, amount INTEGER, fee INTEGER, detail TEXT);
+-- Referral / affiliate programme: an operator shares a code; miners who mine with it earn the
+-- operator a small slice of the pool's OWN fee (never the miners' coins, and only from fee that is
+-- left after the reserve and the liquidity share — see credit()). code<->address is 1:1 and derived.
+CREATE TABLE IF NOT EXISTS referrals (code TEXT PRIMARY KEY, address TEXT UNIQUE, created REAL);
+CREATE TABLE IF NOT EXISTS miner_referrer (miner TEXT PRIMARY KEY, code TEXT, referrer TEXT, since REAL);
+CREATE TABLE IF NOT EXISTS referral_credits (height INTEGER, referrer TEXT, miner TEXT, amount INTEGER, PRIMARY KEY (height, referrer, miner));
+CREATE INDEX IF NOT EXISTS ix_referral_credits_referrer ON referral_credits(referrer);
 """
 
 class Store:
@@ -307,6 +314,56 @@ class Pool:
                 continue
             self.credit(height, h["reward"], last_share, net_diff)
 
+    # ---- referral / affiliate programme -------------------------------------------------
+    # Codes are derived from the address (no public write endpoint, nothing to spoof): the same
+    # address always yields the same code, and register_referral() stores the 1:1 mapping lazily
+    # the first time we see an address (every login, and every stats view). A miner then mines with
+    # someone else's code to credit that operator a slice of the pool fee.
+    @staticmethod
+    def _derive_code(address, length):
+        h = hashlib.sha256(("monzero-referral:" + address).encode()).digest()
+        return "mz" + base64.b32encode(h).decode("ascii").lower().replace("=", "")[:length]
+
+    def referral_code(self, address):
+        """The code already registered to this address, or the shortest free derivation of it."""
+        row = self.store.q("SELECT code FROM referrals WHERE address=?", (address,))
+        if row:
+            return row[0][0]
+        for length in range(8, 27, 2):               # grow only on a genuine collision
+            code = self._derive_code(address, length)
+            owner = self.store.q("SELECT address FROM referrals WHERE code=?", (code,))
+            if not owner or owner[0][0] == address:
+                return code
+        return self._derive_code(address, 24)        # practically unreachable
+
+    def register_referral(self, address):
+        """Ensure this address has an active referral code. Idempotent; safe to call often."""
+        code = self.referral_code(address)
+        with self.store.tx() as db:
+            db.execute("INSERT OR IGNORE INTO referrals(code, address, created) VALUES (?,?,?)",
+                       (code, address, time.time()))
+        return code
+
+    def resolve_referral(self, code):
+        row = self.store.q("SELECT address FROM referrals WHERE code=?", (code,))
+        return row[0][0] if row else None
+
+    def set_miner_referrer(self, miner_address, code):
+        """Record who referred this miner. Sticky (first valid code wins), no self-referral unless
+        the config allows it. Silently ignores unknown or self codes."""
+        if not code:
+            return
+        if self.store.q("SELECT 1 FROM miner_referrer WHERE miner=?", (miner_address,)):
+            return                                   # already attributed; cannot be changed later
+        referrer = self.resolve_referral(code)
+        if not referrer:
+            return
+        if referrer == miner_address and not self.cfg["referral"]["allow_self"]:
+            return
+        with self.store.tx() as db:
+            db.execute("INSERT OR IGNORE INTO miner_referrer(miner, code, referrer, since) VALUES (?,?,?,?)",
+                       (miner_address, code, referrer, time.time()))
+
     def credit(self, height, reward, last_share, net_diff):
         window = max(1, int(net_diff * self.cfg["pplns_window_factor"]))
         totals, acc = {}, 0
@@ -322,17 +379,64 @@ class Pool:
         with self.store.tx() as db:
             if db.execute("SELECT status FROM blocks WHERE height=?", (height,)).fetchone()[0] != "pending":
                 return
-            given = 0
+            given, paid = 0, {}
             for addr, d in sorted(totals.items()):
                 amount = pay * d // shares_sum if shares_sum else 0
                 if amount <= 0:
                     continue
                 given += amount
+                paid[addr] = amount
                 db.execute("INSERT INTO credits VALUES (?,?,?)", (height, addr, amount))
                 db.execute("INSERT INTO balances(address, pending) VALUES (?,?) ON CONFLICT(address) DO UPDATE SET pending=pending+excluded.pending", (addr, amount))
             db.execute("INSERT INTO pool_fee VALUES (?,?)", (height, reward - given))
+            referred = self.credit_referrals(db, height, reward - given, paid)
             db.execute("UPDATE blocks SET status='confirmed', reward=?, credited_at=? WHERE height=?", (reward, time.time(), height))
-        log.info("block %d confirmed: reward %.5f XMZ to %d miners, pool keeps %.5f", height, reward / ATOMIC, len(totals), (reward - given) / ATOMIC)
+        log.info("block %d confirmed: reward %.5f XMZ to %d miners, pool keeps %.5f%s",
+                 height, reward / ATOMIC, len(totals), (reward - given) / ATOMIC,
+                 "" if not referred else ", referrals %.5f" % (referred / ATOMIC))
+
+    def credit_referrals(self, db, height, fee, paid):
+        """Pay referrers from this block's fee, AFTER protecting the operating reserve and the
+        liquidity share. The referral is a share of each referred miner's own reward, but the whole
+        block's referral total is capped at the fee left over, and scaled down pro-rata if it would
+        exceed it — so the 1% fee always covers its other obligations first. Returns the total paid.
+        `fee` is the gross pool fee (recorded to pool_fee unchanged, so liquidity's base is intact).
+        """
+        r = self.cfg["referral"]
+        if not r["enabled"] or fee <= 0 or not paid:
+            return 0
+        # Fee the referral may draw on: gross fee minus the reserve and the liquidity share (both as
+        # a share of the gross fee). Never negative; if the fee is tight this collapses toward zero.
+        reserve = fee * int(r["reserve_basis_points"]) // 10000
+        lq = self.cfg["liquidity"]
+        liq = fee * int(lq["share_basis_points"]) // 10000 if lq["enabled"] else 0
+        budget = max(0, fee - reserve - liq)
+        if budget <= 0:
+            return 0
+        bps = int(r["basis_points"])
+        targets = {}                                 # referrer -> owed from this block (pre-cap)
+        for miner, amount in paid.items():
+            row = db.execute("SELECT referrer FROM miner_referrer WHERE miner=?", (miner,)).fetchone()
+            if not row:
+                continue
+            referrer = row[0]
+            if referrer == miner and not r["allow_self"]:
+                continue
+            owed = amount * bps // 10000
+            if owed > 0:
+                targets[(referrer, miner)] = owed
+        want = sum(targets.values())
+        if want <= 0:
+            return 0
+        total = 0
+        for (referrer, miner), owed in targets.items():
+            amt = owed if want <= budget else owed * budget // want   # pro-rata scale-down
+            if amt <= 0:
+                continue
+            total += amt
+            db.execute("INSERT INTO referral_credits VALUES (?,?,?,?)", (height, referrer, miner, amt))
+            db.execute("INSERT INTO balances(address, pending) VALUES (?,?) ON CONFLICT(address) DO UPDATE SET pending=pending+excluded.pending", (referrer, amt))
+        return total
 
     async def payer(self):
         while True:
@@ -576,7 +680,14 @@ class Pool:
             if fixed_part.isdigit():
                 diff, fixed = max(self.cfg["min_difficulty"], min(int(fixed_part), self.cfg["max_difficulty"])), True
         address, _, worker = login.partition(".")
-        worker = (worker or str(params.get("pass") or "x"))[:32]
+        # A referral code may ride on the worker (ADDR.rig1~CODE) or the password (-p ref:CODE).
+        worker, _, wcode = worker.partition("~")
+        passv = str(params.get("pass") or "").strip()
+        pass_is_ref = passv[:4].lower() in ("ref:", "ref=")
+        code = "".join(c for c in (wcode.strip() or (passv[4:].strip() if pass_is_ref else "")) if c.isalnum())[:32]
+        if not worker:
+            worker = "x" if (pass_is_ref or not passv) else passv
+        worker = worker[:32]
         if not await self.valid_address(address):
             await self.reply(writer, mid, error="Invalid address: use your Monzero (XMZ) wallet address as the login")
             return None
@@ -585,6 +696,12 @@ class Pool:
             return None
         miner = Miner(self, writer, address, worker, diff, fixed)
         self.miners[miner.id] = miner
+        if self.cfg["referral"]["enabled"]:
+            try:
+                self.register_referral(address)      # everyone gets a code, so anyone can refer
+                self.set_miner_referrer(address, code)
+            except Exception as e:                   # attribution must never break a login
+                log.warning("referral attribution failed for %s…: %s", address[:12], e)
         job = await self.new_job(miner)
         await self.reply(writer, mid, result={"id": miner.id, "job": job, "extensions": ["algo", "keepalive"], "status": "OK"})
         log.info("login %s… worker %s diff %d", address[:12], worker, diff)
@@ -741,7 +858,20 @@ class Pool:
                 "hashrate": self.hashrate(address),
                 "hashrates": {k: self.hashrate(address, win) for k, win in self.WORKER_WINDOWS},
                 "shares": int(total_shares), "workersOnline": sum(1 for w in workers if w["online"]), "workers": workers,
-                "payments": [{"timestamp": int(ts), "txid": tx, "amount": a} for ts, tx, a in items]}
+                "payments": [{"timestamp": int(ts), "txid": tx, "amount": a} for ts, tx, a in items],
+                "referral": self.referral_stats(address)}
+
+    def referral_stats(self, address):
+        """The operator's own referral code (registered lazily on view), what it has earned, and how
+        many miners currently mine with it. Absent (enabled False) when the programme is off."""
+        r = self.cfg["referral"]
+        if not r["enabled"]:
+            return {"enabled": False}
+        code = self.register_referral(address)
+        earned = self.store.q("SELECT COALESCE(SUM(amount),0) FROM referral_credits WHERE referrer=?", (address,))[0][0]
+        referred = self.store.q("SELECT COUNT(*) FROM miner_referrer WHERE referrer=?", (address,))[0][0]
+        return {"enabled": True, "code": code, "earned": earned, "referred": referred,
+                "basisPoints": int(r["basis_points"]), "sharePercent": int(r["basis_points"]) / 100}
 
     async def http(self, reader, writer):
         try:
@@ -789,6 +919,11 @@ DEFAULTS = {
     # A share of the pool's own fee for the DEX liquidity wallet (see liquidity_once)
     "liquidity": {"enabled": False, "address": "", "share_basis_points": 100, "min_transfer_xmz": 10.0,
                   "tx_fee_margin_xmz": 0.1, "from_height": None},
+    # Referral / affiliate rewards, paid from the pool fee (see credit_referrals). basis_points is a
+    # share of each referred miner's reward: 15 = 0.15%. reserve_basis_points is the slice of the fee
+    # kept back for operating costs + payout tx fees before any referral is paid. allow_self lets an
+    # address refer itself (off by default). Referrals are only paid when enabled AND payouts run.
+    "referral": {"enabled": False, "basis_points": 15, "reserve_basis_points": 2000, "allow_self": False},
 }
 
 def load_config(path):
@@ -796,11 +931,20 @@ def load_config(path):
     user = json.loads(Path(path).read_text())
     payouts = {**cfg["payouts"], **user.pop("payouts", {})}
     liquidity = {**cfg["liquidity"], **user.pop("liquidity", {})}
+    referral = {**cfg["referral"], **user.pop("referral", {})}
     cfg.update(user)
     cfg["payouts"] = payouts
     cfg["liquidity"] = liquidity
+    cfg["referral"] = referral
     if not 0 <= int(liquidity["share_basis_points"]) <= 10000:
         sys.exit("config: liquidity.share_basis_points must be 0..10000 (100 = 1% of the pool fee)")
+    if not 0 <= int(referral["basis_points"]) <= 100:
+        sys.exit("config: referral.basis_points must be 0..100 (a share of each referred miner's reward; 15 = 0.15%)")
+    if not 0 <= int(referral["reserve_basis_points"]) <= 10000:
+        sys.exit("config: referral.reserve_basis_points must be 0..10000 (a share of the pool fee)")
+    if int(referral["reserve_basis_points"]) + int(liquidity["share_basis_points"]) > 10000:
+        sys.exit("config: referral.reserve_basis_points + liquidity.share_basis_points must be <= 10000, "
+                 "otherwise there is never any fee left for referrals")
     for key in ("daemon_rpc", "wallet_rpc", "pool_address", "database", "stratum_ports"):
         if key not in cfg:
             sys.exit(f"config: missing {key}")

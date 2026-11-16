@@ -108,6 +108,14 @@ th.num{text-align:right}
 tr.off td{color:var(--faint)} tr.off .dot{box-shadow:none}
 .rnbtn{background:transparent;border:1px solid var(--line-2);color:var(--muted);border-radius:7px;padding:4px 9px;font:500 12px var(--sans);cursor:pointer}
 .rnbtn:hover{color:var(--ink);border-color:var(--accent)}
+.refcard{margin-top:8px;border:1px solid var(--line-2);border-radius:12px;padding:16px}
+.refrow{display:flex;flex-wrap:wrap;gap:16px 28px;align-items:center;justify-content:space-between}
+.reflab{display:block;color:var(--faint);font-size:12px;margin:0 0 4px}
+.refcode{display:inline-block;font-family:var(--mono);font-size:17px;color:var(--accent);letter-spacing:.02em;user-select:all}
+.reftiles{display:flex;gap:28px}
+.reftiles b{display:block;font-family:var(--display);font-size:18px}
+.reftiles span{color:var(--faint);font-size:12px}
+.refshare{display:block;margin:4px 0 0;padding:10px 12px;background:var(--faint-bg,rgba(127,127,127,.08));border-radius:8px;font-family:var(--mono);font-size:12.5px;word-break:break-all;user-select:all}
 .pfoot{max-width:980px;margin:36px auto 0;padding-top:20px;border-top:1px solid var(--line);color:var(--faint);font-size:13px;display:flex;flex-wrap:wrap;gap:8px 18px;justify-content:space-between}
 .pfoot a{color:var(--muted);text-decoration:none}
 .pfoot a:hover{color:var(--ink)}
@@ -152,6 +160,21 @@ tr.off td{color:var(--faint)} tr.off .dot{box-shadow:none}
       <div class="feed collapsed" id="workers-feed"><div class="wrap"><table><thead><tr><th>Worker</th><th class="num">5 min</th><th class="num">1 h</th><th class="num">1 d</th><th class="num">1 w</th><th class="num">Shares</th><th>Last</th><th></th></tr></thead><tbody id="wlist"></tbody></table></div><button class="more" type="button" hidden></button></div>
       <p class="muted tiny">Rename a worker to give it a friendly label — saved in this browser only. The real worker name is the one you set in XMRig after <code>-p</code>.</p>
       <div id="m-pay" hidden><div class="wkhead"><h3>Your payments</h3></div><div class="wrap"><table><thead><tr><th>Sent</th><th>Transaction</th><th class="num">Amount</th></tr></thead><tbody id="ulist"></tbody></table></div></div>
+      <div id="m-ref" hidden>
+        <div class="wkhead"><h3>Refer a miner</h3><span class="muted tiny">Earn <span id="r-pct">–</span> of what the miners you bring in earn — paid from the pool fee, never from their rewards.</span></div>
+        <div class="refcard">
+          <div class="refrow">
+            <div><span class="reflab">Your referral code</span><code id="r-code" class="refcode">–</code></div>
+            <div class="reftiles">
+              <div><b id="r-earned">–</b><span>Referral earnings</span></div>
+              <div><b id="r-count">–</b><span>Miners referred</span></div>
+            </div>
+          </div>
+          <p class="reflab">Share this ready-made command — it already has your code in it:</p>
+          <code id="r-cmd" class="refshare">–</code>
+          <p class="muted tiny">A friend adds <code>~YOUR_CODE</code> after their worker name (or <code>-p ref:YOUR_CODE</code>). You can't refer your own address.</p>
+        </div>
+      </div>
     </div>
   </section>
   <section class="feed collapsed" id="blocks-feed"><h2>Recent blocks</h2><div class="wrap"><table><thead><tr><th>Height</th><th>Hash</th><th>Found</th><th>Reward</th><th>Status</th></tr></thead><tbody id="blist"></tbody></table></div><button class="more" type="button" hidden></button></section>
@@ -226,6 +249,15 @@ function renderMiner(m, addr) {
   const pays = m.payments || [];
   $("m-pay").hidden = !pays.length;
   $("ulist").innerHTML = pays.map(p => `<tr><td>${ago(p.timestamp)}</td><td><code>${esc(p.txid.slice(0,16))}…</code></td><td class="num">${xmz(p.amount)}</td></tr>`).join("");
+  const r = m.referral || {};
+  $("m-ref").hidden = !r.enabled;
+  if (r.enabled) {
+    $("r-pct").textContent = (r.sharePercent ?? 0) + "%";
+    $("r-code").textContent = r.code || "–";
+    $("r-earned").textContent = xmz(r.earned || 0);
+    $("r-count").textContent = num(r.referred || 0);
+    $("r-cmd").textContent = `xmrig -o pool.monzero.org:3333 -u THEIR_XMZ_ADDRESS -p rig1~${r.code || "YOUR_CODE"} -a rx/0`;
+  }
 }
 document.getElementById("wlist").addEventListener("click", e => {
   const btn = e.target.closest(".rnbtn"); if (!btn || !lastMiner) return;

@@ -18,12 +18,22 @@ A small RandomX (`rx/0`) stratum pool for Monzero, written for this project
   called. A definite wallet error restores the balances. An uncertain result
   (timeout, lost reply) halts all payouts until an operator reconciles it and
   deletes `<database>.payouts-halted`.
+- **Referrals (optional, off by default):** an operator shares a code derived
+  from their address; a miner who mines with it (`ADDRESS.rig~CODE`, or
+  `-p ref:CODE`) earns that operator a slice of the pool's **own** fee — never
+  the miners' coins. Per block the referral is `referral.basis_points` of each
+  referred miner's reward, but the whole block's referral is paid only from the
+  fee left after a protected reserve (`referral.reserve_basis_points`) and the
+  liquidity share, and is scaled down pro-rata if it would exceed that. So the
+  1% fee always covers its other obligations first. Attribution is sticky (the
+  first code wins) and self-referral is off unless `referral.allow_self`.
 - **Stats API** (for the web page and miningpoolstats): `/api/stats`,
   `/api/miner?address=…`, and `/` serves `web/index.html`.
 
 ## Tests
 
-    python3 tests/unit_test.py                    # 9 tests, no chain needed
+    python3 tests/unit_test.py                    # no chain needed
+    python3 tests/referral_test.py                # referral programme, no chain needed
     python3 tests/run_regtest.py --bin <dir with monzerod and monzero-wallet-rpc>
 
 `run_regtest.py` starts a private offline regtest chain (fixed low difficulty
