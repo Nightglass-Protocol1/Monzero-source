@@ -1,0 +1,26 @@
+/* Styles for the site accent switcher (theme-switch.js). Shipped as a file because the site's
+ * Content-Security-Policy (style-src 'self') blocks <style> injected by JavaScript. */
+
+/* Global tint: active only when a colour is chosen (body.mz-tinted). Each top-level element is
+ * filtered on itself so sticky/fixed headers keep working; images are counter-rotated back. */
+body.mz-tinted > *:not(#mz-theme) { filter: hue-rotate(var(--mz-hue, 0deg)); }
+body.mz-tinted img { filter: hue-rotate(calc(-1 * var(--mz-hue, 0deg))); }
+
+.mz-theme { position: fixed; left: 14px; bottom: 14px; z-index: 9999; font-family: inherit; filter: none !important; }
+.mz-theme-btn { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 50%; cursor: pointer;
+  background: rgba(10, 22, 30, .92); border: 1px solid rgba(255, 255, 255, .14); box-shadow: 0 6px 20px rgba(0, 0, 0, .4); }
+.mz-theme-btn:hover { border-color: rgba(255, 255, 255, .4); }
+.mz-theme-dot { width: 17px; height: 17px; border-radius: 50%; background: #3fdfe8; box-shadow: 0 0 0 3px rgba(255, 255, 255, .08); }
+.mz-theme-pop { position: absolute; left: 0; bottom: 52px; width: 210px; padding: 13px; border-radius: 14px;
+  background: rgba(9, 18, 24, .98); border: 1px solid rgba(255, 255, 255, .14); box-shadow: 0 14px 34px rgba(0, 0, 0, .55); color: #eaf4f6; }
+.mz-theme-pop[hidden] { display: none; }
+.mz-theme-h { margin: 0 0 9px; font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: #8aa3b2; }
+.mz-theme-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+.mz-sw { width: 100%; aspect-ratio: 1; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; }
+.mz-sw:hover { transform: scale(1.08); }
+.mz-sw[aria-current=true] { border-color: #eaf4f6; box-shadow: 0 0 0 2px rgba(0, 0, 0, .6) inset; }
+.mz-theme-custom { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; font-size: 12.5px; color: #8aa3b2; cursor: pointer; }
+.mz-theme-custom input { width: 34px; height: 26px; padding: 0; border: 1px solid rgba(255, 255, 255, .2); border-radius: 7px; background: transparent; cursor: pointer; }
+.mz-theme-reset { display: block; width: 100%; margin-top: 11px; padding: 7px; border: 1px solid rgba(255, 255, 255, .14); background: transparent; color: #8aa3b2; border-radius: 8px; font: 500 12px inherit; cursor: pointer; }
+.mz-theme-reset:hover { color: #eaf4f6; }
+@media print { .mz-theme { display: none; } }

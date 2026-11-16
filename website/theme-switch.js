@@ -20,18 +20,9 @@
     H *= 60; if (H < 0) H += 360; return H; }
   function delta(h){ var d = (hue(h) - BASE_HUE) % 360; if (d > 180) d -= 360; if (d < -180) d += 360; return d; }
 
-  function injectStyle(){
-    if (document.getElementById("mz-tint-css") || !document.head) return;
-    var s = document.createElement("style"); s.id = "mz-tint-css";
-    // Each top-level element is filtered on itself (so its own sticky/fixed keeps working), and
-    // images are counter-rotated back to their true colour. Only active when body.mz-tinted is set.
-    s.textContent =
-      "body.mz-tinted>*:not(#mz-theme){filter:hue-rotate(var(--mz-hue,0deg))}" +
-      "body.mz-tinted img{filter:hue-rotate(calc(-1*var(--mz-hue,0deg)))}";
-    document.head.appendChild(s);
-  }
+  // Styling lives in theme-switch.css (the CSP blocks <style> injected by JS). This only toggles a
+  // class and sets a custom property via the CSSOM, both of which the CSP allows.
   function apply(h){
-    injectStyle();
     var root = document.documentElement, body = document.body;
     if (!h){ root.style.removeProperty("--mz-hue"); if (body) body.classList.remove("mz-tinted"); return; }
     root.style.setProperty("--mz-hue", delta(h).toFixed(1) + "deg");
@@ -41,33 +32,8 @@
   function store(h){ try { h ? localStorage.setItem(KEY, h) : localStorage.removeItem(KEY); } catch (e) {} }
   apply(saved());
 
-  function styles(){
-    if (document.getElementById("mz-theme-css")) return;
-    var css = document.createElement("style"); css.id = "mz-theme-css";
-    css.textContent =
-      ".mz-theme{position:fixed;left:14px;bottom:14px;z-index:9999;font-family:inherit;filter:none!important}" +
-      ".mz-theme-btn{display:grid;place-items:center;width:42px;height:42px;border-radius:50%;cursor:pointer;" +
-        "background:rgba(10,22,30,.92);border:1px solid rgba(255,255,255,.14);box-shadow:0 6px 20px rgba(0,0,0,.4)}" +
-      ".mz-theme-btn:hover{border-color:rgba(255,255,255,.4)}" +
-      ".mz-theme-dot{width:17px;height:17px;border-radius:50%;background:#3fdfe8;box-shadow:0 0 0 3px rgba(255,255,255,.08)}" +
-      ".mz-theme-pop{position:absolute;left:0;bottom:52px;width:210px;padding:13px;border-radius:14px;" +
-        "background:rgba(9,18,24,.98);border:1px solid rgba(255,255,255,.14);box-shadow:0 14px 34px rgba(0,0,0,.55);color:#eaf4f6}" +
-      ".mz-theme-pop[hidden]{display:none}" +
-      ".mz-theme-h{margin:0 0 9px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#8aa3b2}" +
-      ".mz-theme-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}" +
-      ".mz-sw{width:100%;aspect-ratio:1;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0}" +
-      ".mz-sw:hover{transform:scale(1.08)}" +
-      ".mz-sw[aria-current=true]{border-color:#eaf4f6;box-shadow:0 0 0 2px rgba(0,0,0,.6) inset}" +
-      ".mz-theme-custom{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:12px;font-size:12.5px;color:#8aa3b2;cursor:pointer}" +
-      ".mz-theme-custom input{width:34px;height:26px;padding:0;border:1px solid rgba(255,255,255,.2);border-radius:7px;background:transparent;cursor:pointer}" +
-      ".mz-theme-reset{display:block;width:100%;margin-top:11px;padding:7px;border:1px solid rgba(255,255,255,.14);background:transparent;color:#8aa3b2;border-radius:8px;font:500 12px inherit;cursor:pointer}" +
-      ".mz-theme-reset:hover{color:#eaf4f6}" +
-      "@media print{.mz-theme{display:none}}";
-    document.head.appendChild(css);
-  }
   function build(){
     if (document.getElementById("mz-theme") || !document.body) return;
-    styles();
     var wrap = document.createElement("div"); wrap.id = "mz-theme"; wrap.className = "mz-theme";
     var btn = document.createElement("button"); btn.type = "button"; btn.className = "mz-theme-btn";
     btn.setAttribute("aria-label", "Change accent colour"); btn.setAttribute("aria-expanded", "false");
