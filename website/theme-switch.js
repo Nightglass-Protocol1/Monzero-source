@@ -45,12 +45,12 @@
     if (document.getElementById("mz-theme-css")) return;
     var css = document.createElement("style"); css.id = "mz-theme-css";
     css.textContent =
-      ".mz-theme{position:fixed;right:14px;bottom:14px;z-index:9999;font-family:inherit;filter:none!important}" +
+      ".mz-theme{position:fixed;left:14px;bottom:14px;z-index:9999;font-family:inherit;filter:none!important}" +
       ".mz-theme-btn{display:grid;place-items:center;width:42px;height:42px;border-radius:50%;cursor:pointer;" +
         "background:rgba(10,22,30,.92);border:1px solid rgba(255,255,255,.14);box-shadow:0 6px 20px rgba(0,0,0,.4)}" +
       ".mz-theme-btn:hover{border-color:rgba(255,255,255,.4)}" +
       ".mz-theme-dot{width:17px;height:17px;border-radius:50%;background:#3fdfe8;box-shadow:0 0 0 3px rgba(255,255,255,.08)}" +
-      ".mz-theme-pop{position:absolute;right:0;bottom:52px;width:210px;padding:13px;border-radius:14px;" +
+      ".mz-theme-pop{position:absolute;left:0;bottom:52px;width:210px;padding:13px;border-radius:14px;" +
         "background:rgba(9,18,24,.98);border:1px solid rgba(255,255,255,.14);box-shadow:0 14px 34px rgba(0,0,0,.55);color:#eaf4f6}" +
       ".mz-theme-pop[hidden]{display:none}" +
       ".mz-theme-h{margin:0 0 9px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#8aa3b2}" +
