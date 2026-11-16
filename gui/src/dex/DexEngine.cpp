@@ -1221,18 +1221,40 @@ void DexEngine::applyUnlockedTradeKeys(QByteArray seed,QByteArray key,const QStr
     m_keysMessage.clear();
     if (!address.isEmpty()) {m_evmAccount=address;emit dexWalletChanged();emit evmMarketChanged();resumeEvmTrades();return;}
     // The store does not hold an address: ask the helper for the trade accounts (EVM + Solana). The
-    // keys are usable now, but keysReady waits for the EVM address the Funds panel shows.
+    // keys are usable now, but keysReady waits for the EVM address the Funds panel shows. Pick a
+    // market that is free this moment (a periodic listings refresh briefly makes one busy) so the
+    // request actually starts.
     if (m_evmMarkets.isEmpty()) {emit dexWalletChanged();return;}
-    m_keysBusy=true;emit dexWalletChanged();
-    auto *job=*m_evmMarkets.begin();
+    EvmMarketJob *job=nullptr;
+    for (auto *candidate:m_evmMarkets) {
+        const auto st=candidate->status();
+        if (st.value("configured").toBool() && !st.value("busy").toBool()) {job=candidate;break;}
+    }
+    if (!job) {m_keysBusy=false;m_keysMessage=tr("The market is busy; tap Unlock again in a moment.");emit dexWalletChanged();return;}
+    m_keysBusy=true;m_keysMessage.clear();emit dexWalletChanged();
+    QObject::disconnect(m_accountsConn);
     m_accountsConn=connect(job,&EvmMarketJob::changed,this,[this,job]{
-        const auto evm=job->evmAccount();
-        if (evm.isEmpty()) return;
+        if (job->status().value("busy").toBool()) return;   // still deriving
         QObject::disconnect(m_accountsConn);
-        m_keysBusy=false;m_evmAccount=evm;m_keysMessage.clear();
+        m_keysBusy=false;
+        const auto evm=job->evmAccount();
+        if (evm.isEmpty()) {
+            // The helper finished without an account: make it recoverable and say why, rather than
+            // leaving trading stuck "busy" forever (every later Unlock would then do nothing).
+            const auto err=job->status().value("error").toString();
+            m_keysMessage=err.isEmpty() ? tr("Could not read your trading account; tap Unlock again.")
+                                        : tr("Could not read your trading account: %1").arg(err);
+            emit dexWalletChanged();return;
+        }
+        m_evmAccount=evm;m_keysMessage.clear();
         emit dexWalletChanged();emit evmMarketChanged();resumeEvmTrades();
     });
-    QByteArray noSeed;job->requestAccounts(noSeed);
+    QByteArray noSeed;
+    if (!job->requestAccounts(noSeed)) {   // could not even start: do not leave trading stuck busy
+        QObject::disconnect(m_accountsConn);
+        m_keysBusy=false;m_keysMessage=tr("The market is busy; tap Unlock again in a moment.");
+        emit dexWalletChanged();
+    }
 }
 bool DexEngine::unlockDexKeys(const QString &password) {
     if (m_keysBusy || password.isEmpty()) return false;
