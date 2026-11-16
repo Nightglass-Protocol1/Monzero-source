@@ -294,6 +294,10 @@ public:
     bool usingTradeKeyStore() const;
     QString tradeKeyStorePath() const;
     void applyUnlockedTradeKeys(QByteArray seed,QByteArray key,const QString &address);
+    // Derive the EVM/Solana trade account through a market helper once the keys are unlocked and the
+    // store holds no cached address. Markets are briefly busy on each 20s listings refresh, so this
+    // waits (polling every 500ms up to a bound) for one to be free rather than failing on a busy one.
+    void deriveTradeAccount(int attempt);
     // The key wallet's folder (app data). When it was made by another copy of the app, the review
     // of moving it to this copy's helper; approving it (its commitment) lets it be unlocked here.
     QString tradingKeysDirectory() const;
