@@ -88,6 +88,11 @@ tr:last-child td{border-bottom:none}
 th{color:var(--muted);font-weight:500;font-size:12.5px;letter-spacing:.04em;text-transform:uppercase}
 td code{color:var(--accent-2)}
 
+/* Collapsible feeds: show 4 rows, expand for the rest */
+.feed.collapsed tbody tr:nth-child(n+5){display:none}
+.feed .more{margin-top:10px;background:transparent;border:1px solid var(--line-2);color:var(--muted);border-radius:9px;padding:9px 15px;font:500 13px var(--sans);cursor:pointer}
+.feed .more:hover{color:var(--ink);border-color:var(--accent)}
+
 /* Your stats / workers */
 .mstats{margin-top:4px}
 .wkhead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:20px 0 8px}
@@ -149,8 +154,8 @@ tr.off td{color:var(--faint)} tr.off .dot{box-shadow:none}
       <div id="m-pay" hidden><div class="wkhead"><h3>Your payments</h3></div><div class="wrap"><table><thead><tr><th>Sent</th><th>Transaction</th><th class="num">Amount</th></tr></thead><tbody id="ulist"></tbody></table></div></div>
     </div>
   </section>
-  <section><h2>Recent blocks</h2><div class="wrap"><table><thead><tr><th>Height</th><th>Hash</th><th>Found</th><th>Reward</th><th>Status</th></tr></thead><tbody id="blist"></tbody></table></div></section>
-  <section><h2>Recent payments</h2><div class="wrap"><table><thead><tr><th>Sent</th><th>Transaction</th><th>Miners</th><th>Amount</th></tr></thead><tbody id="plist"></tbody></table></div></section>
+  <section class="feed collapsed" id="blocks-feed"><h2>Recent blocks</h2><div class="wrap"><table><thead><tr><th>Height</th><th>Hash</th><th>Found</th><th>Reward</th><th>Status</th></tr></thead><tbody id="blist"></tbody></table></div><button class="more" type="button" hidden></button></section>
+  <section class="feed collapsed" id="pays-feed"><h2>Recent payments</h2><div class="wrap"><table><thead><tr><th>Sent</th><th>Transaction</th><th>Miners</th><th>Amount</th></tr></thead><tbody id="plist"></tbody></table></div><button class="more" type="button" hidden></button></section>
 </main>
 <footer class="pfoot">
   <span>Monzero (XMZ) · independent RandomX proof of work · no premine, no ICO, no fee at genesis</span>
@@ -177,6 +182,20 @@ const aliases = () => { try { return JSON.parse(ls.get(ALIAS_KEY) || "{}") || {}
 const aliasKey = (addr,w) => addr + "|" + w;
 const getAlias = (addr,w) => aliases()[aliasKey(addr,w)] || "";
 function setAlias(addr,w,name){ const a = aliases(); if (name) a[aliasKey(addr,w)] = name.slice(0,40); else delete a[aliasKey(addr,w)]; ls.set(ALIAS_KEY, JSON.stringify(a)); }
+
+// Collapsible "recent blocks/payments": show 4, with a toggle for the rest.
+function updateFeed(id) {
+  const sec = $(id); if (!sec) return;
+  const btn = sec.querySelector(".more"), rows = sec.querySelectorAll("tbody tr");
+  const n = (rows.length === 1 && rows[0].querySelector("td[colspan]")) ? 0 : rows.length;
+  if (n <= 4) { btn.hidden = true; return; }
+  btn.hidden = false;
+  btn.textContent = sec.classList.contains("collapsed") ? "Show all " + n + " ▾" : "Show fewer ▴";
+}
+document.addEventListener("click", e => {
+  const btn = e.target.closest(".feed .more"); if (!btn) return;
+  const sec = btn.closest(".feed"); sec.classList.toggle("collapsed"); updateFeed(sec.id);
+});
 
 let lastMiner = null;
 function renderMiner(m, addr) {
@@ -228,6 +247,7 @@ async function load() {
     $("cmd").textContent = "xmrig -o " + s.config.poolHost + ":" + s.config.ports[0].port + " -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0";
     $("blist").innerHTML = s.pool.blocks.map(b => `<tr><td>${b.height}</td><td><code>${esc(b.hash.slice(0,16))}…</code></td><td>${ago(b.timestamp)}</td><td>${xmz(b.reward)}</td><td>${esc(b.status)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No blocks yet</td></tr>';
     $("plist").innerHTML = s.pool.payments.map(p => `<tr><td>${ago(p.timestamp)}</td><td><code>${esc(p.txid.slice(0,16))}…</code></td><td>${p.miners}</td><td>${xmz(p.amount)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">No payments yet</td></tr>';
+    updateFeed("blocks-feed"); updateFeed("pays-feed");
   } catch (e) { $("nethr").textContent = "offline"; }
   const a = $("addr").value.trim();
   if (a.length >= 90) {
