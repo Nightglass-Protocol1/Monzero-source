@@ -2,54 +2,127 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Monzero Pool</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#02070c">
+<title>Monzero Pool — mining starts at zero</title>
+<link rel="icon" href="https://monzero.org/press/monzero-emblem-20261026-200.png" type="image/png">
+<!-- Luxe fonts from the main site (progressive enhancement; solid system fallbacks below). -->
+<link rel="stylesheet" href="https://monzero.org/assets/luxe-home/fonts.css?v=20261103">
 <style>
-:root { --bg:#0b1118; --panel:#111c27; --line:#293b49; --ink:#edf3f7; --muted:#a8bac8; --accent:#69d5c2; --warn:#edc48d;
-  --sans:"Segoe UI",Arial,sans-serif; --mono:"SFMono-Regular",Consolas,monospace; color-scheme:dark }
-* { box-sizing:border-box }
-body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 var(--sans); padding:32px max(16px,env(safe-area-inset-left)) 64px max(16px,env(safe-area-inset-right)) }
-main { max-width:960px; margin:0 auto; display:grid; gap:28px }
-h1 { margin:0; font-size:30px } h2 { margin:0 0 10px; font-size:18px }
-.muted { color:var(--muted) } code { font-family:var(--mono); font-size:.92em }
-.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px }
-.tile { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px }
-.tile b { display:block; font:600 22px/1.2 var(--mono); font-variant-numeric:tabular-nums }
-.tile span { color:var(--muted); font-size:13px }
-.wrap { overflow-x:auto; border:1px solid var(--line); border-radius:8px; background:var(--panel) }
-table { width:100%; border-collapse:collapse; font-size:14px; font-variant-numeric:tabular-nums }
-th,td { padding:9px 12px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap }
-th { color:var(--muted); font-weight:500 }
-.box { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; display:grid; gap:8px }
-input { width:100%; padding:10px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--ink); font-family:var(--mono) }
-.ok { color:var(--accent) } .warn { color:var(--warn) }
-/* Site bar: the same links as every monzero.org page. */
-.site { max-width:960px; margin:-16px auto 8px; display:flex; align-items:center; justify-content:space-between; gap:16px; position:relative; padding-bottom:16px; border-bottom:1px solid var(--line) }
-.site .brand { display:inline-flex; align-items:center; gap:12px; color:var(--ink); text-decoration:none; font-weight:700; letter-spacing:.14em; font-size:14px }
-.site .mark { display:inline-grid; place-items:center; width:34px; height:34px; border:1px solid var(--accent); border-radius:9px; color:var(--accent); font:600 11px var(--mono); letter-spacing:0 }
-.site nav { display:flex; flex-wrap:wrap; gap:18px }
-.site nav a { color:var(--muted); text-decoration:none; font-size:13px }
-.site nav a:hover, .site nav a[aria-current=page] { color:var(--ink) }
-.site .menu { display:none; padding:8px 14px; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--ink); font:500 14px var(--sans); cursor:pointer }
-@media (max-width:1000px) {
-  .site .menu { display:block }
-  .site nav { display:none; position:absolute; top:100%; left:0; right:0; z-index:5; flex-direction:column; gap:4px; padding:12px 16px; background:var(--panel); border:1px solid var(--line); border-radius:0 0 12px 12px }
-  .site nav.open { display:flex }
-  .site nav a { padding:10px 4px; font-size:15px }
+:root{
+  --bg:#02070c; --bg-2:#050d14; --panel:#0a161e; --panel-2:#0c1a24; --line:#163041; --line-2:#1f3f52;
+  --ink:#eaf4f6; --muted:#8aa3b2; --faint:#5f7585;
+  --accent:#39d7df; --accent-2:#7ef0e6; --glow:rgba(57,215,223,.35); --warn:#f0c48d;
+  --sans:'DM Sans','Segoe UI',system-ui,Helvetica,Arial,sans-serif;
+  --display:'Space Grotesk','Segoe UI',system-ui,Helvetica,Arial,sans-serif;
+  --mono:'IBM Plex Mono','SFMono-Regular',Consolas,monospace;
+  color-scheme:dark;
 }
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 var(--sans);
+  padding:0 max(16px,env(safe-area-inset-left)) 72px max(16px,env(safe-area-inset-right));
+  background-image:radial-gradient(900px 500px at 78% -8%,rgba(57,215,223,.10),transparent 60%),radial-gradient(700px 480px at 8% 4%,rgba(57,215,223,.05),transparent 55%);
+  background-attachment:fixed}
+a{color:inherit}
+.muted{color:var(--muted)} .faint{color:var(--faint)}
+code{font-family:var(--mono);font-size:.92em}
+.wrapc{max-width:980px;margin:0 auto}
+
+/* Top site bar — matches monzero.org */
+.site{max-width:980px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:16px;position:relative;
+  padding:18px 0 16px;border-bottom:1px solid var(--line)}
+.site .brand{display:inline-flex;align-items:center;gap:12px;color:var(--ink);text-decoration:none;font-family:var(--display);font-weight:700;letter-spacing:.16em;font-size:15px}
+.site .brand .zero{color:var(--accent)}
+.site .mark{display:inline-grid;place-items:center;width:34px;height:34px;overflow:hidden;border:1px solid var(--line-2);border-radius:10px;background:var(--panel)}
+.site .mark img{width:24px;height:24px;display:block}
+.site nav{display:flex;flex-wrap:wrap;gap:20px}
+.site nav a{color:var(--muted);text-decoration:none;font-size:13px;letter-spacing:.02em}
+.site nav a:hover,.site nav a[aria-current=page]{color:var(--ink)}
+.site .menu{display:none;padding:8px 14px;border:1px solid var(--line-2);border-radius:9px;background:transparent;color:var(--ink);font:500 14px var(--sans);cursor:pointer}
+@media (max-width:1000px){
+  .site .menu{display:block}
+  .site nav{display:none;position:absolute;top:100%;left:0;right:0;z-index:5;flex-direction:column;gap:4px;padding:12px 16px;background:var(--panel);border:1px solid var(--line);border-radius:0 0 14px 14px}
+  .site nav.open{display:flex}
+  .site nav a{padding:11px 4px;font-size:15px}
+}
+
+main{max-width:980px;margin:0 auto;display:grid;gap:30px}
+
+/* Hero with the zero motif */
+.phero{position:relative;overflow:hidden;margin-top:30px;padding:34px 34px 30px;border:1px solid var(--line);border-radius:18px;
+  background:linear-gradient(160deg,var(--panel-2),var(--bg-2));box-shadow:0 1px 0 rgba(255,255,255,.03) inset}
+.phero .zeromark{position:absolute;right:-40px;top:50%;transform:translateY(-50%);width:300px;height:300px;pointer-events:none;
+  border-radius:50%;background:radial-gradient(closest-side,rgba(57,215,223,.22),rgba(57,215,223,.04) 62%,transparent 72%)}
+.phero .zeromark::after{content:"0";position:absolute;inset:0;display:grid;place-items:center;font-family:var(--display);font-weight:700;
+  font-size:230px;line-height:1;color:transparent;-webkit-text-stroke:2px rgba(126,240,230,.28);text-stroke:2px rgba(126,240,230,.28)}
+.phero .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.28em;text-transform:uppercase;color:var(--accent)}
+.phero h1{margin:.5rem 0 .4rem;font-family:var(--display);font-weight:700;font-size:clamp(30px,5vw,44px);letter-spacing:-.01em}
+.phero h1 .zero{color:var(--accent)}
+.phero p{margin:0;color:var(--muted);max-width:52ch;position:relative}
+.phero .meta{margin-top:14px;font-size:13.5px}
+@media (max-width:620px){ .phero .zeromark{opacity:.5;width:220px;height:220px} .phero .zeromark::after{font-size:170px} }
+
+/* Stat tiles */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(172px,1fr));gap:14px}
+.tile{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 16px 15px;overflow:hidden}
+.tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:linear-gradient(var(--accent),transparent)}
+.tile b{display:block;font:650 24px/1.2 var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
+.tile span{display:block;margin-top:3px;color:var(--muted);font-size:12.5px}
+.tile .split{display:block;margin-top:6px;color:var(--faint);font-size:11.5px}
+
+/* Panels */
+.box{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;display:grid;gap:10px}
+.box h2,section>h2{margin:0 0 2px;font-family:var(--display);font-weight:600;font-size:18px;letter-spacing:-.01em}
+section>h2{margin:0 0 12px}
+.box p{margin:0}
+.box code{display:inline-block;background:var(--bg-2);border:1px solid var(--line);border-radius:7px;padding:3px 8px}
+input{width:100%;padding:12px 13px;border-radius:9px;border:1px solid var(--line-2);background:var(--bg-2);color:var(--ink);font-family:var(--mono);font-size:14px}
+input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(57,215,223,.15)}
+.ok{color:var(--accent-2)} .warn{color:var(--warn)}
+
+/* Tables */
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--panel)}
+table{width:100%;border-collapse:collapse;font-size:14px;font-variant-numeric:tabular-nums}
+th,td{padding:11px 14px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+th{color:var(--muted);font-weight:500;font-size:12.5px;letter-spacing:.04em;text-transform:uppercase}
+td code{color:var(--accent-2)}
+
+/* Your stats / workers */
+.mstats{margin-top:4px}
+.wkhead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:20px 0 8px}
+.wkhead h3,#m-pay h3{margin:0 0 8px;font-family:var(--display);font-weight:600;font-size:15px;letter-spacing:-.01em}
+.wkhead h3{margin:0}
+.tiny{font-size:12px;margin-top:10px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--faint);margin-right:8px;vertical-align:middle}
+.dot.on{background:var(--accent);box-shadow:0 0 0 3px var(--glow)}
+.wk b{font-weight:600}
+.wk .real{display:block;margin-top:1px;color:var(--faint);font-size:11px;font-weight:400;font-family:var(--mono);text-transform:none;letter-spacing:0}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+th.num{text-align:right}
+tr.off td{color:var(--faint)} tr.off .dot{box-shadow:none}
+.rnbtn{background:transparent;border:1px solid var(--line-2);color:var(--muted);border-radius:7px;padding:4px 9px;font:500 12px var(--sans);cursor:pointer}
+.rnbtn:hover{color:var(--ink);border-color:var(--accent)}
+.pfoot{max-width:980px;margin:36px auto 0;padding-top:20px;border-top:1px solid var(--line);color:var(--faint);font-size:13px;display:flex;flex-wrap:wrap;gap:8px 18px;justify-content:space-between}
+.pfoot a{color:var(--muted);text-decoration:none}
+.pfoot a:hover{color:var(--ink)}
 </style>
 </head>
 <body>
 <header class="site">
-  <a class="brand" href="https://monzero.org/" aria-label="Monzero home"><span class="mark">MZ</span>MONZERO</a>
+  <a class="brand" href="https://monzero.org/" aria-label="Monzero home"><span class="mark"><img src="https://monzero.org/press/monzero-emblem-20261026-200.png" alt=""></span>MON<span class="zero">ZERO</span></a>
   <button class="menu" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button>
   <nav id="site-nav" aria-label="Primary navigation"><a href="https://monzero.org/">Home</a><a href="https://monzero.org/explorer/">Explorer</a><a href="https://monzero.org/app/">Studio</a><a href="https://monzero.org/roadmap/">Roadmap</a><a href="https://monzero.org/WHITEPAPER.md?rev=1.5-20261017">Whitepaper</a><a href="https://monzero.org/#mine">Mining</a><a href="./" aria-current="page">Pool</a><a href="https://monzero.org/founder/">Founder</a><a href="https://monzero.org/fund/">Donate</a><a href="https://monzero.org/security/">Security</a></nav>
 </header>
 <main>
-  <header><h1>Monzero Pool</h1><p class="muted">RandomX (rx/0) · PPLNS · <span id="fee">–</span> fee · paid after <span id="depth">–</span> confirmations · <span id="paymode">–</span></p></header>
+  <section class="phero">
+    <div class="zeromark" aria-hidden="true"></div>
+    <div class="kicker">Monzero / mining pool</div>
+    <h1>Mining starts at <span class="zero">zero</span>.</h1>
+    <p>Point any CPU at the pool and earn XMZ. RandomX (rx/0) · PPLNS · <span id="fee">–</span> fee · paid after <span id="depth">–</span> confirmations · <span id="paymode">–</span></p>
+  </section>
   <section class="tiles">
-    <div class="tile"><b id="poolhr">–</b><span>Pool hash rate</span></div>
-    <div class="tile"><b id="nethr">–</b><span>Network hash rate</span></div>
+    <div class="tile"><b id="nethr">–</b><span>Network hash rate (all miners)</span><small id="hrsplit" class="split">Pool and solo miners combined</small></div>
     <div class="tile"><b id="miners">–</b><span>Miners / workers</span></div>
     <div class="tile"><b id="height">–</b><span>Network height</span></div>
     <div class="tile"><b id="blocks">–</b><span>Blocks found</span></div>
@@ -60,42 +133,114 @@ input { width:100%; padding:10px; border-radius:6px; border:1px solid var(--line
     <p>XMRig: <code id="cmd">xmrig -o pool.monzero.org:3333 -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0</code></p>
     <p class="muted">Use your own Monzero wallet address as the username. Add <code>+50000</code> to the address for a fixed difficulty. Ports: <span id="ports">–</span></p>
   </section>
-  <section class="box">
+  <section class="box" id="you">
     <h2>Your stats</h2>
-    <input id="addr" placeholder="Paste your XMZ address" autocomplete="off">
-    <div id="mine" class="muted">Enter an address to see hash rate, pending balance and payments.</div>
+    <input id="addr" placeholder="Paste your XMZ address" autocomplete="off" spellcheck="false">
+    <div id="mine-empty" class="muted">Enter your mining address to see your hash rate, workers, balance and payments. It is remembered in this browser.</div>
+    <div id="mine" hidden>
+      <div class="tiles mstats">
+        <div class="tile"><b id="m-hr5">–</b><span>Hash rate · 5 min</span><small class="split"><span id="m-hr1h">–</span> · 1h&ensp;<span id="m-hr1d">–</span> · 1d&ensp;<span id="m-hr1w">–</span> · 1w</small></div>
+        <div class="tile"><b id="m-pending">–</b><span>Pending balance</span><small class="split">Paid so far <span id="m-paid">–</span></small></div>
+        <div class="tile"><b id="m-workers">–</b><span>Workers online</span><small class="split"><span id="m-shares">–</span> share difficulty · 7 days</small></div>
+      </div>
+      <div class="wkhead"><h3>Workers</h3><span class="muted tiny" id="m-wknote"></span></div>
+      <div class="wrap"><table><thead><tr><th>Worker</th><th class="num">5 min</th><th class="num">1 h</th><th class="num">1 d</th><th class="num">1 w</th><th class="num">Shares</th><th>Last</th><th></th></tr></thead><tbody id="wlist"></tbody></table></div>
+      <p class="muted tiny">Rename a worker to give it a friendly label — saved in this browser only. The real worker name is the one you set in XMRig after <code>-p</code>.</p>
+      <div id="m-pay" hidden><div class="wkhead"><h3>Your payments</h3></div><div class="wrap"><table><thead><tr><th>Sent</th><th>Transaction</th><th class="num">Amount</th></tr></thead><tbody id="ulist"></tbody></table></div></div>
+    </div>
   </section>
   <section><h2>Recent blocks</h2><div class="wrap"><table><thead><tr><th>Height</th><th>Hash</th><th>Found</th><th>Reward</th><th>Status</th></tr></thead><tbody id="blist"></tbody></table></div></section>
   <section><h2>Recent payments</h2><div class="wrap"><table><thead><tr><th>Sent</th><th>Transaction</th><th>Miners</th><th>Amount</th></tr></thead><tbody id="plist"></tbody></table></div></section>
 </main>
+<footer class="pfoot">
+  <span>Monzero (XMZ) · independent RandomX proof of work · no premine, no ICO, no fee at genesis</span>
+  <span><a href="https://monzero.org/mining/">Mining guide</a> · <a href="https://monzero.org/explorer/">Explorer</a> · <a href="https://monzero.org/security/">Security</a></span>
+</footer>
 <script>
 const U = 1e11;
 const hr = h => h >= 1e6 ? (h/1e6).toFixed(2)+" MH/s" : h >= 1e3 ? (h/1e3).toFixed(2)+" kH/s" : h.toFixed(0)+" H/s";
+// One overall figure: the network estimate already includes this pool. Pool and
+// network rates are sampled separately, so clamp the pool's part to the total.
+const split = (net, pool) => { if (!(net > 0)) return "Pool and solo miners combined"; const p = Math.min(pool, net), pct = Math.round(p / net * 100);
+  return "This pool " + hr(p) + " (" + pct + "%) · solo & other " + hr(net - p) + " (" + (100 - pct) + "%)"; };
 const ago = t => { if (!t) return "never"; const s = Date.now()/1000 - t; return s < 120 ? Math.round(s)+" s ago" : s < 7200 ? Math.round(s/60)+" min ago" : Math.round(s/3600)+" h ago"; };
 const xmz = a => (a/U).toFixed(5)+" XMZ";
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const $ = id => document.getElementById(id);
+const num = n => (n || 0).toLocaleString();
+
+// Worker labels and the saved address live in this browser only (the pool has no login).
+const ADDR_KEY = "xmzpool-addr", ALIAS_KEY = "xmzpool-aliases";
+const ls = { get(k){ try { return localStorage.getItem(k); } catch { return null; } },
+             set(k,v){ try { localStorage.setItem(k,v); } catch {} } };
+const aliases = () => { try { return JSON.parse(ls.get(ALIAS_KEY) || "{}") || {}; } catch { return {}; } };
+const aliasKey = (addr,w) => addr + "|" + w;
+const getAlias = (addr,w) => aliases()[aliasKey(addr,w)] || "";
+function setAlias(addr,w,name){ const a = aliases(); if (name) a[aliasKey(addr,w)] = name.slice(0,40); else delete a[aliasKey(addr,w)]; ls.set(ALIAS_KEY, JSON.stringify(a)); }
+
+let lastMiner = null;
+function renderMiner(m, addr) {
+  if (!m || m.error) { $("mine").hidden = true; $("mine-empty").hidden = false;
+    $("mine-empty").textContent = (m && m.error) ? m.error : "Enter your mining address to see your hash rate, workers, balance and payments. It is remembered in this browser.";
+    lastMiner = null; return; }
+  lastMiner = { m, addr };
+  $("mine-empty").hidden = true; $("mine").hidden = false;
+  const h = m.hashrates || {};
+  $("m-hr5").textContent = hr(h.m5 || 0); $("m-hr1h").textContent = hr(h.h1 || 0);
+  $("m-hr1d").textContent = hr(h.d1 || 0); $("m-hr1w").textContent = hr(h.w1 || 0);
+  $("m-pending").textContent = xmz(m.pending || 0); $("m-paid").textContent = xmz(m.paid || 0);
+  const ws = m.workers || [];
+  $("m-workers").textContent = (m.workersOnline || 0) + " / " + ws.length;
+  $("m-shares").textContent = num(m.shares);
+  $("m-wknote").textContent = ws.length ? "" : "No workers seen in the last 7 days.";
+  $("wlist").innerHTML = ws.map(w => {
+    const alias = getAlias(addr, w.name), hrs = w.hashrate || {};
+    const label = alias ? `<b>${esc(alias)}</b><span class="real">${esc(w.name)}</span>` : `<b>${esc(w.name)}</b>`;
+    return `<tr class="${w.online ? "" : "off"}">
+      <td><span class="dot ${w.online ? "on" : ""}"></span><span class="wk">${label}</span></td>
+      <td class="num">${hr(hrs.m5 || 0)}</td><td class="num">${hr(hrs.h1 || 0)}</td>
+      <td class="num">${hr(hrs.d1 || 0)}</td><td class="num">${hr(hrs.w1 || 0)}</td>
+      <td class="num">${num(w.shares)}</td><td>${w.online ? '<span class="ok">online</span>' : ago(w.last)}</td>
+      <td class="num"><button class="rnbtn" data-worker="${esc(w.name)}">${alias ? "Edit" : "Rename"}</button></td></tr>`;
+  }).join("") || '<tr><td colspan="8" class="muted">No workers yet. Point XMRig at the pool with your address.</td></tr>';
+  const pays = m.payments || [];
+  $("m-pay").hidden = !pays.length;
+  $("ulist").innerHTML = pays.map(p => `<tr><td>${ago(p.timestamp)}</td><td><code>${esc(p.txid.slice(0,16))}…</code></td><td class="num">${xmz(p.amount)}</td></tr>`).join("");
+}
+document.getElementById("wlist").addEventListener("click", e => {
+  const btn = e.target.closest(".rnbtn"); if (!btn || !lastMiner) return;
+  const w = btn.dataset.worker;
+  const name = prompt('Label for worker "' + w + '" (leave blank to reset to the real name):', getAlias(lastMiner.addr, w));
+  if (name === null) return;
+  setAlias(lastMiner.addr, w, name.trim());
+  renderMiner(lastMiner.m, lastMiner.addr);
+});
+
 async function load() {
   try {
     const s = await (await fetch("/api/stats")).json();
     $("fee").textContent = s.config.fee + "%"; $("depth").textContent = s.config.depth;
     $("paymode").innerHTML = s.config.paymentsEnabled ? '<span class="ok">payments on</span>' : '<span class="warn">payments not yet enabled</span>';
-    $("poolhr").textContent = hr(s.pool.hashrate); $("nethr").textContent = hr(s.network.hashrate || 0);
+    $("nethr").textContent = hr(s.network.hashrate || 0); $("hrsplit").textContent = split(s.network.hashrate || 0, s.pool.hashrate || 0);
     $("miners").textContent = s.pool.miners + " / " + s.pool.workers; $("height").textContent = s.network.height ?? "–";
     $("blocks").textContent = s.pool.totalBlocks; $("last").textContent = ago(s.pool.lastBlockFound/1000);
     $("ports").textContent = s.config.ports.map(p => p.port + " (diff " + p.difficulty + ")").join(", ");
     $("cmd").textContent = "xmrig -o " + s.config.poolHost + ":" + s.config.ports[0].port + " -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0";
     $("blist").innerHTML = s.pool.blocks.map(b => `<tr><td>${b.height}</td><td><code>${esc(b.hash.slice(0,16))}…</code></td><td>${ago(b.timestamp)}</td><td>${xmz(b.reward)}</td><td>${esc(b.status)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No blocks yet</td></tr>';
     $("plist").innerHTML = s.pool.payments.map(p => `<tr><td>${ago(p.timestamp)}</td><td><code>${esc(p.txid.slice(0,16))}…</code></td><td>${p.miners}</td><td>${xmz(p.amount)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">No payments yet</td></tr>';
-  } catch (e) { $("poolhr").textContent = "offline"; }
+  } catch (e) { $("nethr").textContent = "offline"; }
   const a = $("addr").value.trim();
-  if (a.length > 90) {
+  if (a.length >= 90) {
+    ls.set(ADDR_KEY, a);
     try {
       const m = await (await fetch("/api/miner?address=" + encodeURIComponent(a))).json();
-      $("mine").innerHTML = m.error ? esc(m.error) : `Hash rate <b>${hr(m.hashrate)}</b> · pending <b>${xmz(m.pending)}</b> · paid <b>${xmz(m.paid)}</b> · workers ${m.workers.map(w => esc(w.name)).join(", ") || "none online"}`;
+      renderMiner(m, a);
     } catch (e) {}
+  } else {
+    renderMiner(null);
   }
 }
+const savedAddr = ls.get(ADDR_KEY); if (savedAddr) $("addr").value = savedAddr;
 $("addr").addEventListener("change", load);
 load(); setInterval(load, 15000);
 </script>

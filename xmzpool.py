@@ -156,6 +156,7 @@ def with_nonce(blob_hex, nonce_hex):
 # ---------------------------------------------------------------- storage
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS shares (id INTEGER PRIMARY KEY, ts REAL, address TEXT, worker TEXT, diff INTEGER, height INTEGER);
+CREATE INDEX IF NOT EXISTS ix_shares_addr_ts ON shares(address, ts);
 CREATE TABLE IF NOT EXISTS blocks (height INTEGER PRIMARY KEY, hash TEXT, prev_hash TEXT, nonce INTEGER, ts REAL,
   finder TEXT, net_diff INTEGER, last_share INTEGER, reward INTEGER, status TEXT, credited_at REAL);
 CREATE TABLE IF NOT EXISTS credits (height INTEGER, address TEXT, amount INTEGER, PRIMARY KEY (height, address));
@@ -164,6 +165,8 @@ CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY, ts REAL, status TEX
 CREATE TABLE IF NOT EXISTS payment_items (payment INTEGER, address TEXT, amount INTEGER);
 CREATE TABLE IF NOT EXISTS pool_fee (height INTEGER PRIMARY KEY, amount INTEGER);
 CREATE INDEX IF NOT EXISTS payment_items_address ON payment_items(address);
+CREATE TABLE IF NOT EXISTS liquidity_state (key TEXT PRIMARY KEY, value INTEGER);
+CREATE TABLE IF NOT EXISTS liquidity_transfers (id INTEGER PRIMARY KEY, ts REAL, status TEXT, txid TEXT, amount INTEGER, fee INTEGER, detail TEXT);
 """
 
 class Store:
@@ -338,6 +341,71 @@ class Pool:
                 await self.pay_round()
             except (RpcError, RpcUncertain) as e:
                 log.warning("payouts: %s", e)
+            try:
+                await self.liquidity_once()   # after the miners, and only from what they are not owed
+            except (RpcError, RpcUncertain) as e:
+                log.warning("liquidity: %s", e)
+
+    # --- the DEX liquidity share: a part of the pool's own fee, never the miners' coins
+    def liquidity_owed(self):
+        """Atoms of the pool fee earned since the share was switched on that are still to be sent."""
+        lq = self.cfg["liquidity"]
+        start = lq.get("from_height")
+        if start is None:
+            row = self.store.q("SELECT value FROM liquidity_state WHERE key='from_height'")
+            if row:
+                start = row[0][0]
+            else:   # first run: only fees from blocks credited from now on, not the pool's history
+                start = self.store.q("SELECT COALESCE(MAX(height),0) FROM pool_fee")[0][0]
+                with self.store.tx() as db:
+                    db.execute("INSERT OR IGNORE INTO liquidity_state VALUES ('from_height', ?)", (start,))
+        earned = self.store.q("SELECT COALESCE(SUM(amount),0) FROM pool_fee WHERE height>?", (start,))[0][0]
+        entitled = earned * int(lq["share_basis_points"]) // 10000
+        used = self.store.q("SELECT COALESCE(SUM(amount),0) FROM liquidity_transfers WHERE status IN ('sending','sent','uncertain')")[0][0]
+        return max(0, entitled - used)
+
+    async def liquidity_once(self):
+        """Send the liquidity share to the DEX liquidity wallet when the pool wallet can spare it:
+        its unlocked balance must still cover every miner's whole pending balance (paid out or
+        not yet due), the payout fee reserve and this transfer's own fee."""
+        lq = self.cfg["liquidity"]
+        if not lq["enabled"] or not self.payouts_enabled or self.halt_file.exists():
+            return None
+        if not await self.valid_address(lq["address"]):
+            log.error("liquidity: the address in the config is not a usable %s address; nothing sent", self.cfg["nettype"])
+            return None
+        owed = self.liquidity_owed()
+        if owed < int(lq["min_transfer_xmz"] * ATOMIC):
+            return None
+        if self.store.q("SELECT COUNT(*) FROM payments WHERE status IN ('sending','uncertain')")[0][0]:
+            return None
+        bal = await self.w("get_balance", {"account_index": 0})
+        miners = self.store.q("SELECT COALESCE(SUM(pending),0) FROM balances")[0][0]
+        room = bal["unlocked_balance"] - miners - int(self.cfg["payouts"]["fee_reserve_xmz"] * ATOMIC) - int(lq["tx_fee_margin_xmz"] * ATOMIC)
+        amount = min(owed, room)
+        if amount < int(lq["min_transfer_xmz"] * ATOMIC):
+            log.info("liquidity: %.5f XMZ owed, waiting: unlocked %.5f XMZ must first cover the miners' %.5f XMZ",
+                     owed / ATOMIC, bal["unlocked_balance"] / ATOMIC, miners / ATOMIC)
+            return None
+        with self.store.tx() as db:   # record intent first, as for miner payments
+            tid = db.execute("INSERT INTO liquidity_transfers(ts, status, amount) VALUES (?, 'sending', ?)", (time.time(), amount)).lastrowid
+        try:
+            r = await self.w("transfer", {"destinations": [{"address": lq["address"], "amount": amount}], "priority": 0, "account_index": 0}, timeout=180)
+        except RpcError as e:
+            with self.store.tx() as db:
+                db.execute("UPDATE liquidity_transfers SET status='failed', detail=? WHERE id=?", (str(e)[:500], tid))
+            log.error("liquidity transfer %d refused by wallet: %s", tid, e)
+            return None
+        except RpcUncertain as e:
+            with self.store.tx() as db:
+                db.execute("UPDATE liquidity_transfers SET status='uncertain', detail=? WHERE id=?", (str(e)[:500], tid))
+            self.halt_file.write_text(f"liquidity transfer {tid} outcome unknown: {e}\nCheck the wallet's outgoing transfers, then fix the liquidity_transfers table and delete this file.\n")
+            log.error("liquidity transfer %d outcome unknown; payouts halted", tid)
+            return None
+        with self.store.tx() as db:
+            db.execute("UPDATE liquidity_transfers SET status='sent', txid=?, fee=? WHERE id=?", (r["tx_hash"], r["fee"], tid))
+        log.info("liquidity transfer %d sent: %s, %.5f XMZ to the DEX liquidity wallet", tid, r["tx_hash"], amount / ATOMIC)
+        return r["tx_hash"]
 
     async def pay_round(self):
         """Pay everyone who is due: one transaction holds at most max_destinations miners (a
@@ -623,15 +691,56 @@ class Pool:
                      "blocks": [{"height": h, "hash": bh, "timestamp": int(ts), "reward": r, "status": st,
                                  "finder": f[:8] + "…" + f[-4:]} for h, bh, ts, r, st, f in blocks],
                      "payments": [{"timestamp": int(ts), "txid": tx, "fee": fee, "amount": amt, "miners": n} for ts, tx, fee, amt, n in payments]},
+            "liquidity": self.liquidity_stats(),
             "uptime": int(time.time() - self.started),
         }
+
+    def liquidity_stats(self):
+        lq = self.cfg["liquidity"]
+        if not lq["enabled"]:
+            return {"enabled": False}
+        sent = self.store.q("SELECT ts, txid, amount FROM liquidity_transfers WHERE status='sent' ORDER BY id DESC LIMIT 20")
+        return {"enabled": True, "shareOfPoolFeePercent": lq["share_basis_points"] / 100, "address": lq["address"],
+                "sent": self.store.q("SELECT COALESCE(SUM(amount),0) FROM liquidity_transfers WHERE status='sent'")[0][0],
+                "transfers": [{"timestamp": int(ts), "txid": tx, "amount": a} for ts, tx, a in sent]}
+
+    # Per-worker stats for a miner, from the shares table (so they include workers that are
+    # currently offline but mined within the retention window). Hashrate over several windows,
+    # total shares and last-seen, plus which workers are connected right now.
+    WORKER_WINDOWS = (("m5", 300), ("h1", 3600), ("d1", 86400), ("w1", 604800))
+
+    def worker_stats(self, address):
+        online = {m.worker: m.diff for m in self.miners.values() if m.address == address}
+        workers = {}
+        for key, win in self.WORKER_WINDOWS:
+            for name, s in self.store.q(
+                    "SELECT worker, COALESCE(SUM(diff),0) FROM shares WHERE address=? AND ts>=? GROUP BY worker",
+                    (address, time.time() - win)):
+                workers.setdefault(name, {})[key] = (s or 0) / win
+        for name, total, last in self.store.q(
+                "SELECT worker, COALESCE(SUM(diff),0), COALESCE(MAX(ts),0) FROM shares WHERE address=? GROUP BY worker",
+                (address,)):
+            w = workers.setdefault(name, {})
+            w["shares"], w["last"] = int(total or 0), int(last or 0)
+        for name in online:
+            workers.setdefault(name, {})
+        out = [{"name": name, "online": name in online,
+                "hashrate": {k: w.get(k, 0) for k, _ in self.WORKER_WINDOWS},
+                "shares": w.get("shares", 0), "last": w.get("last", 0),
+                "difficulty": online.get(name, 0)}
+               for name, w in workers.items()]
+        out.sort(key=lambda x: (not x["online"], -x["hashrate"]["m5"], -x["shares"]))
+        return out
 
     def miner_stats(self, address):
         bal = self.store.q("SELECT pending, paid FROM balances WHERE address=?", (address,))
         items = self.store.q("SELECT p.ts, p.txid, i.amount FROM payment_items i JOIN payments p ON p.id=i.payment WHERE i.address=? AND p.status='sent' ORDER BY p.id DESC LIMIT 50", (address,))
-        workers = [{"name": m.worker, "difficulty": m.diff} for m in self.miners.values() if m.address == address]
-        return {"address": address, "hashrate": self.hashrate(address), "pending": bal[0][0] if bal else 0,
-                "paid": bal[0][1] if bal else 0, "workers": workers,
+        workers = self.worker_stats(address)
+        total_shares = self.store.q("SELECT COALESCE(SUM(diff),0) FROM shares WHERE address=?", (address,))[0][0] or 0
+        return {"address": address, "pending": bal[0][0] if bal else 0, "paid": bal[0][1] if bal else 0,
+                "hashrate": self.hashrate(address),
+                "hashrates": {k: self.hashrate(address, win) for k, win in self.WORKER_WINDOWS},
+                "shares": int(total_shares), "workersOnline": sum(1 for w in workers if w["online"]), "workers": workers,
                 "payments": [{"timestamp": int(ts), "txid": tx, "amount": a} for ts, tx, a in items]}
 
     async def http(self, reader, writer):
@@ -677,14 +786,21 @@ DEFAULTS = {
     "unlock_interval_seconds": 60, "share_retention_days": 7,
     "payouts": {"enabled": False, "threshold_xmz": 1.0, "interval_seconds": 3600, "max_destinations": 15, "fee_reserve_xmz": 0.1,
                 "max_batches": 8, "hold_seconds": 21600},
+    # A share of the pool's own fee for the DEX liquidity wallet (see liquidity_once)
+    "liquidity": {"enabled": False, "address": "", "share_basis_points": 100, "min_transfer_xmz": 10.0,
+                  "tx_fee_margin_xmz": 0.1, "from_height": None},
 }
 
 def load_config(path):
     cfg = json.loads(json.dumps(DEFAULTS))
     user = json.loads(Path(path).read_text())
     payouts = {**cfg["payouts"], **user.pop("payouts", {})}
+    liquidity = {**cfg["liquidity"], **user.pop("liquidity", {})}
     cfg.update(user)
     cfg["payouts"] = payouts
+    cfg["liquidity"] = liquidity
+    if not 0 <= int(liquidity["share_basis_points"]) <= 10000:
+        sys.exit("config: liquidity.share_basis_points must be 0..10000 (100 = 1% of the pool fee)")
     for key in ("daemon_rpc", "wallet_rpc", "pool_address", "database", "stratum_ports"):
         if key not in cfg:
             sys.exit(f"config: missing {key}")
