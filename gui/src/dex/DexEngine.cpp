@@ -1226,26 +1226,30 @@ void DexEngine::applyUnlockedTradeKeys(QByteArray seed,QByteArray key,const QStr
     // which is busy on every 20s listings refresh (and for up to two minutes if a relay is slow).
     // So wait for a market to be free rather than failing the moment one is busy: a single Unlock
     // click then reliably finishes instead of silently doing nothing.
-    if (m_evmMarkets.isEmpty()) {
-        m_keysBusy=false;m_keysMessage=tr("Trading is still starting; tap Unlock again in a moment.");
-        emit dexWalletChanged();return;
-    }
     m_keysBusy=true;m_keysMessage.clear();emit dexWalletChanged();
     deriveTradeAccount(0);
 }
 void DexEngine::deriveTradeAccount(int attempt) {
-    // Stop if another path already resolved the account, or the markets went away.
+    // Stop if another path already resolved the account.
     if (!m_evmAccount.isEmpty()) {m_keysBusy=false;return;}
-    if (m_evmMarkets.isEmpty()) {m_keysBusy=false;m_keysMessage=tr("Trading is still starting; tap Unlock again in a moment.");emit dexWalletChanged();return;}
+    // Find a configured, idle market. The markets only appear once the DEX trading wallet has
+    // finished starting — three wallet-rpc processes, slow on a cold Windows first launch while
+    // Defender scans each — and each market is busy during its 20s listings refresh. So keep the
+    // "setting up" state and wait (poll every 500ms) rather than failing: one Unlock click then
+    // finishes on its own as soon as a market is up and free, even if the user clicked early.
     EvmMarketJob *job=nullptr;
     for (auto *candidate:m_evmMarkets) {
         const auto st=candidate->status();
         if (st.value("configured").toBool() && !st.value("busy").toBool()) {job=candidate;break;}
     }
     if (!job) {
-        // Every market is momentarily busy. Keep the "setting up" state and try again shortly,
-        // up to ~60s, instead of giving up — a listings refresh frees a market within seconds.
-        if (attempt>=120) {m_keysBusy=false;m_keysMessage=tr("The market is busy; tap Unlock again in a moment.");emit dexWalletChanged();return;}
+        if (attempt>=240) {   // ~2 min: covers a cold Windows start of the trading wallet
+            m_keysBusy=false;
+            m_keysMessage=m_evmMarkets.isEmpty()
+                ? tr("Trading is still starting; wait for the markets to load, then tap Unlock again.")
+                : tr("The market is busy; tap Unlock again in a moment.");
+            emit dexWalletChanged();return;
+        }
         QTimer::singleShot(500,this,[this,attempt]{deriveTradeAccount(attempt+1);});
         return;
     }
