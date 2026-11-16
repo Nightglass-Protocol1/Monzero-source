@@ -261,6 +261,29 @@ function adClientHash(): string { $ip = adClientIp(); return $ip === '' ? '' : h
 function adDeviceHash(?string $device): string {
     return is_string($device) && preg_match('/\A[a-f0-9]{32}\z/', $device) ? hash_hmac('sha256', 'device:' . $device, adSecret()) : '';
 }
+// The browser's best-effort device fingerprint (canvas/WebGL/screen/etc., hashed in the browser),
+// as a keyed hash. '' if absent or malformed. Unlike the random device id this SURVIVES clearing
+// storage, but it is only a probabilistic signal (identical devices can collide), so it is used
+// ONLY to flag likely duplicates for a moderator — never to auto-disqualify an entry.
+function adFpHash(?string $fp): string {
+    $fp = is_string($fp) ? strtolower(trim($fp)) : '';
+    return preg_match('/\A[a-f0-9]{16,128}\z/', $fp) ? hash_hmac('sha256', 'fp:' . $fp, adSecret()) : '';
+}
+// How many OTHER active, non-exempt entries share this entry's network (IP) or device fingerprint.
+// A moderator review signal only — neither is auto-enforced (families share a network, and
+// identical devices share a fingerprint). Returns ['ip' => n, 'fp' => n].
+function adEntrySharing(int $pid): array {
+    $db = adDb(); $out = ['ip' => 0, 'fp' => 0];
+    foreach (['ip', 'fp'] as $kind) {
+        $q = $db->prepare("SELECT COUNT(DISTINCT o.participant_id) FROM participant_seen m
+            JOIN participant_seen o ON o.kind = m.kind AND o.hash = m.hash AND o.participant_id != m.participant_id
+            JOIN participants p ON p.id = o.participant_id
+            WHERE m.participant_id = ? AND m.kind = ? AND p.status = 'active' AND p.exempt = 0");
+        $q->execute([$pid, $kind]);
+        $out[$kind] = (int)$q->fetchColumn();
+    }
+    return $out;
+}
 
 function adToken(): string { return bin2hex(random_bytes(16)); }
 function adHash(string $t): string { return hash('sha256', $t); }
@@ -269,7 +292,7 @@ function adShort(string $a): string { return substr($a, 0, 8) . '…' . substr($
 
 // Register (or return) a participant for an address. Returns [participant row, token|null].
 // token is only returned on first creation.
-function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null, string $deviceHash = ''): array {
+function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null, string $deviceHash = '', string $fpHash = ''): array {
     $parsed = xmzParseAddress($rawAddress);
     if (isset($parsed['error'])) return ['error' => $parsed['error']];
     if ($parsed['network'] !== 'mainnet' || $parsed['kind'] === 'integrated')
@@ -283,7 +306,7 @@ function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null, st
 
     // One entry per person: refuse a new address from a browser or network another entry already uses.
     if (adConfig()['one_per_person'] && ($other = adLinkedEntry((string)$ipHash, $deviceHash, null)))
-        return ['error' => 'Only one airdrop entry is allowed per person, and this device or connection already has one (' . adShort($other['address']) . '). Use that address. If this is a mistake (for example a shared connection), contact the team on Telegram.'];
+        return ['error' => 'Only one airdrop entry is allowed per person, and this browser already has one (' . adShort($other['address']) . '). Use that address. Sharing a home network is fine — each person just joins from their own device.'];
     $budget = adBudget();
     if ($budget['pool'] <= 0 || $budget['committed'] >= $budget['pool'])
         return ['error' => 'The airdrop budget is fully committed, so new entries are closed. Follow the Telegram for the next round.'];
@@ -307,7 +330,7 @@ function adRegister(string $rawAddress, ?string $ref, ?string $ipHash = null, st
     // The wallet reward is NOT paid here: it unlocks once Telegram or mining is verified, so a
     // bare address (which costs nothing to make) earns nothing on its own.
     $row->execute([$address]); $p = $row->fetch();
-    adSeen((int)$p['id'], (string)$ipHash, $deviceHash);
+    adSeen((int)$p['id'], (string)$ipHash, $deviceHash, $fpHash);
     return ['participant' => $p, 'token' => $token, 'existing' => false];
 }
 
@@ -970,19 +993,23 @@ function adPendingCounts(): array {
 // ---- One entry per person ----
 
 // Remember which (hashed) network and browser an entry was used from, then enforce the rule.
-function adSeen(int $pid, string $ipHash, string $deviceHash): void {
+function adSeen(int $pid, string $ipHash, string $deviceHash, string $fpHash = ''): void {
     $db = adDb(); $now = time();
     $up = $db->prepare('INSERT INTO participant_seen (participant_id, kind, hash, first_at, last_at) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (participant_id, kind, hash) DO UPDATE SET last_at = excluded.last_at');
     if ($ipHash !== '') $up->execute([$pid, 'ip', $ipHash, $now, $now]);
     if ($deviceHash !== '') $up->execute([$pid, 'device', $deviceHash, $now, $now]);
+    // The fingerprint is recorded for moderator review only; it is never used to auto-disqualify.
+    if ($fpHash !== '') $up->execute([$pid, 'fp', $fpHash, $now, $now]);
     if (adConfig()['one_per_person']) adEnforceOnePerPerson($pid);
 }
 
-// An active, non-exempt entry (other than $exceptPid) already seen on this network or browser.
+// An active, non-exempt entry (other than $exceptPid) already seen on this browser. Only the
+// browser's device id is enforced — NOT the network (IP), so a family/household sharing one
+// connection can each join. (The fingerprint is a review flag, not enforced here either.)
 function adLinkedEntry(string $ipHash, string $deviceHash, ?int $exceptPid): ?array {
     $db = adDb();
-    foreach ([['ip', $ipHash], ['device', $deviceHash]] as [$kind, $hash]) {
+    foreach ([['device', $deviceHash]] as [$kind, $hash]) {
         if ($hash === '') continue;
         $q = $db->prepare("SELECT p.* FROM participant_seen s JOIN participants p ON p.id = s.participant_id
             WHERE s.kind = ? AND s.hash = ? AND p.status = 'active' AND p.exempt = 0" . ($exceptPid !== null ? ' AND p.id != ' . (int)$exceptPid : '') . ' ORDER BY p.created_at, p.id LIMIT 1');
@@ -998,8 +1025,10 @@ function adLinkedEntry(string $ipHash, string $deviceHash, ?int $exceptPid): ?ar
 function adEnforceOnePerPerson(int $pid): array {
     $db = adDb();
     $group = [$pid => true]; $queue = [$pid];
+    // Link entries ONLY through a shared browser device id, never a shared network (IP) or the
+    // review-only fingerprint — so households on one connection are not auto-disqualified.
     $q = $db->prepare("SELECT DISTINCT o.participant_id FROM participant_seen m JOIN participant_seen o ON o.kind = m.kind AND o.hash = m.hash
-        JOIN participants p ON p.id = o.participant_id WHERE m.participant_id = ? AND p.status = 'active' AND p.exempt = 0");
+        JOIN participants p ON p.id = o.participant_id WHERE m.participant_id = ? AND m.kind = 'device' AND p.status = 'active' AND p.exempt = 0");
     while ($queue && count($group) < 200) {
         $q->execute([array_pop($queue)]);
         foreach ($q->fetchAll(PDO::FETCH_COLUMN) as $id) if (!isset($group[(int)$id])) { $group[(int)$id] = true; $queue[] = (int)$id; }
@@ -1012,7 +1041,7 @@ function adEnforceOnePerPerson(int $pid): array {
     $out = [];
     $upd = $db->prepare("UPDATE participants SET status = 'disqualified', status_reason = ? WHERE id = ? AND status = 'active' AND exempt = 0");
     foreach ($rows as $r) {
-        $reason = 'Automatic: same device or connection as the earlier entry ' . adShort($keep['address']) . ' (one entry per person).';
+        $reason = 'Automatic: same browser/device as the earlier entry ' . adShort($keep['address']) . ' (one entry per person).';
         $upd->execute([$reason, $r['id']]);
         if ($upd->rowCount()) { adParticipantLog((int)$r['id'], 'auto', 'disqualified', $reason); $out[] = (int)$r['id']; }
     }

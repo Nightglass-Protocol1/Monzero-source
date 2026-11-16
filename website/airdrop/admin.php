@@ -90,7 +90,7 @@ $ago = function (int $t): string {
     $budget = adBudget();
     $payouts = adPayouts();
     $closed = adClosedReason();
-    $pending = $db->query("SELECT s.id, s.platform, s.url, s.created_at, p.address, p.referred_by FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.status = 'pending' AND p.status = 'active' ORDER BY s.created_at")->fetchAll();
+    $pending = $db->query("SELECT s.id, s.platform, s.url, s.created_at, p.address, p.referred_by, p.id AS pid FROM submissions s JOIN participants p ON p.id = s.participant_id WHERE s.status = 'pending' AND p.status = 'active' ORDER BY s.created_at")->fetchAll();
     $participants = adParticipantCount();
     $done = [];
     foreach ($db->query('SELECT task, COUNT(*) AS n FROM progress GROUP BY task')->fetchAll() as $r) $done[$r['task']] = (int)$r['n'];
@@ -176,9 +176,9 @@ $ago = function (int $t): string {
     <div class="empty"><strong>All clear</strong><span>Nothing is waiting for review.</span></div>
   <?php else: ?>
   <div class="queue">
-    <?php foreach ($pending as $row): [$label, $hint] = $TASKS[$row['platform']] ?? [$row['platform'], '']; $u = (string)$row['url']; ?>
+    <?php foreach ($pending as $row): [$label, $hint] = $TASKS[$row['platform']] ?? [$row['platform'], '']; $u = (string)$row['url']; $share = adEntrySharing((int)$row['pid']); ?>
     <article class="qcard">
-      <div class="qhead"><span class="tag t-<?= $e($row['platform']) ?>"><?= $e($label) ?></span><span class="reward">+<?= $e((string)adRewardXmz((string)$row['platform'])) ?> XMZ</span><?php if (empty($row['referred_by'])): ?><span class="tag noref" title="Joined without a referral code. The owner may check this one too.">No referral</span><?php endif; ?><span class="muted small">#<?= $e($row['id']) ?> · <?= $e($ago((int)$row['created_at'])) ?></span></div>
+      <div class="qhead"><span class="tag t-<?= $e($row['platform']) ?>"><?= $e($label) ?></span><span class="reward">+<?= $e((string)adRewardXmz((string)$row['platform'])) ?> XMZ</span><?php if (empty($row['referred_by'])): ?><span class="tag noref" title="Joined without a referral code. The owner may check this one too.">No referral</span><?php endif; ?><?php if ($share['fp'] > 0): ?><span class="tag dupe" title="Same device fingerprint as <?= $e((string)$share['fp']) ?> other active entr<?= $share['fp'] === 1 ? 'y' : 'ies' ?>. A hint, not proof — identical devices can match. Check before approving.">⚠ device ×<?= $e((string)($share['fp'] + 1)) ?></span><?php endif; ?><?php if ($share['ip'] > 0): ?><span class="tag dupe muted" title="Same network/IP as <?= $e((string)$share['ip']) ?> other active entr<?= $share['ip'] === 1 ? 'y' : 'ies' ?> (e.g. a shared household — allowed).">IP ×<?= $e((string)($share['ip'] + 1)) ?></span><?php endif; ?><span class="muted small">#<?= $e($row['id']) ?> · <?= $e($ago((int)$row['created_at'])) ?></span></div>
       <div class="qbody">
         <?php if (preg_match('#^https?://#', $u)): ?><a class="detail" href="<?= $e($u) ?>" target="_blank" rel="noopener noreferrer nofollow"><?= $e(mb_strimwidth($u, 0, 80, '…')) ?> ↗</a>
         <?php else: ?><code class="detail"><?= $e($u) ?></code><?php endif; ?>

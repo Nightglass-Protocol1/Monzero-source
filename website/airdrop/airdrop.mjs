@@ -23,6 +23,41 @@ function device() {
   return d;
 }
 
+// Best-effort device fingerprint (first-party, no library; only one hash ever leaves the page).
+// Unlike the random device id it survives clearing storage, so the team can SEE when several
+// entries come from the same machine. It is a review hint only, never an automatic block, and it
+// returns "" when unavailable (private mode / blocked canvas) — which is treated as "no signal".
+let fpCache = null;
+async function fingerprint() {
+  if (fpCache !== null) return fpCache;
+  try {
+    const n = navigator, s = screen;
+    const bits = [
+      n.userAgent, n.platform, n.language, (n.languages || []).join(","),
+      n.hardwareConcurrency || "", n.deviceMemory || "", n.maxTouchPoints || "",
+      s.width + "x" + s.height + "x" + (s.colorDepth || ""), window.devicePixelRatio || "",
+      Intl.DateTimeFormat().resolvedOptions().timeZone || "", new Date().getTimezoneOffset(),
+    ];
+    try {
+      const c = document.createElement("canvas"); c.width = 220; c.height = 40;
+      const g = c.getContext("2d");
+      g.textBaseline = "top"; g.font = "14px 'Arial'";
+      g.fillStyle = "#f60"; g.fillRect(0, 0, 120, 20);
+      g.fillStyle = "#069"; g.fillText("Monzero airdrop ✨", 2, 4);
+      g.fillStyle = "rgba(102,0,255,0.7)"; g.fillText("Monzero airdrop ✨", 4, 6);
+      bits.push(c.toDataURL());
+    } catch { /* canvas blocked */ }
+    try {
+      const gl = document.createElement("canvas").getContext("webgl");
+      const dbg = gl && gl.getExtension("WEBGL_debug_renderer_info");
+      if (dbg) bits.push(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL), gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+    } catch { /* no webgl */ }
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bits.join("‖")));
+    fpCache = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  } catch { fpCache = ""; }
+  return fpCache;
+}
+
 async function api(action, { method = "GET", body = null, query = {} } = {}) {
   const q = new URLSearchParams({ action, ...query }).toString();
   const res = await fetch(`${API}?${q}`, {
@@ -123,13 +158,13 @@ async function submitShare(token, task) {
   if (!input) return;
   msg.textContent = "Submitting…"; msg.classList.remove("err");
   try {
-    const r = await api("submit", { method: "POST", body: { token, task, detail: input.value.trim(), device: device() } });
+    const r = await api("submit", { method: "POST", body: { token, task, detail: input.value.trim(), device: device(), fp: await fingerprint() } });
     render(r.status, token);
   } catch (e) { msg.textContent = e.message; msg.classList.add("err"); }
 }
 
 async function refresh(token) {
-  try { const r = await api("status", { query: { token, device: device() } }); render(r.status, token); }
+  try { const r = await api("status", { query: { token, device: device(), fp: await fingerprint() } }); render(r.status, token); }
   catch { ls.del(TOKEN_KEY); showRegister(); }
 }
 
@@ -154,7 +189,7 @@ async function registerFlow() {
   $("ad-join-btn").disabled = true;
   try {
     const ref = ls.get(REF_KEY) || "";
-    const r = await api("register", { method: "POST", body: { address: addr, ref, device: device() } });
+    const r = await api("register", { method: "POST", body: { address: addr, ref, device: device(), fp: await fingerprint() } });
     if (r.token) ls.set(TOKEN_KEY, r.token);
     const token = r.token || ls.get(TOKEN_KEY);
     ls.del(REF_KEY);

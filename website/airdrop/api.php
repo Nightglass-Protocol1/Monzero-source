@@ -64,23 +64,24 @@ if (!$live) out(503, ['error' => 'The airdrop is not open right now.']);
 if ($action === 'register' && $method === 'POST') {
     $b = body();
     $device = adDeviceHash(str_param($b, 'device', 32));
-    $res = adRegister(str_param($b, 'address', 120), str_param($b, 'ref', 8), adClientHash(), $device);
+    $fp = adFpHash(str_param($b, 'fp', 128));
+    $res = adRegister(str_param($b, 'address', 120), str_param($b, 'ref', 8), adClientHash(), $device, $fp);
     if (isset($res['error'])) out(400, ['error' => $res['error']]);
     $p = $res['participant'];
-    if ($res['existing']) { adSeen((int)$p['id'], adClientHash(), $device); $p = adParticipantById((int)$p['id']) ?? $p; }
+    if ($res['existing']) { adSeen((int)$p['id'], adClientHash(), $device, $fp); $p = adParticipantById((int)$p['id']) ?? $p; }
     out(200, ['ok' => true, 'existing' => $res['existing'], 'token' => $res['token'], 'ref_code' => $p['ref_code'], 'status' => adStatus($p)]);
 }
 if ($action === 'status') {
     $p = adParticipantByToken(str_param($_GET, 'token', 64));
     if (!$p) out(404, ['error' => 'Unknown dashboard token. Register your address first.']);
-    adSeen((int)$p['id'], adClientHash(), adDeviceHash(str_param($_GET, 'device', 32)));
+    adSeen((int)$p['id'], adClientHash(), adDeviceHash(str_param($_GET, 'device', 32)), adFpHash(str_param($_GET, 'fp', 128)));
     out(200, ['status' => adStatus($p)]);
 }
 if (($action === 'submit' || $action === 'share') && $method === 'POST') {
     $b = body();
     $p = adParticipantByToken(str_param($b, 'token', 64));
     if (!$p) out(404, ['error' => 'Register first.']);
-    adSeen((int)$p['id'], adClientHash(), adDeviceHash(str_param($b, 'device', 32)));
+    adSeen((int)$p['id'], adClientHash(), adDeviceHash(str_param($b, 'device', 32)), adFpHash(str_param($b, 'fp', 128)));
     $p = adParticipantById((int)$p['id']);    // the check above may just have disqualified it
     $task = str_param($b, 'task', 20);
     if ($task === '') { $plat = str_param($b, 'platform', 12); $task = $plat === 'instagram' ? 'share_instagram' : ($plat === 'x' ? 'share_x' : ''); }
