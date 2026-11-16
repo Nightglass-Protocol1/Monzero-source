@@ -149,7 +149,7 @@ tr.off td{color:var(--faint)} tr.off .dot{box-shadow:none}
         <div class="tile"><b id="m-workers">–</b><span>Workers online</span><small class="split"><span id="m-shares">–</span> share difficulty · 7 days</small></div>
       </div>
       <div class="wkhead"><h3>Workers</h3><span class="muted tiny" id="m-wknote"></span></div>
-      <div class="wrap"><table><thead><tr><th>Worker</th><th class="num">5 min</th><th class="num">1 h</th><th class="num">1 d</th><th class="num">1 w</th><th class="num">Shares</th><th>Last</th><th></th></tr></thead><tbody id="wlist"></tbody></table></div>
+      <div class="feed collapsed" id="workers-feed"><div class="wrap"><table><thead><tr><th>Worker</th><th class="num">5 min</th><th class="num">1 h</th><th class="num">1 d</th><th class="num">1 w</th><th class="num">Shares</th><th>Last</th><th></th></tr></thead><tbody id="wlist"></tbody></table></div><button class="more" type="button" hidden></button></div>
       <p class="muted tiny">Rename a worker to give it a friendly label — saved in this browser only. The real worker name is the one you set in XMRig after <code>-p</code>.</p>
       <div id="m-pay" hidden><div class="wkhead"><h3>Your payments</h3></div><div class="wrap"><table><thead><tr><th>Sent</th><th>Transaction</th><th class="num">Amount</th></tr></thead><tbody id="ulist"></tbody></table></div></div>
     </div>
@@ -222,6 +222,7 @@ function renderMiner(m, addr) {
       <td class="num">${num(w.shares)}</td><td>${w.online ? '<span class="ok">online</span>' : ago(w.last)}</td>
       <td class="num"><button class="rnbtn" data-worker="${esc(w.name)}">${alias ? "Edit" : "Rename"}</button></td></tr>`;
   }).join("") || '<tr><td colspan="8" class="muted">No workers yet. Point XMRig at the pool with your address.</td></tr>';
+  updateFeed("workers-feed");
   const pays = m.payments || [];
   $("m-pay").hidden = !pays.length;
   $("ulist").innerHTML = pays.map(p => `<tr><td>${ago(p.timestamp)}</td><td><code>${esc(p.txid.slice(0,16))}…</code></td><td class="num">${xmz(p.amount)}</td></tr>`).join("");
