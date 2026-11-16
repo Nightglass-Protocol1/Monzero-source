@@ -558,7 +558,9 @@ Rectangle {
                 visible: appWindow.walletMode >= 2
                 anchors.left: parent.left
                 anchors.right: parent.right
-                text: qsTr("Mining / tools") + translationManager.emptyString
+                // No-mining builds (miningEnabled=false) drop "Mining" from the label; the page then
+                // shows only the tools (prove/check payment, sign/verify), no mining tab.
+                text: (miningEnabled ? qsTr("Mining / tools") : qsTr("Tools")) + translationManager.emptyString
                 symbol: (isMac ? "⌃" : qsTr("Ctrl+")) + "D" + translationManager.emptyString
                 onClicked: {
                     parent.previousButton.checked = false
