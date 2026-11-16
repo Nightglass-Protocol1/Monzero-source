@@ -102,7 +102,7 @@ nav a:hover,nav a[aria-current] {
   border-radius:50%;
   background:var(--accent);
   margin-right:8px;
-  box-shadow:0 0 0 5px #3fdfe812}
+  box-shadow:0 0 0 5px rgba(var(--accent-rgb), 0.071)}
 h1 {
   font-size:clamp(48px,5.7vw,80px);
   letter-spacing:-4px;
@@ -218,7 +218,7 @@ h1 span,.closing h2 span {
 .pill.building {
   color:#8ce0d0;
   border-color:#366b66;
-  background:#3fdfe812}
+  background:rgba(var(--accent-rgb), 0.071)}
 .pill.planned {
   color:#bac8d3;
   border-color:#3e5363;
@@ -361,10 +361,10 @@ h3 {
   border-color:#3e8075;
   background:linear-gradient(135deg,#16332f,var(--surface))}
 .next .step {
-  background:#3fdfe8;
+  background:var(--accent);
   color:#092820;
-  border-color:#3fdfe8;
-  box-shadow:0 0 0 5px #3fdfe80d}
+  border-color:var(--accent);
+  box-shadow:0 0 0 5px rgba(var(--accent-rgb), 0.051)}
 .release .step {
   color:var(--amber);
   border-color:#72532f}
@@ -486,10 +486,10 @@ h3 {
   display:flex;
   overflow:hidden}
 .track i {
-  background:#3fdfe8}
+  background:var(--accent)}
 .track b {
-  background:repeating-linear-gradient(125deg,#3fdfe855 0 4px,#3fdfe81a 4px 8px);
-  border-right:1px solid #3fdfe8}
+  background:repeating-linear-gradient(125deg,rgba(var(--accent-rgb), 0.333) 0 4px,rgba(var(--accent-rgb), 0.102) 4px 8px);
+  border-right:1px solid var(--accent)}
 .range-1-3 i {
   width:16.666%}
 .range-1-3 b {
@@ -893,7 +893,7 @@ body  {
 
 .brand-mark  {
    border-radius: 10px;
-   background: #3fdfe80c;
+   background: rgba(var(--accent-rgb), 0.047);
    }
 
 nav a  {
@@ -991,7 +991,7 @@ h2  {
    }
 
 .currency-status a:hover, .currency-status a:focus-visible  {
-   background: #3fdfe80b;
+   background: rgba(var(--accent-rgb), 0.043);
    }
 
 .currency-status small  {

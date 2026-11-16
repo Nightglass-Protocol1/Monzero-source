@@ -9,7 +9,7 @@ a:focus-visible, button:focus-visible, summary:focus-visible, input:focus-visibl
 .skip-link { position: fixed; top: -100px; left: 16px; padding: 12px 18px; z-index: 100; background: var(--accent); color: #092820; }
 .skip-link:focus { top: 16px; }
 header, .site-header { height: auto; min-height: 84px; background: var(--bg); backdrop-filter: none; }
-.brand-mark, .mark, [data-page="studio"] .brand > span:first-child { border-radius: 10px; background: #3fdfe80c; }
+.brand-mark, .mark, [data-page="studio"] .brand > span:first-child { border-radius: 10px; background: rgba(var(--accent-rgb), 0.047); }
 nav a, .site-link { font: 13px/1.6 var(--sans); letter-spacing: 0; text-transform: none; }
 nav a:hover, .site-link:hover { color: var(--accent); }
 h1, [data-page="studio"] .intro h1 { font-size: clamp(42px, 5vw, 68px); font-weight: 650; line-height: 1.08; letter-spacing: -.045em; }
@@ -81,7 +81,7 @@ td code, .hash { font-size: 12px; }
 .workspace { overflow: hidden; }
 .tabs { background: var(--input); }
 .tabs button { font: 600 13px/1.5 var(--sans); }
-.tabs button[aria-selected=true] { background: #3fdfe80d; color: var(--accent); }
+.tabs button[aria-selected=true] { background: rgba(var(--accent-rgb), 0.051); color: var(--accent); }
 .panel { gap: 32px; padding: 32px; }
 .panel-copy p { font-size: 15px; }
 label { color: var(--ink); font-size: 13px; }
@@ -202,7 +202,7 @@ nav a[aria-current] { color: var(--accent); }
 }
 /* Home hero: headline and live network card, in the roadmap's panel style. */
 [data-page="home"] .hero { grid-template-columns: minmax(0, 1.05fr) minmax(0, .95fr); gap: clamp(40px, 6vw, 88px); align-items: center; padding-block: clamp(56px, 8vw, 104px) clamp(56px, 7vw, 88px); position: relative; isolation: isolate; }
-[data-page="home"] .hero::before { content: ""; position: absolute; inset: -84px 0 0; z-index: -1; pointer-events: none; background: radial-gradient(ellipse 55% 60% at 78% 40%, #28675f33, transparent 70%), radial-gradient(ellipse 40% 50% at 10% 0%, #3fdfe80d, transparent 70%); }
+[data-page="home"] .hero::before { content: ""; position: absolute; inset: -84px 0 0; z-index: -1; pointer-events: none; background: radial-gradient(ellipse 55% 60% at 78% 40%, #28675f33, transparent 70%), radial-gradient(ellipse 40% 50% at 10% 0%, rgba(var(--accent-rgb), 0.051), transparent 70%); }
 [data-page="home"] .hero h1 { font-size: clamp(48px, 5.7vw, 80px); letter-spacing: -.05em; line-height: 1.02; margin: 0 0 24px; }
 [data-page="home"] .hero h1 em { color: var(--accent); font-style: normal; display: block; }
 .hero-lead { max-width: 560px; color: var(--muted); }
@@ -226,9 +226,9 @@ nav a[aria-current] { color: var(--accent); }
 .chain-strip:not(.loaded) li { animation: chain-wait 1.6s ease-in-out infinite; }
 .chain-strip:not(.loaded) li:nth-child(even) { animation-delay: .4s; }
 .chain-strip li:not(:last-child)::after { content: ""; position: absolute; right: -7px; top: 50%; width: 6px; height: 1px; background: var(--accent-muted); }
-.chain-strip li:last-child { border-color: var(--accent-muted); background: #3fdfe814; }
+.chain-strip li:last-child { border-color: var(--accent-muted); background: rgba(var(--accent-rgb), 0.078); }
 .chain-strip a { display: flex; flex-direction: column; justify-content: center; gap: 2px; height: 100%; padding: 8px 6px; text-align: center; text-decoration: none; border-radius: 8px; }
-.chain-strip a:hover { background: #3fdfe81a; }
+.chain-strip a:hover { background: rgba(var(--accent-rgb), 0.102); }
 .chain-strip strong { font: 500 11px/1.3 var(--mono); color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chain-strip li:last-child strong { color: var(--accent); }
 .chain-strip span { font: 10px/1.3 var(--mono); color: var(--muted); }
@@ -239,7 +239,7 @@ nav a[aria-current] { color: var(--accent); }
 .live-stats dt { color: var(--muted); font-size: 12px; }
 .live-stats dd { margin: 0; font: 500 16px/1.4 var(--mono); color: var(--ink); }
 .live-footer { display: flex; justify-content: space-between; padding: 16px 24px; color: var(--accent); font-size: 13px; text-decoration: none; }
-.live-footer:hover { background: #3fdfe80d; }
+.live-footer:hover { background: rgba(var(--accent-rgb), 0.051); }
 [data-page="home"] .network { grid-template-columns: .9fr 1.1fr; }
 .status-topline span { color: var(--muted); font-size: 12px; }
 .node-addresses p { grid-template-columns: 140px 1fr auto; }
