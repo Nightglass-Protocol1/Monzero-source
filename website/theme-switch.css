@@ -24,3 +24,5 @@ body.mz-tinted img { filter: hue-rotate(calc(-1 * var(--mz-hue, 0deg))); }
 .mz-theme-reset { display: block; width: 100%; margin-top: 11px; padding: 7px; border: 1px solid rgba(255, 255, 255, .14); background: transparent; color: #8aa3b2; border-radius: 8px; font: 500 12px inherit; cursor: pointer; }
 .mz-theme-reset:hover { color: #eaf4f6; }
 @media print { .mz-theme { display: none; } }
+/* Keep the colour button off an open navigation menu (site pages and the homepage). */
+body:has(.menu-toggle[aria-expanded="true"], [aria-controls="mobile-menu"][aria-expanded="true"]) .mz-theme { display: none; }

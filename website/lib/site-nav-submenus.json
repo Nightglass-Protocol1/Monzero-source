@@ -13,6 +13,10 @@
    "Ecosystem"
   ],
   [
+   "/dex/",
+   "DEX"
+  ],
+  [
    "/mining/",
    "Mining"
   ],
@@ -58,10 +62,6 @@
     "Ecosystem directory"
    ],
    [
-    "/dex/",
-    "Atomic swap DEX"
-   ],
-   [
     "/app/",
     "Monzero Studio"
    ],
@@ -76,14 +76,28 @@
    [
     "/payments/request/",
     "Payment request"
+   ]
+  ],
+  "DEX": [
+   [
+    "/dex/",
+    "Trade on the DEX"
+   ],
+   [
+    "/markets/",
+    "Markets & price"
    ],
    [
     "/exchanges/",
     "Exchanges"
    ],
    [
-    "/markets/",
-    "Markets"
+    "/swaps/",
+    "How a swap works"
+   ],
+   [
+    "/dex/recovery/",
+    "Swap recovery"
    ]
   ],
   "Mining": [
