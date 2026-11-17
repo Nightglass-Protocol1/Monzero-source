@@ -39,9 +39,9 @@
 <h1 style="margin:.2em 0">The road to public swaps</h1>
 <p class="rm-lead">A non-custodial atomic-swap exchange built into the Monzero app. You trade XMZ for another coin straight from your own wallet — the two blockchains enforce the trade, so either both sides get paid or both get refunded. No account, no deposit, no custodian.</p>
 
-<div class="rm-note"><strong>Live with small limits.</strong> XMZ trades against ETH, BNB and SOL since 12 November 2026, from the Linux wallet (its own Exchange page since v1.2.0, offers open up to a month since v1.3.0), the <a href="/dex/">DEX page</a> and the Android wallet. Every new trade is checked against per-trade and daily limits in a document signed by the project, which can also pause new trades. The code has not had an independent security audit: trade only amounts you can afford to lose.</div>
+<div class="rm-note"><strong>Live with small limits.</strong> XMZ trades against ETH, BNB and SOL since 12 November 2026, from the Linux wallet (its own Exchange page since v1.2.0, offers open up to a month since v1.3.0), the Windows wallet beta, the <a href="/dex/">DEX page</a> and the Android wallet. Every new trade is checked against per-trade and daily limits in a document signed by the project, which can also pause new trades. The code has not had an independent security audit: trade only amounts you can afford to lose.</div>
 
-<p><em>Status as of 15 November 2026. Milestone-based delivery; no committed dates.</em></p>
+<p><em>Status as of 17 November 2026. Milestone-based delivery; no committed dates.</em></p>
 
 <h2>Released</h2>
 <div class="table-wrap"><table class="rm">
@@ -51,12 +51,13 @@
 <tr><td>15 Nov 2026</td><td>Partial offers</td><td>An offer can allow any part from a smallest amount; the rest stays on offer (relays, website, Android, desktop)</td></tr>
 <tr><td>15 Nov 2026</td><td>Linux wallet v1.2.0</td><td>An <strong>Exchange</strong> page inside the wallet: price chart, order book, market and limit orders, your orders and funds, with no browser needed. Upgrades from v1.1.0 keep the trading keys and DEX wallets</td></tr>
 <tr><td>15 Nov 2026</td><td>Linux wallet v1.3.0</td><td>Offers that stay open from an hour to a month (Exchange page and DEX page), the project's liquidity offers taken in parts from 50 XMZ, and Appearance settings: colour sets, your own colours and a picture on the wallet card</td></tr>
+<tr><td>16 Nov 2026</td><td>Windows wallet v1.3.0 (beta)</td><td>A graphical wallet for 64-bit Windows 10/11 with the same <strong>Exchange</strong> page for ETH, BNB and SOL. No mining. Not code-signed yet, so Windows warns before running it; an early build with limited testing</td></tr>
 </table></div>
 <p><a href="/download/">Downloads and signed release files →</a></p>
 
 <h2>Where each pair stands</h2>
 <p>The DEX is crypto-only — XMZ against Bitcoin, Litecoin, BNB, Ethereum and Solana. (Earlier Bitcoin Cash and Dogecoin work was dropped: a legacy-signature malleability issue made their pre-signed refunds unsafe.)</p>
-<p>Monero (XMR) is in development as a trading coin against BNB, Ethereum and Solana, with XMZ/XMR as two swaps back to back through one of them. 14 Nov 2026: full swaps, refunds and restarts passed on a local Monero test chain with the official Monero 0.18.5.4 software. Next: public test networks, then the wallet apps. Not yet available to trade.</p>
+<p>Monero (XMR) is in development as a trading coin against BNB, Ethereum and Solana, with XMZ/XMR as two swaps back to back through one of them. 14 Nov 2026: full swaps, refunds and restarts passed on a local Monero test chain with the official Monero 0.18.5.4 software. 15 Nov 2026: the first run on Monero's public test network (stagenet) did not finish, because the public stagenet node stopped giving blocks to the trade wallets. No swap took place; the run showed that a refund could stall while the Monero side was unreachable, which is now fixed. The run will be repeated, then the wallet apps. Not yet available to trade.</p>
 <div class="rm-grid">
   <div class="rm-card"><h3>XMZ / BTC <span class="pill done">mainnet tested</span></h3><p>Passed every test-network gate on signet and testnet4 — swap, refund, two machines, interruption and power-loss — with light wallets on both sides (no Bitcoin node needed). The first real-funds BTC↔XMZ swap on Bitcoin mainnet completed on 4&nbsp;November. On 8&nbsp;November a signet swap was started from a signed offer posted to a relay and completed through it — Bitcoin lock, XMZ lock, redemption and payout. Not listed on the public DEX yet.</p></div>
   <div class="rm-card"><h3>XMZ / BNB <span class="pill done">live</span></h3><p>A chain-agnostic EVM atomic-swap contract on BNB Smart Chain. Swap and refund passed on testnet; the first real-funds XMZ↔BNB swap on mainnet completed on 31&nbsp;October.</p></div>
@@ -80,8 +81,8 @@
 <ul>
   <li><strong>Independent security review / community pentest.</strong> The swap contracts and engine have not been externally audited. Limits stay small until this is done.</li>
   <li><strong>Bitcoin and Litecoin on the public DEX.</strong> BTC/XMZ is mainnet tested and runs through the relays on test networks; LTC needs its first real-funds swap. Both need their trading flow finished in the wallets before they are listed.</li>
-  <li><strong>The in-wallet Exchange on more platforms.</strong> Linux has it since v1.2.0; other platforms trade through the DEX page for now.</li>
-  <li><strong>Monero (XMR)</strong> against BNB, Ethereum and Solana: public test networks, then the wallet apps.</li>
+  <li><strong>The in-wallet Exchange on more platforms.</strong> Linux has it since v1.2.0 and Windows as a beta since 16 November; the Windows wallet still needs wider testing and a code-signing certificate. Android trades through the DEX page for now.</li>
+  <li><strong>Monero (XMR)</strong> against BNB, Ethereum and Solana: a full swap on Monero's public test network, then the wallet apps.</li>
   <li><strong>Low-gas L2s</strong> such as Base and Arbitrum on the existing EVM contract.</li>
   <li><strong>Raised limits</strong>, step by step by new signed documents, after weeks of clean trading.</li>
 </ul>
