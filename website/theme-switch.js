@@ -28,8 +28,24 @@
     root.style.setProperty("--mz-hue", delta(h).toFixed(1) + "deg");
     if (body) body.classList.add("mz-tinted");
   }
-  function saved(){ try { return localStorage.getItem(KEY) || ""; } catch (e) { return ""; } }
-  function store(h){ try { h ? localStorage.setItem(KEY, h) : localStorage.removeItem(KEY); } catch (e) {} }
+  // The choice is shared by every *.monzero.org site (main site, web wallet, pool) through a cookie
+  // on the parent domain; localStorage is kept as a fallback (and for older saved choices).
+  var HEX = /^#[0-9a-f]{6}$/i;
+  function cookieDomain(){ var h = location.hostname;
+    return (h === "monzero.org" || /\.monzero\.org$/.test(h)) ? "; domain=.monzero.org" : ""; }
+  function readCookie(){ var m = document.cookie.match(/(?:^|;\s*)monzero-accent=([^;]*)/);
+    if (!m) return null; try { var v = decodeURIComponent(m[1]); return HEX.test(v) ? v : ""; } catch (e) { return ""; } }
+  function writeCookie(h){ try {
+    // An empty value is kept (not deleted) so "default" also wins over an old per-site localStorage choice.
+    document.cookie = KEY + "=" + (h ? encodeURIComponent(h) : "") + "; max-age=31536000; path=/; samesite=lax" + (location.protocol === "https:" ? "; secure" : "") + cookieDomain();
+  } catch (e) {} }
+  function saved(){
+    var c = readCookie(); if (c !== null) return c;
+    var l = ""; try { l = localStorage.getItem(KEY) || ""; } catch (e) {}
+    if (HEX.test(l)) { writeCookie(l); return l; }   // carry an older per-site choice over to all sites
+    return "";
+  }
+  function store(h){ writeCookie(h); try { h ? localStorage.setItem(KEY, h) : localStorage.removeItem(KEY); } catch (e) {} }
   apply(saved());
 
   function build(){
