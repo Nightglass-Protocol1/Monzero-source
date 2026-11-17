@@ -22,11 +22,39 @@
 
   // Styling lives in theme-switch.css (the CSP blocks <style> injected by JS). This only toggles a
   // class and sets a custom property via the CSSOM, both of which the CSP allows.
+  // The filter recolours the body's children but not the body's own background (which also paints
+  // the page margins), so that background is turned by the same hue-rotate matrix the browser uses.
+  function rotateRgb(r, g, b, deg){
+    var a = Math.cos(deg * Math.PI / 180), s = Math.sin(deg * Math.PI / 180);
+    var m = [.213 + a*.787 - s*.213, .715 - a*.715 - s*.715, .072 - a*.072 + s*.928,
+             .213 - a*.213 + s*.143, .715 + a*.285 + s*.140, .072 - a*.072 - s*.283,
+             .213 - a*.213 - s*.787, .715 - a*.715 + s*.715, .072 + a*.928 + s*.072];
+    function c(i){ return Math.max(0, Math.min(255, Math.round(m[i]*r + m[i+1]*g + m[i+2]*b))); }
+    return [c(0), c(3), c(6)];
+  }
+  function rotateColours(css, deg){
+    return css.replace(/rgba?\(\s*(\d+(?:\.\d+)?)[ ,]+(\d+(?:\.\d+)?)[ ,]+(\d+(?:\.\d+)?)\s*(?:[,/]\s*([\d.]+%?))?\s*\)/g,
+      function(_, r, g, b, al){ var o = rotateRgb(+r, +g, +b, deg);
+        return al !== undefined ? "rgba(" + o.join(", ") + ", " + al + ")" : "rgb(" + o.join(", ") + ")"; });
+  }
+  var pageBg = null;   // the body's own background before any tint
+  function tintBackground(deg){
+    var body = document.body; if (!body) return;
+    if (pageBg === null){
+      body.style.removeProperty("background-color"); body.style.removeProperty("background-image");
+      var cs = getComputedStyle(body); pageBg = {color: cs.backgroundColor, image: cs.backgroundImage};
+    }
+    if (deg === null){ body.style.removeProperty("background-color"); body.style.removeProperty("background-image"); return; }
+    body.style.setProperty("background-color", rotateColours(pageBg.color, deg));
+    if (pageBg.image && pageBg.image !== "none") body.style.setProperty("background-image", rotateColours(pageBg.image, deg));
+  }
   function apply(h){
     var root = document.documentElement, body = document.body;
-    if (!h){ root.style.removeProperty("--mz-hue"); if (body) body.classList.remove("mz-tinted"); return; }
-    root.style.setProperty("--mz-hue", delta(h).toFixed(1) + "deg");
+    if (!h){ root.style.removeProperty("--mz-hue"); if (body) body.classList.remove("mz-tinted"); tintBackground(null); return; }
+    var d = delta(h);
+    root.style.setProperty("--mz-hue", d.toFixed(1) + "deg");
     if (body) body.classList.add("mz-tinted");
+    tintBackground(d);
   }
   // The choice is shared by every *.monzero.org site (main site, web wallet, pool) through a cookie
   // on the parent domain; localStorage is kept as a fallback (and for older saved choices).
