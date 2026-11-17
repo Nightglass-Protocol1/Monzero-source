@@ -194,6 +194,81 @@ async function showAsset(assetId) {
     ${(result.outputs || []).length ? `<div class="table-wrap"><table><thead><tr><th>Output ID</th><th>Height</th><th>Index</th><th>Commitment</th></tr></thead><tbody>${result.outputs.map((output) => `<tr><td><code>${escapeHtml(shortHash(output.output_id, 14))}</code></td><td><a class="link" href="#/block/${escapeHtml(output.height)}">#${number.format(output.height || 0)}</a></td><td>${number.format(output.output_index || 0)}</td><td><code>${escapeHtml(shortHash(output.commitment, 14))}</code></td></tr>`).join('')}</tbody></table></div>` : '<div class="empty"><strong>No live outputs</strong><p>No unspent confidential outputs are recorded for this asset.</p></div>'}`;
 }
 
+// Monzero (CryptoNote) base58: 8-byte blocks encoded as 11 characters.
+const base58Alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const base58BlockSizes = [0, 2, 3, 5, 6, 7, 9, 10, 11];
+function base58Decode(text) {
+  const bytes = [];
+  for (let start = 0; start < text.length; start += 11) {
+    const chunk = text.slice(start, start + 11);
+    const size = base58BlockSizes.indexOf(chunk.length);
+    if (size < 1) return null;
+    let value = 0n;
+    for (const char of chunk) {
+      const digit = base58Alphabet.indexOf(char);
+      if (digit < 0) return null;
+      value = value * 58n + BigInt(digit);
+    }
+    if (value >= 1n << BigInt(size * 8)) return null;
+    for (let i = size - 1; i >= 0; i--) bytes.push(Number((value >> BigInt(i * 8)) & 0xffn));
+  }
+  return bytes;
+}
+// Keccak-256 (original padding, as CryptoNote uses) for the 4-byte address checksum.
+const keccakRc = [0x1n, 0x8082n, 0x800000000000808an, 0x8000000080008000n, 0x808bn, 0x80000001n, 0x8000000080008081n, 0x8000000000008009n, 0x8an, 0x88n, 0x80008009n, 0x8000000an, 0x8000808bn, 0x800000000000008bn, 0x8000000000008089n, 0x8000000000008003n, 0x8000000000008002n, 0x8000000000000080n, 0x800an, 0x800000008000000an, 0x8000000080008081n, 0x8000000000008080n, 0x80000001n, 0x8000000080008008n];
+const keccakRot = [0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14];
+const mask64 = (1n << 64n) - 1n;
+const rotl = (x, n) => n ? ((x << BigInt(n)) | (x >> BigInt(64 - n))) & mask64 : x;
+function keccak256(input) {
+  const rate = 136;
+  const data = [...input, 0x01];
+  while (data.length % rate) data.push(0);
+  data[data.length - 1] |= 0x80;
+  const s = new Array(25).fill(0n);
+  for (let off = 0; off < data.length; off += rate) {
+    for (let i = 0; i < rate / 8; i++) {
+      let lane = 0n;
+      for (let b = 7; b >= 0; b--) lane = (lane << 8n) | BigInt(data[off + i * 8 + b]);
+      s[i] ^= lane;
+    }
+    for (let round = 0; round < 24; round++) {
+      const c = [0, 1, 2, 3, 4].map((x) => s[x] ^ s[x + 5] ^ s[x + 10] ^ s[x + 15] ^ s[x + 20]);
+      for (let x = 0; x < 5; x++) { const d = c[(x + 4) % 5] ^ rotl(c[(x + 1) % 5], 1); for (let y = 0; y < 25; y += 5) s[y + x] ^= d; }
+      const b = new Array(25);
+      for (let x = 0; x < 5; x++) for (let y = 0; y < 5; y++) b[y + 5 * ((2 * x + 3 * y) % 5)] = rotl(s[x + 5 * y], keccakRot[x + 5 * y]);
+      for (let x = 0; x < 5; x++) for (let y = 0; y < 25; y += 5) s[y + x] = b[y + x] ^ (~b[y + (x + 1) % 5] & mask64 & b[y + (x + 2) % 5]);
+      s[0] ^= keccakRc[round];
+    }
+  }
+  const out = [];
+  for (let i = 0; i < 4; i++) for (let b = 0; b < 8; b++) out.push(Number((s[i] >> BigInt(8 * b)) & 0xffn));
+  return out;
+}
+const addressKinds = {86: ['Standard address', 69], 87: ['Integrated address', 77], 88: ['Subaddress', 69]};
+function addressKind(address) {
+  if (!/^[1-9A-HJ-NP-Za-km-z]{95}$|^[1-9A-HJ-NP-Za-km-z]{106}$/.test(address)) return null;
+  const bytes = base58Decode(address);
+  if (!bytes) return null;
+  const kind = addressKinds[bytes[0]];
+  if (!kind || kind[1] !== bytes.length) return null;
+  const checksum = keccak256(bytes.slice(0, -4)).slice(0, 4);
+  return checksum.every((byte, i) => byte === bytes[bytes.length - 4 + i]) ? kind[0] : null;
+}
+
+function showAddress(address) {
+  const kind = addressKind(address);
+  if (!kind) return showError('This is not a valid Monzero mainnet address.', 'Invalid address');
+  headerTitle('Address', `<span class="truncate" title="${escapeHtml(address)}">${escapeHtml(shortHash(address, 16))}</span>`);
+  view.innerHTML = `<div class="notice"><strong>Balances and history are private</strong><p>Monzero is a privacy coin. Stealth addresses mean no payment on the blockchain names this address, so no explorer can list its balance or transactions. Only the holder's wallet (or someone given its view key) can see them. To prove a payment, the sender can share the transaction hash and its transaction key.</p></div>
+    <div class="detail-grid">
+      ${datum('Address', `<code>${escapeHtml(address)}</code>`)}
+      ${datum('Type', `<strong>${escapeHtml(kind)}</strong>`)}
+      ${datum('Network', '<strong>Monzero mainnet</strong>')}
+      ${datum('Balance', '<strong>Private</strong>')}
+      ${datum('Transactions', '<strong>Private</strong>')}
+    </div>`;
+}
+
 function datum(label, value) { return `<div class="datum"><span>${escapeHtml(label)}</span>${value}</div>`; }
 function setOffline() { $('#node-dot').className = 'offline'; $('#node-label').textContent = 'Node unavailable'; }
 
@@ -206,6 +281,7 @@ async function route() {
     try { return await showAsset(route[1]); } catch (error) { return showError(error.message); }
   }
   if (route[0] === 'block' && route[1]) return showBlock(route[1]);
+  if (route[0] === 'address' && route[1]) return showAddress(decodeURIComponent(route[1]));
   if (route[0] === 'tx' && route[1]) {
     try { return await showTransaction(route[1]); } catch (error) { return showError(error.message); }
   }
@@ -216,7 +292,8 @@ $('#search-form').addEventListener('submit', (event) => {
   event.preventDefault();
   const value = $('#search-input').value.trim();
   if (/^\d+$/.test(value) || /^[0-9a-f]{64}$/i.test(value)) location.hash = `#/block/${value}`;
-  else showError('Enter a numeric block height or a 64-character hexadecimal hash.');
+  else if (/^[1-9A-HJ-NP-Za-km-z]{95,106}$/.test(value)) location.hash = `#/address/${value}`;
+  else showError('Enter a numeric block height, a 64-character hexadecimal hash, or a Monzero address.');
 });
 $('#latest-search').addEventListener('click', () => { if (chainInfo?.height) location.hash = `#/block/${chainInfo.height - 1}`; });
 window.addEventListener('hashchange', route);
