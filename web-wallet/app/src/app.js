@@ -14,6 +14,32 @@ const LOCK_AFTER_MS = 10 * 60 * 1000;
 
 moneroTs.LibraryUtils.setWorkerDistPath(new URL("monero.worker.js", document.baseURI).href);
 
+// Accent colour chosen by the visitor on monzero.org (shared "monzero-accent" cookie on .monzero.org).
+// Read-only here: only a strict #rrggbb value is accepted, and it only sets CSS colour variables.
+(function applySiteAccent() {
+  const m = document.cookie.match(/(?:^|;\s*)monzero-accent=(%23|#)([0-9a-fA-F]{6})(?:;|$)/);
+  if (!m) return;
+  // Same rule as the main site: the page's teal palette is turned to the chosen hue; the
+  // green/red/amber status colours (received, sent, warnings) keep their meaning and stay as they are.
+  const toHsl = (h) => {
+    const [r, g, b] = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn, l = (mx + mn) / 2;
+    const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+    let hue = d === 0 ? 0 : mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    return [(hue * 60 + 360) % 360, s, l];
+  };
+  const toHex = ([h, s, l]) => {
+    const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m0 = l - c / 2;
+    const [r, g, b] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+    return "#" + [r, g, b].map((v) => Math.round((v + m0) * 255).toString(16).padStart(2, "0")).join("");
+  };
+  const shift = toHsl(m[2])[0] - toHsl("29d6cb")[0];
+  const turn = (h) => { const [hh, s, l] = toHsl(h); return toHex([(hh + shift + 360) % 360, s, l]); };
+  const st = document.documentElement.style;
+  st.setProperty("--accent", "#" + m[2].toLowerCase());
+  for (const [name, base] of [["--bg", "0b1d21"], ["--panel", "10272c"], ["--line", "177e79"], ["--dim", "9db7b9"], ["--track", "1e3a3f"]]) st.setProperty(name, turn(base));
+})();
+
 const $ = (id) => document.getElementById(id);
 let wallet = null;            // the open wallet (in the worker)
 let pending = null;           // a built, not yet sent transaction
