@@ -280,13 +280,16 @@ $("sendReview").onclick = async () => {
   $("sendReview").disabled = true;
   try {
     // Built and fee-checked by Monzero's wallet code; nothing is broadcast until the user confirms
+    // A large amount made of many small received amounts does not fit in one transaction: the
+    // wallet splits it into several (each with its own fee), as Send all does
     const txs = sendAll ? await wallet.sweepUnlocked({ address: to, relay: false })
-                        : [await wallet.createTx({ accountIndex: 0, address: to, amount, relay: false })];
+                        : await wallet.createTxs({ accountIndex: 0, address: to, amount, relay: false });
     const fee = txs.reduce((s, t) => s + t.getFee(), 0n);
     const sent = txs.reduce((s, t) => s + t.getOutgoingAmount(), 0n);
     pending = txs;
     showAddress($("cTo"), to);
     $("cAmount").textContent = formatXmz(sent); $("cFee").textContent = formatXmz(fee); $("cTotal").textContent = formatXmz(sent + fee);
+    $("cSplit").textContent = txs.length > 1 ? `This goes out as ${txs.length} transactions (too many received amounts for one); the fee is their total.` : "";
     $("sendConfirm").hidden = false;
   } catch (e) {
     $("sendError").textContent = e.message || String(e);
@@ -296,14 +299,19 @@ $("sendCancel").onclick = () => { pending = null; $("sendConfirm").hidden = true
 $("sendGo").onclick = async () => {
   if (!pending) return;
   $("sendGo").disabled = true;
+  const hashes = [];
   try {
-    const hashes = [];
     for (const t of pending) hashes.push(await wallet.relayTx(t.getMetadata()));
-    $("sendResult").textContent = "Sent. Transaction " + hashes.join(", ");
+    $("sendResult").textContent = (hashes.length > 1 ? "Sent. Transactions " : "Sent. Transaction ") + hashes.join(", ");
     $("sendTo").value = ""; $("sendAmount").value = ""; sendAll = false;
     persist(); refresh();
   } catch (e) {
-    $("sendError").textContent = "Not sent: " + (e.message || e);
+    // Part of a split send may already be out: say exactly what was sent
+    if (hashes.length) {
+      $("sendResult").textContent = `Sent ${hashes.length} of ${pending.length} transactions: ${hashes.join(", ")}`;
+      $("sendError").textContent = "The rest was not sent: " + (e.message || e) + ". Check History and your balance before sending again.";
+      persist(); refresh();
+    } else $("sendError").textContent = "Not sent: " + (e.message || e);
   } finally { pending = null; $("sendConfirm").hidden = true; $("sendGo").disabled = false; }
 };
 
