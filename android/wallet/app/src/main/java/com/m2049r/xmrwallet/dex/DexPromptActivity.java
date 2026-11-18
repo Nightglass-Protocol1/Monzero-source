@@ -212,7 +212,7 @@ public class DexPromptActivity extends SecureActivity {
         }
         if (w.approval && w.snapshot != null && w.snapshot.optJSONObject("offer") != null) {
             final JSONObject offer = w.snapshot.optJSONObject("offer");
-            final long chain = offer.optLong("chainId");
+            final long chain = DexConfig.marketOf(offer.optLong("chainId"), offer.optString("asset"));
             final boolean paysCoin = w.snapshot.optString("role").equals("owner");
             final String coin = DexText.coinText(offer), xmz = DexText.xmzText(offer);
             if (!w.startRefusal.isEmpty()) notice = w.startRefusal;

@@ -84,7 +84,7 @@ final class DexMarket {
         final JSONObject l = signedListing.optJSONObject("listing");
         if (l == null) return false;
         final String pair = l.optString("pair"), side = l.optString("side");
-        return HASH.matcher(l.optString("id")).matches() && (pair.equals("ETH/XMZ") || pair.equals("BNB/XMZ") || pair.equals("SOL/XMZ"))
+        return HASH.matcher(l.optString("id")).matches() && (pair.equals("ETH/XMZ") || pair.equals("BNB/XMZ") || pair.equals("SOL/XMZ") || pair.equals("USDT/XMZ"))
                 && (side.equals("sell-xmz") || side.equals("buy-xmz")) && HEX_QTY.matcher(l.optString("value")).matches()
                 && amountText(l.opt("xmz")) != null && DexConfig.evmAddress(l.optString("maker"))
                 && l.opt("expiresAt") instanceof Number && l.opt("chainId") instanceof Number;
@@ -200,10 +200,12 @@ final class DexMarket {
             final JSONObject t = tickConfig(seedHex, null);
             if (t == null) return false;
             final String dir = new File(tradesDir, "offer-" + Long.toHexString(new SecureRandom().nextLong())).getPath();
-            final JSONObject offer = new JSONObject().put("chainId", chainId).put("side", side).put("valueWei", valueWei)
+            // The helper trades the market on its chain; a token market (USDT) names its pair
+            final JSONObject offer = new JSONObject().put("chainId", DexConfig.helperChain(chainId)).put("side", side).put("valueWei", valueWei)
                     .put("xmzAtoms", xmzAtoms).put("lifetimeSecs", lifetimeSecs);
             if (minXmzAtoms != null) offer.put("minXmzAtoms", minXmzAtoms);
             if (renew) offer.put("renew", true);
+            if (DexConfig.usdt(chainId)) offer.put("pair", DexConfig.pair(chainId));
             return run(base("post", dir).put("tick", t).put("offer", offer), dir);
         } catch (Exception e) {
             return false;
@@ -267,7 +269,7 @@ final class DexMarket {
             final JSONObject t = tickConfig(seedHex, null);
             if (t == null) return false;
             withdrawal = new JSONObject();
-            return run(base("withdraw", null).put("tick", t).put("payoutAddress", address).put("chainId", chainId), "");
+            return run(base("withdraw", null).put("tick", t).put("payoutAddress", address).put("chainId", DexConfig.helperChain(chainId)), "");
         } catch (Exception e) {
             return false;
         }
