@@ -136,6 +136,9 @@ void EvmMarketJob::scanFolders() {
         f.listingId=f.listing.value("listing").toObject().value("id").toString();
         f.state=QFile::exists(path+"/journal.json") ? "agreed" : (maker && !o.value("takenBy").isNull() ? "agreed" : "open");
         if (QFile::exists(path+"/cancelled") || QFile::exists(path+"/abandoned")) f.state="cancelled";
+        f.renew=maker && QFile::exists(path+"/renew");
+        // Renewed (kept open): the new offer has its own folder; this one is retired
+        if (QFile::exists(path+"/renewed")) f.state="renewed";
         // Taken off the board by our own helper: our side could no longer pay for it
         if (f.state=="open" && QFile::exists(path+"/withdrawn")) {
             f.state="withdrawn";
@@ -202,16 +205,27 @@ bool EvmMarketJob::refreshListings(const QString &pair) {
     return run(r,{});
 }
 
-bool EvmMarketJob::post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,const QString &minXmzAtoms,qint64 lifetimeSecs) {
+bool EvmMarketJob::post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,const QString &minXmzAtoms,qint64 lifetimeSecs,bool renew) {
     if (m_busy || m_path.isEmpty() || chainId!=qint64(m_config.value("chainId").toDouble()) || (side!="sell-xmz" && side!="buy-xmz") || !Digits.match(valueWei).hasMatch()
-        || !Digits.match(xmzAtoms).hasMatch() || lifetimeSecs<=0 || lifetimeSecs>86400 || (!minXmzAtoms.isEmpty() && !Digits.match(minXmzAtoms).hasMatch())) {walletSeed.fill('\0');walletSeed.clear();return false;}
+        || !Digits.match(xmzAtoms).hasMatch() || lifetimeSecs<=0 || lifetimeSecs>31*86400 || (!minXmzAtoms.isEmpty() && !Digits.match(minXmzAtoms).hasMatch())) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
     const auto folder=m_tradesDir+"/offer-"+QString::number(QRandomGenerator::system()->generate64(),16);
     auto r=base("post",folder);r.insert("tick",t);
     QJsonObject offer{{"chainId",chainId},{"side",side},{"valueWei",valueWei},{"xmzAtoms",xmzAtoms},{"lifetimeSecs",lifetimeSecs}};
     if (!minXmzAtoms.isEmpty()) offer.insert("minXmzAtoms",minXmzAtoms);
+    if (renew) offer.insert("renew",true);
     r.insert("offer",offer);
     return run(r,folder);
+}
+
+bool EvmMarketJob::setRenew(const QString &folder,bool on) {
+    for (auto &f:m_folders) if (f.path==folder && f.kind=="offer" && f.state=="open") {
+        QFile mark(folder+"/renew");
+        const bool ok=on ? (mark.open(QIODevice::WriteOnly) && (mark.close(),true)) : (!mark.exists() || mark.remove());
+        if (ok) {f.renew=on;emit changed();}
+        return ok;
+    }
+    return false;
 }
 
 bool EvmMarketJob::take(QByteArray &walletSeed,const QString &listingId,const QString &xmzAtoms) {
@@ -322,9 +336,13 @@ void EvmMarketJob::finish(bool success) {
         // Part of a partial offer of ours was taken: the rest is a new offer in its own folder
         const auto rest=r.value("remainder").toObject().value("folder").toString();
         if (!rest.isEmpty() && std::none_of(m_folders.cbegin(),m_folders.cend(),[&rest](const Folder &f){return f.path==rest;})) scanFolders();
+        // A kept-open offer was posted again: serve the new folder from now on
+        const auto renewed=r.value("renewed").toObject().value("folder").toString();
+        if (!renewed.isEmpty()) scanFolders();
         const bool done=r.value("taken").toBool() || r.value("agreed").toBool();
         for (auto &f:m_folders) if (f.path==m_folder) {
             if (done) f.state="agreed";
+            else if (!renewed.isEmpty()) f.state="renewed";
             else if (r.value("offerWithdrawn").toBool()) f.state="withdrawn";
             else if (r.value("expired").toBool()) f.state="expired";
             f.detail=r.value("refused").isString() ? r.value("refused").toString().left(200)
@@ -347,7 +365,7 @@ QVariantMap EvmMarketJob::status() const {
     for (const auto &f:m_folders) {
         const auto l=f.listing.value("listing").toObject();
         const auto wei=hexToDecimal(l.value("value").toString());
-        folders.append(QVariantMap{{"folder",f.path},{"kind",f.kind},{"state",f.state},{"detail",f.detail},{"id",f.listingId},
+        folders.append(QVariantMap{{"folder",f.path},{"kind",f.kind},{"state",f.state},{"detail",f.detail},{"id",f.listingId},{"renew",f.renew},
             {"pair",l.value("pair")},{"side",l.value("side")},{"coin",weiToCoin(wei,places)},{"xmz",units(l.value("xmz").toString(),11)},
             {"price",priceText(wei,l.value("xmz").toString(),places)},{"expiresAt",l.value("expiresAt").toDouble()}});
     }

@@ -20,7 +20,9 @@ public:
     bool configure(const QString &path);
     bool refreshListings(const QString &pair);
     // minXmzAtoms: empty for a whole offer, else the least one take may be (a partial offer)
-    bool post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,const QString &minXmzAtoms,qint64 lifetimeSecs);
+    bool post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,const QString &minXmzAtoms,qint64 lifetimeSecs,bool renew=false);
+    // Keep one of our open offers open (renewed before it expires) or not; a mark in its folder
+    bool setRenew(const QString &folder,bool on);
     // xmzAtoms: empty to take all of it, else how much of a partial offer
     bool take(QByteArray &walletSeed,const QString &listingId,const QString &xmzAtoms=QString());
     bool cancel(QByteArray &walletSeed,const QString &folder);
@@ -55,7 +57,7 @@ signals:
     void agreed(const QString &tradeDir);
 private:
     QByteArray m_swapSeedHex,m_evmKeyHex;
-    struct Folder {QString path,kind,listingId,state,detail;QJsonObject listing;};
+    struct Folder {QString path,kind,listingId,state,detail;QJsonObject listing;bool renew=false;};
     bool run(const QJsonObject &request,const QString &folder);
     bool tickConfig(QByteArray &walletSeed,QJsonObject *out) const;
     void scanFolders();

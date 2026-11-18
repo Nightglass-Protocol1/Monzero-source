@@ -266,7 +266,9 @@ public:
     Q_INVOKABLE bool refreshEvmOffers(const QString &pair);
     // side: "sell-xmz" (we sell XMZ for the coin) or "buy-xmz"; amounts as decimal text in coins
     // minXmzAmount: empty for a whole offer, else the least XMZ one take may be (a partial offer)
-    Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours,const QString &minXmzAmount=QString());
+    Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours,const QString &minXmzAmount=QString(),bool renew=false);
+    // Keep an open offer of ours open (posted again shortly before it expires, while the wallet runs)
+    Q_INVOKABLE bool setEvmOfferRenew(const QString &folder,bool on);
     // Why an order of these amounts (decimal text in coins) would be refused by the kill switch and
     // caps, before it is posted or taken; "" when it may go ahead. Nothing is recorded.
     Q_INVOKABLE QString evmOrderRefusal(int chainId,const QString &coinAmount,const QString &xmzAmount);

@@ -71,9 +71,10 @@ ColumnLayout {
             var mine = (markets[allCoins[i]] || {}).mine || []
             for (var j = 0; j < mine.length; ++j) {
                 var o = mine[j]
+                if (o.state === "renewed") continue
                 if ((o.state === "cancelled" || o.state === "withdrawn") && Number(o.expiresAt) < now - 86400) continue
                 out.push({ coin: allCoins[i], kind: o.kind, state: o.state, side: o.side, xmz: o.xmz, amount: o.coin, price: o.price,
-                           expiresAt: Number(o.expiresAt), folder: o.folder, detail: o.detail || "" })
+                           expiresAt: Number(o.expiresAt), folder: o.folder, detail: o.detail || "", renew: o.renew === true })
             }
         }
         out.sort(function (a, b) { return (a.state === "open" ? 0 : 1) - (b.state === "open" ? 0 : 1) || b.expiresAt - a.expiresAt })
@@ -495,7 +496,7 @@ ColumnLayout {
             }
             onPostRequested: {
                 ex.localError = ""
-                if (ex.dex.postEvmOffer(ex.chainId, side, coinAmount, xmz, hours, minXmz)) ex.bottomTab = "orders"
+                if (ex.dex.postEvmOffer(ex.chainId, side, coinAmount, xmz, hours, minXmz, renew)) ex.bottomTab = "orders"
                 else if (!(ex.market.message || "")) ex.localError = qsTr("The offer could not be posted now.")
             }
         }
@@ -552,7 +553,7 @@ ColumnLayout {
                         Text {
                             Layout.fillWidth: true; Layout.preferredWidth: 5; elide: Text.ElideRight
                             font.pixelSize: 12; color: M.Style.dimmedFontColor
-                            text: (modelData.state === "open" ? (modelData.kind === "offer" ? qsTr("open · %1").arg(X.timeLeft(modelData.expiresAt, ex.now)) : qsTr("waiting for the maker"))
+                            text: (modelData.state === "open" ? (modelData.kind === "offer" ? (modelData.renew ? qsTr("open · renews itself") : qsTr("open · %1").arg(X.timeLeft(modelData.expiresAt, ex.now))) : qsTr("waiting for the maker"))
                                   : modelData.state === "agreed" ? qsTr("matched: see the trade above")
                                   : modelData.state === "expired" ? qsTr("expired") : modelData.state === "cancelled" ? qsTr("cancelled")
                                   : modelData.state === "withdrawn" ? qsTr("withdrawn: funds no longer there") : modelData.state)
@@ -561,6 +562,15 @@ ColumnLayout {
                         Item {
                             Layout.fillWidth: true; Layout.preferredWidth: 2; implicitHeight: 22
                             Text {
+                                id: keepOpen
+                                visible: modelData.kind === "offer" && modelData.state === "open" && typeof ex.dex.setEvmOfferRenew === "function"
+                                anchors.right: cancelText.left; anchors.rightMargin: 14
+                                text: modelData.renew ? qsTr("Stop renewing") : qsTr("Keep open"); font.pixelSize: 13; color: M.Style.accent
+                                MouseArea { anchors.fill: parent; anchors.margins: -4; cursorShape: Qt.PointingHandCursor
+                                            onClicked: ex.localError = ex.dex.setEvmOfferRenew(modelData.folder, !modelData.renew) ? "" : qsTr("That could not be changed now.") }
+                            }
+                            Text {
+                                id: cancelText
                                 visible: modelData.kind === "offer" && modelData.state === "open"
                                 anchors.right: parent.right
                                 text: qsTr("Cancel"); font.pixelSize: 13; color: "#E5677A"
