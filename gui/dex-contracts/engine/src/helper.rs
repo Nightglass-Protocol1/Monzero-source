@@ -331,11 +331,7 @@ async fn tick(dir: &Path, cfg: Option<TickConfig>, sponsors: Vec<String>) -> Res
     let agreed = saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
     // Only relays that offer to pay now count: unfunded or unreachable relays leave the trade as
     // it was (the trader pays the fees in SOL/BNB, with the usual fee advance)
-    let sponsors = if saved.offer.asset == alloy::primitives::Address::ZERO || sponsors.is_empty() {
-        vec![]
-    } else {
-        crate::sponsor::offering(&sponsors, Chain::from_id(saved.offer.chain_id).is_some_and(Chain::is_solana)).await
-    };
+    let sponsors = crate::sponsor::trade_sponsors(&sponsors, saved.offer.asset != alloy::primitives::Address::ZERO, Chain::from_id(saved.offer.chain_id).is_some_and(Chain::is_solana)).await;
     let sponsored = !sponsors.is_empty();
     let chain = trade_chain(&cfg, &saved, &agreed, &key)?.with_sponsors(sponsors);
     let xmz = xmz_parts(dir, &cfg, &saved, &agreed, &swap_seed)?;

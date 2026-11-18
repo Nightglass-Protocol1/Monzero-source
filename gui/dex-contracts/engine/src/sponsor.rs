@@ -31,15 +31,37 @@ pub fn relays() -> &'static [String] {
 /// The relays that offer to pay this chain's USDT fees now (an unfunded relay offers nothing):
 /// only these count; with none, the trade runs as without sponsoring (the trader pays in SOL/BNB)
 pub async fn offering(relays: &[String], solana: bool) -> Vec<String> {
-    let mut out = vec![];
-    for relay in relays {
-        let Some(i) = info(relay).await else { continue };
-        let offers = if solana { i.solana.is_some() && i.sol_claim_fee.is_some() && i.sol_lock_fee.is_some() } else { i.evm.is_some() && i.bsc_claim_fee.is_some() };
-        if offers {
-            out.push(relay.clone());
+    // All asked at once, each for a few seconds at most: a relay that is down never slows a trade
+    let mut asks = tokio::task::JoinSet::new();
+    for (n, relay) in relays.iter().enumerate() {
+        let relay = relay.clone();
+        asks.spawn(async move { (n, tokio::time::timeout(std::time::Duration::from_secs(8), info(&relay)).await.ok().flatten()) });
+    }
+    let mut offers = vec![false; relays.len()];
+    while let Some(Ok((n, answer))) = asks.join_next().await {
+        offers[n] = answer.is_some_and(|i| i.offers(solana));
+    }
+    relays.iter().zip(offers).filter(|(_, o)| *o).map(|(r, _)| r.clone()).collect()
+}
+
+/// The relays that pay a trade's fees: only for a token (USDT) trade, and only those offering now.
+/// None: the trade runs as without relays (fees in SOL/BNB, with the usual fee advance).
+pub async fn trade_sponsors(relays: &[String], token_trade: bool, solana: bool) -> Vec<String> {
+    if !token_trade || relays.is_empty() {
+        return vec![];
+    }
+    offering(relays, solana).await
+}
+
+impl SponsorInfo {
+    /// Whether this answer offers to pay the fees on Solana (claims and locks) or BNB Smart Chain (claims)
+    pub fn offers(&self, solana: bool) -> bool {
+        if solana {
+            self.solana.is_some() && self.sol_claim_fee.is_some() && self.sol_lock_fee.is_some() && self.sol_lock_front.is_some()
+        } else {
+            self.evm.is_some() && self.bsc_claim_fee.is_some()
         }
     }
-    out
 }
 
 /// The lock fee of the first relay that pays Solana fees for USDT buyers, if any does
@@ -190,5 +212,62 @@ pub async fn post<T: Serialize>(relay: &str, path: &str, body: &T) -> Result<Spo
         (Some(e), _) => Err(e.clone()),
         (None, true) => Ok(answer),
         (None, false) => Err(format!("HTTP {status}")),
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    /// A one-shot HTTP server answering every GET with `body`, or a server that never answers
+    async fn serve(body: Option<&'static str>) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = s.read(&mut buf).await;
+                    match body {
+                        Some(b) => {
+                            let _ = s.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{b}", b.len()).as_bytes()).await;
+                        }
+                        None => tokio::time::sleep(std::time::Duration::from_secs(120)).await,
+                    }
+                });
+            }
+        });
+        at
+    }
+
+    const FUNDED: &str = r#"{"solana":"11111111111111111111111111111111","solClaimFee":198234,"solLockFee":500000,"solLockFront":5200200,"evm":"0x0000000000000000000000000000000000000001","bscClaimFee":"50000000000000000"}"#;
+
+    #[tokio::test]
+    async fn only_relays_offering_now_pay_a_usdt_trades_fees() {
+        // What the live relays answer with unfunded fee payers today: {}
+        let unfunded = serve(Some("{}")).await;
+        let funded = serve(Some(FUNDED)).await;
+        let sol_only = serve(Some(r#"{"solana":"11111111111111111111111111111111","solClaimFee":1,"solLockFee":2,"solLockFront":3}"#)).await;
+        let broken = serve(Some("not json")).await;
+        let down = "http://127.0.0.1:9".to_string();
+        let all = vec![unfunded.clone(), down.clone(), broken.clone(), funded.clone(), sol_only.clone()];
+        assert_eq!(trade_sponsors(&all, true, true).await, vec![funded.clone(), sol_only.clone()], "Solana: offering relays, in order");
+        assert_eq!(trade_sponsors(&all, true, false).await, vec![funded.clone()], "BNB Smart Chain: only an EVM offer counts");
+        assert!(trade_sponsors(&[unfunded.clone(), down, broken], true, true).await.is_empty(), "unfunded/down/broken: fees in SOL/BNB");
+        assert!(trade_sponsors(&[funded.clone()], false, true).await.is_empty(), "a SOL/BNB/ETH trade never uses sponsors");
+        assert!(trade_sponsors(&[], true, true).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_never_answers_costs_a_trade_step_seconds_not_minutes() {
+        let silent = [serve(None).await, serve(None).await, serve(None).await];
+        let funded = serve(Some(FUNDED)).await;
+        let started = std::time::Instant::now();
+        let mut relays = silent.to_vec();
+        relays.push(funded.clone());
+        assert_eq!(trade_sponsors(&relays, true, true).await, vec![funded]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(12), "asked in parallel, 8 s each at most: {:?}", started.elapsed());
     }
 }
