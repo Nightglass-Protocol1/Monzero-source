@@ -1,6 +1,6 @@
-# Building the Linux release wallet (v1.3.2; earlier releases the same way)
+# Building the Linux release wallet (v1.3.3; earlier releases the same way)
 
-The published `monzero-v1.3.2-linux-gui-x86_64.tar.gz` was produced with these steps. Paths are
+The published `monzero-v1.3.3-linux-gui-x86_64.tar.gz` was produced with these steps. Paths are
 examples; `$SRC` is this repository at the release commit with its submodules checked out.
 
 ## 1. Build image
@@ -18,7 +18,7 @@ x86-64, offline from a local copy of the crates in each `Cargo.lock`:
     export RUSTUP_TOOLCHAIN=1.95.0 RUSTFLAGS="--remap-path-prefix=<checkout parent>=/build -C target-cpu=x86-64"
     # in gui/dex-contracts/engine
     cargo build --release --locked --offline --bin monzero-dex-evm-helper
-    # in the adapted swap engine (monzero-v1.1.0-dex-helper-source.tar.gz, engine/); v1.3.2 reuses
+    # in the adapted swap engine (monzero-v1.1.0-dex-helper-source.tar.gz, engine/); v1.3.3 reuses
     # the v1.1.0 native-ltc-* binaries (that source did not change)
     cargo build --release --locked --offline -p swap-machine --bin native-ltc-light --bin native-ltc-journal
     strip monzero-dex-evm-helper native-ltc-light native-ltc-journal
@@ -41,7 +41,7 @@ The wallet runs a helper only if its SHA-256 is the one given here.
 
 ## 4. Package
 
-    cd $SRC/core && bash utils/release/package-linux-gui.sh <build dir>/bin <output dir> v1.3.2
+    cd $SRC/core && bash utils/release/package-linux-gui.sh <build dir>/bin <output dir> v1.3.3
 
 The archive is deterministic for the same binaries. The binaries themselves have not been shown
 to rebuild byte for byte (`binary_build_reproducibility=unverified` in `BUILD-MANIFEST.txt`).

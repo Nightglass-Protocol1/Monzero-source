@@ -1,3 +1,50 @@
+# Monzero v1.3.3 release notes
+
+Release label: v1.3.3
+
+Monzero v1.3.3 is a Linux wallet fix release for the DEX. It changes no consensus rule: the chain,
+blocks, coins, wallets, seeds and addresses are the same as in v1.0.0 to v1.3.2, and **nobody has to
+upgrade to stay on the network**. Update before trading on the XMZ/USDT markets.
+
+## What is fixed
+
+- **USDT trades and network fees.** v1.3.2 counted on the project's relays to pay the network fees
+  of every USDT trade. The relays do not pay them yet, so a USDT trade in v1.3.2 would have stopped
+  at the lock. v1.3.3 asks the relays at each step and uses only one that offers to pay now; until
+  then a USDT trader keeps a little SOL (about 0.015) or BNB in the trade account for fees, as on
+  the other pairs, and the buyer's fee advance covers the seller's claim. When the relays start
+  paying fees, v1.3.3 uses them without an update (then the fee is a little USDT instead).
+- A relay that does not answer no longer slows a trade step: the relays are asked together, for a
+  few seconds at most.
+
+The XMZ/USDT markets were not open while v1.3.2 was current, so no trade was affected.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Trades stay inside the limits of the project's signed control documents (about $25 per trade and
+  $250 a day per pair while the DEX opens; 25 USDT and 250 USDT on the USDT markets).
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
+| Complete source | Exact repository commit and recursive pinned submodules |
+
+The DEX helper programs are the v1.1.0 ones except `monzero-dex-evm-helper`, rebuilt from
+`gui/dex-contracts/engine` in the complete source.
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.3 and start it; it uses the same wallet files, node data, trading
+keys and trading wallet. A trade running in v1.3.2 carries on in v1.3.3.
+
+---
+
 # Monzero v1.3.2 release notes
 
 Release label: v1.3.2
@@ -10,12 +57,13 @@ upgrade to stay on the network**.
 
 - **XMZ/USDT.** Two new markets on the Exchange page: **USDT (SOL)**, Tether on Solana (SPL), and
   **USDT (BNB)**, Tether on BNB Smart Chain (BEP-20). Pay in USDT, or sell XMZ for USDT, with the
-  same atomic swaps as the other pairs. A USDT trader keeps a little SOL (about 0.015) or BNB in the
-  trade account for network fees. The wallet is also ready for the project's relays to pay those
-  fees and take a small USDT fee instead (then a Solana trader needs no SOL, and a BNB Smart Chain
-  seller no BNB); this is switched on later, when the relays have fee accounts. There is no ERC-20
-  USDT on Ethereum (its fees are too high). Each USDT market opens when its signed limits document
-  is published.
+  same atomic swaps as the other pairs. **Network fees are paid in USDT**: the project's relays pay
+  the Solana or BNB Smart Chain fee and take a small USDT fee instead (on Solana about 0.5 USDT to
+  buy, most of it coming back as SOL after the trade, and about 0.2 USDT from what you receive when
+  you sell; on BNB Smart Chain about 0.05 to 0.2 USDT when you sell). On Solana neither side needs
+  SOL; on BNB Smart Chain a buyer still needs a little BNB. If no relay answers, the wallet asks for
+  a little SOL or BNB instead. There is no ERC-20 USDT on Ethereum (its fees are too high). Each USDT
+  market opens when its signed limits document is published.
 - **Keep open.** An order can renew itself: shortly before it expires the wallet posts it again at
   the same price for the same time, while the wallet runs. Switch it on in the order form, or with
   "Keep open" on an open order.
