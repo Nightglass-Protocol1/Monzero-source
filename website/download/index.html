@@ -177,7 +177,7 @@
 <a class="button secondary wide" download="" href="/downloads/monzero-android-1.0.0-source.tar.gz">Android source <span>1.0.0: wallet, miner, wallet library and XMRig · TAR.GZ</span></a>
 <a class="checksum-link" download="" href="/downloads/monzero-android-1.0.0-source.tar.gz.sha256">SHA-256 checksum</a>
 <code class="hash" data-file="monzero-android-1.0.0-source.tar.gz">1843b3c2fbe5a83ce1babec6d35e7397187b73f7d403ebad1be41bfed2cb73a7</code>
-<p class="release-note">Wallet 1.1.11 source, with the DEX trade helper it runs (GPL-3.0), is in the <a href="https://github.com/Nightglass-Protocol1/Monzero-source" rel="noopener noreferrer">public repository</a> under <code>android/wallet</code> and <code>gui/dex-contracts/engine</code>.</p>
+<p class="release-note">Wallet 1.1.11 source, with the DEX trade helper it runs (GPL-3.0), is in the <a href="https://github.com/Nightglass-Protocol1/Monzero-source" rel="noopener noreferrer">public repository</a> under <code>android/wallet</code> and <code>gui/dex-contracts/engine</code>; its native wallet library is built from branch <code>android/wallet-lib</code>.</p>
 </div>
 </div>
 </div>
@@ -185,24 +185,24 @@
 <section class="download section" id="windows">
 <div class="download-card">
 <div>
-<p class="eyebrow">Monzero for Windows · v1.3.3 · 64-bit · unsigned beta</p>
+<p class="eyebrow">Monzero for Windows · v1.3.4 · 64-bit · unsigned beta</p>
 <h2>Windows wallet (beta)</h2>
-<p><strong>Experimental.</strong> A graphical wallet for 64-bit Windows 10/11 with the built-in Exchange: trade XMZ against ETH, BNB, SOL and USDT (Tether on Solana and on BNB Smart Chain), with orders that keep themselves open, the same as the Linux v1.3.3 wallet. This edition has <strong>no mining</strong>, and Bitcoin/Litecoin trading is not included. It is an early community build with limited Windows testing and <strong>no independent audit</strong> &mdash; use a throwaway wallet and small amounts. The signed Linux release above is the stable lineage.</p>
+<p><strong>Experimental.</strong> A graphical wallet for 64-bit Windows 10/11 with the built-in Exchange: trade XMZ against ETH, BNB, SOL and USDT (Tether on Solana and on BNB Smart Chain), with orders that keep themselves open, the same as the Linux v1.3.4 wallet. This edition has <strong>no mining</strong>, and Bitcoin/Litecoin trading is not included. It is an early community build with limited Windows testing and <strong>no independent audit</strong> &mdash; use a throwaway wallet and small amounts. The signed Linux release above is the stable lineage.</p>
 <p class="unsigned-note"><strong>Why Windows warns you: this build is not code-signed.</strong> A trusted Windows signature needs a paid code-signing certificate (and a Microsoft Store/MSIX enrolment) the project has not bought yet, so Windows SmartScreen and Microsoft Defender will flag it. Unsigned does not mean tampered &mdash; the way to be sure is to check the SHA-256 below, and the full source is public. A signing certificate and a false-positive report are on the to-do list.</p>
 <p class="release-note"><strong>How to run it, and clear the warnings:</strong></p>
 <ol>
 <li><strong>SmartScreen</strong> ("Windows protected your PC"): click <em>More info</em>, then <em>Run anyway</em>.</li>
 <li><strong>Microsoft Defender</strong> may quarantine <code>monzerod.exe</code> (the node) &mdash; a known false positive for Monero-family wallets, triggered by RandomX proof-of-work strings. <strong>If the wallet will not synchronise, this is usually why:</strong> open <em>Windows Security &rarr; Virus &amp; threat protection &rarr; Protection history</em>, find <code>monzerod.exe</code> and choose <strong>Restore</strong> / <strong>Allow</strong> (or add an exclusion for the wallet folder), then reopen the wallet.</li>
-<li><strong>Verify the download</strong> before running it &mdash; in PowerShell, <code>Get-FileHash .\monzero-v1.3.3-windows-x64.zip</code> must match the SHA-256 below.</li>
-<li>Extract the ZIP, keep every file together, run <code>monzero-wallet-gui.exe</code>, and read <code>START-HERE.txt</code> inside (it has a troubleshooting section). Coming from v1.3.0: extract into a new folder; your wallets and trading keys carry over.</li>
+<li><strong>Verify the download</strong> before running it &mdash; in PowerShell, <code>Get-FileHash .\monzero-v1.3.4-windows-x64.zip</code> must match the SHA-256 below.</li>
+<li>Extract the ZIP, keep every file together, run <code>monzero-wallet-gui.exe</code>, and read <code>START-HERE.txt</code> inside (it has a troubleshooting section). Coming from an earlier version: extract into a new folder; your wallets and trading keys carry over.</li>
 </ol>
 <p class="release-note">The binaries are not packed or obfuscated. Report issues to security@monzero.org.</p>
 </div>
 <div class="download-action">
 <div class="release-download">
-<a class="button primary wide" download="" href="/downloads/monzero-v1.3.3-windows-x64.zip">Windows wallet v1.3.3 · 64-bit · built-in exchange <span>64 MB · ZIP · unsigned · Windows 10/11</span></a>
-<a class="checksum-link" download="" href="/downloads/monzero-v1.3.3-windows-x64.zip.sha256">SHA-256 checksum</a>
-<code class="hash" data-file="monzero-v1.3.3-windows-x64.zip">e38f314deca634ef21dadda992ae42282ce9bc80ef563e3159fda87e9e04a979</code>
+<a class="button primary wide" download="" href="/downloads/monzero-v1.3.4-windows-x64.zip">Windows wallet v1.3.4 · 64-bit · built-in exchange <span>64 MB · ZIP · unsigned · Windows 10/11</span></a>
+<a class="checksum-link" download="" href="/downloads/monzero-v1.3.4-windows-x64.zip.sha256">SHA-256 checksum</a>
+<code class="hash" data-file="monzero-v1.3.4-windows-x64.zip">fd5c09fa50c0697e25b8db137444f86d6a79a57c825b8164b7fd7898b3316c15</code>
 </div>
 </div>
 </div>
