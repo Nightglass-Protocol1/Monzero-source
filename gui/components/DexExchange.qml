@@ -576,7 +576,8 @@ ColumnLayout {
                             text: (modelData.state === "open" ? (modelData.kind === "offer" ? (modelData.renew ? qsTr("open · renews itself") : qsTr("open · %1").arg(X.timeLeft(modelData.expiresAt, ex.now))) : qsTr("waiting for the maker"))
                                   : modelData.state === "agreed" ? qsTr("matched: see the trade above")
                                   : modelData.state === "expired" ? qsTr("expired") : modelData.state === "cancelled" ? qsTr("cancelled")
-                                  : modelData.state === "withdrawn" ? qsTr("withdrawn: funds no longer there") : modelData.state)
+                                  : modelData.state === "withdrawn" ? qsTr("withdrawn: funds no longer there")
+                                  : modelData.state === "refused" ? qsTr("not matched: the maker refused") : modelData.state)
                                   + (modelData.detail ? " · " + modelData.detail : "")
                         }
                         Item {
@@ -591,11 +592,12 @@ ColumnLayout {
                             }
                             Text {
                                 id: cancelText
-                                visible: modelData.kind === "offer" && modelData.state === "open"
+                                visible: modelData.state === "open"
                                 anchors.right: parent.right
-                                text: qsTr("Cancel"); font.pixelSize: 13; color: "#E5677A"
+                                text: modelData.kind === "offer" ? qsTr("Cancel") : qsTr("Stop waiting"); font.pixelSize: 13; color: "#E5677A"
                                 MouseArea { anchors.fill: parent; anchors.margins: -4; cursorShape: Qt.PointingHandCursor
-                                            onClicked: ex.localError = ex.dex.cancelEvmOffer(modelData.folder) ? "" : qsTr("The offer could not be cancelled now.") }
+                                            onClicked: ex.localError = ex.dex.cancelEvmOffer(modelData.folder) ? ""
+                                                     : modelData.kind === "offer" ? qsTr("The offer could not be cancelled now.") : qsTr("The wallet is busy: try again in a few seconds.") }
                             }
                         }
                     }
