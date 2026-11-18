@@ -30,6 +30,7 @@ final class DexMarket {
 
     private static final class Folder {
         String path, kind, state, detail = "", listingId;
+        boolean renew;
         JSONObject listing;
     }
 
@@ -139,6 +140,9 @@ final class DexMarket {
             f.listingId = f.listing.optJSONObject("listing").optString("id");
             f.state = new File(path, "journal.json").isFile() ? "agreed" : (maker && !o.isNull("takenBy") && o.has("takenBy") ? "agreed" : "open");
             if (new File(path, "cancelled").exists() || new File(path, "abandoned").exists()) f.state = "cancelled";
+            f.renew = maker && new File(path, "renew").exists();
+            // Renewed (kept open): the new offer has its own folder; this one is retired
+            if (new File(path, "renewed").exists()) f.state = "renewed";
             // Taken off the board by our own helper: our side could no longer pay for it
             final File withdrawn = new File(path, "withdrawn");
             if ("open".equals(f.state) && withdrawn.isFile()) {
@@ -188,9 +192,9 @@ final class DexMarket {
     }
 
     /** minXmzAtoms: the least one take may be (a partial offer), or null for a whole offer. */
-    boolean post(String seedHex, String side, String valueWei, String xmzAtoms, String minXmzAtoms, long lifetimeSecs) {
+    boolean post(String seedHex, String side, String valueWei, String xmzAtoms, String minXmzAtoms, long lifetimeSecs, boolean renew) {
         if (busy || (!side.equals("sell-xmz") && !side.equals("buy-xmz")) || !DIGITS.matcher(valueWei).matches()
-                || !DIGITS.matcher(xmzAtoms).matches() || lifetimeSecs <= 0 || lifetimeSecs > 86400
+                || !DIGITS.matcher(xmzAtoms).matches() || lifetimeSecs <= 0 || lifetimeSecs > 31 * 86400L
                 || (minXmzAtoms != null && !DIGITS.matcher(minXmzAtoms).matches())) return false;
         try {
             final JSONObject t = tickConfig(seedHex, null);
@@ -199,10 +203,23 @@ final class DexMarket {
             final JSONObject offer = new JSONObject().put("chainId", chainId).put("side", side).put("valueWei", valueWei)
                     .put("xmzAtoms", xmzAtoms).put("lifetimeSecs", lifetimeSecs);
             if (minXmzAtoms != null) offer.put("minXmzAtoms", minXmzAtoms);
+            if (renew) offer.put("renew", true);
             return run(base("post", dir).put("tick", t).put("offer", offer), dir);
         } catch (Exception e) {
             return false;
         }
+    }
+
+    /** Keep one of our open offers open (posted again shortly before it expires) or not: a mark in its folder. */
+    boolean setRenew(String dir, boolean on) {
+        for (Folder f : folders)
+            if (f.path.equals(dir) && "offer".equals(f.kind) && "open".equals(f.state)) {
+                final File mark = new File(dir, "renew");
+                final boolean ok = on ? DexFiles.write(mark, "") : (!mark.exists() || mark.delete());
+                if (ok) { f.renew = on; listener.marketChanged(); }
+                return ok;
+            }
+        return false;
     }
 
     /** The amounts of a listing the relays showed (for the limits check); null when unknown. */
@@ -347,10 +364,14 @@ final class DexMarket {
                         for (Folder f : folders) have = have || f.path.equals(rest);
                         if (!have) scanFolders();
                     }
+                    // A kept-open offer was posted again: serve the new folder from now on
+                    final boolean renewed = r.optJSONObject("renewed") != null;
+                    if (renewed) scanFolders();
                     final boolean done = r.optBoolean("taken") || r.optBoolean("agreed");
                     for (Folder f : folders)
                         if (f.path.equals(folder)) {
                             if (done) f.state = "agreed";
+                            else if (renewed) f.state = "renewed";
                             else if (r.optBoolean("offerWithdrawn")) f.state = "withdrawn";
                             else if (r.optBoolean("expired")) f.state = "expired";
                             final String refused = r.opt("refused") instanceof String ? r.optString("refused")
@@ -397,7 +418,7 @@ final class DexMarket {
                 mine.put(new JSONObject().put("folder", f.path).put("kind", f.kind).put("state", f.state).put("detail", f.detail).put("id", f.listingId)
                         .put("pair", l.optString("pair")).put("side", l.optString("side")).put("coin", wei == null ? "" : DexFiles.units(wei, places))
                         .put("xmz", xmz == null ? "" : DexFiles.units(xmz, 11)).put("price", wei == null || xmz == null ? "" : priceText(wei, xmz, places))
-                        .put("expiresAt", l.optLong("expiresAt")).put("partial", l.has("minXmz")));
+                        .put("expiresAt", l.optLong("expiresAt")).put("partial", l.has("minXmz")).put("renew", f.renew));
             }
             return new JSONObject().put("configured", true).put("busy", busy).put("state", state).put("error", error).put("command", command)
                     .put("listings", listings).put("mine", mine).put("withdrawal", withdrawal).put("chainId", chainId).put("coin", coin())

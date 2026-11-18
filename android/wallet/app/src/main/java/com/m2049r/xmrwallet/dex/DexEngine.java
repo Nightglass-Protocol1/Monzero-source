@@ -342,9 +342,9 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     }
 
     /** minXmzAmount: empty for a whole offer, else the least XMZ one buyer or seller may take. */
-    boolean postOffer(long chainId, String side, String coinAmount, String xmzAmount, String minXmzAmount, int hours) {
+    boolean postOffer(long chainId, String side, String coinAmount, String xmzAmount, String minXmzAmount, int hours, boolean renew) {
         final String wei = DexFiles.atomic(coinAmount, DexConfig.decimals(chainId)), atoms = DexFiles.atomic(xmzAmount, 11);
-        if (wei == null || atoms == null || hours < 1 || hours > 24) return say("Check the amounts and how long the offer stays open (1-24 hours).");
+        if (wei == null || atoms == null || hours < 1 || hours > 31 * 24) return say("Check the amounts and how long the offer stays open (1 hour to 31 days).");
         String minAtoms = null;
         if (minXmzAmount != null && !minXmzAmount.trim().isEmpty()) {
             minAtoms = DexFiles.atomic(minXmzAmount.trim(), 11);
@@ -355,7 +355,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         if (!refusal.isEmpty()) return say(refusal);
         final DexMarket m = markets.get(chainId);
         if (m == null) return false;
-        final boolean started = m.post(keys.seedHex(), side, wei, atoms, minAtoms, hours * 3600L);
+        final boolean started = m.post(keys.seedHex(), side, wei, atoms, minAtoms, hours * 3600L, renew);
         marketMessage = started ? "" : "The offer could not be posted now.";
         changed();
         return started;
@@ -411,6 +411,11 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         } catch (Exception e) {
             return null;
         }
+    }
+
+    boolean setOfferRenew(String folder, boolean on) {
+        final DexMarket m = folder == null ? null : marketFor(folder);
+        return m != null && m.setRenew(folder, on);
     }
 
     boolean cancelOffer(String folder) {

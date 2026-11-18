@@ -310,7 +310,7 @@ final class DexBridge implements DexEngine.Listener {
                 .put("wallet", pick(engine.walletStatus(), "state", "balance", "unlocked", "address", "keysReady", "keysExist", "keysBusy", "tradeAccount", "solTradeAccount", "error"))
                 .put("markets", marketOut).put("trade", tradeOut).put("account", account).put("solAccount", solAccount)
                 // What this wallet can do beyond the first page protocol: the page offers only these
-                .put("features", new JSONArray().put("partial"));
+                .put("features", new JSONArray().put("partial").put("long-offers").put("renew"));
     }
 
     private static final class Reply {
@@ -398,7 +398,8 @@ final class DexBridge implements DexEngine.Listener {
                 final long chainId = body.optLong("chainId");
                 final String side = body.optString("side");
                 if (!side.equals("buy-xmz") && !side.equals("sell-xmz")) return fail(400, "side");
-                final boolean posted = engine.postOffer(chainId, side, body.optString("coin"), body.optString("xmz"), body.optString("minXmz"), body.optInt("hours", 6));
+                final boolean posted = engine.postOffer(chainId, side, body.optString("coin"), body.optString("xmz"), body.optString("minXmz"), body.optInt("hours", 6),
+                        body.optBoolean("renew"));
                 return ok(new JSONObject().put("ok", posted).put("message", marketMessage()));
             }
             case "/v1/take": {
@@ -409,6 +410,8 @@ final class DexBridge implements DexEngine.Listener {
             }
             case "/v1/cancel":
                 return ok(new JSONObject().put("ok", engine.cancelOffer(body.optString("folder"))));
+            case "/v1/renew":
+                return ok(new JSONObject().put("ok", engine.setOfferRenew(body.optString("folder"), body.optBoolean("on"))));
             case "/v1/return": {
                 // Only ever to the account the user accepted for this page
                 final long chainId = body.optLong("chainId");
