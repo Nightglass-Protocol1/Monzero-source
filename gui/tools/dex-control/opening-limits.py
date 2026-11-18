@@ -23,6 +23,7 @@ NETWORKS = [  # network, coin symbol, atomic units per coin
     ("eth-mainnet", "ETH", 10**18),
     ("bnb-mainnet", "BNB", 10**18),
     ("sol-mainnet", "SOL", 10**9),
+    ("sol-usdt-mainnet", "USDT", 10**6),  # USDT on Solana (SPL), priced at $1
 ]
 XMZ_ATOMS = 10**11
 
@@ -30,7 +31,9 @@ XMZ_ATOMS = 10**11
 def prices():
     req = urllib.request.Request("https://monzero.org/markets/api.php?only=coins", headers={"User-Agent": "monzero-opening-limits"})
     with urllib.request.urlopen(req, timeout=20) as r:
-        return {c["symbol"]: Decimal(str(c["usd"])) for c in json.load(r)["coins"] if c.get("usd")}
+        found = {c["symbol"]: Decimal(str(c["usd"])) for c in json.load(r)["coins"] if c.get("usd")}
+    found.setdefault("USDT", Decimal(1))
+    return found
 
 
 def atoms(usd, coin_usd, per_coin):

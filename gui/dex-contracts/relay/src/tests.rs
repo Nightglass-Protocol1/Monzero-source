@@ -418,3 +418,11 @@ async fn a_month_long_offer_is_accepted_and_hidden_from_apps_before_it() {
     old.expires_at = NOW + 2 * 24 * 3600;
     assert!(r.post(old.sign(&maker), NOW).await.is_err());
 }
+
+#[test]
+fn a_usdt_print_is_priced_in_usdt_units() {
+    let p = Print { pair: "USDT/XMZ".into(), chain_id: monzero_dex_evm::Chain::SolMainnet.id(), tx: TxId("t".into()), at: NOW, value: U256::from(12_000_000u64), xmz: 1_000 * 100_000_000_000, listing: B256::ZERO };
+    assert!((p.price() - 0.012).abs() < 1e-12, "12 USDT for 1000 XMZ is 0.012 USDT per XMZ, got {}", p.price());
+    let sol = Print { pair: "SOL/XMZ".into(), value: U256::from(12_000_000u64), ..p };
+    assert!((sol.price() - 0.000012).abs() < 1e-15);
+}

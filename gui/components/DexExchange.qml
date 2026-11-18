@@ -27,16 +27,21 @@ ColumnLayout {
     readonly property var trade: (dex && dex.evmTradeStatus) || ({})
     readonly property var market: markets[coin] || ({})
     readonly property bool keysReady: wallet.keysReady === true
-    readonly property var allCoins: ["ETH", "BNB", "SOL"]
+    // USDT (on Solana) appears once the wallet runs its market
+    readonly property var allCoins: markets.USDT ? ["ETH", "BNB", "SOL", "USDT"] : ["ETH", "BNB", "SOL"]
     property string coin: "ETH"
-    readonly property int coinDecimals: coin === "SOL" ? 9 : 18
+    // SOL and USDT live on Solana (same trade account, Solana addresses)
+    function onSolana(c) { return c === "SOL" || c === "USDT" }
+    readonly property string usdtMint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+    readonly property int coinDecimals: decimalsOf(coin)
     readonly property int chainId: Number(market.chainId) || 0
     readonly property var relays: (market.relays && market.relays.length) ? market.relays : ["https://relay1.monzero.org", "https://relay2.monzero.org"]
     readonly property string myAccount: wallet.tradeAccount || ""
-    readonly property string coinAccount: coin === "SOL" ? (wallet.solTradeAccount || "") : myAccount
+    readonly property string coinAccount: onSolana(coin) ? (wallet.solTradeAccount || "") : myAccount
     readonly property var tradeSnapshot: trade.snapshot || ({})
     readonly property bool tradeRunning: trade.configured === true && tradeSnapshot.done !== true
     readonly property string tradeCoin: {
+        if (trade.coin) return trade.coin   // the wallet names it (USDT on Solana too)
         var o = tradeSnapshot.offer
         var id = o ? Number(o.chainId) : 0
         return id >= 501000101 && id <= 501000103 ? "SOL" : id === 56 || id === 97 ? "BNB" : "ETH"
@@ -62,7 +67,7 @@ ColumnLayout {
 
     readonly property var book: X.book(market.listings || [], coin, coinDecimals, myAccount, now)
     readonly property var stats: X.dayStats(candles[coin] || [], now)
-    readonly property real coinUsd: usd[coin] || 0
+    readonly property real coinUsd: usd[coin] || (coin === "USDT" ? 1 : 0)
     readonly property real xmzBalance: wallet.state === "ready" && wallet.unlocked !== undefined ? Number(wallet.unlocked) : -1
     readonly property real coinBalance: balances[coin] !== undefined ? balances[coin] : -1
     readonly property var myOrders: {
@@ -92,11 +97,11 @@ ColumnLayout {
 
     function marketChain(c) { return Number((markets[c] || {}).chainId) || 0 }
     function rpcFor(id) {
-        return ({ 1: "https://ethereum-rpc.publicnode.com", 56: "https://bsc-rpc.publicnode.com", 501000101: "https://solana-rpc.publicnode.com",
+        return ({ 1: "https://ethereum-rpc.publicnode.com", 56: "https://bsc-rpc.publicnode.com", 501000101: "https://solana-rpc.publicnode.com", 501000201: "https://solana-rpc.publicnode.com",
                   11155111: "https://ethereum-sepolia-rpc.publicnode.com", 97: "https://bsc-testnet-rpc.publicnode.com", 501000102: "https://api.devnet.solana.com" })[id] || ""
     }
     function networkName(id) {
-        return id === 1 ? qsTr("Ethereum") : id === 56 ? qsTr("BNB Smart Chain") : id === 501000101 ? qsTr("Solana")
+        return id === 1 ? qsTr("Ethereum") : id === 56 ? qsTr("BNB Smart Chain") : id === 501000101 ? qsTr("Solana") : id === 501000201 ? qsTr("Solana (USDT)")
              : id === 11155111 ? qsTr("Sepolia (test network)") : id === 97 ? qsTr("BNB Smart Chain Testnet") : id === 501000102 ? qsTr("Solana Devnet") : ""
     }
 
@@ -115,7 +120,7 @@ ColumnLayout {
         ignoreUnknownSignals: true
         function onDexRiskChanged() { ex.riskTick++ }
     }
-    function decimalsOf(c) { return c === "SOL" ? 9 : 18 }
+    function decimalsOf(c) { return c === "USDT" ? 6 : c === "SOL" ? 9 : 18 }
     function syncFeed() {
         var d = feed.data
         var cs = JSON.parse(JSON.stringify(candles)), ps = JSON.parse(JSON.stringify(prints)), bs = JSON.parse(JSON.stringify(balances))
@@ -180,7 +185,7 @@ ColumnLayout {
         if (feed) { feed.prints(c); return }
         relayGet("/v1/prints?pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
             if (!d || !d.prints) return
-            var m = JSON.parse(JSON.stringify(ex.prints)); m[c] = X.trades(d.prints, c === "SOL" ? 9 : 18); ex.prints = m
+            var m = JSON.parse(JSON.stringify(ex.prints)); m[c] = X.trades(d.prints, decimalsOf(c)); ex.prints = m
         })
     }
     function loadUsd() {
@@ -195,10 +200,18 @@ ColumnLayout {
     function loadBalance(c) {
         if (feed) { feed.balance(c); return }
         var id = marketChain(c), rpc = rpcFor(id)
-        var account = c === "SOL" ? (wallet.solTradeAccount || "") : myAccount
+        var account = onSolana(c) ? (wallet.solTradeAccount || "") : myAccount
         if (!rpc || !account) return
         var store = function (value) { var m = JSON.parse(JSON.stringify(ex.balances)); m[c] = value; ex.balances = m }
-        if (c === "SOL") {
+        if (c === "USDT") {
+            post(rpc, { jsonrpc: "2.0", id: 1, method: "getTokenAccountsByOwner", params: [account, { mint: usdtMint }, { encoding: "jsonParsed", commitment: "confirmed" }] }, function (d) {
+                var a = d && d.result && d.result.value
+                if (!a) return
+                var units = 0
+                for (var i = 0; i < a.length; ++i) units += Number(a[i].account.data.parsed.info.tokenAmount.amount || 0)
+                store(units / 1e6)
+            })
+        } else if (c === "SOL") {
             post(rpc, { jsonrpc: "2.0", id: 1, method: "getBalance", params: [account, { commitment: "confirmed" }] }, function (d) {
                 if (d && d.result && d.result.value !== undefined) store(Number(d.result.value) / 1e9)
             })
@@ -372,7 +385,7 @@ ColumnLayout {
         visible: ex.trade.configured === true
         trade: ex.trade
         coin: ex.tradeCoin
-        coinDecimals: ex.tradeCoin === "SOL" ? 9 : 18
+        coinDecimals: ex.decimalsOf(ex.tradeCoin)
         errorText: ex.localError
         externalWallet: ex.withdrawTo[ex.tradeCoin] || ""
         onApprove: ex.localError = ex.dex.approveEvmTrade(commitment) ? "" : qsTr("Approval could not start.")
@@ -671,7 +684,9 @@ ColumnLayout {
                     }
                     Text {
                         Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor
-                        text: qsTr("To buy XMZ, send %1 on %2 here (plus a little for network fees). It is this app's own account: only your trading keys can move it.").arg(ex.coin).arg(ex.networkName(ex.chainId) || ex.coin)
+                        text: ex.coin === "USDT"
+                              ? qsTr("To buy XMZ, send USDT on Solana (SPL, not ERC-20 or TRC-20) here, plus about 0.01 SOL for network fees. It is this app's own account: only your trading keys can move it.")
+                              : qsTr("To buy XMZ, send %1 on %2 here (plus a little for network fees). It is this app's own account: only your trading keys can move it.").arg(ex.coin).arg(ex.networkName(ex.chainId) || ex.coin)
                     }
                     RowLayout {
                         Layout.fillWidth: true
@@ -679,7 +694,8 @@ ColumnLayout {
                         spacing: 12
                         Image {
                             Layout.preferredWidth: 96; Layout.preferredHeight: 96; smooth: false; fillMode: Image.PreserveAspectFit
-                            source: !parent.visible ? "" : ex.coin === "SOL" ? "image://qrcode/solana:" + ex.coinAccount
+                            source: !parent.visible ? "" : ex.coin === "USDT" ? "image://qrcode/solana:" + ex.coinAccount + "?spl-token=" + ex.usdtMint
+                                  : ex.coin === "SOL" ? "image://qrcode/solana:" + ex.coinAccount
                                   : "image://qrcode/ethereum:" + ex.coinAccount + "@" + ex.chainId
                         }
                         M.LineEdit { Layout.fillWidth: true; readOnly: true; copyButton: true; fontSize: 12; text: ex.coinAccount }
@@ -689,7 +705,7 @@ ColumnLayout {
                         Layout.fillWidth: true
                         visible: ex.coinAccount !== ""
                         M.LineEdit { id: withdrawAddress; Layout.fillWidth: true; fontSize: 13; inputPaddingTop: 6; inputPaddingBottom: 6
-                                     text: ex.withdrawTo[ex.coin] || ""; placeholderText: ex.coin === "SOL" ? qsTr("Solana address") : qsTr("0x… address"); placeholderFontSize: 13 }
+                                     text: ex.withdrawTo[ex.coin] || ""; placeholderText: ex.onSolana(ex.coin) ? qsTr("Solana address") : qsTr("0x… address"); placeholderFontSize: 13 }
                         M.StandardButton {
                             small: true; text: qsTr("Withdraw")
                             enabled: withdrawAddress.text.trim() !== "" && ex.market.busy !== true

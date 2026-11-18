@@ -787,8 +787,10 @@ QString evmControlNetwork(qint64 chainId) {
     case 56: return QStringLiteral("bnb-mainnet");
     case 1:  return QStringLiteral("eth-mainnet");
     case DexChains::SolMainnet: return QStringLiteral("sol-mainnet");
+    // USDT on Solana has its own document: limits in USDT, its own kill switch
+    case DexChains::SolUsdtMainnet: return QStringLiteral("sol-usdt-mainnet");
 #ifndef MONZERO_DEX_PUBLIC_EDITION
-    case DexChains::SolDevnet: case DexChains::SolLocal: return QStringLiteral("evm-regtest");
+    case DexChains::SolDevnet: case DexChains::SolLocal: case DexChains::SolUsdtDevnet: case DexChains::SolUsdtLocal: return QStringLiteral("evm-regtest");
     // The public edition trades on mainnets only, always under a signed document
     case 97: case 11155111: case 1337: case 31337: return QStringLiteral("evm-regtest");
 #endif
@@ -820,7 +822,14 @@ bool DexEngine::configureEvmTrade(const QString &config,const QString &seedFile)
     m_evmSeedFile=seedFile;m_evmTrade->refresh();m_evmTicker->start();return true;
 }
 QVariantMap DexEngine::evmTradeStatus() const {
-    auto s=m_evmTrade->status();s.insert("stepping",m_evmTicker->isActive());s.insert("startRefusal",m_evmStartRefusal);return s;
+    auto s=m_evmTrade->status();s.insert("stepping",m_evmTicker->isActive());s.insert("startRefusal",m_evmStartRefusal);
+    // What the trade is paid in, for the trade card: the chain's coin, or USDT on Solana
+    const auto offer=m_evmTrade->offer();
+    if (!offer.isEmpty()) {
+        const auto market=DexChains::marketOf(qint64(offer.value("chainId").toDouble()),offer.value("asset").toString());
+        s.insert("market",double(market));s.insert("coin",DexChains::coin(market));s.insert("decimals",DexChains::decimals(market));
+    }
+    return s;
 }
 bool DexEngine::refreshEvmTrade() {return m_evmTrade->refresh();}
 bool DexEngine::approveEvmTrade(const QString &commitment) {
@@ -829,7 +838,8 @@ bool DexEngine::approveEvmTrade(const QString &commitment) {
     // in-flight trade are never blocked (nothing is stranded); only the first is enforced.
     const auto offer=m_evmTrade->offer();const auto trade=m_evmTrade->tradeId();
     if (offer.isEmpty() || trade.isEmpty()) return false;
-    const auto network=evmControlNetwork(qint64(offer.value("chainId").toDouble()));
+    // The trade's market: its chain, and for a token (USDT on Solana) the token's own market
+    const auto network=evmControlNetwork(DexChains::marketOf(qint64(offer.value("chainId").toDouble()),offer.value("asset").toString()));
     const auto refuse=[this](const QString &why){m_evmStartRefusal=why;emit evmTradeChanged();return false;};
     if (network.isEmpty()) return refuse(tr("This EVM chain is not supported for trading."));
     bool valueOk=false,xmzOk=false;
@@ -934,6 +944,12 @@ void DexEngine::setUpEvmMarkets() {
     if (!mainnet && DexChains::solanaAddress(localSolProgram)) {
         for (auto &c:chains) if (c.id==int(DexChains::SolDevnet)) c={int(DexChains::SolLocal),"http://127.0.0.1:8899"};
     }
+    // USDT on Solana: its own market on the same chain (mainnet; a local validator with a USDT mint)
+    for (const auto &c:QList<Chain>(chains)) {
+        if (c.id==int(DexChains::SolMainnet)) chains.append({int(DexChains::SolUsdtMainnet),c.rpc});
+        if (c.id==int(DexChains::SolLocal) && DexChains::solanaAddress(qEnvironmentVariable("MONZERO_DEX_SOL_LOCAL_USDT_MINT")))
+            chains.append({int(DexChains::SolUsdtLocal),c.rpc});
+    }
     QJsonArray relays;for (const auto &r:defaultRelays()) relays.append(r);
     for (const auto &c:chains) {
         const auto rpcOverride=qEnvironmentVariable(QStringLiteral("MONZERO_DEX_EVM_RPC_%1").arg(c.id).toLatin1().constData());
@@ -941,7 +957,8 @@ void DexEngine::setUpEvmMarkets() {
         QJsonObject config{{"schema","monzero-private-xmz-evm-market-v1"},{"helper",m_dexWallets->helper()},{"helperDigest",m_dexWallets->helperSha256()},
             {"tradesDir",QStringLiteral("%1/evm-trades/%2").arg(root).arg(c.id)},{"evmRpc",rpcOverride.isEmpty() ? QString::fromLatin1(c.rpc) : rpcOverride},
             {"chainId",c.id},{"accountIndex",0},{"mainWallet",main},{"swapWallet",main},{"relays",relays}};
-        if (c.id==int(DexChains::SolLocal)) config.insert("localSolProgram",localSolProgram);
+        if (DexChains::helperChain(c.id)==DexChains::SolLocal) config.insert("localSolProgram",localSolProgram);
+        if (c.id==int(DexChains::SolUsdtLocal)) config.insert("localSolUsdtMint",qEnvironmentVariable("MONZERO_DEX_SOL_LOCAL_USDT_MINT"));
         const auto path=QStringLiteral("%1/evm-market-%2.json").arg(root).arg(c.id);
         QFile f(path);
         if (!f.open(QIODevice::WriteOnly|QIODevice::Truncate) || !f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner)) continue;
@@ -1134,7 +1151,10 @@ bool DexEngine::takeEvmOffer(const QString &listingId,const QString &xmzAmount) 
             }
             if (atoms==l.value("xmzAtoms").toString()) atoms.clear(); else wei=part;
         }
-        const auto refusal=evmOfferRefusal(qint64(l.value("chainId").toDouble()),wei,atoms.isEmpty() ? l.value("xmzAtoms").toString() : atoms);
+        // A USDT offer is checked under the USDT market's limits, not the chain coin's
+        const qint64 chain=qint64(l.value("chainId").toDouble());
+        const qint64 market=l.value("pair").toString()=="USDT/XMZ" ? DexChains::marketOf(chain,QStringLiteral("usdt")) : chain;
+        const auto refusal=evmOfferRefusal(market,wei,atoms.isEmpty() ? l.value("xmzAtoms").toString() : atoms);
         if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
         QByteArray seed=evmSeed();
         const bool started=job->take(seed,listingId,atoms);

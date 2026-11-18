@@ -18,7 +18,7 @@ const int TimeoutMs=15000;
 
 DexExchangeFeed::DexExchangeFeed(SourceFor sources,QObject *parent) : QObject(parent),m_sources(std::move(sources)),m_net(new QNetworkAccessManager(this)) {}
 
-bool DexExchangeFeed::knownCoin(const QString &coin) {return coin=="ETH" || coin=="BNB" || coin=="SOL";}
+bool DexExchangeFeed::knownCoin(const QString &coin) {return coin=="ETH" || coin=="BNB" || coin=="SOL" || coin=="USDT";}
 bool DexExchangeFeed::knownInterval(int interval) {return interval==3600 || interval==4*3600 || interval==24*3600;}
 bool DexExchangeFeed::allowedBase(const QString &text) {
     const QUrl url(text);
@@ -105,20 +105,35 @@ bool DexExchangeFeed::balance(const QString &coin) {
     if (m_pending.value(key) || !allowedBase(source.rpc) || source.account.isEmpty()) return false;
     if (source.solana ? !DexChains::solanaAddress(source.account) : !DexChains::evmAddress(source.account)) return false;
     m_pending.insert(key,true);
-    const QJsonObject call=source.solana
+    // USDT on Solana: the token accounts of the trade account for Tether's mint
+    const bool token=coin=="USDT";
+    const QJsonObject call=token
+        ? QJsonObject{{"jsonrpc","2.0"},{"id",1},{"method","getTokenAccountsByOwner"},{"params",QJsonArray{source.account,
+              QJsonObject{{"mint","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}},QJsonObject{{"encoding","jsonParsed"},{"commitment","confirmed"}}}}}
+        : source.solana
         ? QJsonObject{{"jsonrpc","2.0"},{"id",1},{"method","getBalance"},{"params",QJsonArray{source.account,QJsonObject{{"commitment","confirmed"}}}}}
         : QJsonObject{{"jsonrpc","2.0"},{"id",1},{"method","eth_getBalance"},{"params",QJsonArray{source.account,"latest"}}};
     QNetworkRequest request{QUrl(source.rpc)};
     request.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
     request.setTransferTimeout(TimeoutMs);
     auto *reply=m_net->post(request,QJsonDocument(call).toJson(QJsonDocument::Compact));
-    connect(reply,&QNetworkReply::finished,this,[this,reply,key,solana=source.solana]{
+    connect(reply,&QNetworkReply::finished,this,[this,reply,key,solana=source.solana,token]{
         reply->deleteLater();
         m_pending.remove(key);
         const auto body=reply->error()==QNetworkReply::NoError && reply->bytesAvailable()<=MaxReply ? reply->readAll() : QByteArray();
         const auto result=QJsonDocument::fromJson(body).object().value("result");
         QString amount;
-        if (solana) {
+        if (token) {
+            // Base units (6 decimals) summed over the account's USDT token accounts; none yet: 0
+            quint64 units=0;bool read=result.isObject();
+            for (const auto &a:result.toObject().value("value").toArray()) {
+                const auto text=a.toObject().value("account").toObject().value("data").toObject().value("parsed").toObject()
+                    .value("info").toObject().value("tokenAmount").toObject().value("amount").toString();
+                bool ok=false;const auto n=text.toULongLong(&ok);
+                if (ok) units+=n; else read=false;
+            }
+            if (read) amount=QString::number(units);
+        } else if (solana) {
             const auto v=result.toObject().value("value");
             if (v.isDouble() && v.toDouble()>=0) amount=QString::number(qint64(v.toDouble()));
         } else {

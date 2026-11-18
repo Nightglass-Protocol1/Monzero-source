@@ -53,12 +53,14 @@ private:
         if (m_network.startsWith("bnb-")) return QStringLiteral("BNB");
         if (m_network.startsWith("eth-")) return QStringLiteral("ETH");
         if (m_network.startsWith("evm-")) return QStringLiteral("EVM");
+        if (m_network.startsWith("sol-usdt-")) return QStringLiteral("USDT");
         if (m_network.startsWith("sol-")) return QStringLiteral("SOL");
         return QStringLiteral("Litecoin");
     }
     // Places of the coin's smallest unit (satoshi, wei, lamport) for showing a cap in coins
     int coinDecimals() const {
         if (m_network.startsWith("bnb-") || m_network.startsWith("eth-") || m_network.startsWith("evm-")) return 18;
+        if (m_network.startsWith("sol-usdt-")) return 6;
         if (m_network.startsWith("sol-")) return 9;
         return 8;
     }

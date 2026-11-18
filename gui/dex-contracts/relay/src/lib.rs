@@ -160,8 +160,14 @@ pub struct Print {
 impl Print {
     /// Coin per XMZ
     pub fn price(&self) -> f64 {
-        // The coin's smallest unit: wei (18 places), or lamports on Solana (9)
-        let unit = if monzero_dex_evm::Chain::from_id(self.chain_id).is_some_and(|c| c.is_solana()) { 1e9 } else { 1e18 };
+        // The coin's smallest unit: wei (18 places), lamports on Solana (9), USDT base units (6)
+        let unit = if self.pair == "USDT/XMZ" {
+            1e6
+        } else if monzero_dex_evm::Chain::from_id(self.chain_id).is_some_and(|c| c.is_solana()) {
+            1e9
+        } else {
+            1e18
+        };
         let coin = self.value.to_string().parse::<f64>().unwrap_or(0.0) / unit;
         coin / (self.xmz as f64 / 1e11)
     }

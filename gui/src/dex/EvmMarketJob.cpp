@@ -29,7 +29,7 @@ bool localEndpoint(const QJsonValue &value) {
 bool configValid(const QJsonObject &c) {
     const QSet<QString> required{"schema","helper","helperDigest","tradesDir","evmRpc","chainId","accountIndex","mainWallet","swapWallet","relays"};
     for (const auto &key:required) if (!c.contains(key)) return false;
-    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk" && i.key()!="localContract" && i.key()!="localSolProgram") return false;
+    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk" && i.key()!="localContract" && i.key()!="localSolProgram" && i.key()!="localSolUsdtMint") return false;
     static const QRegularExpression rpc("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?|http://127\\.0\\.0\\.1:[0-9]{1,5})\\z");
     static const QRegularExpression relay("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?|http://(127\\.0\\.0\\.1|localhost):[0-9]{1,5})\\z");
     const auto relays=c.value("relays").toArray();
@@ -39,7 +39,8 @@ bool configValid(const QJsonObject &c) {
     const auto chain=c.value("chainId").toDouble(-1);
     if (chain!=double(qint64(chain)) || !DexChains::known(qint64(chain))) return false;
     // A local Solana test validator's swap program (that chain only), as the local EVM contract
-    if (c.contains("localSolProgram") && !(qint64(chain)==DexChains::SolLocal && DexChains::solanaAddress(c.value("localSolProgram").toString()))) return false;
+    if (c.contains("localSolProgram") && !(DexChains::helperChain(qint64(chain))==DexChains::SolLocal && DexChains::solanaAddress(c.value("localSolProgram").toString()))) return false;
+    if (c.contains("localSolUsdtMint") && !(qint64(chain)==DexChains::SolUsdtLocal && DexChains::solanaAddress(c.value("localSolUsdtMint").toString()))) return false;
     return c.value("schema")=="monzero-private-xmz-evm-market-v1" && cleanAbsolute(c.value("helper").toString())
         && cleanAbsolute(c.value("tradesDir").toString()) && rpc.match(c.value("evmRpc").toString()).hasMatch()
         && index>=0 && index<2147483648.0 && index==double(qint64(index))
@@ -73,7 +74,7 @@ bool listingValid(const QJsonObject &signedListing) {
     const auto l=signedListing.value("listing").toObject();
     static const QRegularExpression address("\\A0x[0-9a-fA-F]{40}\\z");
     return signedListing.size()==2 && Hash.match(l.value("id").toString()).hasMatch()
-        && (l.value("pair")=="ETH/XMZ" || l.value("pair")=="BNB/XMZ" || l.value("pair")=="SOL/XMZ")
+        && (l.value("pair")=="ETH/XMZ" || l.value("pair")=="BNB/XMZ" || l.value("pair")=="SOL/XMZ" || l.value("pair")=="USDT/XMZ")
         && (l.value("side")=="sell-xmz" || l.value("side")=="buy-xmz")
         && HexQty.match(l.value("value").toString()).hasMatch() && Digits.match(l.value("xmz").toString()).hasMatch()
         && address.match(l.value("maker").toString()).hasMatch() && l.value("expiresAt").isDouble() && l.value("chainId").isDouble();
@@ -161,6 +162,7 @@ QJsonObject EvmMarketJob::base(const QString &command,const QString &folder) con
         {"relays",m_config.value("relays")}};
     if (m_config.contains("localContract")) r.insert("localContract",m_config.value("localContract"));
     if (m_config.contains("localSolProgram")) r.insert("localSolProgram",m_config.value("localSolProgram"));
+    if (m_config.contains("localSolUsdtMint")) r.insert("localSolUsdtMint",m_config.value("localSolUsdtMint"));
     return r;
 }
 
@@ -199,7 +201,8 @@ bool EvmMarketJob::requestAccounts(QByteArray &walletSeed) {
 }
 
 bool EvmMarketJob::refreshListings(const QString &pair) {
-    if (pair!="ETH/XMZ" && pair!="BNB/XMZ" && pair!="SOL/XMZ") return false;
+    // This market's pair only (USDT and SOL share the Solana chain but are separate markets)
+    if (pair!=DexChains::pair(qint64(m_config.value("chainId").toDouble()))) return false;
     // Partial offers too: this wallet can take part of one
     auto r=base("listings",{});r.insert("pair",pair);r.insert("partial",true);
     return run(r,{});
@@ -211,7 +214,9 @@ bool EvmMarketJob::post(QByteArray &walletSeed,qint64 chainId,const QString &sid
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
     const auto folder=m_tradesDir+"/offer-"+QString::number(QRandomGenerator::system()->generate64(),16);
     auto r=base("post",folder);r.insert("tick",t);
-    QJsonObject offer{{"chainId",chainId},{"side",side},{"valueWei",valueWei},{"xmzAtoms",xmzAtoms},{"lifetimeSecs",lifetimeSecs}};
+    // The helper trades the market on its chain; a token market names its pair
+    QJsonObject offer{{"chainId",DexChains::helperChain(chainId)},{"side",side},{"valueWei",valueWei},{"xmzAtoms",xmzAtoms},{"lifetimeSecs",lifetimeSecs}};
+    if (DexChains::usdt(chainId)) offer.insert("pair",DexChains::pair(chainId));
     if (!minXmzAtoms.isEmpty()) offer.insert("minXmzAtoms",minXmzAtoms);
     if (renew) offer.insert("renew",true);
     r.insert("offer",offer);
@@ -250,7 +255,8 @@ bool EvmMarketJob::cancel(QByteArray &walletSeed,const QString &folder) {
 bool EvmMarketJob::withdraw(QByteArray &walletSeed,const QString &address) {
     if (m_busy || m_path.isEmpty() || !DexChains::address(qint64(m_config.value("chainId").toDouble()),address)) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
-    auto r=base("withdraw",QString());r.insert("tick",t);r.insert("payoutAddress",address);r.insert("chainId",m_config.value("chainId"));
+    auto r=base("withdraw",QString());r.insert("tick",t);r.insert("payoutAddress",address);
+    r.insert("chainId",double(DexChains::helperChain(qint64(m_config.value("chainId").toDouble()))));
     m_withdrawal.clear();
     return run(r,QString());
 }

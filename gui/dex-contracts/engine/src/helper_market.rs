@@ -794,6 +794,16 @@ pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: &str, no
     if let Some(why) = funds_in_use(root, now)? {
         return Err(why);
     }
+    // On Solana the SOL and USDT markets share one trade account (folders <chain id> and the app's
+    // USDT market <chain id + 100>): an open offer or trade in either keeps its funds
+    if Chain::from_id(chain_id).is_some_and(Chain::is_solana) {
+        let name = root.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse::<u64>().ok());
+        for sibling in [name.map(|n| n + 100), name.and_then(|n| n.checked_sub(100))].into_iter().flatten() {
+            if let Some(why) = funds_in_use(&root.with_file_name(sibling.to_string()), now)? {
+                return Err(why);
+            }
+        }
+    }
     let (_, key) = keys(cfg)?;
     let kind = Chain::from_id(chain_id).ok_or("unknown chain")?;
     if kind.is_solana() {
