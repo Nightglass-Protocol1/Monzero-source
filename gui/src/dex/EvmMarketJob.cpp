@@ -136,6 +136,12 @@ void EvmMarketJob::scanFolders() {
         f.listingId=f.listing.value("listing").toObject().value("id").toString();
         f.state=QFile::exists(path+"/journal.json") ? "agreed" : (maker && !o.value("takenBy").isNull() ? "agreed" : "open");
         if (QFile::exists(path+"/cancelled") || QFile::exists(path+"/abandoned")) f.state="cancelled";
+        // Taken off the board by our own helper: our side could no longer pay for it
+        if (f.state=="open" && QFile::exists(path+"/withdrawn")) {
+            f.state="withdrawn";
+            QFile why(path+"/withdrawn");
+            if (why.open(QIODevice::ReadOnly)) f.detail=QString::fromUtf8(why.read(400)).left(200);
+        }
         m_folders.append(f);
     }
 }
@@ -319,8 +325,10 @@ void EvmMarketJob::finish(bool success) {
         const bool done=r.value("taken").toBool() || r.value("agreed").toBool();
         for (auto &f:m_folders) if (f.path==m_folder) {
             if (done) f.state="agreed";
+            else if (r.value("offerWithdrawn").toBool()) f.state="withdrawn";
             else if (r.value("expired").toBool()) f.state="expired";
-            f.detail=r.value("refused").isString() ? r.value("refused").toString().left(200) : QString();
+            f.detail=r.value("refused").isString() ? r.value("refused").toString().left(200)
+                : r.value("offerWithdrawn").toBool() ? r.value("reason").toString().left(200) : QString();
         }
         if (done) {const auto folder=m_folder;emit changed();emit agreed(folder);return;}
     } else if (m_command=="withdraw") {

@@ -65,6 +65,20 @@ struct MakerFile {
     remainder: Option<std::path::PathBuf>,
 }
 
+// Kept beside listing.json, so the offer file stays as older helpers read it:
+// `withdrawn` holds why we took the open offer off the board ourselves (our side could no
+// longer pay for the smallest take), `funds-checked` when we last saw that it still could.
+fn withdrawn_reason(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join("withdrawn")).ok()
+}
+
+fn funds_checked_at(dir: &Path) -> u64 {
+    std::fs::read_to_string(dir.join("funds-checked")).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0)
+}
+
+/// How often an open offer's funds are checked again while no take arrives
+const FUNDS_RECHECK_SECS: u64 = 600;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct TakerFile {
@@ -137,6 +151,15 @@ async fn heights(cfg: &TickConfig, chain: Chain, evm_from_block: Option<u64>) ->
 /// Our side can pay for its part before we offer or take: the coin (owner) or XMZ (claimer)
 /// for `xmz` atoms of the listing (all of it when we make the offer).
 async fn check_funds(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySigner, cfg: &TickConfig) -> Result<(), String> {
+    match funds_short(role, listing, xmz, key, cfg).await? {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
+/// Whether our side can pay for its part of `xmz` atoms of the listing: `Ok(None)` when it can,
+/// `Ok(Some(why))` when it cannot, `Err` when the balance could not be read (unknown, not short).
+async fn funds_short(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySigner, cfg: &TickConfig) -> Result<Option<String>, String> {
     let value = listing.fill_value(xmz);
     match role {
         Role::Owner if Chain::from_id(listing.chain_id).is_some_and(Chain::is_solana) => {
@@ -145,10 +168,10 @@ async fn check_funds(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySi
             let need = u64::try_from(value).map_err(|_| "the amount does not fit Solana's lamports")?;
             if have < need {
                 let sol = |lamports: u64| format!("{}.{:09}", lamports / 1_000_000_000, lamports % 1_000_000_000);
-                return Err(format!(
+                return Ok(Some(format!(
                     "the trade account {} holds {} SOL; this offer needs {} plus network fees. Send at least {} more to it (for example from Phantom), then try again",
                     crate::sol::to_base58(&account), sol(have), sol(need), sol(need - have)
-                ));
+                )));
             }
         }
         Role::Owner => {
@@ -157,10 +180,10 @@ async fn check_funds(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySi
             if have < value {
                 // In coins, not wei: this is what the person reads before sending from their wallet
                 let coins = alloy::primitives::utils::format_ether;
-                return Err(format!(
+                return Ok(Some(format!(
                     "the trade account {} holds {}; this offer needs {} plus network fees. Send at least {} more to it (for example from MetaMask), then try again",
                     key.address(), coins(have), coins(value), coins(value - have)
-                ));
+                )));
             }
         }
         Role::Claimer => {
@@ -170,11 +193,11 @@ async fn check_funds(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySi
             let unlocked = main.call("get_balance", json!({})).await.map_err(|e| e.to_string())?["unlocked_balance"].as_u64().unwrap_or(0);
             let needed = xmz_needed(xmz);
             if unlocked < needed {
-                return Err(format!("the XMZ wallet has {unlocked} atoms unlocked; this offer needs {needed} (the amount plus a margin for fees)"));
+                return Ok(Some(format!("the XMZ wallet has {unlocked} atoms unlocked; this offer needs {needed} (the amount plus a margin for fees)")));
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn evm_chain(cfg: &TickConfig, listing: &Listing, from_block: u64, key: &PrivateKeySigner) -> Result<AlloyChain, String> {
@@ -336,6 +359,25 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
         return Err("these keys are not the offer's maker".into());
     }
     let id = file.listing.listing.id;
+    if let Some(why) = withdrawn_reason(dir) {
+        // Still answer late takes with a refusal, and tell the relays if they had not heard yet
+        return withdraw_offer(dir, &mut file, &client, &seed, &key, why).await;
+    }
+    let role = file.listing.listing.maker_role();
+    let smallest = file.listing.listing.min_xmz.unwrap_or(file.listing.listing.xmz);
+    // Every so often while the offer waits: can we still pay for the smallest take? An offer
+    // whose coins were spent or moved is taken off the board, not left for someone to take
+    let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if file.taken_by.is_none() && clock >= funds_checked_at(dir) + FUNDS_RECHECK_SECS {
+        crate::helper::step("checking that the offer can still be paid for");
+        match funds_short(role, &file.listing.listing, smallest, &key, cfg).await {
+            Ok(Some(why)) => return withdraw_offer(dir, &mut file, &client, &seed, &key, why).await,
+            Ok(None) => {
+                let _ = std::fs::write(dir.join("funds-checked"), clock.to_string());
+            }
+            Err(_) => {} // balance unreadable now: unknown, not short; checked again on a take
+        }
+    }
     if !dir.join("posted").exists() && file.taken_by.is_none() && !file.closed {
         mark_posted(dir, &send_offer(&client, &file.listing, &key).await);
     }
@@ -354,6 +396,16 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
             at = Some(heights(cfg, chain_of_id(file.listing.listing.chain_id)?, None).await?);
         }
         let heights = at.expect("set");
+        // Before agreeing to a trade: our side must still be able to pay for this take. Short:
+        // refuse and take the offer off the board. Unknown (node unreachable): leave the letter
+        // unanswered, so it is answered on a later call, rather than start a trade we may not fill
+        if file.taken_by.is_none() {
+            match funds_short(role, &file.listing.listing, take.xmz.unwrap_or(file.listing.listing.xmz), &key, cfg).await {
+                Ok(None) => {}
+                Ok(Some(why)) => return withdraw_offer(dir, &mut file, &client, &seed, &key, why).await,
+                Err(_) => continue,
+            }
+        }
         // A taker with code on chain could not receive the payout: refuse before answering
         let plain = check_chain(cfg, &file.listing.listing, heights.evm_from_block, &key, &[take.taker]).await.is_ok();
         let (answer, saved) = if plain {
@@ -383,6 +435,44 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
         return taken(dir, &mut file, cfg, relays, Some(now), answered).await;
     }
     Ok(json!({"taken": false, "answered": answered, "expired": now >= file.listing.listing.expires_at, "listing": file.listing}))
+}
+
+/// Take our open offer off the board because our side can no longer pay for it: a signed cancel
+/// to the relays (tried again on later calls until one accepts it) and the reason kept with it.
+async fn withdraw_offer(dir: &Path, file: &mut MakerFile, client: &RelayClient, seed: &SwapSeed, key: &PrivateKeySigner, why: String) -> Result<Value, String> {
+    // Every take still waiting gets a refusal, so no taker waits for an offer that is gone
+    let id = file.listing.listing.id;
+    let mailbox = seed.mailbox(id, true);
+    for (_, sealed) in client.mail(mailbox.address()).await {
+        let digest = keccak256(&sealed);
+        if file.answered.contains(&digest) {
+            continue;
+        }
+        let Some(Letter::Take(take)) = Letter::open(&mailbox, &sealed) else { continue };
+        let refusal = crate::mail::Answer {
+            listing: id,
+            response: crate::exchange::KeyResponse::Refused("the maker can no longer pay for this offer; it was withdrawn".into()),
+        };
+        if let Some(sealed) = Letter::Answer(refusal).seal(take.reply_to, &mut OsRng) {
+            client.send_mail(&Envelope { to: take.reply_to, sealed }).await;
+        }
+        file.answered.insert(digest);
+    }
+    if !file.closed {
+        let l = &file.listing.listing;
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(l.created_at);
+        let signed = Cancel { schema: CANCEL_SCHEMA.into(), id: l.id, maker: key.address(), at }.sign(key);
+        let told = client.cancel(&signed).await;
+        let gone = |v: &Value| v["ok"] == true || v["error"].as_str().is_some_and(|e| e.contains("not found") || e.contains("404"));
+        file.closed = told.iter().any(gone);
+    }
+    std::fs::write(dir.join("withdrawn"), &why).map_err(|e| e.to_string())?;
+    write(&dir.join("listing.json"), file)?;
+    Ok(withdrawn_status(file, &why))
+}
+
+fn withdrawn_status(file: &MakerFile, why: &str) -> Value {
+    json!({"taken": false, "offerWithdrawn": true, "reason": format!("Offer withdrawn: {why}"), "expired": true, "listing": file.listing})
 }
 
 /// The answer for a taken offer: the trade's status, and for a partial offer the new offer for
@@ -548,7 +638,7 @@ pub fn funds_in_use(root: &Path, now: u64) -> Result<Option<String>, String> {
                 continue;
             }
         }
-        if dir.join("cancelled").exists() {
+        if dir.join("cancelled").exists() || dir.join("withdrawn").exists() {
             continue;
         }
         if let Ok(Some(file)) = read::<MakerFile>(&dir.join("listing.json")) {
@@ -666,6 +756,10 @@ mod withdraw_tests {
         assert!(funds_in_use(&r, NOW).unwrap().unwrap().contains("still open"));
         std::fs::write(open.join("cancelled"), b"").unwrap();
         assert_eq!(funds_in_use(&r, NOW).unwrap(), None, "cancelled: free");
+        let gone = offer_folder(&r, "offer-withdrawn", NOW + 3600, false);
+        assert!(funds_in_use(&r, NOW).unwrap().is_some());
+        std::fs::write(gone.join("withdrawn"), b"the XMZ wallet has 0 atoms unlocked").unwrap();
+        assert_eq!(funds_in_use(&r, NOW).unwrap(), None, "withdrawn (its funds were gone): free");
         offer_folder(&r, "offer-expired", NOW - 1, false);
         assert_eq!(funds_in_use(&r, NOW).unwrap(), None, "expired: free");
         // Taken but the trade is not written yet: the taker may be waiting for our lock

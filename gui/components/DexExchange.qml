@@ -71,7 +71,7 @@ ColumnLayout {
             var mine = (markets[allCoins[i]] || {}).mine || []
             for (var j = 0; j < mine.length; ++j) {
                 var o = mine[j]
-                if (o.state === "cancelled" && Number(o.expiresAt) < now - 86400) continue
+                if ((o.state === "cancelled" || o.state === "withdrawn") && Number(o.expiresAt) < now - 86400) continue
                 out.push({ coin: allCoins[i], kind: o.kind, state: o.state, side: o.side, xmz: o.xmz, amount: o.coin, price: o.price,
                            expiresAt: Number(o.expiresAt), folder: o.folder, detail: o.detail || "" })
             }
@@ -554,7 +554,8 @@ ColumnLayout {
                             font.pixelSize: 12; color: M.Style.dimmedFontColor
                             text: (modelData.state === "open" ? (modelData.kind === "offer" ? qsTr("open · %1").arg(X.timeLeft(modelData.expiresAt, ex.now)) : qsTr("waiting for the maker"))
                                   : modelData.state === "agreed" ? qsTr("matched: see the trade above")
-                                  : modelData.state === "expired" ? qsTr("expired") : modelData.state === "cancelled" ? qsTr("cancelled") : modelData.state)
+                                  : modelData.state === "expired" ? qsTr("expired") : modelData.state === "cancelled" ? qsTr("cancelled")
+                                  : modelData.state === "withdrawn" ? qsTr("withdrawn: funds no longer there") : modelData.state)
                                   + (modelData.detail ? " · " + modelData.detail : "")
                         }
                         Item {
