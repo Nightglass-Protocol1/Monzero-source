@@ -27,11 +27,11 @@
     ? { id: 501000103, name: "Solana (local test)", control: null, sol: true, rpc: "http://127.0.0.1:18899", tx: "https://solscan.io/tx/" }
     : { id: 501000102, name: "Solana Devnet (test network)", control: null, sol: true, rpc: "https://api.devnet.solana.com", tx: "https://solscan.io/tx/", txEnd: "?cluster=devnet" };
   // USDT on BNB Smart Chain (BEP-20 BSC-USD): its own market and limits, traded on chain 56 (`net`)
-  if (!TEST) CHAINS["USDT-BSC"] = { id: 100000056, net: 56, name: "BNB Smart Chain (USDT)", control: "bnb-usdt-mainnet", tx: "https://bscscan.com/tx/",
+  if (!TEST) CHAINS["USDT-BSC"] = { id: 100000056, net: 56, name: "BNB Smart Chain (USDT)", control: "bnb-usdt-v2-mainnet", tx: "https://bscscan.com/tx/",
                                    evmToken: { address: "0x55d398326f99059fF775485246999027B3197955", decimals: 18 }, add: CHAINS.BNB.add };
   // USDT on Solana (SPL): its own market and limits; the wallet's Solana trade account holds it.
   // On a local copy, ?usdt=<mint> with ?sol=local trades a test mint on the local validator.
-  if (!TEST) CHAINS.USDT = { id: 501000201, name: "Solana (USDT)", control: "sol-usdt-mainnet", sol: true, rpc: "https://solana-rpc.publicnode.com", tx: "https://solscan.io/tx/",
+  if (!TEST) CHAINS.USDT = { id: 501000201, name: "Solana (USDT)", control: "sol-usdt-v2-mainnet", sol: true, rpc: "https://solana-rpc.publicnode.com", tx: "https://solscan.io/tx/",
                              token: { mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 } };
   else (function () { var m = /[?&]usdt=([1-9A-HJ-NP-Za-km-z]{32,44})/.exec(location.search);
     if (m && /[?&]sol=local/.test(location.search)) CHAINS.USDT = { id: 501000203, name: "Solana USDT (local test)", control: null, sol: true, rpc: "http://127.0.0.1:18899", tx: "https://solscan.io/tx/", token: { mint: m[1], decimals: 6 } }; })();
@@ -458,6 +458,8 @@
   // A wallet that may post offers open longer than a day (up to 31 days)
   function canLong() { var f = st.status && st.status.features; return !!(f && f.indexOf && f.indexOf("long-offers") >= 0); }
   // A wallet that keeps an offer open: posts it again shortly before it expires, while it runs
+  // USDT needs a wallet that pays its fees right (v1.3.3 / Android 1.1.10): older ones stall
+  function canUsdt() { var f = st.status && st.status.features; return !!(f && f.indexOf && f.indexOf("usdt-v2") >= 0); }
   function canRenew() { var f = st.status && st.status.features; return !!(f && f.indexOf && f.indexOf("renew") >= 0); }
   // How long a new offer stays open, in hours (0: not a valid choice)
   function lifeHours() {
@@ -762,7 +764,7 @@
         : "One more step: your Monzero wallet asks you to choose a trading password.") + '</p>' +
         (w.keysBusy ? "" : '<button class="button primary" type="button" data-act="unlock">' + (w.keysExist ? "Unlock in the wallet" : "Set it up in the wallet") + "</button>");
       else if (live) h += tradeHTML(t);
-      else if ((tok() || evmTok()) && !(s.markets || {})[st.coin]) h += '<p class="tp-note">Trading USDT needs the newest Monzero wallet (Linux 1.3.2 or Android 1.1.9). <a href="/download/">Download it</a>, then connect again.</p>';
+      else if ((tok() || evmTok()) && (!(s.markets || {})[st.coin] || !canUsdt())) h += '<p class="tp-note">Trading USDT needs the newest Monzero wallet (Linux v1.3.3 or Android 1.1.10). <a href="/download/">Download it</a>, then connect again.</p>';
       else {
         var lim = st.limits[st.coin];
         h += '<div class="tp-side" role="group"><button type="button" data-act="side" data-side="buy" class="' + (st.side === "buy" ? "on" : "") + '">Buy XMZ</button>' +
