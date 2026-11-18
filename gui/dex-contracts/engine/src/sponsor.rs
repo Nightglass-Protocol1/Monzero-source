@@ -31,17 +31,23 @@ pub fn relays() -> &'static [String] {
 /// The relays that offer to pay this chain's USDT fees now (an unfunded relay offers nothing):
 /// only these count; with none, the trade runs as without sponsoring (the trader pays in SOL/BNB)
 pub async fn offering(relays: &[String], solana: bool) -> Vec<String> {
-    // All asked at once, each for a few seconds at most: a relay that is down never slows a trade
+    let answers = answers(relays).await;
+    relays.iter().zip(answers).filter(|(_, a)| a.as_ref().is_some_and(|i| i.offers(solana))).map(|(r, _)| r.clone()).collect()
+}
+
+/// Every relay's offer, in order (None: no answer). All asked at once, each for a few seconds at
+/// most: a relay that is down never slows a trade or a funding check.
+async fn answers(relays: &[String]) -> Vec<Option<SponsorInfo>> {
     let mut asks = tokio::task::JoinSet::new();
     for (n, relay) in relays.iter().enumerate() {
         let relay = relay.clone();
         asks.spawn(async move { (n, tokio::time::timeout(std::time::Duration::from_secs(8), info(&relay)).await.ok().flatten()) });
     }
-    let mut offers = vec![false; relays.len()];
+    let mut out = vec![None; relays.len()];
     while let Some(Ok((n, answer))) = asks.join_next().await {
-        offers[n] = answer.is_some_and(|i| i.offers(solana));
+        out[n] = answer;
     }
-    relays.iter().zip(offers).filter(|(_, o)| *o).map(|(r, _)| r.clone()).collect()
+    out
 }
 
 /// The relays that pay a trade's fees: only for a token (USDT) trade, and only those offering now.
@@ -54,24 +60,28 @@ pub async fn trade_sponsors(relays: &[String], token_trade: bool, solana: bool) 
 }
 
 impl SponsorInfo {
-    /// Whether this answer offers to pay the fees on Solana (claims and locks) or BNB Smart Chain (claims)
+    /// Whether this answer offers to pay the fees on Solana (claims and locks) or BNB Smart Chain
+    /// (claims) on terms a trade accepts (the same limits the trade checks before signing)
     pub fn offers(&self, solana: bool) -> bool {
         if solana {
-            self.solana.is_some() && self.sol_claim_fee.is_some() && self.sol_lock_fee.is_some() && self.sol_lock_front.is_some()
+            self.solana.as_deref().is_some_and(|a| crate::sol::from_base58(a).is_ok())
+                && self.sol_claim_fee.is_some_and(|f| f <= MAX_SOL_CLAIM_FEE)
+                && self.sol_lock_fee.is_some_and(|f| f <= MAX_SOL_LOCK_FEE)
+                && self.sol_lock_front.is_some_and(|f| f <= SOL_LOCK_FRONT)
         } else {
-            self.evm.is_some() && self.bsc_claim_fee.is_some()
+            self.evm.is_some() && self.bsc_claim_fee.as_deref().and_then(|f| f.parse::<alloy::primitives::U256>().ok()).is_some_and(|f| f <= max_evm_claim_fee())
         }
     }
 }
 
 /// The lock fee of the first relay that pays Solana fees for USDT buyers, if any does
 pub async fn sol_lock_fee() -> Option<u64> {
-    for relay in relays() {
-        if let Some(fee) = info(relay).await.and_then(|i| i.sol_lock_fee.filter(|f| *f <= MAX_SOL_LOCK_FEE)) {
-            return Some(fee);
-        }
-    }
-    None
+    sol_lock_fee_of(relays()).await
+}
+
+/// The same choice as a trade's (`offering`): the first relay whose offer a trade would take
+async fn sol_lock_fee_of(relays: &[String]) -> Option<u64> {
+    answers(relays).await.into_iter().flatten().find(|i| i.offers(true)).and_then(|i| i.sol_lock_fee)
 }
 pub const SOL_CLAIM_PATH: &str = "/v1/sponsor/sol-claim";
 pub const SOL_LOCK_PATH: &str = "/v1/sponsor/sol-lock";
@@ -250,12 +260,18 @@ mod selection_tests {
         let unfunded = serve(Some("{}")).await;
         let funded = serve(Some(FUNDED)).await;
         let sol_only = serve(Some(r#"{"solana":"11111111111111111111111111111111","solClaimFee":1,"solLockFee":2,"solLockFront":3}"#)).await;
+        // Asks more than a trade accepts (lock fee 2 USDT; claim 2 USDT on BNB Smart Chain)
+        let greedy = serve(Some(r#"{"solana":"11111111111111111111111111111111","solClaimFee":1,"solLockFee":2000000,"solLockFront":3,"evm":"0x0000000000000000000000000000000000000001","bscClaimFee":"2000000000000000000"}"#)).await;
         let broken = serve(Some("not json")).await;
         let down = "http://127.0.0.1:9".to_string();
-        let all = vec![unfunded.clone(), down.clone(), broken.clone(), funded.clone(), sol_only.clone()];
+        let all = vec![unfunded.clone(), greedy.clone(), down.clone(), broken.clone(), funded.clone(), sol_only.clone()];
         assert_eq!(trade_sponsors(&all, true, true).await, vec![funded.clone(), sol_only.clone()], "Solana: offering relays, in order");
         assert_eq!(trade_sponsors(&all, true, false).await, vec![funded.clone()], "BNB Smart Chain: only an EVM offer counts");
-        assert!(trade_sponsors(&[unfunded.clone(), down, broken], true, true).await.is_empty(), "unfunded/down/broken: fees in SOL/BNB");
+        assert!(trade_sponsors(&[unfunded.clone(), greedy.clone(), down, broken], true, true).await.is_empty(), "unfunded/greedy/down/broken: fees in SOL/BNB");
+        assert!(trade_sponsors(&[greedy.clone()], true, false).await.is_empty(), "too dear on BNB Smart Chain too");
+        // The buyer's funding check takes the same relay a trade would
+        assert_eq!(sol_lock_fee_of(&[unfunded.clone(), greedy.clone(), funded.clone()]).await, Some(500000), "the funded relay's fee, not the greedy one's");
+        assert_eq!(sol_lock_fee_of(&[unfunded.clone(), greedy]).await, None, "no acceptable relay: the buyer is asked for SOL");
         assert!(trade_sponsors(&[funded.clone()], false, true).await.is_empty(), "a SOL/BNB/ETH trade never uses sponsors");
         assert!(trade_sponsors(&[], true, true).await.is_empty());
     }
