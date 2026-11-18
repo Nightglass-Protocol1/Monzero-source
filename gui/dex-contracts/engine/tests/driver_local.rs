@@ -832,3 +832,51 @@ async fn a_token_swap_approves_exactly_the_value_then_locks_and_the_claimer_gets
 alloy::sol! {
     function mint(address to, uint256 amount) external;
 }
+
+/// USDT (BEP-20) with a relay claiming for the seller, who holds no gas coin at all: the relay
+/// sends the contract's claimRelayer and is paid its fee out of the tokens.
+///   + MONZERO_EVM_CONTRACT, MONZERO_EVM_TOKEN (deployed before the relay starts) and
+///     MONZERO_EVM_SPONSOR (a relay sponsoring this chain with that token)
+#[tokio::test]
+async fn a_seller_with_no_gas_coin_collects_usdt_through_a_relay() {
+    let Some(url) = std::env::var("MONZERO_EVM_RPC").ok() else { return };
+    let (Ok(contract), Ok(token), Ok(relay)) = (std::env::var("MONZERO_EVM_CONTRACT"), std::env::var("MONZERO_EVM_TOKEN"), std::env::var("MONZERO_EVM_SPONSOR")) else { return };
+    let _chain = CHAIN.lock().await;
+    let (contract, token): (Address, Address) = (contract.parse().unwrap(), token.parse().unwrap());
+    monzero_dex_evm::chain::set_local_usdt_token(token);
+    let info = monzero_dex_evm::sponsor::info(&relay).await.expect("the relay sponsors");
+    let fee: U256 = info.bsc_claim_fee.unwrap().parse().unwrap();
+    let mut w = world(url).await;
+    let value = U256::from(25u64) * U256::from(10u64).pow(U256::from(18u64));
+    let seller = PrivateKeySigner::random();
+    w.trade.terms.contract = contract;
+    w.trade.terms.asset = token;
+    w.trade.terms.value = value;
+    w.trade.terms.claimer = seller.address();
+    let deployer = ProviderBuilder::new().wallet(EthereumWallet::from(key(DEPLOYER_KEY))).connect_http(w.url.parse().unwrap());
+    let mint = alloy::sol_types::SolCall::abi_encode(&mintCall { to: w.trade.terms.owner, amount: value });
+    deployer.send_transaction(TransactionRequest::default().with_to(token).with_input(mint)).await.unwrap().get_receipt().await.unwrap();
+    assert_eq!(balance(&w.url, seller.address()).await, U256::ZERO, "the seller holds no gas coin");
+
+    let sponsors = vec![relay];
+    let owner_chain = AlloyChain::new(&w.url, Chain::Local, contract, w.from_block, key(OWNER_KEY)).unwrap();
+    let seller_chain = AlloyChain::new(&w.url, Chain::Local, contract, w.from_block, seller.clone()).unwrap().with_sponsors(sponsors);
+    let mut owner = Driver::new(w.trade.clone(), w.owner_secret.clone(), U256::from(7), owner_chain, w.xmz("owner"), MemoryJournal(Record::new(RoleState::Owner(OwnerState::Start)))).unwrap();
+    let journal = MemoryJournal(Record::new(RoleState::Claimer(ClaimerState::WaitingForEvmLock)));
+    let mut claimer = Driver::new(w.trade.clone(), w.claimer_secret.clone(), U256::ZERO, seller_chain, w.xmz("claimer"), journal).unwrap();
+    let (mut owner_state, mut claimer_state) = (None, None);
+    for _ in 0..40 {
+        owner_state = Some(owner.tick().await.unwrap());
+        claimer_state = Some(claimer.tick().await.unwrap());
+        w.xmz("chain").mine(5);
+        if owner_state.as_ref().unwrap().is_done() && claimer_state.as_ref().unwrap().is_done() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(claimer_state, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
+    assert_eq!(owner_state, Some(RoleState::Owner(OwnerState::Done(Outcome::Swapped))));
+    assert_eq!(token_balance(&w.url, token, seller.address()).await, value - fee, "the seller got the USDT less the relay's fee");
+    assert_eq!(balance(&w.url, seller.address()).await, U256::ZERO, "and never needed gas");
+    assert_eq!(w.ledger.lock().unwrap().swept_by, Some("owner"));
+}

@@ -25,7 +25,8 @@ Selling XMZ for SOL or BNB
 
 USDT
   Exchange > USDT (SOL) or USDT (BNB): send USDT on that network (SPL or BEP-20) to the trade
-  account, plus a little SOL or BNB for fees. Turn on "Keep open" to renew an order by itself.
+  account. Fees are paid in USDT (a BNB Chain buyer also needs a little BNB). Turn on "Keep open"
+  to renew an order by itself.
 
 Your own look
   Settings > Layout > Appearance: colour sets, your own colours and a picture on the wallet card.

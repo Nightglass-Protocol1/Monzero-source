@@ -692,9 +692,9 @@ ColumnLayout {
                     Text {
                         Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor
                         text: ex.coin === "USDT"
-                              ? qsTr("To buy XMZ, send USDT on Solana (SPL, not ERC-20 or TRC-20) here, plus about 0.015 SOL for network fees and account deposits. It is this app's own account: only your trading keys can move it.")
+                              ? qsTr("To buy XMZ, send USDT on Solana (SPL, not ERC-20 or TRC-20) here. No SOL is needed: the network fees are paid in USDT (about 0.5 USDT to buy, most of it back as SOL after the trade; about 0.2 USDT from what you receive when you sell). It is this app's own account: only your trading keys can move it.")
                               : ex.coin === "USDT-BSC"
-                              ? qsTr("To buy XMZ, send USDT on BNB Smart Chain (BEP-20, not ERC-20 or TRC-20) here, plus a little BNB for network fees. It is this app's own account: only your trading keys can move it.")
+                              ? qsTr("To buy XMZ, send USDT on BNB Smart Chain (BEP-20, not ERC-20 or TRC-20) here, plus a little BNB for network fees. Selling needs no BNB: the fee is paid from the USDT you receive (about 0.05 to 0.2 USDT). It is this app's own account: only your trading keys can move it.")
                               : qsTr("To buy XMZ, send %1 on %2 here (plus a little for network fees). It is this app's own account: only your trading keys can move it.").arg(ex.coin).arg(ex.networkName(ex.chainId) || ex.coin)
                     }
                     RowLayout {

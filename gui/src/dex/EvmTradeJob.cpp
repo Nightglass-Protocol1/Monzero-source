@@ -24,8 +24,17 @@ bool endpoint(const QJsonValue &value) {
 bool configValid(const QJsonObject &c) {
     const QSet<QString> required{"schema","helper","helperDigest","tradeDir","evmRpc","accountIndex","mainWallet","swapWallet"};
     for (const auto &key:required) if (!c.contains(key)) return false;
-    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk" && i.key()!="localSolProgram") return false;
+    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk" && i.key()!="localSolProgram"
+        && i.key()!="localSolUsdtMint" && i.key()!="relays") return false;
     if (c.contains("localSolProgram") && !DexChains::solanaAddress(c.value("localSolProgram").toString())) return false;
+    if (c.contains("localSolUsdtMint") && !DexChains::solanaAddress(c.value("localSolUsdtMint").toString())) return false;
+    // The relays that may pay a USDT trade's network fees (paid back in USDT): https, or local in tests
+    static const QRegularExpression relay("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?|http://(127\\.0\\.0\\.1|localhost):[0-9]{1,5})\\z");
+    if (c.contains("relays")) {
+        const auto list=c.value("relays").toArray();
+        if (list.size()>8) return false;
+        for (const auto &r:list) if (!relay.match(r.toString()).hasMatch()) return false;
+    }
     static const QRegularExpression rpc("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?|http://127\\.0\\.0\\.1:[0-9]{1,5})\\z");
     const auto index=c.value("accountIndex").toDouble(-1);
     return c.value("schema")=="monzero-private-xmz-evm-trade-v1" && cleanAbsolute(c.value("helper").toString())
@@ -184,6 +193,9 @@ bool EvmTradeJob::run(const QJsonObject &request) {
     auto sent=request;
     // The swap program of a local Solana test validator (as the market job passes it)
     if (m_config.contains("localSolProgram")) sent.insert("localSolProgram",m_config.value("localSolProgram"));
+    if (m_config.contains("localSolUsdtMint")) sent.insert("localSolUsdtMint",m_config.value("localSolUsdtMint"));
+    // A USDT trade's network fees may be paid by these relays, in USDT
+    if (m_config.contains("relays")) sent.insert("relays",m_config.value("relays"));
     m_input=QJsonDocument(sent).toJson(QJsonDocument::Compact);m_output.clear();m_errors=0;
     m_busy=true;m_state="running";m_error.clear();
     QProcessEnvironment environment;environment.insert("LANG","C");

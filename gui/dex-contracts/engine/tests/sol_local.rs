@@ -13,7 +13,7 @@ use monzero_dex_evm::exchange::{SavedTrade, Session};
 use monzero_dex_evm::machine::{ClaimerState, Outcome, OwnerState, Timing, XmzLock};
 use monzero_dex_evm::negotiation::{Offer, Role};
 use monzero_dex_evm::secret::combined_spend_key;
-use monzero_dex_evm::sol::{self, SolChain};
+use monzero_dex_evm::sol::{self, AnyChain, SolChain};
 use monzero_dex_evm::swap_seed::SwapSeed;
 use monzero_dex_evm::xmz::XmzNetwork;
 use monzero_dex_evm::Chain;
@@ -394,4 +394,65 @@ async fn a_usdt_swap_locks_the_tokens_and_the_seller_collects_them() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     assert_eq!(sol::token_balance(&url, &home, &mint).await.unwrap(), units, "the USDT reached the seller's own wallet");
+}
+
+/// USDT with a relay paying the fees: the buyer holds only USDT, the seller nothing. The relay
+/// fronts the buyer's lock deposits and is paid in USDT; it submits the seller's claim and takes
+/// its fee out of the USDT.
+///   + MONZERO_SOL_SPONSOR=<a relay with a Solana sponsor for this validator>
+#[tokio::test]
+async fn a_usdt_trade_needs_no_sol_on_either_side_with_a_sponsoring_relay() {
+    let Some((url, program)) = setup() else { return };
+    let (Ok(mint), Ok(bank), Ok(relay)) = (std::env::var("MONZERO_SOL_USDT_MINT"), std::env::var("MONZERO_SOL_USDT_BANK"), std::env::var("MONZERO_SOL_SPONSOR")) else { return };
+    let _chain = CHAIN.lock().await;
+    let mint = sol::from_base58(&mint).unwrap();
+    sol::set_local_usdt_mint(mint);
+    let bank = ed25519_dalek::SigningKey::from_bytes(&hex::decode(bank).unwrap().try_into().unwrap());
+    let info = monzero_dex_evm::sponsor::info(&relay).await.expect("the relay sponsors");
+    let (relayer, lock_fee, claim_fee) = (sol::from_base58(info.solana.as_deref().unwrap()).unwrap(), info.sol_lock_fee.unwrap(), info.sol_claim_fee.unwrap());
+    println!("relay {} lock fee {lock_fee}, claim fee {claim_fee}", info.solana.unwrap());
+    let units = 25_000_000u64;
+    let timing = Timing { xmz_confirmations: 10, xmz_lock_budget: 120, owner_refund_margin: 120, claim_margin: 120 };
+    let (owner, claimer) = agree_asset(&url, program, 6, timing, 0, 0, sol::asset_address(&mint), units).await;
+    // The buyer gets exactly the USDT for the trade and the relay's fee, and no SOL
+    let bank_sol = balance(&url, &bank.verifying_key().to_bytes()).await;
+    sol::pay_out_with(&url, &bank, &owner.account(), bank_sol, Some(mint)).await.unwrap();
+    for _ in 0..60 {
+        if sol::token_balance(&url, &owner.account(), &mint).await.unwrap() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let owner_tokens = sol::token_balance(&url, &owner.account(), &mint).await.unwrap();
+    assert!(owner_tokens >= units + lock_fee);
+    assert_eq!(balance(&url, &owner.account()).await, 0, "the buyer holds no SOL");
+    assert_eq!(balance(&url, &claimer.account()).await, 0, "the seller holds no SOL");
+    let relay_tokens = sol::token_balance(&url, &relayer, &mint).await.unwrap();
+
+    let sponsors = vec![relay.clone()];
+    let (mut owner_state, mut claimer_state) = (None, None);
+    for round in 0..120 {
+        let mut o = Driver::resume(&owner.seed, &owner.key, AnyChain::Sol(owner.chain(&url, program)).with_sponsors(sponsors.clone()), owner.xmz.clone(), FileJournal(owner.journal.clone())).unwrap()
+            .with_gas_advance(GasAdvance::Off);
+        let mut c = Driver::resume(&claimer.seed, &claimer.key, AnyChain::Sol(claimer.chain(&url, program)).with_sponsors(sponsors.clone()), claimer.xmz.clone(), FileJournal(claimer.journal.clone())).unwrap()
+            .with_gas_advance(GasAdvance::Off);
+        owner_state = Some(o.tick().await.unwrap());
+        claimer_state = Some(c.tick().await.unwrap());
+        println!("round {round}: owner {} | claimer {}", owner_state.as_ref().unwrap().stage(), claimer_state.as_ref().unwrap().stage());
+        if owner_state.as_ref().unwrap().is_done() && claimer_state.as_ref().unwrap().is_done() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    assert_eq!(owner_state, Some(RoleState::Owner(OwnerState::Done(Outcome::Swapped))));
+    assert_eq!(claimer_state, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
+    assert_eq!(owner.xmz.ledger.lock().unwrap().swept_by, Some("owner"));
+    let got = sol::token_balance(&url, &claimer.account(), &mint).await.unwrap();
+    assert!(got > 0 && got <= units && units - got <= claim_fee, "the seller got the USDT less the relay's claim fee: {got}");
+    assert_eq!(balance(&url, &claimer.account()).await, 0, "and still needed no SOL");
+    let paid = owner_tokens - sol::token_balance(&url, &owner.account(), &mint).await.unwrap();
+    assert!(paid >= units && paid - units <= lock_fee, "the buyer paid the USDT and the relay's lock fee: {paid}");
+    assert!(sol::token_balance(&url, &relayer, &mint).await.unwrap() > relay_tokens, "the relay was paid in USDT");
+    // The deposits the relay fronted came back to the buyer when the swap closed
+    assert!(balance(&url, &owner.account()).await >= 4_000_000, "the buyer holds the returned deposits");
 }
