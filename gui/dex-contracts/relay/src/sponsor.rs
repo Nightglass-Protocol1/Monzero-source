@@ -123,6 +123,12 @@ impl<C: ChainView + 'static> Sponsor<C> {
         if let Some(s) = &self.sol {
             if let Ok(b) = sol::balance(&s.rpc, &s.key.verifying_key().to_bytes()).await {
                 p.sol_balance = b;
+                // Our USDT account (where buyers pay the lock fee), opened once we have SOL
+                if b >= SOL_FLOOR {
+                    if let Err(e) = sol::open_own_token_account(&s.rpc, &s.key, &s.mint).await {
+                        eprintln!("sponsor: own USDT account: {e}");
+                    }
+                }
             }
         }
         if let Some(e) = &self.evm {
