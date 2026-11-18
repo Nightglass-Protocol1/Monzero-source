@@ -281,8 +281,10 @@ async fn main() {
             monzero_dex_evm::chain::set_local_usdt_token(t);
         }
         let read = |p: &PathBuf| std::fs::read_to_string(p).unwrap_or_else(|e| fail(format!("{}: {e}", p.display())));
+        // A key file not created yet: this relay does not sponsor that chain (it still relays)
+        let present = |p: &PathBuf| p.exists() || { eprintln!("sponsor: {} not there; not sponsoring with it", p.display()); false };
         let mut sol_sponsor = None;
-        if let Some(path) = &sc.sol_key_file {
+        if let Some(path) = sc.sol_key_file.as_ref().filter(|p| present(p)) {
             let c = config.chains.iter().find(|c| Chain::from_id(c.chain_id).is_some_and(|k| k.is_solana())).unwrap_or_else(|| fail("sponsor: no Solana chain configured"));
             let chain = Chain::from_id(c.chain_id).expect("checked");
             let program = sol::from_base58(c.sol_program.as_deref().unwrap_or_default()).unwrap_or_else(|e| fail(e));
@@ -293,7 +295,7 @@ async fn main() {
             sol_sponsor = Some(SolSponsor { chain, rpc: c.rpc.clone(), program, mint, key });
         }
         let mut evm_sponsor = None;
-        if let Some(path) = &sc.evm_key_file {
+        if let Some(path) = sc.evm_key_file.as_ref().filter(|p| present(p)) {
             let c = config.chains.iter().find(|c| matches!(Chain::from_id(c.chain_id), Some(Chain::BscMainnet | Chain::BscTestnet | Chain::Local)))
                 .unwrap_or_else(|| fail("sponsor: no BNB Smart Chain configured"));
             let chain = Chain::from_id(c.chain_id).expect("checked");

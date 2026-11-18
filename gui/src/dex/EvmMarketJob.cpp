@@ -190,6 +190,9 @@ QJsonObject EvmMarketJob::tradeConfig(const QString &tradeDir) const {
         {"mainWallet",m_config.value("mainWallet")},{"swapWallet",m_config.value("swapWallet")}};
     if (m_config.contains("evmLogChunk")) c.insert("evmLogChunk",m_config.value("evmLogChunk"));
     if (m_config.contains("localSolProgram")) c.insert("localSolProgram",m_config.value("localSolProgram"));
+    if (m_config.contains("localSolUsdtMint")) c.insert("localSolUsdtMint",m_config.value("localSolUsdtMint"));
+    // The trade's relays: a USDT trade's network fees may be paid by them (in USDT)
+    if (DexChains::token(qint64(m_config.value("chainId").toDouble()))) c.insert("relays",m_config.value("relays"));
     return c;
 }
 
