@@ -72,6 +72,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         wallets = new DexWallets(root, new File(bin, "libmonzero_wallet_rpc.so"), node, DexConfig.networkFlag(), helper, handler, this);
         risk = new DexRisk(DexConfig.CONTROL_KEY, new File(root, "started-trades.json"), handler, this::changed);
         trade = new DexTrade(helper, this);
+        trade.setRelays(overrides.relaysOrDefault());
     }
 
     // ---- threads -------------------------------------------------------------------------------
