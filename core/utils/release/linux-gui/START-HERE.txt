@@ -20,6 +20,9 @@ Trading on the DEX
   Send the coin you pay with to the trade account shown under Funds. Read RELEASE_NOTES.md
   first. The DEX page https://monzero.org/dex/ also still works with this wallet.
 
+Selling XMZ for SOL or BNB
+  You no longer need SOL or BNB first: the buyer's wallet pays the small fee to collect.
+
 Your own look
   Settings > Layout > Appearance: colour sets, your own colours and a picture on the wallet card.
 

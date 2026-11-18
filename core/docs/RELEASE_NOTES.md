@@ -1,3 +1,49 @@
+# Monzero v1.3.1 release notes
+
+Release label: v1.3.1
+
+Monzero v1.3.1 is a Linux wallet fix release for the DEX. It changes no consensus rule: the chain,
+blocks, coins, wallets, seeds and addresses are the same as in v1.0.0 to v1.3.0, and **nobody has to
+upgrade to stay on the network**.
+
+## What is new
+
+- **Sell XMZ for SOL or BNB without holding any first.** The buyer's wallet now pays the small
+  network fee you need to collect your coins (about 0.0015 SOL; a fraction of a cent on BNB Smart
+  Chain), and sends it only after your XMZ is locked. If the buyer runs an older wallet that does
+  not send it, your wallet asks you to pay that fee in to collect; if you do not, the buyer's coins
+  go back to them after the time limit and your XMZ comes back to you. On Ethereum each side still
+  pays its own fees.
+- **Clearer trade limits.** An order above the opening limits now says so on the order form before
+  you post it, with the limit in the coin you trade (for example "0.33 SOL per trade"). On the SOL
+  pair the message wrongly named Litecoin; it now names SOL.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Trades stay inside the limits of the project's signed control document (about $25 per trade and
+  $250 a day per pair while the DEX opens).
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
+| Complete source | Exact repository commit and recursive pinned submodules |
+
+The DEX helper programs are the v1.1.0 ones except `monzero-dex-evm-helper`, rebuilt from
+`gui/dex-contracts/engine` in the complete source.
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.1 and start it; it uses the same wallet files, node data, trading
+keys and trading wallet. Finish or refund a running trade first.
+
+---
+
 # Monzero v1.3.0 release notes
 
 Release label: v1.3.0
