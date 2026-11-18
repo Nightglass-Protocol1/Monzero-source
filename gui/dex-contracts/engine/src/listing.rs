@@ -193,6 +193,9 @@ impl Chain {
         if self.is_solana() && crate::sol::usdt_mint(self).is_some() {
             out.push("USDT/XMZ");
         }
+        if !self.is_solana() && crate::chain::usdt_token(self).is_some() {
+            out.push("USDT-BSC/XMZ");
+        }
         out
     }
 
@@ -203,6 +206,8 @@ impl Chain {
         }
         match pair {
             "USDT/XMZ" if self.is_solana() => crate::sol::usdt_mint(self).map(|m| crate::sol::asset_address(&m)),
+            // USDT on BNB Smart Chain (BEP-20): its own pair name, so its book and chart never mix with Solana's
+            "USDT-BSC/XMZ" if !self.is_solana() => crate::chain::usdt_token(self),
             _ => None,
         }
     }

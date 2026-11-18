@@ -864,6 +864,8 @@ impl EvmChain for SolChain {
                 data.extend_from_slice(&lamports(*amount)?.to_le_bytes());
                 ixs.push((SYSTEM_PROGRAM, vec![meta(me, true, true), meta(b.claimer, false, true)], data));
             }
+            // Solana token swaps need no approval: the owner signs the lock itself
+            EvmCall::Approve { .. } => return Err(sol_err("no token approval on Solana")),
             EvmCall::Refund(swap, secret) => {
                 let address = self.swap_address(swap.value)?;
                 match self.mint {
@@ -983,6 +985,9 @@ impl EvmChain for AnyChain {
     }
     fn reserve(&self, owner: bool) -> U256 {
         either!(self, c => c.reserve(owner))
+    }
+    async fn allowance(&self, token: Address) -> Result<U256, DriverError> {
+        either!(self, c => c.allowance(token).await)
     }
 }
 
