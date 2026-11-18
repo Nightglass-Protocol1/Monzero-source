@@ -9948,6 +9948,16 @@ void wallet2::get_outs(std::vector<std::vector<tools::wallet2::get_outs_entry>> 
 
     std::unordered_map<uint64_t, uint64_t> scanty_outs;
     size_t base = 0;
+    // Monzero: keep the rings of one transaction apart. The decoys of every input are picked from the
+    // same recent outputs, and on a young chain (a few outputs a block) a transaction with many inputs
+    // then repeats so many ring members that it fails tx_sanity_check ("Transaction sanity check
+    // failed", in the wallet and in the node). So a ring first takes only outputs that no other ring
+    // of this transaction uses and that no other input spends; only if that leaves it short does it
+    // take the others too (the previous behaviour).
+    std::unordered_set<uint64_t> used_by_other_rings;
+    for (size_t idx: selected_transfers)
+      if (m_transfers[idx].is_rct())
+        used_by_other_rings.insert(m_transfers[idx].m_global_output_index);
     outs.reserve(num_selected_transfers);
     for(size_t idx: selected_transfers)
     {
@@ -10029,9 +10039,12 @@ void wallet2::get_outs(std::vector<std::vector<tools::wallet2::get_outs_entry>> 
 
       // While we are still lacking outputs in this result ring, in our secret pick order...
       LOG_PRINT_L2("Looking for " << (fake_outputs_count+1) << " outputs of size " << print_money(td.is_rct() ? 0 : td.amount()));
+      for (int pass = 0; pass < 2 && outs.back().size() < fake_outputs_count + 1; ++pass)
       for (size_t ring_pick_idx = base; ring_pick_idx < base + requested_outputs_count && outs.back().size() < fake_outputs_count + 1; ++ring_pick_idx)
       {
         const get_outputs_out attempted_output = secret_picking_order[ring_pick_idx];
+        if (pass == 0 && td.is_rct() && used_by_other_rings.count(attempted_output.index))
+          continue;
 
         // Find the index i of our pick in the request/response arrays
         size_t i;
@@ -10054,6 +10067,9 @@ void wallet2::get_outs(std::vector<std::vector<tools::wallet2::get_outs_entry>> 
         // sort the subsection, so any spares are reset in order
         std::sort(outs.back().begin(), outs.back().end(), [](const get_outs_entry &a, const get_outs_entry &b) { return std::get<0>(a) < std::get<0>(b); });
       }
+      if (td.is_rct())
+        for (const auto &member: outs.back())
+          used_by_other_rings.insert(std::get<0>(member));
       base += requested_outputs_count;
     }
     THROW_WALLET_EXCEPTION_IF(!scanty_outs.empty(), error::not_enough_outs_to_mix, scanty_outs, fake_outputs_count);
