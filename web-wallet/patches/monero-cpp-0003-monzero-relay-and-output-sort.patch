@@ -1,0 +1,35 @@
+--- a/src/utils/monero_utils.cpp	2026-11-18 16:32:15.677554214 +0000
++++ b/src/utils/monero_utils.cpp	2026-11-18 16:32:15.689102549 +0000
+@@ -606,7 +606,13 @@
+     if (ow1->m_subaddress_index.get() < ow2->m_subaddress_index.get()) return true;
+     if (ow1->m_subaddress_index.get() == ow2->m_subaddress_index.get()) {
+       if (ow1->m_index.get() < ow2->m_index.get()) return true;
+-      if (ow1->m_index.get() == ow2->m_index.get()) throw std::runtime_error("Should never sort outputs with duplicate indices");
++      // Monzero: two records of one output (e.g. one without its key image yet) must not make every
++      // later lookup fail; order them by key image, which keeps the order strict and deterministic
++      if (ow1->m_index.get() == ow2->m_index.get()) {
++        const std::string k1 = ow1->m_key_image == nullptr || ow1->m_key_image->m_hex == boost::none ? std::string() : ow1->m_key_image->m_hex.get();
++        const std::string k2 = ow2->m_key_image == nullptr || ow2->m_key_image->m_hex == boost::none ? std::string() : ow2->m_key_image->m_hex.get();
++        return k1 < k2;
++      }
+     }
+   }
+   return false;
+--- a/src/wallet/monero_wallet_full.cpp	2026-11-18 16:32:15.678220244 +0000
++++ b/src/wallet/monero_wallet_full.cpp	2026-11-18 16:32:15.689641775 +0000
+@@ -2685,8 +2685,13 @@
+       tx_hashes.push_back(epee::string_tools::pod_to_hex(cryptonote::get_transaction_hash(ptx.tx)));
+     }
+ 
+-    // notify listeners of spent funds
+-    m_w2_listener->on_spend_tx_hashes(tx_hashes);
++    // notify listeners of spent funds. Monzero: the transactions are already sent; a failure while
++    // describing them to listeners must not report the send as failed (the user would send again)
++    try {
++      m_w2_listener->on_spend_tx_hashes(tx_hashes);
++    } catch (const std::exception& e) {
++      MERROR("relay_txs: sent, but notifying listeners failed: " << e.what());
++    }
+ 
+     // return relayed tx hashes
+     return tx_hashes;

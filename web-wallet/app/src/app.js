@@ -311,7 +311,7 @@ $("sendGo").onclick = async () => {
       $("sendResult").textContent = `Sent ${hashes.length} of ${pending.length} transactions: ${hashes.join(", ")}`;
       $("sendError").textContent = "The rest was not sent: " + (e.message || e) + ". Check History and your balance before sending again.";
       persist(); refresh();
-    } else $("sendError").textContent = "Not sent: " + (e.message || e);
+    } else $("sendError").textContent = "Not sent: " + (e.message || e) + ". Check History and your balance before sending again.";
   } finally { pending = null; $("sendConfirm").hidden = true; $("sendGo").disabled = false; }
 };
 

@@ -27,6 +27,7 @@ prepare() {
   git -C "$ts" checkout -q -- src CMakeLists.txt
   git -C "$ts/external/monero-cpp" apply "$HERE/patches/monero-cpp-0001-monzero-amounts-and-uri.patch"
   git -C "$ts/external/monero-cpp" apply "$HERE/patches/monero-cpp-0002-monzero-wallet2-stop.patch"
+  git -C "$ts/external/monero-cpp" apply "$HERE/patches/monero-cpp-0003-monzero-relay-and-output-sort.patch"
   git -C "$ts" apply "$HERE/patches/monero-ts-0001-monzero-amounts.patch"
   git -C "$ts" apply "$HERE/patches/monero-ts-0002-monzero-wallet-sources.patch"
   # Declarations Monzero's sources include but the browser never uses (see shims/)
