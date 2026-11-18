@@ -84,7 +84,7 @@ final class DexMarket {
         final JSONObject l = signedListing.optJSONObject("listing");
         if (l == null) return false;
         final String pair = l.optString("pair"), side = l.optString("side");
-        return HASH.matcher(l.optString("id")).matches() && (pair.equals("ETH/XMZ") || pair.equals("BNB/XMZ") || pair.equals("SOL/XMZ") || pair.equals("USDT/XMZ"))
+        return HASH.matcher(l.optString("id")).matches() && (pair.equals("ETH/XMZ") || pair.equals("BNB/XMZ") || pair.equals("SOL/XMZ") || pair.equals("USDT/XMZ") || pair.equals("USDT-BSC/XMZ"))
                 && (side.equals("sell-xmz") || side.equals("buy-xmz")) && HEX_QTY.matcher(l.optString("value")).matches()
                 && amountText(l.opt("xmz")) != null && DexConfig.evmAddress(l.optString("maker"))
                 && l.opt("expiresAt") instanceof Number && l.opt("chainId") instanceof Number;
@@ -205,7 +205,7 @@ final class DexMarket {
                     .put("xmzAtoms", xmzAtoms).put("lifetimeSecs", lifetimeSecs);
             if (minXmzAtoms != null) offer.put("minXmzAtoms", minXmzAtoms);
             if (renew) offer.put("renew", true);
-            if (DexConfig.usdt(chainId)) offer.put("pair", DexConfig.pair(chainId));
+            if (DexConfig.token(chainId)) offer.put("pair", DexConfig.pair(chainId));
             return run(base("post", dir).put("tick", t).put("offer", offer), dir);
         } catch (Exception e) {
             return false;

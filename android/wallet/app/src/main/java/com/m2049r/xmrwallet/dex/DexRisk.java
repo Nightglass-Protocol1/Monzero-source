@@ -215,7 +215,7 @@ final class DexRisk {
         }
         if (control.optLong("expiresAt") <= now) return "The operator control document expired; new trades are paused.";
         if (!control.optBoolean("newTradesEnabled")) return "New trades are paused by the operator.";
-        final String coin = controlNetwork.startsWith("bnb") ? "BNB" : controlNetwork.startsWith("sol-usdt") ? "USDT" : controlNetwork.startsWith("sol") ? "SOL" : "ETH";
+        final String coin = controlNetwork.contains("-usdt-") ? "USDT" : controlNetwork.startsWith("bnb") ? "BNB" : controlNetwork.startsWith("sol") ? "SOL" : "ETH";
         final int places = controlNetwork.startsWith("sol-usdt") ? 6 : controlNetwork.startsWith("sol") ? 9 : 18;
         // Name the cap, so a refused order says how large an order may be
         if (amount.compareTo(new BigInteger(control.optString("maxLtcAtomsPerTrade"))) > 0)

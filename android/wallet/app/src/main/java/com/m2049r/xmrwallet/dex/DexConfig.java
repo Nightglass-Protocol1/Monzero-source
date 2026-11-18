@@ -26,6 +26,8 @@ final class DexConfig {
     /** USDT on Solana: the app's own market ids (the chain's id + 100); the helper trades them on
      *  the Solana chain with the pair "USDT/XMZ". Same ids as the desktop wallet and the page. */
     static final long SOL_USDT_MAINNET = 501000201L, SOL_USDT_DEVNET = 501000202L, SOL_USDT_LOCAL = 501000203L;
+    /** USDT (BEP-20) on BNB Smart Chain: market ids = the chain's id + 100,000,000. */
+    static final long BSC_USDT_MAINNET = 100000056L, BSC_USDT_TESTNET = 100000097L;
     /** The page looks for the wallet on these loopback ports (the same five as the desktop wallet). */
     static final int FIRST_PORT = 38471, PORTS = 5;
 
@@ -69,15 +71,26 @@ final class DexConfig {
         return id == SOL_USDT_MAINNET || id == SOL_USDT_DEVNET || id == SOL_USDT_LOCAL;
     }
 
+    static boolean usdtBsc(long id) {
+        return id == BSC_USDT_MAINNET || id == BSC_USDT_TESTNET;
+    }
+
+    /** A token market (USDT on either chain): the helper is told its pair. */
+    static boolean token(long id) {
+        return usdt(id) || usdtBsc(id);
+    }
+
     /** The chain the helper trades a market on. */
     static long helperChain(long id) {
-        return usdt(id) ? id - 100 : id;
+        return usdt(id) ? id - 100 : usdtBsc(id) ? id - 100000000L : id;
     }
 
     /** The market of a trade the helper describes: its chain, and a token asset (USDT on Solana). */
     static long marketOf(long chainId, String asset) {
-        final boolean sol = chainId == SOL_MAINNET || chainId == SOL_DEVNET || chainId == SOL_LOCAL;
-        return sol && asset != null && !asset.matches("\\A(0x)?0*\\z") ? chainId + 100 : chainId;
+        if (asset == null || asset.matches("\\A(0x)?0*\\z")) return chainId;
+        if (chainId == SOL_MAINNET || chainId == SOL_DEVNET || chainId == SOL_LOCAL) return chainId + 100;
+        if (chainId == 56 || chainId == 97) return chainId + 100000000L;
+        return chainId;
     }
 
     /** Solana addresses and transactions: the chain's coin and its USDT alike. */
@@ -86,7 +99,7 @@ final class DexConfig {
     }
 
     static String coin(long chainId) {
-        return usdt(chainId) ? "USDT" : solana(chainId) ? "SOL" : (chainId == 56 || chainId == 97) ? "BNB" : "ETH";
+        return usdt(chainId) ? "USDT" : usdtBsc(chainId) ? "USDT-BSC" : solana(chainId) ? "SOL" : (chainId == 56 || chainId == 97) ? "BNB" : "ETH";
     }
 
     static String pair(long chainId) {
@@ -104,6 +117,7 @@ final class DexConfig {
         if (chainId == 97) return "BNB Smart Chain Testnet";
         if (chainId == SOL_MAINNET) return "Solana";
         if (chainId == SOL_USDT_MAINNET) return "Solana (USDT)";
+        if (chainId == BSC_USDT_MAINNET) return "BNB Smart Chain (USDT)";
         if (chainId == SOL_DEVNET) return "Solana Devnet (test network)";
         return "chain " + chainId;
     }
@@ -126,7 +140,7 @@ final class DexConfig {
 
     /** The chains this build trades on. */
     static long[] chains() {
-        return mainnet() ? new long[]{1, 56, SOL_MAINNET, SOL_USDT_MAINNET} : new long[]{11155111, 97, SOL_DEVNET};
+        return mainnet() ? new long[]{1, 56, SOL_MAINNET, SOL_USDT_MAINNET, BSC_USDT_MAINNET} : new long[]{11155111, 97, SOL_DEVNET};
     }
 
     static boolean tradedHere(long chainId) {
@@ -141,12 +155,13 @@ final class DexConfig {
         if (chainId == 1) return "eth-mainnet";
         if (chainId == SOL_MAINNET) return "sol-mainnet";
         if (chainId == SOL_USDT_MAINNET) return "sol-usdt-mainnet";
+        if (chainId == BSC_USDT_MAINNET) return "bnb-usdt-mainnet";
         return "evm-regtest";   // test networks: no document, nothing of value
     }
 
     static String defaultRpc(long chainId) {
         if (chainId == 1) return "https://ethereum-rpc.publicnode.com";
-        if (chainId == 56) return "https://bsc-rpc.publicnode.com";
+        if (chainId == 56 || chainId == BSC_USDT_MAINNET) return "https://bsc-rpc.publicnode.com";
         if (chainId == SOL_MAINNET || chainId == SOL_USDT_MAINNET) return "https://solana-rpc.publicnode.com";
         if (chainId == 11155111) return "https://ethereum-sepolia-rpc.publicnode.com";
         if (chainId == 97) return "https://bsc-testnet-rpc.publicnode.com";

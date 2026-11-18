@@ -382,7 +382,8 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             // A partial offer taken whole still names its amount: the maker then knows it was chosen
             if (atoms == null && l.has("minXmzAtoms")) atoms = l.optString("xmzAtoms");
             // A USDT offer is checked under the USDT market's limits
-            final long market = "USDT/XMZ".equals(l.optString("pair")) ? DexConfig.marketOf(l.optLong("chainId"), "usdt") : l.optLong("chainId");
+            final String pairName = l.optString("pair");
+            final long market = "USDT/XMZ".equals(pairName) || "USDT-BSC/XMZ".equals(pairName) ? DexConfig.marketOf(l.optLong("chainId"), "usdt") : l.optLong("chainId");
             final String refusal = offerRefusal(market, wei, atoms == null ? l.optString("xmzAtoms") : atoms);
             if (!refusal.isEmpty()) return say(refusal);
             final boolean started = m.take(keys.seedHex(), listingId, atoms);
