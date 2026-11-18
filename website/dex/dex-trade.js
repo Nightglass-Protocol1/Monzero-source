@@ -543,7 +543,22 @@
   function cancel(folder) {
     if (st.busy) return;
     st.busy = "cancel";
-    api("/v1/cancel", { folder: folder }).then(untilIdle).then(function () { st.busy = ""; say("Offer cancelled."); }).catch(fail);
+    api("/v1/cancel", { folder: folder }).then(function (r) {
+      if (!r.ok) throw new Error(r.message || "The wallet could not cancel the offer now. Try again in a few seconds.");
+      return untilIdle();
+    }).then(function () { st.busy = ""; say("Offer cancelled."); }).catch(fail);
+  }
+  // A take of ours still waiting for the maker's answer: nothing of it is locked, so the wallet
+  // can simply stop waiting (wallets before Linux v1.3.5 / Android 1.1.12 cannot: it then ends
+  // when the offer expires)
+  function stopWaiting(folder, expiresAt) {
+    if (st.busy) return;
+    st.busy = "cancel";
+    api("/v1/cancel", { folder: folder }).then(function (r) {
+      if (!r.ok) throw new Error(r.message || ("The wallet could not stop waiting now. Try again in a few seconds; if it still cannot, your wallet is older than this page " +
+        "and the take ends by itself when the offer expires" + (expiresAt ? " (" + new Date(expiresAt * 1000).toLocaleString() + ")" : "") + "."));
+      return untilIdle();
+    }).then(function () { st.busy = ""; say("Stopped waiting for that offer."); }).catch(fail);
   }
   function giveBack() {
     if (st.busy) return;
@@ -777,7 +792,14 @@
           lifeHTML() +
           '<p class="tp-note" id="tp-total"></p><button class="button secondary" type="button" data-act="post"' + (st.busy ? " disabled" : "") + ">" + (st.side === "buy" ? "Post offer to buy XMZ" : "Post offer to sell XMZ") + "</button>";
         if (lim && lim.open) h += '<p class="tp-note">While the DEX is new: at most ' + esc(fromUnits(lim.coin, dec(), 6)) + " " + st.coin + " and " + esc(fromUnits(lim.xmz, 11, 0)) + " XMZ per trade.</p>";
-        var open = (m.mine || []).filter(function (x) { return x.state === "open"; });
+        // Our own offers only: a take of someone else's offer is listed apart (it cannot be cancelled
+        // like an offer, and it must not hide the button that sends unused coin back)
+        var open = (m.mine || []).filter(function (x) { return x.state === "open" && x.kind !== "take"; });
+        var waiting = (m.mine || []).filter(function (x) { return x.state === "open" && x.kind === "take"; });
+        if (waiting.length) h += "<h3>Waiting for the maker</h3>" + '<ul class="tp-offers">' + waiting.map(function (x) {
+          return "<li><span>" + (x.side === "buy-xmz" ? "Sell " : "Buy ") + "<strong>" + esc(x.xmz) + " XMZ</strong> for " + esc(x.coin) + " " + st.coin + "</span>" +
+            '<button class="button secondary" type="button" data-act="stop-waiting" data-folder="' + esc(x.folder) + '" data-expires="' + esc(String(x.expiresAt || "")) + '">Stop waiting</button></li>';
+        }).join("") + "</ul>";
         if (open.length) h += "<h3>Your open offers</h3>" + '<ul class="tp-offers">' + open.map(function (x) {
           return "<li><span>" + (x.side === "buy-xmz" ? "Buy " : "Sell ") + "<strong>" + esc(x.xmz) + " XMZ</strong> for " + esc(x.coin) + " " + st.coin +
             (x.renew ? " · renews itself" : "") + "</span>" +
@@ -815,6 +837,7 @@
     else if (act === "post") post();
     else if (act === "take") take(b.getAttribute("data-id"));
     else if (act === "cancel") cancel(b.getAttribute("data-folder"));
+    else if (act === "stop-waiting") stopWaiting(b.getAttribute("data-folder"), Number(b.getAttribute("data-expires")) || 0);
     else if (act === "renew") {
       var on = b.getAttribute("data-on") === "1";
       api("/v1/renew", { folder: b.getAttribute("data-folder"), on: on }).then(function (r) {
