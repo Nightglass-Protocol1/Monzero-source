@@ -17,6 +17,9 @@ Rectangle {
     property real coinBalance: -1          // the trade account's coin (-1: not known yet)
     property real xmzBalance: -1           // the trading wallet's unlocked XMZ (-1: not known yet)
     property string blockedReason: ""      // why no order can be placed now ("" when it can)
+    // function(coinText, xmzText) -> why the operator caps refuse an order of that size ("" when allowed)
+    property var limitCheck: null
+    property int limitTick: 0              // bumped when the caps document changes, to check again
     property bool busy: false
     property string message: ""            // the engine's last answer
     property string side: "buy"            // "buy" or "sell" XMZ
@@ -51,14 +54,19 @@ Rectangle {
             if (!plan || !plan.ok) return ""
             if (buying && coinBalance >= 0 && plan.coin > coinBalance) return ""   // funded during the trade: a note, not a block
             if (!buying && xmzBalance >= 0 && plan.atoms / 1e11 > xmzBalance) return qsTr("Not enough XMZ in your trading wallet")
-            return ""
+            return capProblem(X.plain(plan.coin, coinDecimals), X.atomsText(plan.atoms))
         }
         if (!(limitPrice > 0)) return qsTr("Enter your price")
         if (hours < 1) return qsTr("An offer stays open from 1 hour to 31 days")
         if (limitCoin === "" || Number(limitCoin) <= 0) return qsTr("The total is too small")
         if (partialToggle.on && (!(minXmz >= 1) || minXmz * 1e11 > amountAtoms)) return qsTr("The smallest part must be at least 1 XMZ and at most the amount")
         if (!buying && xmzBalance >= 0 && amountAtoms / 1e11 > xmzBalance) return qsTr("Not enough XMZ in your trading wallet")
-        return ""
+        return capProblem(limitCoin, X.atomsText(amountAtoms))
+    }
+    function capProblem(coinText, xmzText) {
+        limitTick   // re-check when the caps document changes
+        if (typeof limitCheck !== "function" || !coinText || !xmzText) return ""
+        return limitCheck(coinText, xmzText) || ""
     }
     readonly property bool ready: problem === "" && (type === "limit" || (plan && plan.ok))
     readonly property var summary: summaryRows()

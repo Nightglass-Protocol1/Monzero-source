@@ -107,6 +107,13 @@ ColumnLayout {
         ignoreUnknownSignals: true
         function onChanged() { ex.syncFeed() }
     }
+    // The order form checks the operator's caps again when the signed caps document changes
+    property int riskTick: 0
+    Connections {
+        target: ex.dex && typeof ex.dex.dexRiskChanged === "function" ? ex.dex : null
+        ignoreUnknownSignals: true
+        function onDexRiskChanged() { ex.riskTick++ }
+    }
     function decimalsOf(c) { return c === "SOL" ? 9 : 18 }
     function syncFeed() {
         var d = feed.data
@@ -474,6 +481,9 @@ ColumnLayout {
             xmzBalance: ex.xmzBalance
             blockedReason: ex.blockedReason !== "" ? ex.blockedReason
                          : form.type === "market" && ex.tradeRunning ? qsTr("Finish your current trade first") : ""
+            limitCheck: ex.chainId > 0 && typeof ex.dex.evmOrderRefusal === "function"
+                        ? function (coinText, xmzText) { return ex.dex.evmOrderRefusal(ex.chainId, coinText, xmzText) } : null
+            limitTick: ex.riskTick
             busy: ex.market.busy === true
             message: ex.localError !== "" ? ex.localError : (ex.market.message || "")
             pickedId: ex.pickedId

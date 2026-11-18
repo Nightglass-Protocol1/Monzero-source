@@ -475,6 +475,13 @@ private slots:
         // Error text names BNB, not Litecoin.
         QVERIFY(evm.acceptControlDocument(doc({{"sequence",3}}),now));
         QVERIFY(evm.refusal(t2,bnbCap+1,1,now).contains("BNB"));
+        // ...and says how large an order may be, in coins
+        QVERIFY(evm.refusal(t2,bnbCap+1,1,now).contains("0.1 BNB"));
+        QVERIFY(evm.refusal(t2,1,500000000001ULL,now).contains("5 XMZ"));
+        QCOMPARE(DexRiskControl::unitsText(334001336,9),QStringLiteral("0.334001336"));
+        QCOMPARE(DexRiskControl::unitsText(2500000000000000ULL,11),QStringLiteral("25000"));
+        QCOMPARE(DexRiskControl::unitsText(0,18),QStringLiteral("0"));
+        QCOMPARE(DexRiskControl::unitsText(5,8),QStringLiteral("0.00000005"));
         // One gate serves ETH and BNB. Each network's document is polled and kept, so the gate has
         // the right one whichever network is selected (it used to fetch only the first network's
         // document and refuse every trade on the other: "control document is for another network").

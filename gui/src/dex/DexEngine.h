@@ -267,6 +267,9 @@ public:
     // side: "sell-xmz" (we sell XMZ for the coin) or "buy-xmz"; amounts as decimal text in coins
     // minXmzAmount: empty for a whole offer, else the least XMZ one take may be (a partial offer)
     Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours,const QString &minXmzAmount=QString());
+    // Why an order of these amounts (decimal text in coins) would be refused by the kill switch and
+    // caps, before it is posted or taken; "" when it may go ahead. Nothing is recorded.
+    Q_INVOKABLE QString evmOrderRefusal(int chainId,const QString &coinAmount,const QString &xmzAmount);
     // xmzAmount: empty to take all of the offer, else how much of a partial offer
     Q_INVOKABLE bool takeEvmOffer(const QString &listingId,const QString &xmzAmount=QString());
     // The coin for `atoms` XMZ of a listing as the market shows it, at its price, rounded in the

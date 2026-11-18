@@ -154,8 +154,13 @@ QString DexRiskControl::refusal(const QString &trade,quint64 ltcAtoms,quint64 xm
         :tr("New trades are paused: %1.").arg(m_lastError);
     if (qint64(m_control.value("expiresAt").toDouble())<=now) return tr("The operator control document expired; new trades are paused.");
     if (!m_control.value("newTradesEnabled").toBool()) return tr("New trades are paused by the operator.");
-    if (ltcAtoms>m_control.value("maxLtcAtomsPerTrade").toString().toULongLong()) return tr("%1 amount exceeds the per-trade limit.").arg(coinName());
-    if (xmzAtoms>m_control.value("maxXmzAtomsPerTrade").toString().toULongLong()) return tr("XMZ amount exceeds the per-trade limit.");
+    const auto maxCoin=m_control.value("maxLtcAtomsPerTrade").toString().toULongLong();
+    const auto maxXmz=m_control.value("maxXmzAtomsPerTrade").toString().toULongLong();
+    // Name the cap, so a refused order says how large an order may be
+    if (ltcAtoms>maxCoin) return tr("This order is above the per-trade limit of %1 %2 while the DEX is opening. Post a smaller order.")
+        .arg(unitsText(maxCoin,coinDecimals()),coinName());
+    if (xmzAtoms>maxXmz) return tr("This order is above the per-trade limit of %1 XMZ while the DEX is opening. Post a smaller order.")
+        .arg(unitsText(maxXmz,11));
     quint64 day=0;
     for (auto it=trades.begin();it!=trades.end();++it) {
         const auto entry=it.value().toObject();
@@ -165,8 +170,10 @@ QString DexRiskControl::refusal(const QString &trade,quint64 ltcAtoms,quint64 xm
         if (!on.isEmpty() && on!=m_network) continue;
         if (now-qint64(entry.value("startedAt").toDouble())<Day) day+=entry.value("ltcAtoms").toString().toULongLong();
     }
-    if (day+ltcAtoms<day || day+ltcAtoms>m_control.value("maxLtcAtomsPerDay").toString().toULongLong())
-        return tr("This trade would exceed the 24-hour %1 limit.").arg(coinName());
+    const auto maxDay=m_control.value("maxLtcAtomsPerDay").toString().toULongLong();
+    if (day+ltcAtoms<day || day+ltcAtoms>maxDay)
+        return tr("This trade would exceed the 24-hour limit of %1 %2 (%3 %2 left today).")
+            .arg(unitsText(maxDay,coinDecimals()),coinName(),unitsText(day<maxDay ? maxDay-day : 0,coinDecimals()));
     return {};
 }
 bool DexRiskControl::recordStart(const QString &trade,quint64 ltcAtoms,qint64 now) {

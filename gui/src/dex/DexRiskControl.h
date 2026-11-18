@@ -53,8 +53,24 @@ private:
         if (m_network.startsWith("bnb-")) return QStringLiteral("BNB");
         if (m_network.startsWith("eth-")) return QStringLiteral("ETH");
         if (m_network.startsWith("evm-")) return QStringLiteral("EVM");
+        if (m_network.startsWith("sol-")) return QStringLiteral("SOL");
         return QStringLiteral("Litecoin");
     }
+    // Places of the coin's smallest unit (satoshi, wei, lamport) for showing a cap in coins
+    int coinDecimals() const {
+        if (m_network.startsWith("bnb-") || m_network.startsWith("eth-") || m_network.startsWith("evm-")) return 18;
+        if (m_network.startsWith("sol-")) return 9;
+        return 8;
+    }
+public:
+    // Smallest units as plain coin text without trailing zeros, e.g. 334001336 lamports -> "0.334001336"
+    static QString unitsText(quint64 units,int decimals) {
+        auto digits=QString::number(units).rightJustified(decimals+1,QLatin1Char('0'));
+        auto whole=digits.left(digits.size()-decimals),part=digits.right(decimals);
+        while (part.endsWith(QLatin1Char('0'))) part.chop(1);
+        return part.isEmpty() ? whole : whole+QLatin1Char('.')+part;
+    }
+private:
     QString m_network="ltc-regtest",m_ledgerPath,m_url;
     QByteArray m_publicKey;
     QJsonObject m_control;

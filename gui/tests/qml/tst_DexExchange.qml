@@ -32,6 +32,12 @@ Item {
                                listing("0xa3", "sell-xmz", 400000000, 1000, 0, "0x00000000000000000000000000000000000000a1"),
                                listing("0xb1", "buy-xmz", 180000000, 1500, 100), listing("0xb2", "buy-xmz", 50000000, 500) ] },
             ETH: { configured: true, busy: false, coin: "ETH", chainId: 1, relays: [], mine: [], listings: [] } })
+        // The operator's per-trade cap in coins; the real engine reads it from the signed caps document
+        property real capCoin: 1000
+        signal dexRiskChanged()
+        function evmOrderRefusal(chainId, coin, xmz) {
+            return Number(coin) > capCoin ? "This order is above the per-trade limit of " + capCoin + " SOL while the DEX is opening. Post a smaller order." : ""
+        }
         function refreshEvmOffers(pair) { return true }
         function takeEvmOffer(id, xmz) { calls.push(["take", id, xmz]); return true }
         function postEvmOffer(chainId, side, coin, xmz, hours, min) { calls.push(["post", chainId, side, coin, xmz, hours, min]); return true }
@@ -54,7 +60,7 @@ Item {
     TestCase {
         name: "DexExchange"
         when: windowShown
-        function init() { engine.calls = []; ex.pick("SOL"); var f = find(ex, "exchangeForm"); f.clearPick(); f.reviewing = false }
+        function init() { engine.capCoin = 1000; engine.calls = []; ex.pick("SOL"); var f = find(ex, "exchangeForm"); f.clearPick(); f.reviewing = false }
 
         function test_book() {
             compare(ex.book.asks.map(function (r) { return r.id }).join(), "0xa1,0xa2,0xa3")
@@ -130,6 +136,22 @@ Item {
             find(ex, "limitPrice").text = "0.0002"
             find(ex, "orderAmount").text = "5000"
             verify(!f.ready)
+        }
+        function test_an_order_above_the_per_trade_cap_names_the_cap_before_posting() {
+            var f = find(ex, "exchangeForm")
+            f.type = "limit"; f.side = "sell"
+            engine.capCoin = 0.3; engine.dexRiskChanged()
+            find(ex, "limitPrice").text = "0.0002"
+            find(ex, "orderAmount").text = "2000"        // 0.4 SOL
+            verify(!f.ready)
+            verify(f.problem.indexOf("0.3 SOL") >= 0)
+            press("orderButton")
+            compare(engine.calls.length, 0)
+            engine.capCoin = 1; engine.dexRiskChanged()   // a new caps document arrives
+            verify(f.ready)
+            find(ex, "orderAmount").text = "1000"        // 0.2 SOL, within the cap
+            engine.capCoin = 0.3; engine.dexRiskChanged()
+            verify(f.ready)
         }
         function test_locked_keys_block_orders() {
             var w = JSON.parse(JSON.stringify(engine.dexWalletStatus)); w.keysReady = false; engine.dexWalletStatus = w
