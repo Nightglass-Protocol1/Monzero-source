@@ -28,6 +28,20 @@ pub fn relays() -> &'static [String] {
     RELAYS.get().map(Vec::as_slice).unwrap_or(&[])
 }
 
+/// The relays that offer to pay this chain's USDT fees now (an unfunded relay offers nothing):
+/// only these count; with none, the trade runs as without sponsoring (the trader pays in SOL/BNB)
+pub async fn offering(relays: &[String], solana: bool) -> Vec<String> {
+    let mut out = vec![];
+    for relay in relays {
+        let Some(i) = info(relay).await else { continue };
+        let offers = if solana { i.solana.is_some() && i.sol_claim_fee.is_some() && i.sol_lock_fee.is_some() } else { i.evm.is_some() && i.bsc_claim_fee.is_some() };
+        if offers {
+            out.push(relay.clone());
+        }
+    }
+    out
+}
+
 /// The lock fee of the first relay that pays Solana fees for USDT buyers, if any does
 pub async fn sol_lock_fee() -> Option<u64> {
     for relay in relays() {
