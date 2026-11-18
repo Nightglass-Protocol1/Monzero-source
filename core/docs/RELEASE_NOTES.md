@@ -1,3 +1,53 @@
+# Monzero v1.3.2 release notes
+
+Release label: v1.3.2
+
+Monzero v1.3.2 is a Linux wallet update for the DEX. It changes no consensus rule: the chain,
+blocks, coins, wallets, seeds and addresses are the same as in v1.0.0 to v1.3.1, and **nobody has to
+upgrade to stay on the network**.
+
+## What is new
+
+- **XMZ/USDT.** Two new markets on the Exchange page: **USDT (SOL)**, Tether on Solana (SPL), and
+  **USDT (BNB)**, Tether on BNB Smart Chain (BEP-20). Pay in USDT, or sell XMZ for USDT, with the
+  same atomic swaps as the other pairs. A USDT buyer also keeps a little SOL (about 0.015) or BNB in
+  the trade account for network fees; a seller needs none. There is no ERC-20 USDT on Ethereum (its
+  fees are too high). Each USDT market opens when its signed limits document is published.
+- **Keep open.** An order can renew itself: shortly before it expires the wallet posts it again at
+  the same price for the same time, while the wallet runs. Switch it on in the order form, or with
+  "Keep open" on an open order.
+- **Orders you can no longer fill are withdrawn.** If the coins behind an open order are spent or
+  moved, the wallet takes the order off the board and refuses anyone who tries to take it, instead
+  of letting a buyer lock coins for nothing.
+- **Fixed:** orders open longer than a day (a week, a month, custom) could not be posted from the
+  Exchange page ("The offer could not be posted now"). They can now, up to 31 days.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Trades stay inside the limits of the project's signed control documents (about $25 per trade and
+  $250 a day per pair while the DEX opens; 25 USDT and 250 USDT on the USDT markets).
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
+| Complete source | Exact repository commit and recursive pinned submodules |
+
+The DEX helper programs are the v1.1.0 ones except `monzero-dex-evm-helper`, rebuilt from
+`gui/dex-contracts/engine` in the complete source.
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.2 and start it; it uses the same wallet files, node data, trading
+keys and trading wallet. Finish or refund a running trade first.
+
+---
+
 # Monzero v1.3.1 release notes
 
 Release label: v1.3.1

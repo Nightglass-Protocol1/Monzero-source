@@ -4,6 +4,12 @@ Back up wallet files, mnemonic seeds and the node data directory before
 replacing any binary. Never enter a Monero seed into Monzero or a Monzero seed
 into Monero.
 
+## v1.3.2: optional, USDT markets and order upkeep (Linux)
+
+No consensus change. Close the old wallet and node, unpack v1.3.2 and start it: same wallet files,
+node data, trading keys and trading wallet. Finish or refund a running trade first; to go back,
+start the v1.3.1 files again (v1.3.1 does not show USDT offers).
+
 ## v1.3.1: optional, DEX fixes (Linux)
 
 No consensus change. Close the old wallet and node, unpack v1.3.1 and start it: same wallet files,
