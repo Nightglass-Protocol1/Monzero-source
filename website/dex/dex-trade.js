@@ -726,6 +726,7 @@
         : "One more step: your Monzero wallet asks you to choose a trading password.") + '</p>' +
         (w.keysBusy ? "" : '<button class="button primary" type="button" data-act="unlock">' + (w.keysExist ? "Unlock in the wallet" : "Set it up in the wallet") + "</button>");
       else if (live) h += tradeHTML(t);
+      else if (tok() && !(s.markets || {})[st.coin]) h += '<p class="tp-note">Trading USDT needs the newest Monzero wallet (Linux 1.3.2 or Android 1.1.9). <a href="/download/">Download it</a>, then connect again.</p>';
       else {
         var lim = st.limits[st.coin];
         h += '<div class="tp-side" role="group"><button type="button" data-act="side" data-side="buy" class="' + (st.side === "buy" ? "on" : "") + '">Buy XMZ</button>' +
