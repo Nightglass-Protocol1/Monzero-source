@@ -788,8 +788,8 @@ QString evmControlNetwork(qint64 chainId) {
     case 1:  return QStringLiteral("eth-mainnet");
     case DexChains::SolMainnet: return QStringLiteral("sol-mainnet");
     // USDT on Solana has its own document: limits in USDT, its own kill switch
-    case DexChains::SolUsdtMainnet: return QStringLiteral("sol-usdt-mainnet");
-    case DexChains::BscUsdtMainnet: return QStringLiteral("bnb-usdt-mainnet");
+    case DexChains::SolUsdtMainnet: return QStringLiteral("sol-usdt-v2-mainnet");
+    case DexChains::BscUsdtMainnet: return QStringLiteral("bnb-usdt-v2-mainnet");
 #ifndef MONZERO_DEX_PUBLIC_EDITION
     case DexChains::SolDevnet: case DexChains::SolLocal: case DexChains::SolUsdtDevnet: case DexChains::SolUsdtLocal:
     case DexChains::BscUsdtTestnet: case DexChains::LocalUsdt: return QStringLiteral("evm-regtest");
