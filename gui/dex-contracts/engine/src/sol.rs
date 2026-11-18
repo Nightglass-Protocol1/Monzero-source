@@ -286,6 +286,7 @@ impl SolBinding {
 
 // ---- transactions
 
+#[derive(Clone)]
 struct Meta {
     key: Pubkey,
     signer: bool,
@@ -329,9 +330,14 @@ fn message(payer: &Pubkey, program: &Pubkey, accounts: &[Meta], data: &[u8], blo
 
 /// Several instructions in one transaction, paid for and signed by `payer` alone.
 fn message_many(payer: &Pubkey, ixs: &[(&Pubkey, &[Meta], &[u8])], blockhash: &[u8; 32]) -> Vec<u8> {
-    // Order: the signer, other writable accounts, read-only accounts (programs last). An account
+    message_signed_by(&[*payer], ixs, blockhash)
+}
+
+/// Several instructions signed by `signers` (the first pays the fees; all writable).
+fn message_signed_by(signers: &[Pubkey], ixs: &[(&Pubkey, &[Meta], &[u8])], blockhash: &[u8; 32]) -> Vec<u8> {
+    // Order: the signers, other writable accounts, read-only accounts (programs last). An account
     // writable in any instruction is writable.
-    let mut keys: Vec<(Pubkey, bool)> = vec![(*payer, true)];
+    let mut keys: Vec<(Pubkey, bool)> = signers.iter().map(|k| (*k, true)).collect();
     for writable in [true, false] {
         for (_, accounts, _) in ixs {
             for a in accounts.iter().filter(|a| a.writable == writable && !a.signer) {
@@ -347,7 +353,7 @@ fn message_many(payer: &Pubkey, ixs: &[(&Pubkey, &[Meta], &[u8])], blockhash: &[
         }
     }
     let readonly = keys.iter().filter(|(_, w)| !w).count() as u8;
-    let mut m = vec![1, 0, readonly];
+    let mut m = vec![signers.len() as u8, 0, readonly];
     compact(keys.len(), &mut m);
     for (k, _) in &keys {
         m.extend_from_slice(k);
@@ -376,11 +382,12 @@ fn signed(key: &SigningKey, message: Vec<u8>) -> Vec<u8> {
 
 /// The signature (the transaction's id) and where its blockhash sits, for a transaction made here
 fn parts(raw: &[u8]) -> Option<([u8; 64], usize)> {
-    if raw.first() != Some(&1) || raw.len() < 65 + 3 {
+    let n = *raw.first()? as usize;
+    if n == 0 || n > 2 || raw.len() < 1 + 64 * n + 3 {
         return None;
     }
     let signature: [u8; 64] = raw[1..65].try_into().ok()?;
-    let mut at = 65 + 3;
+    let mut at = 1 + 64 * n + 3;
     let keys = read_compact(raw, &mut at)?;
     let blockhash = at + keys * 32;
     (raw.len() >= blockhash + 32).then_some((signature, blockhash))
@@ -541,15 +548,27 @@ pub async fn claim_lookup(url: &str, program: &Pubkey, signature: &[u8; 64]) -> 
     }
     // Claim = 2: the secret follows; accounts are the claimer, the swap, the owner.
     // ClaimSpl = 5: accounts are the claimer, the swap, its token account, the vault, the owner, the mint.
+    // ClaimRelayedSpl = 8 (a relay's, the fee follows the secret): the relay, the swap, the
+    // claimer's token account, the relay's, the vault, the owner, the mint; the claimer comes from
+    // the swap's creation below.
     let Some((claim, kind)) = program_calls(&tx, program).into_iter().find_map(|(a, d)| match (d.len(), d.first()) {
         (33, Some(2)) if a.len() >= 3 => Some((a, 2u8)),
         (33, Some(5)) if a.len() >= 6 => Some((a, 5u8)),
+        (41, Some(8)) if a.len() >= 7 => Some((a, 8u8)),
         _ => None,
     }) else {
         return Ok(ClaimSeen::NotAClaim("no claim on the pinned program in it".into()));
     };
-    let (claimer, swap, owner) = if kind == 2 { (claim[0], claim[1], claim[2]) } else { (claim[0], claim[1], claim[4]) };
-    let claimed_mint = (kind == 5).then(|| claim[5]);
+    let (claimer, swap, owner) = match kind {
+        2 => (Some(claim[0]), claim[1], claim[2]),
+        5 => (Some(claim[0]), claim[1], claim[4]),
+        _ => (None, claim[1], claim[5]),
+    };
+    let claimed_mint = match kind {
+        5 => Some(claim[5]),
+        8 => Some(claim[6]),
+        _ => None,
+    };
     let Some(at) = tx["blockTime"].as_u64() else {
         return Ok(ClaimSeen::Pending);
     };
@@ -562,7 +581,7 @@ pub async fn claim_lookup(url: &str, program: &Pubkey, signature: &[u8; 64]) -> 
         for (accounts, data) in program_calls(&made, program) {
             // NewSwap = 0 (NewSpl = 4): both points, both durations, the amount, the nonce;
             // accounts are the owner, the claimer, the swap (then, for a token, its mint)
-            let made_kind = if kind == 2 { 0 } else { 4 };
+            let made_kind = if kind == 2 { 0 } else { 4 };   // a token claim (5 or 8) follows NewSpl
             if data.len() != 97 || data[0] != made_kind || accounts.len() < 3 || accounts[2] != swap {
                 continue;
             }
@@ -573,10 +592,10 @@ pub async fn claim_lookup(url: &str, program: &Pubkey, signature: &[u8; 64]) -> 
             let word = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().expect("8 bytes"));
             let binding = SolBinding { owner: accounts[0], claimer: accounts[1], claim_point: point(1), refund_point: point(33) };
             let (lamports, nonce) = (word(81), word(89));
-            if binding.swap_address(program, lamports, nonce) != Some(swap) || binding.owner != owner || binding.claimer != claimer {
+            if binding.swap_address(program, lamports, nonce) != Some(swap) || binding.owner != owner || claimer.is_some_and(|c| c != binding.claimer) {
                 continue;
             }
-            return Ok(ClaimSeen::Final(ClaimedSwap { owner, claimer, lamports, nonce, at, mint: claimed_mint }));
+            return Ok(ClaimSeen::Final(ClaimedSwap { owner, claimer: binding.claimer, lamports, nonce, at, mint: claimed_mint }));
         }
     }
     Ok(ClaimSeen::NotAClaim("the claimed swap's creation was not found".into()))
@@ -633,6 +652,8 @@ pub struct SolChain {
     amount: u64,
     /// The token the swap holds (USDT); None for native SOL
     mint: Option<Pubkey>,
+    /// Relays that may pay this token trade's fees (see `sponsor`); none: we pay them in SOL
+    sponsors: Vec<String>,
     rpc: Rpc,
 }
 
@@ -650,7 +671,111 @@ impl SolChain {
             return Err(sol_err("not a Solana chain"));
         }
         let mint = mint_of(chain, asset)?;
-        Ok(SolChain { chain, program, contract: contract_address(&program), key, binding, nonce, amount, mint, rpc: Rpc::new(url)? })
+        Ok(SolChain { chain, program, contract: contract_address(&program), key, binding, nonce, amount, mint, sponsors: vec![], rpc: Rpc::new(url)? })
+    }
+
+    /// Relays that may pay the fees of a token (USDT) trade, paid back in USDT
+    pub fn with_sponsors(mut self, relays: Vec<String>) -> Self {
+        self.sponsors = relays;
+        self
+    }
+
+    fn sponsored(&self) -> bool {
+        self.mint.is_some() && !self.sponsors.is_empty()
+    }
+
+    /// Our lock as a sponsored transaction (we hold USDT but no SOL): the first relay that agrees
+    /// signs it as fee payer. The relay's terms are checked here before we sign anything.
+    async fn lock_through_sponsor(&self, lock: (Pubkey, Vec<Meta>, Vec<u8>)) -> Result<Vec<u8>, DriverError> {
+        let mint = self.mint.ok_or_else(|| sol_err("not a token trade"))?;
+        let me = self.account();
+        let token = from_base58(TOKEN_PROGRAM)?;
+        let ours = token_account(&me, &mint).ok_or_else(|| sol_err("no token account address"))?;
+        let mut why = String::from("no relay pays network fees for USDT");
+        for relay in &self.sponsors {
+            let Some(info) = crate::sponsor::info(relay).await else { continue };
+            let (Some(relayer), Some(fee), Some(front)) = (info.solana.as_deref().and_then(|r| from_base58(r).ok()), info.sol_lock_fee, info.sol_lock_front) else { continue };
+            if fee > crate::sponsor::MAX_SOL_LOCK_FEE || front > crate::sponsor::SOL_LOCK_FRONT {
+                why = format!("{relay} asks {fee} USDT units for the lock; at most {}", crate::sponsor::MAX_SOL_LOCK_FEE);
+                continue;
+            }
+            let theirs = token_account(&relayer, &mint).ok_or_else(|| sol_err("no token account address"))?;
+            let mut give = 2u32.to_le_bytes().to_vec();
+            give.extend_from_slice(&front.to_le_bytes());
+            let mut pay = vec![12u8];
+            pay.extend_from_slice(&fee.to_le_bytes());
+            pay.push(token_decimals(&mint));
+            let ixs: Vec<(Pubkey, Vec<Meta>, Vec<u8>)> = vec![
+                (SYSTEM_PROGRAM, vec![meta(relayer, true, true), meta(me, false, true)], give),
+                lock.clone(),
+                (token, vec![meta(ours, false, true), meta(mint, false, false), meta(theirs, false, true), meta(me, true, false)], pay),
+            ];
+            let list: Vec<(&Pubkey, &[Meta], &[u8])> = ixs.iter().map(|(p, a, d)| (p, a.as_slice(), d.as_slice())).collect();
+            let m = message_signed_by(&[relayer, me], &list, &self.rpc.blockhash().await?);
+            match self.sponsor_lock_at(relay, m).await {
+                Ok(raw) => return Ok(raw),
+                Err(e) => why = format!("{relay}: {e}"),
+            }
+        }
+        Err(sol_err(why))
+    }
+
+    /// Sign `m` (a sponsored lock message) and have `relay` sign it as fee payer
+    async fn sponsor_lock_at(&self, relay: &str, m: Vec<u8>) -> Result<Vec<u8>, String> {
+        let signature = self.key.sign(&m).to_bytes();
+        let request = crate::sponsor::SolLockRequest {
+            chain_id: self.chain.id(),
+            message: base64::engine::general_purpose::STANDARD.encode(&m),
+            signature: hex::encode(signature),
+        };
+        let answer = crate::sponsor::post(relay, crate::sponsor::SOL_LOCK_PATH, &request).await?;
+        let raw = base64::engine::general_purpose::STANDARD.decode(answer.raw.ok_or("no transaction in the answer")?).map_err(|e| e.to_string())?;
+        // Exactly what we signed, with the relay's signature added
+        if raw.len() != 129 + m.len() || raw[0] != 2 || raw[129..] != m[..] || raw[65..129] != signature[..] {
+            return Err("the relay returned another transaction".into());
+        }
+        Ok(raw)
+    }
+
+    /// A sponsored lock again with a fresh blockhash, from the relay that paid the first
+    async fn sponsor_lock_message(&self, m: Vec<u8>) -> Result<Vec<u8>, DriverError> {
+        let relayer = parse_message(&m).and_then(|p| p.keys.first().copied()).ok_or_else(|| sol_err("not a message"))?;
+        for relay in &self.sponsors {
+            if crate::sponsor::info(relay).await.and_then(|i| i.solana).and_then(|r| from_base58(&r).ok()) == Some(relayer) {
+                return self.sponsor_lock_at(relay, m).await.map_err(sol_err);
+            }
+        }
+        Err(sol_err("the relay that paid for the lock is gone"))
+    }
+
+    /// Our claim through a relay (we hold no SOL): it pays the fees and takes `fee` of the USDT
+    async fn claim_through_sponsor(&self, value: U256, secret: B256) -> Result<bool, DriverError> {
+        if !self.sponsored() {
+            return Ok(false);
+        }
+        let address = self.swap_address(value)?;
+        let secret = program_secret(secret);
+        for relay in &self.sponsors {
+            let Some(info) = crate::sponsor::info(relay).await else { continue };
+            let (Some(relayer), Some(fee)) = (info.solana.as_deref().and_then(|r| from_base58(r).ok()), info.sol_claim_fee) else { continue };
+            if fee > crate::sponsor::MAX_SOL_CLAIM_FEE || fee >= self.amount {
+                continue;
+            }
+            let signature = self.key.sign(&crate::sponsor::sol_claim_message(&address, fee, &relayer)).to_bytes();
+            let request = crate::sponsor::SolClaimRequest {
+                chain_id: self.chain.id(),
+                swap: to_base58(&address),
+                secret: hex::encode(secret),
+                fee,
+                claimer: to_base58(&self.account()),
+                owner: to_base58(&self.binding.owner),
+                signature: hex::encode(signature),
+            };
+            if crate::sponsor::post(relay, crate::sponsor::SOL_CLAIM_PATH, &request).await.is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The swap's token vault (the program's account for the swap's tokens)
@@ -837,6 +962,12 @@ impl EvmChain for SolChain {
                              meta(ours, false, true), meta(self.vault(&swap)?, false, true), meta(token, false, false), meta(SYSTEM_PROGRAM, false, false)]
                     }
                 };
+                let lamports = self.rpc.call("getBalance", json!([to_base58(&me), {"commitment": "confirmed"}])).await?["value"].as_u64().unwrap_or(0);
+                if self.sponsored() && lamports < crate::sponsor::SOL_LOCK_FRONT {
+                    // We hold USDT but no SOL: a relay pays the fees and fronts the deposits, for USDT
+                    let lock = (self.program, accounts, data);
+                    return self.lock_through_sponsor(lock).await.map(Into::into);
+                }
                 ixs.push((self.program, accounts, data));
             }
             EvmCall::SetReady(swap) => ixs.push((self.program, vec![meta(me, true, true), meta(self.swap_address(swap.value)?, false, true)], vec![1u8])),
@@ -911,6 +1042,12 @@ impl EvmChain for SolChain {
         if self.rpc.status(&signature).await? == Some(true) {
             return Ok(None);
         }
+        if raw[0] == 2 {
+            // A sponsored lock: the relay signs the fresh one too (it checks it again)
+            let mut m = raw[129..].to_vec();
+            m[at - 129..at - 129 + 32].copy_from_slice(&self.rpc.blockhash().await?);
+            return self.sponsor_lock_message(m).await.map(|r| Some(r.into()));
+        }
         let mut m = raw[65..].to_vec();
         m[at - 65..at - 65 + 32].copy_from_slice(&self.rpc.blockhash().await?);
         Ok(Some(signed(&self.key, m).into()))
@@ -928,6 +1065,18 @@ impl EvmChain for SolChain {
     async fn funds(&self) -> Result<Funds, DriverError> {
         let r = self.rpc.call("getBalance", json!([to_base58(&self.account()), {"commitment": "confirmed"}])).await?;
         Ok(Funds { balance: U256::from(r["value"].as_u64().unwrap_or(0)), fee_per_gas: U256::from(LAMPORTS_PER_GAS) })
+    }
+
+    fn relayed_claim(&self) -> bool {
+        self.sponsored()
+    }
+
+    fn sponsored_lock(&self) -> bool {
+        self.sponsored()
+    }
+
+    async fn relay_claim(&self, swap: &Swap, secret: B256) -> Result<bool, DriverError> {
+        self.claim_through_sponsor(swap.value, secret).await
     }
 
     fn reserve(&self, owner: bool) -> U256 {
@@ -999,8 +1148,294 @@ impl EvmChain for AnyChain {
     async fn allowance(&self, token: Address) -> Result<U256, DriverError> {
         either!(self, c => c.allowance(token).await)
     }
+    fn relayed_claim(&self) -> bool {
+        either!(self, c => c.relayed_claim())
+    }
+    fn sponsored_lock(&self) -> bool {
+        either!(self, c => c.sponsored_lock())
+    }
+    async fn relay_claim(&self, swap: &Swap, secret: B256) -> Result<bool, DriverError> {
+        either!(self, c => c.relay_claim(swap, secret).await)
+    }
+}
+
+impl AnyChain {
+    /// Relays that may pay this token trade's fees (a USDT trade); none for a coin trade
+    pub fn with_sponsors(self, relays: Vec<String>) -> Self {
+        match self {
+            AnyChain::Evm(c) => AnyChain::Evm(c.with_sponsors(relays)),
+            AnyChain::Sol(c) => AnyChain::Sol(c.with_sponsors(relays)),
+        }
+    }
 }
 
 #[cfg(test)]
 #[path = "sol_tests.rs"]
 mod tests;
+
+
+// ---- fee sponsoring (see `sponsor`): the relay's side
+
+const ED25519_PROGRAM: &str = "Ed25519SigVerify111111111111111111111111111";
+const INSTRUCTIONS_SYSVAR: &str = "Sysvar1nstructions1111111111111111111111111";
+
+/// The ed25519 program's check of one signature, all data inline (the layout the swap program reads)
+fn ed25519_check(signer: &Pubkey, signature: &[u8; 64], message: &[u8]) -> Vec<u8> {
+    let (pk, sig, msg) = (16u16, 48u16, 112u16);
+    let mut d = vec![1u8, 0];
+    for v in [sig, u16::MAX, pk, u16::MAX, msg, message.len() as u16, u16::MAX] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    d.extend_from_slice(signer);
+    d.extend_from_slice(signature);
+    d.extend_from_slice(message);
+    d
+}
+
+/// The relay's transaction for a seller's relayed USDT claim: open the seller's token account
+/// (if it has none) and the relay's, check the seller's signature, claim; the relay pays the fees.
+#[allow(clippy::too_many_arguments)]
+pub fn sponsored_claim_tx(relayer: &SigningKey, program: &Pubkey, mint: &Pubkey, swap: &Pubkey, secret: &[u8; 32], fee: u64,
+                          claimer: &Pubkey, owner: &Pubkey, signature: &[u8; 64], blockhash: &[u8; 32]) -> Result<Vec<u8>, DriverError> {
+    let me = relayer.verifying_key().to_bytes();
+    let (token, ata_program) = (from_base58(TOKEN_PROGRAM)?, from_base58(ATA_PROGRAM)?);
+    let (ed, sysvar) = (from_base58(ED25519_PROGRAM)?, from_base58(INSTRUCTIONS_SYSVAR)?);
+    let theirs = token_account(claimer, mint).ok_or_else(|| sol_err("no token account address"))?;
+    let ours = token_account(&me, mint).ok_or_else(|| sol_err("no token account address"))?;
+    let vault = find_program_address(&[b"vault", swap], program).map(|(k, _)| k).ok_or_else(|| sol_err("no vault address"))?;
+    let open = |wallet: Pubkey, ata: Pubkey| vec![meta(me, true, true), meta(ata, false, true), meta(wallet, false, false), meta(*mint, false, false), meta(SYSTEM_PROGRAM, false, false), meta(token, false, false)];
+    let message = crate::sponsor::sol_claim_message(swap, fee, &me);
+    let mut claim = vec![8u8];
+    claim.extend_from_slice(secret);
+    claim.extend_from_slice(&fee.to_le_bytes());
+    let ixs: Vec<(Pubkey, Vec<Meta>, Vec<u8>)> = vec![
+        (ata_program, open(*claimer, theirs), vec![1u8]),
+        (ata_program, open(me, ours), vec![1u8]),
+        // The program reads the check just before its own instruction
+        (ed, vec![], ed25519_check(claimer, signature, &message)),
+        (*program, vec![meta(me, true, true), meta(*swap, false, true), meta(theirs, false, true), meta(ours, false, true), meta(vault, false, true),
+                        meta(*owner, false, true), meta(*mint, false, false), meta(token, false, false), meta(sysvar, false, false)], claim),
+    ];
+    let list: Vec<(&Pubkey, &[Meta], &[u8])> = ixs.iter().map(|(p, a, d)| (p, a.as_slice(), d.as_slice())).collect();
+    Ok(signed(relayer, message_many(&me, &list, blockhash)))
+}
+
+struct Parsed {
+    signers: usize,
+    readonly_signed: u8,
+    keys: Vec<Pubkey>,
+    ixs: Vec<(usize, Vec<usize>, Vec<u8>)>,
+}
+
+fn parse_message(m: &[u8]) -> Option<Parsed> {
+    let (signers, readonly_signed) = (*m.first()? as usize, *m.get(1)?);
+    let mut at = 3;
+    let n = read_compact(m, &mut at)?;
+    let mut keys = Vec::with_capacity(n);
+    for _ in 0..n {
+        keys.push(m.get(at..at + 32)?.try_into().ok()?);
+        at += 32;
+    }
+    at += 32; // blockhash
+    let count = read_compact(m, &mut at)?;
+    let mut ixs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let program = *m.get(at)? as usize;
+        at += 1;
+        let k = read_compact(m, &mut at)?;
+        let accounts: Vec<usize> = m.get(at..at + k)?.iter().map(|b| *b as usize).collect();
+        at += k;
+        let len = read_compact(m, &mut at)?;
+        let data = m.get(at..at + len)?.to_vec();
+        at += len;
+        if program >= keys.len() || accounts.iter().any(|a| *a >= keys.len()) {
+            return None;
+        }
+        ixs.push((program, accounts, data));
+    }
+    (at == m.len()).then_some(Parsed { signers, readonly_signed, keys, ixs })
+}
+
+/// A buyer's sponsored lock as the relay accepts it, nothing else: exactly (1) the relay sends the
+/// buyer at most `max_front` lamports, (2) the buyer locks USDT in the pinned program (NewSpl), (3)
+/// the buyer pays the relay's token account at least `min_fee` USDT. The relay's account is the fee
+/// payer and appears in no other instruction. Returns the buyer's account.
+pub fn check_sponsored_lock(m: &[u8], relayer: &Pubkey, program: &Pubkey, mint: &Pubkey, max_front: u64, min_fee: u64) -> Result<Pubkey, String> {
+    let p = parse_message(m).ok_or("not a transaction message")?;
+    if p.signers != 2 || p.readonly_signed != 0 || p.keys.first() != Some(relayer) {
+        return Err("the relay must be the fee payer and the buyer the only other signer".into());
+    }
+    let owner = p.keys[1];
+    let key = |i: usize| p.keys[i];
+    let (token, ours) = (from_base58(TOKEN_PROGRAM).map_err(|e| e.to_string())?, token_account(relayer, mint).ok_or("no token account")?);
+    if p.ixs.len() != 3 {
+        return Err("a sponsored lock has exactly three instructions".into());
+    }
+    let (front, lock, pay) = (&p.ixs[0], &p.ixs[1], &p.ixs[2]);
+    // (1) the deposits the relay fronts
+    if key(front.0) != SYSTEM_PROGRAM || front.1 != [0, 1] || front.2.len() != 12 || front.2[..4] != [2, 0, 0, 0] {
+        return Err("the first instruction must be the relay's transfer to the buyer".into());
+    }
+    let lamports = u64::from_le_bytes(front.2[4..12].try_into().unwrap());
+    if lamports > max_front {
+        return Err(format!("asks for {lamports} lamports; at most {max_front}"));
+    }
+    // (2) the lock, by the buyer, of this token, in the pinned program; the relay not involved
+    if key(lock.0) != *program || lock.2.len() != 97 || lock.2[0] != 4 || lock.1.len() != 8 || lock.1[0] != 1 || lock.1.contains(&0) || key(lock.1[3]) != *mint {
+        return Err("the second instruction must be the buyer's USDT lock in the swap program".into());
+    }
+    // (3) the relay's fee, from the buyer, in this token, to the relay's token account
+    if key(pay.0) != token || pay.2.len() != 10 || pay.2[0] != 12 || pay.2[9] != 6 || pay.1.len() != 4
+        || key(pay.1[1]) != *mint || key(pay.1[2]) != ours || pay.1[3] != 1 || pay.1.contains(&0) {
+        return Err("the third instruction must pay the relay's fee in USDT from the buyer".into());
+    }
+    let fee = u64::from_le_bytes(pay.2[1..9].try_into().unwrap());
+    if fee < min_fee {
+        return Err(format!("the fee is {fee}; this relay takes {min_fee}"));
+    }
+    Ok(owner)
+}
+
+/// The full transaction of a checked sponsored lock: the relay's signature first (fee payer), the buyer's
+pub fn cosign(relayer: &SigningKey, message: &[u8], buyer_signature: &[u8; 64]) -> Vec<u8> {
+    let mut tx = vec![2u8];
+    tx.extend_from_slice(&relayer.sign(message).to_bytes());
+    tx.extend_from_slice(buyer_signature);
+    tx.extend_from_slice(message);
+    tx
+}
+
+/// A transaction's simulation on the node: Ok when it would succeed (signatures checked)
+pub async fn simulate(url: &str, raw: &[u8]) -> Result<(), String> {
+    let rpc = Rpc::new(url).map_err(|e| e.to_string())?;
+    let text = base64::engine::general_purpose::STANDARD.encode(raw);
+    let sim = rpc.call("simulateTransaction", json!([text, {"encoding": "base64", "commitment": "confirmed", "sigVerify": true}])).await.map_err(|e| e.to_string())?;
+    if sim["value"]["err"].is_null() { Ok(()) } else { Err(format!("{} {}", sim["value"]["err"], sim["value"]["logs"])) }
+}
+
+/// Send a signed transaction; its id
+pub async fn send_raw(url: &str, raw: &[u8]) -> Result<String, String> {
+    let rpc = Rpc::new(url).map_err(|e| e.to_string())?;
+    rpc.send(raw).await.map_err(|e| e.to_string())?;
+    transaction_id(raw).ok_or_else(|| "no signature".into())
+}
+
+pub async fn latest_blockhash(url: &str) -> Result<[u8; 32], String> {
+    Rpc::new(url).map_err(|e| e.to_string())?.blockhash().await.map_err(|e| e.to_string())
+}
+
+/// Open the relay's own USDT account (once, before it is paid in USDT)
+pub async fn open_own_token_account(url: &str, relayer: &SigningKey, mint: &Pubkey) -> Result<(), String> {
+    let rpc = Rpc::new(url).map_err(|e| e.to_string())?;
+    let me = relayer.verifying_key().to_bytes();
+    let ours = token_account(&me, mint).ok_or("no token account")?;
+    if rpc.account(&ours, "confirmed").await.map_err(|e| e.to_string())?.is_some() {
+        return Ok(());
+    }
+    let token = from_base58(TOKEN_PROGRAM).map_err(|e| e.to_string())?;
+    let ata = from_base58(ATA_PROGRAM).map_err(|e| e.to_string())?;
+    let accounts = [meta(me, true, true), meta(ours, false, true), meta(me, false, false), meta(*mint, false, false), meta(SYSTEM_PROGRAM, false, false), meta(token, false, false)];
+    let raw = signed(relayer, message_many(&me, &[(&ata, &accounts, &[1u8])], &rpc.blockhash().await.map_err(|e| e.to_string())?));
+    rpc.send(&raw).await.map_err(|e| e.to_string())
+}
+
+/// The relay's Solana fee-payer key, from a file of 32 bytes in hex or a solana-keygen JSON keypair
+pub fn relayer_key(text: &str) -> Result<SigningKey, String> {
+    let t = text.trim();
+    let seed: [u8; 32] = if t.starts_with('[') {
+        let bytes: Vec<u8> = serde_json::from_str(t).map_err(|e| e.to_string())?;
+        bytes.get(..32).ok_or("short keypair")?.try_into().map_err(|_| "bad keypair")?
+    } else {
+        hex::decode(t).map_err(|e| e.to_string())?.try_into().map_err(|_| "a key is 32 bytes")?
+    };
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+#[cfg(test)]
+mod sponsor_tests {
+    use super::*;
+
+    fn key(n: u8) -> Pubkey {
+        SigningKey::from_bytes(&[n; 32]).verifying_key().to_bytes()
+    }
+
+    /// A lock message as the buyer's wallet builds it (`SolChain::lock_through_sponsor`)
+    fn lock_message(relayer: Pubkey, owner: Pubkey, program: Pubkey, mint: Pubkey, front: u64, fee: u64, tamper: impl Fn(&mut Vec<(Pubkey, Vec<Meta>, Vec<u8>)>)) -> Vec<u8> {
+        let token = from_base58(TOKEN_PROGRAM).unwrap();
+        let (ours, theirs) = (token_account(&owner, &mint).unwrap(), token_account(&relayer, &mint).unwrap());
+        let swap = key(40);
+        let mut give = 2u32.to_le_bytes().to_vec();
+        give.extend_from_slice(&front.to_le_bytes());
+        let mut lock = vec![4u8];
+        lock.extend_from_slice(&[7u8; 96]);
+        let mut pay = vec![12u8];
+        pay.extend_from_slice(&fee.to_le_bytes());
+        pay.push(6);
+        let mut ixs: Vec<(Pubkey, Vec<Meta>, Vec<u8>)> = vec![
+            (SYSTEM_PROGRAM, vec![meta(relayer, true, true), meta(owner, false, true)], give),
+            (program, vec![meta(owner, true, true), meta(key(41), false, false), meta(swap, false, true), meta(mint, false, false),
+                           meta(ours, false, true), meta(key(42), false, true), meta(token, false, false), meta(SYSTEM_PROGRAM, false, false)], lock),
+            (token, vec![meta(ours, false, true), meta(mint, false, false), meta(theirs, false, true), meta(owner, true, false)], pay),
+        ];
+        tamper(&mut ixs);
+        let list: Vec<(&Pubkey, &[Meta], &[u8])> = ixs.iter().map(|(p, a, d)| (p, a.as_slice(), d.as_slice())).collect();
+        message_signed_by(&[relayer, owner], &list, &[9u8; 32])
+    }
+
+    #[test]
+    fn a_relay_signs_only_the_sponsored_lock_it_agreed_to() {
+        let (relayer, owner, program, mint) = (key(1), key(2), key(3), key(4));
+        let front = crate::sponsor::SOL_LOCK_FRONT;
+        let ok = lock_message(relayer, owner, program, mint, front, 500_000, |_| {});
+        assert_eq!(check_sponsored_lock(&ok, &relayer, &program, &mint, front, 400_000), Ok(owner));
+        // Too small a fee, too much fronted
+        assert!(check_sponsored_lock(&ok, &relayer, &program, &mint, front, 600_000).is_err());
+        let greedy = lock_message(relayer, owner, program, mint, front + 1, 500_000, |_| {});
+        assert!(check_sponsored_lock(&greedy, &relayer, &program, &mint, front, 400_000).is_err());
+        // A fourth instruction (say, another transfer out of the relay's account)
+        let extra = lock_message(relayer, owner, program, mint, front, 500_000, |ixs| {
+            let mut d = 2u32.to_le_bytes().to_vec();
+            d.extend_from_slice(&1_000_000u64.to_le_bytes());
+            ixs.push((SYSTEM_PROGRAM, vec![meta(relayer, true, true), meta(key(66), false, true)], d));
+        });
+        assert!(check_sponsored_lock(&extra, &relayer, &program, &mint, front, 400_000).is_err());
+        // The relay's account inside the lock, another program, another mint, the fee paid elsewhere
+        let inside = lock_message(relayer, owner, program, mint, front, 500_000, |ixs| ixs[1].1[1] = meta(relayer, false, false));
+        assert!(check_sponsored_lock(&inside, &relayer, &program, &mint, front, 400_000).is_err());
+        let elsewhere_program = lock_message(relayer, owner, key(9), mint, front, 500_000, |_| {});
+        assert!(check_sponsored_lock(&elsewhere_program, &relayer, &program, &mint, front, 400_000).is_err());
+        let other_mint = lock_message(relayer, owner, program, key(10), front, 500_000, |_| {});
+        assert!(check_sponsored_lock(&other_mint, &relayer, &program, &mint, front, 400_000).is_err());
+        let fee_elsewhere = lock_message(relayer, owner, program, mint, front, 500_000, |ixs| ixs[2].1[2] = meta(key(77), false, true));
+        assert!(check_sponsored_lock(&fee_elsewhere, &relayer, &program, &mint, front, 400_000).is_err());
+        // The relay not as fee payer
+        let swapped = lock_message(owner, relayer, program, mint, front, 500_000, |_| {});
+        assert!(check_sponsored_lock(&swapped, &relayer, &program, &mint, front, 400_000).is_err());
+    }
+
+    #[test]
+    fn a_relayed_claim_carries_the_sellers_permission_just_before_the_claim() {
+        let relayer = SigningKey::from_bytes(&[1; 32]);
+        let seller = SigningKey::from_bytes(&[2; 32]);
+        let (program, mint, swap, owner) = (key(3), key(4), key(5), key(6));
+        let claimer = seller.verifying_key().to_bytes();
+        let permission = seller.sign(&crate::sponsor::sol_claim_message(&swap, 150_000, &relayer.verifying_key().to_bytes())).to_bytes();
+        let raw = sponsored_claim_tx(&relayer, &program, &mint, &swap, &[8; 32], 150_000, &claimer, &owner, &permission, &[9; 32]).unwrap();
+        assert_eq!(raw[0], 1, "only the relay signs");
+        let p = parse_message(&raw[65..]).unwrap();
+        assert_eq!(p.keys[0], relayer.verifying_key().to_bytes(), "the relay pays");
+        let ed = from_base58(ED25519_PROGRAM).unwrap();
+        let (check, claim) = (&p.ixs[2], &p.ixs[3]);
+        assert_eq!(p.keys[check.0], ed);
+        assert_eq!(p.keys[claim.0], program);
+        assert_eq!(claim.2[0], 8);
+        assert_eq!(u64::from_le_bytes(claim.2[33..41].try_into().unwrap()), 150_000);
+        // The check covers the seller's key and the exact message the program rebuilds
+        let d = &check.2;
+        assert_eq!(&d[16..48], &claimer);
+        assert_eq!(&d[48..112], &permission);
+        assert_eq!(&d[112..], crate::sponsor::sol_claim_message(&swap, 150_000, &relayer.verifying_key().to_bytes()).as_slice());
+        // The payout goes to the seller's own token account
+        assert_eq!(p.keys[claim.1[2]], token_account(&claimer, &mint).unwrap());
+    }
+}

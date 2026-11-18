@@ -376,6 +376,7 @@ pub mod secret;
 pub mod driver;
 pub mod chain;
 pub mod sol;
+pub mod sponsor;
 pub mod xmz;
 pub mod negotiation;
 pub mod swap_seed;

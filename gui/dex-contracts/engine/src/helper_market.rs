@@ -190,13 +190,18 @@ async fn funds_short(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySi
             let account = crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes();
             let mint = crate::sol::mint_of(kind, listing.asset()).map_err(|e| e.to_string())?.ok_or("no token")?;
             let have = crate::sol::token_balance(&cfg.evm_rpc, &account, &mint).await.map_err(|e| e.to_string())?;
-            let need = u64::try_from(value).map_err(|_| "the amount does not fit")?;
+            // A relay that pays the fees takes its fee in USDT from the buyer: then no SOL is needed
+            let sponsor = crate::sponsor::sol_lock_fee().await;
+            let need = u64::try_from(value).map_err(|_| "the amount does not fit")? + sponsor.unwrap_or(0);
             let usdt = |units: u64| format!("{}.{:06}", units / 1_000_000, units % 1_000_000);
             if have < need {
                 return Ok(Some(format!(
-                    "the trade account {} holds {} USDT; this offer needs {}. Send at least {} USDT more to it (for example from Phantom), then try again",
-                    crate::sol::to_base58(&account), usdt(have), usdt(need), usdt(need - have)
+                    "the trade account {} holds {} USDT; this offer needs {}{}. Send at least {} USDT more to it (for example from Phantom), then try again",
+                    crate::sol::to_base58(&account), usdt(have), usdt(need), if sponsor.is_some() { " (with the network fee, paid in USDT)" } else { "" }, usdt(need - have)
                 )));
+            }
+            if sponsor.is_some() {
+                return Ok(None);
             }
             // And SOL for the network fees and the swap's two accounts (returned when it closes)
             let sol = crate::sol::balance(&cfg.evm_rpc, &account).await.map_err(|e| e.to_string())?;

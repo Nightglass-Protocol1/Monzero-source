@@ -58,6 +58,26 @@ struct Config {
     /// BTC/XMZ and LTC/XMZ offers for these networks ("btc-mainnet", "ltc-mainnet", "btc-signet", ...)
     #[serde(default)]
     utxo_networks: Vec<String>,
+    /// Pay USDT traders' network fees, paid back in USDT (absent: this relay does not)
+    #[serde(default)]
+    sponsor: Option<SponsorConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SponsorConfig {
+    /// The relay's Solana fee-payer key (solana-keygen JSON, or 32 bytes hex); chain: the
+    /// configured Solana cluster
+    #[serde(default)]
+    sol_key_file: Option<PathBuf>,
+    /// The relay's BNB Smart Chain key (hex); chain: the configured BNB Smart Chain (or local)
+    #[serde(default)]
+    evm_key_file: Option<PathBuf>,
+    /// Tests only: the USDT mint of a local Solana validator, the USDT token of a local EVM chain
+    #[serde(default)]
+    local_sol_usdt_mint: Option<String>,
+    #[serde(default)]
+    local_usdt_token: Option<Address>,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -250,6 +270,52 @@ async fn main() {
     }
 
     let api = Arc::new(Api::new(relay.clone(), config.peers.clone(), config.trust_proxy));
+    let mut app = router(api);
+    if let Some(sc) = &config.sponsor {
+        use monzero_dex_evm::sol;
+        use monzero_dex_relay::sponsor::{EvmSponsor, SolSponsor, Sponsor};
+        if let Some(m) = &sc.local_sol_usdt_mint {
+            sol::set_local_usdt_mint(sol::from_base58(m).unwrap_or_else(|e| fail(e)));
+        }
+        if let Some(t) = sc.local_usdt_token {
+            monzero_dex_evm::chain::set_local_usdt_token(t);
+        }
+        let read = |p: &PathBuf| std::fs::read_to_string(p).unwrap_or_else(|e| fail(format!("{}: {e}", p.display())));
+        let mut sol_sponsor = None;
+        if let Some(path) = &sc.sol_key_file {
+            let c = config.chains.iter().find(|c| Chain::from_id(c.chain_id).is_some_and(|k| k.is_solana())).unwrap_or_else(|| fail("sponsor: no Solana chain configured"));
+            let chain = Chain::from_id(c.chain_id).expect("checked");
+            let program = sol::from_base58(c.sol_program.as_deref().unwrap_or_default()).unwrap_or_else(|e| fail(e));
+            let mint = sol::usdt_mint(chain).unwrap_or_else(|| fail("sponsor: no USDT mint on this cluster"));
+            let key = sol::relayer_key(&read(path)).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
+            sol::open_own_token_account(&c.rpc, &key, &mint).await.unwrap_or_else(|e| eprintln!("sponsor: own USDT account not opened yet: {e}"));
+            eprintln!("sponsor: Solana fee payer {}", sol::to_base58(&key.verifying_key().to_bytes()));
+            sol_sponsor = Some(SolSponsor { chain, rpc: c.rpc.clone(), program, mint, key });
+        }
+        let mut evm_sponsor = None;
+        if let Some(path) = &sc.evm_key_file {
+            let c = config.chains.iter().find(|c| matches!(Chain::from_id(c.chain_id), Some(Chain::BscMainnet | Chain::BscTestnet | Chain::Local)))
+                .unwrap_or_else(|| fail("sponsor: no BNB Smart Chain configured"));
+            let chain = Chain::from_id(c.chain_id).expect("checked");
+            let token = monzero_dex_evm::chain::usdt_token(chain).unwrap_or_else(|| fail("sponsor: no USDT token on this chain"));
+            let signer: alloy::signers::local::PrivateKeySigner = read(path).trim().parse().unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
+            let provider = ProviderBuilder::new().connect_http(c.rpc.parse().unwrap_or_else(|e| fail(format!("{}: {e}", c.rpc)))).erased();
+            eprintln!("sponsor: BNB Smart Chain account {}", signer.address());
+            evm_sponsor = Some(EvmSponsor { chain, contract: c.contract.unwrap_or_else(|| fail("sponsor: contract missing")), token, provider, signer });
+        }
+        let s = Sponsor::new(relay.clone(), sol_sponsor, evm_sponsor, config.trust_proxy);
+        if s.enabled() {
+            let keep = s.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(300));
+                loop {
+                    tick.tick().await;
+                    keep.refresh().await;
+                }
+            });
+            app = app.merge(monzero_dex_relay::sponsor::router(s));
+        }
+    }
     let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap_or_else(|e| fail(format!("{}: {e}", config.listen)));
     eprintln!("listening on {}", config.listen);
     let shutdown = async {
@@ -260,7 +326,7 @@ async fn main() {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
         tokio::select! { _ = shutdown => {}, _ = term.recv() => {} }
     };
-    axum::serve(listener, router(api).into_make_service_with_connect_info::<SocketAddr>())
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown)
         .await
         .unwrap_or_else(|e| fail(e));

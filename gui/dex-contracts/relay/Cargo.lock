@@ -3124,6 +3124,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "axum",
+ "base64 0.22.1",
  "bs58",
  "ed25519-dalek",
  "hex",

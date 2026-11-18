@@ -193,6 +193,9 @@ async fn dispatch(r: Request) -> Result<Value, String> {
     if let Some(program) = &r.local_sol_program {
         crate::sol::set_local_program(crate::sol::from_base58(program).map_err(|e| e.to_string())?);
     }
+    if let Some(relays) = &r.relays {
+        crate::sponsor::set_relays(relays.clone());
+    }
     if let Some(token) = r.local_usdt_token {
         crate::chain::set_local_usdt_token(token);
     }
@@ -206,7 +209,8 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         }
         Command::Status => status(&r.trade_dir),
         Command::Approve => approve(&r.trade_dir, r.commitment),
-        Command::Tick => tick(&r.trade_dir, r.tick).await,
+        // The relays, when given, may pay a USDT trade's network fees (paid back in USDT)
+        Command::Tick => tick(&r.trade_dir, r.tick, r.relays.clone().unwrap_or_default()).await,
         Command::Payout => {
             let keep = keep_wei(&r)?;
             payout(&r.trade_dir, r.tick, r.payout_address.as_deref(), keep).await
@@ -320,14 +324,15 @@ fn approve(dir: &Path, commitment: Option<B256>) -> Result<Value, String> {
     status(dir)
 }
 
-async fn tick(dir: &Path, cfg: Option<TickConfig>) -> Result<Value, String> {
+async fn tick(dir: &Path, cfg: Option<TickConfig>, sponsors: Vec<String>) -> Result<Value, String> {
     let cfg = cfg.ok_or("tick needs its configuration")?;
     let (swap_seed, key) = keys(&cfg)?;
     let saved = journal(dir).load().map_err(|e| e.to_string())?.trade.ok_or("the journal holds no saved trade")?;
     let agreed = saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
-    let chain = trade_chain(&cfg, &saved, &agreed, &key)?;
+    let sponsored = !sponsors.is_empty() && saved.offer.asset != alloy::primitives::Address::ZERO;
+    let chain = trade_chain(&cfg, &saved, &agreed, &key)?.with_sponsors(if sponsored { sponsors } else { vec![] });
     let xmz = xmz_parts(dir, &cfg, &saved, &agreed, &swap_seed)?;
-    let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?.with_gas_advance(cfg.gas_advance.unwrap_or_else(|| default_gas_advance(&saved)));
+    let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?.with_gas_advance(cfg.gas_advance.unwrap_or_else(|| if sponsored { crate::driver::GasAdvance::Off } else { default_gas_advance(&saved) }));
     let (awaiting, funding) = match driver.tick().await {
         Ok(_) => (false, None),
         Err(DriverError::AwaitingApproval) => (true, None),

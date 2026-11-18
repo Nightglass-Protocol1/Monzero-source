@@ -50,6 +50,10 @@ pub struct AlloyChain {
     log_chunk: u64,
     /// Searches by key, so each tick queries only blocks it has not seen
     scans: std::sync::Mutex<std::collections::HashMap<B256, Scan>>,
+    /// Our key, for signing a relayed claim's permission
+    signer: PrivateKeySigner,
+    /// Relays that may claim for us in a token (USDT) trade, paid in the token; none: we pay gas
+    sponsors: Vec<String>,
 }
 
 fn chain_err(e: impl std::fmt::Display) -> DriverError {
@@ -100,6 +104,7 @@ impl AlloyChain {
     pub fn new(url: &str, chain: Chain, contract: Address, from_block: u64, key: PrivateKeySigner) -> Result<Self, DriverError> {
         let url: alloy::transports::http::reqwest::Url = url.parse().map_err(chain_err)?;
         let from = key.address();
+        let signer = key.clone();
         Ok(AlloyChain {
             chain,
             contract,
@@ -109,7 +114,15 @@ impl AlloyChain {
             from,
             log_chunk: LOG_CHUNK,
             scans: Default::default(),
+            signer,
+            sponsors: vec![],
         })
+    }
+
+    /// Relays that may claim for us in a token (USDT) trade, paid out of the tokens
+    pub fn with_sponsors(mut self, relays: Vec<String>) -> Self {
+        self.sponsors = relays;
+        self
     }
 
     pub fn with_log_chunk(mut self, blocks: u64) -> Self {
@@ -288,6 +301,40 @@ impl AlloyChain {
 }
 
 impl EvmChain for AlloyChain {
+    fn relayed_claim(&self) -> bool {
+        !self.sponsors.is_empty()
+    }
+
+    /// Our claim through a relay (the contract's claimRelayer): we sign (swap, fee, relayer); the
+    /// relay sends it and the contract pays it `fee` of the tokens, us the rest
+    async fn relay_claim(&self, swap: &Swap, secret: B256) -> Result<bool, DriverError> {
+        if swap.asset == Address::ZERO {
+            return Ok(false);
+        }
+        let chain_id = self.check_network().await?;
+        let id = crate::swap_id(swap);
+        for relay in &self.sponsors {
+            let Some(info) = crate::sponsor::info(relay).await else { continue };
+            let (Some(relayer), Some(fee)) = (info.evm, info.bsc_claim_fee.as_deref().and_then(|f| f.parse::<U256>().ok())) else { continue };
+            if fee > crate::sponsor::max_evm_claim_fee() || fee >= swap.value {
+                continue;
+            }
+            let digest = crate::relay_digest(chain_id, self.contract, id, fee, relayer);
+            let signature = alloy::signers::SignerSync::sign_hash_sync(&self.signer, &digest).map_err(chain_err)?;
+            let request = crate::sponsor::EvmClaimRequest {
+                chain_id,
+                swap: swap.abi_encode().into(),
+                secret,
+                fee,
+                signature: signature.as_bytes().to_vec().into(),
+            };
+            if crate::sponsor::post(relay, crate::sponsor::EVM_CLAIM_PATH, &request).await.is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn allowance(&self, token: Address) -> Result<U256, DriverError> {
         crate::IErc20::new(token, self.reader.clone()).allowance(self.from, self.contract).call().await.map_err(chain_err)
     }
