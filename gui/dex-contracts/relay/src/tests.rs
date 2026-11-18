@@ -340,7 +340,7 @@ async fn a_solana_claim_is_a_trade_only_with_the_makers_account_on_the_makers_si
     let sell = sol_offer(&maker, 1, Side::SellXmz, 50_000_000);
     r.post_with(sell.clone(), Some(note(&maker, &sell, 7)), NOW).await.unwrap();
     let nonce = u64::try_from(sell.listing.swap_nonce()).unwrap();
-    let claim = |owner, claimer, lamports, nonce| ClaimLookup::FinalSol { owner, claimer, lamports, nonce, at: NOW + 60 };
+    let claim = |owner, claimer, lamports, nonce| ClaimLookup::FinalSol { owner, claimer, lamports, nonce, at: NOW + 60, asset: Address::ZERO };
     // Someone else's swap under the offer's nonce and amount: not this maker's trade, and the offer stays open
     for (i, wrong) in [claim(theirs, theirs, 50_000_000, nonce), claim(mine, theirs, 50_000_000, nonce), claim(theirs, mine, 49_000_000, nonce), claim(theirs, mine, 50_000_000, nonce + 1)].into_iter().enumerate() {
         let tx = sol_tx(i as u8 + 1);

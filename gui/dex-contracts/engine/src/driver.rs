@@ -120,6 +120,11 @@ pub trait EvmChain {
     async fn balance_of(&self, _who: Address) -> Result<U256, DriverError> {
         Err(DriverError::Chain("this chain has no gas advance".into()))
     }
+    /// What a side needs besides gas, in the chain's coin: on Solana a token swap opens a token
+    /// vault (the owner) and a token account (the claimer), each holding a deposit
+    fn reserve(&self, _owner: bool) -> U256 {
+        U256::ZERO
+    }
 }
 
 /// The XMZ wallet side of the swap.
@@ -350,13 +355,13 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         if first_lock {
             let funds = self.chain.funds().await?;
             let owner = matches!(record.state, RoleState::Owner(_));
-            let claim_gas = funding_needed(&self.trade.terms, false, funds.fee_per_gas);
+            let claim_gas = funding_needed(&self.trade.terms, false, funds.fee_per_gas) + self.chain.reserve(false);
             let needed = match (owner, self.gas_advance) {
                 // The owner also holds what it may have to advance
-                (true, GasAdvance::Give) => funding_needed(&self.trade.terms, true, funds.fee_per_gas) + claim_gas,
+                (true, GasAdvance::Give) => funding_needed(&self.trade.terms, true, funds.fee_per_gas) + self.chain.reserve(true) + claim_gas,
                 // The claimer counts on the advance
                 (false, GasAdvance::Expect) => U256::ZERO,
-                _ => funding_needed(&self.trade.terms, owner, funds.fee_per_gas),
+                _ => funding_needed(&self.trade.terms, owner, funds.fee_per_gas) + self.chain.reserve(owner),
             };
             if funds.balance < needed {
                 return Err(DriverError::AwaitingFunding { needed, have: funds.balance });
@@ -410,7 +415,7 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
                 // in, as the lock's funding rule does, rather than failing with the chain's error
                 Err(e) => {
                     let funds = self.chain.funds().await?;
-                    let needed = funding_needed(&self.trade.terms, false, funds.fee_per_gas);
+                    let needed = funding_needed(&self.trade.terms, false, funds.fee_per_gas) + self.chain.reserve(false);
                     if funds.balance < needed { Err(DriverError::AwaitingFunding { needed, have: funds.balance }) } else { Err(e) }
                 }
                 ok => ok,
@@ -435,7 +440,7 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         if record.retained.contains_key("set_ready") {
             return Ok(());
         }
-        let needed = funding_needed(&self.trade.terms, false, self.chain.funds().await?.fee_per_gas);
+        let needed = funding_needed(&self.trade.terms, false, self.chain.funds().await?.fee_per_gas) + self.chain.reserve(false);
         let have = self.chain.balance_of(to).await?;
         if have >= needed {
             return Ok(());

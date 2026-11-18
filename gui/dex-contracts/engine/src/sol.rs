@@ -79,6 +79,63 @@ pub fn program_of(chain: Chain) -> Option<Pubkey> {
     from_base58(text).ok()
 }
 
+static LOCAL_USDT: std::sync::OnceLock<Pubkey> = std::sync::OnceLock::new();
+
+/// The USDT mint on a local test validator (chain `SolLocal` only), given with the request
+pub fn set_local_usdt_mint(mint: Pubkey) {
+    let _ = LOCAL_USDT.set(mint);
+}
+
+/// The SPL token program and the associated token account program
+pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+/// What a token account must hold to stay open (165 bytes); the claimer pays it once per token
+pub const TOKEN_ACCOUNT_RENT: u64 = 2_039_280;
+
+/// The pinned USDT mint of each Solana cluster (Tether's on mainnet; none on devnet)
+pub fn usdt_mint(chain: Chain) -> Option<Pubkey> {
+    match chain {
+        Chain::SolMainnet => from_base58("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").ok(),
+        Chain::SolLocal => LOCAL_USDT.get().copied(),
+        _ => None,
+    }
+}
+
+/// The 20-byte stand-in for a mint in the trade terms (as `contract_address` for the program)
+pub fn asset_address(mint: &Pubkey) -> Address {
+    Address::from_slice(&mint[..20])
+}
+
+/// The mint a trade's asset stands for on this cluster: None for native SOL
+pub fn mint_of(chain: Chain, asset: Address) -> Result<Option<Pubkey>, DriverError> {
+    if asset == Address::ZERO {
+        return Ok(None);
+    }
+    match usdt_mint(chain) {
+        Some(m) if asset_address(&m) == asset => Ok(Some(m)),
+        _ => Err(sol_err("this token is not traded on this cluster")),
+    }
+}
+
+/// The associated token account of `wallet` for `mint`
+pub fn token_account(wallet: &Pubkey, mint: &Pubkey) -> Option<Pubkey> {
+    let token = from_base58(TOKEN_PROGRAM).ok()?;
+    let ata = from_base58(ATA_PROGRAM).ok()?;
+    find_program_address(&[wallet, &token, mint], &ata).map(|(k, _)| k)
+}
+
+/// Base units of `mint` that `wallet` holds in its associated token account (0 without one)
+pub async fn token_balance(url: &str, wallet: &Pubkey, mint: &Pubkey) -> Result<u64, DriverError> {
+    let rpc = Rpc::new(url)?;
+    let Some(ata) = token_account(wallet, mint) else { return Ok(0) };
+    match rpc.call("getTokenAccountBalance", json!([to_base58(&ata), {"commitment": "confirmed"}])).await {
+        Ok(r) => Ok(r["value"]["amount"].as_str().and_then(|a| a.parse().ok()).unwrap_or(0)),
+        // No such account yet: it holds nothing
+        Err(DriverError::Chain(e)) if e.contains("could not find account") || e.contains("Invalid param") => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
 /// The stand-in contract addresses of the Solana clusters that have a program
 pub fn pinned_contracts() -> Vec<(u64, Address)> {
     [Chain::SolMainnet, Chain::SolDevnet, Chain::SolLocal].into_iter().filter_map(|c| program_of(c).map(|p| (c.id(), contract_address(&p)))).collect()
@@ -109,19 +166,64 @@ pub async fn check_program(url: &str, program: &Pubkey) -> Result<(), DriverErro
 /// Send everything `key` holds (less the fee) to `to`, outside any trade.
 /// Sends the account's balance to `to`, less the fee and less `keep` lamports (left for later fees)
 pub async fn pay_out(url: &str, key: &SigningKey, to: &Pubkey, keep: u64) -> Result<Option<(String, u64)>, DriverError> {
+    pay_out_with(url, key, to, keep, None).await
+}
+
+/// As `pay_out`, and first all of `mint` (USDT) the account holds: into `to`'s token account
+/// (opened if it has none), then our token account is closed so its deposit comes back with
+/// the SOL. One transaction. Returns the SOL sent (0 when only tokens moved).
+pub async fn pay_out_with(url: &str, key: &SigningKey, to: &Pubkey, keep: u64, mint: Option<Pubkey>) -> Result<Option<(String, u64)>, DriverError> {
     let rpc = Rpc::new(url)?;
     let me = key.verifying_key().to_bytes();
-    let balance = rpc.call("getBalance", json!([to_base58(&me), {"commitment": "confirmed"}])).await?["value"].as_u64().unwrap_or(0);
-    if balance <= FEE_LAMPORTS.saturating_add(keep) || to == &me {
+    if to == &me {
         return Ok(None);
     }
-    let amount = balance - FEE_LAMPORTS - keep;
-    let mut data = 2u32.to_le_bytes().to_vec();
-    data.extend_from_slice(&amount.to_le_bytes());
-    let raw = signed(key, message(&me, &SYSTEM_PROGRAM, &[meta(me, true, true), meta(*to, false, true)], &data, &rpc.blockhash().await?));
+    let lamports_of = |r: Value| r["value"].as_u64().unwrap_or(0);
+    let balance = lamports_of(rpc.call("getBalance", json!([to_base58(&me), {"commitment": "confirmed"}])).await?);
+    let token = from_base58(TOKEN_PROGRAM)?;
+    let mut ixs: Vec<(Pubkey, Vec<Meta>, Vec<u8>)> = vec![];
+    let mut available = balance;
+    if let Some(mint) = mint {
+        let units = token_balance(url, &me, &mint).await?;
+        let ours = token_account(&me, &mint).ok_or_else(|| sol_err("no token account address"))?;
+        let ours_rent = lamports_of(rpc.call("getBalance", json!([to_base58(&ours), {"commitment": "confirmed"}])).await?);
+        if ours_rent > 0 {
+            let theirs = token_account(to, &mint).ok_or_else(|| sol_err("no token account address"))?;
+            if units > 0 {
+                if rpc.account(&theirs, "confirmed").await?.is_none() {
+                    available = available.saturating_sub(TOKEN_ACCOUNT_RENT); // we open it for them
+                }
+                let ata_program = from_base58(ATA_PROGRAM)?;
+                ixs.push((ata_program, vec![meta(me, true, true), meta(theirs, false, true), meta(*to, false, false), meta(mint, false, false), meta(SYSTEM_PROGRAM, false, false), meta(token, false, false)], vec![1u8]));
+                let mut data = vec![12u8];
+                data.extend_from_slice(&units.to_le_bytes());
+                data.push(token_decimals(&mint));
+                ixs.push((token, vec![meta(ours, false, true), meta(mint, false, false), meta(theirs, false, true), meta(me, true, true)], data));
+            }
+            // Close our token account: its deposit comes back to us and goes out with the SOL
+            ixs.push((token, vec![meta(ours, false, true), meta(me, false, true), meta(me, true, true)], vec![9u8]));
+            available += ours_rent;
+        }
+    }
+    let sol = available.saturating_sub(FEE_LAMPORTS).saturating_sub(keep);
+    if sol > 0 && balance > FEE_LAMPORTS.saturating_add(keep) {
+        let mut data = 2u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&sol.to_le_bytes());
+        ixs.push((SYSTEM_PROGRAM, vec![meta(me, true, true), meta(*to, false, true)], data));
+    }
+    if ixs.is_empty() {
+        return Ok(None);
+    }
+    let list: Vec<(&Pubkey, &[Meta], &[u8])> = ixs.iter().map(|(p, a, d)| (p, a.as_slice(), d.as_slice())).collect();
+    let raw = signed(key, message_many(&me, &list, &rpc.blockhash().await?));
     let id = bs58::encode(&raw[1..65]).into_string();
     rpc.send(&raw).await?;
-    Ok(Some((id, amount)))
+    Ok(Some((id, if ixs.iter().any(|(p, _, _)| p == &SYSTEM_PROGRAM) { sol } else { 0 })))
+}
+
+/// Decimals of a pinned token (USDT: 6)
+fn token_decimals(_mint: &Pubkey) -> u8 {
+    6
 }
 
 /// A transaction's id as Solana shows it (its first signature), for a transaction made here
@@ -214,18 +316,29 @@ fn read_compact(bytes: &[u8], at: &mut usize) -> Option<usize> {
 }
 
 /// One instruction, paid for and signed by `payer` alone (the first account).
+#[cfg(test)]
 fn message(payer: &Pubkey, program: &Pubkey, accounts: &[Meta], data: &[u8], blockhash: &[u8; 32]) -> Vec<u8> {
-    // Order: the signer, other writable accounts, read-only accounts (the program last)
+    message_many(payer, &[(program, accounts, data)], blockhash)
+}
+
+/// Several instructions in one transaction, paid for and signed by `payer` alone.
+fn message_many(payer: &Pubkey, ixs: &[(&Pubkey, &[Meta], &[u8])], blockhash: &[u8; 32]) -> Vec<u8> {
+    // Order: the signer, other writable accounts, read-only accounts (programs last). An account
+    // writable in any instruction is writable.
     let mut keys: Vec<(Pubkey, bool)> = vec![(*payer, true)];
     for writable in [true, false] {
-        for a in accounts.iter().filter(|a| a.writable == writable && !a.signer) {
-            if !keys.iter().any(|(k, _)| k == &a.key) {
-                keys.push((a.key, writable));
+        for (_, accounts, _) in ixs {
+            for a in accounts.iter().filter(|a| a.writable == writable && !a.signer) {
+                if !keys.iter().any(|(k, _)| k == &a.key) {
+                    keys.push((a.key, writable));
+                }
             }
         }
     }
-    if !keys.iter().any(|(k, _)| k == program) {
-        keys.push((*program, false));
+    for (program, _, _) in ixs {
+        if !keys.iter().any(|(k, _)| k == *program) {
+            keys.push((**program, false));
+        }
     }
     let readonly = keys.iter().filter(|(_, w)| !w).count() as u8;
     let mut m = vec![1, 0, readonly];
@@ -234,15 +347,17 @@ fn message(payer: &Pubkey, program: &Pubkey, accounts: &[Meta], data: &[u8], blo
         m.extend_from_slice(k);
     }
     m.extend_from_slice(blockhash);
-    compact(1, &mut m);
+    compact(ixs.len(), &mut m);
     let index = |key: &Pubkey| keys.iter().position(|(k, _)| k == key).expect("listed above") as u8;
-    m.push(index(program));
-    compact(accounts.len(), &mut m);
-    for a in accounts {
-        m.push(index(&a.key));
+    for (program, accounts, data) in ixs {
+        m.push(index(program));
+        compact(accounts.len(), &mut m);
+        for a in accounts.iter() {
+            m.push(index(&a.key));
+        }
+        compact(data.len(), &mut m);
+        m.extend_from_slice(data);
     }
-    compact(data.len(), &mut m);
-    m.extend_from_slice(data);
     m
 }
 
@@ -374,6 +489,8 @@ pub struct ClaimedSwap {
     pub nonce: u64,
     /// Block time of the claim
     pub at: u64,
+    /// The token claimed (USDT); None for native SOL. `lamports` is then the token's base units.
+    pub mint: Option<Pubkey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -416,11 +533,17 @@ pub async fn claim_lookup(url: &str, program: &Pubkey, signature: &[u8; 64]) -> 
     if !tx["meta"]["err"].is_null() {
         return Ok(ClaimSeen::NotAClaim("the transaction failed".into()));
     }
-    // Claim = 2: the secret follows; accounts are the claimer, the swap, the owner
-    let Some((claim, _)) = program_calls(&tx, program).into_iter().find(|(a, d)| d.len() == 33 && d[0] == 2 && a.len() >= 3) else {
+    // Claim = 2: the secret follows; accounts are the claimer, the swap, the owner.
+    // ClaimSpl = 5: accounts are the claimer, the swap, its token account, the vault, the owner, the mint.
+    let Some((claim, kind)) = program_calls(&tx, program).into_iter().find_map(|(a, d)| match (d.len(), d.first()) {
+        (33, Some(2)) if a.len() >= 3 => Some((a, 2u8)),
+        (33, Some(5)) if a.len() >= 6 => Some((a, 5u8)),
+        _ => None,
+    }) else {
         return Ok(ClaimSeen::NotAClaim("no claim on the pinned program in it".into()));
     };
-    let (claimer, swap, owner) = (claim[0], claim[1], claim[2]);
+    let (claimer, swap, owner) = if kind == 2 { (claim[0], claim[1], claim[2]) } else { (claim[0], claim[1], claim[4]) };
+    let claimed_mint = (kind == 5).then(|| claim[5]);
     let Some(at) = tx["blockTime"].as_u64() else {
         return Ok(ClaimSeen::Pending);
     };
@@ -431,9 +554,13 @@ pub async fn claim_lookup(url: &str, program: &Pubkey, signature: &[u8; 64]) -> 
     for id in oldest {
         let made = rpc.call("getTransaction", json!([id, options])).await?;
         for (accounts, data) in program_calls(&made, program) {
-            // NewSwap = 0: both points, both durations, the amount, the nonce; accounts are
-            // the owner, the claimer, the swap
-            if data.len() != 97 || data[0] != 0 || accounts.len() < 3 || accounts[2] != swap {
+            // NewSwap = 0 (NewSpl = 4): both points, both durations, the amount, the nonce;
+            // accounts are the owner, the claimer, the swap (then, for a token, its mint)
+            let made_kind = if kind == 2 { 0 } else { 4 };
+            if data.len() != 97 || data[0] != made_kind || accounts.len() < 3 || accounts[2] != swap {
+                continue;
+            }
+            if made_kind == 4 && accounts.get(3) != claimed_mint.as_ref() {
                 continue;
             }
             let point = |at: usize| -> [u8; 32] { data[at..at + 32].try_into().expect("32 bytes") };
@@ -443,7 +570,7 @@ pub async fn claim_lookup(url: &str, program: &Pubkey, signature: &[u8; 64]) -> 
             if binding.swap_address(program, lamports, nonce) != Some(swap) || binding.owner != owner || binding.claimer != claimer {
                 continue;
             }
-            return Ok(ClaimSeen::Final(ClaimedSwap { owner, claimer, lamports, nonce, at }));
+            return Ok(ClaimSeen::Final(ClaimedSwap { owner, claimer, lamports, nonce, at, mint: claimed_mint }));
         }
     }
     Ok(ClaimSeen::NotAClaim("the claimed swap's creation was not found".into()))
@@ -460,6 +587,7 @@ struct Stored {
     amount: u64,
     stage: u8,
     native: bool,
+    mint: Pubkey,
     nonce: u64,
 }
 
@@ -478,8 +606,9 @@ fn stored(data: &[u8]) -> Option<Stored> {
         timeout2: word(136),
         amount: word(144),
         stage: data[152],
-        // bump at 153, mint at 154..186
+        // bump at 153, mint at 154..186, kind at 186
         native: data[186] == 0 && data[154..186] == [0u8; 32],
+        mint: key(154),
         nonce: word(188),
     };
     // A closed swap is zeroed
@@ -493,19 +622,34 @@ pub struct SolChain {
     key: SigningKey,
     binding: SolBinding,
     nonce: u64,
-    /// The trade's lamports: with the binding and the nonce it fixes the swap account's address
+    /// The trade's lamports (or token base units): with the binding and the nonce it fixes the
+    /// swap account's address
     amount: u64,
+    /// The token the swap holds (USDT); None for native SOL
+    mint: Option<Pubkey>,
     rpc: Rpc,
 }
 
 impl SolChain {
     /// `binding`, `nonce` and `value` belong to one trade: this chain view serves that trade only.
     pub fn new(url: &str, chain: Chain, program: Pubkey, key: SigningKey, binding: SolBinding, nonce: u64, value: U256) -> Result<Self, DriverError> {
+        Self::with_asset(url, chain, program, key, binding, nonce, value, Address::ZERO)
+    }
+
+    /// As `new`, for a trade paid in `asset` (zero: native SOL; else a pinned token such as USDT)
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_asset(url: &str, chain: Chain, program: Pubkey, key: SigningKey, binding: SolBinding, nonce: u64, value: U256, asset: Address) -> Result<Self, DriverError> {
         let amount = lamports(value)?;
         if !chain.is_solana() {
             return Err(sol_err("not a Solana chain"));
         }
-        Ok(SolChain { chain, program, contract: contract_address(&program), key, binding, nonce, amount, rpc: Rpc::new(url)? })
+        let mint = mint_of(chain, asset)?;
+        Ok(SolChain { chain, program, contract: contract_address(&program), key, binding, nonce, amount, mint, rpc: Rpc::new(url)? })
+    }
+
+    /// The swap's token vault (the program's account for the swap's tokens)
+    fn vault(&self, swap: &Pubkey) -> Result<Pubkey, DriverError> {
+        find_program_address(&[b"vault", swap], &self.program).map(|(k, _)| k).ok_or_else(|| sol_err("no vault address"))
     }
 
     pub fn account(&self) -> Pubkey {
@@ -540,8 +684,8 @@ impl EvmChain for SolChain {
     }
 
     async fn find_lock(&self, terms: &AgreedTerms) -> Result<Option<ObservedLock>, DriverError> {
-        if terms.asset != Address::ZERO {
-            return Err(sol_err("only native SOL swaps"));
+        if mint_of(self.chain, terms.asset)? != self.mint {
+            return Err(sol_err("the trade's asset is not this chain view's"));
         }
         if lamports(terms.value).ok() != Some(self.amount) {
             return Ok(None);
@@ -564,7 +708,10 @@ impl EvmChain for SolChain {
             refundCommitment: stands_for(s.refund_point == self.binding.refund_point, terms.refund_commitment),
             timeout1: U256::from(s.timeout1),
             timeout2: U256::from(s.timeout2),
-            asset: stands_for(s.native, Address::ZERO),
+            asset: match self.mint {
+                None => stands_for(s.native, Address::ZERO),
+                Some(m) => stands_for(!s.native && s.mint == m, terms.asset),
+            },
             value: U256::from(s.amount),
             nonce: U256::from(s.nonce),
         };
@@ -639,8 +786,8 @@ impl EvmChain for SolChain {
                 };
                 let evm = share.to_evm();
                 match kind {
-                    2 | 7 if secret_matches(&evm, swap.claimCommitment) => return Ok(Some(Revealed::Claimed(evm))),
-                    3 if secret_matches(&evm, swap.refundCommitment) => return Ok(Some(Revealed::Refunded(evm))),
+                    2 | 5 | 7 | 8 if secret_matches(&evm, swap.claimCommitment) => return Ok(Some(Revealed::Claimed(evm))),
+                    3 | 6 if secret_matches(&evm, swap.refundCommitment) => return Ok(Some(Revealed::Refunded(evm))),
                     _ => {}
                 }
             }
@@ -655,27 +802,56 @@ impl EvmChain for SolChain {
     async fn sign(&self, call: &EvmCall) -> Result<Bytes, DriverError> {
         let me = self.account();
         let b = &self.binding;
-        let mut program = self.program;
-        let (accounts, data) = match call {
+        let token = from_base58(TOKEN_PROGRAM)?;
+        let ata_program = from_base58(ATA_PROGRAM)?;
+        // "Open this wallet's token account if it has none" (create idempotent), paid by us
+        let open_account = |wallet: Pubkey, mint: Pubkey| -> Result<(Pubkey, Vec<Meta>, Vec<u8>), DriverError> {
+            let ata = token_account(&wallet, &mint).ok_or_else(|| sol_err("no token account address"))?;
+            Ok((ata_program, vec![meta(me, true, true), meta(ata, false, true), meta(wallet, false, false), meta(mint, false, false), meta(SYSTEM_PROGRAM, false, false), meta(token, false, false)], vec![1u8]))
+        };
+        let mut ixs: Vec<(Pubkey, Vec<Meta>, Vec<u8>)> = vec![];
+        match call {
             EvmCall::NewSwap { terms, nonce } => {
-                if me != b.owner || terms.asset != Address::ZERO || u64::try_from(*nonce).ok() != Some(self.nonce) {
+                if me != b.owner || mint_of(self.chain, terms.asset)? != self.mint || u64::try_from(*nonce).ok() != Some(self.nonce) {
                     return Err(sol_err("this account does not lock this swap"));
                 }
                 let amount = lamports(terms.value)?;
-                let mut data = vec![0u8];
+                let mut data = vec![if self.mint.is_some() { 4u8 } else { 0u8 }];
                 data.extend_from_slice(&b.claim_point);
                 data.extend_from_slice(&b.refund_point);
                 for word in [terms.duration1, terms.duration2, amount, self.nonce] {
                     data.extend_from_slice(&word.to_le_bytes());
                 }
                 let swap = self.swap_address(terms.value)?;
-                (vec![meta(me, true, true), meta(b.claimer, false, false), meta(swap, false, true), meta(SYSTEM_PROGRAM, false, false)], data)
+                let accounts = match self.mint {
+                    None => vec![meta(me, true, true), meta(b.claimer, false, false), meta(swap, false, true), meta(SYSTEM_PROGRAM, false, false)],
+                    Some(mint) => {
+                        let ours = token_account(&me, &mint).ok_or_else(|| sol_err("no token account address"))?;
+                        vec![meta(me, true, true), meta(b.claimer, false, false), meta(swap, false, true), meta(mint, false, false),
+                             meta(ours, false, true), meta(self.vault(&swap)?, false, true), meta(token, false, false), meta(SYSTEM_PROGRAM, false, false)]
+                    }
+                };
+                ixs.push((self.program, accounts, data));
             }
-            EvmCall::SetReady(swap) => (vec![meta(me, true, true), meta(self.swap_address(swap.value)?, false, true)], vec![1u8]),
+            EvmCall::SetReady(swap) => ixs.push((self.program, vec![meta(me, true, true), meta(self.swap_address(swap.value)?, false, true)], vec![1u8])),
             EvmCall::Claim(swap, secret) => {
-                let mut data = vec![2u8];
-                data.extend_from_slice(&program_secret(*secret));
-                (vec![meta(me, true, true), meta(self.swap_address(swap.value)?, false, true), meta(b.owner, false, true)], data)
+                let address = self.swap_address(swap.value)?;
+                match self.mint {
+                    None => {
+                        let mut data = vec![2u8];
+                        data.extend_from_slice(&program_secret(*secret));
+                        ixs.push((self.program, vec![meta(me, true, true), meta(address, false, true), meta(b.owner, false, true)], data));
+                    }
+                    Some(mint) => {
+                        // The tokens go to our own token account, opened first if we have none
+                        ixs.push(open_account(me, mint)?);
+                        let ours = token_account(&me, &mint).ok_or_else(|| sol_err("no token account address"))?;
+                        let mut data = vec![5u8];
+                        data.extend_from_slice(&program_secret(*secret));
+                        ixs.push((self.program, vec![meta(me, true, true), meta(address, false, true), meta(ours, false, true), meta(self.vault(&address)?, false, true),
+                                                    meta(b.owner, false, true), meta(mint, false, false), meta(token, false, false)], data));
+                    }
+                }
             }
             // A plain system transfer from the owner to the claimer's account, so a claimer
             // holding no SOL can pay for its claim. The claimer is the swap's bound claimer,
@@ -684,18 +860,31 @@ impl EvmChain for SolChain {
                 if me != b.owner {
                     return Err(sol_err("only the owner advances the claimer's fee"));
                 }
-                program = SYSTEM_PROGRAM;
                 let mut data = 2u32.to_le_bytes().to_vec();
                 data.extend_from_slice(&lamports(*amount)?.to_le_bytes());
-                (vec![meta(me, true, true), meta(b.claimer, false, true)], data)
+                ixs.push((SYSTEM_PROGRAM, vec![meta(me, true, true), meta(b.claimer, false, true)], data));
             }
             EvmCall::Refund(swap, secret) => {
-                let mut data = vec![3u8];
-                data.extend_from_slice(&program_secret(*secret));
-                (vec![meta(me, true, true), meta(self.swap_address(swap.value)?, false, true)], data)
+                let address = self.swap_address(swap.value)?;
+                match self.mint {
+                    None => {
+                        let mut data = vec![3u8];
+                        data.extend_from_slice(&program_secret(*secret));
+                        ixs.push((self.program, vec![meta(me, true, true), meta(address, false, true)], data));
+                    }
+                    Some(mint) => {
+                        ixs.push(open_account(me, mint)?);
+                        let ours = token_account(&me, &mint).ok_or_else(|| sol_err("no token account address"))?;
+                        let mut data = vec![6u8];
+                        data.extend_from_slice(&program_secret(*secret));
+                        ixs.push((self.program, vec![meta(me, true, true), meta(address, false, true), meta(ours, false, true), meta(self.vault(&address)?, false, true),
+                                                    meta(mint, false, false), meta(token, false, false)], data));
+                    }
+                }
             }
-        };
-        let raw = signed(&self.key, message(&me, &program, &accounts, &data, &self.rpc.blockhash().await?));
+        }
+        let list: Vec<(&Pubkey, &[Meta], &[u8])> = ixs.iter().map(|(p, a, d)| (p, a.as_slice(), d.as_slice())).collect();
+        let raw = signed(&self.key, message_many(&me, &list, &self.rpc.blockhash().await?));
         // As gas estimation on EVM: a call the program would refuse is not kept
         let text = base64::engine::general_purpose::STANDARD.encode(&raw);
         let sim = self.rpc.call("simulateTransaction", json!([text, {"encoding": "base64", "commitment": "confirmed"}])).await?;
@@ -731,6 +920,12 @@ impl EvmChain for SolChain {
     async fn funds(&self) -> Result<Funds, DriverError> {
         let r = self.rpc.call("getBalance", json!([to_base58(&self.account()), {"commitment": "confirmed"}])).await?;
         Ok(Funds { balance: U256::from(r["value"].as_u64().unwrap_or(0)), fee_per_gas: U256::from(LAMPORTS_PER_GAS) })
+    }
+
+    fn reserve(&self, owner: bool) -> U256 {
+        // A token swap: the owner's vault deposit, the claimer's token account deposit
+        let _ = owner;
+        U256::from(if self.mint.is_some() { TOKEN_ACCOUNT_RENT } else { 0 })
     }
 
     /// The claimer's balance, for the gas advance: always the swap's bound claimer
@@ -785,6 +980,9 @@ impl EvmChain for AnyChain {
     }
     async fn balance_of(&self, who: Address) -> Result<U256, DriverError> {
         either!(self, c => c.balance_of(who).await)
+    }
+    fn reserve(&self, owner: bool) -> U256 {
+        either!(self, c => c.reserve(owner))
     }
 }
 

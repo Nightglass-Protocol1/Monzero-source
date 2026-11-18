@@ -186,7 +186,28 @@ pub enum ListingError {
 }
 
 impl Chain {
-    /// The pair a listing on this chain trades
+    /// Every pair listings on this chain may trade: the chain's coin, and its tokens (USDT on
+    /// Solana). Apps from before tokens check against `pair` alone and so never take a token offer.
+    pub fn pairs(self) -> Vec<&'static str> {
+        let mut out = vec![self.pair()];
+        if self.is_solana() && crate::sol::usdt_mint(self).is_some() {
+            out.push("USDT/XMZ");
+        }
+        out
+    }
+
+    /// The asset of a pair on this chain, as the trade terms name it: zero for the chain's coin
+    pub fn asset_of(self, pair: &str) -> Option<Address> {
+        if pair == self.pair() {
+            return Some(Address::ZERO);
+        }
+        match pair {
+            "USDT/XMZ" if self.is_solana() => crate::sol::usdt_mint(self).map(|m| crate::sol::asset_address(&m)),
+            _ => None,
+        }
+    }
+
+    /// The pair a listing on this chain trades in the chain's own coin
     pub fn pair(self) -> &'static str {
         match self {
             Chain::BscMainnet | Chain::BscTestnet => "BNB/XMZ",
@@ -233,6 +254,11 @@ impl Listing {
     }
 
     /// Whether takers may take part of it (a version-2 listing whose minimum is all of it is whole)
+    /// What the offer is paid in, as the trade terms name it (zero: the chain's own coin)
+    pub fn asset(&self) -> Address {
+        Chain::from_id(self.chain_id).and_then(|c| c.asset_of(&self.pair)).unwrap_or(Address::repeat_byte(0xEE))
+    }
+
     pub fn is_partial(&self) -> bool {
         self.min_xmz.is_some_and(|m| m < self.xmz)
     }
@@ -297,7 +323,7 @@ impl Listing {
         }
         let chain = Chain::from_id(self.chain_id).ok_or(ListingError::Chain(self.chain_id))?;
         let pinned = rules.contracts.get(&self.chain_id).ok_or(ListingError::Chain(self.chain_id))?;
-        if self.pair != chain.pair() {
+        if chain.asset_of(&self.pair).is_none() {
             return Err(ListingError::Pair(self.pair.clone()));
         }
         if &self.contract != pinned {

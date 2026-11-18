@@ -169,3 +169,49 @@ fn a_version_2_listing_may_stay_open_a_month_a_first_version_one_a_day() {
     assert!(long.fill_ok(long.xmz) && !long.fill_ok(long.xmz / 2));
     assert!(partial(&key).is_partial());
 }
+
+#[test]
+fn usdt_is_a_pair_on_solana_mainnet_only_and_trades_carry_its_mint() {
+    let mint = crate::sol::usdt_mint(Chain::SolMainnet).expect("Tether's mint is pinned");
+    assert_eq!(crate::sol::to_base58(&mint), "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
+    assert_eq!(Chain::SolMainnet.pairs(), vec!["SOL/XMZ", "USDT/XMZ"]);
+    assert_eq!(Chain::BscMainnet.pairs(), vec!["BNB/XMZ"]);
+    assert_eq!(Chain::SolMainnet.asset_of("SOL/XMZ"), Some(Address::ZERO));
+    assert_eq!(Chain::SolMainnet.asset_of("USDT/XMZ"), Some(crate::sol::asset_address(&mint)));
+    assert_eq!(Chain::BscMainnet.asset_of("USDT/XMZ"), None, "no BNB-chain USDT yet");
+    assert_eq!(Chain::SolDevnet.asset_of("USDT/XMZ"), None, "no USDT pinned on devnet");
+
+    let program = crate::sol::program_of(Chain::SolMainnet).expect("mainnet program");
+    let mut r = Rules::default();
+    r.contracts.insert(Chain::SolMainnet.id(), crate::sol::contract_address(&program));
+    let key = PrivateKeySigner::random();
+    let mut l = listing(&key);
+    l.chain_id = Chain::SolMainnet.id();
+    l.contract = crate::sol::contract_address(&program);
+    l.pair = "USDT/XMZ".into();
+    l.value = U256::from(25_000_000u64); // 25 USDT
+    assert_eq!(l.check(&r, NOW), Ok(Chain::SolMainnet));
+    assert_eq!(l.asset(), crate::sol::asset_address(&mint));
+    let offer = crate::market::offer_for(&l, Address::repeat_byte(9), l.xmz);
+    assert_eq!(offer.asset, crate::sol::asset_address(&mint), "the trade is paid in USDT, not SOL");
+    assert_eq!(crate::sol::mint_of(Chain::SolMainnet, offer.asset).unwrap(), Some(mint));
+    // A token this app does not know is refused, as is USDT named on a chain without it
+    l.pair = "DOGE/XMZ".into();
+    assert_eq!(l.check(&r, NOW), Err(ListingError::Pair("DOGE/XMZ".into())));
+    let mut eth = listing(&key);
+    eth.pair = "USDT/XMZ".into();
+    assert_eq!(eth.check(&rules(), NOW), Err(ListingError::Pair("USDT/XMZ".into())));
+}
+
+#[test]
+fn token_accounts_are_program_addresses_of_wallet_and_mint() {
+    let mint = crate::sol::usdt_mint(Chain::SolMainnet).unwrap();
+    let a = crate::sol::token_account(&[1u8; 32], &mint).unwrap();
+    let b = crate::sol::token_account(&[2u8; 32], &mint).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(crate::sol::token_account(&[1u8; 32], &mint), Some(a), "deterministic");
+    assert!(curve25519_dalek::edwards::CompressedEdwardsY(a).decompress().is_none(), "a program address is off the curve");
+    // The same address Solana's own tool gives (spl-token address --owner … --token <USDT>)
+    let wallet = crate::sol::from_base58("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM").unwrap();
+    assert_eq!(crate::sol::to_base58(&crate::sol::token_account(&wallet, &mint).unwrap()), "TB5FCqbNsnuLQgEjUuPaT9qtVPTT4U1A8rvi7qzEj2M");
+}
