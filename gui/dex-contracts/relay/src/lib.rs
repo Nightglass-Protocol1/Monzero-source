@@ -122,7 +122,8 @@ pub enum ClaimLookup {
     Pending,
     Final { swap: Swap, at: u64 },
     /// As `Final`, on Solana: the traders are Solana accounts and the amount is in lamports
-    FinalSol { owner: B256, claimer: B256, lamports: u64, nonce: u64, at: u64 },
+    /// `asset`: what was claimed, as a listing names it (zero: SOL; a token's stand-in address)
+    FinalSol { owner: B256, claimer: B256, lamports: u64, nonce: u64, at: u64, asset: Address },
     NotAClaim(String),
 }
 
@@ -159,8 +160,14 @@ pub struct Print {
 impl Print {
     /// Coin per XMZ
     pub fn price(&self) -> f64 {
-        // The coin's smallest unit: wei (18 places), or lamports on Solana (9)
-        let unit = if monzero_dex_evm::Chain::from_id(self.chain_id).is_some_and(|c| c.is_solana()) { 1e9 } else { 1e18 };
+        // The coin's smallest unit: wei (18 places), lamports on Solana (9), USDT base units (6)
+        let unit = if self.pair == "USDT/XMZ" {
+            1e6
+        } else if monzero_dex_evm::Chain::from_id(self.chain_id).is_some_and(|c| c.is_solana()) {
+            1e9
+        } else {
+            1e18
+        };
         let coin = self.value.to_string().parse::<f64>().unwrap_or(0.0) / unit;
         coin / (self.xmz as f64 / 1e11)
     }
@@ -429,10 +436,10 @@ impl<C: ChainView> Relay<C> {
                 return Ok(PrintStatus::Pending);
             }
             ClaimLookup::Final { swap, at } => {
-                let native = swap.asset == Address::ZERO;
+                let asset = swap.asset;
                 let (owner, claimer) = (swap.owner, swap.claimer);
                 (swap.nonce, swap.value, at, Box::new(move |o, _| {
-                    native
+                    asset == o.listing.asset()
                         && match o.listing.maker_role() {
                             Role::Owner => owner == o.listing.maker,
                             Role::Claimer => claimer == o.listing.maker,
@@ -440,8 +447,8 @@ impl<C: ChainView> Relay<C> {
                 }))
             }
             // On Solana the maker's side is the account its signed note names
-            ClaimLookup::FinalSol { owner, claimer, lamports, nonce, at } => (U256::from(nonce), U256::from(lamports), at, Box::new(move |o, account| {
-                account.is_some_and(|a| match o.listing.maker_role() {
+            ClaimLookup::FinalSol { owner, claimer, lamports, nonce, at, asset } => (U256::from(nonce), U256::from(lamports), at, Box::new(move |o, account| {
+                asset == o.listing.asset() && account.is_some_and(|a| match o.listing.maker_role() {
                     Role::Owner => owner == a.note.account,
                     Role::Claimer => claimer == a.note.account,
                 })

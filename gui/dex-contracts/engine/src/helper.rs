@@ -69,6 +69,9 @@ pub struct Request {
     /// The swap program on a local Solana test validator only; real clusters use the pinned ones
     #[serde(default)]
     pub local_sol_program: Option<String>,
+    /// The USDT mint on a local Solana test validator only; mainnet uses Tether's
+    #[serde(default)]
+    pub local_sol_usdt_mint: Option<String>,
     /// `withdraw`: the chain whose trade account is emptied
     #[serde(default)]
     pub chain_id: Option<u64>,
@@ -186,6 +189,9 @@ pub async fn handle(request: &[u8]) -> Value {
 async fn dispatch(r: Request) -> Result<Value, String> {
     if let Some(program) = &r.local_sol_program {
         crate::sol::set_local_program(crate::sol::from_base58(program).map_err(|e| e.to_string())?);
+    }
+    if let Some(mint) = &r.local_sol_usdt_mint {
+        crate::sol::set_local_usdt_mint(crate::sol::from_base58(mint).map_err(|e| e.to_string())?);
     }
     match r.command {
         Command::Accounts => {
@@ -408,7 +414,9 @@ pub(crate) fn trade_chain(
         return Err("the trade's Solana account is not this wallet's".into());
     }
     let nonce = u64::try_from(saved.swap_nonce()).map_err(|_| "the swap nonce does not fit")?;
-    crate::sol::SolChain::new(&cfg.evm_rpc, kind, program, sol_key, binding, nonce, saved.offer.value).map(crate::sol::AnyChain::Sol).map_err(|e| e.to_string())
+    crate::sol::SolChain::with_asset(&cfg.evm_rpc, kind, program, sol_key, binding, nonce, saved.offer.value, saved.offer.asset)
+        .map(crate::sol::AnyChain::Sol)
+        .map_err(|e| e.to_string())
 }
 
 /// After the trade is done, send the trade account's balance to the user's own address.
@@ -437,7 +445,8 @@ async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>, keep: all
             saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
             let to = crate::sol::from_base58(to_text).map_err(|e| e.to_string())?;
             let keep = u64::try_from(keep).map_err(|_| "keepWei is too large for Solana")?;
-            let sent = crate::sol::pay_out(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to, keep).await.map_err(|e| e.to_string())?;
+            let mint = Chain::from_id(saved.offer.chain_id).and_then(crate::sol::usdt_mint);
+            let sent = crate::sol::pay_out_with(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to, keep, mint).await.map_err(|e| e.to_string())?;
             let mut v = status(dir)?;
             v["payout"] = match sent {
                 Some((tx, amount)) => {

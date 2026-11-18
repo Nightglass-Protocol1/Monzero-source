@@ -52,7 +52,7 @@ pub fn offer_for(listing: &Listing, taker: Address, xmz: u64) -> Offer {
         contract: listing.contract,
         owner,
         claimer,
-        asset: Address::ZERO,
+        asset: listing.asset(),
         value: listing.fill_value(xmz),
         duration1: DURATION,
         duration2: DURATION,

@@ -340,7 +340,7 @@ async fn a_solana_claim_is_a_trade_only_with_the_makers_account_on_the_makers_si
     let sell = sol_offer(&maker, 1, Side::SellXmz, 50_000_000);
     r.post_with(sell.clone(), Some(note(&maker, &sell, 7)), NOW).await.unwrap();
     let nonce = u64::try_from(sell.listing.swap_nonce()).unwrap();
-    let claim = |owner, claimer, lamports, nonce| ClaimLookup::FinalSol { owner, claimer, lamports, nonce, at: NOW + 60 };
+    let claim = |owner, claimer, lamports, nonce| ClaimLookup::FinalSol { owner, claimer, lamports, nonce, at: NOW + 60, asset: Address::ZERO };
     // Someone else's swap under the offer's nonce and amount: not this maker's trade, and the offer stays open
     for (i, wrong) in [claim(theirs, theirs, 50_000_000, nonce), claim(mine, theirs, 50_000_000, nonce), claim(theirs, mine, 49_000_000, nonce), claim(theirs, mine, 50_000_000, nonce + 1)].into_iter().enumerate() {
         let tx = sol_tx(i as u8 + 1);
@@ -417,4 +417,12 @@ async fn a_month_long_offer_is_accepted_and_hidden_from_apps_before_it() {
     let mut old = offer(&maker, 4, Side::SellXmz, ETH / 100, 10_000).listing;
     old.expires_at = NOW + 2 * 24 * 3600;
     assert!(r.post(old.sign(&maker), NOW).await.is_err());
+}
+
+#[test]
+fn a_usdt_print_is_priced_in_usdt_units() {
+    let p = Print { pair: "USDT/XMZ".into(), chain_id: monzero_dex_evm::Chain::SolMainnet.id(), tx: TxId("t".into()), at: NOW, value: U256::from(12_000_000u64), xmz: 1_000 * 100_000_000_000, listing: B256::ZERO };
+    assert!((p.price() - 0.012).abs() < 1e-12, "12 USDT for 1000 XMZ is 0.012 USDT per XMZ, got {}", p.price());
+    let sol = Print { pair: "SOL/XMZ".into(), value: U256::from(12_000_000u64), ..p };
+    assert!((sol.price() - 0.000012).abs() < 1e-15);
 }

@@ -49,6 +49,9 @@ pub struct OfferParams {
     /// for the same time (while the wallet runs and can still pay for it)
     #[serde(default)]
     pub renew: bool,
+    /// What the offer trades: "USDT/XMZ" on Solana; absent, the chain's own coin
+    #[serde(default)]
+    pub pair: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -91,6 +94,10 @@ fn renew_margin(l: &Listing) -> u64 {
 fn funds_checked_at(dir: &Path) -> u64 {
     std::fs::read_to_string(dir.join("funds-checked")).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0)
 }
+
+/// SOL a USDT buyer's trade account needs besides the USDT: the swap state and token vault
+/// rent (returned when the swap closes), fees, and the claimer's fee advance
+const SOL_TOKEN_OWNER_RESERVE: u64 = 10_000_000;
 
 /// How often an open offer's funds are checked again while no take arrives
 const FUNDS_RECHECK_SECS: u64 = 600;
@@ -178,6 +185,29 @@ async fn check_funds(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySi
 async fn funds_short(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySigner, cfg: &TickConfig) -> Result<Option<String>, String> {
     let value = listing.fill_value(xmz);
     match role {
+        Role::Owner if Chain::from_id(listing.chain_id).is_some_and(Chain::is_solana) && listing.asset() != Address::ZERO => {
+            let kind = Chain::from_id(listing.chain_id).expect("checked");
+            let account = crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes();
+            let mint = crate::sol::mint_of(kind, listing.asset()).map_err(|e| e.to_string())?.ok_or("no token")?;
+            let have = crate::sol::token_balance(&cfg.evm_rpc, &account, &mint).await.map_err(|e| e.to_string())?;
+            let need = u64::try_from(value).map_err(|_| "the amount does not fit")?;
+            let usdt = |units: u64| format!("{}.{:06}", units / 1_000_000, units % 1_000_000);
+            if have < need {
+                return Ok(Some(format!(
+                    "the trade account {} holds {} USDT; this offer needs {}. Send at least {} USDT more to it (for example from Phantom), then try again",
+                    crate::sol::to_base58(&account), usdt(have), usdt(need), usdt(need - have)
+                )));
+            }
+            // And SOL for the network fees and the swap's two accounts (returned when it closes)
+            let sol = crate::sol::balance(&cfg.evm_rpc, &account).await.map_err(|e| e.to_string())?;
+            let fees = SOL_TOKEN_OWNER_RESERVE;
+            if sol < fees {
+                return Ok(Some(format!(
+                    "the trade account {} needs about {}.{:09} SOL for network fees and the swap's accounts (returned afterwards); send a little SOL to it too",
+                    crate::sol::to_base58(&account), fees / 1_000_000_000, fees % 1_000_000_000
+                )));
+            }
+        }
         Role::Owner if Chain::from_id(listing.chain_id).is_some_and(Chain::is_solana) => {
             let account = crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes();
             let have = crate::sol::balance(&cfg.evm_rpc, &account).await.map_err(|e| e.to_string())?;
@@ -287,7 +317,11 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
         schema: if min_xmz.is_some() { PARTIAL_SCHEMA } else { LISTING_SCHEMA }.into(),
         min_xmz,
         id,
-        pair: chain_kind.pair().into(),
+        pair: match &params.pair {
+            Some(p) if chain_kind.asset_of(p).is_some() => p.clone(),
+            Some(p) => return Err(format!("{p} is not traded on this chain")),
+            None => chain_kind.pair().into(),
+        },
         chain_id: params.chain_id,
         contract,
         side: params.side,
@@ -501,6 +535,7 @@ async fn renew(dir: &Path, file: &mut MakerFile, cfg: &TickConfig, relays: &[Str
             lifetime_secs: l.expires_at.saturating_sub(l.created_at).clamp(1, MAX_LIFETIME_V2),
             min_xmz_atoms: if l.is_partial() { l.min_xmz.map(|m| m.to_string()) } else { None },
             renew: true,
+            pair: Some(l.pair.clone()),
         };
         let local = (Chain::from_id(l.chain_id) == Some(Chain::Local)).then_some(l.contract);
         post(&next, cfg, relays, &params, local).await?;
@@ -759,12 +794,22 @@ pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: &str, no
     if let Some(why) = funds_in_use(root, now)? {
         return Err(why);
     }
+    // On Solana the SOL and USDT markets share one trade account (folders <chain id> and the app's
+    // USDT market <chain id + 100>): an open offer or trade in either keeps its funds
+    if Chain::from_id(chain_id).is_some_and(Chain::is_solana) {
+        let name = root.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse::<u64>().ok());
+        for sibling in [name.map(|n| n + 100), name.and_then(|n| n.checked_sub(100))].into_iter().flatten() {
+            if let Some(why) = funds_in_use(&root.with_file_name(sibling.to_string()), now)? {
+                return Err(why);
+            }
+        }
+    }
     let (_, key) = keys(cfg)?;
     let kind = Chain::from_id(chain_id).ok_or("unknown chain")?;
     if kind.is_solana() {
         let to_key = crate::sol::from_base58(to).map_err(|e| e.to_string())?;
         let keep = u64::try_from(keep).map_err(|_| "keepWei is too large for Solana")?;
-        let sent = crate::sol::pay_out(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to_key, keep).await.map_err(|e| e.to_string())?;
+        let sent = crate::sol::pay_out_with(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to_key, keep, crate::sol::usdt_mint(kind)).await.map_err(|e| e.to_string())?;
         return Ok(match sent {
             Some((tx, amount)) => json!({"withdrawn": {"to": to.trim(), "tx": tx, "amountWei": amount.to_string()}}),
             None => json!({"withdrawn": null, "reason": "nothing to send, or a payment is still pending"}),
