@@ -186,12 +186,12 @@ check(not r.get("offerWithdrawn") and r.get("answered") == 1, f"wallet back with
 
 # 4. auto-renew ("keep open")
 state["listings"].clear()
-d4, r = post("four", lifetime=75, renew=True)  # renewed in its last 60 s
+d4, r = post("four", lifetime=150, renew=True)  # renewed in its last 60 s (after 90 s)
 check(os.path.isfile(os.path.join(d4, "renew")), "keep-open offer posted with its renew mark")
 first = next(iter(state["listings"].values()))
 r = helper("serve", d4, maker_seed)
 check(r.get("renew") is True and "renewed" not in r, "not renewed while more than a minute is left")
-time.sleep(17)
+time.sleep(92)
 r = helper("serve", d4, maker_seed)
 nxt = (r.get("renewed") or {}).get("folder")
 check(nxt and os.path.isfile(os.path.join(nxt, "listing.json")) and os.path.isfile(os.path.join(nxt, "renew")),
@@ -212,10 +212,10 @@ check(r.get("taken") is False and r.get("renew") is True and not r.get("offerWit
 
 # 5. renewal due but the coins are gone: withdrawn, not renewed
 state["listings"].clear()
-d5, r = post("five", lifetime=75, renew=True)
+d5, r = post("five", lifetime=150, renew=True)
 state["unlocked"] = 0
 open(os.path.join(d5, "funds-checked"), "w").write(str(int(time.time())))  # the periodic check is not due
-time.sleep(17)
+time.sleep(92)
 r = helper("serve", d5, maker_seed)
 check(r.get("offerWithdrawn") is True and "renewed" not in r and not state["listings"], "renewal due with no funds: withdrawn instead")
 state["unlocked"] = 10**6 * XMZ

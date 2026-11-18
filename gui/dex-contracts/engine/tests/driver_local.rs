@@ -770,3 +770,65 @@ async fn a_sent_lock_is_rebroadcast_without_the_funding_check() {
     assert_eq!(again.unwrap(), RoleState::Owner(OwnerState::LockSent));
     assert_eq!(owner.journal().0.retained["new_swap"].len(), 1, "the same lock, not a second one");
 }
+
+async fn deploy_token(url: &str) -> Address {
+    let artifact: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../artifacts/contracts/test/TestTokens.sol/TestToken.json")).unwrap(),
+    )
+    .unwrap();
+    let code = Bytes::from_str(artifact["bytecode"].as_str().unwrap()).unwrap();
+    let provider = ProviderBuilder::new().wallet(EthereumWallet::from(key(DEPLOYER_KEY))).connect_http(url.parse().unwrap());
+    let receipt = provider.send_transaction(TransactionRequest::default().with_deploy_code(code)).await.unwrap().get_receipt().await.unwrap();
+    receipt.contract_address.unwrap()
+}
+
+async fn token_balance(url: &str, token: Address, who: Address) -> U256 {
+    monzero_dex_evm::IErc20::new(token, ProviderBuilder::new().connect_http(url.parse().unwrap())).balanceOf(who).call().await.unwrap()
+}
+
+/// USDT (BEP-20) as on BNB Smart Chain: the owner approves the contract for exactly the trade's
+/// value, then locks; the claimer collects the tokens; the owner sweeps the XMZ.
+#[tokio::test]
+async fn a_token_swap_approves_exactly_the_value_then_locks_and_the_claimer_gets_the_tokens() {
+    let Some(url) = std::env::var("MONZERO_EVM_RPC").ok() else { return };
+    let _chain = CHAIN.lock().await;
+    let mut w = world(url).await;
+    let token = deploy_token(&w.url).await;
+    let value = U256::from(25u64) * U256::from(10u64).pow(U256::from(18u64)); // 25 USDT
+    w.trade.terms.asset = token;
+    w.trade.terms.value = value;
+    // The owner holds the tokens (minted by anyone on the test token)
+    let deployer = ProviderBuilder::new().wallet(EthereumWallet::from(key(DEPLOYER_KEY))).connect_http(w.url.parse().unwrap());
+    let mint = alloy::sol_types::SolCall::abi_encode(&mintCall { to: w.trade.terms.owner, amount: value });
+    deployer.send_transaction(TransactionRequest::default().with_to(token).with_input(mint)).await.unwrap().get_receipt().await.unwrap();
+    let owner_before = token_balance(&w.url, token, w.trade.terms.owner).await;
+    let claimer_before = token_balance(&w.url, token, w.trade.terms.claimer).await;
+
+    let mut owner = w.owner(MemoryJournal(Record::new(RoleState::Owner(OwnerState::Start))));
+    let mut claimer = w.claimer();
+    let (mut owner_state, mut claimer_state) = (None, None);
+    for _ in 0..30 {
+        owner_state = Some(owner.tick().await.unwrap());
+        claimer_state = Some(claimer.tick().await.unwrap());
+        w.xmz("chain").mine(5);
+        if owner_state.as_ref().unwrap().is_done() && claimer_state.as_ref().unwrap().is_done() {
+            break;
+        }
+    }
+    assert_eq!(owner_state, Some(RoleState::Owner(OwnerState::Done(Outcome::Swapped))));
+    assert_eq!(claimer_state, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
+    let record = owner.journal().load().unwrap();
+    assert_eq!(record.retained["approve"].len(), 1, "approved once");
+    assert!(record.retained.contains_key("new_swap"));
+    assert_eq!(token_balance(&w.url, token, w.trade.terms.claimer).await, claimer_before + value, "the claimer got the tokens");
+    assert_eq!(token_balance(&w.url, token, w.trade.terms.owner).await, owner_before - value);
+    // Exactly the value was approved, and all of it was taken: nothing left to spend later
+    let left = monzero_dex_evm::IErc20::new(token, ProviderBuilder::new().connect_http(w.url.parse().unwrap()))
+        .allowance(w.trade.terms.owner, w.trade.terms.contract).call().await.unwrap();
+    assert_eq!(left, U256::ZERO, "no allowance left over");
+    assert_eq!(w.ledger.lock().unwrap().swept_by, Some("owner"));
+}
+
+alloy::sol! {
+    function mint(address to, uint256 amount) external;
+}

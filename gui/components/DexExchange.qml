@@ -692,7 +692,7 @@ ColumnLayout {
                     Text {
                         Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor
                         text: ex.coin === "USDT"
-                              ? qsTr("To buy XMZ, send USDT on Solana (SPL, not ERC-20 or TRC-20) here, plus about 0.01 SOL for network fees. It is this app's own account: only your trading keys can move it.")
+                              ? qsTr("To buy XMZ, send USDT on Solana (SPL, not ERC-20 or TRC-20) here, plus about 0.015 SOL for network fees and account deposits. It is this app's own account: only your trading keys can move it.")
                               : ex.coin === "USDT-BSC"
                               ? qsTr("To buy XMZ, send USDT on BNB Smart Chain (BEP-20, not ERC-20 or TRC-20) here, plus a little BNB for network fees. It is this app's own account: only your trading keys can move it.")
                               : qsTr("To buy XMZ, send %1 on %2 here (plus a little for network fees). It is this app's own account: only your trading keys can move it.").arg(ex.coin).arg(ex.networkName(ex.chainId) || ex.coin)
