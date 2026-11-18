@@ -40,7 +40,7 @@ Item {
         }
         function refreshEvmOffers(pair) { return true }
         function takeEvmOffer(id, xmz) { calls.push(["take", id, xmz]); return true }
-        function postEvmOffer(chainId, side, coin, xmz, hours, min) { calls.push(["post", chainId, side, coin, xmz, hours, min]); return true }
+        function postEvmOffer(chainId, side, coin, xmz, hours, min, renew) { calls.push(["post", chainId, side, coin, xmz, hours, min].concat(renew ? ["renew"] : [])); return true }
         function cancelEvmOffer(folder) { calls.push(["cancel", folder]); return true }
         function approveTradingKeysHelper(commitment) { calls.push(["approveHelper", commitment]); return true }
     }
@@ -129,6 +129,15 @@ Item {
             find(ex, "customLife").text = "800"           // past 31 days
             verify(!f.ready)
             press("life_6"); verify(f.ready)
+        }
+        function test_keep_open_posts_a_renewing_offer() {
+            var f = find(ex, "exchangeForm")
+            f.type = "limit"; f.side = "buy"
+            find(ex, "limitPrice").text = "0.0001"
+            find(ex, "orderAmount").text = "1000"
+            press("renewToggle"); press("orderButton"); press("orderButton")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["post", 501000101, "buy-xmz", "0.1", "1000", 6, "100", "renew"]]))
+            press("renewToggle")
         }
         function test_selling_more_than_the_trading_wallet_holds_is_blocked() {
             var f = find(ex, "exchangeForm")

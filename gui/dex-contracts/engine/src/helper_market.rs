@@ -45,6 +45,10 @@ pub struct OfferParams {
     /// A partial offer: the least XMZ (atoms, decimal) one take may be. Absent: whole offers only.
     #[serde(default)]
     pub min_xmz_atoms: Option<String>,
+    /// Keep the offer open: shortly before it expires, `serve` posts it again at the same price
+    /// for the same time (while the wallet runs and can still pay for it)
+    #[serde(default)]
+    pub renew: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -70,6 +74,18 @@ struct MakerFile {
 // longer pay for the smallest take), `funds-checked` when we last saw that it still could.
 fn withdrawn_reason(dir: &Path) -> Option<String> {
     std::fs::read_to_string(dir.join("withdrawn")).ok()
+}
+
+// `renew`: the owner asked to keep this offer open (copied to each renewal and to the rest of a
+// partly taken offer). `renewed`: the folder of the offer that replaced this one.
+fn renewed_into(dir: &Path) -> Option<std::path::PathBuf> {
+    std::fs::read_to_string(dir.join("renewed")).ok().map(std::path::PathBuf::from)
+}
+
+/// How long before it expires a kept-open offer is posted again: a tenth of its life, from one
+/// minute to ten
+fn renew_margin(l: &Listing) -> u64 {
+    (l.expires_at.saturating_sub(l.created_at) / 10).clamp(60, 600)
 }
 
 fn funds_checked_at(dir: &Path) -> u64 {
@@ -291,6 +307,9 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
     check_funds(listing.maker_role(), &listing, listing.xmz, &key, cfg).await?;
     let signed = listing.sign(&key);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    if params.renew {
+        std::fs::write(dir.join("renew"), b"").map_err(|e| e.to_string())?;
+    }
     write(&dir.join("listing.json"), &MakerFile::open(signed.clone()))?;
     let posted = send_offer(&client, &signed, &key).await;
     mark_posted(dir, &posted);
@@ -335,6 +354,9 @@ fn write_remainder(dir: &Path, file: &mut MakerFile, seed: &SwapSeed, key: &Priv
     let signed = rest.sign(key);
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     write(&path.join("listing.json"), &MakerFile::open(signed.clone()))?;
+    if dir.join("renew").exists() {
+        std::fs::write(path.join("renew"), b"").map_err(|e| e.to_string())?;
+    }
     file.remainder = Some(path.clone());
     write(&dir.join("listing.json"), file)?;
     Ok(Some((path, signed)))
@@ -363,8 +385,14 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
         // Still answer late takes with a refusal, and tell the relays if they had not heard yet
         return withdraw_offer(dir, &mut file, &client, &seed, &key, why).await;
     }
+    if let Some(next) = renewed_into(dir) {
+        let mut v = retire(dir, &mut file, &client, &seed, &key, "the offer was renewed: take the new one").await?;
+        v["renewed"] = json!({"folder": next});
+        return Ok(v);
+    }
     let role = file.listing.listing.maker_role();
     let smallest = file.listing.listing.min_xmz.unwrap_or(file.listing.listing.xmz);
+    let mut renew_error: Option<String> = None;
     // Every so often while the offer waits: can we still pay for the smallest take? An offer
     // whose coins were spent or moved is taken off the board, not left for someone to take
     let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -434,13 +462,67 @@ pub async fn serve(dir: &Path, cfg: &TickConfig, relays: &[String]) -> Result<Va
     if file.taken_by.is_some() && journal_has_trade(dir) {
         return taken(dir, &mut file, cfg, relays, Some(now), answered).await;
     }
-    Ok(json!({"taken": false, "answered": answered, "expired": now >= file.listing.listing.expires_at, "listing": file.listing}))
+    // Takes are answered first: a renewal never refuses a buyer who came in its last minutes
+    if dir.join("renew").exists() && file.taken_by.is_none() && clock + renew_margin(&file.listing.listing) >= file.listing.listing.expires_at {
+        match renew(dir, &mut file, cfg, relays, &client, &seed, &key).await {
+            Ok(v) => return Ok(v),
+            // Not now (limits paused, a relay or node down): the offer stays as it is, tried again
+            Err(e) => renew_error = Some(e),
+        }
+    }
+    let mut v = json!({"taken": false, "answered": answered, "expired": now >= file.listing.listing.expires_at, "listing": file.listing});
+    if dir.join("renew").exists() {
+        v["renew"] = json!(true);
+    }
+    if let Some(e) = renew_error {
+        v["renewError"] = json!(e);
+    }
+    Ok(v)
 }
 
-/// Take our open offer off the board because our side can no longer pay for it: a signed cancel
-/// to the relays (tried again on later calls until one accepts it) and the reason kept with it.
-async fn withdraw_offer(dir: &Path, file: &mut MakerFile, client: &RelayClient, seed: &SwapSeed, key: &PrivateKeySigner, why: String) -> Result<Value, String> {
-    // Every take still waiting gets a refusal, so no taker waits for an offer that is gone
+/// Post a kept-open offer again: same side, amounts, smallest part and life, as a new offer in
+/// a sibling folder (with its own `renew`), then retire this one so it cannot be taken as well.
+/// Idempotent: a renewal already made (the helper stopped half way) is used, not made twice.
+async fn renew(dir: &Path, file: &mut MakerFile, cfg: &TickConfig, relays: &[String], client: &RelayClient, seed: &SwapSeed, key: &PrivateKeySigner) -> Result<Value, String> {
+    let l = file.listing.listing.clone();
+    let base = dir.file_name().and_then(|n| n.to_str()).unwrap_or("offer");
+    let base = base.split("-renew-").next().unwrap_or(base);
+    let next = dir.parent().ok_or("the offer's folder has no parent")?.join(format!("{base}-renew-{}", hex::encode(&l.id[..4])));
+    if read::<MakerFile>(&next.join("listing.json"))?.is_none() {
+        // Coins spent since: not renewed but withdrawn, as the funds re-check would
+        if let Ok(Some(why)) = funds_short(l.maker_role(), &l, l.min_xmz.unwrap_or(l.xmz), key, cfg).await {
+            return withdraw_offer(dir, file, client, seed, key, why).await;
+        }
+        let params = OfferParams {
+            chain_id: l.chain_id,
+            side: l.side,
+            value_wei: l.value.to_string(),
+            xmz_atoms: l.xmz.to_string(),
+            lifetime_secs: l.expires_at.saturating_sub(l.created_at).clamp(1, MAX_LIFETIME_V2),
+            min_xmz_atoms: if l.is_partial() { l.min_xmz.map(|m| m.to_string()) } else { None },
+            renew: true,
+        };
+        let local = (Chain::from_id(l.chain_id) == Some(Chain::Local)).then_some(l.contract);
+        post(&next, cfg, relays, &params, local).await?;
+    }
+    std::fs::write(dir.join("renewed"), next.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+    let mut v = retire(dir, file, client, seed, key, "the offer was renewed: take the new one").await?;
+    v["renewed"] = json!({"folder": next, "listing": read::<MakerFile>(&next.join("listing.json"))?.map(|f| f.listing)});
+    Ok(v)
+}
+
+/// Take a renewed offer off the board: a signed cancel (until a relay accepts it) and a refusal
+/// to every take still waiting or arriving later
+async fn retire(dir: &Path, file: &mut MakerFile, client: &RelayClient, seed: &SwapSeed, key: &PrivateKeySigner, why: &str) -> Result<Value, String> {
+    refuse_waiting(file, client, seed, why).await;
+    if !file.closed {
+        cancel_on_relays(file, client, key).await;
+    }
+    write(&dir.join("listing.json"), file)?;
+    Ok(json!({"taken": false, "expired": true, "listing": file.listing}))
+}
+
+async fn refuse_waiting(file: &mut MakerFile, client: &RelayClient, seed: &SwapSeed, why: &str) {
     let id = file.listing.listing.id;
     let mailbox = seed.mailbox(id, true);
     for (_, sealed) in client.mail(mailbox.address()).await {
@@ -449,22 +531,30 @@ async fn withdraw_offer(dir: &Path, file: &mut MakerFile, client: &RelayClient, 
             continue;
         }
         let Some(Letter::Take(take)) = Letter::open(&mailbox, &sealed) else { continue };
-        let refusal = crate::mail::Answer {
-            listing: id,
-            response: crate::exchange::KeyResponse::Refused("the maker can no longer pay for this offer; it was withdrawn".into()),
-        };
+        let refusal = crate::mail::Answer { listing: id, response: crate::exchange::KeyResponse::Refused(why.into()) };
         if let Some(sealed) = Letter::Answer(refusal).seal(take.reply_to, &mut OsRng) {
             client.send_mail(&Envelope { to: take.reply_to, sealed }).await;
         }
         file.answered.insert(digest);
     }
+}
+
+async fn cancel_on_relays(file: &mut MakerFile, client: &RelayClient, key: &PrivateKeySigner) {
+    let l = &file.listing.listing;
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(l.created_at);
+    let signed = Cancel { schema: CANCEL_SCHEMA.into(), id: l.id, maker: key.address(), at }.sign(key);
+    let told = client.cancel(&signed).await;
+    let gone = |v: &Value| v["ok"] == true || v["error"].as_str().is_some_and(|e| e.contains("not found") || e.contains("404"));
+    file.closed = told.iter().any(gone);
+}
+
+/// Take our open offer off the board because our side can no longer pay for it: a signed cancel
+/// to the relays (tried again on later calls until one accepts it) and the reason kept with it.
+async fn withdraw_offer(dir: &Path, file: &mut MakerFile, client: &RelayClient, seed: &SwapSeed, key: &PrivateKeySigner, why: String) -> Result<Value, String> {
+    // Every take still waiting gets a refusal, so no taker waits for an offer that is gone
+    refuse_waiting(file, client, seed, "the maker can no longer pay for this offer; it was withdrawn").await;
     if !file.closed {
-        let l = &file.listing.listing;
-        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(l.created_at);
-        let signed = Cancel { schema: CANCEL_SCHEMA.into(), id: l.id, maker: key.address(), at }.sign(key);
-        let told = client.cancel(&signed).await;
-        let gone = |v: &Value| v["ok"] == true || v["error"].as_str().is_some_and(|e| e.contains("not found") || e.contains("404"));
-        file.closed = told.iter().any(gone);
+        cancel_on_relays(file, client, key).await;
     }
     std::fs::write(dir.join("withdrawn"), &why).map_err(|e| e.to_string())?;
     write(&dir.join("listing.json"), file)?;
@@ -638,7 +728,7 @@ pub fn funds_in_use(root: &Path, now: u64) -> Result<Option<String>, String> {
                 continue;
             }
         }
-        if dir.join("cancelled").exists() || dir.join("withdrawn").exists() {
+        if dir.join("cancelled").exists() || dir.join("withdrawn").exists() || dir.join("renewed").exists() {
             continue;
         }
         if let Ok(Some(file)) = read::<MakerFile>(&dir.join("listing.json")) {

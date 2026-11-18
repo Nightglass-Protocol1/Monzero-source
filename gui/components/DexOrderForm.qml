@@ -28,7 +28,7 @@ Rectangle {
     property bool reviewing: false
 
     signal takeRequested(string listingId, string xmz)           // xmz "" = all of the offer
-    signal postRequested(string side, string coinAmount, string xmz, int hours, string minXmz)
+    signal postRequested(string side, string coinAmount, string xmz, int hours, string minXmz, bool renew)
     signal clearPick()
 
     readonly property bool buying: side === "buy"
@@ -244,6 +244,21 @@ Rectangle {
                 }
                 Text { visible: partialToggle.on; text: "XMZ"; font.pixelSize: 12; color: M.Style.dimmedFontColor }
             }
+            RowLayout {
+                Layout.fillWidth: true
+                Rectangle {
+                    id: renewToggle; objectName: "renewToggle"
+                    property bool on: false
+                    width: 34; height: 18; radius: 9
+                    color: on ? M.Style.accentMuted : "#20383C"
+                    Rectangle { width: 14; height: 14; radius: 7; y: 2; x: renewToggle.on ? 18 : 2; color: renewToggle.on ? M.Style.accent : M.Style.dimmedFontColor }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { form.reviewing = false; renewToggle.on = !renewToggle.on } }
+                }
+                Text {
+                    text: qsTr("Keep open: renew automatically while this wallet runs"); font.pixelSize: 13; color: M.Style.defaultFontColor
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap
+                }
+            }
             Text { text: qsTr("Open for"); font.pixelSize: 12; color: M.Style.dimmedFontColor }
             Flow {
                 Layout.fillWidth: true
@@ -365,7 +380,7 @@ Rectangle {
                         form.takeRequested(form.plan.row.id, all ? "" : X.atomsText(form.plan.atoms))
                     } else {
                         form.postRequested(form.buying ? "buy-xmz" : "sell-xmz", form.limitCoin, X.atomsText(form.amountAtoms), form.hours,
-                                           partialToggle.on ? String(form.minXmz) : "")
+                                           partialToggle.on ? String(form.minXmz) : "", renewToggle.on)
                     }
                 }
             }
@@ -396,6 +411,7 @@ Rectangle {
         if (limitCoin === "") return []
         var rows = [[buying ? qsTr("You pay") : qsTr("You receive"), limitCoin + " " + coin + usdText(Number(limitCoin))]]
         if (partialToggle.on) rows.push([qsTr("Partial fills"), qsTr("from %1 XMZ").arg(X.amount(minXmz, 4))])
+        if (renewToggle.on) rows.push([qsTr("Keep open"), qsTr("renewed at this price while the wallet runs")])
         if (hours > 0) rows.push([qsTr("Open until"), Qt.formatDateTime(new Date(Date.now() + hours * 3600000), "d MMM yyyy HH:mm")])
         return rows
     }

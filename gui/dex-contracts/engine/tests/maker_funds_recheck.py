@@ -113,10 +113,10 @@ root = tempfile.mkdtemp(prefix="funds-recheck-")
 maker_seed, taker_seed = secrets.token_hex(64), secrets.token_hex(64)
 
 
-def post(name):
+def post(name, lifetime=3600, renew=False):
     d = os.path.join(root, "maker", name)
     r = helper("post", d, maker_seed, offer={"chainId": CHAIN, "side": "sell-xmz", "valueWei": "50000000",
-                                            "xmzAtoms": str(1000 * XMZ), "lifetimeSecs": 3600})
+                                            "xmzAtoms": str(1000 * XMZ), "lifetimeSecs": lifetime, "renew": renew})
     assert "error" not in r or r.get("ok") is not False, r
     return d, r
 
@@ -183,6 +183,42 @@ check(sum(len(v) for v in state["mail"].values()) == mail_before, "unknown balan
 state["wallet_fails"] = False
 r = helper("serve", d3, maker_seed)
 check(not r.get("offerWithdrawn") and r.get("answered") == 1, f"wallet back with the funds: the take is answered ({json.dumps(r)[:120]})")
+
+# 4. auto-renew ("keep open")
+state["listings"].clear()
+d4, r = post("four", lifetime=75, renew=True)  # renewed in its last 60 s
+check(os.path.isfile(os.path.join(d4, "renew")), "keep-open offer posted with its renew mark")
+first = next(iter(state["listings"].values()))
+r = helper("serve", d4, maker_seed)
+check(r.get("renew") is True and "renewed" not in r, "not renewed while more than a minute is left")
+time.sleep(17)
+r = helper("serve", d4, maker_seed)
+nxt = (r.get("renewed") or {}).get("folder")
+check(nxt and os.path.isfile(os.path.join(nxt, "listing.json")) and os.path.isfile(os.path.join(nxt, "renew")),
+      f"renewed into a new folder that is kept open too ({nxt})")
+new_l = json.load(open(os.path.join(nxt, "listing.json")))["listing"]["listing"]
+old_l = first["listing"]
+check(new_l["value"] == old_l["value"] and new_l["xmz"] == old_l["xmz"] and new_l["side"] == old_l["side"]
+      and new_l["expiresAt"] - new_l["createdAt"] == old_l["expiresAt"] - old_l["createdAt"] and new_l["id"] != old_l["id"],
+      "same side, price, amount and life; new id")
+check(list(state["listings"]) == [new_l["id"]], "relays carry only the renewal (old one cancelled)")
+t4, r = take("four-old", first)  # a taker still holding the old offer
+r = helper("serve", d4, maker_seed)
+check(r.get("renewed", {}).get("folder") == nxt, "old offer stays retired")
+r = helper("take", t4, taker_seed)
+check(isinstance(r.get("refused"), str) and "renewed" in r["refused"], f"a take of the old offer is refused: {r.get('refused')}")
+r = helper("serve", nxt, maker_seed)
+check(r.get("taken") is False and r.get("renew") is True and not r.get("offerWithdrawn"), "the renewal serves as a normal open offer")
+
+# 5. renewal due but the coins are gone: withdrawn, not renewed
+state["listings"].clear()
+d5, r = post("five", lifetime=75, renew=True)
+state["unlocked"] = 0
+open(os.path.join(d5, "funds-checked"), "w").write(str(int(time.time())))  # the periodic check is not due
+time.sleep(17)
+r = helper("serve", d5, maker_seed)
+check(r.get("offerWithdrawn") is True and "renewed" not in r and not state["listings"], "renewal due with no funds: withdrawn instead")
+state["unlocked"] = 10**6 * XMZ
 
 print("FAILED" if failed else "ALL PASSED")
 sys.exit(1 if failed else 0)

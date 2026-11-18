@@ -1086,7 +1086,7 @@ QString DexEngine::evmOrderRefusal(int chainId,const QString &coinAmount,const Q
     if (wei.isEmpty() || atoms.isEmpty()) return {}; // the form reports unreadable amounts itself
     return evmOfferRefusal(chainId,wei,atoms);
 }
-bool DexEngine::postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours,const QString &minXmzAmount) {
+bool DexEngine::postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours,const QString &minXmzAmount,bool renew) {
     const auto wei=atomic(coinAmount,DexChains::decimals(chainId)),atoms=atomic(xmzAmount,11);
     if (wei.isEmpty() || atoms.isEmpty() || lifetimeHours<1 || lifetimeHours>31*24) {m_marketMessage=tr("Check the amounts and how long the offer stays open (1 hour to 31 days).");emit evmMarketChanged();return false;}
     QString minAtoms;
@@ -1101,7 +1101,7 @@ bool DexEngine::postEvmOffer(int chainId,const QString &side,const QString &coin
     auto *job=m_evmMarkets.value(chainId);
     if (!job) return false;
     QByteArray seed=evmSeed();
-    const bool started=job->post(seed,chainId,side,wei,atoms,minAtoms,qint64(lifetimeHours)*3600);
+    const bool started=job->post(seed,chainId,side,wei,atoms,minAtoms,qint64(lifetimeHours)*3600,renew);
     m_marketMessage=started ? QString() : tr("The offer could not be posted now.");
     emit evmMarketChanged();return started;
 }
@@ -1142,6 +1142,10 @@ bool DexEngine::takeEvmOffer(const QString &listingId,const QString &xmzAmount) 
         emit evmMarketChanged();return started;
     }
     return false;
+}
+bool DexEngine::setEvmOfferRenew(const QString &folder,bool on) {
+    auto *job=evmMarketFor(folder);
+    return job && job->setRenew(folder,on);
 }
 bool DexEngine::cancelEvmOffer(const QString &folder) {
     auto *job=evmMarketFor(folder);
