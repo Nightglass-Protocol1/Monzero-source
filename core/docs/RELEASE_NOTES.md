@@ -1,3 +1,46 @@
+# Monzero v1.3.4 release notes
+
+Release label: v1.3.4
+
+Monzero v1.3.4 is a Linux wallet fix release. It changes no consensus rule: the chain, blocks, coins,
+wallets, seeds and addresses are the same as in v1.0.0 to v1.3.3, and **nobody has to upgrade to stay
+on the network**.
+
+## What is fixed
+
+- **"Transaction sanity check failed" when sending a large amount or "Send all".** A wallet holding
+  many small amounts (pool or mining payouts) could not send them in one go: a transaction spending
+  more than about 130 of them was refused before it was sent. Each spent amount hides among outputs
+  picked from the chain's recent ones, and on today's chain (a few outputs a block) the picks of
+  different amounts repeated too often for the wallet's own privacy check. The wallet now keeps
+  every amount's picks apart from the others in the same transaction, so these sends go out (split
+  into several transactions when there are very many amounts). Nothing changes for the network:
+  nodes accept these transactions as they are.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
+| Complete source | Exact repository commit and recursive pinned submodules |
+
+The DEX helper programs are the v1.1.0 ones except `monzero-dex-evm-helper`, rebuilt from
+`gui/dex-contracts/engine` in the complete source (unchanged since v1.3.3).
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.4 and start it; it uses the same wallet files, node data, trading
+keys and trading wallet. A trade running in v1.3.3 carries on in v1.3.4.
+
+---
+
 # Monzero v1.3.3 release notes
 
 Release label: v1.3.3
