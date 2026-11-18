@@ -310,7 +310,7 @@ final class DexBridge implements DexEngine.Listener {
                 .put("wallet", pick(engine.walletStatus(), "state", "balance", "unlocked", "address", "keysReady", "keysExist", "keysBusy", "tradeAccount", "solTradeAccount", "error"))
                 .put("markets", marketOut).put("trade", tradeOut).put("account", account).put("solAccount", solAccount)
                 // What this wallet can do beyond the first page protocol: the page offers only these
-                .put("features", new JSONArray().put("partial").put("long-offers").put("renew"));
+                .put("features", new JSONArray().put("partial").put("long-offers").put("renew").put("usdt-v2"));
     }
 
     private static final class Reply {

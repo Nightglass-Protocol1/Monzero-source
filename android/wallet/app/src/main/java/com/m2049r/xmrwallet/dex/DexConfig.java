@@ -154,8 +154,8 @@ final class DexConfig {
         if (chainId == 56) return "bnb-mainnet";
         if (chainId == 1) return "eth-mainnet";
         if (chainId == SOL_MAINNET) return "sol-mainnet";
-        if (chainId == SOL_USDT_MAINNET) return "sol-usdt-mainnet";
-        if (chainId == BSC_USDT_MAINNET) return "bnb-usdt-mainnet";
+        if (chainId == SOL_USDT_MAINNET) return "sol-usdt-v2-mainnet";
+        if (chainId == BSC_USDT_MAINNET) return "bnb-usdt-v2-mainnet";
         return "evm-regtest";   // test networks: no document, nothing of value
     }
 
