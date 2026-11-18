@@ -352,6 +352,8 @@
   function canPart() { var f = st.status && st.status.features; return !!(f && f.indexOf && f.indexOf("partial") >= 0); }
   // A wallet that may post offers open longer than a day (up to 31 days)
   function canLong() { var f = st.status && st.status.features; return !!(f && f.indexOf && f.indexOf("long-offers") >= 0); }
+  // A wallet that keeps an offer open: posts it again shortly before it expires, while it runs
+  function canRenew() { var f = st.status && st.status.features; return !!(f && f.indexOf && f.indexOf("renew") >= 0); }
   // How long a new offer stays open, in hours (0: not a valid choice)
   function lifeHours() {
     var max = canLong() ? 744 : 24, h;
@@ -379,6 +381,7 @@
       say("Posting your offer…");
       var offer = { chainId: chain().id, side: owner ? "buy-xmz" : "sell-xmz", coin: fromUnits(value, dec()), xmz: fromUnits(xmz, 11), hours: hours };
       if (min) offer.minXmz = fromUnits(min, 11);
+      if (canRenew() && st.form.renew) offer.renew = true;
       return api("/v1/offer", offer);
     }).then(function (r) {
       if (!r.ok) throw new Error(r.message || "The wallet could not post the offer. What you paid in stays in your trade account; you can send it back to " + own() + " below.");
@@ -600,6 +603,7 @@
     if (st.form.life === "c") h += '<label>Days (up to 31)<input id="tp-days" inputmode="decimal" autocomplete="off" placeholder="14" value="' + esc(st.form.days) + '"></label>';
     h += "</div>";
     var hrs = lifeHours();
+    if (canRenew()) h += '<label class="tp-check"><input type="checkbox" id="tp-renew"' + (st.form.renew ? " checked" : "") + "> Keep open: post it again at this price before it expires, while your wallet runs</label>";
     if (hrs > 24) h += '<p class="tp-note">Open until ' + esc(new Date(Date.now() + hrs * 3600000).toLocaleString()) + ". Keep your Monzero wallet running when you can: a taker is answered only while it runs.</p>";
     return h;
   }
@@ -668,7 +672,9 @@
         var open = (m.mine || []).filter(function (x) { return x.state === "open"; });
         if (open.length) h += "<h3>Your open offers</h3>" + '<ul class="tp-offers">' + open.map(function (x) {
           return "<li><span>" + (x.side === "buy-xmz" ? "Buy " : "Sell ") + "<strong>" + esc(x.xmz) + " XMZ</strong> for " + esc(x.coin) + " " + st.coin +
-            '</span><button class="button secondary" type="button" data-act="cancel" data-folder="' + esc(x.folder) + '">Cancel</button></li>';
+            (x.renew ? " · renews itself" : "") + "</span>" +
+            (canRenew() ? '<button class="button secondary" type="button" data-act="renew" data-on="' + (x.renew ? "0" : "1") + '" data-folder="' + esc(x.folder) + '">' + (x.renew ? "Stop renewing" : "Keep open") + "</button>" : "") +
+            '<button class="button secondary" type="button" data-act="cancel" data-folder="' + esc(x.folder) + '">Cancel</button></li>';
         }).join("") + "</ul>";
         else h += '<p class="tp-note">Paid in ' + st.coin + ' you no longer need? <button class="tp-link" type="button" data-act="return">Send it back to ' + own() + '</button></p>';
       }
@@ -701,6 +707,14 @@
     else if (act === "post") post();
     else if (act === "take") take(b.getAttribute("data-id"));
     else if (act === "cancel") cancel(b.getAttribute("data-folder"));
+    else if (act === "renew") {
+      var on = b.getAttribute("data-on") === "1";
+      api("/v1/renew", { folder: b.getAttribute("data-folder"), on: on }).then(function (r) {
+        if (!r.ok) throw new Error("That could not be changed now.");
+        say(on ? "This offer is kept open: your wallet posts it again before it expires, while it runs." : "This offer will now end when it expires.");
+        return refresh();
+      }).catch(fail);
+    }
     else if (act === "return") giveBack();
     else if (act === "topup") topUp();
     else if (act === "abandon") api("/v1/abandon", {}).then(function (r) {
@@ -718,6 +732,7 @@
     if (e.target.id === "tp-xmz") st.form.xmz = e.target.value;
     if (e.target.id === "tp-price") st.form.price = e.target.value;
     if (e.target.id === "tp-min") st.form.min = e.target.value;
+    if (e.target.id === "tp-renew") { st.form.renew = e.target.checked; return; }
     if (e.target.id === "tp-days") { st.form.days = e.target.value; render(); return; }
     if (e.target.id === "tp-life") { st.form.life = e.target.value; render(); return; }
     if (e.target.classList && e.target.classList.contains("tp-part")) st.parts[e.target.getAttribute("data-id")] = e.target.value;

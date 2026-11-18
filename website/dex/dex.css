@@ -335,3 +335,7 @@ a.trade-row:hover, a.trade-row:focus-visible { background: color-mix(in srgb, va
 @keyframes tp-pulse { 50% { opacity: .35; } }
 @keyframes tp-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .tp-track li.now .tp-dot, .tp-busy::before { animation: none; } }
+
+/* Keep open (auto-renew) choice in the post form */
+.tp-check{display:flex;gap:8px;align-items:flex-start;margin:.5rem 0;font-size:.92rem;line-height:1.35}
+.tp-check input{margin-top:.2rem;flex:none}
