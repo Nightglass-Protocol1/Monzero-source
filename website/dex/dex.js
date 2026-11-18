@@ -10,16 +10,18 @@
     XMZ: { name: "Monzero", usd: 0.01, dp: 4 },
     BNB: { name: "BNB", usd: 600, dp: 6 },
     ETH: { name: "Ethereum", usd: 3500, dp: 6 },
-    SOL: { name: "Solana", usd: 190, dp: 6 }
+    SOL: { name: "Solana", usd: 190, dp: 6 },
+    USDT: { name: "Tether (Solana)", usd: 1, dp: 2 }
   };
   // The pairs open to the public. Bitcoin and Litecoin are not listed while they are being
   // finished (12 Nov 2026); put them back here, in PAIRS below and in /dex/api.php when they open.
-  var COUNTERS = ["ETH", "BNB", "SOL"];
-  var STATUS = { ETH: "live", BNB: "live", SOL: "live" };
+  var COUNTERS = ["ETH", "BNB", "SOL", "USDT"];
+  // USDT (on Solana) shows as "soon" until /dex/api.php marks it live (when its limits are signed)
+  var STATUS = { ETH: "live", BNB: "live", SOL: "live", USDT: "soon" };
   // Project fee per pair: SOL dynamic 0.1%–0.5% (floor used for indicative math);
   // EVM (BNB/ETH) fee to be decided. See dex-mainnet/go-live for the live policy.
-  var FEES = { BNB: 0, ETH: 0, SOL: 0.001 };
-  var FEE_LABEL = { BNB: "TBD", ETH: "TBD", SOL: "0.1%–0.5%" };
+  var FEES = { BNB: 0, ETH: 0, SOL: 0.001, USDT: 0 };
+  var FEE_LABEL = { BNB: "TBD", ETH: "TBD", SOL: "0.1%–0.5%", USDT: "0" };
 
   var state = { dir: "xmz-to-coin", coin: "ETH" }; // dir: which way XMZ flows
   var $ = function (id) { return document.getElementById(id); };
@@ -163,9 +165,9 @@
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   if (!$("mode-pro")) return;
-  var PAIRS = ["ETH", "BNB", "SOL"];   // Bitcoin and Litecoin are not listed for now (see COUNTERS above)
-  var NAME = { BTC: "Bitcoin", ETH: "Ethereum", BNB: "BNB", LTC: "Litecoin", SOL: "Solana" };
-  var EXPLORER = { BTC: "https://mempool.space/tx/", ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/", LTC: "https://litecoinspace.org/tx/", SOL: "https://explorer.solana.com/tx/" };
+  var PAIRS = ["ETH", "BNB", "SOL", "USDT"];   // Bitcoin and Litecoin are not listed for now (see COUNTERS above)
+  var NAME = { BTC: "Bitcoin", ETH: "Ethereum", BNB: "BNB", LTC: "Litecoin", SOL: "Solana", USDT: "USDT (Solana)" };
+  var EXPLORER = { BTC: "https://mempool.space/tx/", ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/", LTC: "https://litecoinspace.org/tx/", SOL: "https://explorer.solana.com/tx/", USDT: "https://explorer.solana.com/tx/" };
   // A recorded trade's claim on its chain's explorer (Solana's test cluster is named in the link)
   function claimLink(p) { return EXPLORER[pro.coin] + encodeURIComponent(p.tx) + (p.chainId === 501000102 ? "?cluster=devnet" : ""); }
   // Bitcoin and Litecoin offers give the coin in satoshis/litoshis (`coin`); EVM offers in wei (`value`, hex)
@@ -179,7 +181,7 @@
   function places(p) { return p > 0 ? Math.min(14, Math.max(2, 3 - Math.floor(Math.log(p) / Math.LN10))) : 2; }
   function price(p) { return fmt(p, places(p)); }
   // The coin's smallest unit: wei (18 decimals), or lamports on Solana (9)
-  function wei(hex) { return parseInt(hex, 16) / (pro.coin === "SOL" ? 1e9 : 1e18); }
+  function wei(hex) { return parseInt(hex, 16) / (pro.coin === "USDT" ? 1e6 : pro.coin === "SOL" ? 1e9 : 1e18); }
   function coinOf(l) { return UTXO[pro.coin] ? Number(l.coin) / 1e8 : wei(l.value); }
   function coins(atoms) { return Number(atoms) / 1e11; }
   function pDot(t) { return '<span class="cdot" data-c="' + t + '">' + t.slice(0, 1) + '</span>'; }

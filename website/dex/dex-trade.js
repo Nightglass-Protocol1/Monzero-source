@@ -26,6 +26,12 @@
   else CHAINS.SOL = /[?&]sol=local/.test(location.search)
     ? { id: 501000103, name: "Solana (local test)", control: null, sol: true, rpc: "http://127.0.0.1:18899", tx: "https://solscan.io/tx/" }
     : { id: 501000102, name: "Solana Devnet (test network)", control: null, sol: true, rpc: "https://api.devnet.solana.com", tx: "https://solscan.io/tx/", txEnd: "?cluster=devnet" };
+  // USDT on Solana (SPL): its own market and limits; the wallet's Solana trade account holds it.
+  // On a local copy, ?usdt=<mint> with ?sol=local trades a test mint on the local validator.
+  if (!TEST) CHAINS.USDT = { id: 501000201, name: "Solana (USDT)", control: "sol-usdt-mainnet", sol: true, rpc: "https://solana-rpc.publicnode.com", tx: "https://solscan.io/tx/",
+                             token: { mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 } };
+  else (function () { var m = /[?&]usdt=([1-9A-HJ-NP-Za-km-z]{32,44})/.exec(location.search);
+    if (m && /[?&]sol=local/.test(location.search)) CHAINS.USDT = { id: 501000203, name: "Solana USDT (local test)", control: null, sol: true, rpc: "http://127.0.0.1:18899", tx: "https://solscan.io/tx/", token: { mint: m[1], decimals: 6 } }; })();
   // On an Android phone the wallet is the Monzero app on the same phone: its DEX link answers on
   // the same loopback ports, and it asks the user through notifications (connect, password, approve)
   var PHONE = /Android/i.test(navigator.userAgent || "");
@@ -64,7 +70,8 @@
   // What differs on Solana: the coin has 9 decimals (lamports), the user's own wallet is a Solana
   // wallet such as Phantom, and the coin is paid in to the wallet's Solana trade account
   function sol() { var c = chain(); return !!(c && c.sol); }
-  function dec() { return sol() ? 9 : 18; }
+  function tok() { var c = chain(); return !!(c && c.token); }
+  function dec() { return tok() ? chain().token.decimals : sol() ? 9 : 18; }
   function own() { return sol() ? "Phantom" : "MetaMask"; }
   function ownAccount() { return st.link ? (sol() ? st.link.solAccount : st.link.account) || "" : ""; }
   function payIn() { var w = st.status.wallet; return sol() ? w.solTradeAccount : w.tradeAccount; }
@@ -123,6 +130,12 @@
       .then(function (r) { if (r.error) throw new Error("Solana: " + (r.error.message || "request failed")); return r.result; });
   }
   function solBalance(account) { return solRpc("getBalance", [account, { commitment: "confirmed" }]).then(function (r) { return BigInt(r.value); }); }
+  // Base units of the market's token (USDT) an account holds, over its token accounts
+  function tokenBalance(account) {
+    return solRpc("getTokenAccountsByOwner", [account, { mint: chain().token.mint }, { encoding: "jsonParsed", commitment: "confirmed" }]).then(function (r) {
+      return (r.value || []).reduce(function (n, a) { return n + BigInt(a.account.data.parsed.info.tokenAmount.amount || "0"); }, 0n);
+    });
+  }
   // The Solana library the site already hosts (same origin), loaded only when SOL is traded
   function loadWeb3() {
     if (window.solanaWeb3) return Promise.resolve();
@@ -154,6 +167,39 @@
       return id;
     });
   }
+  // USDT from the user's own token account to the trade account's (opened first if it has none,
+  // paid by the user: about 0.002 SOL once), signed and sent by Phantom
+  function tokenSend(to, units) {
+    var from = st.link.solAccount, p = solProvider(), t = chain().token;
+    return loadWeb3().then(function () { return p.connect(); }).then(function (r) {
+      var now = r && r.publicKey ? r.publicKey.toString() : "";
+      if (now && now !== from) throw new Error("Phantom is on another account than the one you connected (" + short(from) + "). Switch back, or disconnect and connect again.");
+      return solRpc("getLatestBlockhash", [{ commitment: "confirmed" }]);
+    }).then(function (b) {
+      var web3 = window.solanaWeb3, payer = new web3.PublicKey(from), dest = new web3.PublicKey(to), mint = new web3.PublicKey(t.mint);
+      var TOKEN = new web3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), ATA = new web3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+      var ata = function (owner) { return web3.PublicKey.findProgramAddressSync([owner.toBuffer(), TOKEN.toBuffer(), mint.toBuffer()], ATA)[0]; };
+      var src = ata(payer), dst = ata(dest);
+      var open = new web3.TransactionInstruction({ programId: ATA, data: Uint8Array.from([1]), keys: [
+        { pubkey: payer, isSigner: true, isWritable: true }, { pubkey: dst, isSigner: false, isWritable: true },
+        { pubkey: dest, isSigner: false, isWritable: false }, { pubkey: mint, isSigner: false, isWritable: false },
+        { pubkey: web3.SystemProgram.programId, isSigner: false, isWritable: false }, { pubkey: TOKEN, isSigner: false, isWritable: false }] });
+      var data = new Uint8Array(10); data[0] = 12;   // TransferChecked: amount (u64, little-endian), decimals
+      var v = BigInt(units); for (var i = 0; i < 8; i++) { data[1 + i] = Number(v & 255n); v >>= 8n; }
+      data[9] = t.decimals;
+      var move = new web3.TransactionInstruction({ programId: TOKEN, data: data, keys: [
+        { pubkey: src, isSigner: false, isWritable: true }, { pubkey: mint, isSigner: false, isWritable: false },
+        { pubkey: dst, isSigner: false, isWritable: true }, { pubkey: payer, isSigner: true, isWritable: false }] });
+      var tx = new web3.Transaction().add(open).add(move);
+      tx.feePayer = payer; tx.recentBlockhash = b.value.blockhash;
+      if (typeof p.signAndSendTransaction === "function") return p.signAndSendTransaction(tx);
+      return p.request({ method: "signAndSendTransaction", params: { message: b58encode(tx.serializeMessage()) } });
+    }).then(function (r) {
+      var id = r && (r.signature || r);
+      if (typeof id !== "string" || !id) throw new Error("Phantom did not return the payment's id.");
+      return id;
+    });
+  }
   function solConfirmed(signature) {
     var tries = 0;
     function once() {
@@ -171,8 +217,9 @@
     return once();
   }
   // One payment into the wallet's trade account, from the user's own wallet of this chain
-  function pay(to, amount) {
-    if (sol()) return solSend(to, amount).then(function (sig) { st.paying = sig; return sig; }).then(function (sig) {
+  // (`token`: in the market's token, USDT; else in the chain's coin)
+  function pay(to, amount, token) {
+    if (sol()) return (token ? tokenSend(to, amount) : solSend(to, amount)).then(function (sig) { st.paying = sig; return sig; }).then(function (sig) {
       say("Payment sent from Phantom. Waiting for the network to confirm it (a few seconds)…");
       return solConfirmed(sig);
     }).then(function (r) { st.paying = ""; return r; }, function (e) { st.paying = ""; throw e; });
@@ -207,22 +254,44 @@
     }
     return once();
   }
-  // Pay into the wallet's trade account whatever it still lacks for this trade
+  // Pay into the wallet's trade account whatever it still lacks for this trade (in the chain's coin)
   function fund(need) {
     var acct = payIn();
     if (!acct) return Promise.reject(new Error("The wallet has not shown its " + st.coin + " trade account yet. Wait a moment and try again."));
     var held = sol() ? solBalance(acct) : onChain().then(function () { return eth("eth_getBalance", [acct, "latest"]); }).then(function (h) { return BigInt(h); });
+    var coin = tok() ? "SOL" : st.coin, places = tok() ? 9 : dec();
     return held.then(function (have) {
       var missing = need - have;
       if (missing <= 0n) return null;
-      say(own() + " will ask you to send " + fromUnits(missing, dec(), 8) + " " + st.coin + " to your trade account in the Monzero wallet.");
+      say(own() + " will ask you to send " + fromUnits(missing, places, 8) + " " + coin + (tok() ? " (network fees)" : "") + " to your trade account in the Monzero wallet.");
       return pay(acct, missing);
+    });
+  }
+  // The same for the market's token (USDT)
+  function fundToken(need) {
+    var acct = payIn();
+    if (!acct) return Promise.reject(new Error("The wallet has not shown its Solana trade account yet. Wait a moment and try again."));
+    return tokenBalance(acct).then(function (have) {
+      var missing = need - have;
+      if (missing <= 0n) return null;
+      say(own() + " will ask you to send " + fromUnits(missing, dec(), 6) + " USDT to your trade account in the Monzero wallet.");
+      return pay(acct, missing, true);
+    });
+  }
+  // What a trade needs in the trade account: the coin (for a buyer) and the network fees; for a
+  // USDT trade the USDT and the fees (in SOL) are two payments
+  function fundFor(owner, value) {
+    return reserve(owner).then(function (gas) {
+      if (!tok()) return fund(owner ? value + gas : gas);
+      return fund(gas).then(function () { return owner ? fundToken(value) : null; });
     });
   }
   function reserve(owner) {
     // Solana: fixed fees. The buyer's reserve covers the swap account's rent (returned when the
     // swap closes), fees and the minimum an account must keep; the seller's keeps its account
     // open while it pays for its claim. The same figures as the wallet's engine.
+    // A USDT trade also opens token accounts (a vault for the buyer, a USDT account for the seller)
+    if (tok()) return Promise.resolve(owner ? 10000000n : 3600000n);
     if (sol()) return Promise.resolve(owner ? 4500000n : 1500000n);
     // On the trade's own network: the fee there is what counts
     // Price plus tip, doubled: the wallet pays a tip on top of the base fee, and a reserve that is too
@@ -377,7 +446,7 @@
     var why = checks(owner, value, xmz);
     if (why) return fail(new Error(why));
     st.busy = "post"; say("Preparing…");
-    reserve(owner).then(function (gas) { return fund(owner ? value + gas : gas); }).then(function () {
+    fundFor(owner, value).then(function () {
       say("Posting your offer…");
       var offer = { chainId: chain().id, side: owner ? "buy-xmz" : "sell-xmz", coin: fromUnits(value, dec()), xmz: fromUnits(xmz, 11), hours: hours };
       if (min) offer.minXmz = fromUnits(min, 11);
@@ -410,7 +479,7 @@
     var why = checks(owner, value, xmz);
     if (why) return fail(new Error(why));
     st.busy = "take"; say("Preparing…");
-    reserve(owner).then(function (gas) { return fund(owner ? value + gas : gas); }).then(function () {
+    fundFor(owner, value).then(function () {
       say("Asking the wallet to take the offer…");
       return api("/v1/refresh", { pair: st.coin + "/XMZ" });
     }).then(untilIdle).then(function () { return api("/v1/take", typed ? { id: id, xmz: fromUnits(xmz, 11) } : { id: id }); }).then(function (r) {
