@@ -11,17 +11,18 @@
     BNB: { name: "BNB", usd: 600, dp: 6 },
     ETH: { name: "Ethereum", usd: 3500, dp: 6 },
     SOL: { name: "Solana", usd: 190, dp: 6 },
-    USDT: { name: "Tether (Solana)", usd: 1, dp: 2 }
+    USDT: { name: "Tether (Solana)", usd: 1, dp: 2 },
+    "USDT-BSC": { name: "Tether (BNB Chain)", usd: 1, dp: 2 }
   };
   // The pairs open to the public. Bitcoin and Litecoin are not listed while they are being
   // finished (12 Nov 2026); put them back here, in PAIRS below and in /dex/api.php when they open.
-  var COUNTERS = ["ETH", "BNB", "SOL", "USDT"];
+  var COUNTERS = ["ETH", "BNB", "SOL", "USDT", "USDT-BSC"];
   // USDT (on Solana) shows as "soon" until /dex/api.php marks it live (when its limits are signed)
-  var STATUS = { ETH: "live", BNB: "live", SOL: "live", USDT: "soon" };
+  var STATUS = { ETH: "live", BNB: "live", SOL: "live", USDT: "soon", "USDT-BSC": "soon" };
   // Project fee per pair: SOL dynamic 0.1%–0.5% (floor used for indicative math);
   // EVM (BNB/ETH) fee to be decided. See dex-mainnet/go-live for the live policy.
-  var FEES = { BNB: 0, ETH: 0, SOL: 0.001, USDT: 0 };
-  var FEE_LABEL = { BNB: "TBD", ETH: "TBD", SOL: "0.1%–0.5%", USDT: "0" };
+  var FEES = { BNB: 0, ETH: 0, SOL: 0.001, USDT: 0, "USDT-BSC": 0 };
+  var FEE_LABEL = { BNB: "TBD", ETH: "TBD", SOL: "0.1%–0.5%", USDT: "0", "USDT-BSC": "0" };
 
   var state = { dir: "xmz-to-coin", coin: "ETH" }; // dir: which way XMZ flows
   var $ = function (id) { return document.getElementById(id); };
@@ -165,9 +166,9 @@
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   if (!$("mode-pro")) return;
-  var PAIRS = ["ETH", "BNB", "SOL", "USDT"];   // Bitcoin and Litecoin are not listed for now (see COUNTERS above)
-  var NAME = { BTC: "Bitcoin", ETH: "Ethereum", BNB: "BNB", LTC: "Litecoin", SOL: "Solana", USDT: "USDT (Solana)" };
-  var EXPLORER = { BTC: "https://mempool.space/tx/", ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/", LTC: "https://litecoinspace.org/tx/", SOL: "https://explorer.solana.com/tx/", USDT: "https://explorer.solana.com/tx/" };
+  var PAIRS = ["ETH", "BNB", "SOL", "USDT", "USDT-BSC"];   // Bitcoin and Litecoin are not listed for now (see COUNTERS above)
+  var NAME = { BTC: "Bitcoin", ETH: "Ethereum", BNB: "BNB", LTC: "Litecoin", SOL: "Solana", USDT: "USDT (Solana)", "USDT-BSC": "USDT (BNB Chain)" };
+  var EXPLORER = { BTC: "https://mempool.space/tx/", ETH: "https://etherscan.io/tx/", BNB: "https://bscscan.com/tx/", LTC: "https://litecoinspace.org/tx/", SOL: "https://explorer.solana.com/tx/", USDT: "https://explorer.solana.com/tx/", "USDT-BSC": "https://bscscan.com/tx/" };
   // A recorded trade's claim on its chain's explorer (Solana's test cluster is named in the link)
   function claimLink(p) { return EXPLORER[pro.coin] + encodeURIComponent(p.tx) + (p.chainId === 501000102 ? "?cluster=devnet" : ""); }
   // Bitcoin and Litecoin offers give the coin in satoshis/litoshis (`coin`); EVM offers in wei (`value`, hex)

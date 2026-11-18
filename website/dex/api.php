@@ -38,6 +38,7 @@ $cfg = [
         ['pair' => 'XMZ/BNB',  'status' => 'live', 'fee' => 'tbd'],
         ['pair' => 'XMZ/SOL',  'status' => 'live', 'fee' => '0.1%-0.5%'],
         ['pair' => 'XMZ/USDT', 'status' => 'soon', 'fee' => '0'],
+        ['pair' => 'XMZ/USDT-BSC', 'status' => 'soon', 'fee' => '0'],
     ],
 ];
 

@@ -26,6 +26,9 @@
   else CHAINS.SOL = /[?&]sol=local/.test(location.search)
     ? { id: 501000103, name: "Solana (local test)", control: null, sol: true, rpc: "http://127.0.0.1:18899", tx: "https://solscan.io/tx/" }
     : { id: 501000102, name: "Solana Devnet (test network)", control: null, sol: true, rpc: "https://api.devnet.solana.com", tx: "https://solscan.io/tx/", txEnd: "?cluster=devnet" };
+  // USDT on BNB Smart Chain (BEP-20 BSC-USD): its own market and limits, traded on chain 56 (`net`)
+  if (!TEST) CHAINS["USDT-BSC"] = { id: 100000056, net: 56, name: "BNB Smart Chain (USDT)", control: "bnb-usdt-mainnet", tx: "https://bscscan.com/tx/",
+                                   evmToken: { address: "0x55d398326f99059fF775485246999027B3197955", decimals: 18 }, add: CHAINS.BNB.add };
   // USDT on Solana (SPL): its own market and limits; the wallet's Solana trade account holds it.
   // On a local copy, ?usdt=<mint> with ?sol=local trades a test mint on the local validator.
   if (!TEST) CHAINS.USDT = { id: 501000201, name: "Solana (USDT)", control: "sol-usdt-mainnet", sol: true, rpc: "https://solana-rpc.publicnode.com", tx: "https://solscan.io/tx/",
@@ -71,7 +74,8 @@
   // wallet such as Phantom, and the coin is paid in to the wallet's Solana trade account
   function sol() { var c = chain(); return !!(c && c.sol); }
   function tok() { var c = chain(); return !!(c && c.token); }
-  function dec() { return tok() ? chain().token.decimals : sol() ? 9 : 18; }
+  function evmTok() { var c = chain(); return !!(c && c.evmToken); }
+  function dec() { return tok() ? chain().token.decimals : evmTok() ? chain().evmToken.decimals : sol() ? 9 : 18; }
   function own() { return sol() ? "Phantom" : "MetaMask"; }
   function ownAccount() { return st.link ? (sol() ? st.link.solAccount : st.link.account) || "" : ""; }
   function payIn() { var w = st.status.wallet; return sol() ? w.solTradeAccount : w.tradeAccount; }
@@ -233,7 +237,7 @@
   // ---- MetaMask
   function eth(method, params) { return window.ethereum.request({ method: method, params: params || [] }); }
   function onChain() {
-    var want = hex(BigInt(chain().id));
+    var want = hex(BigInt(chain().net || chain().id));
     return eth("eth_chainId").then(function (now) {
       if (BigInt(now) === BigInt(want)) return true;
       return eth("wallet_switchEthereumChain", [{ chainId: want }]).catch(function (e) {
@@ -259,11 +263,11 @@
     var acct = payIn();
     if (!acct) return Promise.reject(new Error("The wallet has not shown its " + st.coin + " trade account yet. Wait a moment and try again."));
     var held = sol() ? solBalance(acct) : onChain().then(function () { return eth("eth_getBalance", [acct, "latest"]); }).then(function (h) { return BigInt(h); });
-    var coin = tok() ? "SOL" : st.coin, places = tok() ? 9 : dec();
+    var coin = tok() ? "SOL" : evmTok() ? "BNB" : st.coin, places = tok() ? 9 : evmTok() ? 18 : dec();
     return held.then(function (have) {
       var missing = need - have;
       if (missing <= 0n) return null;
-      say(own() + " will ask you to send " + fromUnits(missing, places, 8) + " " + coin + (tok() ? " (network fees)" : "") + " to your trade account in the Monzero wallet.");
+      say(own() + " will ask you to send " + fromUnits(missing, places, 8) + " " + coin + (tok() || evmTok() ? " (network fees)" : "") + " to your trade account in the Monzero wallet.");
       return pay(acct, missing);
     });
   }
@@ -280,8 +284,25 @@
   }
   // What a trade needs in the trade account: the coin (for a buyer) and the network fees; for a
   // USDT trade the USDT and the fees (in SOL) are two payments
+  // The same for USDT on BNB Smart Chain: a BEP-20 transfer from MetaMask
+  function fundEvmToken(need) {
+    var acct = payIn(), t = chain().evmToken;
+    if (!acct) return Promise.reject(new Error("The wallet has not shown its trade account yet. Wait a moment and try again."));
+    var pad = function (h) { return h.replace(/^0x/, "").toLowerCase().padStart(64, "0"); };
+    return onChain().then(function () { return eth("eth_call", [{ to: t.address, data: "0x70a08231" + pad(acct) }, "latest"]); }).then(function (h) {
+      var missing = need - BigInt(h);
+      if (missing <= 0n) return null;
+      say("MetaMask will ask you to send " + fromUnits(missing, t.decimals, 6) + " USDT (BNB Smart Chain) to your trade account in the Monzero wallet.");
+      return eth("eth_sendTransaction", [{ from: st.link.account, to: t.address, data: "0xa9059cbb" + pad(acct) + pad(missing.toString(16)) }]).then(function (tx) {
+        st.paying = tx;
+        say("Payment sent from MetaMask. Waiting for the network to confirm it (usually seconds)…");
+        return receipt(tx).then(function (r) { st.paying = ""; return r; }, function (e) { st.paying = ""; throw e; });
+      });
+    });
+  }
   function fundFor(owner, value) {
     return reserve(owner).then(function (gas) {
+      if (evmTok()) return fund(gas).then(function () { return owner ? fundEvmToken(value) : null; });
       if (!tok()) return fund(owner ? value + gas : gas);
       return fund(gas).then(function () { return owner ? fundToken(value) : null; });
     });
@@ -726,7 +747,7 @@
         : "One more step: your Monzero wallet asks you to choose a trading password.") + '</p>' +
         (w.keysBusy ? "" : '<button class="button primary" type="button" data-act="unlock">' + (w.keysExist ? "Unlock in the wallet" : "Set it up in the wallet") + "</button>");
       else if (live) h += tradeHTML(t);
-      else if (tok() && !(s.markets || {})[st.coin]) h += '<p class="tp-note">Trading USDT needs the newest Monzero wallet (Linux 1.3.2 or Android 1.1.9). <a href="/download/">Download it</a>, then connect again.</p>';
+      else if ((tok() || evmTok()) && !(s.markets || {})[st.coin]) h += '<p class="tp-note">Trading USDT needs the newest Monzero wallet (Linux 1.3.2 or Android 1.1.9). <a href="/download/">Download it</a>, then connect again.</p>';
       else {
         var lim = st.limits[st.coin];
         h += '<div class="tp-side" role="group"><button type="button" data-act="side" data-side="buy" class="' + (st.side === "buy" ? "on" : "") + '">Buy XMZ</button>' +
