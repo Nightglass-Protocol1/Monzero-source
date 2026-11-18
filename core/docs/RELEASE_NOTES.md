@@ -10,13 +10,12 @@ upgrade to stay on the network**.
 
 - **XMZ/USDT.** Two new markets on the Exchange page: **USDT (SOL)**, Tether on Solana (SPL), and
   **USDT (BNB)**, Tether on BNB Smart Chain (BEP-20). Pay in USDT, or sell XMZ for USDT, with the
-  same atomic swaps as the other pairs. **Network fees are paid in USDT**: the project's relays pay
-  the Solana or BNB Smart Chain fee and take a small USDT fee instead (on Solana about 0.5 USDT to
-  buy, most of it coming back as SOL after the trade, and about 0.2 USDT from what you receive when
-  you sell; on BNB Smart Chain about 0.05 to 0.2 USDT when you sell). On Solana neither side needs
-  SOL; on BNB Smart Chain a buyer still needs a little BNB. If no relay answers, the wallet asks for
-  a little SOL or BNB instead. There is no ERC-20 USDT on Ethereum (its fees are too high). Each USDT
-  market opens when its signed limits document is published.
+  same atomic swaps as the other pairs. A USDT trader keeps a little SOL (about 0.015) or BNB in the
+  trade account for network fees. The wallet is also ready for the project's relays to pay those
+  fees and take a small USDT fee instead (then a Solana trader needs no SOL, and a BNB Smart Chain
+  seller no BNB); this is switched on later, when the relays have fee accounts. There is no ERC-20
+  USDT on Ethereum (its fees are too high). Each USDT market opens when its signed limits document
+  is published.
 - **Keep open.** An order can renew itself: shortly before it expires the wallet posts it again at
   the same price for the same time, while the wallet runs. Switch it on in the order form, or with
   "Keep open" on an open order.
