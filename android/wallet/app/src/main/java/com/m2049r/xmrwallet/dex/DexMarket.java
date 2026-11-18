@@ -151,6 +151,14 @@ final class DexMarket {
                 final String text = why == null ? "" : new String(why, java.nio.charset.StandardCharsets.UTF_8);
                 f.detail = text.length() > 200 ? text.substring(0, 200) : text;
             }
+            // A take the maker refused: it ended there, nothing was locked
+            final File refused = new File(path, "refused");
+            if ("open".equals(f.state) && !maker && refused.isFile()) {
+                f.state = "refused";
+                final byte[] why = DexFiles.read(refused, 400);
+                final String text = why == null ? "" : new String(why, java.nio.charset.StandardCharsets.UTF_8);
+                f.detail = text.length() > 200 ? text.substring(0, 200) : text;
+            }
             folders.add(f);
         }
     }
@@ -252,6 +260,16 @@ final class DexMarket {
     }
 
     boolean cancel(String seedHex, String dir) {
+        // A take still waiting for the maker's answer: nothing of it is locked, so we just stop
+        // waiting (no helper step runs meanwhile: the market is idle). Its folder keeps a mark.
+        for (Folder f : folders)
+            if (f.path.equals(dir) && f.kind.equals("take") && f.state.equals("open")) {
+                if (busy || new File(dir, "journal.json").exists()) return false;
+                if (!DexFiles.write(new File(dir, "abandoned"), "stopped waiting for the maker\n")) return false;
+                f.state = "cancelled";
+                listener.marketChanged();
+                return true;
+            }
         boolean ours = false;
         for (Folder f : folders) ours = ours || (f.path.equals(dir) && f.kind.equals("offer") && f.state.equals("open"));
         if (busy || !ours) return false;
@@ -376,6 +394,8 @@ final class DexMarket {
                             else if (renewed) f.state = "renewed";
                             else if (r.optBoolean("offerWithdrawn")) f.state = "withdrawn";
                             else if (r.optBoolean("expired")) f.state = "expired";
+                            else if (r.optBoolean("refusedFinal")) f.state = "refused";
+                            else if (r.optBoolean("stopped")) f.state = "cancelled";
                             final String refused = r.opt("refused") instanceof String ? r.optString("refused")
                                     : r.optBoolean("offerWithdrawn") ? r.optString("reason") : "";
                             f.detail = refused.length() > 200 ? refused.substring(0, 200) : refused;
