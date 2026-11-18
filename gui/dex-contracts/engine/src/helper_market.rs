@@ -49,6 +49,9 @@ pub struct OfferParams {
     /// for the same time (while the wallet runs and can still pay for it)
     #[serde(default)]
     pub renew: bool,
+    /// What the offer trades: "USDT/XMZ" on Solana; absent, the chain's own coin
+    #[serde(default)]
+    pub pair: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -314,7 +317,11 @@ pub async fn post(dir: &Path, cfg: &TickConfig, relays: &[String], params: &Offe
         schema: if min_xmz.is_some() { PARTIAL_SCHEMA } else { LISTING_SCHEMA }.into(),
         min_xmz,
         id,
-        pair: chain_kind.pair().into(),
+        pair: match &params.pair {
+            Some(p) if chain_kind.asset_of(p).is_some() => p.clone(),
+            Some(p) => return Err(format!("{p} is not traded on this chain")),
+            None => chain_kind.pair().into(),
+        },
         chain_id: params.chain_id,
         contract,
         side: params.side,
@@ -528,6 +535,7 @@ async fn renew(dir: &Path, file: &mut MakerFile, cfg: &TickConfig, relays: &[Str
             lifetime_secs: l.expires_at.saturating_sub(l.created_at).clamp(1, MAX_LIFETIME_V2),
             min_xmz_atoms: if l.is_partial() { l.min_xmz.map(|m| m.to_string()) } else { None },
             renew: true,
+            pair: Some(l.pair.clone()),
         };
         let local = (Chain::from_id(l.chain_id) == Some(Chain::Local)).then_some(l.contract);
         post(&next, cfg, relays, &params, local).await?;
