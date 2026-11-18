@@ -18,7 +18,7 @@
   // finished (12 Nov 2026); put them back here, in PAIRS below and in /dex/api.php when they open.
   var COUNTERS = ["ETH", "BNB", "SOL", "USDT", "USDT-BSC"];
   // USDT (on Solana) shows as "soon" until /dex/api.php marks it live (when its limits are signed)
-  var STATUS = { ETH: "live", BNB: "live", SOL: "live", USDT: "soon", "USDT-BSC": "soon" };
+  var STATUS = { ETH: "live", BNB: "live", SOL: "live", USDT: "live", "USDT-BSC": "live" };
   // Project fee per pair: SOL dynamic 0.1%–0.5% (floor used for indicative math);
   // EVM (BNB/ETH) fee to be decided. See dex-mainnet/go-live for the live policy.
   var FEES = { BNB: 0, ETH: 0, SOL: 0.001, USDT: 0, "USDT-BSC": 0 };
