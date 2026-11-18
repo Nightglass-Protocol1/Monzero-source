@@ -456,3 +456,89 @@ async fn a_usdt_trade_needs_no_sol_on_either_side_with_a_sponsoring_relay() {
     // The deposits the relay fronted came back to the buyer when the swap closed
     assert!(balance(&url, &owner.account()).await >= 4_000_000, "the buyer holds the returned deposits");
 }
+
+/// USDT with relays listed that do not sponsor (their fee payers hold no SOL, as on mainnet until
+/// funded): the wallet uses none of them, and the trade runs on SOL fees with the fee advance.
+/// The released v1.3.2 used every listed relay: the buyer was asked for USDT only and its lock
+/// then failed ("no relay pays"), so the trade stalled. Checked first below.
+///   + MONZERO_SOL_UNFUNDED_RELAY=<a relay whose Solana sponsor key holds no SOL>
+#[tokio::test]
+async fn a_usdt_trade_with_relays_that_do_not_sponsor_runs_on_sol_fees() {
+    let Some((url, program)) = setup() else { return };
+    let (Ok(mint), Ok(bank), Ok(relay)) = (std::env::var("MONZERO_SOL_USDT_MINT"), std::env::var("MONZERO_SOL_USDT_BANK"), std::env::var("MONZERO_SOL_UNFUNDED_RELAY")) else { return };
+    let _chain = CHAIN.lock().await;
+    let mint = sol::from_base58(&mint).unwrap();
+    sol::set_local_usdt_mint(mint);
+    let bank = ed25519_dalek::SigningKey::from_bytes(&hex::decode(bank).unwrap().try_into().unwrap());
+    assert_eq!(monzero_dex_evm::sponsor::info(&relay).await, Some(Default::default()), "the relay answers, offering nothing");
+    let listed = vec![relay.clone(), "http://127.0.0.1:9".to_string()];
+    let sponsors = monzero_dex_evm::sponsor::trade_sponsors(&listed, true, true).await;
+    assert!(sponsors.is_empty(), "no listed relay pays: {sponsors:?}");
+
+    let units = 25_000_000u64;
+    let timing = Timing { xmz_confirmations: 10, xmz_lock_budget: 120, owner_refund_margin: 120, claim_margin: 120 };
+
+    // Now: the buyer holds USDT and SOL for fees, the seller nothing (the buyer's advance pays its claim)
+    let (owner, claimer) = agree_asset(&url, program, 9, timing, 1_000_000, 0, sol::asset_address(&mint), units).await;
+    let bank_sol = balance(&url, &bank.verifying_key().to_bytes()).await;
+    sol::pay_out_with(&url, &bank, &owner.account(), bank_sol - 30_000_000, Some(mint)).await.unwrap().unwrap();
+    for _ in 0..60 {
+        if sol::token_balance(&url, &owner.account(), &mint).await.unwrap() >= units {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let owner_tokens = sol::token_balance(&url, &owner.account(), &mint).await.unwrap();
+    assert!(owner_tokens >= units);
+    assert_eq!(balance(&url, &claimer.account()).await, 0, "the seller holds no SOL");
+    let (mut owner_state, mut claimer_state) = (None, None);
+    for round in 0..90 {
+        // As the helper does each step: the sponsors asked again; none, so the usual fee advance
+        let sponsors = monzero_dex_evm::sponsor::trade_sponsors(&listed, true, true).await;
+        let advance = |give| if !sponsors.is_empty() { GasAdvance::Off } else if give { GasAdvance::Give } else { GasAdvance::Expect };
+        let mut o = Driver::resume(&owner.seed, &owner.key, AnyChain::Sol(owner.chain(&url, program)).with_sponsors(sponsors.clone()), owner.xmz.clone(), FileJournal(owner.journal.clone())).unwrap()
+            .with_gas_advance(advance(true));
+        let mut c = Driver::resume(&claimer.seed, &claimer.key, AnyChain::Sol(claimer.chain(&url, program)).with_sponsors(sponsors.clone()), claimer.xmz.clone(), FileJournal(claimer.journal.clone())).unwrap()
+            .with_gas_advance(advance(false));
+        owner_state = Some(o.tick().await.unwrap());
+        claimer_state = Some(c.tick().await.unwrap());
+        println!("round {round}: owner {} | claimer {}", owner_state.as_ref().unwrap().stage(), claimer_state.as_ref().unwrap().stage());
+        if owner_state.as_ref().unwrap().is_done() && claimer_state.as_ref().unwrap().is_done() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    assert_eq!(owner_state, Some(RoleState::Owner(OwnerState::Done(Outcome::Swapped))));
+    assert_eq!(claimer_state, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
+    assert_eq!(sol::token_balance(&url, &claimer.account(), &mint).await.unwrap(), units, "the seller got all 25 USDT (no relay fee)");
+    assert_eq!(sol::token_balance(&url, &owner.account(), &mint).await.unwrap(), owner_tokens - units);
+    assert_eq!(owner.xmz.ledger.lock().unwrap().swept_by, Some("owner"));
+
+    // The released v1.3.2 behaviour, for the record: every listed relay counted, so a buyer holding
+    // only USDT went to lock through a relay that refused
+    let (old_owner, _) = agree_asset(&url, program, 8, timing, 0, 0, sol::asset_address(&mint), units).await;
+    // (its USDT: what the first buyer has left; no SOL)
+    let first = sol::account_key(&owner.key.to_bytes().0);
+    let keep = balance(&url, &owner.account()).await;
+    sol::pay_out_with(&url, &first, &old_owner.account(), keep, Some(mint)).await.unwrap().expect("USDT to send");
+    for _ in 0..60 {
+        if sol::token_balance(&url, &old_owner.account(), &mint).await.unwrap() >= units {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(balance(&url, &old_owner.account()).await < monzero_dex_evm::sponsor::SOL_LOCK_FRONT, "that buyer holds USDT and too little SOL to lock on its own");
+    let mut stalled = None;
+    for _ in 0..20 {
+        let mut o = Driver::resume(&old_owner.seed, &old_owner.key, AnyChain::Sol(old_owner.chain(&url, program)).with_sponsors(listed.clone()), old_owner.xmz.clone(), FileJournal(old_owner.journal.clone())).unwrap()
+            .with_gas_advance(GasAdvance::Off);
+        if let Err(e) = o.tick().await {
+            stalled = Some(e.to_string());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    println!("v1.3.2 behaviour: {stalled:?}");
+    assert!(stalled.as_deref().is_some_and(|e| e.contains("relay")), "the old behaviour stalls at the lock: {stalled:?}");
+
+}
