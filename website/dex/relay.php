@@ -33,6 +33,10 @@ switch ($what) {
     case 'info':
         $path = '/v1/info';
         break;
+    case 'sponsor':
+        // Whether a relay pays USDT traders' network fees now (and for how much USDT)
+        $path = '/v1/sponsor';
+        break;
     case 'listings':
     case 'prints':
     case 'candles':

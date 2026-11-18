@@ -304,12 +304,22 @@
   // the seller's claim). A Solana USDT buyer pays in the trade's USDT plus up to SOL_FEE_USDT for the
   // relay's fee (what is not used stays in the trade account and goes back afterwards).
   var SOL_FEE_USDT = 600000n;
+  // Whether a relay pays these fees now (an unfunded relay does not): asked once per page
+  function sponsored() {
+    if (st.sponsor === undefined) st.sponsor = fetch("/dex/relay.php?what=sponsor", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : {}; }).catch(function () { return {}; });
+    return st.sponsor.then(function (i) { return tok() ? !!(i && i.solLockFee && i.solClaimFee) : evmTok() ? !!(i && i.bscClaimFee) : false; });
+  }
   function fundFor(owner, value) {
-    if (tok()) return owner ? fundToken(value + SOL_FEE_USDT) : Promise.resolve(null);
-    if (evmTok() && !owner) return Promise.resolve(null);
-    return reserve(owner).then(function (gas) {
-      if (evmTok()) return fund(gas).then(function () { return fundEvmToken(value); });
-      return fund(owner ? value + gas : gas);
+    return sponsored().then(function (paid) {
+      if (paid && tok()) return owner ? fundToken(value + SOL_FEE_USDT) : null;
+      if (paid && evmTok() && !owner) return null;
+      // No relay pays: the trade account needs the coin for the fees, as for the other pairs
+      return reserve(owner).then(function (gas) {
+        if (evmTok()) return fund(gas).then(function () { return owner ? fundEvmToken(value) : null; });
+        if (tok()) return fund(gas).then(function () { return owner ? fundToken(value) : null; });
+        return fund(owner ? value + gas : gas);
+      });
     });
   }
   function reserve(owner) {
