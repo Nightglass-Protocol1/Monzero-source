@@ -132,7 +132,7 @@ QVariantMap DexWebBridge::statusFor() const {
     return {{"wallet",pick(wallet,{"state","balance","unlocked","address","keysReady","keysExist","keysBusy","tradeAccount","solTradeAccount","error"})},
         {"markets",marketOut},{"trade",tradeOut},{"account",m_account},{"solAccount",m_solAccount},
         // What this wallet can do beyond the first page protocol: the page offers only these
-        {"features",QStringList{"partial","long-offers","renew"}}};
+        {"features",QStringList{"partial","long-offers","renew","usdt-v2"}}};
 }
 
 void DexWebBridge::watchTrade() {

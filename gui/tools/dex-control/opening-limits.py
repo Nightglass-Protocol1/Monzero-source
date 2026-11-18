@@ -23,8 +23,8 @@ NETWORKS = [  # network, coin symbol, atomic units per coin
     ("eth-mainnet", "ETH", 10**18),
     ("bnb-mainnet", "BNB", 10**18),
     ("sol-mainnet", "SOL", 10**9),
-    ("sol-usdt-mainnet", "USDT", 10**6),  # USDT on Solana (SPL), priced at $1
-    ("bnb-usdt-mainnet", "USDT", 10**18),  # USDT on BNB Smart Chain (BEP-20 BSC-USD, 18 decimals)
+    ("sol-usdt-v2-mainnet", "USDT", 10**6),  # USDT on Solana (SPL), priced at $1
+    ("bnb-usdt-v2-mainnet", "USDT", 10**18),  # USDT on BNB Smart Chain (BEP-20 BSC-USD, 18 decimals)
 ]
 XMZ_ATOMS = 10**11
 
