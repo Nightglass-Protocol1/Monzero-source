@@ -300,11 +300,16 @@
       });
     });
   }
+  // USDT: the relays pay the network fees and are paid in USDT (Solana: both sides; BNB Smart Chain:
+  // the seller's claim). A Solana USDT buyer pays in the trade's USDT plus up to SOL_FEE_USDT for the
+  // relay's fee (what is not used stays in the trade account and goes back afterwards).
+  var SOL_FEE_USDT = 600000n;
   function fundFor(owner, value) {
+    if (tok()) return owner ? fundToken(value + SOL_FEE_USDT) : Promise.resolve(null);
+    if (evmTok() && !owner) return Promise.resolve(null);
     return reserve(owner).then(function (gas) {
-      if (evmTok()) return fund(gas).then(function () { return owner ? fundEvmToken(value) : null; });
-      if (!tok()) return fund(owner ? value + gas : gas);
-      return fund(gas).then(function () { return owner ? fundToken(value) : null; });
+      if (evmTok()) return fund(gas).then(function () { return fundEvmToken(value); });
+      return fund(owner ? value + gas : gas);
     });
   }
   function reserve(owner) {
