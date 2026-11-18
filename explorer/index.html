@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Monzero blockchain explorer">
+  <meta name="theme-color" content="#090d0c">
+  <title>Monzero Explorer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="#/">
+      <span class="mark">MZ</span>
+      <span><strong>MONZERO</strong><small>CHAIN EXPLORER</small></span>
+    </a>
+    <div class="header-actions">
+      <a class="site-link" href="#/assets">Assets &amp; NFTs</a>
+      <div class="node-pill"><span id="node-dot"></span><span id="node-label">Connecting</span></div>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <p class="eyebrow">Independent chain · XMZ</p>
+      <h1>Verify the chain.<br><em>Block by block.</em></h1>
+      <form id="search-form" class="search">
+        <label class="sr-only" for="search-input">Search the blockchain</label>
+        <input id="search-input" autocomplete="off" spellcheck="false" placeholder="Block height, block hash, transaction hash, or asset ID">
+        <button type="submit">Search <span>↗</span></button>
+      </form>
+      <p class="search-hint">Try a block height such as <button type="button" id="latest-search">latest</button> or paste a 64-character hash.</p>
+    </section>
+
+    <section id="overview" class="overview" aria-label="Network overview">
+      <article><span>Chain height</span><strong id="stat-height">—</strong><small>Mainnet</small></article>
+      <article><span>Difficulty</span><strong id="stat-difficulty">—</strong><small id="stat-hashrate">— H/s estimated</small></article>
+      <article><span>Transactions</span><strong id="stat-transactions">—</strong><small>Confirmed on-chain</small></article>
+      <article><span>Connections</span><strong id="stat-connections">—</strong><small>Public seed node</small></article>
+    </section>
+
+    <section id="content" class="content" aria-live="polite">
+      <div class="section-title">
+        <div><p class="eyebrow">Live ledger</p><h2>Recent blocks</h2></div>
+        <button id="refresh" class="ghost" type="button">Refresh</button>
+      </div>
+      <div id="view"><div class="loading"><span></span>Loading chain data…</div></div>
+    </section>
+  </main>
+
+  <footer>
+    <span>Monzero Genesis network</span>
+    <span>Node: <code>node.monzero.org:6175</code></span>
+    <span>Read-only explorer · <a href="https://monzero.org">monzero.org</a></span>
+  </footer>
+
+  <template id="error-template">
+    <div class="empty"><strong>Nothing found</strong><p>The value could not be resolved on the current Monzero chain.</p><a href="#/">Return to recent blocks</a></div>
+  </template>
+  <script src="app.js"></script>
+</body>
+</html>

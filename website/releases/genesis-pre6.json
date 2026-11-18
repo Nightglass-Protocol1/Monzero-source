@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "project": "Monzero",
+  "release": "Genesis pre6",
+  "channel": "prerelease",
+  "production_ready": false,
+  "source_commit": "d4cac36271387af2b6589208bf2be74e10e5a01f",
+  "published_at": "2026-08-23T12:42:59Z",
+  "security_audit": "not_completed",
+  "signing": "unsigned",
+  "independent_reproducibility": "unverified",
+  "local_build_reproducibility": "byte_for_byte_verified",
+  "source": {
+    "filename": "monzero-genesis-pre6-source.tar.gz",
+    "size_bytes": 21200074,
+    "sha256": "9ebdf1bf68357fc784d6c92370eff94bc9b104ed1e668ae0110de5fcedf48104"
+  },
+  "artifacts": [
+    {
+      "platform": "linux-x86_64",
+      "filename": "monzero-genesis-pre6-linux-x86_64.tar.gz",
+      "size_bytes": 25807704,
+      "sha256": "77b7299a7532093eec94411a59f6663451566a6964feecb742a17029eaa0ebaa",
+      "compatibility": {
+        "minimum_glibc": "2.29",
+        "ubuntu_24_04": "verified"
+      }
+    },
+    {
+      "platform": "windows-x64",
+      "filename": "monzero-genesis-pre6-windows-x64.zip",
+      "size_bytes": 23215350,
+      "sha256": "9d6fb20055a1e1e89625f8565af13be6f9140275de943c5a41a886d8aea87405",
+      "native_clean_system_test": "not_completed"
+    }
+  ]
+}

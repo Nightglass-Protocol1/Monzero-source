@@ -1,0 +1,51 @@
+MONZERO GENESIS PRE13
+=====================
+
+Genesis pre13 is experimental, unsigned, and independently unaudited
+prerelease software. It is not a production release.
+
+Core source: bddd92e435d66cef92478618b35c3812dfc34328
+GUI source:  2e40a3a40c8a34494a6d67d7d26953897fd58181
+Network UUID: 94834264-d0b2-41dd-b0f2-0ada675c7710
+Genesis hash: 84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4
+Native currency: XMZ
+
+PACKAGE SHA-256
+
+Linux x86-64 CLI
+  6e280ff46b45c7065dd9089e773c0ecd3954d618d0bdda1f686a0940a8b10aa4
+Windows x64 CLI
+  96425939b70f5de84a00855a45f92002f1901b4d5e70fba35515f9d681bb7d13
+Windows x64 graphical wallet
+  5935799aca65b68b6fec4318a05ddbfa97b495d85c85e9927f937b009227d171
+Complete core source
+  1f005d7fa27942b32bb4a821c5c554b3870adf09f4b242547d46e5035d2b5166
+Graphical-wallet source
+  68571df159342d8f9d2c0ebbc2c4a523ce900fb6f111a350ae73945421d720e2
+
+CHANGES SINCE PRE12
+
+- Fixed a peer synchronization stall caused by an incoming object request
+  overwriting the timer used to track an outstanding synchronization request.
+- Added a regression test for preservation of pending synchronization state.
+- Removed circular pool initialization undefined behaviour.
+- Hardened cancelled wallet creation and release/CI package checks.
+- Disabled accidental host ICU detection in the pinned Boost depends build.
+- Consensus identity and chain rules are unchanged from pre10 through pre12.
+- GUI package revision 2 starts its managed local daemon with synchronization
+  enabled and selects the local RPC endpoint automatically. New users do not
+  need to enter 127.0.0.1 or configure a node address.
+
+TEST STATUS AND LIMITATIONS
+
+All 1,305 unit tests passed. The exact Linux archive passed clean-container
+startup, three-node propagation/reorganization/transfer testing, and wallet
+creation/restoration testing. The exact Windows CLI archive passed native
+daemon startup, local RPC, and clean shutdown testing. The Windows GUI package
+passed archive, manifest, PE mitigation, subsystem, and noninteractive native
+startup checks; interactive wallet workflows remain pending.
+
+Independent binary reproduction, release signing, sustained live-network
+observation, interactive Windows GUI testing, and an independent security
+review remain outstanding. Keep the prior verified installation available for
+rollback.

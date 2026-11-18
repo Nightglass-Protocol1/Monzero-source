@@ -1,0 +1,23 @@
+[Unit]
+Description=Check Monzero node operational health
+Documentation=https://monzero.org/
+After=monzerod.service
+Requires=monzerod.service
+
+[Service]
+Type=oneshot
+User=monzero
+Group=monzero
+ExecStart=/usr/local/libexec/monzero/monitor-node-health.sh http://127.0.0.1:6177 monzerod.service /var/lib/monzero /var/log/monzero/monzerod.log
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+

@@ -1,0 +1,71 @@
+{
+  "schema": "org.monzero.consensus.v1",
+  "native_asset": {
+    "name": "Monzero",
+    "ticker": "XMZ",
+    "atomic_units_per_coin": 100000000000,
+    "decimal_places": 11,
+    "money_supply_atomic": 10000000000000000000,
+    "emission_speed_factor_per_minute": 20,
+    "final_subsidy_per_minute_atomic": 163000000000,
+    "target_seconds": 120,
+    "mined_output_unlock_blocks": 60,
+    "normal_output_spendable_age_blocks": 10
+  },
+  "protocol": {
+    "current_transaction_version": 2,
+    "public_asset_transactions_accepted": false,
+    "hard_forks": [
+      {"version": 1, "height": 1},
+      {"version": 2, "height": 2},
+      {"version": 3, "height": 3},
+      {"version": 4, "height": 4},
+      {"version": 5, "height": 5},
+      {"version": 6, "height": 6},
+      {"version": 7, "height": 7},
+      {"version": 8, "height": 8},
+      {"version": 9, "height": 9},
+      {"version": 10, "height": 10},
+      {"version": 11, "height": 11},
+      {"version": 12, "height": 12},
+      {"version": 13, "height": 13},
+      {"version": 14, "height": 14},
+      {"version": 15, "height": 15},
+      {"version": 16, "height": 16},
+      {"version": 17, "height": 21000, "rule": "lwma1_difficulty_60_blocks_future_time_limit_360s"}
+    ]
+  },
+  "inactive_research_features": {
+    "asset_descriptor_version": 2,
+    "asset_classes": ["fungible", "non_fungible", "collection", "edition"],
+    "asset_transactions_serialized": false,
+    "asset_transactions_consensus_accepted": false,
+    "asset_wallet_support": false
+  },
+  "networks": {
+    "mainnet": {
+      "network_uuid": "94834264-d0b2-41dd-b0f2-0ada675c7710",
+      "address_prefixes": {"standard": 86, "integrated": 87, "subaddress": 88},
+      "ports": {"p2p": 6174, "rpc": 6175, "zmq": 6176},
+      "genesis_nonce": 2271206363,
+      "genesis_transaction": "013c01ff0001bda282a38eab04029b2e4c0281c0b02e7c53291a94d1d0cbff8883f8024f5142ee494ffbbd08807121017767aafcde9be00dcfd098715ebcf7f410daebc582fda69d24a28e9d0bc890d1",
+      "genesis_hash": "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4"
+    },
+    "testnet": {
+      "network_uuid": "adc2a271-5539-43d9-b3c2-7aadaf6b938c",
+      "address_prefixes": {"standard": 111, "integrated": 112, "subaddress": 113},
+      "ports": {"p2p": 16174, "rpc": 16175, "zmq": 16176},
+      "genesis_nonce": 818137481,
+      "genesis_transaction": "013c01ff0001bda282a38eab04029b2e4c0281c0b02e7c53291a94d1d0cbff8883f8024f5142ee494ffbbd08807121017767aafcde9be00dcfd098715ebcf7f410daebc582fda69d24a28e9d0bc890d1",
+      "genesis_hash": "d89bd4d42729aa9f68fd8d6bc86c3b12686a3fcd5ec83a392844efc067d5c040"
+    },
+    "stagenet": {
+      "network_uuid": "b1dcac5a-9d11-4653-8122-e67eec8b59ac",
+      "address_prefixes": {"standard": 131, "integrated": 132, "subaddress": 133},
+      "ports": {"p2p": 26174, "rpc": 26175, "zmq": 26176},
+      "genesis_nonce": 818137482,
+      "genesis_transaction": "013c01ff0001bda282a38eab0402df5d56da0c7d643ddd1ce61901c7bdc5fb1738bfe39fbe69c28a3a7032729c0f2101168d0c4ca86fb55a4cf6a36d31431be1c53a3bd7411bb24e8832410289fa6f3b",
+      "genesis_hash": "0d917308bb74557f9ccefd1360b9875a39df00363474fe4da9ae8e5f989170b7"
+    }
+  }
+}

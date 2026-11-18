@@ -1,0 +1,49 @@
+MONZERO GENESIS PRE9
+====================
+
+Genesis pre9 is experimental, unsigned, unaudited, and deliberately untested
+prerelease software. It is not a production release.
+
+Core source: 782d9c28645816aabb4f558e43e9ce5497fa1ef3
+GUI source:  f31aba2332009ebc0b4a278a1291f98ec2bb868a
+Native currency: XMZ
+Asset hard fork: inactive; no public activation is scheduled
+
+PACKAGES
+
+Linux x86-64 CLI
+  SHA-256: 275d0d3d64de57d0d5516e7836c8709b850c8cbae4554b618fb2cb7f70e7434d
+
+Windows x64 CLI
+  SHA-256: 7b99c32ce25260393b5147311b2bdef75a536b67a2a0a127e11843712960c294
+
+Windows x64 graphical wallet
+  SHA-256: 546760e22e14efcf73e9897c9601cedd063bd82449689b6f4483cbea76606b3b
+
+Complete core source
+  SHA-256: 27ef17275fd5e5296f41b49d1cdcd00fb0c11d9bb70beaf5fe80f14975aadf7d
+
+Graphical-wallet source
+  SHA-256: 8f47abce67c0c0e7e7e382ae0757b305996c097f6094ffaf6dc7c68a43166488
+
+CHANGES SINCE PRE8
+
+- Uses defined multiplication for cryptographic carry normalization.
+- Corrects enum varint serialization without changing the established bytes.
+- Adds modern view-tagged mined-reward ownership coverage to the source tree.
+- Defaults new GUI wallets to Monzero/wallets while continuing to discover
+  existing wallets in the legacy Monero/wallets directory.
+
+TEST STATUS
+
+At the publisher's direction, no test suite, archive verifier, native startup,
+wallet lifecycle, network, or platform smoke test was run to qualify these
+exact pre9 artifacts. Compilation and checksum generation are not test
+evidence. Earlier pre8 results do not qualify pre9.
+
+LIMITATIONS
+
+The artifacts are unsigned and have not been independently reproduced or
+audited. The public network has limited independent infrastructure and hash
+power. Windows may show an unknown-publisher warning. Never reuse a Monero or
+other CryptoNote seed, keys, wallet, or data directory with Monzero.

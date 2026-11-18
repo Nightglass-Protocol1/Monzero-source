@@ -1,0 +1,65 @@
+MONZERO GENESIS PRE8
+====================
+
+Genesis pre8 is experimental, unsigned, and unaudited command-line
+prerelease software. It is not a production release.
+
+Source commit: 6ea49557542cfa45883adb3af229775159738e45
+Native currency: XMZ
+Asset hard fork: inactive; no public activation is scheduled
+
+PACKAGES
+
+Linux x86-64 CLI
+  SHA-256: 9adee89066046bb24f84dc1f2d739b8025a4ef6cb933a40754110088a384ed79
+  GLIBC 2.31+ supported scope; highest imported symbol is GLIBC 2.29.
+  Strict archive verification, clean Ubuntu 24.04 startup/shutdown, and a
+  native wallet create/export/restore/refresh lifecycle passed.
+
+Windows x64 CLI
+  SHA-256: 4745a650d0050767438b60d3b1676b8a7d75cb66431b03ce1a2173416ff91bbe
+  Strict archive and source-provenance verification passed. The native
+  Windows host was unavailable, so pre8 network, launcher, and wallet
+  lifecycle tests have not been repeated for this exact archive.
+
+Windows x64 graphical wallet
+  SHA-256: 8ac7f4d1cdf6c920beec1198f2441efc7021b2930b404938e1a15067b1cb7bcc
+  Contains the static graphical wallet, matching pre8 daemon, command-line
+  tools, start-wallet-gui.bat, provenance manifests, and whitepaper. The GUI
+  was built from GUI commit e207630859d5709986af0752259a86e8a4c6c185
+  against core commit 6ea49557542cfa45883adb3af229775159738e45.
+  PE structure, Windows system imports, and internal checksums passed. Native
+  Windows startup and wallet lifecycle testing remains pending because the
+  Windows test host was unavailable.
+
+Complete source
+  SHA-256: 15b2e1bc4851dea2a275607cb78550cc77bedb9b78446f77e9877555fe7ccec9
+  Contains the pinned repository commit and recursive submodule contents.
+
+Graphical-wallet source
+  SHA-256: b7f0715b671d9eec55f2d9a8fadbe66296640ea8aa5c7bf2130c9e678983e58e
+  Contains GUI commit e207630859d5709986af0752259a86e8a4c6c185,
+  the expanded pre8 core source, and their recursive submodule contents.
+
+HIGHLIGHTS
+
+- Adds the Monzero whitepaper to the source, website, and binary packages.
+- Corrects node, wallet, and mining launchers and removes personal paths and
+  fixed priority-node IPs.
+- Corrects the 120-second emission fee fallback bound.
+- Rejects malicious or oversized tar and ZIP structures before extraction.
+- Makes binary packaging fail closed on source-version mismatch.
+- Aligns generated emission, overflow, RingCT, Bulletproof, Bulletproof+,
+  and CLSAG fixtures with Monzero's actual economics.
+
+LIMITATIONS
+
+Packages and metadata are unsigned. Independent binary reproduction and an
+independent security/consensus audit have not been completed. The public
+network has limited independent infrastructure and hash power. Windows may
+show an unknown-publisher warning. The asset prototype remains inactive.
+Never reuse a Monero or other CryptoNote seed, keys, wallet, or data directory
+with Monzero.
+
+Verify the adjacent .sha256 files and each archive's internal manifest before
+use. See WHITEPAPER.md, RELEASE_NOTES.md, RELEASE_STATUS.md, and UPGRADE.md.

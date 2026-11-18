@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "project": "Monzero",
+  "release": "Genesis pre14",
+  "channel": "prerelease",
+  "production_ready": false,
+  "source_commit": "06180b4ff40d3218f514fc85528a103f117a0bee",
+  "gui_source_commit": "0018a58f2aeb1670ca6ab7c61b7c0de7d07ff9f8",
+  "network_uuid": "94834264-d0b2-41dd-b0f2-0ada675c7710",
+  "genesis_nonce": 2271206363,
+  "genesis_hash": "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4",
+  "published_at": "2026-09-18T14:15:00Z",
+  "revised_at": "2026-09-18T14:15:00Z",
+  "gui_package_revision": 1,
+  "security_audit": "not_completed",
+  "signing": "unsigned",
+  "independent_reproducibility": "unverified",
+  "release_tests": "1305_unit_tests_and_20_ctest_suites_passed_locally_native_windows_execution_not_yet_tested",
+  "migration": "same_chain_as_genesis_pre10_through_pre13",
+  "source": {
+    "filename": "monzero-genesis-pre14-source.tar.gz",
+    "size_bytes": 21292767,
+    "sha256": "56f46a83a382dbfa37c55821724cb5991f22dc13e2e932b609aef27270db915a"
+  },
+  "gui_source": {
+    "filename": "monzero-genesis-pre14-gui-source.tar.gz",
+    "size_bytes": 35937499,
+    "sha256": "f4d8b4b5cc772d7b3d4fdc762e96883ba790773dc06558b59a9470256360dea7",
+    "gui_source_commit": "0018a58f2aeb1670ca6ab7c61b7c0de7d07ff9f8",
+    "core_source_commit": "06180b4ff40d3218f514fc85528a103f117a0bee",
+    "recursive_submodules_included": true,
+    "note": "GUI source is the newest monzero-gui commit whose wallet_api calls are satisfied by this release's core; it is older than monzero-gui's own current development tip, which has diverged onto unmerged asset transfer/burn work this core commit does not implement."
+  },
+  "artifacts": [
+    {
+      "platform": "linux-x86_64",
+      "filename": "monzero-genesis-pre14-linux-x86_64.tar.gz",
+      "size_bytes": 18269959,
+      "sha256": "aff64882b80e2b3fd528e071c1d56b5605e73ce311b26a16dbb3eb2a8bcdc0d1",
+      "minimum_glibc": "2.31",
+      "tests": "1305_unit_tests_and_20_ctest_suites_passed_locally_built_with_ordinary_toolchain_not_pinned_depends_environment_container_smoke_test_not_run"
+    },
+    {
+      "platform": "windows-x64",
+      "filename": "monzero-genesis-pre14-windows-x64.zip",
+      "size_bytes": 26457895,
+      "sha256": "1050e444c24e8e5a19c26e2c710080d17a2c5a08990e8b5818b4c39ec4ed6bcf",
+      "tests": "package_and_pe_mitigation_checks_passed_native_windows_execution_not_yet_tested"
+    },
+    {
+      "platform": "windows-gui-x64",
+      "filename": "monzero-genesis-pre14-windows-gui-x64.zip",
+      "size_bytes": 55590145,
+      "sha256": "639bf9f0a073196d833ee165810d442b56769c3698a64bb4394251553e0e2b0e",
+      "tests": "gui_build_manifest_archive_pe_and_subsystem_checks_passed_native_windows_execution_not_yet_tested"
+    }
+  ]
+}

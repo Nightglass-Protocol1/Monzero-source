@@ -1,0 +1,141 @@
+.DS_Store
+/doc
+/build
+/tags
+log/
+
+# vim swap files
+*.swp
+*.swo
+TAGS
+!TAGS/
+tags
+!tags/
+gtags.files
+GTAGS
+GRTAGS
+GPATH
+cscope.files
+cscope.out
+cscope.in.out
+cscope.po.out
+
+version/
+ClangBuildAnalyzerSession.txt
+
+# gitian
+contrib/gitian/builder/
+contrib/gitian/docker/
+contrib/gitian/sigs/
+
+# Created by https://www.gitignore.io
+
+### C++ ###
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+
+### CMake ###
+CMakeCache.txt
+CMakeFiles
+cmake_install.cmake
+install_manifest.txt
+cmake-build-debug/
+
+### Linux ###
+*~
+
+# KDE directory preferences
+.directory
+
+### VSCode ###
+.vscode/
+
+### Eclipse ###
+*.pydevproject
+.metadata
+.gradle
+bin/
+tmp/
+*.tmp
+*.bak
+*.swp
+*~.nib
+local.properties
+.settings/
+.loadpath
+
+# External tool builders
+.externalToolBuilders/
+
+# Locally stored "Eclipse launch configurations"
+*.launch
+
+# CDT-specific
+.cproject
+
+# PDT-specific
+.buildpath
+
+# Netbeans-specific
+nbproject
+
+# sbteclipse plugin
+.target
+
+# TeXlipse plugin
+.texlipse
+.idea/
+
+/testnet
+
+__pycache__/
+*.pyc
+*.log
+
+# Monzero local release outputs and uploaded copies
+/dist/
+/website/downloads/
+
+# GUI is maintained and versioned as a separate Git repository.
+/monzero-gui/
+
+# Files produced by wallet_storage unit tests beside their immutable fixtures
+/tests/data/wallet_*_copy_change_password_same*
+/tests/data/wallet_*_new_change_password_diff*
+/tests/data/wallet_*_new_file2file*
+/tests/data/wallet_change_password_mem2file*
+/tests/data/wallet_mem2file*
+/tests/data/wallet_origin_*
+
+# Real wallet files must never live inside a source tree with any public
+# mirror. Keep wallets outside the repository entirely; these patterns are a
+# backstop against an accidental `git add`, not a substitute for that.
+*.keys
+/Wallet*

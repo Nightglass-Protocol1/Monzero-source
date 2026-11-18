@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "project": "Monzero",
+  "release": "Genesis pre9",
+  "channel": "prerelease",
+  "production_ready": false,
+  "source_commit": "782d9c28645816aabb4f558e43e9ce5497fa1ef3",
+  "gui_source_commit": "f31aba2332009ebc0b4a278a1291f98ec2bb868a",
+  "published_at": "2026-08-25T13:13:57Z",
+  "security_audit": "not_completed",
+  "signing": "unsigned",
+  "independent_reproducibility": "unverified",
+  "release_tests": "not_run_at_publisher_direction",
+  "source": {
+    "filename": "monzero-genesis-pre9-source.tar.gz",
+    "size_bytes": 21246647,
+    "sha256": "27ef17275fd5e5296f41b49d1cdcd00fb0c11d9bb70beaf5fe80f14975aadf7d"
+  },
+  "gui_source": {
+    "filename": "monzero-genesis-pre9-gui-source.tar.gz",
+    "size_bytes": 32730174,
+    "sha256": "8f47abce67c0c0e7e7e382ae0757b305996c097f6094ffaf6dc7c68a43166488",
+    "gui_source_commit": "f31aba2332009ebc0b4a278a1291f98ec2bb868a",
+    "core_source_commit": "782d9c28645816aabb4f558e43e9ce5497fa1ef3",
+    "recursive_submodules_included": true
+  },
+  "artifacts": [
+    {
+      "platform": "linux-x86_64",
+      "filename": "monzero-genesis-pre9-linux-x86_64.tar.gz",
+      "size_bytes": 28556497,
+      "sha256": "275d0d3d64de57d0d5516e7836c8709b850c8cbae4554b618fb2cb7f70e7434d",
+      "build": "completed",
+      "tests": "not_run"
+    },
+    {
+      "platform": "windows-x64",
+      "filename": "monzero-genesis-pre9-windows-x64.zip",
+      "size_bytes": 25764715,
+      "sha256": "7b99c32ce25260393b5147311b2bdef75a536b67a2a0a127e11843712960c294",
+      "build": "completed",
+      "tests": "not_run"
+    },
+    {
+      "platform": "windows-gui-x64",
+      "filename": "monzero-genesis-pre9-windows-gui-x64.zip",
+      "size_bytes": 64798376,
+      "sha256": "546760e22e14efcf73e9897c9601cedd063bd82449689b6f4483cbea76606b3b",
+      "gui_source_commit": "f31aba2332009ebc0b4a278a1291f98ec2bb868a",
+      "core_source_commit": "782d9c28645816aabb4f558e43e9ce5497fa1ef3",
+      "build": "completed",
+      "tests": "not_run"
+    }
+  ]
+}

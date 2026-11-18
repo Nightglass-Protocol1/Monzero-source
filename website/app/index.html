@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Monzero beta asset, NFT and non-custodial swap workspace.">
+  <meta name="theme-color" content="#0c0911">
+  <title>Monzero Studio — Assets, NFTs and swaps</title>
+  <link rel="icon" href="../assets/monzero-xmz-coin.png">
+  <link rel="stylesheet" href="styles.css?v=20260823-nightshade">
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to Studio workspace</a>
+  <header>
+    <a class="brand" href="../"><span>MZ</span><span>MONZERO <small>STUDIO</small></span></a>
+    <nav aria-label="Product navigation">
+      <a href="../explorer/">Explorer</a>
+      <a href="../#network">Network</a>
+      <a class="home-link" href="../">Home</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="intro">
+      <div>
+        <p class="eyebrow">Protocol laboratory · Local drafts only</p>
+        <h1>Design the intent.<br><em>Keep control.</em></h1>
+        <p>Shape fixed-supply tokens, NFTs, collections, and atomic-swap offers without handing over funds or keys. Studio exports inspectable local drafts; on-chain submission remains locked until activation and audit gates are satisfied.</p>
+        <div class="intro-badges"><span>No wallet connection</span><span>No custody</span><span>No submission</span></div>
+      </div>
+      <aside class="network-card">
+        <span class="label">Current public node</span>
+        <strong><i id="node-dot"></i><span id="node-state">Checking…</span></strong>
+        <dl>
+          <div><dt>Height</dt><dd id="height">—</dd></div>
+          <div><dt>Peers</dt><dd id="peers">—</dd></div>
+          <div><dt>Chain tip</dt><dd id="tip">—</dd></div>
+          <div><dt>Asset protocol</dt><dd class="amber">Inactive</dd></div>
+        </dl>
+      </aside>
+    </section>
+
+    <section class="workspace" id="workspace">
+      <div class="tabs" role="tablist" aria-label="Studio tools">
+        <button role="tab" aria-selected="true" data-panel="token">Token creator</button>
+        <button role="tab" aria-selected="false" data-panel="nft">NFT studio</button>
+        <button role="tab" aria-selected="false" data-panel="collections">Collections</button>
+        <button role="tab" aria-selected="false" data-panel="swap">Atomic swap</button>
+      </div>
+
+      <article class="panel active" id="token" role="tabpanel">
+        <div class="panel-copy"><p class="eyebrow">Fixed supply</p><h2>Issue a token</h2><p>Supply is created once. No administrator mint, freeze, blacklist or clawback authority exists in V1.</p></div>
+        <form class="studio-form" data-type="token">
+          <label>Name <input name="name" type="text" maxlength="64" placeholder="Example Token" value="Nightshade Credit"></label>
+          <label>Symbol <input name="symbol" type="text" maxlength="12" placeholder="EXM" value="NSC"></label>
+          <div class="split"><label>Atomic supply <input name="atomic_supply" type="number" min="1" placeholder="1000000" value="1000000"></label><label>Decimals <input name="decimals" type="number" min="0" max="11" value="8"></label></div>
+          <label>Metadata content hash <input name="metadata_hash" type="text" maxlength="64" pattern="[0-9a-fA-F]{64}" placeholder="64 hexadecimal characters"></label>
+          <button type="submit">Download token draft</button>
+        </form>
+      </article>
+
+      <article class="panel" id="nft" role="tabpanel" hidden>
+        <div class="panel-copy"><p class="eyebrow">One indivisible unit</p><h2>Mint an NFT</h2><p>Only a bounded metadata hash is committed to consensus. Images and descriptions remain off-chain and untrusted.</p></div>
+        <form class="studio-form" data-type="nft">
+          <label>Title <input name="title" type="text" maxlength="96" placeholder="Artifact 001" value="Nightshade Artifact 001"></label>
+          <label>Collection ID <input name="collection_id" type="text" maxlength="64" placeholder="Optional 64-character asset ID"></label>
+          <label>Metadata URI <input name="metadata_uri" type="text" maxlength="512" placeholder="ipfs://…"></label>
+          <label>Metadata content hash <input name="metadata_hash" type="text" maxlength="64" pattern="[0-9a-fA-F]{64}" placeholder="64 hexadecimal characters"></label>
+          <button type="submit">Download NFT draft</button>
+        </form>
+      </article>
+
+      <article class="panel" id="collections" role="tabpanel" hidden>
+        <div class="panel-copy"><p class="eyebrow">Authenticated membership</p><h2>Create a collection</h2><p>Members require a signature from the collection controller over the exact member asset ID.</p></div>
+        <form class="studio-form" data-type="collection">
+          <label>Collection name <input name="collection_name" type="text" maxlength="96" placeholder="Monzero Originals" value="Monzero Originals"></label>
+          <label>Metadata URI <input name="metadata_uri" type="text" maxlength="512" placeholder="ipfs://…"></label>
+          <label>Metadata content hash <input name="metadata_hash" type="text" maxlength="64" pattern="[0-9a-fA-F]{64}" placeholder="64 hexadecimal characters"></label>
+          <button type="submit">Download collection draft</button>
+        </form>
+      </article>
+
+      <article class="panel" id="swap" role="tabpanel" hidden>
+        <div class="panel-copy"><p class="eyebrow">Non-custodial only</p><h2>Atomic swap</h2><p>No deposits and no operator custody. Swap activation requires an audited protocol ensuring either both sides settle or neither side does.</p></div>
+        <form class="studio-form" data-type="swap">
+          <div class="split"><label>You offer <input name="offer" type="text" maxlength="160" placeholder="Amount and asset ID"></label><label>You request <input name="request" type="text" maxlength="160" placeholder="Amount and asset ID"></label></div>
+          <label>Counterparty or public offer <input name="counterparty" type="text" maxlength="256" placeholder="Optional public counterparty identifier"></label>
+          <label>Expiry height <input name="expiry_height" type="number" min="1" placeholder="Block height"></label>
+          <button type="submit">Download swap draft</button>
+        </form>
+      </article>
+      <aside class="draft-preview" aria-live="polite">
+        <div class="draft-topline"><span id="draft-type">TOKEN</span><strong id="draft-state">Not submitted</strong></div>
+        <div class="draft-card"><small>LOCAL DRAFT</small><h3 id="draft-title">Untitled draft</h3><p id="draft-detail">Local preview only</p></div>
+        <details><summary>Inspect draft JSON</summary><pre id="draft-json"></pre></details>
+        <p class="draft-warning">Draft files are descriptive and unsigned. They are not transactions, assets, orders, or promises of future activation.</p>
+      </aside>
+    </section>
+
+    <section class="gate">
+      <p class="eyebrow">Activation gates</p>
+      <h2>What remains before funds are accepted.</h2>
+      <ol>
+        <li class="done"><span>01</span><div><strong>Persistent, reorg-safe asset state</strong><small>Implemented and covered by activation-gated tests</small></div></li>
+        <li class="done"><span>02</span><div><strong>Confidential ownership and conservation proofs</strong><small>Implemented; independent cryptographic review remains required</small></div></li>
+        <li class="done"><span>03</span><div><strong>Wallet scanning, restoration and signing</strong><small>CLI and RPC paths implemented and tested</small></div></li>
+        <li><span>04</span><div><strong>Adversarial testnet and independent review</strong><small>Required before activation or funds are accepted</small></div></li>
+      </ol>
+    </section>
+  </main>
+
+  <footer><span>Monzero Studio preview</span><span>No deposits · No custody · No active issuance</span><a href="../security/">Security</a></footer>
+  <script src="app.js?v=20260823-nightshade"></script>
+</body>
+</html>

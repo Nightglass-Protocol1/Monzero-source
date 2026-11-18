@@ -1,0 +1,26 @@
+[Unit]
+Description=Monzero disposable regression-test wallet RPC
+After=monzero-regtest.service
+Requires=monzero-regtest.service
+
+[Service]
+Type=simple
+User=monzero
+Group=monzero
+ExecStart=/srv/monzero-dex/bin/monzero-wallet-rpc --wallet-dir /srv/monzero-dex/recovery/wallets --shared-ringdb-dir /srv/monzero-dex/recovery/shared-ringdb --rpc-bind-ip 127.0.0.1 --rpc-bind-port 6176 --disable-rpc-login --rpc-ssl disabled --daemon-ssl disabled --daemon-address 127.0.0.1:6175 --allow-mismatched-daemon-version --log-file /srv/monzero-dex/logs/wallet-rpc-regtest.log
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/srv/monzero-dex/recovery/wallets /srv/monzero-dex/recovery/shared-ringdb /srv/monzero-dex/logs
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

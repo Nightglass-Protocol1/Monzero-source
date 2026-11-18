@@ -1,0 +1,62 @@
+MONZERO GENESIS PRE14
+=====================
+
+Genesis pre14 is experimental, unsigned, and independently unaudited
+prerelease software. It is not a production release.
+
+Core source: 06180b4ff40d3218f514fc85528a103f117a0bee
+GUI source:  0018a58f2aeb1670ca6ab7c61b7c0de7d07ff9f8
+Network UUID: 94834264-d0b2-41dd-b0f2-0ada675c7710
+Genesis hash: 84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4
+Native currency: XMZ
+
+PACKAGE SHA-256
+
+Linux x86-64 CLI
+  aff64882b80e2b3fd528e071c1d56b5605e73ce311b26a16dbb3eb2a8bcdc0d1
+Windows x64 CLI
+  1050e444c24e8e5a19c26e2c710080d17a2c5a08990e8b5818b4c39ec4ed6bcf
+Windows x64 graphical wallet
+  639bf9f0a073196d833ee165810d442b56769c3698a64bb4394251553e0e2b0e
+Complete core source
+  56f46a83a382dbfa37c55821724cb5991f22dc13e2e932b609aef27270db915a
+Graphical-wallet source
+  f4d8b4b5cc772d7b3d4fdc762e96883ba790773dc06558b59a9470256360dea7
+
+CHANGES SINCE PRE13
+
+- Added isolated, fixture-only DEX-lab preparation tooling (utils/dex-lab/)
+  for a separate, air-gapped-from-production VM. It ships no live adapters,
+  no atomic settlement, and no funds verification, and is not wired into
+  any release package or public network path.
+- Closed a release-verification gap where a Windows GUI archive could ship
+  binaries built against a different core commit than its manifest
+  declared.
+- Added .gitignore patterns for wallet key and backup files as a backstop
+  against accidental commits of wallet material.
+- Consensus identity and chain rules are unchanged from pre10 through pre13.
+  No file under src/ changed since pre13.
+- The graphical wallet in this package is built from an older, compatible
+  monzero-gui source commit, not the GUI project's current development
+  tip, which has diverged onto unmerged asset transfer/burn UI work this
+  core commit does not yet implement. Real-money DEX trading, cross-chain
+  settlement, and native asset transfer/burn are unavailable in this
+  package.
+
+TEST STATUS AND LIMITATIONS
+
+All 1,305 unit tests and all 20 ctest suites passed on the local Linux
+build. The Linux CLI archive was built with the ordinary system toolchain,
+not the pinned reproducible-build/depends environment used for prior
+published candidates, and has not passed strict package verification or
+the digest-pinned container smoke test. The Windows CLI and GUI archives
+were cross-compiled in the pinned build environments and passed their
+package, manifest, checksum, PE-mitigation, and (for the GUI) subsystem
+checks, but neither has been run on a native Windows host. The RPC
+functional-test suite did not run on this build host (missing Python
+dependencies, not a code regression).
+
+Independent binary reproduction, release signing, native Windows testing,
+sustained live-network observation, and an independent security review
+remain outstanding. Keep the prior verified installation available for
+rollback.

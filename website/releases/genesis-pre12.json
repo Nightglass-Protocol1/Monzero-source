@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "project": "Monzero",
+  "release": "Genesis pre12",
+  "channel": "prerelease",
+  "production_ready": false,
+  "source_commit": "19b947119d71b88c330421a1d69ec7fa31c8f672",
+  "gui_source_commit": "b0fee657ce7f079de36995ddb5c6053ce7bf7d4f",
+  "network_uuid": "94834264-d0b2-41dd-b0f2-0ada675c7710",
+  "genesis_nonce": 2271206363,
+  "genesis_hash": "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4",
+  "published_at": "2026-09-02T20:52:05Z",
+  "security_audit": "not_completed",
+  "signing": "unsigned",
+  "independent_reproducibility": "unverified",
+  "release_tests": "1303_unit_tests_focused_security_regressions_fuzz_package_verification_linux_smoke_and_pe_mitigation_checks_passed",
+  "migration": "same_chain_as_genesis_pre10_and_pre11",
+  "source": {
+    "filename": "monzero-genesis-pre12-source.tar.gz",
+    "size_bytes": 21262915,
+    "sha256": "1f2cbf67c7eed8f42de6f24f3406756237b838066ee94dd9f5e2dacc9fc85a4f"
+  },
+  "gui_source": {
+    "filename": "monzero-genesis-pre12-gui-source.tar.gz",
+    "size_bytes": 35612073,
+    "sha256": "695c83d263ff0ddf4ddb55fe948a0877837c711d2685332373f8d4aa496efc61",
+    "gui_source_commit": "b0fee657ce7f079de36995ddb5c6053ce7bf7d4f",
+    "core_source_commit": "19b947119d71b88c330421a1d69ec7fa31c8f672",
+    "recursive_submodules_included": true
+  },
+  "artifacts": [
+    {
+      "platform": "linux-x86_64",
+      "filename": "monzero-genesis-pre12-linux-x86_64.tar.gz",
+      "size_bytes": 25843926,
+      "sha256": "307fa5be2fb716af0988683089a5971e584d986a51fa8e9a51a6d662e34acb2c",
+      "minimum_glibc": "2.29",
+      "tests": "package_verified_clean_ubuntu_daemon_smoke_passed"
+    },
+    {
+      "platform": "windows-x64",
+      "filename": "monzero-genesis-pre12-windows-x64.zip",
+      "size_bytes": 25769116,
+      "sha256": "e8778d12e15fe940faa73c70ca8c011fd4d1f21bbcca4888ee83fe8df56cb71d",
+      "tests": "structure_imports_and_pe_mitigations_verified_native_execution_pending"
+    },
+    {
+      "platform": "windows-gui-x64",
+      "filename": "monzero-genesis-pre12-windows-gui-x64.zip",
+      "size_bytes": 57349694,
+      "sha256": "082d599288e6140cf34317cf7da93d58acf4d32771950e11ebff07fcd318a7ea",
+      "tests": "internal_manifest_pe_imports_subsystem_and_mitigations_verified_native_execution_pending"
+    }
+  ]
+}

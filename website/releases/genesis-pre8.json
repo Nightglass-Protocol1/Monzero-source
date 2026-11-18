@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "project": "Monzero",
+  "release": "Genesis pre8",
+  "channel": "prerelease",
+  "production_ready": false,
+  "source_commit": "6ea49557542cfa45883adb3af229775159738e45",
+  "published_at": "2026-08-24T21:13:49Z",
+  "metadata_updated_at": "2026-08-24T22:29:52Z",
+  "security_audit": "not_completed",
+  "signing": "unsigned",
+  "independent_reproducibility": "unverified",
+  "local_build_reproducibility": "not_repeated",
+  "source": {
+    "filename": "monzero-genesis-pre8-source.tar.gz",
+    "size_bytes": 21245142,
+    "sha256": "15b2e1bc4851dea2a275607cb78550cc77bedb9b78446f77e9877555fe7ccec9"
+  },
+  "gui_source": {
+    "filename": "monzero-genesis-pre8-gui-source.tar.gz",
+    "size_bytes": 32696411,
+    "sha256": "b7f0715b671d9eec55f2d9a8fadbe66296640ea8aa5c7bf2130c9e678983e58e",
+    "gui_source_commit": "e207630859d5709986af0752259a86e8a4c6c185",
+    "core_source_commit": "6ea49557542cfa45883adb3af229775159738e45",
+    "recursive_submodules_included": true
+  },
+  "artifacts": [
+    {
+      "platform": "linux-x86_64",
+      "filename": "monzero-genesis-pre8-linux-x86_64.tar.gz",
+      "size_bytes": 25837770,
+      "sha256": "9adee89066046bb24f84dc1f2d739b8025a4ef6cb933a40754110088a384ed79",
+      "compatibility": {
+        "minimum_glibc": "2.31",
+        "highest_imported_glibc_symbol": "2.29",
+        "ubuntu_24_04": "verified"
+      },
+      "clean_startup_shutdown_test": "passed",
+      "native_wallet_create_restore_refresh_test": "passed"
+    },
+    {
+      "platform": "windows-x64",
+      "filename": "monzero-genesis-pre8-windows-x64.zip",
+      "size_bytes": 25762582,
+      "sha256": "4745a650d0050767438b60d3b1676b8a7d75cb66431b03ce1a2173416ff91bbe",
+      "strict_archive_verification": "passed",
+      "native_network_and_launcher_test": "not_retested_for_pre8",
+      "native_wallet_create_restore_refresh_test": "not_retested_for_pre8"
+    },
+    {
+      "platform": "windows-gui-x64",
+      "filename": "monzero-genesis-pre8-windows-gui-x64.zip",
+      "size_bytes": 64795758,
+      "sha256": "8ac7f4d1cdf6c920beec1198f2441efc7021b2930b404938e1a15067b1cb7bcc",
+      "gui_source_commit": "e207630859d5709986af0752259a86e8a4c6c185",
+      "core_source_commit": "6ea49557542cfa45883adb3af229775159738e45",
+      "static_cross_build": "passed",
+      "pe_and_system_import_verification": "passed",
+      "internal_checksum_manifest": "passed",
+      "native_windows_startup_and_wallet_test": "not_retested_for_pre8"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+Options -Indexes
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteCond %{SERVER_PORT} !=443
+  RewriteRule ^ https://monzero.org%{REQUEST_URI} [R=301,L,NE]
+</IfModule>
+
+<IfModule mod_headers.c>
+  Header always unset X-Powered-By
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header always set X-Frame-Options "DENY"
+  Header always set Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+  Header always set Permissions-Policy "camera=(), geolocation=(), microphone=()"
+  Header always set Strict-Transport-Security "max-age=86400"
+</IfModule>
+
+<FilesMatch "\.(?:css|js|png|ico|svg|sha256)$">
+  <IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresDefault "access plus 7 days"
+  </IfModule>
+</FilesMatch>
+
+<FilesMatch "\.tar\.gz$">
+  ForceType application/gzip
+</FilesMatch>
+
+<FilesMatch "\.zip$">
+  ForceType application/zip
+</FilesMatch>
+
+<FilesMatch "\.ps1$">
+  ForceType text/plain
+  <IfModule mod_headers.c>
+    Header set Content-Disposition "attachment"
+  </IfModule>
+</FilesMatch>

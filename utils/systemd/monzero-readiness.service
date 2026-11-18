@@ -1,0 +1,23 @@
+[Unit]
+Description=Check Monzero public-network readiness
+Documentation=https://monzero.org/
+After=monzerod.service
+Requires=monzerod.service
+
+[Service]
+Type=oneshot
+User=monzero
+Group=monzero
+ExecStart=/usr/local/libexec/monzero/verify-network-readiness.sh http://127.0.0.1:6177
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+

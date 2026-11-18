@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "project": "Monzero",
+  "release": "Genesis pre10",
+  "channel": "prerelease",
+  "production_ready": false,
+  "source_commit": "519654692657855445c0ab490380dd2465ea5c91",
+  "gui_source_commit": "7244605d0b11ee68c3f077aba792355b58bf94b0",
+  "network_uuid": "94834264-d0b2-41dd-b0f2-0ada675c7710",
+  "genesis_nonce": 2271206363,
+  "genesis_hash": "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4",
+  "published_at": "2026-08-25T19:29:53Z",
+  "security_audit": "not_completed",
+  "signing": "unsigned",
+  "independent_reproducibility": "unverified",
+  "release_tests": "source_suites_passed_archive_verification_passed",
+  "migration": "fresh_mainnet_blockchain_required",
+  "source": {
+    "filename": "monzero-genesis-pre10-source.tar.gz",
+    "size_bytes": 193716907,
+    "sha256": "97215f624eac4edae9b6ec33bf320fe71370e43a2fc6c6633335c818f3282d9e"
+  },
+  "gui_source": {
+    "filename": "monzero-genesis-pre10-gui-source.tar.gz",
+    "size_bytes": 208063833,
+    "sha256": "dcb281e2d52dd11b6274a189b2b84a2920375fed9ee65f2c7618e06df1e2e063",
+    "gui_source_commit": "7244605d0b11ee68c3f077aba792355b58bf94b0",
+    "core_source_commit": "519654692657855445c0ab490380dd2465ea5c91",
+    "recursive_submodules_included": true
+  },
+  "artifacts": [
+    {
+      "platform": "linux-x86_64",
+      "filename": "monzero-genesis-pre10-linux-x86_64.tar.gz",
+      "size_bytes": 28560944,
+      "sha256": "7eb3d2d0c527b58e2dc3854317d2abcf49bc42222206d522d36994007e7fbb2b",
+      "minimum_glibc": "2.42",
+      "tests": "package_verified"
+    },
+    {
+      "platform": "windows-x64",
+      "filename": "monzero-genesis-pre10-windows-x64.zip",
+      "size_bytes": 23233882,
+      "sha256": "3e50890ab6b44eec27aac1fc73e5bc9101ad841499e50941f90a45c3f61662f2",
+      "tests": "structure_verified_native_execution_pending"
+    },
+    {
+      "platform": "windows-gui-x64",
+      "filename": "monzero-genesis-pre10-windows-gui-x64.zip",
+      "size_bytes": 69517462,
+      "sha256": "04a8e59c9603d9e1c849e905eb6f9ed39f03787123ff742fb150af54b6aad659",
+      "tests": "internal_manifest_verified_native_execution_pending"
+    }
+  ]
+}

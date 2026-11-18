@@ -1,0 +1,58 @@
+MONZERO GENESIS PRE7 RELEASE NOTES
+==================================
+
+Genesis pre7 is experimental, unsigned, unaudited command-line prerelease
+software. It is not a production release.
+
+RELEASE IDENTITY
+----------------
+Codename: Genesis pre7
+Source commit: 38914bf1347781dc6e0ead4a786e3607cc8ebeac
+Native currency: XMZ
+Public asset hard fork: inactive and unscheduled
+
+PACKAGED AND TESTED PLATFORMS
+-----------------------------
+Linux x86-64 CLI:
+- Requires glibc 2.29 or newer.
+- Passed a digest-pinned Ubuntu 24.04 launch test.
+- Passed native wallet creation, seed restoration, and refresh testing.
+
+Windows x64 CLI:
+- Tested on native Windows 11 build 26200.
+- Passed node launch, empty-directory synchronization, one-thread mining
+  start/stop, clean shutdown, and wallet creation, restoration, and refresh.
+
+Both archives contain the node, command-line wallet, and wallet RPC. The
+graphical wallet is not included. macOS, Linux ARM, Windows ARM, mobile, and
+32-bit systems are not packaged or supported by this candidate. Other
+glibc-based Linux distributions meeting the symbol floor are unqualified.
+
+KNOWN LIMITATIONS
+-----------------
+- Packages and release metadata are unsigned.
+- Independent binary reproduction and signature are not complete.
+- Consensus, asset cryptography, and the broader implementation are unaudited.
+- Public infrastructure and independent hash power remain limited; chain tips
+  can become stale even when nodes are synchronized.
+- Windows SmartScreen may show an unknown-publisher warning.
+- Hardware-wallet, multisig, view-only, offline-signing, and funded-transaction
+  release coverage is incomplete across both packaged platforms.
+- Studio produces local unsigned, non-submittable design JSON only. It does not
+  hold keys, sign transactions, create live assets, or place exchange orders.
+- Asset hard fork 17 is inactive on all public networks and must not be enabled
+  without the documented review, testnet, audit, and coordination gates.
+- Never reuse a Monero or other CryptoNote-derived seed, keys, wallet file, or
+  data directory with Monzero.
+
+UPGRADE AND VERIFICATION
+------------------------
+Stop all Monzero programs, back up wallets and node data, verify the outer
+SHA-256 and internal SHA256SUMS, and extract into a new directory. Retain the
+previous verified binaries and matching data backup for rollback.
+
+Artifact hashes and sizes:
+https://monzero.org/releases/genesis-pre7.json
+
+Security reports:
+security@monzero.org

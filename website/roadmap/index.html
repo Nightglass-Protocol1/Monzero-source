@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0c0911">
+  <meta name="description" content="Follow the Monzero BTC/XMZ DEX roadmap: verified test-chain milestones, upcoming engineering work, and the gates before real-money trading.">
+  <meta property="og:title" content="Monzero DEX — The road to public swaps">
+  <meta property="og:description" content="Built in the open. Verified in stages. Explore the BTC/XMZ DEX roadmap and what still stands between test-chain swaps and live trading.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://monzero.org/roadmap/">
+  <link rel="canonical" href="https://monzero.org/roadmap/">
+  <link rel="icon" href="../assets/monzero-xmz-coin.png">
+  <link rel="stylesheet" href="roadmap.css?v=20260919a">
+  <title>DEX Roadmap · Monzero</title>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to roadmap</a>
+  <header class="header wrap">
+    <a class="brand" href="../" aria-label="Monzero home"><span class="brand-mark">MZ</span> MONZERO</a>
+    <nav aria-label="Primary navigation"><a href="../">Home</a><a href="../WHITEPAPER.md">Whitepaper</a><a href="../security/">Security</a><a href="./" aria-current="page">Roadmap</a></nav>
+    <a class="header-cta" href="../#download">Explore the wallet <span aria-hidden="true">↗</span></a>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="dot"></span> Engineering roadmap / BTC ↔ XMZ</p>
+        <h1 id="hero-title">The road to<br><span>public swaps.</span></h1>
+        <p class="lead">A Bitcoin–Monzero exchange inside the Monzero GUI. Built in the open, verified in stages, with recovery designed into the trading journey.</p>
+        <div class="actions"><a class="button primary" href="#milestones">Explore the milestones <span aria-hidden="true">↓</span></a><a class="button secondary" href="#verified">See what is verified</a></div>
+        <p class="snapshot">Engineering snapshot · <time datetime="2026-09-19">19 September 2026</time><br>Milestone-based delivery. No committed live launch date.</p>
+      </div>
+      <div class="blueprint" aria-label="Current position: isolated swap paths verified; public trading remains gated">
+        <div class="blueprint-top"><span>PROTOCOL / DELIVERY MAP</span><span class="version">BTC + XMZ</span></div>
+        <div class="swap-art" aria-hidden="true"><div class="coin btc">₿</div><div class="swap-link"><span>⇄</span><small>CROSS-CHAIN</small></div><div class="coin xmz">XMZ</div><div class="orbit"></div></div>
+        <ol class="mini-path">
+          <li class="done"><span class="node">✓</span><div><strong>Isolated settlement paths</strong><small>Test-chain payments &amp; recovery</small></div><span class="mini-state">Verified</span></li>
+          <li class="active"><span class="node">02</span><div><strong>Complete the trading journey</strong><small>Full proceeds · restart safety · GUI</small></div><span class="mini-state">Building</span></li>
+          <li><span class="node">03</span><div><strong>Public test-network pilot</strong><small>Peers · market rules · tester feedback</small></div><span class="mini-state">Planned</span></li>
+          <li><span class="node">04</span><div><strong>Real-money release</strong><small>Independent review &amp; release gates</small></div><span class="mini-state">Gated</span></li>
+        </ol>
+        <div class="blueprint-bottom"><span class="signal" aria-hidden="true"></span> Evidence first. Activation follows verification.</div>
+      </div>
+    </section>
+
+    <aside class="notice wrap" aria-label="Current trading availability"><span class="notice-icon" aria-hidden="true">!</span><p><strong>Experimental development — real-money DEX trading is not enabled.</strong> Current funded tests use disposable Bitcoin regtest and XMZ fakechain funds. They demonstrate specific settlement and recovery paths, not a complete live exchange. Do not send funds to test the DEX.</p><span class="pill gated">Live gate closed</span></aside>
+
+    <section class="section wrap" id="verified" aria-labelledby="verified-title">
+      <div class="section-heading"><div><p class="eyebrow">01 / Evidence, not promises</p><h2 id="verified-title">A foundation we can test.</h2></div><p>These are development checks at this snapshot—not an audit, a security score or a percentage of project completion.</p></div>
+      <div class="evidence-grid">
+        <article><span class="metric">89<span> / passed</span></span><h3>Engine library tests</h3><p>Latest settlement acceptance run, alongside three compile-fail checks. Test counts are not a security audit.</p></article>
+        <article><span class="metric">33<span> / passed</span></span><h3>C++ DEX tests</h3><p>Native wallet coordination, recovery controls and GUI/backend boundaries.</p></article>
+        <article><span class="metric">5<span> / passed</span></span><h3>QML presentation tests</h3><p>Quote review, state visibility and the read-only recovery action.</p></article>
+        <article><span class="metric">2<span> / funded paths</span></span><h3>Redeem + cancel/refund</h3><p>Real transactions on isolated test chains, with restart reconciliation.</p></article>
+      </div>
+      <div class="verified-strip"><span>Also verified</span><p>Full GUI build <b aria-hidden="true">·</b> Isolated startup <b aria-hidden="true">·</b> Signed recovery destinations &amp; fee limits <b aria-hidden="true">·</b> Swap-lock input binding <b aria-hidden="true">·</b> Repeatable acceptance runner</p></div>
+      <p class="scope-note"><strong>Important boundary:</strong> the new isolated exact-payment test delivers full principal and returns unused reserve. The broader negotiated two-party swap fixture still pays partial XMZ proceeds. Complete full-proceeds swaps and whole-application recovery remain unfinished. C++ and QML counts above are from the earlier roadmap snapshot, not a new run today.</p>
+    </section>
+
+    <section class="section wrap" id="progress-20260919" aria-labelledby="progress-title">
+      <div class="section-heading"><div><p class="eyebrow">Engineering update / 19 September 2026</p><h2 id="progress-title">Exact payments. Safer recovery.</h2></div><p>Development progress on disposable test chains only. No real-money activation or new downloadable wallet release is announced by this update.</p></div>
+      <div class="scope-grid">
+        <article><h3>Verified in isolated tests</h3><p>Exact quoted XMZ reaches its destination, with network fees accounted for separately and unused reserve returned. A deliberately lost broadcast reply is reconciled without a second payment.</p></article>
+        <article><h3>Wallet safeguard implemented</h3><p>Saved transaction inputs are checked against the open wallet before submission. Wrong-wallet relay is rejected. Focused tests passed with GCC and Clang, and the wallet RPC was rebuilt successfully.</p></article>
+        <article><h3>Restart research, not a finished vault</h3><p>Encrypted transaction metadata can be restored in a fresh worker. Wrong keys and altered records fail before broadcast. Production key storage, backup and recovery after the whole application closes remain outstanding.</p></article>
+      </div>
+      <details><summary>Public verification summary — no personal paths or raw logs</summary><ul><li>89 engine library tests and three compile-fail checks passed in the latest acceptance run.</li><li>Both funded scenarios passed, including lost replies, metadata tampering and wrong-wallet rejection.</li><li>Four focused wallet-validation tests passed with each of GCC and Clang.</li><li>AI-assisted source review informed the work; independent security review is still required.</li></ul><p>Only an aggregate summary is published here. Raw development logs, local usernames, home-directory paths and private wallet data are not included.</p></details>
+      <div class="gate"><strong>Agreed payout policy</strong><p>A quote for 100 XMZ means exactly 100 XMZ received. The XMZ buyer funds a separate network-fee reserve and receives its unused balance. This policy is documented; its new signed terms and complete two-party execution are not yet implemented. Initial application trading fees remain zero, separate from network fees.</p></div>
+      <p class="scope-note"><strong>Next:</strong> implement signed reserve terms and durable recovery storage; prove complete two-party settlement and refunds; connect GUI approval to execution; validate public peers, pricing rules and release gates. Cancellation-fee responsibility, recovery unlocking and reserve funding for buyers without XMZ still need resolution.</p>
+    </section>
+
+    <section class="section wrap" id="milestones" aria-labelledby="milestones-title">
+      <div class="section-heading"><div><p class="eyebrow">02 / The delivery path</p><h2 id="milestones-title">Six milestones.<br>One complete journey.</h2></div><p>Workstreams can overlap, but dependencies cannot be skipped. Each milestone has an observable exit condition.</p></div>
+      <div class="legend" aria-label="Status key"><span><i class="legend-dot verified"></i> Verified foundation</span><span><i class="legend-dot building"></i> In development / next</span><span><i class="legend-dot planned"></i> Planned</span><span><i class="legend-dot locked"></i> Release-gated</span></div>
+      <div class="timeline">
+        <article class="milestone next" id="settlement"><div class="step" aria-hidden="true">01</div><div class="milestone-body"><div class="card-top"><span class="pill building">Next focus</span><span class="effort">1–3 weeks · estimated effort</span></div><p class="card-kicker">SETTLEMENT ENGINE</p><h3>Every atom accounted for.</h3><p>Integrate the tested exact-payment primitive into a complete negotiated exchange: agreed proceeds delivered, buyer-funded network fees accounted for, no unexplained funds left behind.</p><details open><summary>Deliverables &amp; completion gate</summary><ul><li>Implement the agreed exact XMZ payout with a buyer-funded reserve and unused reserve returned to the buyer.</li><li>Account for funding fees, recovery fees, change and remaining balances.</li><li>Verify complete payout and refund paths with exact on-chain accounting.</li></ul><div class="gate"><strong>Exit condition</strong><p>Full proceeds or the defined refund reach the correct wallet; every fee and remaining output has an explicit treatment.</p></div></details><p class="depends">Still needed: signed reserve terms, cancellation-fee policy and full two-party integration</p></div></article>
+        <article class="milestone" id="recovery"><div class="step" aria-hidden="true">02</div><div class="milestone-body"><div class="card-top"><span class="pill planned">Planned integration</span><span class="effort">2–4 weeks · estimated effort</span></div><p class="card-kicker">DURABLE RECOVERY</p><h3>Close the app. Keep the trade safe.</h3><p>Retain enough verified state to recover when the entire application stops—not only when one test process restarts.</p><details><summary>Deliverables &amp; completion gate</summary><ul><li>Persist signed terms, peer identities, policy and protocol progress.</li><li>Connect single-use execution ownership to a restart-safe journal.</li><li>Test crashes, interrupted writes, missing replies and uncertain broadcasts.</li><li>Reconcile an existing payment instead of blindly sending it again.</li></ul><div class="gate"><strong>Exit condition</strong><p>A fresh application process resumes or safely reconciles interrupted swaps without duplicate funding or loss of recovery information.</p></div></details><p class="depends">Builds on: single-use claims and isolated recovery tests</p></div></article>
+        <article class="milestone" id="gui"><div class="step" aria-hidden="true">03</div><div class="milestone-body"><div class="card-top"><span class="pill planned">Planned integration</span><span class="effort">2–4 weeks · estimated effort</span></div><p class="card-kicker">MONZERO GUI</p><h3>One clear trading experience.</h3><p>Connect the wallet interface to actual execution, with deliberate approval, understandable progress and a visible recovery path.</p><div class="trade-flow" aria-label="Planned user journey"><span>Quote</span><b aria-hidden="true">→</b><span>Approve</span><b aria-hidden="true">→</b><span>Fund</span><b aria-hidden="true">→</b><span>Settle / refund</span></div><details><summary>Deliverables &amp; completion gate</summary><ul><li>Separate saving commercial terms from explicit permission to start a trade.</li><li>Display exact amounts, destinations, fees, confirmations and deadlines.</li><li>Connect journal loading to read-only payment checks and recovery controls.</li><li>Test the complete interface against the native settlement engine.</li></ul><div class="gate"><strong>Exit condition</strong><p>A tester can complete a full test-network swap in the GUI, including an interrupted-and-restarted scenario, without developer intervention.</p></div></details><p class="depends">Requires: full settlement + durable recovery</p></div></article>
+        <article class="milestone" id="network"><div class="step" aria-hidden="true">04</div><div class="milestone-body"><div class="card-top"><span class="pill planned">Planned</span><span class="effort">3–6 weeks · estimated effort</span></div><p class="card-kicker">PUBLIC TRADING INFRASTRUCTURE</p><h3>Find a peer. Verify the offer.</h3><p>Move beyond controlled local counterparts to authenticated peers and discoverable offers on a public test network.</p><details><summary>Deliverables &amp; completion gate</summary><ul><li>Implement public peer authentication and offer discovery.</li><li>Handle unavailable peers, expired offers and conflicting trade attempts.</li><li>Introduce operational monitoring and a controlled tester workflow.</li><li>Recruit willing counterparties; adapters do not create liquidity.</li></ul><div class="gate"><strong>Exit condition</strong><p>Separate testers can discover, agree and complete supported test-network trades, with failures and offline peers handled explicitly.</p></div></details><p class="depends">Requires: authenticated protocol + working execution workflow</p></div></article>
+        <article class="milestone" id="market-rules"><div class="step" aria-hidden="true">05</div><div class="milestone-body"><div class="card-top"><span class="pill building">Design + foundations</span><span class="effort">2–6 weeks · estimated effort</span></div><p class="card-kicker">PRICE POLICY &amp; XMZ UTILITY</p><h3>Transparent rules. Explicit fees.</h3><p>Apply agreed price limits and a clearly defined XMZ application-fee model to trades through the Monzero protocol.</p><details><summary>Deliverables &amp; completion gate</summary><ul><li>Select the initial reference price, trusted pricing source and permitted deviation.</li><li>Reject stale references and out-of-band new trades; keep existing recovery paths available.</li><li>Define reference updates and manipulation protections for a thinly traded market.</li><li>Agree and implement the application-fee scope, recipient and failure/refund behaviour.</li></ul><div class="gate"><strong>Exit condition</strong><p>Actual trade admission enforces the approved price policy and fee rules; users can distinguish application fees from native network fees.</p></div></details><p class="depends">Decision needed: pricing policy + fee model. Current signed quotes support zero application fee.</p></div></article>
+        <article class="milestone release" id="release"><div class="step" aria-hidden="true">06</div><div class="milestone-body"><div class="card-top"><span class="pill gated">Release gate closed</span><span class="effort">No committed launch date</span></div><p class="card-kicker">REVIEW &amp; STAGED RELEASE</p><h3>Earn the right to go live.</h3><p>A passing test suite is evidence, not a launch switch. Real-money activation follows review, platform validation and explicit release approval.</p><details><summary>Deliverables &amp; completion gate</summary><ul><li>Complete adversarial testing and obtain an independent security review.</li><li>Validate native platform behaviour, including Windows; some new primitives are Linux-only.</li><li>Reproduce and sign release artifacts, verify downloads and document limitations.</li><li>Move from a public test-network pilot to a separately approved, controlled real-money rollout.</li></ul><div class="gate"><strong>Exit condition</strong><p>Settlement, recovery, security and release requirements have supporting evidence. Warnings and public testing do not replace those requirements.</p></div></details><p class="depends">Requires: prior milestones + review findings addressed</p></div></article>
+      </div>
+    </section>
+
+    <section class="section timing" id="timing" aria-labelledby="timing-title"><div class="wrap">
+      <div class="section-heading"><div><p class="eyebrow">03 / Planning horizon</p><h2 id="timing-title">Ranges, not countdowns.</h2></div><p>Illustrative engineering effort, assuming experienced full-time development, prompt design decisions and no major protocol redesign. These are not scheduled completion dates.</p></div>
+      <div class="timing-grid"><div class="effort-chart" aria-label="Estimated effort by workstream, in weeks">
+        <div class="chart-axis" aria-hidden="true"><span>0</span><span>2 weeks</span><span>4 weeks</span><span>6 weeks</span></div>
+        <div class="chart-row"><div><strong>Full settlement</strong><span>1–3 weeks</span></div><div class="track range-1-3" aria-hidden="true"><i></i><b></b></div></div>
+        <div class="chart-row"><div><strong>Restart recovery</strong><span>2–4 weeks</span></div><div class="track range-2-4" aria-hidden="true"><i></i><b></b></div></div>
+        <div class="chart-row"><div><strong>GUI execution</strong><span>2–4 weeks</span></div><div class="track range-2-4" aria-hidden="true"><i></i><b></b></div></div>
+        <div class="chart-row"><div><strong>Public infrastructure</strong><span>3–6 weeks</span></div><div class="track range-3-6" aria-hidden="true"><i></i><b></b></div></div>
+        <div class="chart-row"><div><strong>Commercial rules</strong><span>2–6 weeks</span></div><div class="track range-2-6" aria-hidden="true"><i></i><b></b></div></div>
+        <p class="chart-note">Solid + hatched bars show the estimated effort range. Work can overlap; the ranges should not simply be added together. Independent review and release scheduling are separate.</p>
+      </div><div class="horizon"><article><span class="eyebrow">First integration target</span><strong>4–8 <small>weeks</small></strong><h3>Complete GUI-driven test swaps</h3><p>A planning estimate for the end-to-end test-network journey, including restart recovery.</p></article><article><span class="eyebrow">Broader planning window</span><strong>8–16 <small>weeks</small></strong><h3>Public test-network pilot</h3><p>Subject to capacity, peer infrastructure, market-rule decisions and test findings. Not a mainnet launch promise.</p></article></div></div>
+    </div></section>
+
+    <section class="section wrap" aria-labelledby="scope-title"><div class="section-heading"><div><p class="eyebrow">04 / Clear expectations</p><h2 id="scope-title">What this roadmap means.</h2></div></div><div class="scope-grid">
+      <article><span class="scope-symbol" aria-hidden="true">↔</span><h3>BTC / XMZ first</h3><p>The immediate milestone is a complete Bitcoin–Monzero trading path. Additional assets are future scope, not supported live markets implied by this page.</p></article>
+      <article><span class="scope-symbol" aria-hidden="true">≠</span><h3>Price bands are not value guarantees</h3><p>Limits apply to new trades through our protocol. They do not set prices on other exchanges, guarantee a buyer or establish a guaranteed XMZ value.</p></article>
+      <article><span class="scope-symbol" aria-hidden="true">◎</span><h3>Community testing complements review</h3><p>Public test-network participation can uncover failures. It does not replace independent review, and no paid bug-bounty programme is announced by this roadmap.</p></article>
+    </div></section>
+
+    <section class="closing wrap"><p class="eyebrow">Open development. Honest milestones.</p><h2>Follow the evidence.<br><span>Help shape what comes next.</span></h2><p>Explore the project, review the security guidance and follow future tester instructions. No deposit is required to read or follow this roadmap.</p><div class="actions"><a class="button primary" href="https://github.com/Nightglass-Protocol1/monzero">Explore the source <span aria-hidden="true">↗</span></a><a class="button secondary" href="../security/">Security &amp; reporting</a></div></section>
+  </main>
+  <footer class="footer wrap"><a class="brand" href="../"><span class="brand-mark">MZ</span> MONZERO</a><p>Experimental, community-run development.<br>Roadmap snapshot: 19 September 2026 · Subject to revision.</p><a href="#main">Back to top ↑</a></footer>
+</body>
+</html>
