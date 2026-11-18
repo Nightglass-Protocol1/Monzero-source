@@ -789,8 +789,10 @@ QString evmControlNetwork(qint64 chainId) {
     case DexChains::SolMainnet: return QStringLiteral("sol-mainnet");
     // USDT on Solana has its own document: limits in USDT, its own kill switch
     case DexChains::SolUsdtMainnet: return QStringLiteral("sol-usdt-mainnet");
+    case DexChains::BscUsdtMainnet: return QStringLiteral("bnb-usdt-mainnet");
 #ifndef MONZERO_DEX_PUBLIC_EDITION
-    case DexChains::SolDevnet: case DexChains::SolLocal: case DexChains::SolUsdtDevnet: case DexChains::SolUsdtLocal: return QStringLiteral("evm-regtest");
+    case DexChains::SolDevnet: case DexChains::SolLocal: case DexChains::SolUsdtDevnet: case DexChains::SolUsdtLocal:
+    case DexChains::BscUsdtTestnet: case DexChains::LocalUsdt: return QStringLiteral("evm-regtest");
     // The public edition trades on mainnets only, always under a signed document
     case 97: case 11155111: case 1337: case 31337: return QStringLiteral("evm-regtest");
 #endif
@@ -947,6 +949,8 @@ void DexEngine::setUpEvmMarkets() {
     // USDT on Solana: its own market on the same chain (mainnet; a local validator with a USDT mint)
     for (const auto &c:QList<Chain>(chains)) {
         if (c.id==int(DexChains::SolMainnet)) chains.append({int(DexChains::SolUsdtMainnet),c.rpc});
+        // USDT (BEP-20) on BNB Smart Chain: its own market beside BNB
+        if (c.id==56) chains.append({int(DexChains::BscUsdtMainnet),c.rpc});
         if (c.id==int(DexChains::SolLocal) && DexChains::solanaAddress(qEnvironmentVariable("MONZERO_DEX_SOL_LOCAL_USDT_MINT")))
             chains.append({int(DexChains::SolUsdtLocal),c.rpc});
     }
@@ -1153,7 +1157,8 @@ bool DexEngine::takeEvmOffer(const QString &listingId,const QString &xmzAmount) 
         }
         // A USDT offer is checked under the USDT market's limits, not the chain coin's
         const qint64 chain=qint64(l.value("chainId").toDouble());
-        const qint64 market=l.value("pair").toString()=="USDT/XMZ" ? DexChains::marketOf(chain,QStringLiteral("usdt")) : chain;
+        const auto pairName=l.value("pair").toString();
+        const qint64 market=pairName=="USDT/XMZ" || pairName=="USDT-BSC/XMZ" ? DexChains::marketOf(chain,QStringLiteral("usdt")) : chain;
         const auto refusal=evmOfferRefusal(market,wei,atoms.isEmpty() ? l.value("xmzAtoms").toString() : atoms);
         if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
         QByteArray seed=evmSeed();

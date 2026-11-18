@@ -74,7 +74,7 @@ bool listingValid(const QJsonObject &signedListing) {
     const auto l=signedListing.value("listing").toObject();
     static const QRegularExpression address("\\A0x[0-9a-fA-F]{40}\\z");
     return signedListing.size()==2 && Hash.match(l.value("id").toString()).hasMatch()
-        && (l.value("pair")=="ETH/XMZ" || l.value("pair")=="BNB/XMZ" || l.value("pair")=="SOL/XMZ" || l.value("pair")=="USDT/XMZ")
+        && (l.value("pair")=="ETH/XMZ" || l.value("pair")=="BNB/XMZ" || l.value("pair")=="SOL/XMZ" || l.value("pair")=="USDT/XMZ" || l.value("pair")=="USDT-BSC/XMZ")
         && (l.value("side")=="sell-xmz" || l.value("side")=="buy-xmz")
         && HexQty.match(l.value("value").toString()).hasMatch() && Digits.match(l.value("xmz").toString()).hasMatch()
         && address.match(l.value("maker").toString()).hasMatch() && l.value("expiresAt").isDouble() && l.value("chainId").isDouble();
@@ -216,7 +216,7 @@ bool EvmMarketJob::post(QByteArray &walletSeed,qint64 chainId,const QString &sid
     auto r=base("post",folder);r.insert("tick",t);
     // The helper trades the market on its chain; a token market names its pair
     QJsonObject offer{{"chainId",DexChains::helperChain(chainId)},{"side",side},{"valueWei",valueWei},{"xmzAtoms",xmzAtoms},{"lifetimeSecs",lifetimeSecs}};
-    if (DexChains::usdt(chainId)) offer.insert("pair",DexChains::pair(chainId));
+    if (DexChains::token(chainId)) offer.insert("pair",DexChains::pair(chainId));
     if (!minXmzAtoms.isEmpty()) offer.insert("minXmzAtoms",minXmzAtoms);
     if (renew) offer.insert("renew",true);
     r.insert("offer",offer);

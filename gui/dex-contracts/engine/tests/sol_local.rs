@@ -112,7 +112,7 @@ impl Party {
     fn chain(&self, url: &str, program: sol::Pubkey) -> SolChain {
         let agreed = self.saved.agreed(&self.seed, &self.key).unwrap();
         let nonce = u64::try_from(self.saved.swap_nonce()).unwrap();
-        SolChain::new(url, Chain::SolLocal, program, sol::account_key(&self.key.to_bytes().0), agreed.sol.expect("Solana accounts in the frames"), nonce, self.saved.offer.value)
+        SolChain::with_asset(url, Chain::SolLocal, program, sol::account_key(&self.key.to_bytes().0), agreed.sol.expect("Solana accounts in the frames"), nonce, self.saved.offer.value, self.saved.offer.asset)
             .unwrap()
     }
 
@@ -128,6 +128,12 @@ async fn agree(url: &str, program: sol::Pubkey, tag: u8, timing: Timing) -> (Par
 
 /// As `agree`, with the lamports each side's account is given
 async fn agree_funded(url: &str, program: sol::Pubkey, tag: u8, timing: Timing, owner_lamports: u64, claimer_lamports: u64) -> (Party, Party) {
+    agree_asset(url, program, tag, timing, owner_lamports, claimer_lamports, Address::ZERO, LAMPORTS).await
+}
+
+/// As `agree_funded`, for a trade of `value` in `asset` (zero: SOL; else a token's stand-in)
+#[allow(clippy::too_many_arguments)]
+async fn agree_asset(url: &str, program: sol::Pubkey, tag: u8, timing: Timing, owner_lamports: u64, claimer_lamports: u64, asset: Address, value: u64) -> (Party, Party) {
     let (owner_key, claimer_key) = (PrivateKeySigner::random(), PrivateKeySigner::random());
     let (owner_seed, claimer_seed) = (SwapSeed::from_bytes([tag; 32]), SwapSeed::from_bytes([tag ^ 0xFF; 32]));
     let mut id = [tag; 32];
@@ -138,8 +144,8 @@ async fn agree_funded(url: &str, program: sol::Pubkey, tag: u8, timing: Timing, 
         contract: sol::contract_address(&program),
         owner: owner_key.address(),
         claimer: claimer_key.address(),
-        asset: Address::ZERO,
-        value: U256::from(LAMPORTS),
+        asset,
+        value: U256::from(value),
         duration1: D,
         duration2: D,
         xmz_amount: XMZ,
@@ -335,4 +341,57 @@ async fn a_claimer_holding_no_sol_is_asked_for_it_when_no_advance_comes() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
     assert_eq!(claimer_state, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
+}
+
+/// USDT on Solana with a test mint: a buyer pays 25 USDT, a seller holding no SOL collects them
+/// into a token account opened in its claim (the buyer's fee advance pays for it).
+///   MONZERO_SOL_USDT_MINT=<mint> MONZERO_SOL_USDT_BANK=<hex seed of an account holding the mint's tokens and SOL>
+#[tokio::test]
+async fn a_usdt_swap_locks_the_tokens_and_the_seller_collects_them() {
+    let Some((url, program)) = setup() else { return };
+    let (Ok(mint), Ok(bank)) = (std::env::var("MONZERO_SOL_USDT_MINT"), std::env::var("MONZERO_SOL_USDT_BANK")) else { return };
+    let _chain = CHAIN.lock().await;
+    let mint = sol::from_base58(&mint).unwrap();
+    sol::set_local_usdt_mint(mint);
+    let bank = ed25519_dalek::SigningKey::from_bytes(&hex::decode(bank).unwrap().try_into().unwrap());
+    let units = 25_000_000u64; // 25 USDT
+    let timing = Timing { xmz_confirmations: 10, xmz_lock_budget: 120, owner_refund_margin: 120, claim_margin: 120 };
+    let (owner, claimer) = agree_asset(&url, program, 5, timing, 1_000_000, 0, sol::asset_address(&mint), units).await;
+    // The buyer's USDT and its SOL for fees, the vault, the swap account and the seller's advance
+    let bank_sol = balance(&url, &bank.verifying_key().to_bytes()).await;
+    sol::pay_out_with(&url, &bank, &owner.account(), bank_sol - 30_000_000, Some(mint)).await.unwrap().unwrap();
+    for _ in 0..60 {
+        if sol::token_balance(&url, &owner.account(), &mint).await.unwrap() >= units {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let owner_tokens = sol::token_balance(&url, &owner.account(), &mint).await.unwrap();
+    assert!(owner_tokens >= units, "the buyer holds its USDT");
+    assert_eq!(balance(&url, &claimer.account()).await, 0, "the seller holds no SOL");
+    let (mut owner_state, mut claimer_state) = (None, None);
+    for round in 0..90 {
+        owner_state = Some(owner.resume(&url, program).with_gas_advance(GasAdvance::Give).tick().await.unwrap());
+        claimer_state = Some(claimer.resume(&url, program).with_gas_advance(GasAdvance::Expect).tick().await.unwrap());
+        println!("round {round}: owner {} | claimer {}", owner_state.as_ref().unwrap().stage(), claimer_state.as_ref().unwrap().stage());
+        if owner_state.as_ref().unwrap().is_done() && claimer_state.as_ref().unwrap().is_done() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    assert_eq!(owner_state, Some(RoleState::Owner(OwnerState::Done(Outcome::Swapped))));
+    assert_eq!(claimer_state, Some(RoleState::Claimer(ClaimerState::Done(Outcome::Swapped))));
+    assert_eq!(sol::token_balance(&url, &claimer.account(), &mint).await.unwrap(), units, "the seller collected exactly 25 USDT");
+    assert_eq!(sol::token_balance(&url, &owner.account(), &mint).await.unwrap(), owner_tokens - units);
+    assert_eq!(owner.xmz.ledger.lock().unwrap().swept_by, Some("owner"), "the buyer took the XMZ with the secret the USDT claim revealed");
+    // Afterwards the seller sends everything home: its USDT (into a token account opened for it) and its SOL
+    let home = ed25519_dalek::SigningKey::from_bytes(&rand::random()).verifying_key().to_bytes();
+    sol::pay_out_with(&url, &sol::account_key(&claimer.key.to_bytes().0), &home, 0, Some(mint)).await.unwrap().expect("something to send");
+    for _ in 0..60 {
+        if sol::token_balance(&url, &home, &mint).await.unwrap() == units {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(sol::token_balance(&url, &home, &mint).await.unwrap(), units, "the USDT reached the seller's own wallet");
 }

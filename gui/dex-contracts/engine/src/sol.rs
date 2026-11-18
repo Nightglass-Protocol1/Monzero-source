@@ -191,7 +191,13 @@ pub async fn pay_out_with(url: &str, key: &SigningKey, to: &Pubkey, keep: u64, m
             let theirs = token_account(to, &mint).ok_or_else(|| sol_err("no token account address"))?;
             if units > 0 {
                 if rpc.account(&theirs, "confirmed").await?.is_none() {
-                    available = available.saturating_sub(TOKEN_ACCOUNT_RENT); // we open it for them
+                    // We open it for them, before our own token account's deposit comes back
+                    if balance < TOKEN_ACCOUNT_RENT + FEE_LAMPORTS {
+                        return Err(sol_err(format!(
+                            "sending the USDT opens a USDT account in the receiving wallet, which needs {}.{:09} SOL here first; send a little SOL to this account, or receive at a wallet that already holds USDT",
+                            (TOKEN_ACCOUNT_RENT + FEE_LAMPORTS) / 1_000_000_000, (TOKEN_ACCOUNT_RENT + FEE_LAMPORTS) % 1_000_000_000)));
+                    }
+                    available = available.saturating_sub(TOKEN_ACCOUNT_RENT);
                 }
                 let ata_program = from_base58(ATA_PROGRAM)?;
                 ixs.push((ata_program, vec![meta(me, true, true), meta(theirs, false, true), meta(*to, false, false), meta(mint, false, false), meta(SYSTEM_PROGRAM, false, false), meta(token, false, false)], vec![1u8]));
@@ -925,9 +931,13 @@ impl EvmChain for SolChain {
     }
 
     fn reserve(&self, owner: bool) -> U256 {
-        // A token swap: the owner's vault deposit, the claimer's token account deposit
-        let _ = owner;
-        U256::from(if self.mint.is_some() { TOKEN_ACCOUNT_RENT } else { 0 })
+        // A token swap: the owner's vault deposit; the claimer's own token account deposit, and one
+        // more for the token account its pay-out opens in the user's wallet (most new sellers have none)
+        U256::from(match (self.mint.is_some(), owner) {
+            (false, _) => 0,
+            (true, true) => TOKEN_ACCOUNT_RENT,
+            (true, false) => 2 * TOKEN_ACCOUNT_RENT,
+        })
     }
 
     /// The claimer's balance, for the gas advance: always the swap's bound claimer

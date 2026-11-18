@@ -32,7 +32,8 @@ Item {
                                listing("0xa3", "sell-xmz", 400000000, 1000, 0, "0x00000000000000000000000000000000000000a1"),
                                listing("0xb1", "buy-xmz", 180000000, 1500, 100), listing("0xb2", "buy-xmz", 50000000, 500) ] },
             ETH: { configured: true, busy: false, coin: "ETH", chainId: 1, relays: [], mine: [], listings: [] },
-            USDT: { configured: true, busy: false, coin: "USDT", chainId: 501000201, relays: [], mine: [], listings: [] } })
+            USDT: { configured: true, busy: false, coin: "USDT", chainId: 501000201, relays: [], mine: [], listings: [] },
+            "USDT-BSC": { configured: true, busy: false, coin: "USDT-BSC", chainId: 100000056, relays: [], mine: [], listings: [] } })
         // The operator's per-trade cap in coins; the real engine reads it from the signed caps document
         property real capCoin: 1000
         signal dexRiskChanged()
@@ -132,7 +133,8 @@ Item {
             press("life_6"); verify(f.ready)
         }
         function test_usdt_is_its_own_market_with_six_decimals() {
-            compare(ex.allCoins.join(), "ETH,BNB,SOL,USDT")
+            compare(ex.allCoins.join(), "ETH,BNB,SOL,USDT,USDT-BSC")
+            compare(ex.label("USDT-BSC"), "USDT (BNB)")
             ex.pick("USDT")
             compare(ex.coinDecimals, 6)
             compare(ex.coinAccount, "11111111111111111111111111111112", "USDT sits in the Solana trade account")
@@ -142,6 +144,18 @@ Item {
             find(ex, "orderAmount").text = "1000"
             press("orderButton"); press("orderButton")
             compare(JSON.stringify(engine.calls), JSON.stringify([["post", 501000201, "buy-xmz", "12", "1000", 6, "100"]]))
+            ex.pick("SOL")
+        }
+        function test_bnb_usdt_has_eighteen_decimals_and_the_evm_account() {
+            ex.pick("USDT-BSC")
+            compare(ex.coinDecimals, 18)
+            compare(ex.coinAccount, "0x00000000000000000000000000000000000000a1")
+            var f = find(ex, "exchangeForm")
+            f.type = "limit"; f.side = "buy"
+            find(ex, "limitPrice").text = "0.012"
+            find(ex, "orderAmount").text = "1000"
+            press("orderButton"); press("orderButton")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["post", 100000056, "buy-xmz", "12", "1000", 6, "100"]]))
             ex.pick("SOL")
         }
         function test_keep_open_posts_a_renewing_offer() {

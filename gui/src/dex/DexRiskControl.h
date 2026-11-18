@@ -50,6 +50,7 @@ private:
     QJsonObject ledger() const;
     QString coinName() const {
         if (m_network.startsWith("btc-")) return QStringLiteral("Bitcoin");
+        if (m_network.startsWith("bnb-usdt-")) return QStringLiteral("USDT");
         if (m_network.startsWith("bnb-")) return QStringLiteral("BNB");
         if (m_network.startsWith("eth-")) return QStringLiteral("ETH");
         if (m_network.startsWith("evm-")) return QStringLiteral("EVM");

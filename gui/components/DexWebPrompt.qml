@@ -51,9 +51,10 @@ Item {
     function coin(chainId) { var id = Number(chainId); return solana(id) ? "SOL" : id === 56 || id === 97 ? "BNB" : "ETH" }
     function places(chainId) { return solana(chainId) ? 9 : 18 }
     // What a trade is paid in: the chain's coin, or USDT on Solana (a token asset in the terms)
-    function token(o) { return !!o && solana(o.chainId) && !!o.asset && !/^(0x)?0*$/.test(String(o.asset)) }
+    // (on Solana or on BNB Smart Chain: a non-zero asset)
+    function token(o) { return !!o && !!o.asset && !/^(0x)?0*$/.test(String(o.asset)) }
     function offerCoin(o) { return token(o) ? "USDT" : coin(o ? o.chainId : 0) }
-    function offerPlaces(o) { return token(o) ? 6 : places(o ? o.chainId : 0) }
+    function offerPlaces(o) { return token(o) && solana(o.chainId) ? 6 : places(o ? o.chainId : 0) }
     // The user's own account for a chain, as accepted when the page connected
     function ownAccount(chainId) { return (solana(chainId) ? link.solAccount : link.account) || "" }
     function accountsText(a) {

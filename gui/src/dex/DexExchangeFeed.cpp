@@ -18,7 +18,7 @@ const int TimeoutMs=15000;
 
 DexExchangeFeed::DexExchangeFeed(SourceFor sources,QObject *parent) : QObject(parent),m_sources(std::move(sources)),m_net(new QNetworkAccessManager(this)) {}
 
-bool DexExchangeFeed::knownCoin(const QString &coin) {return coin=="ETH" || coin=="BNB" || coin=="SOL" || coin=="USDT";}
+bool DexExchangeFeed::knownCoin(const QString &coin) {return coin=="ETH" || coin=="BNB" || coin=="SOL" || coin=="USDT" || coin=="USDT-BSC";}
 bool DexExchangeFeed::knownInterval(int interval) {return interval==3600 || interval==4*3600 || interval==24*3600;}
 bool DexExchangeFeed::allowedBase(const QString &text) {
     const QUrl url(text);
@@ -112,6 +112,10 @@ bool DexExchangeFeed::balance(const QString &coin) {
               QJsonObject{{"mint","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}},QJsonObject{{"encoding","jsonParsed"},{"commitment","confirmed"}}}}}
         : source.solana
         ? QJsonObject{{"jsonrpc","2.0"},{"id",1},{"method","getBalance"},{"params",QJsonArray{source.account,QJsonObject{{"commitment","confirmed"}}}}}
+        // USDT (BEP-20) on BNB Smart Chain: balanceOf(account) at BSC-USD; the answer is hex like a balance
+        : coin=="USDT-BSC"
+        ? QJsonObject{{"jsonrpc","2.0"},{"id",1},{"method","eth_call"},{"params",QJsonArray{
+              QJsonObject{{"to","0x55d398326f99059fF775485246999027B3197955"},{"data","0x70a08231"+QString(24,'0')+source.account.mid(2).toLower()}},"latest"}}}
         : QJsonObject{{"jsonrpc","2.0"},{"id",1},{"method","eth_getBalance"},{"params",QJsonArray{source.account,"latest"}}};
     QNetworkRequest request{QUrl(source.rpc)};
     request.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");

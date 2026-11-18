@@ -97,7 +97,7 @@ fn funds_checked_at(dir: &Path) -> u64 {
 
 /// SOL a USDT buyer's trade account needs besides the USDT: the swap state and token vault
 /// rent (returned when the swap closes), fees, and the claimer's fee advance
-const SOL_TOKEN_OWNER_RESERVE: u64 = 10_000_000;
+const SOL_TOKEN_OWNER_RESERVE: u64 = 13_000_000;
 
 /// How often an open offer's funds are checked again while no take arrives
 const FUNDS_RECHECK_SECS: u64 = 600;

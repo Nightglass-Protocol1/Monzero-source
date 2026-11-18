@@ -28,7 +28,10 @@ ColumnLayout {
     readonly property var market: markets[coin] || ({})
     readonly property bool keysReady: wallet.keysReady === true
     // USDT (on Solana) appears once the wallet runs its market
-    readonly property var allCoins: markets.USDT ? ["ETH", "BNB", "SOL", "USDT"] : ["ETH", "BNB", "SOL"]
+    readonly property var allCoins: ["ETH", "BNB", "SOL"].concat(markets.USDT ? ["USDT"] : []).concat(markets["USDT-BSC"] ? ["USDT-BSC"] : [])
+    // How a market is named on screen (two USDT markets: on Solana and on BNB Smart Chain)
+    function label(c) { return c === "USDT" ? "USDT (SOL)" : c === "USDT-BSC" ? "USDT (BNB)" : c }
+    readonly property string bscUsdt: "0x55d398326f99059fF775485246999027B3197955"
     property string coin: "ETH"
     // SOL and USDT live on Solana (same trade account, Solana addresses)
     function onSolana(c) { return c === "SOL" || c === "USDT" }
@@ -67,7 +70,7 @@ ColumnLayout {
 
     readonly property var book: X.book(market.listings || [], coin, coinDecimals, myAccount, now)
     readonly property var stats: X.dayStats(candles[coin] || [], now)
-    readonly property real coinUsd: usd[coin] || (coin === "USDT" ? 1 : 0)
+    readonly property real coinUsd: usd[coin] || (coin === "USDT" || coin === "USDT-BSC" ? 1 : 0)
     readonly property real xmzBalance: wallet.state === "ready" && wallet.unlocked !== undefined ? Number(wallet.unlocked) : -1
     readonly property real coinBalance: balances[coin] !== undefined ? balances[coin] : -1
     readonly property var myOrders: {
@@ -97,11 +100,11 @@ ColumnLayout {
 
     function marketChain(c) { return Number((markets[c] || {}).chainId) || 0 }
     function rpcFor(id) {
-        return ({ 1: "https://ethereum-rpc.publicnode.com", 56: "https://bsc-rpc.publicnode.com", 501000101: "https://solana-rpc.publicnode.com", 501000201: "https://solana-rpc.publicnode.com",
+        return ({ 1: "https://ethereum-rpc.publicnode.com", 56: "https://bsc-rpc.publicnode.com", 100000056: "https://bsc-rpc.publicnode.com", 501000101: "https://solana-rpc.publicnode.com", 501000201: "https://solana-rpc.publicnode.com",
                   11155111: "https://ethereum-sepolia-rpc.publicnode.com", 97: "https://bsc-testnet-rpc.publicnode.com", 501000102: "https://api.devnet.solana.com" })[id] || ""
     }
     function networkName(id) {
-        return id === 1 ? qsTr("Ethereum") : id === 56 ? qsTr("BNB Smart Chain") : id === 501000101 ? qsTr("Solana") : id === 501000201 ? qsTr("Solana (USDT)")
+        return id === 1 ? qsTr("Ethereum") : id === 56 ? qsTr("BNB Smart Chain") : id === 501000101 ? qsTr("Solana") : id === 501000201 ? qsTr("Solana (USDT)") : id === 100000056 ? qsTr("BNB Smart Chain (USDT)")
              : id === 11155111 ? qsTr("Sepolia (test network)") : id === 97 ? qsTr("BNB Smart Chain Testnet") : id === 501000102 ? qsTr("Solana Devnet") : ""
     }
 
@@ -120,7 +123,7 @@ ColumnLayout {
         ignoreUnknownSignals: true
         function onDexRiskChanged() { ex.riskTick++ }
     }
-    function decimalsOf(c) { return c === "USDT" ? 6 : c === "SOL" ? 9 : 18 }
+    function decimalsOf(c) { return c === "USDT" ? 6 : c === "SOL" ? 9 : 18 }   // USDT on BNB Smart Chain has 18
     function syncFeed() {
         var d = feed.data
         var cs = JSON.parse(JSON.stringify(candles)), ps = JSON.parse(JSON.stringify(prints)), bs = JSON.parse(JSON.stringify(balances))
@@ -211,6 +214,10 @@ ColumnLayout {
                 for (var i = 0; i < a.length; ++i) units += Number(a[i].account.data.parsed.info.tokenAmount.amount || 0)
                 store(units / 1e6)
             })
+        } else if (c === "USDT-BSC") {
+            post(rpc, { jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: bscUsdt, data: "0x70a08231" + "000000000000000000000000" + account.slice(2).toLowerCase() }, "latest"] }, function (d) {
+                if (d && typeof d.result === "string") store(parseInt(d.result, 16) / 1e18)
+            })
         } else if (c === "SOL") {
             post(rpc, { jsonrpc: "2.0", id: 1, method: "getBalance", params: [account, { commitment: "confirmed" }] }, function (d) {
                 if (d && d.result && d.result.value !== undefined) store(Number(d.result.value) / 1e9)
@@ -291,7 +298,7 @@ ColumnLayout {
                 Column {
                     anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
                     spacing: 3
-                    Text { text: "XMZ / " + modelData; font.pixelSize: 15; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    Text { text: "XMZ / " + ex.label(modelData); font.pixelSize: 15; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
                     Row {
                         spacing: 8
                         Text { text: st.last > 0 ? X.price(st.last) + " " + modelData : qsTr("no trades yet"); font.pixelSize: 11; color: M.Style.dimmedFontColor }
@@ -557,7 +564,7 @@ ColumnLayout {
                     delegate: RowLayout {
                         Layout.fillWidth: true
                         readonly property bool buys: (modelData.kind === "offer") === (modelData.side === "buy-xmz")
-                        Text { text: "XMZ/" + modelData.coin; font.pixelSize: 13; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 2 }
+                        Text { text: "XMZ/" + ex.label(modelData.coin); font.pixelSize: 13; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 2 }
                         Text { text: (parent.buys ? qsTr("Buy") : qsTr("Sell")) + " · " + (modelData.kind === "offer" ? qsTr("limit") : qsTr("market"))
                                font.pixelSize: 13; color: parent.buys ? M.Style.green : "#E5677A"; Layout.fillWidth: true; Layout.preferredWidth: 3 }
                         Text { text: modelData.price || "—"; font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
@@ -685,7 +692,9 @@ ColumnLayout {
                     Text {
                         Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor
                         text: ex.coin === "USDT"
-                              ? qsTr("To buy XMZ, send USDT on Solana (SPL, not ERC-20 or TRC-20) here, plus about 0.01 SOL for network fees. It is this app's own account: only your trading keys can move it.")
+                              ? qsTr("To buy XMZ, send USDT on Solana (SPL, not ERC-20 or TRC-20) here, plus about 0.015 SOL for network fees and account deposits. It is this app's own account: only your trading keys can move it.")
+                              : ex.coin === "USDT-BSC"
+                              ? qsTr("To buy XMZ, send USDT on BNB Smart Chain (BEP-20, not ERC-20 or TRC-20) here, plus a little BNB for network fees. It is this app's own account: only your trading keys can move it.")
                               : qsTr("To buy XMZ, send %1 on %2 here (plus a little for network fees). It is this app's own account: only your trading keys can move it.").arg(ex.coin).arg(ex.networkName(ex.chainId) || ex.coin)
                     }
                     RowLayout {
@@ -695,6 +704,7 @@ ColumnLayout {
                         Image {
                             Layout.preferredWidth: 96; Layout.preferredHeight: 96; smooth: false; fillMode: Image.PreserveAspectFit
                             source: !parent.visible ? "" : ex.coin === "USDT" ? "image://qrcode/solana:" + ex.coinAccount + "?spl-token=" + ex.usdtMint
+                                  : ex.coin === "USDT-BSC" ? "image://qrcode/ethereum:" + ex.bscUsdt + "@56/transfer?address=" + ex.coinAccount
                                   : ex.coin === "SOL" ? "image://qrcode/solana:" + ex.coinAccount
                                   : "image://qrcode/ethereum:" + ex.coinAccount + "@" + ex.chainId
                         }
