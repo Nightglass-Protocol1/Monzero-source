@@ -139,6 +139,14 @@ final class DexMarket {
             f.listingId = f.listing.optJSONObject("listing").optString("id");
             f.state = new File(path, "journal.json").isFile() ? "agreed" : (maker && !o.isNull("takenBy") && o.has("takenBy") ? "agreed" : "open");
             if (new File(path, "cancelled").exists() || new File(path, "abandoned").exists()) f.state = "cancelled";
+            // Taken off the board by our own helper: our side could no longer pay for it
+            final File withdrawn = new File(path, "withdrawn");
+            if ("open".equals(f.state) && withdrawn.isFile()) {
+                f.state = "withdrawn";
+                final byte[] why = DexFiles.read(withdrawn, 400);
+                final String text = why == null ? "" : new String(why, java.nio.charset.StandardCharsets.UTF_8);
+                f.detail = text.length() > 200 ? text.substring(0, 200) : text;
+            }
             folders.add(f);
         }
     }
@@ -343,8 +351,10 @@ final class DexMarket {
                     for (Folder f : folders)
                         if (f.path.equals(folder)) {
                             if (done) f.state = "agreed";
+                            else if (r.optBoolean("offerWithdrawn")) f.state = "withdrawn";
                             else if (r.optBoolean("expired")) f.state = "expired";
-                            final String refused = r.opt("refused") instanceof String ? r.optString("refused") : "";
+                            final String refused = r.opt("refused") instanceof String ? r.optString("refused")
+                                    : r.optBoolean("offerWithdrawn") ? r.optString("reason") : "";
                             f.detail = refused.length() > 200 ? refused.substring(0, 200) : refused;
                         }
                     if (done) {
