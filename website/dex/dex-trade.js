@@ -312,7 +312,7 @@
     // swap closes), fees and the minimum an account must keep; the seller's keeps its account
     // open while it pays for its claim. The same figures as the wallet's engine.
     // A USDT trade also opens token accounts (a vault for the buyer, a USDT account for the seller)
-    if (tok()) return Promise.resolve(owner ? 10000000n : 3600000n);
+    if (tok()) return Promise.resolve(owner ? 13000000n : 5600000n);
     if (sol()) return Promise.resolve(owner ? 4500000n : 1500000n);
     // On the trade's own network: the fee there is what counts
     // Price plus tip, doubled: the wallet pays a tip on top of the base fee, and a reserve that is too
