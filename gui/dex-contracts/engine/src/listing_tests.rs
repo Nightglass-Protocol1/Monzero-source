@@ -175,10 +175,10 @@ fn usdt_is_a_pair_on_solana_mainnet_only_and_trades_carry_its_mint() {
     let mint = crate::sol::usdt_mint(Chain::SolMainnet).expect("Tether's mint is pinned");
     assert_eq!(crate::sol::to_base58(&mint), "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
     assert_eq!(Chain::SolMainnet.pairs(), vec!["SOL/XMZ", "USDT/XMZ"]);
-    assert_eq!(Chain::BscMainnet.pairs(), vec!["BNB/XMZ"]);
+    assert_eq!(Chain::BscMainnet.pairs(), vec!["BNB/XMZ", "USDT-BSC/XMZ"]);
     assert_eq!(Chain::SolMainnet.asset_of("SOL/XMZ"), Some(Address::ZERO));
     assert_eq!(Chain::SolMainnet.asset_of("USDT/XMZ"), Some(crate::sol::asset_address(&mint)));
-    assert_eq!(Chain::BscMainnet.asset_of("USDT/XMZ"), None, "no BNB-chain USDT yet");
+    assert_eq!(Chain::BscMainnet.asset_of("USDT/XMZ"), None, "BNB Chain USDT has its own pair name");
     assert_eq!(Chain::SolDevnet.asset_of("USDT/XMZ"), None, "no USDT pinned on devnet");
 
     let program = crate::sol::program_of(Chain::SolMainnet).expect("mainnet program");
@@ -214,4 +214,25 @@ fn token_accounts_are_program_addresses_of_wallet_and_mint() {
     // The same address Solana's own tool gives (spl-token address --owner … --token <USDT>)
     let wallet = crate::sol::from_base58("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM").unwrap();
     assert_eq!(crate::sol::to_base58(&crate::sol::token_account(&wallet, &mint).unwrap()), "TB5FCqbNsnuLQgEjUuPaT9qtVPTT4U1A8rvi7qzEj2M");
+}
+
+#[test]
+fn bep20_usdt_is_its_own_pair_on_bnb_smart_chain_only() {
+    let token = crate::chain::usdt_token(Chain::BscMainnet).expect("BSC-USD is pinned");
+    assert_eq!(token.to_string().to_lowercase(), "0x55d398326f99059ff775485246999027b3197955");
+    assert_eq!(Chain::BscMainnet.pairs(), vec!["BNB/XMZ", "USDT-BSC/XMZ"]);
+    assert_eq!(Chain::EthMainnet.pairs(), vec!["ETH/XMZ"], "no ERC-20 USDT: fees too high");
+    assert_eq!(Chain::BscMainnet.asset_of("USDT-BSC/XMZ"), Some(token));
+    assert_eq!(Chain::BscMainnet.asset_of("USDT/XMZ"), None, "Solana's USDT pair is not BNB Chain's");
+    assert_eq!(Chain::SolMainnet.asset_of("USDT-BSC/XMZ"), None);
+    let mut r = Rules::default();
+    r.contracts.insert(56, contract());
+    let key = PrivateKeySigner::random();
+    let mut l = listing(&key);
+    l.chain_id = 56;
+    l.pair = "USDT-BSC/XMZ".into();
+    l.value = U256::from(25u64) * U256::from(10u64).pow(U256::from(18u64)); // 25 USDT (18 decimals)
+    assert_eq!(l.check(&r, NOW), Ok(Chain::BscMainnet));
+    let offer = crate::market::offer_for(&l, Address::repeat_byte(9), l.xmz);
+    assert_eq!(offer.asset, token, "the lock is in USDT, not BNB");
 }

@@ -72,6 +72,9 @@ pub struct Request {
     /// The USDT mint on a local Solana test validator only; mainnet uses Tether's
     #[serde(default)]
     pub local_sol_usdt_mint: Option<String>,
+    /// A test USDT token on a local EVM chain (31337) only; BNB Smart Chain uses BSC-USD
+    #[serde(default)]
+    pub local_usdt_token: Option<alloy::primitives::Address>,
     /// `withdraw`: the chain whose trade account is emptied
     #[serde(default)]
     pub chain_id: Option<u64>,
@@ -189,6 +192,9 @@ pub async fn handle(request: &[u8]) -> Value {
 async fn dispatch(r: Request) -> Result<Value, String> {
     if let Some(program) = &r.local_sol_program {
         crate::sol::set_local_program(crate::sol::from_base58(program).map_err(|e| e.to_string())?);
+    }
+    if let Some(token) = r.local_usdt_token {
+        crate::chain::set_local_usdt_token(token);
     }
     if let Some(mint) = &r.local_sol_usdt_mint {
         crate::sol::set_local_usdt_mint(crate::sol::from_base58(mint).map_err(|e| e.to_string())?);
@@ -469,7 +475,7 @@ async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>, keep: all
     saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
     let chain_kind = Chain::from_id(saved.offer.chain_id).ok_or("unknown chain")?;
     let chain = AlloyChain::new(&cfg.evm_rpc, chain_kind, saved.offer.contract, saved.evm_from_block, key).map_err(|e| e.to_string())?;
-    let sent = chain.pay_out(to, keep).await.map_err(|e| e.to_string())?;
+    let sent = chain.pay_out_all(to, keep).await.map_err(|e| e.to_string())?;
     let mut v = status(dir)?;
     v["payout"] = match sent {
         Some((tx, amount)) => {

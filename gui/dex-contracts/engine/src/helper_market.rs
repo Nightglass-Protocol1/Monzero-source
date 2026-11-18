@@ -220,6 +220,18 @@ async fn funds_short(role: Role, listing: &Listing, xmz: u64, key: &PrivateKeySi
                 )));
             }
         }
+        // USDT (BEP-20) on an EVM chain: the tokens; the coin for gas is checked when the lock is due
+        Role::Owner if listing.asset() != Address::ZERO => {
+            let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
+            let have = crate::IErc20::new(listing.asset(), provider).balanceOf(key.address()).call().await.map_err(|e| e.to_string())?;
+            if have < value {
+                let coins = alloy::primitives::utils::format_ether; // BSC-USD has 18 decimals, as BNB
+                return Ok(Some(format!(
+                    "the trade account {} holds {} USDT; this offer needs {}. Send at least {} more USDT (BEP-20, on BNB Smart Chain) to it, plus a little BNB for fees, then try again",
+                    key.address(), coins(have), coins(value), coins(value - have)
+                )));
+            }
+        }
         Role::Owner => {
             let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
             let have = provider.get_balance(key.address()).await.map_err(|e| e.to_string())?;
@@ -817,7 +829,7 @@ pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: &str, no
     }
     let to = crate::helper::parse_address(to)?;
     let chain = AlloyChain::new(&cfg.evm_rpc, kind, Address::ZERO, 0, key).map_err(|e| e.to_string())?;
-    Ok(match chain.pay_out(to, keep).await.map_err(|e| e.to_string())? {
+    Ok(match chain.pay_out_all(to, keep).await.map_err(|e| e.to_string())? {
         Some((tx, amount)) => json!({"withdrawn": {"to": to.to_string(), "tx": tx.to_string(), "amountWei": amount.to_string()}}),
         None => json!({"withdrawn": null, "reason": "nothing to send, or a payment is still pending"}),
     })

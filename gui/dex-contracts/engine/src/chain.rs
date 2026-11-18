@@ -22,6 +22,23 @@ struct Scan {
     logs: Vec<Log>,
 }
 
+static LOCAL_USDT_TOKEN: std::sync::OnceLock<Address> = std::sync::OnceLock::new();
+
+/// A test USDT token on a local EVM test chain (31337) only, given with the request
+pub fn set_local_usdt_token(token: Address) {
+    let _ = LOCAL_USDT_TOKEN.set(token);
+}
+
+/// The pinned USDT (BEP-20) of an EVM chain: Binance-Peg BSC-USD on BNB Smart Chain (18 decimals).
+/// None where USDT is not traded (Ethereum: ERC-20 fees are too high).
+pub fn usdt_token(chain: Chain) -> Option<Address> {
+    match chain {
+        Chain::BscMainnet => Some(Address::from(alloy::primitives::address!("55d398326f99059fF775485246999027B3197955"))),
+        Chain::Local => LOCAL_USDT_TOKEN.get().copied(),
+        _ => None,
+    }
+}
+
 pub struct AlloyChain {
     chain: Chain,
     contract: Address,
@@ -180,6 +197,56 @@ impl AlloyChain {
     /// `to` (the user's own wallet, e.g. MetaMask). Returns the transaction and the amount, or
     /// None when a payout is still pending or nothing is left to send. Repeating it is safe.
     /// Sends the account's balance to `to`, less the fee and less `keep` (left for later fees)
+    /// Units of `token` (USDT) an account holds
+    pub async fn token_balance(&self, token: Address, who: Address) -> Result<U256, DriverError> {
+        crate::IErc20::new(token, self.reader.clone()).balanceOf(who).call().await.map_err(chain_err)
+    }
+
+    /// Send all of `token` the account holds to `to` (before its coin, which pays for this too)
+    pub async fn pay_out_token(&self, token: Address, to: Address) -> Result<Option<B256>, DriverError> {
+        let units = self.token_balance(token, self.from).await?;
+        if units.is_zero() {
+            return Ok(None);
+        }
+        let latest = self.reader.get_transaction_count(self.from).block_id(BlockId::latest()).await.map_err(chain_err)?;
+        let pending = self.reader.get_transaction_count(self.from).pending().await.map_err(chain_err)?;
+        if pending > latest {
+            return Ok(None); // a payment is still pending; tried again on the next call
+        }
+        let input = crate::IErc20::transferCall { to, amount: units }.abi_encode();
+        let probe = TransactionRequest::default().with_from(self.from).with_to(token).with_input(input.clone());
+        let gas = self.reader.estimate_gas(probe).await.map_err(chain_err)?;
+        let fees = self.reader.estimate_eip1559_fees().await.map_err(chain_err)?;
+        let tx = TransactionRequest::default()
+            .with_from(self.from)
+            .with_to(token)
+            .with_input(input)
+            .with_nonce(latest)
+            .with_chain_id(self.check_network().await?)
+            .with_gas_limit(gas + gas / 5)
+            .with_max_fee_per_gas(fees.max_fee_per_gas)
+            .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas.min(fees.max_fee_per_gas));
+        let envelope = tx.build(&self.wallet).await.map_err(chain_err)?;
+        self.broadcast(&Bytes::from(envelope.encoded_2718())).await?;
+        Ok(Some(*envelope.tx_hash()))
+    }
+
+    /// Everything the account holds to `to`: its USDT first (where USDT is traded), then, once that
+    /// payment is mined, its coin less the fee and `keep`
+    pub async fn pay_out_all(&self, to: Address, keep: U256) -> Result<Option<(B256, U256)>, DriverError> {
+        if let Some(token) = usdt_token(self.chain) {
+            if let Some(tx) = self.pay_out_token(token, to).await? {
+                for _ in 0..40 {
+                    if self.reader.get_transaction_receipt(tx).await.map_err(chain_err)?.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+            }
+        }
+        self.pay_out(to, keep).await
+    }
+
     pub async fn pay_out(&self, to: Address, keep: U256) -> Result<Option<(B256, U256)>, DriverError> {
         let latest = self.reader.get_transaction_count(self.from).block_id(BlockId::latest()).await.map_err(chain_err)?;
         let pending = self.reader.get_transaction_count(self.from).pending().await.map_err(chain_err)?;
@@ -221,6 +288,10 @@ impl AlloyChain {
 }
 
 impl EvmChain for AlloyChain {
+    async fn allowance(&self, token: Address) -> Result<U256, DriverError> {
+        crate::IErc20::new(token, self.reader.clone()).allowance(self.from, self.contract).call().await.map_err(chain_err)
+    }
+
     async fn now(&self) -> Result<u64, DriverError> {
         let head = self.reader.get_block_number().await.map_err(chain_err)?;
         self.block_timestamp(head).await
@@ -278,6 +349,7 @@ impl EvmChain for AlloyChain {
         let chain_id = self.check_network().await?;
         let (to, input, value) = match call {
             EvmCall::GasAdvance { to, amount } => (*to, Vec::new(), *amount),
+            EvmCall::Approve { token, amount } => (*token, crate::IErc20::approveCall { spender: self.contract, amount: *amount }.abi_encode(), U256::ZERO),
             EvmCall::NewSwap { terms, nonce } => (
                 self.contract,
                 XmzSwap::newSwapCall {

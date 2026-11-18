@@ -78,6 +78,8 @@ pub enum EvmCall {
     /// A plain payment from the owner to the claimer's account, so a claimer who holds none
     /// of the chain's coin can pay for its claim (see `GasAdvance`)
     GasAdvance { to: Address, amount: U256 },
+    /// Let the swap contract take `amount` of `token` from us (a BEP-20 USDT lock needs it first)
+    Approve { token: Address, amount: U256 },
 }
 
 /// Who pays the gas for the claimer's claim when the claimer's account is empty.
@@ -124,6 +126,10 @@ pub trait EvmChain {
     /// vault (the owner) and a token account (the claimer), each holding a deposit
     fn reserve(&self, _owner: bool) -> U256 {
         U256::ZERO
+    }
+    /// How much of `token` the swap contract may take from us (no approval needed: everything)
+    async fn allowance(&self, _token: Address) -> Result<U256, DriverError> {
+        Ok(U256::MAX)
     }
 }
 
@@ -400,6 +406,13 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
     async fn execute(&mut self, action: Action) -> Result<(), DriverError> {
         match action {
             Action::SendNewSwap => {
+                // A token lock: the contract must be allowed to take the tokens first. The approval
+                // is kept and sent again like any step; the lock follows on a later tick, once the
+                // chain shows the allowance (the lock's own gas estimate needs it)
+                let terms = &self.trade.terms;
+                if terms.asset != Address::ZERO && !self.journal.load()?.retained.contains_key("new_swap") && self.chain.allowance(terms.asset).await? < terms.value {
+                    return self.evm("approve", EvmCall::Approve { token: terms.asset, amount: terms.value }).await;
+                }
                 let call = EvmCall::NewSwap { terms: self.trade.terms.clone(), nonce: self.swap_nonce };
                 self.evm("new_swap", call).await
             }
