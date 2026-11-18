@@ -682,7 +682,7 @@ int main(int argc, char *argv[])
     // sell) on the same engine, with no need for the DEX website. Elsewhere the public wallet has no
     // trading page: trading is on the DEX website, and the wallet only asks (connect, password,
     // approve) in prompts. Developer builds keep the in-wallet trading screen everywhere.
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) || defined(Q_OS_WIN)
     const bool dexNativeExchange = dexPrototypeEnabled;
 #else
     const bool dexNativeExchange = false;
@@ -840,7 +840,14 @@ int main(int argc, char *argv[])
     // The app's own XMZ trading wallet, when this build bundles the DEX helpers: the wallet RPC
     // installed next to the app (its digest taken now) on the local daemon of the swap stage.
     if (dexPrototypeEnabled && BundledDexHelpers::evmSha256[0]!='\0' && !DexDeployment::litecoinNetwork().endsWith("regtest")) {
+        // The wallet RPC binary carries the platform's executable suffix (.exe on Windows); without
+        // it the file is not found, configureDexWallets never runs, and the Exchange is stuck on
+        // "Trading is starting…".
+#ifdef Q_OS_WIN
+        const auto rpc=QCoreApplication::applicationDirPath()+"/monzero-wallet-rpc.exe";
+#else
         const auto rpc=QCoreApplication::applicationDirPath()+"/monzero-wallet-rpc";
+#endif
         QFile rpcFile(rpc);QCryptographicHash rpcHash(QCryptographicHash::Sha256);
         if (rpcFile.open(QIODevice::ReadOnly) && rpcHash.addData(&rpcFile)) {
             const bool mainnet=DexDeployment::mainnetStage();

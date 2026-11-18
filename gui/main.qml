@@ -93,8 +93,11 @@ ApplicationWindow {
     property var cameraUi
     property bool androidCloseTapped: false;
     property int userLastActive;  // epoch
-    // Default daemon addresses
-    readonly property string localDaemonAddress : "localhost:" + getDefaultDaemonRpcPort(persistentSettings.nettype)
+    // Default daemon addresses. Use the IPv4 literal, not "localhost": the embedded node binds its
+    // RPC on 127.0.0.1 only, while on Windows "localhost" resolves to ::1 (IPv6) first, so the
+    // wallet silently fails to connect and the balance never refreshes even though the node is
+    // synced. 127.0.0.1 behaves identically to localhost on Linux.
+    readonly property string localDaemonAddress : "127.0.0.1:" + getDefaultDaemonRpcPort(persistentSettings.nettype)
     property string currentDaemonAddress;
     property int disconnectedEpoch: 0
     property int estimatedBlockchainSize: persistentSettings.pruneBlockchain ? 110 : 270 // GB

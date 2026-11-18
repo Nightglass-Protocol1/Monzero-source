@@ -35,7 +35,7 @@ public:
     QVariantMap status() const;
 private:
     QVariantMap m_withdrawal;
-    QString m_solAccount;
+    QString m_solAccount,m_evmAccount;
 public:
     // Keys of the trade account from the light-wallet vault (hex); used instead of a wallet seed
     void setSwapKeys(const QByteArray &swapSeedHex,const QByteArray &evmKeyHex);
@@ -51,6 +51,7 @@ public:
     // Ask the helper for this wallet's trade accounts (Solana chains: where SOL is paid in)
     bool requestAccounts(QByteArray &walletSeed);
     QString solAccount() const {return m_solAccount;}
+    QString evmAccount() const {return m_evmAccount;}
     void rescan() {scanFolders();emit changed();}
 signals:
     void changed();

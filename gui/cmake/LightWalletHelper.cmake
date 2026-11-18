@@ -4,8 +4,11 @@ set(MONZERO_LIGHT_HELPER "" CACHE FILEPATH "Reviewed native light-wallet helper 
 set(MONZERO_LIGHT_HELPER_SHA256 "" CACHE STRING "Expected SHA-256 of the reviewed light-wallet helper")
 set(MONZERO_BUNDLED_LIGHT_HELPER_SHA256 "")
 if(MONZERO_LIGHT_HELPER OR MONZERO_LIGHT_HELPER_SHA256)
-    if(NOT WITH_DEX_PROTOTYPE OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        message(FATAL_ERROR "Bundled light wallets require the Linux DEX prototype build")
+    if(NOT WITH_DEX_PROTOTYPE)
+        message(FATAL_ERROR "Bundled light wallets require the DEX prototype build")
+    endif()
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
+        message(FATAL_ERROR "Bundled light wallets are built for Linux and Windows only")
     endif()
     string(LENGTH "${MONZERO_LIGHT_HELPER_SHA256}" digest_length)
     if(NOT IS_ABSOLUTE "${MONZERO_LIGHT_HELPER}" OR NOT EXISTS "${MONZERO_LIGHT_HELPER}"

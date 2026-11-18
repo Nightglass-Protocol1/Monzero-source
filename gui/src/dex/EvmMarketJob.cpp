@@ -318,6 +318,8 @@ void EvmMarketJob::finish(bool success) {
         // This wallet's trade accounts for these keys (the Solana one is where SOL is paid in)
         const auto sol=r.value("sol").toString();
         if (DexChains::solanaAddress(sol)) m_solAccount=sol;
+        const auto evm=r.value("evm").toString();
+        if (DexChains::evmAddress(evm)) m_evmAccount=evm;
     } else if (m_command=="listings") {
         m_signed.clear();m_listings.clear();
         const int places=DexChains::decimals(qint64(m_config.value("chainId").toDouble()));
@@ -380,7 +382,7 @@ QVariantMap EvmMarketJob::status() const {
     }
     return {{"configured",!m_path.isEmpty()},{"busy",m_busy},{"state",m_state},{"error",m_error},{"command",m_command},
         {"listings",m_listings},{"mine",folders},{"withdrawal",m_withdrawal},{"relays",m_config.value("relays").toArray().toVariantList()},
-        {"chainId",m_config.value("chainId").toDouble()},{"coin",DexChains::coin(qint64(m_config.value("chainId").toDouble()))},{"decimals",DexChains::decimals(qint64(m_config.value("chainId").toDouble()))},{"solAccount",m_solAccount}};
+        {"chainId",m_config.value("chainId").toDouble()},{"coin",DexChains::coin(qint64(m_config.value("chainId").toDouble()))},{"decimals",DexChains::decimals(qint64(m_config.value("chainId").toDouble()))},{"solAccount",m_solAccount},{"evmAccount",m_evmAccount}};
 }
 
 QString EvmMarketJob::weiToCoin(const QString &valueWei,int decimals) {

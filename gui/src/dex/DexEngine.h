@@ -295,6 +295,14 @@ public:
     // One step for a new user: makes the app's own key wallet (a Bitcoin light wallet kept in the
     // app's data folder) if there is none, opens it and unlocks the trade keys with this password
     Q_INVOKABLE bool setUpTradingKeys(const QString &password);
+    // Trade keys kept in a self-contained encrypted store (builds with no bundled light wallet)
+    bool usingTradeKeyStore() const;
+    QString tradeKeyStorePath() const;
+    void applyUnlockedTradeKeys(QByteArray seed,QByteArray key,const QString &address);
+    // Derive the EVM/Solana trade account through a market helper once the keys are unlocked and the
+    // store holds no cached address. Markets are briefly busy on each 20s listings refresh, so this
+    // waits (polling every 500ms up to a bound) for one to be free rather than failing on a busy one.
+    void deriveTradeAccount(int attempt);
     // The key wallet's folder (app data). When it was made by another copy of the app, the review
     // of moving it to this copy's helper; approving it (its commitment) lets it be unlocked here.
     QString tradingKeysDirectory() const;
@@ -586,6 +594,7 @@ private:
     BtcMarketJob *m_btcMarket=nullptr;
     DexWalletService *m_dexWallets=nullptr;
     QString m_evmAccount,m_keysMessage;
+    QMetaObject::Connection m_accountsConn;   // one-shot: the store path pulls the EVM address from the helper
     bool m_keysBusy=false;
     QString m_keysSetupPassword;
     int m_keysSetupSteps=0;

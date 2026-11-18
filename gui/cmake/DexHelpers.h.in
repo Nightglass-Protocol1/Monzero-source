@@ -4,8 +4,8 @@
 // the build bundles no such helper (then trading for those pairs needs a configured helper).
 namespace BundledDexHelpers {
 constexpr const char *evmSha256 = "@MONZERO_BUNDLED_EVM_HELPER_SHA256@";
-constexpr const char *evmRelativePath = "/monzero-dex/monzero-dex-evm-helper";
+constexpr const char *evmRelativePath = "@MONZERO_EVM_RELATIVE_PATH@";
 constexpr const char *journalSha256 = "@MONZERO_BUNDLED_JOURNAL_HELPER_SHA256@";
-constexpr const char *journalRelativePath = "/monzero-dex/native-ltc-journal";
+constexpr const char *journalRelativePath = "@MONZERO_JOURNAL_RELATIVE_PATH@";
 }
 #endif

@@ -78,6 +78,17 @@ bool DaemonManager::start(const QString &flags, NetworkType::Type nettype, const
     if (!flags.contains("--disable-rpc-ban", Qt::CaseSensitive))
         arguments << "--disable-rpc-ban";
 
+#ifdef Q_OS_WIN
+    // Serve the embedded node's RPC as plain HTTP on loopback. It listens on 127.0.0.1 only, where
+    // TLS adds no security, and the daemon's default "autodetect" RPC SSL has broken block sync on
+    // Windows: the wallet negotiates TLS to the local node (the wallet API's use_ssl=false still
+    // means autodetect), the TLS handshake succeeds, then the large getblocks.bin transfer is reset
+    // mid-send (WSAECONNRESET) and retried as HTTP 500, so the wallet never advances past height 0
+    // and the balance never updates. With plain HTTP the wallet's autodetect connects cleanly.
+    if (!flags.contains("--rpc-ssl", Qt::CaseSensitive))
+        arguments << "--rpc-ssl" << "disabled";
+#endif
+
     // Custom startup flags for daemon
     foreach (const QString &str, flags.split(" ")) {
           qDebug() << QString(" [%1] ").arg(str);
