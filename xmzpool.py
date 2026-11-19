@@ -808,7 +808,9 @@ class Pool:
 
     def stats(self):
         c = self.cfg
-        blocks = self.store.q("SELECT height, hash, ts, reward, status, finder, solo FROM blocks ORDER BY height DESC LIMIT 50")
+        # The last 50 of each kind, so the rarer solo blocks are not pushed out by the shared ones
+        blocks = sorted((r for so in (0, 1) for r in self.store.q(
+            "SELECT height, hash, ts, reward, status, finder, solo FROM blocks WHERE solo=? ORDER BY height DESC LIMIT 50", (so,))), reverse=True)
         last = self.store.q("SELECT MAX(ts) FROM blocks WHERE status!='orphaned'")[0][0]
         round_start = self.store.q("SELECT COALESCE(MAX(last_share),0) FROM blocks WHERE solo=0")[0][0]
         round_hashes = self.store.q("SELECT COALESCE(SUM(diff),0) FROM shares WHERE id>? AND solo=0", (round_start,))[0][0]

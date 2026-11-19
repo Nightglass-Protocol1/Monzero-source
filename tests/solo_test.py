@@ -134,6 +134,15 @@ class Stats(unittest.TestCase):
         self.assertEqual({b["height"]: b["solo"] for b in s["pool"]["blocks"]}, {20: False, 21: True, 22: True})
         json.dumps(s)
 
+    def test_solo_blocks_not_pushed_out(self):
+        db = self.pool.store.db
+        for h in range(100, 160):   # 60 newer shared blocks
+            db.execute("INSERT INTO blocks(height,hash,status,last_share,net_diff,ts,finder,reward,solo) VALUES (?,?,'confirmed',1,1,0,?,5,0)", (h, "%064d" % h, A))
+        blocks = self.pool.stats()["pool"]["blocks"]
+        self.assertEqual(sum(1 for b in blocks if not b["solo"]), 50)
+        self.assertEqual({b["height"] for b in blocks if b["solo"]}, {21, 22}, "the solo feed keeps its own last 50")
+        self.assertEqual([b["height"] for b in blocks], sorted((b["height"] for b in blocks), reverse=True))
+
     def test_disabled_says_so(self):
         self.pool.cfg["solo"]["enabled"] = False
         self.assertEqual(self.pool.stats()["solo"], {"enabled": False})

@@ -88,6 +88,14 @@ tr:last-child td{border-bottom:none}
 th{color:var(--muted);font-weight:500;font-size:12.5px;letter-spacing:.04em;text-transform:uppercase}
 td code{color:var(--accent-2)}
 
+/* Pool and solo blocks side by side; stacked on narrow screens */
+.feeds2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.feeds2>.feed{min-width:0}
+.feeds2 h2{margin-bottom:2px}
+.feeds2 .tiny{margin:0 0 10px}
+.feeds2 th,.feeds2 td{padding:10px 11px}
+@media (max-width:760px){ .feeds2{grid-template-columns:1fr} }
+
 /* Collapsible feeds: show 4 rows, expand for the rest */
 .feed.collapsed tbody tr:nth-child(n+5){display:none}
 .feed .more{margin-top:10px;background:transparent;border:1px solid var(--line-2);color:var(--muted);border-radius:9px;padding:9px 15px;font:500 13px var(--sans);cursor:pointer}
@@ -182,7 +190,10 @@ tr.off td{color:var(--faint)} tr.off .dot{box-shadow:none}
       </div>
     </div>
   </section>
-  <section class="feed collapsed" id="blocks-feed"><h2>Recent blocks</h2><div class="wrap"><table><thead><tr><th>Height</th><th>Hash</th><th>Found</th><th>Reward</th><th>Status</th></tr></thead><tbody id="blist"></tbody></table></div><button class="more" type="button" hidden></button></section>
+  <div class="feeds2">
+    <section class="feed collapsed" id="blocks-feed"><h2>Pool blocks</h2><p class="muted tiny">Found by pool miners, shared by everyone mining (PPLNS)</p><div class="wrap"><table><thead><tr><th>Height</th><th>Found</th><th>Reward</th><th>Status</th></tr></thead><tbody id="blist"></tbody></table></div><button class="more" type="button" hidden></button></section>
+    <section class="feed collapsed" id="solo-feed"><h2>Solo blocks</h2><p class="muted tiny">Found by solo miners, paid to the finder alone</p><div class="wrap"><table><thead><tr><th>Height</th><th>Finder</th><th>Found</th><th>Reward</th><th>Status</th></tr></thead><tbody id="slist"></tbody></table></div><button class="more" type="button" hidden></button></section>
+  </div>
   <section class="feed collapsed" id="pays-feed"><h2>Recent payments</h2><div class="wrap"><table><thead><tr><th>Sent</th><th>Transaction</th><th>Miners</th><th>Amount</th></tr></thead><tbody id="plist"></tbody></table></div><button class="more" type="button" hidden></button></section>
 </main>
 <footer class="pfoot">
@@ -292,9 +303,12 @@ async function load() {
     }
     const shared = s.config.ports.find(p => !p.solo) || s.config.ports[0];
     $("cmd").textContent = "xmrig -o " + s.config.poolHost + ":" + shared.port + " -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0";
-    $("blist").innerHTML = s.pool.blocks.map(b => `<tr><td>${b.height}</td><td><code>${esc(b.hash.slice(0,16))}…</code></td><td>${ago(b.timestamp)}</td><td>${xmz(b.reward)}</td><td>${esc(b.status)}${b.solo ? " · solo" : ""}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No blocks yet</td></tr>';
+    const bxmz = a => a ? (a/U).toFixed(2)+" XMZ" : "–";
+    const brow = (b, finder) => `<tr title="${esc(b.hash)}"><td>${b.height}</td>${finder ? `<td><code>${esc(b.finder)}</code></td>` : ""}<td>${ago(b.timestamp)}</td><td>${bxmz(b.reward)}</td><td>${esc(b.status)}</td></tr>`;
+    $("blist").innerHTML = s.pool.blocks.filter(b => !b.solo).map(b => brow(b, false)).join("") || '<tr><td colspan="4" class="muted">No pool blocks yet</td></tr>';
+    $("slist").innerHTML = s.pool.blocks.filter(b => b.solo).map(b => brow(b, true)).join("") || '<tr><td colspan="5" class="muted">No solo blocks yet</td></tr>';
     $("plist").innerHTML = s.pool.payments.map(p => `<tr><td>${ago(p.timestamp)}</td><td><code>${esc(p.txid.slice(0,16))}…</code></td><td>${p.miners}</td><td>${xmz(p.amount)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">No payments yet</td></tr>';
-    updateFeed("blocks-feed"); updateFeed("pays-feed");
+    updateFeed("blocks-feed"); updateFeed("solo-feed"); updateFeed("pays-feed");
   } catch (e) { $("nethr").textContent = "offline"; }
   const a = $("addr").value.trim();
   if (a.length >= 90) {
