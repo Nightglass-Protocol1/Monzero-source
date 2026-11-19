@@ -21,7 +21,9 @@ class DexExchangeFeed final : public QObject {
     // "usdHistory" -> {coin: [[seconds, usd], …]} hourly, "noir" -> NoirTrade's XMZ/USDT market from monzero.org: {last, stale, trades: [[ms, price], …]}
     Q_PROPERTY(QVariantMap data READ data NOTIFY changed)
 public:
-    struct Source {QStringList relays;QString rpc,account;bool solana=false;};
+    // tokenAccount: the USDT (Solana) token account of `account`, read directly (public nodes refuse
+    // the indexed lookups by owner)
+    struct Source {QStringList relays;QString rpc,account,tokenAccount;bool solana=false;};
     using SourceFor=std::function<Source(const QString &coin)>;
     DexExchangeFeed(SourceFor sources,QObject *parent=nullptr);
     QVariantMap data() const {return m_data;}

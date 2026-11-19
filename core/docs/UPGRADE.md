@@ -4,6 +4,12 @@ Back up wallet files, mnemonic seeds and the node data directory before
 replacing any binary. Never enter a Monero seed into Monzero or a Monzero seed
 into Monero.
 
+## v1.3.6: SOL/USDT withdrawals fix (Linux)
+
+No consensus change. Close the old wallet and node, unpack v1.3.6 and start it: same wallet files,
+node data, trading keys and trading wallet. A running trade carries on; to go back, start the v1.3.5
+files again.
+
 ## v1.3.5: optional, exchange fixes and new price chart (Linux)
 
 No consensus change. Close the old wallet and node, unpack v1.3.5 and start it: same wallet files,

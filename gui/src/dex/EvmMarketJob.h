@@ -36,6 +36,7 @@ public:
 private:
     QVariantMap m_withdrawal;
     QString m_solAccount,m_evmAccount;
+    QString m_solUsdtAccount;   // the Solana trade account's USDT token account (from the helper)
 public:
     // Keys of the trade account from the light-wallet vault (hex); used instead of a wallet seed
     void setSwapKeys(const QByteArray &swapSeedHex,const QByteArray &evmKeyHex);
@@ -52,6 +53,7 @@ public:
     bool requestAccounts(QByteArray &walletSeed);
     QString solAccount() const {return m_solAccount;}
     QString evmAccount() const {return m_evmAccount;}
+    QString solUsdtAccount() const {return m_solUsdtAccount;}
     void rescan() {scanFolders();emit changed();}
 signals:
     void changed();

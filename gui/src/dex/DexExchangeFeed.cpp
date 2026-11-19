@@ -141,12 +141,13 @@ bool DexExchangeFeed::balance(const QString &coin) {
     const auto key="balance:"+coin;
     if (m_pending.value(key) || !allowedBase(source.rpc) || source.account.isEmpty()) return false;
     if (source.solana ? !DexChains::solanaAddress(source.account) : !DexChains::evmAddress(source.account)) return false;
-    m_pending.insert(key,true);
-    // USDT on Solana: the token accounts of the trade account for Tether's mint
+    // USDT on Solana: the trade account's own USDT token account, read directly
     const bool token=coin=="USDT";
+    if (token && !DexChains::solanaAddress(source.tokenAccount)) return false;
+    m_pending.insert(key,true);
     const QJsonObject call=token
-        ? QJsonObject{{"jsonrpc","2.0"},{"id",1},{"method","getTokenAccountsByOwner"},{"params",QJsonArray{source.account,
-              QJsonObject{{"mint","Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}},QJsonObject{{"encoding","jsonParsed"},{"commitment","confirmed"}}}}}
+        ? QJsonObject{{"jsonrpc","2.0"},{"id",1},{"method","getAccountInfo"},{"params",QJsonArray{source.tokenAccount,
+              QJsonObject{{"encoding","base64"},{"commitment","confirmed"}}}}}
         : source.solana
         ? QJsonObject{{"jsonrpc","2.0"},{"id",1},{"method","getBalance"},{"params",QJsonArray{source.account,QJsonObject{{"commitment","confirmed"}}}}}
         // USDT (BEP-20) on BNB Smart Chain: balanceOf(account) at BSC-USD; the answer is hex like a balance
@@ -165,15 +166,18 @@ bool DexExchangeFeed::balance(const QString &coin) {
         const auto result=QJsonDocument::fromJson(body).object().value("result");
         QString amount;
         if (token) {
-            // Base units (6 decimals) summed over the account's USDT token accounts; none yet: 0
-            quint64 units=0;bool read=result.isObject();
-            for (const auto &a:result.toObject().value("value").toArray()) {
-                const auto text=a.toObject().value("account").toObject().value("data").toObject().value("parsed").toObject()
-                    .value("info").toObject().value("tokenAmount").toObject().value("amount").toString();
-                bool ok=false;const auto n=text.toULongLong(&ok);
-                if (ok) units+=n; else read=false;
+            // An SPL token account: mint (32 bytes) | owner (32) | amount (u64 little-endian) | …;
+            // no account yet: it holds 0. Base units, 6 decimals.
+            const auto value=result.toObject().value("value");
+            if (result.isObject() && value.isNull()) amount=QStringLiteral("0");
+            else if (value.isObject() && value.toObject().value("owner").toString()==QLatin1String("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")) {
+                const auto data=QByteArray::fromBase64(value.toObject().value("data").toArray().at(0).toString().toLatin1());
+                if (data.size()>=72) {
+                    quint64 units=0;
+                    for (int i=7;i>=0;--i) units=(units<<8)|quint8(data.at(64+i));
+                    amount=QString::number(units);
+                }
             }
-            if (read) amount=QString::number(units);
         } else if (solana) {
             const auto v=result.toObject().value("value");
             if (v.isDouble() && v.toDouble()>=0) amount=QString::number(qint64(v.toDouble()));

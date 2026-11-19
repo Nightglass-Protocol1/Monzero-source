@@ -335,6 +335,8 @@ void EvmMarketJob::finish(bool success) {
         if (DexChains::solanaAddress(sol)) m_solAccount=sol;
         const auto evm=r.value("evm").toString();
         if (DexChains::evmAddress(evm)) m_evmAccount=evm;
+        const auto usdt=r.value("solUsdt").toString();
+        if (DexChains::solanaAddress(usdt)) m_solUsdtAccount=usdt;
     } else if (m_command=="listings") {
         m_signed.clear();m_listings.clear();
         const int places=DexChains::decimals(qint64(m_config.value("chainId").toDouble()));
