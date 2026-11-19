@@ -175,11 +175,14 @@
   var UTXO = { BTC: true, LTC: true };
   var MAINNET = { BTC: "btc-mainnet", LTC: "ltc-mainnet" };
   var TF = { "1h": 3600, "4h": 14400, "1D": 86400 };
-  var OPENING_USD = 0.01; // the DEX's opening quote, not a market price
-  var pro = { coin: "ETH", tf: "1h", rendered: false, timer: null, chart: null, candles: null, vol: null, ref: null, ext: null, noir: null, range: null, usd: {}, gen: 0 };
+  var DEC = { ETH: 18, BNB: 18, SOL: 9, USDT: 6, "USDT-BSC": 18 };
+  var SPAN = 120;   // chart intervals across the chart, at most
+  var pro = { coin: "ETH", tf: "1h", rendered: false, timer: null, chart: null, candles: null, dots: null, vol: null, ext: null, noir: null, range: null,
+    unit: "USD", kind: "auto", prints: {}, history: {}, shown: [], cds: [], noirLine: [], drawn: "trades", sub: "", loads: 0, usd: {}, gen: 0 };
   // A swap under this share of the volume on the chart does not stretch the price axis (a 1 XMZ
   // test trade at a far-off price would otherwise press every real trade flat)
   var TINY_SHARE = 0.001;
+  var NOIR_COLOR = "#e8b04b";
 
   function fmt(n, d) { if (!isFinite(n)) return "0"; var s = n.toFixed(d); return s.indexOf(".") >= 0 ? s.replace(/0+$/, "").replace(/\.$/, "") : s; }
   function places(p) { return p > 0 ? Math.min(14, Math.max(2, 3 - Math.floor(Math.log(p) / Math.LN10))) : 2; }
@@ -196,10 +199,86 @@
   }
   function cssVar(name, fallback) { var v = getComputedStyle(document.documentElement).getPropertyValue(name).trim(); return v || fallback; }
 
+  // ---- The price chart. The same rules as the wallet's chart (components/dexExchange.js there):
+  // one dot per swap sized by its XMZ while intervals hold one swap or none, candles once they hold
+  // several; in USD across every pair (each swap at its coin's USD price then) or in the pair's coin.
+  function isUsdt(c) { return c === "USDT" || c === "USDT-BSC"; }
+  function coinName(c) { return c === "USDT-BSC" ? "USDT" : c; }
+  // The coin's USD price at `at`: the last hourly price at or before it (the first one for older
+  // times, the price now for the newest hour); 1 for USDT; null when unknown
+  function usdAt(c, at) {
+    if (isUsdt(c)) return 1;
+    var h = pro.history[c], now = pro.usd[c];
+    if (!h || !h.length) return now > 0 ? now : null;
+    if (at >= h[h.length - 1][0] + 3600) return now > 0 ? now : h[h.length - 1][1];
+    if (at <= h[0][0]) return h[0][1];
+    var lo = 0, hi = h.length - 1;
+    while (lo < hi) { var mid = (lo + hi + 1) >> 1; if (h[mid][0] <= at) lo = mid; else hi = mid - 1; }
+    return h[lo][1];
+  }
+  // The swaps to plot, oldest first: {t, p (per XMZ in USD or in the coin), xmz, coin}
+  function chartPoints(coins, inUsd) {
+    var out = [];
+    coins.forEach(function (c) {
+      (pro.prints[c] || []).forEach(function (pr) {
+        var value = parseInt(String(pr.value), 16) / Math.pow(10, DEC[c] || 18), xmz = Number(pr.xmz) / 1e11;
+        var p = value / xmz;
+        if (inUsd) { var u = usdAt(c, Number(pr.at)); if (!(u > 0)) return; p *= u; }
+        if (p > 0 && xmz > 0) out.push({ t: Number(pr.at), p: p, xmz: xmz, coin: c });
+      });
+    });
+    return out.sort(function (a, b) { return a.t - b.t; });
+  }
+  // Candles from swaps: only intervals that had one
+  function candlesOf(points, interval) {
+    var out = [], cur = null;
+    points.forEach(function (pt) {
+      var t = pt.t - pt.t % interval;
+      if (!cur || cur.t !== t) { cur = { t: t, o: pt.p, h: pt.p, l: pt.p, c: pt.p, v: 0, n: 0 }; out.push(cur); }
+      cur.h = Math.max(cur.h, pt.p); cur.l = Math.min(cur.l, pt.p); cur.c = pt.p; cur.v += pt.xmz; cur.n++;
+    });
+    return out;
+  }
+  function autoKind(points, cds) { return points.length >= 20 && points.length >= 2 * cds.length ? "candles" : "trades"; }
+  // The price axis from items ({lo, hi, v}) with real volume and the extra prices; `off`: tiny ones beyond it
+  function axisRange(items, extras) {
+    var total = 0, lo = Infinity, hi = 0, off = [];
+    items.forEach(function (i) { total += i.v > 0 ? i.v : 0; });
+    items.forEach(function (i) { if (!(total > 0) || i.v >= total * TINY_SHARE) { lo = Math.min(lo, i.lo); hi = Math.max(hi, i.hi); } });
+    extras.forEach(function (x) { if (x > 0) { lo = Math.min(lo, x); hi = Math.max(hi, x); } });
+    if (!(hi > 0)) return null;
+    items.forEach(function (i) { if (i.hi > hi || i.lo < lo) off.push(i); });
+    return { lo: lo, hi: hi, off: off };
+  }
+  // NoirTrade as steps: each interval's last trade from `from` on, carried to now; in a coin, each
+  // USDT price over the coin's USD price then
+  function noirSteps(inUsd, interval, from, now) {
+    var n = pro.noir, byT = {}, times = [], out = [];
+    var before = null;   // the price standing when the chart starts
+    ((n && n.trades) || []).forEach(function (tr) {
+      var at = Math.floor(Number(tr[0]) / 1000), p = Number(tr[1]);
+      if (!(p > 0)) return;
+      if (!(at >= from)) { if (!before || at >= before.t) before = { t: at, p: p }; return; }
+      var b = at - at % interval;
+      if (!(b in byT)) times.push(b);
+      byT[b] = { t: at, p: p };
+    });
+    var f = from - from % interval;
+    if (before && !(f in byT)) { times.push(f); byT[f] = before; }
+    times.sort(function (a, b) { return a - b; }).forEach(function (b) {
+      var u = inUsd ? 1 : usdAt(pro.coin, byT[b].t);
+      if (u > 0) out.push({ t: b, p: byT[b].p / u });
+    });
+    var end = now - now % interval;
+    if (out.length && out[out.length - 1].t < end) out.push({ t: end, p: out[out.length - 1].p });
+    return out;
+  }
+
   function ensureChart() {
     if (pro.chart || !window.LightweightCharts) return !!pro.chart;
     var up = cssVar("--success", "#93d9b6"), down = cssVar("--danger", "#ff8a9f"), text = cssVar("--muted", "#9eb6bd");
     var fmtOpt = { type: "custom", minMove: 1e-14, formatter: price };
+    var scaled = function (base) { return pro.range ? { priceRange: pro.range } : base(); };
     pro.chart = window.LightweightCharts.createChart($("price-chart"), {
       autoSize: true,
       layout: { background: { type: "solid", color: "transparent" }, textColor: text, attributionLogo: false },
@@ -209,82 +288,95 @@
       localization: { priceFormatter: price }
     });
     pro.candles = pro.chart.addCandlestickSeries({ upColor: up, downColor: down, borderVisible: false, wickUpColor: up, wickDownColor: down, priceFormat: fmtOpt,
-      autoscaleInfoProvider: function (base) { return pro.range ? { priceRange: pro.range } : base(); } });
+      autoscaleInfoProvider: scaled });
+    // The swaps as dots: an invisible line whose points carry a circle each, sized by its XMZ
+    pro.dots = pro.chart.addLineSeries({ lineVisible: false, color: cssVar("--accent", "#6fd3c1"), priceLineVisible: false, crosshairMarkerVisible: false,
+      lastValueVisible: true, priceFormat: fmtOpt, autoscaleInfoProvider: scaled });
     pro.vol = pro.chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false });
     pro.chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-    pro.ref = pro.chart.addLineSeries({ color: text, lineWidth: 1, lineStyle: 2, priceLineVisible: false, crosshairMarkerVisible: false, title: "Opening rate", priceFormat: fmtOpt,
-      // A flat line alone would give an axis of one repeated price: show ±20% around it
-      autoscaleInfoProvider: function (base) {
-        var r = base();
-        if (r && r.priceRange && r.priceRange.maxValue === r.priceRange.minValue) {
-          var m = Math.abs(r.priceRange.maxValue) * 0.2 || 1e-12;
-          return { priceRange: { minValue: r.priceRange.minValue - m, maxValue: r.priceRange.maxValue + m } };
-        }
-        return r;
-      } });
-    // NoirTrade's XMZ/USDT trades, in the pair's coin: the exchange's market rate next to the DEX's own swaps
-    pro.ext = pro.chart.addLineSeries({ color: cssVar("--accent", "#6fd3c1"), lineWidth: 2, lineType: 1, priceLineVisible: false, crosshairMarkerVisible: true,
+    pro.ext = pro.chart.addLineSeries({ color: NOIR_COLOR, lineWidth: 2, lineType: 1, priceLineVisible: false, crosshairMarkerVisible: false,
       title: "NoirTrade", priceFormat: fmtOpt });
+    pro.chart.subscribeCrosshairMove(function (param) {
+      var sub = $("chart-sub");
+      if (!param || param.time === undefined) { sub.textContent = pro.sub; return; }
+      sub.textContent = readout(Number(param.time)) || pro.sub;
+    });
     return true;
   }
 
-  // One point per chart interval: the last NoirTrade trade in it (USDT per XMZ, over the coin's
-  // USD price now), carried on to the latest price. Empty when there is no price for the coin.
-  function noirData(interval, from, now) {
-    var n = pro.noir, usd = /^USDT/.test(pro.coin) ? 1 : pro.usd[pro.coin];
-    if (!n || !(usd > 0) || !n.trades) return [];
-    var byT = {}, times = [];
-    n.trades.forEach(function (t) {
-      var at = Math.floor(Number(t[0]) / 1000), px = Number(t[1]);
-      if (!(at >= from) || !(px > 0)) return;
-      var b = at - at % interval;
-      if (!(b in byT)) times.push(b);
-      byT[b] = { at: at, px: px };
-    });
-    times.sort(function (a, b) { return a - b; });
-    var out = times.map(function (b) { return { time: b, value: byT[b].px / usd }; });
-    var last = Number(n.last), end = now - now % interval;
-    if (last > 0 && (!out.length || out[out.length - 1].time < end)) out.push({ time: end, value: last / usd });
-    else if (last > 0 && out.length) out[out.length - 1].value = last / usd;
-    return out;
+  function money(p) { return pro.unit === "USD" ? "$" + price(p) : price(p) + " " + coinName(pro.coin); }
+  function when(t) { var d = new Date(t * 1000), pp = function (x) { return ("0" + x).slice(-2); }; return d.getDate() + " " + d.toLocaleString("en", { month: "short" }) + " " + pp(d.getHours()) + ":" + pp(d.getMinutes()); }
+  // The hover read-out: the swap (or candle) at that time, and NoirTrade then
+  function readout(t) {
+    var iv = TF[pro.tf], parts = [], n = null;
+    pro.noirLine.forEach(function (s) { if (s.t <= t) n = s.p; });
+    if (pro.drawn === "candles") {
+      pro.cds.forEach(function (c) { if (c.t === t) parts.push(when(t) + " · O " + price(c.o) + " H " + price(c.h) + " L " + price(c.l) + " C " + price(c.c) + " · " + c.n + (c.n === 1 ? " swap, " : " swaps, ") + fmt(c.v, 0) + " XMZ"); });
+    } else {
+      pro.shown.forEach(function (s) { if (s.key === t) parts.push(when(s.t) + " · " + fmt(s.xmz, 2) + " XMZ at " + money(s.p) + (pro.unit === "USD" ? " (" + (s.coin === "USDT-BSC" ? "USDT on BNB Chain" : s.coin) + ")" : "")); });
+    }
+    if (!parts.length) parts.push(when(t - t % iv));
+    return parts.join("; ") + (n !== null ? " · NoirTrade " + money(n) : "");
   }
 
-  function renderChart(list) {
-    var empty = $("chart-empty"), interval = TF[pro.tf];
+  function renderChart() {
+    var empty = $("chart-empty"), interval = TF[pro.tf], inUsd = pro.unit === "USD";
     if (!ensureChart()) { empty.hidden = false; empty.textContent = "The chart could not load."; return; }
-    var up = cssVar("--success", "#93d9b6"), down = cssVar("--danger", "#ff8a9f");
-    // The axis from the candles that carry real volume; tiny ones beyond it are drawn off the edge
-    var total = 0, lo = Infinity, hi = 0, off = [];
-    list.forEach(function (c) { total += c.v > 0 ? c.v : 0; });
-    list.forEach(function (c) { if (!(total > 0) || c.v >= total * TINY_SHARE) { lo = Math.min(lo, c.l); hi = Math.max(hi, c.h); } });
-    pro.range = hi > 0 ? { minValue: lo, maxValue: hi } : null;
-    if (pro.range) list.forEach(function (c) { if (c.h > hi || c.l < lo) off.push(c); });
-    pro.candles.setData(list.map(function (c) { return { time: c.t, open: c.o, high: c.h, low: c.l, close: c.c }; }));
-    // An off-scale swap still shows: a marker on its volume bar with its price and size
-    pro.vol.setMarkers(off.map(function (c) {
-      var above = c.h > hi;
-      return { time: c.t, position: "aboveBar", shape: above ? "arrowUp" : "arrowDown", color: cssVar("--muted", "#9eb6bd"),
-        text: price(above ? c.h : c.l) + " · " + fmt(c.v, 2) + " XMZ" };
-    }));
-    pro.vol.setData(list.map(function (c) { return { time: c.t, value: c.v, color: (c.c >= c.o ? up : down) + "66" }; }));
-    var usd = pro.usd[pro.coin], now = Math.floor(Date.now() / 1000), refData = [];
-    if (usd > 0) {
-      var ref = OPENING_USD / usd, from = list.length ? list[0].t : now - 30 * interval;
-      from -= from % interval; var to = now - now % interval;
-      refData = [{ time: from, value: ref }];
-      if (to > from) refData.push({ time: to, value: ref });
+    var up = cssVar("--success", "#93d9b6"), down = cssVar("--danger", "#ff8a9f"), accent = cssVar("--accent", "#6fd3c1");
+    var now = Math.floor(Date.now() / 1000), tEnd = now - now % interval, limit = tEnd - (SPAN - 1) * interval;
+    var points = chartPoints(inUsd ? PAIRS : [pro.coin], inUsd), noirFirst = Infinity;
+    ((pro.noir && pro.noir.trades) || []).forEach(function (tr) { var at = Math.floor(Number(tr[0]) / 1000); if (at >= limit && at < noirFirst) noirFirst = at; });
+    var first = Math.min(noirFirst, (points.filter(function (p) { return p.t >= limit; })[0] || { t: Infinity }).t);
+    var tStart = isFinite(first) ? Math.max(limit, first - first % interval - interval) : limit;
+    var shown = points.filter(function (p) { return p.t >= tStart; }), cds = candlesOf(shown, interval);
+    var drawn = pro.kind === "auto" ? autoKind(shown, cds) : pro.kind;
+    var noirLine = (inUsd || isUsdt(pro.coin) || pro.usd[pro.coin] > 0) ? noirSteps(inUsd, interval, tStart, now) : [];
+    var items = drawn === "candles" ? cds.map(function (c) { return { lo: c.l, hi: c.h, v: c.v, t: c.t }; })
+      : shown.map(function (p) { return { lo: p.p, hi: p.p, v: p.xmz, t: p.t - p.t % interval }; });
+    var range = axisRange(items, noirLine.map(function (s) { return s.p; }));
+    pro.range = range ? { minValue: range.lo, maxValue: range.hi } : null;
+    pro.shown = shown; pro.cds = cds; pro.noirLine = noirLine; pro.drawn = drawn;
+
+    // Every interval on the time axis (so time is to scale), with its volume where it had swaps
+    var vol = {}; cds.forEach(function (c) { vol[c.t] = c; });
+    var bars = [];
+    for (var t = tStart; t <= tEnd; t += interval) bars.push(vol[t] ? { time: t, value: vol[t].v, color: (drawn === "candles" ? (vol[t].c >= vol[t].o ? up : down) : accent) + "55" } : { time: t });
+    pro.vol.setData(bars);
+    pro.vol.setMarkers(range ? range.off.map(function (i) {
+      var above = i.hi > range.hi;
+      return { time: i.t, position: "aboveBar", shape: above ? "arrowUp" : "arrowDown", color: cssVar("--muted", "#9eb6bd"), text: price(above ? i.hi : i.lo) + " · " + fmt(i.v, 2) + " XMZ" };
+    }) : []);
+    if (drawn === "candles") {
+      pro.candles.setData(cds.map(function (c) { return { time: c.t, open: c.o, high: c.h, low: c.l, close: c.c }; }));
+      pro.dots.setData([]); pro.dots.setMarkers([]);
+    } else {
+      // One point per swap at its interval (a second swap in the same interval moves a few seconds on)
+      var big = 0, used = {}, data = [];
+      shown.forEach(function (p) { big = Math.max(big, p.xmz); });
+      shown.forEach(function (p) {
+        var key = p.t - p.t % interval; while (used[key]) key += 1;
+        used[key] = true; p.key = key; data.push({ time: key, value: p.p });
+      });
+      data.sort(function (a, b) { return a.time - b.time; });
+      pro.candles.setData([]);
+      pro.dots.setData(data);
+      pro.dots.setMarkers(shown.slice().sort(function (a, b) { return a.key - b.key; }).map(function (p) {
+        return { time: p.key, position: "inBar", shape: "circle", color: accent, size: 0.6 + 2.4 * Math.sqrt(p.xmz / big) };
+      }));
     }
-    pro.ref.setData(refData);
-    var ext = noirData(interval, now - 400 * interval, now);
-    pro.ext.setData(ext);
+    pro.ext.setData(noirLine.map(function (s) { return { time: s.t, value: s.p }; }));
     pro.ext.applyOptions({ title: pro.noir && pro.noir.stale ? "NoirTrade (old)" : "NoirTrade" });
-    $("chart-sub").textContent = "XMZ / " + pro.coin + " · completed swaps" + (ext.length ? " · line: NoirTrade XMZ/USDT in " + pro.coin.replace("-BSC", "") : "") +
-      (off.length ? " · " + off.length + (off.length === 1 ? " tiny swap" : " tiny swaps") + " off the scale" : "");
-    if (list.length) { empty.hidden = true; }
+    Array.prototype.forEach.call($("kind-group").children, function (x) { x.classList.toggle("on", x.getAttribute("data-kind") === drawn); });
+    Array.prototype.forEach.call($("unit-group").children, function (x) { x.classList.toggle("on", (x.getAttribute("data-unit") === "USD") === inUsd); });
+    $("unit-coin").textContent = coinName(pro.coin);
+    pro.sub = (inUsd ? "XMZ in USD · all pairs" : "XMZ / " + coinName(pro.coin)) + " · " + (drawn === "candles" ? "candles" : "one dot per swap") +
+      (noirLine.length ? " · amber: NoirTrade" : "") + (range && range.off.length ? " · " + range.off.length + (range.off.length === 1 ? " tiny swap" : " tiny swaps") + " off the scale" : "");
+    $("chart-sub").textContent = pro.sub;
+    if (shown.length) empty.hidden = true;
     else {
       empty.hidden = false;
-      empty.textContent = (UTXO[pro.coin] ? NAME[pro.coin] + " swaps are not reported to relays yet." : "No completed swaps yet.") +
-        (ext.length ? " Solid line: the NoirTrade rate." : "") + (usd > 0 ? " Dashed line: the $0.01 opening rate." : "");
+      empty.textContent = (inUsd ? "No completed swaps in this time range yet." : "No completed XMZ/" + coinName(pro.coin) + " swaps in this time range yet.") +
+        (noirLine.length ? " The amber line is NoirTrade." : "");
     }
     pro.chart.timeScale().fitContent();
   }
@@ -372,34 +464,43 @@
     $("pro-note").textContent = why;
     $("r-relay").textContent = "none reachable";
     renderBook([]); renderTrades([]);
-    renderChart([]);
+    renderChart();
   }
 
   function load() {
-    var gen = ++pro.gen, since = Math.floor(Date.now() / 1000) - 400 * TF[pro.tf];
+    var gen = ++pro.gen;
+    if (++pro.loads % 10 === 0) loadPrices();
     var noir = fetch("/markets/xmz.php", { cache: "no-store" }).then(function (r) { return r.json(); }).catch(function () { return null; });
-    Promise.all([get("listings"), get("prints"), get("candles", "&interval=" + TF[pro.tf] + "&since=" + since), noir]).then(function (r) {
+    // Every pair's swaps: the chart shows them all in USD
+    var prints = Promise.all(PAIRS.map(function (c) {
+      return fetch("/dex/relay.php?what=prints&pair=" + encodeURIComponent(c + "/XMZ"), { cache: "no-store" }).then(function (r) { return r.json(); }).catch(function () { return null; });
+    }));
+    Promise.all([get("listings"), prints, noir]).then(function (r) {
       if (gen !== pro.gen) return;
-      if (r[3] && r[3].trades) pro.noir = r[3];
+      if (r[2] && r[2].trades) pro.noir = r[2];
+      PAIRS.forEach(function (c, i) { if (r[1][i] && r[1][i].prints) pro.prints[c] = r[1][i].prints; });
       if (!r[0] || !r[0].relay) { noRelay("No relay is connected yet"); return; }
       $("pro-note").textContent = "Signed offers from the open relays";
       $("r-relay").textContent = r[0].relay;
       renderBook(r[0].listings || []);
       announce(r[0].listings || []);
-      renderTrades(r[1].prints || []);
-      renderChart(r[2].candles || []);
+      renderTrades(pro.prints[pro.coin] || []);
+      renderChart();
     }).catch(function () { if (gen === pro.gen) noRelay("The relays could not be reached"); });
   }
 
   function loadPrices() {
-    return fetch("/markets/api.php?only=coins", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (d) {
+    // Prices now and hourly for the last days, to value each swap at its time
+    return fetch("/markets/api.php", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (d) {
       (d.coins || []).forEach(function (c) { if (c && c.symbol && c.usd > 0) pro.usd[c.symbol] = c.usd; });
+      if (d.history && typeof d.history === "object") pro.history = d.history;
     }).catch(function () {});
   }
 
   function syncPair() {
     $("pro-pair").innerHTML = pDot("XMZ") + '<span>XMZ / ' + pro.coin + '</span><span class="ccaret">▾</span>';
     $("chart-sub").textContent = "XMZ / " + pro.coin + " · completed swaps";
+    $("unit-coin").textContent = coinName(pro.coin);
   }
   // The trade panel (dex-trade.js) follows the selected pair and the relays' offers
   function announce(listings) { document.dispatchEvent(new CustomEvent("monzero-dex-book", { detail: { coin: pro.coin, listings: listings || [] } })); }
@@ -450,6 +551,14 @@
   window.addEventListener("hashchange", function () { setMode(fromHash()); });
   if (/^#pro/.test(location.hash)) setMode(fromHash());
   $("pro-pair").addEventListener("click", function (e) { e.stopPropagation(); openPairMenu(); });
+  $("unit-group").addEventListener("click", function (e) {
+    var b = e.target.closest && e.target.closest("button[data-unit]"); if (!b) return;
+    pro.unit = b.getAttribute("data-unit"); renderChart();
+  });
+  $("kind-group").addEventListener("click", function (e) {
+    var b = e.target.closest && e.target.closest("button[data-kind]"); if (!b) return;
+    pro.kind = b.getAttribute("data-kind"); renderChart();
+  });
   $("tf-group").addEventListener("click", function (e) {
     var b = e.target.closest && e.target.closest("button[data-tf]"); if (!b) return;
     pro.tf = b.getAttribute("data-tf");
