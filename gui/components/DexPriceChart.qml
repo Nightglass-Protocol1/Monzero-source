@@ -153,10 +153,14 @@ Rectangle {
             ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(plotW, gy); ctx.stroke()
         }
         var cs = chart.slots, nl = chart.noirLine
-        // The price range: candles, the NoirTrade line and the best offers, so all of them are on screen
-        var hi = 0, lo = Infinity, vmax = 0
+        // The price range: candles with real volume, the NoirTrade line and the best offers, so all
+        // of them are on screen. A swap under 0.1% of the volume shown (a 1 XMZ test trade at a
+        // far-off price) does not stretch the axis: it is marked at the edge instead.
+        var hi = 0, lo = Infinity, vmax = 0, total = 0
+        for (var v0 = 0; v0 < cs.length; ++v0) if (!cs[v0].empty && cs[v0].v > 0) total += cs[v0].v
         for (var i = 0; i < cs.length; ++i) {
-            if (!cs[i].empty) { hi = Math.max(hi, cs[i].h); lo = Math.min(lo, cs[i].l); vmax = Math.max(vmax, cs[i].v) }
+            if (!cs[i].empty) vmax = Math.max(vmax, cs[i].v)
+            if (!cs[i].empty && !cs[i].flat && cs[i].v >= total * 0.001) { hi = Math.max(hi, cs[i].h); lo = Math.min(lo, cs[i].l) }
             if (nl[i] !== null) { hi = Math.max(hi, nl[i]); lo = Math.min(lo, nl[i]) }
         }
         var marks = []
@@ -180,7 +184,10 @@ Rectangle {
         var x0 = plotW - count * slot
         canvas.slot = slot; canvas.x0 = x0 - first * slot
 
+        // Prices beyond the axis are cut at the price area's edges (the volume bars stay below)
+        var clipPrice = function () { ctx.save(); ctx.beginPath(); ctx.rect(0, priceTop, plotW, priceBottom - priceTop); ctx.clip() }
         if (count > 0 && chart.mode === "line" && chart.shown.length) {
+            clipPrice()
             ctx.beginPath()
             for (var j = first; j < cs.length; ++j) {
                 var lx = x0 + (j - first) * slot + slot / 2
@@ -189,7 +196,9 @@ Rectangle {
             ctx.strokeStyle = M.Style.accent; ctx.lineWidth = 2; ctx.stroke()
             ctx.lineTo(x0 + (cs.length - 1 - first) * slot + slot / 2, priceBottom); ctx.lineTo(x0 + slot / 2, priceBottom); ctx.closePath()
             ctx.fillStyle = "rgba(41,214,203,0.10)"; ctx.fill()
+            ctx.restore()
         }
+        var offScale = []
         for (var k = first; k < cs.length; ++k) {
             if (cs[k].empty) continue
             var c = cs[k], rising = c.c >= c.o
@@ -197,16 +206,27 @@ Rectangle {
             var cx = x0 + (k - first) * slot + slot / 2
             ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1
             if (chart.mode === "candles") {
+                clipPrice()
                 ctx.beginPath(); ctx.moveTo(Math.round(cx) + 0.5, y(c.h)); ctx.lineTo(Math.round(cx) + 0.5, y(c.l)); ctx.stroke()
                 var top = y(Math.max(c.o, c.c)), body = Math.max(1, Math.abs(y(c.o) - y(c.c)))
                 ctx.fillRect(Math.round(cx - slot * 0.35), top, Math.max(2, Math.round(slot * 0.7)), body)
+                ctx.restore()
             }
+            if (!c.flat && (c.h > hi || c.l < lo)) offScale.push({ x: cx, up: c.h > hi, p: c.h > hi ? c.h : c.l, v: c.v })
             if (vmax > 0 && c.v > 0) {
                 var vh = c.v / vmax * (plotH - volTop)
                 ctx.globalAlpha = 0.35
                 ctx.fillRect(Math.round(cx - slot * 0.35), plotH - vh, Math.max(2, Math.round(slot * 0.7)), vh)
                 ctx.globalAlpha = 1
             }
+        }
+        // A swap off the scale: an arrow at the edge with its price and size
+        for (var o = 0; o < offScale.length; ++o) {
+            var os = offScale[o], ey = os.up ? priceTop + 2 : priceBottom - 2, dir = os.up ? 1 : -1
+            ctx.fillStyle = "#9EB6BD"
+            ctx.beginPath(); ctx.moveTo(os.x, ey); ctx.lineTo(os.x - 5, ey + dir * 7); ctx.lineTo(os.x + 5, ey + dir * 7); ctx.closePath(); ctx.fill()
+            var label = X.price(os.p) + " · " + X.amount(os.v, 2) + " XMZ"
+            ctx.fillText(label, Math.max(0, Math.min(plotW - ctx.measureText(label).width, os.x - ctx.measureText(label).width / 2)), ey + dir * 19 + (os.up ? 0 : 0))
         }
         // NoirTrade: a step line across each slot from its first trade, its latest price on the axis
         var noirLast = null
