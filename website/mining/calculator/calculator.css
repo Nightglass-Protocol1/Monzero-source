@@ -24,3 +24,4 @@ select:focus-visible { outline:3px solid var(--accent); outline-offset:4px; }
 /* Body copy matches the original pages: muted text, links inherit and stay underlined. */
 main p, main li, main dd, main td, main figcaption { color: var(--muted); }
 main p a, main li a, main dd a { color: inherit; }
+.field-hint { font-size:.9em; color:var(--muted); }

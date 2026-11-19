@@ -53,6 +53,26 @@
     return '';
   }
 
+  // A Solana address (here: a collection's mint) is base58 that decodes to exactly 32 bytes.
+  // Base58 is case-sensitive, so the value is stored exactly as typed (trimmed).
+  const BASE58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  function isSolanaAddress(value) {
+    const text = String(value || '').trim();
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) return false;
+    let n = 0n;
+    for (const ch of text) n = n * 58n + BigInt(BASE58.indexOf(ch));
+    let bytes = 0;
+    while (n > 0n) { n >>= 8n; bytes++; }
+    const zeros = text.match(/^1*/)[0].length;
+    return zeros + bytes === 32;
+  }
+  function collectionProblem(value) {
+    const text = String(value || '').trim();
+    if (!text || isSolanaAddress(text)) return '';
+    if (/^[0-9a-fA-F]{64}$/.test(text)) return 'Collection must be a Solana collection mint address (base58), not a 64-character hex ID';
+    return 'Collection must be a Solana collection mint address: 32 to 44 base58 characters';
+  }
+
   // fields: raw form strings; art: fingerprint or null; traits: [{trait_type, value}] already trimmed.
   function metadataFrom({ kind, fields, art, traits }) {
     const text = (name) => String(fields[name] ?? '').trim();
@@ -69,7 +89,7 @@
       if (text('symbol')) meta.symbol = text('symbol').toUpperCase();
       meta.decimals = Number(fields.decimals);
     }
-    if ((kind === 'nft' || kind === 'edition') && text('collection')) meta.collection = text('collection').toLowerCase();
+    if ((kind === 'nft' || kind === 'edition') && text('collection')) meta.collection = text('collection');
     return meta;
   }
 
@@ -286,7 +306,7 @@
   window.MonzeroStudioCore = {
     STANDARD, MAX_IMAGE_BYTES, U64_MAX, encoder,
     sha256Hex, canonical, formatBytes, slug, atomicSupply, referenceProblem,
-    metadataFrom, descriptorArgs, loadImage, thumbnail, hasLocation, fingerprint,
+    metadataFrom, descriptorArgs, isSolanaAddress, collectionProblem, loadImage, thumbnail, hasLocation, fingerprint,
     sampleArtwork, canvasFile, crc32, zip, download,
   };
 })();

@@ -201,7 +201,7 @@
       checks: ['DEX: ETH, BNB, SOL and USDT open with small limits', 'Windows wallet: unsigned beta', 'Bitcoin and Litecoin: built and tested, not yet listed'], url: 'https://monzero.org/roadmap/', link: 'Read engineering updates' },
     { badge: '○ CONDITIONAL', title: ['No shortcuts.', 'No invented dates.'],
       description: 'Higher trading limits, more pairs and other proposed services depend on testing, security review, recovery checks and operator acceptance. There is no committed launch date.',
-      checks: ['Complete acceptance & recovery testing', 'External security evaluation', 'Public deployment only when ready'], url: 'https://monzero.org/roadmap/', link: 'Explore planned milestones' }
+      checks: ['Complete acceptance & recovery testing', 'Community security testing (pentest kit)', 'Public deployment only when ready'], url: 'https://monzero.org/roadmap/', link: 'Explore planned milestones' }
   ];
   const roadTabs = $$('.roadmap-stop');
   function selectPhase(idx, focus = false) {

@@ -42,7 +42,7 @@
           <div><dt>Devnet (practice)</dt><dd>Free</dd></div>
         </dl>
         <p>A draft is a local design file until you mint it. Minting happens in your own Solana wallet, and the fee is paid only if the mint succeeds. <a href="#sol-create">Mint on Solana</a></p>
-        <div hidden><i id="node-dot"></i><span id="node-state"></span><span id="height"></span><span id="asset-count"></span><span id="asset-state"></span></div>
+        <div hidden><i id="node-dot"></i><span id="node-state"></span><span id="height"></span></div>
       </aside>
     </section>
 
@@ -60,7 +60,7 @@
       </div>
       <div class="st-kinds" role="radiogroup" aria-label="Asset type">
         <button type="button" role="radio" aria-checked="true" data-kind="nft"><strong>NFT</strong><span>One of one</span></button>
-        <button type="button" role="radio" aria-checked="false" data-kind="edition"><strong>Edition</strong><span>Numbered copies</span></button>
+        <button type="button" role="radio" aria-checked="false" data-kind="edition"><strong>Edition</strong><span>Master for numbered prints</span></button>
         <button type="button" role="radio" aria-checked="false" data-kind="collection"><strong>Collection</strong><span>Groups NFTs together</span></button>
         <button type="button" role="radio" aria-checked="false" data-kind="fungible"><strong>Token</strong><span>Fixed supply</span></button>
       </div>
@@ -89,6 +89,7 @@
             </div>
             <label data-only="fungible">Total supply <input name="supply" inputmode="decimal" placeholder="1000000" autocomplete="off"></label>
             <label data-only="edition">Number of copies <input name="edition_size" type="number" min="2" max="1000000" value="100"></label>
+            <p class="st-help" data-only="edition">On Solana, Studio mints the master edition with a maximum supply of this number. The numbered prints themselves are minted later from that master with another Solana tool.</p>
             <label>Description <textarea name="description" maxlength="2000" rows="3" placeholder="What is it, and why does it exist?"></textarea></label>
             <div class="st-split">
               <label>Creator <input name="creator" maxlength="80" placeholder="Your name or handle" autocomplete="off"></label>
@@ -104,7 +105,8 @@
             </div>
             <label>Website <input name="external_url" type="url" maxlength="200" placeholder="https://" autocomplete="off"></label>
             <label data-hide="fungible collection">Local collection workspace<select name="local_collection" id="local-collection"><option value="">No local collection</option></select></label>
-            <label data-hide="fungible collection">Collection ID <input name="collection" maxlength="64" placeholder="Optional 64-character collection ID" autocomplete="off" spellcheck="false"></label>
+            <label data-hide="fungible collection">Collection mint address <input name="collection" maxlength="44" placeholder="Optional Solana collection mint address (base58)" autocomplete="off" spellcheck="false"></label>
+            <p class="st-help" data-hide="fungible collection">Paste the mint address Studio showed when you created the collection. Studio records it in the metadata only; minting does not add this NFT to the collection on chain. Verify membership afterwards with another Solana tool, such as Metaplex Sugar or the Metaplex JS SDK.</p>
             <div class="st-traits" data-hide="fungible">
               <div class="st-traits-head"><span>Traits</span><button type="button" class="st-link" id="add-trait">+ Add trait</button></div>
               <div id="traits"></div>
@@ -211,7 +213,8 @@
               </label>
             </div>
             <label>Website <input name="external_url" type="url" maxlength="200" placeholder="https://" autocomplete="off"></label>
-            <label>Part of collection <input name="collection" maxlength="64" placeholder="Optional 64-character collection ID" autocomplete="off" spellcheck="false"></label>
+            <label>Part of collection <input name="collection" maxlength="44" placeholder="Optional Solana collection mint address (base58)" autocomplete="off" spellcheck="false"></label>
+            <p class="st-help">Recorded in each metadata file only. Adding the pieces to the collection on chain is done with another Solana tool.</p>
           </fieldset>
 
           <fieldset>
@@ -242,22 +245,12 @@
         <h2 id="verify-title">Is this NFT what it claims to be?</h2>
         <p class="st-help">Select metadata and artwork to check their fingerprints. Everything is checked in your browser; nothing is uploaded.</p>
       </div>
-      <div class="st-lookup" hidden><label>Asset ID (optional)<input id="verify-asset-id" maxlength="64" placeholder="64-character asset ID" autocomplete="off" spellcheck="false"></label><button type="button" class="st-btn ghost" id="lookup-asset">Look up on chain</button></div><p id="lookup-status" class="st-help" role="status" hidden></p>
       <div class="st-verify-grid">
         <label class="st-drop small"><input type="file" id="verify-meta" accept="application/json,.json"><span class="st-drop-text"><strong>Metadata file</strong><small>metadata.json</small></span></label>
         <label class="st-drop small"><input type="file" id="verify-image" accept="image/*"><span class="st-drop-text"><strong>Image file</strong><small>optional</small></span></label>
         <label class="st-verify-hash">Expected metadata hash <input id="verify-expected" maxlength="64" placeholder="64-character hash published by the creator" spellcheck="false" autocomplete="off"></label>
       </div>
       <ul class="st-results" id="verify-results" aria-live="polite"></ul>
-    </section>
-
-    <section class="st-onchain" aria-labelledby="onchain-title" hidden>
-      <div class="st-section-head row">
-        <div><p class="eyebrow">On the Monzero chain</p><h2 id="onchain-title">Issued native assets</h2></div>
-        <a class="st-link" href="../explorer/">Open the explorer →</a>
-      </div>
-      <button type="button" class="st-btn ghost" id="retry-network">Refresh network status</button><p id="network-note" class="st-help" role="status"></p>
-      <div class="st-grid" id="onchain"><p class="st-empty">Loading…</p></div>
     </section>
 
     <section class="st-standard" aria-labelledby="standard-title">
@@ -271,7 +264,7 @@
             <li><code>name</code>, <code>description</code>, <code>creator</code>, <code>license</code>, <code>external_url</code></li>
             <li><code>image</code>, plus <code>image_sha256</code>, <code>image_mime</code>, <code>image_bytes</code>, <code>image_width</code>, <code>image_height</code></li>
             <li><code>attributes</code>: a list of <code>{"trait_type", "value"}</code></li>
-            <li><code>edition_size</code> (editions), <code>symbol</code> and <code>decimals</code> (tokens), <code>collection</code> (member NFTs)</li>
+            <li><code>edition_size</code> (editions), <code>symbol</code> and <code>decimals</code> (tokens), <code>collection</code> (member NFTs: the Solana collection mint address, base58, as typed; recorded in the metadata, not verified on chain by Studio)</li>
           </ul>
           <p>Galleries must download the metadata, check its SHA-256 against the hash the creator published, then check the image against <code>image_sha256</code> before showing anything. Treat every field as untrusted text. Never render SVG or HTML from metadata.</p>
         </div>
@@ -281,12 +274,12 @@
 
   <footer><span>Monzero Studio</span><span>Your files stay on your device · No custody</span><span><a href="../security/">Security</a> · <a href="/privacy/">Privacy Policy</a> · <a href="/terms/">Website Terms</a></span></footer>
   <div class="st-toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="studio-core.js?v=1"></script>
-  <script src="studio-20261025.js?v=2"></script>
+  <script src="studio-core.js?v=2"></script>
+  <script src="studio-20261025.js?v=4"></script>
   <script src="studio-extras.js?v=1"></script>
-  <script src="batch.js?v=4"></script>
+  <script src="batch.js?v=5"></script>
   <script src="tour.js?v=3"></script>
   <script src="../site-nav.js?v=20261113-noticker" defer></script>
-<script defer src="/app/sol-studio.js?v=10"></script>
+<script defer src="/app/sol-studio.js?v=11"></script>
 </body>
 </html>

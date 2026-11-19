@@ -215,7 +215,7 @@
       if (text('symbol')) meta.symbol = text('symbol').toUpperCase();
       meta.decimals = Number(field('decimals').value);
     }
-    if ((kind === 'nft' || kind === 'edition') && text('collection')) meta.collection = text('collection').toLowerCase();
+    if ((kind === 'nft' || kind === 'edition') && text('collection')) meta.collection = text('collection');
     return meta;
   }
 
@@ -238,14 +238,16 @@
     else if (!metaUri) add('warn', 'Add the metadata address so wallets can find it');
     else add('ok', 'Metadata address set');
     const collection = field('collection').value.trim();
-    if ((kind === 'nft' || kind === 'edition') && collection && !/^[0-9a-fA-F]{64}$/.test(collection)) add('bad', 'Collection ID must be 64 hexadecimal characters');
+    const collectionProblem = (kind === 'nft' || kind === 'edition') && window.MonzeroStudioCore.collectionProblem(collection);
+    if (collectionProblem) add('bad', collectionProblem);
+    else if ((kind === 'nft' || kind === 'edition') && collection) add('warn', 'Collection address is recorded in the metadata only. Minting does not add this NFT to the collection on chain; verify membership afterwards with another Solana tool');
     if (kind === 'edition') {
       const n = Number(field('edition_size').value);
-      Number.isInteger(n) && n >= 2 && n <= 1000000 ? add('ok', `${n.toLocaleString()} numbered copies`) : add('bad', 'Copies must be between 2 and 1,000,000');
+      Number.isInteger(n) && n >= 2 && n <= 1000000 ? add('ok', `Master edition with up to ${n.toLocaleString()} numbered prints (prints are minted later with another tool)`) : add('bad', 'Copies must be between 2 and 1,000,000');
     }
     if (kind === 'fungible') {
       const d = Number(field('decimals').value);
-      if (!Number.isInteger(d) || d < 0 || d > 11) add('bad', 'Decimals must be 0 to 11');
+      if (!Number.isInteger(d) || d < 0 || d > 9) add('bad', 'Decimals must be 0 to 9 (the Solana limit)');
       else if (atomicSupply(field('supply').value, d) === null) add('bad', 'Enter a total supply that fits the chosen decimals');
       else add('ok', 'Supply is fixed forever: nobody can mint more');
     }
@@ -610,8 +612,8 @@
   $('#check-image-host').addEventListener('click',()=>checkHost('image'));
   $('#check-metadata-host').addEventListener('click',()=>checkHost('metadata'));
 
-  // A pasted hash is not an on-chain observation. Bind verified provenance to the lookup.
-  let verifiedAsset=null,verifySeq=0,lookupSeq=0;
+  // A pasted hash is not an on-chain observation.
+  let verifySeq=0;
   function resultsList(items) {
     $('#verify-results').replaceChildren(...items.map(({level,message})=>{const li=document.createElement('li');li.className=level;li.textContent=message;return li;}));
   }
@@ -619,7 +621,7 @@
     const seq=++verifySeq,items=[];
     const add=(level,message)=>items.push({level,message});
     const metaFile=$('#verify-meta').files[0],imageFile=$('#verify-image').files[0];
-    const expected=$('#verify-expected').value.trim().toLowerCase(),chain=verifiedAsset;
+    const expected=$('#verify-expected').value.trim().toLowerCase();
     if(!metaFile){resultsList([]);return;}
     try {
       if(metaFile.size>1024*1024)throw new Error('Metadata must be no larger than 1 MB.');
@@ -628,8 +630,7 @@
       if(!expected)add('warn','No expected hash provided. Metadata has not been matched against an independent reference.');
       else if(!/^[a-f0-9]{64}$/.test(expected))add('bad','The expected hash must contain 64 hexadecimal characters.');
       else if(hash!==expected)add('bad','Metadata does NOT match the expected hash.');
-      else if(chain && chain.hash===expected)add('ok',`Metadata matches the hash returned by the public node for asset ${chain.id.slice(0,12)}…${chain.active?'':' (asset protocol inactive)'}.`);
-      else add('ok','Metadata matches the supplied hash. No on-chain lookup has verified that hash.');
+      else add('ok','Metadata matches the supplied hash.');
       const meta=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
       if(!meta || Array.isArray(meta) || typeof meta!=='object')throw new Error('Metadata must be a JSON object.');
       if(meta.standard==='monzero-metadata/1' && Object.hasOwn(KIND_LABEL,meta.class) && typeof meta.name==='string' && meta.name.trim())add('ok','Metadata declares the supported standard, asset class and name.');
@@ -643,54 +644,21 @@
     }catch(error){add('bad',error instanceof SyntaxError?'The metadata is not valid JSON.':error.message);}
     if(seq===verifySeq)resultsList(items);
   }
-  function clearLookup(message='No on-chain lookup performed.') {lookupSeq++;verifiedAsset=null;$('#lookup-status').textContent=message;}
-  $('#verify-expected').addEventListener('input',()=>{clearLookup('Manual hash supplied. No on-chain confirmation.');verify();});
-  $('#verify-asset-id').addEventListener('input',()=>{clearLookup();verify();});
+  $('#verify-expected').addEventListener('input',verify);
   for(const selector of ['#verify-meta','#verify-image'])$(selector).addEventListener('change',event=>{
     const file=event.target.files[0];event.target.closest('label').querySelector('small').textContent=file?file.name:(selector==='#verify-meta'?'metadata.json':'optional');verify();
   });
-  $('#lookup-asset').addEventListener('click',async()=>{
-    clearLookup();const seq=lookupSeq,id=$('#verify-asset-id').value.trim().toLowerCase(),button=$('#lookup-asset');
-    if(!/^[a-f0-9]{64}$/.test(id)){$('#lookup-status').textContent='Enter a valid 64-character asset ID.';verify();return;}
-    button.disabled=true;$('#lookup-status').textContent='Looking up the public node’s record…';
-    try {
-      const data=await post('../explorer/api.php',{action:'asset',asset_id:id});if(seq!==lookupSeq)return;
-      const hash=data.asset?.metadata_content_hash;
-      if(data.supported!==true || typeof data.active!=='boolean' || typeof data.asset?.asset_id!=='string' || data.asset.asset_id.toLowerCase()!==id || typeof hash!=='string' || !/^[a-f0-9]{64}$/i.test(hash) || /^0+$/.test(hash))throw new Error('No usable committed metadata hash was returned.');
-      verifiedAsset={id,hash:hash.toLowerCase(),active:data.active};$('#verify-expected').value=verifiedAsset.hash;
-      $('#lookup-status').textContent=`Hash retrieved from the public node at ${new Date().toLocaleTimeString()}.${data.active?'':' The node reports the asset protocol is inactive.'} Select metadata to compare its bytes.`;
-    }catch(error){if(seq===lookupSeq)$('#lookup-status').textContent='On-chain lookup unavailable or no usable record returned. This does not establish whether the asset exists. Manual file verification remains available.';}
-    finally{button.disabled=false;if(seq===lookupSeq)verify();}
-  });
 
+  // Node status for the hidden status fields. The native-asset registry list was removed with
+  // the Solana-only switch (2026-11-15): Studio no longer issues assets on the Monzero chain.
   async function refreshNetwork() {
-    const button=$('#retry-network');button.disabled=true;
-    await Promise.allSettled([
-      post('/api/node-info/',{}).then(info=>{
-        $('#node-state').textContent=info.network_ready===true?'Network online':info.synchronized===true?'Node synchronized':'Node not ready';
-        $('#node-dot').classList.toggle('ready',info.network_ready===true);
-        $('#node-dot').classList.remove('offline');
-        $('#height').textContent=Number.isSafeInteger(info.height)?`#${Math.max(0,info.height-1).toLocaleString()}`:'—';
-      }).catch(()=>{$('#node-state').textContent='Network status unavailable';$('#node-dot').classList.remove('ready');$('#node-dot').classList.add('offline');$('#height').textContent='—';}),
-      post('../explorer/api.php',{action:'assets',offset:0,count:24}).then(data=>{
-        if(data.supported!==true || typeof data.active!=='boolean' || !Array.isArray(data.assets) || !Number.isSafeInteger(data.total) || data.total<0)throw new Error('Unusable asset status');
-        $('#asset-count').textContent=data.total.toLocaleString();$('#asset-state').textContent=data.active?'Active':'Not active';$('#asset-state').classList.toggle('amber',!data.active);
-        $('#network-note').textContent=`Asset status checked at ${new Date().toLocaleTimeString()}. ${data.active?'Studio still prepares local files only.':'The node reports asset issuance is inactive.'}`;
-        $('#onchain').replaceChildren(...data.assets.map(asset=>{
-          const card=document.createElement('a');card.className='st-mini chain';
-          card.href=`../explorer/#/asset/${encodeURIComponent(String(asset.asset_id||''))}`;
-          const body=document.createElement('div');body.className='st-mini-body';const title=document.createElement('strong');title.textContent=`Asset ${String(asset.asset_id||'').slice(0,12)}…`;
-          const hint=document.createElement('small');hint.textContent=asset.metadata_reference?'External metadata available · open explorer':'No external metadata address';body.append(title,hint);card.append(body);return card;
-        }));
-        if(!data.assets.length){const empty=document.createElement('p');empty.className='st-empty';empty.textContent=data.active?'No issued assets were returned by the node.':'The node reports no assets and an inactive asset protocol. You can continue designing local drafts.';$('#onchain').append(empty);}
-      }).catch(()=>{
-        $('#asset-count').textContent='—';$('#asset-state').textContent='Unconfirmed';$('#asset-state').classList.add('amber');
-        $('#network-note').textContent=`Asset service unavailable at ${new Date().toLocaleTimeString()}. Activation and asset counts could not be confirmed. Your local projects are still usable.`;
-        const p=document.createElement('p');p.className='st-empty';p.textContent='Could not retrieve the asset registry. This is not evidence that no assets exist. Retry the status check or visit the explorer.';$('#onchain').replaceChildren(p);
-      })
-    ]);button.disabled=false;
+    await post('/api/node-info/',{}).then(info=>{
+      $('#node-state').textContent=info.network_ready===true?'Network online':info.synchronized===true?'Node synchronized':'Node not ready';
+      $('#node-dot').classList.toggle('ready',info.network_ready===true);
+      $('#node-dot').classList.remove('offline');
+      $('#height').textContent=Number.isSafeInteger(info.height)?`#${Math.max(0,info.height-1).toLocaleString()}`:'—';
+    }).catch(()=>{$('#node-state').textContent='Network status unavailable';$('#node-dot').classList.remove('ready');$('#node-dot').classList.add('offline');$('#height').textContent='—';});
   }
-  $('#retry-network').addEventListener('click',refreshNetwork);
 
   // Opening Studio does not create an empty draft or alter old local storage.
   const requestedKind = new URLSearchParams(location.search).get('kind');

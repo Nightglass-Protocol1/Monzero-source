@@ -86,7 +86,7 @@
         <button id="quiz-submit" class="ch-button" type="submit" hidden>Show my starting point</button>
         <div id="quiz-result" class="ch-result" role="status" aria-live="polite" aria-atomic="true" hidden><p class="ch-kicker">YOUR STARTING POINT</p><h3 id="quiz-kind">NFT</h3><p id="quiz-reason"></p><a id="quiz-link" href="/app/?kind=nft#create">Start an NFT draft →</a></div>
       </form>
-      <div class="ch-kind-guide"><p><a href="/app/?kind=nft#create"><strong>NFT</strong></a> — one of one.</p><p><a href="/app/?kind=edition#create"><strong>Edition</strong></a> — 2 to 1,000,000 numbered copies.</p><p><a href="/app/?kind=collection#create"><strong>Collection</strong></a> — a group of NFTs.</p><p><a href="/app/?kind=fungible#create"><strong>Token</strong></a> — a fixed supply, with 0–9 decimals.</p></div>
+      <div class="ch-kind-guide"><p><a href="/app/?kind=nft#create"><strong>NFT</strong></a> — one of one.</p><p><a href="/app/?kind=edition#create"><strong>Edition</strong></a> — a master edition allowing 2 to 1,000,000 numbered prints (prints minted later with another tool).</p><p><a href="/app/?kind=collection#create"><strong>Collection</strong></a> — a group of NFTs.</p><p><a href="/app/?kind=fungible#create"><strong>Token</strong></a> — a fixed supply, with 0–9 decimals.</p></div>
     </section>
 
     <section id="guides" aria-labelledby="guides-title">
@@ -102,7 +102,7 @@
           <p class="ch-kicker">GUIDE 02</p><h3 id="names-title">Names, descriptions and traits</h3><p>Use a name people can recognise. Describe what they are looking at and how you made it.</p>
           <div class="ch-example"><span class="ch-kicker">WEAK</span><p>“Art #1”<br>“A great picture.”</p></div><div class="ch-example ch-good"><span class="ch-kicker">MORE USEFUL</span><p>“Tide Glass #1”<br>“A sea-green circle with soft edges on a deep blue background. Drawn from a shoreline sketch.”</p></div>
           <p>Traits are short labels and values. Try <code>Background: Deep blue</code>, <code>Palette: Sea green</code> and <code>Shape: Circle</code>. Use the same spelling and capitalisation throughout a series. Avoid mixing “Background”, “background” and “Backdrop” for the same trait.</p>
-          <details><summary>What goes into metadata.json?</summary><p>Studio uses <code>monzero-metadata/1</code>. It writes UTF-8 canonical JSON: sorted keys and no whitespace between values. The SHA-256 of those exact bytes is the metadata hash.</p><p><code>standard</code>, <code>class</code>, <code>name</code>, <code>description</code>, <code>creator</code>, <code>license</code> and <code>external_url</code> describe the work.</p><p><code>image</code>, <code>image_sha256</code>, <code>image_mime</code>, <code>image_bytes</code>, <code>image_width</code> and <code>image_height</code> describe the artwork file.</p><p><code>attributes</code> is a list of objects with <code>trait_type</code> and <code>value</code>. <code>edition_size</code> is for editions; <code>symbol</code> and <code>decimals</code> are for tokens; <code>collection</code> links a member to its collection. Only relevant fields are included.</p><p>Do not reformat the downloaded JSON. Even adding a final newline changes the hash.</p></details>
+          <details><summary>What goes into metadata.json?</summary><p>Studio uses <code>monzero-metadata/1</code>. It writes UTF-8 canonical JSON: sorted keys and no whitespace between values. The SHA-256 of those exact bytes is the metadata hash.</p><p><code>standard</code>, <code>class</code>, <code>name</code>, <code>description</code>, <code>creator</code>, <code>license</code> and <code>external_url</code> describe the work.</p><p><code>image</code>, <code>image_sha256</code>, <code>image_mime</code>, <code>image_bytes</code>, <code>image_width</code> and <code>image_height</code> describe the artwork file.</p><p><code>attributes</code> is a list of objects with <code>trait_type</code> and <code>value</code>. <code>edition_size</code> is for editions; <code>symbol</code> and <code>decimals</code> are for tokens; <code>collection</code> holds the Solana mint address of a member’s collection. Only relevant fields are included.</p><p>Do not reformat the downloaded JSON. Even adding a final newline changes the hash.</p></details>
         </article>
         <article class="ch-panel" id="licences" aria-labelledby="licences-title">
           <p class="ch-kicker">GUIDE 03</p><h3 id="licences-title">Choosing a licence</h3><p>A licence tells others how they may use your work. Holding an asset does not, by itself, transfer copyright. Choose only rights you can grant.</p>
@@ -118,12 +118,12 @@
           <p>Image and metadata addresses must have no spaces and be at most 256 bytes in UTF-8. Bytes are not always the same as characters. Hashes prove that files have not changed, so the host need not be trusted for integrity. They cannot keep an offline file available. Keep backups and maintain hosting or pinning.</p>
         </article>
         <article class="ch-panel" id="collections" aria-labelledby="collections-title">
-          <p class="ch-kicker">GUIDE 05</p><h3 id="collections-title">Planning a collection</h3><p>A Collection groups NFTs. Each member references its collection’s 64-hex-character ID. Plan the collection first, then prepare its members. On Solana, Studio mints the collection itself; adding members to it on chain is done afterwards with a Solana tool of your choice.</p>
+          <p class="ch-kicker">GUIDE 05</p><h3 id="collections-title">Planning a collection</h3><p>A Collection groups NFTs. Mint the collection first: Studio shows its <strong>mint address</strong>, a base58 Solana address of 32 to 44 characters. Paste that address into each member’s “Collection mint address” field. Studio records it in the member’s metadata (the <code>collection</code> field); it does not set or verify the collection on chain. Adding members to the collection on chain and verifying them is done afterwards with another Solana tool, such as Metaplex Sugar or the Metaplex JS SDK, signed by the collection’s update authority (the wallet that minted it).</p>
           <ol><li>Set a naming pattern, such as <code>Tide Glass #{n}</code>.</li><li>Choose consistent traits. If a trait is rare, make that an intentional count in your plan. Rarity is simply how often a trait appears.</li><li>Prepare an optional CSV: a <code>file</code> column with the exact image filename, then one column per trait.</li><li>Open the batch builder and drop in your images. Add the name pattern and optional traits CSV.</li><li>Download the zip of numbered metadata files and a manifest CSV of fingerprints. Review the names, traits and fingerprints before hosting.</li></ol>
           <p>The batch builder helps prepare files. It does not mint or host your images.</p><div class="ch-actions"><a class="ch-button ch-secondary" href="/app/#batch">Open the batch builder</a><a href="materials/traits-template.csv" download>Download the traits CSV</a></div>
         </article>
         <article class="ch-panel" id="editions" aria-labelledby="editions-title">
-          <p class="ch-kicker">GUIDE 06</p><h3 id="editions-title">Editions vs one-of-ones</h3><p>Choose an <strong>NFT</strong> for one of one: a single work with a single copy. Choose an <strong>Edition</strong> for 2 to 1,000,000 numbered copies of the same work.</p><p>For example, one shoreline drawing can be an NFT. A run of 25 numbered copies can be an Edition. A group of different drawings can belong to a Collection.</p><p>Decide the edition size before issuing. Keep its name, description and licence clear so people know what the numbered copies represent.</p><div class="ch-actions"><a href="/app/?kind=nft#create">Start an NFT →</a><a href="/app/?kind=edition#create">Start an Edition →</a></div>
+          <p class="ch-kicker">GUIDE 06</p><h3 id="editions-title">Editions vs one-of-ones</h3><p>Choose an <strong>NFT</strong> for one of one: a single work with a single copy. Choose an <strong>Edition</strong> for 2 to 1,000,000 numbered copies of the same work.</p><p>On Solana, Studio mints the <strong>master edition</strong>: one token whose maximum supply of prints is the number of copies you set. The numbered prints are not minted by Studio; you or your collectors mint them later from the master with another Solana tool, such as the Metaplex JS SDK. Each print is a separate token numbered 1, 2, 3 and so on, up to the maximum.</p><p>For example, one shoreline drawing can be an NFT. A run of 25 numbered copies can be an Edition. A group of different drawings can belong to a Collection.</p><p>Decide the edition size before issuing. Keep its name, description and licence clear so people know what the numbered copies represent.</p><div class="ch-actions"><a href="/app/?kind=nft#create">Start an NFT →</a><a href="/app/?kind=edition#create">Start an Edition →</a></div>
         </article>
         <article class="ch-panel ch-wide" id="tokens" aria-labelledby="tokens-title">
           <p class="ch-kicker">GUIDE 07</p><h3 id="tokens-title">Tokens: supply and decimals</h3>
@@ -147,7 +147,7 @@
 <label><input type="checkbox" name="artwork" id="check-artwork"><span>Export the final artwork, remove location data and keep it under 25 MB.</span></label>
 <label><input type="checkbox" name="details" id="check-details"><span>Review names, descriptions, traits and the licence.</span></label>
 <label><input type="checkbox" name="supply" id="check-supply"><span>Check the kind, edition size or fixed token supply and decimals.</span></label>
-<label><input type="checkbox" name="collection" id="check-collection"><span>If grouping NFTs, check each member’s 64-hex-character collection ID after the collection is issued.</span></label>
+<label><input type="checkbox" name="collection" id="check-collection"><span>If grouping NFTs, mint the collection first, paste its Solana mint address into each member, and verify membership on chain afterwards with a Solana tool.</span></label>
 <label><input type="checkbox" name="hosting" id="check-hosting"><span>Host the final image and metadata; arrange pinning or ongoing hosting.</span></label>
 <label><input type="checkbox" name="verify" id="check-verify"><span>Verify the exact hosted metadata and image against their expected hashes.</span></label>
 <label><input type="checkbox" name="backups" id="check-backups"><span>Keep backups of artwork, metadata, hashes and project backups outside the browser.</span></label>
@@ -161,7 +161,7 @@ Kind: [NFT / Edition / Collection / Token]
 Edition size or fixed supply and decimals, if relevant: [details]
 Licence: [licence]
 Solana mint address: [mint address]
-Collection ID, if relevant: [collection ID]
+Collection mint address, if relevant: [collection mint address]
 Image address: [image address]
 Metadata address: [metadata address]
 Metadata SHA-256: [64-character metadata hash]
@@ -178,8 +178,8 @@ This is a creator’s own work minted on Solana with Monzero Studio. It is not i
       <div><dt>Fingerprint</dt><dd>A way to identify a file. Studio records the image’s SHA-256, size, type, width and height.</dd></div>
       <div><dt>Metadata</dt><dd>The file describing your asset: its name, creator, licence, artwork reference and other details.</dd></div>
       <div><dt>Canonical JSON</dt><dd>A consistent way to write JSON: sorted keys, no extra whitespace and UTF-8 bytes. It makes the metadata hash reproducible.</dd></div>
-      <div><dt>Edition</dt><dd>2 to 1,000,000 numbered copies of one work.</dd></div>
-      <div><dt>Collection ID</dt><dd>The 64-hex-character ID of a Collection. Members reference it to belong to the group.</dd></div>
+      <div><dt>Edition</dt><dd>A master edition of one work with a maximum of 2 to 1,000,000 numbered prints. Studio mints the master; the prints are minted later with another tool.</dd></div>
+      <div><dt>Collection mint address</dt><dd>The Solana mint address of a Collection: 32 to 44 base58 characters. Members record it in their metadata; on-chain membership is verified with a Solana tool.</dd></div>
       <div><dt>Mint address</dt><dd>The Solana address that identifies a minted token or NFT. It is different from a metadata file’s hash.</dd></div>
       <div><dt>IPFS / CID</dt><dd>IPFS addresses content using a content identifier, or CID. Keep the content pinned and available so others can retrieve it.</dd></div>
       <div><dt>Atomic units</dt><dd>The smallest indivisible units of a token. With 2 decimals, one full token is 100 atomic units.</dd></div>
@@ -201,7 +201,7 @@ This is a creator’s own work minted on Solana with Monzero Studio. It is not i
   </main>
 
   <footer><span>Monzero Studio</span><span>Your files stay on your device · No custody</span><span><a href="/security/">Security</a> · <a href="/privacy/">Privacy Policy</a> · <a href="/terms/">Website Terms</a></span></footer>
-  <script src="creators.js" defer></script>
+  <script src="creators.js?v=2" defer></script>
   <script src="/site-nav.js?v=20261113-noticker" defer></script>
 </body>
 </html>

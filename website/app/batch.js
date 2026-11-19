@@ -140,7 +140,7 @@
       const n = Number(s.edition_size);
       if (!(Number.isInteger(n) && n >= 2 && n <= 1000000)) checks.push(li('bad', 'Copies must be between 2 and 1,000,000'));
     }
-    if (s.collection.trim() && !/^[0-9a-fA-F]{64}$/.test(s.collection.trim())) checks.push(li('bad', 'Collection ID must be 64 hexadecimal characters'));
+    if (core.collectionProblem(s.collection)) checks.push(li('bad', core.collectionProblem(s.collection)));
     if (state.csv?.error) checks.push(li('bad', state.csv.error));
     if (!s.metadataBase) checks.push(li('warn', 'Add the metadata folder address so wallets can find each file'));
     const located = images.filter((x) => x.location).length;

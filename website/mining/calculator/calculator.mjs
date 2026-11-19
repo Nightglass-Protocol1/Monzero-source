@@ -53,3 +53,19 @@ document.querySelector('#refresh').addEventListener('click',refresh);
 // Expire visible estimates too, rather than retaining an apparently current result.
 setInterval(()=>{if(observation && Math.max(performance.now()-observation.receivedAt,Date.now()-observation.receivedWallAt)>300000){observation=null;results.replaceChildren();status.textContent='Observation expired. Refresh network data.';document.querySelector('#result-status').textContent='Estimate expired.';}},10000);
 refresh();
+// Reference only: the last XMZ/USDT trade on NoirTrade (same-origin cache of its public market data).
+// One exchange, thin market: shown as a reference line, never used as a valuation in the estimate.
+async function loadReferencePrice() {
+  const line=document.querySelector('#xmz-reference');if(!line)return;
+  try {
+    const response=await fetch('../../markets/xmz.php',{cache:'no-store'});
+    if(!response.ok)throw new Error('Unavailable');
+    const data=await response.json();
+    const last=Number(data?.last);
+    if(!Number.isFinite(last)||last<=0)throw new Error('No price');
+    const price=new Intl.NumberFormat('en-US',{maximumSignificantDigits:4}).format(last);
+    const read=data.updated&&!Number.isNaN(Date.parse(data.updated))?` · read ${new Date(data.updated).toLocaleString()}`:'';
+    line.textContent=`Last NoirTrade trade: $${price} per XMZ (USDT; one exchange, thin market — not a valuation)${read}${data.stale?' · out of date':''}`;
+  } catch {line.textContent='The last NoirTrade trade price is unavailable right now. See the Markets page.';}
+}
+loadReferencePrice();

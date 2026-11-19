@@ -75,36 +75,6 @@
     });
   }
 
-  function fmtCoinAmt(v) {
-    if (v == null) return "—";
-    if (v >= 1) return (+v.toFixed(4)).toString();
-    var p = Number(v).toPrecision(3);           // 3 sig figs
-    if (p.indexOf("e") >= 0) {                    // expand sci-notation to plain decimals
-      var dec = Math.min(18, -Math.floor(Math.log10(v)) + 2);
-      p = Number(v).toFixed(dec);
-    }
-    return p.replace(/0+$/, "").replace(/\.$/, "");
-  }
-  function fmtXmz(v) { return v == null ? "—" : Math.round(v).toLocaleString("en-US"); }
-
-  function renderOpening(d) {
-    var tb = document.getElementById("mkt-opening-rows");
-    if (!tb) return;
-    var pairs = (d.openingRate && d.openingRate.pairs) || [];
-    var bySym = {}; pairs.forEach(function (p) { bySym[p.symbol] = p; });
-    tb.innerHTML = "";
-    ORDER.forEach(function (sym) {
-      var p = bySym[sym]; var tr = el("tr");
-      var dot = el("span", "mkt-dot"); dot.style.background = COLOR[sym];
-      var name = el("td", "mkt-name"); name.appendChild(dot);
-      name.appendChild(el("strong", null, "XMZ/" + sym));
-      tr.appendChild(name);
-      tr.appendChild(el("td", "num", p ? fmtCoinAmt(p.coinPerXmz) + " " + sym : "—"));
-      tr.appendChild(el("td", "num", p ? fmtXmz(p.xmzPerCoin) + " XMZ" : "—"));
-      tb.appendChild(tr);
-    });
-  }
-
   function renderSwaps(d) {
     var tb = document.getElementById("mkt-swaps");
     if (!tb) return;
@@ -125,7 +95,7 @@
     fetch("/markets/api.php", { cache: "no-store" })
       .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
       .then(function (d) {
-        renderTable(d); renderOpening(d); renderChart(d); renderSwaps(d);
+        renderTable(d); renderChart(d); renderSwaps(d);
         var u = document.getElementById("mkt-updated");
         if (u && d.updated) u.textContent = "Live · updated " + new Date(d.updated).toLocaleString() + " · source " + (d.source || "");
       })

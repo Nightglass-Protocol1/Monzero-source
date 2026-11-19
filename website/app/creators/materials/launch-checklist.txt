@@ -6,7 +6,7 @@ Design in Studio, practise on Solana Devnet for free, then mint on Solana Mainne
 [ ] Export the final artwork, remove location data and keep it under 25 MB.
 [ ] Review names, descriptions, traits and the licence.
 [ ] Check the kind, edition size or fixed token supply and decimals.
-[ ] If grouping NFTs, check each member’s 64-hex-character collection ID after the collection is issued.
+[ ] If grouping NFTs, mint the collection first, paste its Solana mint address into each member, and verify membership on chain afterwards with a Solana tool.
 [ ] Host the final image and metadata; arrange pinning or ongoing hosting.
 [ ] Verify the exact hosted metadata and image against their expected hashes.
 [ ] Keep backups of artwork, metadata, hashes and project backups outside the browser.

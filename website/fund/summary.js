@@ -15,7 +15,7 @@
     .then(([data, g]) => {
       const open = g && g.schema === "monzero-fund-goals-v1" && Array.isArray(g.records) ? g.records.filter((x) => x && x.status !== "closed" && /^[1-9]\d{0,8}$/.test(x.target_usd)) : [];
       const first = open.length ? Number(open[0].target_usd) : 15000;
-      const all = open.length ? open.reduce((sum, x) => sum + Number(x.target_usd), 0) : 20000;
+      const all = open.length ? open.reduce((sum, x) => sum + Number(x.target_usd), 0) : 5000;
       if (open.length) {
         set("support-goal-name", typeof open[0].title === "string" ? open[0].title.slice(0, 80) : "First goal");
         set("support-goal-target", usd.format(first));

@@ -177,11 +177,14 @@
           const uri = field('metadata_uri');
           if (!uri) return say('Set the metadata URI (export + host the metadata JSON first).', true);
           const common = { payer: pub, name, symbol: field('symbol'), uri, rentLamports: rent };
-          if (kind === 'collection') { built = SM.buildCreateCollection(common); what = 'collection'; }
+          if (kind === 'collection') { built = SM.buildCreateCollection(common); what = 'collection (use this mint address as the collection address of its members)'; }
           else if (kind === 'edition') {
-            const n = parseInt(field('edition_size') || '', 10);
-            built = SM.buildCreateEdition({ ...common, maxSupply: Number.isInteger(n) && n > 0 ? n : null });
-            what = 'edition';
+            // A master edition whose maxSupply caps the numbered prints; the prints themselves
+            // are minted later with another tool. Never fall back to an unlimited master.
+            const n = Number(field('edition_size'));
+            if (!Number.isInteger(n) || n < 2 || n > 1000000) return say('Set the number of copies (2 to 1,000,000) first.', true);
+            built = SM.buildCreateEdition({ ...common, maxSupply: n });
+            what = 'master edition (up to ' + n.toLocaleString() + ' prints; mint the prints later with another Solana tool)';
           } else { built = SM.buildCreateNft(common); what = 'NFT'; }
         }
 

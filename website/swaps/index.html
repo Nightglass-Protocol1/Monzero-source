@@ -1,12 +1,12 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>How BTC/XMZ swaps work · Monzero</title><!-- seo:begin --><link rel="canonical" href="https://monzero.org/swaps/"><meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/swaps/"><meta property="og:title" content="How BTC/XMZ swaps work · Monzero"><meta property="og:description" content="How a Monzero BTC/XMZ atomic swap works, step by step: locks, claims, refunds and crash safety. Test networks only."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="Monzero MZ emblem and wordmark: Join the Monzero community. Privacy focused, independent blockchain, CPU mineable."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="How BTC/XMZ swaps work · Monzero"><meta name="twitter:description" content="How a Monzero BTC/XMZ atomic swap works, step by step: locks, claims, refunds and crash safety. Test networks only."><meta name="twitter:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><!-- seo:end --><meta name="description" content="How a Monzero BTC/XMZ atomic swap works, step by step: locks, claims, refunds and crash safety. Test networks only."><link rel="stylesheet" href="/styles.css?v=20261026-brand"><link rel="stylesheet" href="/theme.css?v=20261026-brand"><link rel="stylesheet" href="/site-nav.css?v=20261026-brand"><link rel="stylesheet" href="/swaps/swaps.css?v=20261026-brand"><link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261026-brand"></noscript>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>How a Monzero swap works · Monzero</title><!-- seo:begin --><link rel="canonical" href="https://monzero.org/swaps/"><meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/swaps/"><meta property="og:title" content="How a Monzero swap works · Monzero"><meta property="og:description" content="How a Monzero DEX atomic swap works, step by step: XMZ against ETH, BNB, SOL and USDT. Offers, locks, claims, refunds, the two timeouts and where to trade."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="Monzero MZ emblem and wordmark: Join the Monzero community. Privacy focused, independent blockchain, CPU mineable."><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="How a Monzero swap works · Monzero"><meta name="twitter:description" content="How a Monzero DEX atomic swap works, step by step: XMZ against ETH, BNB, SOL and USDT. Offers, locks, claims, refunds, the two timeouts and where to trade."><meta name="twitter:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><!-- seo:end --><meta name="description" content="How a Monzero DEX atomic swap works, step by step: XMZ against ETH, BNB, SOL and USDT. Offers, locks, claims, refunds, the two timeouts and where to trade."><link rel="stylesheet" href="/styles.css?v=20261026-brand"><link rel="stylesheet" href="/theme.css?v=20261026-brand"><link rel="stylesheet" href="/site-nav.css?v=20261026-brand"><link rel="stylesheet" href="/swaps/swaps.css?v=20261026-brand"><link rel="stylesheet" href="/site-shell.css?v=20261026-brand"><noscript><link rel="stylesheet" href="/no-script.css?v=20261026-brand"></noscript>
 <link rel="stylesheet" href="/theme-switch.css?v=20261117c">
 <script defer src="/theme-switch.js?v=20261117c"></script>
 </head><body class="site-shell"><a class="skip-link" href="#main">Skip to content</a><header class="site-header"><a class="brand" href="/" aria-label="Monzero home"><img class="brand-mark brand-coin" src="/assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"><span>MONZERO</span></a><button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button><nav id="site-nav" aria-label="Primary navigation"><a href="/">Home</a><div class="nav-group"><a href="/#about">About</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-about"><span class="visually-hidden">About pages</span></button><div class="nav-sub" id="nav-sub-about"><a href="/#about">About Monzero</a><a href="/roadmap/">Roadmap</a><a href="/objectives/">Project objectives</a><a href="/founder/">Founder</a></div></div><div class="nav-group"><a href="/ecosystem/">Ecosystem</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-ecosystem"><span class="visually-hidden">Ecosystem pages</span></button><div class="nav-sub" id="nav-sub-ecosystem"><a href="/ecosystem/">Ecosystem directory</a><a href="/app/">Monzero Studio</a><a href="/app/creators/">Creator hub</a><a href="/wallets/">Public wallets</a><a href="/payments/request/">Payment request</a></div></div><div class="nav-group current"><a href="/dex/">DEX</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-dex"><span class="visually-hidden">DEX pages</span></button><div class="nav-sub" id="nav-sub-dex"><a href="/dex/">Trade on the DEX</a><a href="/markets/">Markets &amp; price</a><a href="/exchanges/">Exchanges</a><a href="/swaps/" aria-current="page">How a swap works</a><a href="/dex/recovery/">Swap recovery</a></div></div><div class="nav-group"><a href="/mining/">Mining</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-mining"><span class="visually-hidden">Mining pages</span></button><div class="nav-sub" id="nav-sub-mining"><a href="/mining/">How to mine</a><a href="/mining/calculator/">Mining calculator</a><a href="/mining/dashboard/">Your mining</a><a href="/mining/benchmarks/">CPU benchmarks</a><a href="/mining/leaderboard/">Mining leaderboard</a><a href="/faucet/">Faucet</a><a href="https://pool.monzero.org/">Mining pool</a></div></div><div class="nav-group"><a href="/explorer/">Network</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-network"><span class="visually-hidden">Network pages</span></button><div class="nav-sub" id="nav-sub-network"><a href="/explorer/">Block explorer</a><a href="/network/">Network history</a><a href="/network/nodes/">Node map</a><a href="/stats/">Network stats</a><a href="/status/">Service status</a></div></div><div class="nav-group"><a href="/download/">Downloads</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-downloads"><span class="visually-hidden">Downloads pages</span></button><div class="nav-sub" id="nav-sub-downloads"><a href="/download/">Downloads &amp; verification</a><a href="/upgrade/">Upgrade guide</a></div></div><div class="nav-group"><a href="/developers/">Documentation</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-documentation"><span class="visually-hidden">Documentation pages</span></button><div class="nav-sub" id="nav-sub-documentation"><a href="/developers/">Developer portal</a><a href="/WHITEPAPER.md?rev=1.5-20261017">Whitepaper</a><a href="/developers/api/">API v1</a><a href="/developers/payments/">Accept XMZ</a><a href="/security/">Security</a><a href="/privacy/">Privacy Policy</a><a href="/terms/">Website Terms</a></div></div><div class="nav-group"><a href="/community/">Community</a><button class="nav-sub-toggle" type="button" aria-expanded="false" aria-controls="nav-sub-community"><span class="visually-hidden">Community pages</span></button><div class="nav-sub" id="nav-sub-community"><a href="/airdrop/">Airdrop</a><a href="/community/">Community hub</a><a href="/community/board/">Discussion board</a><a href="/community/voting/">Voting</a><a href="/community/bounties/">Bounties</a><a href="/fund/">Fundraising</a><a href="/news/">News</a><a href="/press/">Press kit</a><a href="/marketing/">Marketing kit</a></div></div></nav><a class="header-cta" href="/#get-started">Get started</a></header><main tabindex="-1" id="main"><div class="sw-wrap sw-page">
   <div class="sw-intro">
     <span class="sw-eyebrow">Monzero DEX · atomic swap</span>
-    <h1>How a <span class="sw-b">BTC</span> / <span class="sw-x">XMZ</span> swap works</h1>
-    <p class="sw-lede">Two strangers trade Bitcoin for Monzero without an exchange, an escrow agent or trusting each other. The two blockchains enforce every step: either both sides get paid, or both get their coins back.</p>
-    <p class="sw-notice"><strong>Bitcoin is not offered yet.</strong> This page explains the Bitcoin swap that was built and tested on test networks (Bitcoin signet/testnet4 and the Monzero test network); Bitcoin and Litecoin follow later. The live <a href="/dex/">DEX</a> markets — ETH, BNB, SOL and USDT (on Solana and on BNB Chain) — use the same idea with a swap contract on Ethereum or BNB Chain, or a Solana program, and two 2-hour timeouts that refund both sides if a trade stalls: see the <a href="/dex/recovery/">recovery guide</a>.</p>
+    <h1>How a <span class="sw-x">XMZ</span> swap works</h1>
+    <p class="sw-lede">On the Monzero DEX, two strangers trade XMZ against <strong>ETH</strong>, <strong>BNB</strong>, <strong>SOL</strong> or <strong>USDT</strong> (on Solana as an SPL token, and on BNB Chain as a BEP-20 token) without an exchange, an escrow agent or trusting each other. Each trade is an <strong>atomic swap</strong>: either both sides get paid, or both get their coins back. Nobody holds your coins in between, there is no bridge and no wrapped token: your coin waits in an open swap contract (a program on Solana), your XMZ on the Monzero chain, and the two blockchains enforce every step.</p>
+    <p class="sw-notice"><strong>Live, with small limits.</strong> The DEX is new: each trade is capped at a small amount, and the swap contract and program have not been independently audited. Bitcoin and Litecoin are not offered yet. If a trade of yours is stuck, see the <a href="/dex/recovery/">recovery guide</a>.</p>
   </div>
 
   <section aria-labelledby="cast-h">
@@ -14,13 +14,13 @@
     <div class="sw-cast">
       <div class="sw-person sw-bob">
         <span class="sw-role">Bob · buying XMZ</span>
-        <h3>Pays with Bitcoin</h3>
-        <p>Uses the Bitcoin light wallet built into the Monzero app, so he doesn't need to run a Bitcoin node.</p>
+        <h3>Pays with ETH, BNB, SOL or USDT</h3>
+        <p>His coin goes into the swap contract on Ethereum or BNB Chain, or the swap program on Solana. Only the rules written there can release it: to Alice if she claims in time, or back to Bob.</p>
       </div>
       <div class="sw-person sw-alice">
         <span class="sw-role">Alice · selling XMZ</span>
-        <h3>Gets paid in Bitcoin</h3>
-        <p>Uses her Monzero wallet. For now her app also needs a Bitcoin node to check the chain; a light-wallet option for sellers is being designed.</p>
+        <h3>Gets paid in that coin</h3>
+        <p>She locks her XMZ on the Monzero chain in a key that she and Bob share. Either of them can be the one who posted the offer; the steps are the same.</p>
       </div>
     </div>
   </section>
@@ -28,7 +28,7 @@
   <section aria-labelledby="flow-h">
     <div class="sw-head">
       <h2 id="flow-h">Step by step</h2>
-      <p class="sw-sub">Amounts are from the signet test swap on 25 October: 0.002 BTC for 1 XMZ, with a 36-block safety timelock.</p>
+      <p class="sw-sub">Every trade has two deadlines of two hours each, counted from Bob's lock: <strong>timeout 1</strong> and <strong>timeout 2</strong>. Your wallet takes every protective step by itself; the only click you make is approving the trade.</p>
     </div>
     <div class="sw-tabs" role="tablist" aria-label="Swap outcome">
       <button id="tab-swap" role="tab" aria-selected="true" aria-controls="swap">The swap completes</button>
@@ -36,56 +36,70 @@
     </div>
 
     <div id="swap" class="sw-panel" role="tabpanel" aria-labelledby="tab-swap">
-      <div class="sw-lanes-head" aria-hidden="true"><span>Bob · BTC</span><span>On-chain</span><span>Alice · XMZ</span></div>
+      <div class="sw-lanes-head" aria-hidden="true"><span>Bob · ETH, BNB, SOL, USDT</span><span>On-chain</span><span>Alice · XMZ</span></div>
       <div class="sw-flow">
         <div class="sw-step">
           <div class="sw-card sw-both">
-            <span class="sw-n">STEP 1 · AGREE</span>
-            <h3>Both apps sign the deal before any money moves</h3>
-            <p>Bob accepts Alice's signed quote. The apps exchange identities, keys and proofs, then each saves <strong>pre-signed cancel and refund transactions</strong>. From here, either side can always get their coins back.</p>
+            <span class="sw-n">STEP 1 · OFFER</span>
+            <h3>A signed offer goes to the public relays</h3>
+            <p>The maker (Bob or Alice) posts an offer: the pair, the amounts and an expiry, signed with the maker's trading key. It goes to the open relays, <code>relay1.monzero.org</code> and <code>relay2.monzero.org</code>, which copy offers from each other. Anyone can run another relay. A relay holds nothing and signs nothing: it can delay or drop an offer, but it cannot change one.</p>
+          </div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-card sw-both">
+            <span class="sw-n">STEP 2 · TAKE</span>
+            <h3>The taker answers in sealed relay mail</h3>
+            <p>The other trader takes the offer by leaving a sealed letter in the maker's relay mailbox; the relays see only scrambled bytes. An offer may allow <strong>partial fills</strong>: you can take part of it, from the minimum the maker set, and the maker's wallet posts the rest again as a new offer at the same price.</p>
+          </div>
+        </div>
+        <div class="sw-step">
+          <div class="sw-card sw-both">
+            <span class="sw-n">STEP 3 · AGREE AND APPROVE</span>
+            <h3>The wallets agree keys; you approve the trade</h3>
+            <p>The two wallets swap the keys for this one trade, each with a proof that it is built correctly, and both build the same trade from the offer. Then <strong>your wallet shows you the amounts and asks you to approve</strong>. Nothing is locked on any chain before that, and a web page cannot approve for you.</p>
           </div>
         </div>
         <div class="sw-step">
           <div class="sw-card sw-bob">
-            <span class="sw-n">STEP 2 · BOB LOCKS BTC</span>
-            <h3>0.002 BTC goes into a shared contract</h3>
-            <p>Bob approves the payment in his app. The coins sit in a <strong>2-of-2 contract</strong>: spending them needs both traders' keys, or the timelock to pass.</p>
+            <span class="sw-n">STEP 4 · BOB LOCKS HIS COIN</span>
+            <h3>The coin goes into the swap contract</h3>
+            <p>Bob's wallet locks the agreed ETH, BNB, SOL or USDT in the swap contract (the Solana program for SOL and Solana USDT). The lock records both deadlines. The contract has no owner, no admin key and no pause button.</p>
           </div>
-          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-btc">Bitcoin</span><span>lock confirms</span></div>
+          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-btc">ETH · BNB · SOL</span><span>lock confirms</span></div>
           <div class="sw-empty"></div>
         </div>
         <div class="sw-step">
           <div class="sw-empty"></div>
-          <div class="sw-chain"><span class="sw-pill sw-xmz">Monzero</span><span class="sw-arrow sw-xmz">←</span><span>10 confirmations</span></div>
+          <div class="sw-chain"><span class="sw-pill sw-xmz">Monzero</span><span class="sw-arrow sw-xmz">←</span><span>XMZ lock confirms</span></div>
           <div class="sw-card sw-alice">
-            <span class="sw-n">STEP 3 · ALICE LOCKS XMZ</span>
-            <h3>1 XMZ goes to a shared address</h3>
-            <p>Alice's app checks Bob's lock first. Then she sends <strong>1 XMZ plus a small fee reserve</strong> to an address that can only be spent with both traders' key shares.</p>
+            <span class="sw-n">STEP 5 · ALICE LOCKS XMZ</span>
+            <h3>XMZ goes to a key both traders share</h3>
+            <p>Alice's wallet first checks Bob's lock against every agreed term, and that enough time is left before timeout 1. Then it sends the XMZ to an address whose spending key is split in two: Alice holds one half, Bob the other, so neither can move it alone.</p>
           </div>
         </div>
         <div class="sw-step">
           <div class="sw-card sw-bob">
-            <span class="sw-n">STEP 4 · BOB HANDS OVER A LOCKED SIGNATURE</span>
-            <h3>A signature with a catch</h3>
-            <p>Bob checks the XMZ lock, then gives Alice an <strong>adaptor signature</strong> for claiming the BTC. To use it, Alice has to reveal her XMZ key share.</p>
+            <span class="sw-n">STEP 6 · BOB CONFIRMS READY</span>
+            <h3>"The XMZ is there"</h3>
+            <p>Bob's wallet checks that exactly the agreed XMZ arrived and confirmed, then marks the swap <strong>ready</strong> in the contract, before timeout 1. From now on Bob can no longer take his coin back early.</p>
           </div>
-          <div class="sw-chain"><span class="sw-arrow sw-mut">→</span><span>sent app to app</span></div>
+          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-btc">contract</span><span>ready</span></div>
           <div class="sw-empty"></div>
         </div>
         <div class="sw-step">
           <div class="sw-empty"></div>
-          <div class="sw-chain"><span class="sw-pill sw-btc">Bitcoin</span><span class="sw-arrow sw-btc">←</span><span>redeem published</span></div>
+          <div class="sw-chain"><span class="sw-pill sw-btc">ETH · BNB · SOL</span><span class="sw-arrow sw-btc">←</span><span>claim published</span></div>
           <div class="sw-card sw-alice">
-            <span class="sw-n">STEP 5 · ALICE CLAIMS THE BTC</span>
-            <h3>0.0019 BTC to Alice</h3>
-            <p>While the timelock is still safely far away, Alice completes the signature and broadcasts it. 0.0001 BTC goes on the network fee. <strong>Publishing it puts her XMZ key share on the Bitcoin chain.</strong></p>
+            <span class="sw-n">STEP 7 · ALICE CLAIMS THE COIN</span>
+            <h3>The coin is paid to Alice</h3>
+            <p>Alice's wallet claims the coin from the contract, well before timeout 2. To claim, it has to hand the contract her secret: <strong>her half of the XMZ key, which the claim publishes on chain.</strong></p>
           </div>
         </div>
         <div class="sw-step">
           <div class="sw-card sw-bob">
-            <span class="sw-n">STEP 6 · BOB CLAIMS THE XMZ</span>
-            <h3>Exactly 1 XMZ to Bob</h3>
-            <p>Bob's app reads Alice's redeem from the Bitcoin chain, recovers her key share and sweeps the 1 XMZ to his wallet. The unused fee reserve goes back to Alice.</p>
+            <span class="sw-n">STEP 8 · BOB SWEEPS THE XMZ</span>
+            <h3>The XMZ is Bob's</h3>
+            <p>Bob's wallet reads Alice's secret from her claim, joins it with its own half and sweeps the XMZ into his own wallet.</p>
           </div>
           <div class="sw-chain"><span class="sw-arrow sw-xmz">←</span><span class="sw-pill sw-done">swap done</span></div>
           <div class="sw-empty"></div>
@@ -93,119 +107,179 @@
         <div class="sw-step">
           <div class="sw-key">
             <h3>Why neither side can cheat</h3>
-            <p>Alice can only take the Bitcoin by publishing the very thing Bob needs to take the XMZ. If she never claims, the timelock runs out and Bob gets his Bitcoin back.</p>
+            <p>Alice can only take the coin by publishing the very thing Bob needs to take the XMZ. If she never claims, timeout 2 passes and Bob gets his coin back, and his refund in turn publishes his half of the key, so Alice gets her XMZ back.</p>
           </div>
         </div>
       </div>
     </div>
 
     <div id="refund" class="sw-panel" role="tabpanel" aria-labelledby="tab-refund" hidden>
-      <div class="sw-lanes-head" aria-hidden="true"><span>Bob · BTC</span><span>On-chain</span><span>Alice · XMZ</span></div>
+      <div class="sw-lanes-head" aria-hidden="true"><span>Bob · ETH, BNB, SOL, USDT</span><span>On-chain</span><span>Alice · XMZ</span></div>
       <div class="sw-flow">
         <div class="sw-step">
           <div class="sw-card sw-both">
             <span class="sw-n">THE TRIGGER</span>
-            <h3>Alice never locks her XMZ, or never claims before the timelock</h3>
-            <p>Bob's 0.002 BTC is sitting in the contract. Nobody can take it alone, and the 36-block timelock is counting down.</p>
+            <h3>Alice's XMZ never arrives, or she never claims</h3>
+            <p>Bob's coin is sitting in the swap contract. Nobody can take it outside the contract's rules, and the two deadlines are counting down.</p>
           </div>
         </div>
         <div class="sw-step">
           <div class="sw-card sw-bob">
-            <span class="sw-n">AFTER 36 BLOCKS · CANCEL</span>
-            <h3>Bob broadcasts the pre-signed cancel</h3>
-            <p>This moves the coins out of the swap contract into a refund contract. It was signed by both apps back in step 1, so Alice's help isn't needed.</p>
+            <span class="sw-n">BEFORE TIMEOUT 1 · EARLY REFUND</span>
+            <h3>No correct XMZ: Bob takes his coin straight back</h3>
+            <p>If the agreed XMZ has not arrived and confirmed by shortly before timeout 1, or the wrong amount arrived, Bob's wallet never marks the swap ready. It refunds the coin at once instead of waiting.</p>
           </div>
-          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-btc">Bitcoin</span><span>cancel confirms</span></div>
+          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-done">coin refunded</span></div>
           <div class="sw-empty"></div>
         </div>
         <div class="sw-step">
           <div class="sw-card sw-bob">
-            <span class="sw-n">REFUND</span>
-            <h3>0.0018 BTC back in Bob's light wallet</h3>
-            <p>Bob's app sends the refund. The 0.0002 BTC difference is the two network fees. Tested on testnet4 and on signet.</p>
+            <span class="sw-n">FROM TIMEOUT 2 · REFUND</span>
+            <h3>Alice locked XMZ but never claimed</h3>
+            <p>Between ready and timeout 2 the coin is reserved for Alice's claim. Once timeout 2 passes without one, Bob's wallet refunds the coin to him.</p>
           </div>
-          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-done">BTC refunded</span></div>
+          <div class="sw-chain"><span class="sw-arrow sw-btc">→</span><span class="sw-pill sw-done">coin refunded</span></div>
           <div class="sw-empty"></div>
         </div>
         <div class="sw-step">
           <div class="sw-empty"></div>
-          <div class="sw-chain"><span class="sw-pill sw-xmz">Monzero</span><span class="sw-arrow sw-xmz">←</span><span>XMZ refunded</span></div>
+          <div class="sw-chain"><span class="sw-pill sw-xmz">Monzero</span><span class="sw-arrow sw-xmz">←</span><span>XMZ swept back</span></div>
           <div class="sw-card sw-alice">
             <span class="sw-n">ALICE'S XMZ</span>
             <h3>Bob's refund unlocks Alice's XMZ</h3>
-            <p>If Alice did lock XMZ, Bob's refund transaction reveals his key share, so Alice's app can sweep her XMZ back.</p>
+            <p>To refund, Bob has to hand the contract his own secret, so the refund publishes his half of the XMZ key. If Alice had locked XMZ, her wallet reads it from the chain and sweeps her XMZ back.</p>
           </div>
         </div>
         <div class="sw-step">
           <div class="sw-empty"></div>
-          <div class="sw-chain"><span class="sw-pill sw-btc">Bitcoin</span><span class="sw-arrow sw-btc">←</span><span class="sw-pill sw-bad">punish</span></div>
+          <div class="sw-chain"><span class="sw-pill sw-bad">too late to claim</span></div>
           <div class="sw-card sw-alice">
-            <span class="sw-n">IF BOB VANISHES AFTER CANCEL</span>
-            <h3>Alice can take the BTC</h3>
-            <p>If Bob cancels but never refunds, after 10 more blocks Alice can punish and take the Bitcoin. Otherwise her XMZ would stay stuck, so this keeps both sides honest.</p>
+            <span class="sw-n">IF ALICE'S WALLET WAS OFFLINE</span>
+            <h3>Missing the deadline costs time, not XMZ</h3>
+            <p>Alice's wallet will not claim in the last 30 minutes before timeout 2, so a late claim can never race the refund. It waits for Bob's refund and sweeps the XMZ back as above.</p>
           </div>
         </div>
       </div>
 
       <div class="sw-clock">
-        <h3>The clock, in Bitcoin blocks</h3>
-        <div class="sw-timeline-wrap" tabindex="0" aria-label="Timelock timeline">
-          <div class="sw-timeline">
-            <div class="sw-bar">
-              <div class="sw-w1">Swap window · Alice may claim</div>
-              <div class="sw-w2">Bob refunds</div>
-              <div class="sw-w3">Alice may punish</div>
-            </div>
-            <div class="sw-ticks"><span>block 0 · BTC lock confirms</span><span>36 · cancel</span><span>+10 · punish</span></div>
-          </div>
+        <h3>The clock</h3>
+        <div class="sw-table-wrap" tabindex="0" role="region" aria-label="Swap deadlines">
+          <table>
+            <thead><tr><th>When</th><th>Who</th><th>What happens</th></tr></thead>
+            <tbody>
+              <tr><td>Right after approving</td><td>Bob (buying XMZ)</td><td>Locks ETH, BNB, SOL or USDT in the contract. This starts both clocks.</td></tr>
+              <tr><td>Before timeout 1 <span class="sw-mono">(lock + 2 h)</span></td><td>Alice (selling XMZ)</td><td>Locks the XMZ in the key both share.</td></tr>
+              <tr><td>Before timeout 1</td><td>Bob</td><td>Marks the swap ready, or, if no correct XMZ arrived, takes the coin back (early refund).</td></tr>
+              <tr><td>From ready (or timeout 1) until timeout 2 <span class="sw-mono">(lock + 4 h)</span></td><td>Alice</td><td>Claims the coin; the claim lets Bob's wallet sweep the XMZ.</td></tr>
+              <tr><td>From timeout 2</td><td>Bob</td><td>If Alice never claimed: refunds the coin; the refund lets Alice's wallet sweep the XMZ back.</td></tr>
+            </tbody>
+          </table>
         </div>
-        <p class="sw-sub">Alice's app refuses to claim when the timelock is close; it keeps a safety margin of several blocks. On Bitcoin, 36 blocks is about six hours.</p>
+        <p class="sw-sub">So once coins are locked, a trade settles within about four hours, either way. The same rules apply on Ethereum, BNB Chain and Solana, for the native coin and for USDT. Full table and recovery steps: <a href="/dex/recovery/#timelocks">recovery guide, section 6</a>.</p>
       </div>
     </div>
   </section>
 
   <section aria-labelledby="crash-h">
-    <h2 id="crash-h">What if an app crashes mid-trade?</h2>
+    <h2 id="crash-h">Your wallet does the protective steps</h2>
     <div class="sw-facts">
       <div class="sw-fact">
-        <h3>Everything is saved before it is sent</h3>
-        <p>Each signed transaction is written to disk before broadcast. A reopened app sends the <em>same</em> bytes again: no double payment, and nothing is signed twice.</p>
+        <h3>No click needed to stay safe</h3>
+        <p>You approve a trade once. After that, marking ready, claiming, refunding and sweeping the XMZ happen by themselves. Keep the wallet open, or reopen it, until the trade says <em>swapped</em> or <em>refunded</em>.</p>
       </div>
       <div class="sw-fact">
-        <h3>Tested with the power pulled</h3>
-        <p>On 25 October the buyer's machine was switched off mid-swap without shutting down. After reboot its wallet and trade files were intact and the swap finished with exact amounts.</p>
+        <h3>Saved before it is sent</h3>
+        <p>Each trade keeps a journal. Every transaction is signed once and saved before it is broadcast; a reopened wallet sends the <em>same</em> transaction again, so nothing is paid twice. A crash or power cut means picking up where it left off.</p>
       </div>
       <div class="sw-fact">
-        <h3>Approvals don't carry over</h3>
-        <p>After a restart, any approval that hadn't been used is cleared. You review and approve again with fresh chain data.</p>
+        <h3>Each wallet checks the chains itself</h3>
+        <p>Neither wallet takes the other trader's word for a payment. Each reads the contract and the Monzero chain directly, and never sends a claim or refund the contract would refuse, since even a failed one would publish its secret.</p>
       </div>
       <div class="sw-fact">
-        <h3>Each app checks the chain itself</h3>
-        <p>Neither app takes the other trader's word for a payment. Bob's light wallet verifies Bitcoin block headers and proofs; Alice's app checks with her own node.</p>
+        <h3>If something does go wrong</h3>
+        <p>The <a href="/dex/recovery/">recovery guide</a> covers backups of your trading keys, reopening the wallet mid-trade, coin left in your trade account, a lost device, and the last-resort path without any Monzero software.</p>
       </div>
     </div>
   </section>
 
-  <section aria-labelledby="evidence-h">
-    <h2 id="evidence-h">Test runs so far</h2>
-    <div class="sw-table-wrap">
+  <section aria-labelledby="where-h">
+    <div class="sw-head">
+      <h2 id="where-h">Where you trade</h2>
+      <p class="sw-sub">The swap always runs inside your own Monzero wallet; your keys never leave your device.</p>
+    </div>
+    <div class="sw-facts">
+      <div class="sw-fact">
+        <h3>The desktop wallet's Exchange page</h3>
+        <p>The <a href="/download/">Monzero wallet</a> for Linux has a built-in <strong>Exchange</strong> page for every live market. So does the Windows wallet, a 64-bit <strong>unsigned beta</strong> (no mining), so Windows may warn before it opens.</p>
+      </div>
+      <div class="sw-fact">
+        <h3>The web page: monzero.org/dex</h3>
+        <p>On the <a href="/dex/">DEX page</a> you connect <strong>MetaMask</strong> (ETH, BNB, USDT on BNB Chain) or <strong>Phantom</strong> (SOL, USDT on Solana) together with the Monzero wallet running on the same device. Both show the same six-digit code when you connect. The page is only the screen: it can ask, but only the wallet signs.</p>
+      </div>
+      <div class="sw-fact">
+        <h3>On an Android phone</h3>
+        <p>Turn on the DEX link in the Monzero wallet app, then open monzero.org/dex in MetaMask's or Phantom's built-in browser on the same phone. The wallet asks for approvals through notifications.</p>
+      </div>
+      <div class="sw-fact">
+        <h3>Your trade account</h3>
+        <p>ETH, BNB, SOL or USDT is paid into your wallet's own <strong>trade account</strong> before a trade and paid out after it. For a web-page trade the wallet sends what is left back to the MetaMask or Phantom account you connected. The page never holds a key, cannot approve a trade and cannot choose where money goes.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="tech-h">
+    <div class="sw-head">
+      <h2 id="tech-h">Technical detail</h2>
+      <p class="sw-sub">For readers who want to check the mechanism. The source is open in <a href="https://github.com/Nightglass-Protocol1/Monzero-source">Monzero-source</a>, under <code>gui/dex-contracts</code>.</p>
+    </div>
+    <div class="sw-table-wrap" tabindex="0" role="region" aria-label="Technical detail">
       <table>
-        <thead><tr><th>Run</th><th>Network</th><th>Result</th><th>Time</th></tr></thead>
+        <thead><tr><th>Part</th><th>How it works</th></tr></thead>
         <tbody>
-          <tr><td>Complete swap</td><td>Bitcoin signet</td><td>1 XMZ to buyer, 0.0019 BTC to seller</td><td class="sw-num">≈ 1 h 45 m</td></tr>
-          <tr><td>Refund after timelock</td><td>Bitcoin signet</td><td>0.0018 BTC back to buyer, XMZ back to seller</td><td class="sw-num">≈ 4 h 24 m</td></tr>
-          <tr><td>Refund after restart</td><td>Bitcoin testnet4</td><td>Reopened app cancelled and refunded</td><td class="sw-num">≈ 2 days*</td></tr>
-          <tr><td>Two separate machines</td><td>Bitcoin signet</td><td>Swap completed, exact amounts</td><td class="sw-num">≈ 2 h 01 m</td></tr>
-          <tr><td>Buyer app stopped after signing</td><td>Bitcoin signet</td><td>Reopened, resent same lock, completed</td><td class="sw-num">≈ 1 h 12 m</td></tr>
-          <tr><td>Buyer machine powered off</td><td>Bitcoin signet</td><td>Rebooted, files intact, completed</td><td class="sw-num">≈ 1 h 39 m</td></tr>
+          <tr><td>Swap contract</td><td><code>XmzSwap.sol</code>, the same code on Ethereum and BNB Chain. Stages: pending → ready → completed. No owner, admin, proxy or pause. Tokens that take a fee on transfer are refused by checking the balance change.</td></tr>
+          <tr><td>Solana program</td><td>The same stages and timing rules (lock, ready, claim, refund; two timeouts), for SOL and USDT (SPL).</td></tr>
+          <tr><td>Deadlines</td><td><code>timeout1 = lock time + 2 h</code>, <code>timeout2 = timeout1 + 2 h</code>. <em>Ready</em> only before timeout 1. <em>Claim</em> while ready, or from timeout 1 if ready was never set, and never at or after timeout 2. <em>Refund</em> before timeout 1 while not ready, or from timeout 2.</td></tr>
+          <tr><td>Secrets</td><td>Each trader has a secret number <span class="sw-mono">k</span> for the trade, derived from its trading keys and the offer, so it never opens another offer's lock. <span class="sw-mono">k·B</span> (ed25519) is its half of the shared XMZ spend key. On Ethereum and BNB Chain the contract holds the address of <span class="sw-mono">k·G</span> (secp256k1), and a cross-curve proof shows both points hide the same <span class="sw-mono">k</span>. On Solana the program checks <span class="sw-mono">k·B</span> itself, the same curve as XMZ. A claim reveals the seller's <span class="sw-mono">k</span>; a refund reveals the buyer's.</td></tr>
+          <tr><td>Shared XMZ address</td><td>Spend key = sum of both halves; view key = sum of both view shares, which the traders exchange so both wallets can watch the lock. Only incoming XMZ with no unlock time counts as a lock.</td></tr>
+          <tr><td>Safety margins</td><td>The seller locks XMZ only if the coin lock matches every agreed term and at least 1 h is left before timeout 1. The buyer refunds early on a wrong amount, or if no confirmed XMZ lock exists 30 min before timeout 1, and never marks ready that late. No claim in the last 30 min before timeout 2. No claim or refund on an unread contract stage.</td></tr>
+          <tr><td>Offers and relays</td><td>Signed offers (at most 24 h long) on the open relays, copied between relays and checked again by signature. Takes and answers travel as sealed relay mail (X25519, ChaCha20-Poly1305). Completed trades shown on the chart are checked on chain by the relays.</td></tr>
+          <tr><td>Partial fills</td><td>An offer may set a minimum (at least 1 XMZ). A take names its amount: at least the minimum, leaving nothing or at least the minimum. The coin side is rounded in the maker's favour; the rest is reposted as a new offer at the same price.</td></tr>
+          <tr><td>Limits</td><td>Owner-signed control documents per network, published at <code>monzero.org/dex/control/</code> and checked by the wallet against a pinned key. They set the per-trade limits and can pause new trades; trades already started always finish or refund.</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="sw-sub sw-evidence-note">* Testnet4 mined only empty blocks for about two days, so the cancel waited in the mempool.</p>
+  </section>
+
+  <section aria-labelledby="later-h">
+    <h2 id="later-h">Not offered yet</h2>
+    <div class="sw-facts">
+      <div class="sw-fact">
+        <h3>Bitcoin and Litecoin</h3>
+        <p>A Bitcoin and Litecoin swap with XMZ has been built and tested on test networks, but neither is listed on the DEX. In October 2026 the Bitcoin swap ran to completion on Bitcoin's signet, refunded after its timelock, and finished after the buyer's app was stopped and after its machine lost power. They follow later; no date is set.</p>
+      </div>
+      <div class="sw-fact">
+        <h3>Monero</h3>
+        <p>Trading XMZ against Monero is planned, not built into the DEX yet. No date is set.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="limits-h">
+    <h2 id="limits-h">Honest limits</h2>
+    <div class="sw-facts">
+      <div class="sw-fact">
+        <h3>Small amounts while it is new</h3>
+        <p>Every trade is capped at a small amount (about $25 per trade when the DEX opened), set in the owner-signed control documents. They are raised only by a newly signed document. Each chain's normal network fee applies too; the <a href="/dex/">DEX page</a> shows the current fees.</p>
+      </div>
+      <div class="sw-fact">
+        <h3>Not independently audited</h3>
+        <p>The swap contract, the Solana program and the wallet's swap engine are open source and tested, but no independent security audit has been done. Trade only amounts you can afford to have tied up for a few hours, or to lose. Found a problem? See the <a href="/security/">security page</a>.</p>
+      </div>
+    </div>
   </section>
 
   <div class="sw-outro">
-    <p><strong>Still to come before mainnet:</strong> a light-wallet option for sellers, independent review, and release validation.</p>
+    <p><strong>Stuck mid-trade?</strong> Read the <a href="/dex/recovery/">swap recovery guide</a>.</p>
     <p>Follow progress on the <a href="/roadmap/">Monzero roadmap</a>.</p>
   </div>
 </div></main><footer><a href="/roadmap/">Monzero roadmap</a></footer><script src="/swaps/swaps.js?v=20261025-swaps" defer></script><script src="/site-nav.js?v=20261113-noticker" defer></script></body></html>

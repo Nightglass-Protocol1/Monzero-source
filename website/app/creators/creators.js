@@ -52,8 +52,8 @@
   const quizResult = document.getElementById('quiz-result');
   const recommendations = {
     nft: ['NFT', 'You want one standalone artwork with one copy. An NFT is a one-of-one work.', 'Start an NFT draft →'],
-    edition: ['Edition', 'You want numbered copies of one artwork. An Edition has 2 to 1,000,000 copies. Decide the count before issuing.', 'Start an Edition draft →'],
-    collection: ['Collection', 'You want different artworks to belong to a named group. Start with a Collection; each member NFT references its 64-hex-character collection ID.', 'Start a Collection draft →'],
+    edition: ['Edition', 'You want numbered copies of one artwork. Studio mints a master edition allowing 2 to 1,000,000 numbered prints; the prints are minted later with another Solana tool. Decide the count before minting.', 'Start an Edition draft →'],
+    collection: ['Collection', 'You want different artworks to belong to a named group. Start with a Collection; each member NFT records the collection’s Solana mint address, and membership is verified on chain with another Solana tool.', 'Start a Collection draft →'],
     fungible: ['Token', 'You want interchangeable units. A Token has a fixed supply and 0–11 decimals. Nobody can mint more. The artwork answers do not change this choice.', 'Start a Token draft →']
   };
   function recommend() {

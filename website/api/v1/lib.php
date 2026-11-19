@@ -232,6 +232,7 @@ const V1_MONEY_SUPPLY = '10000000000000000000';
 const V1_TAIL_REWARD = 326000000000;
 const V1_SPEED_SHIFT = 19;
 const V1_UNLOCK_BLOCKS = 60;
+const V1_SUPPLY_STEP = 200;    // blocks walked per request at most (see v1Supply)
 
 function v1BlockFees(int $height): int {
     $block = v1Rpc('get_block', ['height' => $height]);
@@ -271,6 +272,11 @@ function v1Supply(): array {
         $cap = gmp_init(V1_MONEY_SUPPLY);
         $next = null;
         $atUnlock = null;
+        // Each block with transactions costs two node requests, so a long walk cannot finish in one
+        // request: progress is saved as it goes (blocks at least 200 deep only, so a reorg cannot
+        // invalidate it) and a request does at most V1_SUPPLY_STEP blocks, then asks for a retry.
+        $stop = min($tip, $checkpoint['height'] + V1_SUPPLY_STEP);
+        $save = static function (array $c) use ($path): void { @file_put_contents($path, json_encode($c), LOCK_EX); };
         for ($height = $checkpoint['height'] + 1; $height <= $tip; $height++) {
             $h = $byHeight[$height] ?? null;
             if (!is_array($h) || !is_int($h['reward'] ?? null)) throw new RuntimeException('Missing block header');
@@ -280,9 +286,14 @@ function v1Supply(): array {
             if (gmp_cmp($minted, $allowed) > 0) throw new RuntimeException("Block $height minted more than allowed");
             $generated = gmp_add($generated, $minted);
             if ($height === $tip - V1_UNLOCK_BLOCKS) $atUnlock = gmp_strval($generated);
-            if ($height === $tip - 200) $next = ['height' => $height, 'generated' => gmp_strval($generated), 'hash' => $h['hash']];
+            if ($height <= $tip - 200) $next = ['height' => $height, 'generated' => gmp_strval($generated), 'hash' => $h['hash']];
+            if ($next && $height % 100 === 0) $save($next);
+            if ($height >= $stop && $stop < $tip) {
+                if ($next) $save($next);
+                throw new RuntimeException('Supply is catching up with the chain; retry shortly');
+            }
         }
-        if ($next) @file_put_contents($path, json_encode($next), LOCK_EX);
+        if ($next) $save($next);
         return ['height' => $tip + 1, 'total_atomic' => gmp_strval($generated), 'circulating_atomic' => $atUnlock ?? gmp_strval($generated)];
     });
 }
