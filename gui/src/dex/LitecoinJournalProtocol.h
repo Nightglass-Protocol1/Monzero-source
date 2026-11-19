@@ -8,7 +8,38 @@
 namespace LitecoinJournalProtocol {
 // Public wallet journals can reach 2 MB; configuration limits remain separate.
 inline QByteArray privateRecord(const QString &path,qint64 maximum) {
-#ifndef Q_OS_LINUX
+#if defined(Q_OS_WIN)
+    // Windows has no O_NOFOLLOW/uid/mode bits. The same intent with Win32: the path is the file's
+    // own (no reparse point, symlink or junction), a single hard link, bounded size, opened denying
+    // writers, and its identity unchanged across the read. Privacy comes from the app data folder's
+    // per-user ACL, as for the backend executables (see BackendExecutable::matches).
+    if (maximum<=0 || maximum>2000000) return {};
+    const QFileInfo info(path);
+    if (!info.isAbsolute() || info.isSymLink() || info.canonicalFilePath().compare(path,Qt::CaseInsensitive)!=0) return {};
+    const auto wide=QDir::toNativeSeparators(path).toStdWString();
+    const HANDLE h=::CreateFileW(wide.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    if (h==INVALID_HANDLE_VALUE) return {};
+    struct Closer { HANDLE h; ~Closer(){ ::CloseHandle(h); } } closer{h};
+    BY_HANDLE_FILE_INFORMATION before{},after{};
+    if (!::GetFileInformationByHandle(h,&before)) return {};
+    const qint64 size=qint64((quint64(before.nFileSizeHigh)<<32)|before.nFileSizeLow);
+    if ((before.dwFileAttributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DIRECTORY)) || before.nNumberOfLinks!=1
+        || size<=0 || size>maximum) return {};
+    QByteArray bytes(int(size)+1,Qt::Uninitialized);
+    DWORD got=0;qint64 total=0;
+    while (total<bytes.size()) {
+        if (!::ReadFile(h,bytes.data()+total,DWORD(bytes.size()-total),&got,nullptr)) return {};
+        if (got==0) break;
+        total+=got;
+    }
+    if (total!=size || !::GetFileInformationByHandle(h,&after)
+        || after.nFileSizeHigh!=before.nFileSizeHigh || after.nFileSizeLow!=before.nFileSizeLow
+        || after.ftLastWriteTime.dwLowDateTime!=before.ftLastWriteTime.dwLowDateTime
+        || after.ftLastWriteTime.dwHighDateTime!=before.ftLastWriteTime.dwHighDateTime) return {};
+    bytes.truncate(int(size));
+    return bytes;
+#elif !defined(Q_OS_LINUX)
     Q_UNUSED(path)
     Q_UNUSED(maximum)
     return {};

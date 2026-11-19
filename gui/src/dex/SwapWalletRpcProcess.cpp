@@ -19,6 +19,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#elif defined(Q_OS_WIN)
+#include <io.h>
 #endif
 
 namespace {
@@ -34,6 +36,12 @@ bool syncDirectory(const QString &directory) {
 bool durableCommit(QSaveFile &file,const QString &directory) {
 #ifdef Q_OS_LINUX
     return file.flush() && ::fsync(file.handle())==0 && file.commit() && syncDirectory(directory);
+#elif defined(Q_OS_WIN)
+    // _commit flushes the file to disk (FlushFileBuffers); the rename in commit() is an NTFS
+    // metadata operation, journaled by the file system, so there is no directory to sync.
+    Q_UNUSED(directory);
+    const int fd=file.handle();
+    return file.flush() && (fd<0 || ::_commit(fd)==0) && file.commit();
 #else
     Q_UNUSED(file);Q_UNUSED(directory);return false;
 #endif
@@ -44,6 +52,13 @@ bool privateDirectory(const QString &path) {
     return directory.isAbsolute() && directory.isDir() && !directory.isSymLink()
         && directory.ownerId() == geteuid() && !(directory.permissions() &
         (QFile::ReadGroup | QFile::WriteGroup | QFile::ExeGroup | QFile::ReadOther | QFile::WriteOther | QFile::ExeOther));
+#elif defined(Q_OS_WIN)
+    // A real folder (not a symlink or junction) under the app's data folder, which Windows keeps
+    // private to the user by its ACL; there are no Unix owner/mode bits to check.
+    const QFileInfo directory(path);
+    if (!directory.isAbsolute() || !directory.isDir() || directory.isSymLink()) return false;
+    const DWORD attrs=::GetFileAttributesW(QDir::toNativeSeparators(path).toStdWString().c_str());
+    return attrs!=INVALID_FILE_ATTRIBUTES && (attrs&FILE_ATTRIBUTE_DIRECTORY) && !(attrs&FILE_ATTRIBUTE_REPARSE_POINT);
 #else
     return false;
 #endif
