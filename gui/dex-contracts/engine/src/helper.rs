@@ -208,7 +208,7 @@ async fn dispatch(r: Request) -> Result<Value, String> {
             let sol = crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes();
             // Its USDT (Solana) token account too: balances are read from the account itself, as
             // public nodes refuse the "indexed" token lookups by owner
-            let usdt = crate::sol::usdt_mint(crate::chain::Chain::SolMainnet).and_then(|m| crate::sol::token_account(&sol, &m));
+            let usdt = crate::sol::usdt_mint(Chain::SolMainnet).and_then(|m| crate::sol::token_account(&sol, &m));
             Ok(json!({"evm": key.address().to_string(), "sol": crate::sol::to_base58(&sol), "solUsdt": usdt.map(|a| crate::sol::to_base58(&a))}))
         }
         Command::Status => status(&r.trade_dir),
