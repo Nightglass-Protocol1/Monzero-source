@@ -21,6 +21,8 @@
 <h3 id="pool">Mining pool</h3>
 <p>Prefer sharing block rewards? Mine with others at <a href="https://pool.monzero.org/">pool.monzero.org</a>: the pool reported PPLNS, a 1% fee, automatic payouts from 1 XMZ and 30 confirmations when checked on 19 November 2026. Check the pool for current terms and payout status. Point XMRig at port <code>3333</code> (CPUs and laptops) or <code>5555</code> (servers and rigs), with your Monzero address as the login:</p>
 <p><code>xmrig -o pool.monzero.org:3333 -u YOUR_MONZERO_ADDRESS -p rig1 -a rx/0</code></p>
+<p>The pool also offers <strong>solo mining</strong>: you keep the whole reward of every block you find, less the same 1% fee, paid the same way. Use port 4444, or log in as <code>solo:YOUR_MONZERO_ADDRESS</code> on any port. Solo pays only when you find a block yourself, so earnings come rarely and in large amounts.</p>
+<p><code>xmrig -o pool.monzero.org:4444 -u YOUR_MONZERO_ADDRESS -p rig1 -a rx/0</code></p>
 </div>
 <ol class="steps">
 <li><span>1</span>
