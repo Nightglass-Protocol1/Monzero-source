@@ -134,10 +134,21 @@
       .then(function (r) { if (r.error) throw new Error("Solana: " + (r.error.message || "request failed")); return r.result; });
   }
   function solBalance(account) { return solRpc("getBalance", [account, { commitment: "confirmed" }]).then(function (r) { return BigInt(r.value); }); }
-  // Base units of the market's token (USDT) an account holds, over its token accounts
+  // Base units of the market's token (USDT) an account holds in its associated token account,
+  // read from that account itself: public nodes refuse the "indexed" lookups by owner
+  // (getTokenAccountsByOwner, getTokenAccountBalance). Layout: mint 32 | owner 32 | amount u64 LE.
   function tokenBalance(account) {
-    return solRpc("getTokenAccountsByOwner", [account, { mint: chain().token.mint }, { encoding: "jsonParsed", commitment: "confirmed" }]).then(function (r) {
-      return (r.value || []).reduce(function (n, a) { return n + BigInt(a.account.data.parsed.info.tokenAmount.amount || "0"); }, 0n);
+    return loadWeb3().then(function () {
+      var web3 = window.solanaWeb3, mint = new web3.PublicKey(chain().token.mint);
+      var TOKEN = new web3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), ATA = new web3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+      var ata = web3.PublicKey.findProgramAddressSync([new web3.PublicKey(account).toBuffer(), TOKEN.toBuffer(), mint.toBuffer()], ATA)[0];
+      return solRpc("getAccountInfo", [ata.toBase58(), { encoding: "base64", commitment: "confirmed" }]);
+    }).then(function (r) {
+      if (!r || !r.value) return 0n;                        // no token account yet: it holds nothing
+      var bin = atob(r.value.data[0]), n = 0n;
+      if (r.value.owner !== "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" || bin.length < 72) throw new Error("Solana: unexpected token account.");
+      for (var i = 71; i >= 64; i--) n = (n << 8n) | BigInt(bin.charCodeAt(i));
+      return n;
     });
   }
   // The Solana library the site already hosts (same origin), loaded only when SOL is traded
