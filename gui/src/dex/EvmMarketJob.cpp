@@ -137,6 +137,12 @@ void EvmMarketJob::scanFolders() {
         f.listingId=f.listing.value("listing").toObject().value("id").toString();
         f.state=QFile::exists(path+"/journal.json") ? "agreed" : (maker && !o.value("takenBy").isNull() ? "agreed" : "open");
         if (QFile::exists(path+"/cancelled") || QFile::exists(path+"/abandoned")) f.state="cancelled";
+        // A take the maker refused: it ended there, nothing was locked
+        if (f.state=="open" && !maker && QFile::exists(path+"/refused")) {
+            f.state="refused";
+            QFile why(path+"/refused");
+            if (why.open(QIODevice::ReadOnly)) f.detail=QString::fromUtf8(why.read(400)).left(200);
+        }
         f.renew=maker && QFile::exists(path+"/renew");
         // Renewed (kept open): the new offer has its own folder; this one is retired
         if (QFile::exists(path+"/renewed")) f.state="renewed";
@@ -248,6 +254,15 @@ bool EvmMarketJob::take(QByteArray &walletSeed,const QString &listingId,const QS
 }
 
 bool EvmMarketJob::cancel(QByteArray &walletSeed,const QString &folder) {
+    // A take still waiting for the maker's answer: nothing of it is locked, so we just stop
+    // waiting (no helper step runs meanwhile: the job is idle). Its folder keeps a mark.
+    for (auto &f:m_folders) if (f.path==folder && f.kind=="take" && f.state=="open") {
+        walletSeed.fill('\0');walletSeed.clear();
+        if (m_busy || QFile::exists(folder+"/journal.json")) return false;
+        QFile marker(folder+"/abandoned");
+        if (!marker.open(QIODevice::WriteOnly) || marker.write("stopped waiting for the maker\n")<0) return false;
+        marker.close();f.state="cancelled";emit changed();return true;
+    }
     bool ours=false;for (const auto &f:m_folders) ours=ours || (f.path==folder && f.kind=="offer" && f.state=="open");
     if (m_busy || !ours) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
@@ -356,6 +371,8 @@ void EvmMarketJob::finish(bool success) {
             else if (!renewed.isEmpty()) f.state="renewed";
             else if (r.value("offerWithdrawn").toBool()) f.state="withdrawn";
             else if (r.value("expired").toBool()) f.state="expired";
+            else if (r.value("refusedFinal").toBool()) f.state="refused";
+            else if (r.value("stopped").toBool()) f.state="cancelled";
             f.detail=r.value("refused").isString() ? r.value("refused").toString().left(200)
                 : r.value("offerWithdrawn").toBool() ? r.value("reason").toString().left(200) : QString();
         }

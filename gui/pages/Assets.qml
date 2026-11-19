@@ -396,7 +396,7 @@ Rectangle {
 
         MonzeroComponents.WarningBox {
             visible: !root.assetProtocolActive
-            text: qsTr("Assets are not active on this network yet (hard fork 17). You can design assets and save their metadata now; issuing, transfers and burns unlock when the upgrade activates.") + translationManager.emptyString
+            text: qsTr("Assets cannot be issued on the Monzero network, and no upgrade is planned to change that. You can design assets and save their metadata here. To mint a token or NFT, use Monzero Studio at monzero.org/app, which mints on Solana.") + translationManager.emptyString
         }
 
         MonzeroComponents.Label {
@@ -1014,7 +1014,7 @@ Rectangle {
                                 text: qsTr("Issue on chain") + translationManager.emptyString
                                 enabled: root.assetProtocolActive && root.assetTransfersAvailable && currentWallet && !currentWallet.viewOnly && !root.blocking
                                 tooltip: root.assetProtocolActive ? qsTr("Build the issuance transaction for review")
-                                                                  : qsTr("Requires hard fork 17")
+                                                                  : qsTr("Not available on the Monzero network")
                                 onClicked: root.issueOnChain()
                             }
                         }

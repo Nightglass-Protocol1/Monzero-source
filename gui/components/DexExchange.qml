@@ -54,10 +54,10 @@ ColumnLayout {
     property real now: Date.now() / 1000
     property int interval: 3600
     property var candles: ({})             // coin -> hourly candles (for the tabs and the stats)
-    property var chartData: []             // the chart's candles for this coin and interval
-    property bool chartLoading: false
     property var prints: ({})              // coin -> trades, newest first
     property var usd: ({})                 // coin -> USD price
+    property var noir: null                // NoirTrade's XMZ/USDT market (from monzero.org), for the chart
+    property var usdHistory: ({})          // coin -> [[seconds, usd], …] hourly, to value each swap at its time
     property var balances: ({})            // coin -> trade account balance (coin)
     property string localError: ""
     property string pickedId: ""
@@ -135,8 +135,8 @@ ColumnLayout {
         }
         candles = cs; prints = ps; balances = bs
         if (d.usd) usd = d.usd
-        var chartKey = "candles:" + coin + ":" + interval
-        if (d[chartKey]) { chartData = d[chartKey]; chartLoading = false }
+        if (d.usdHistory) usdHistory = d.usdHistory
+        if (d.noir) noir = d.noir
     }
     function get(url, done) {
         if (!fetchEnabled) { done(null); return }
@@ -171,17 +171,6 @@ ColumnLayout {
         relayGet("/v1/candles?interval=3600&pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
             if (!d || !d.candles) return
             var m = JSON.parse(JSON.stringify(ex.candles)); m[c] = d.candles; ex.candles = m
-            if (c === ex.coin && ex.interval === 3600) ex.chartData = d.candles
-        })
-    }
-    function loadChart() {
-        var c = coin, iv = interval
-        chartLoading = true
-        if (feed) { if (feed.data["candles:" + c + ":" + iv]) syncFeed(); feed.candles(c, iv); return }
-        relayGet("/v1/candles?interval=" + iv + "&pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
-            if (c !== ex.coin || iv !== ex.interval) return
-            ex.chartLoading = false
-            ex.chartData = d && d.candles ? d.candles : []
         })
     }
     function loadPrints(c) {
@@ -191,6 +180,10 @@ ColumnLayout {
             var m = JSON.parse(JSON.stringify(ex.prints)); m[c] = X.trades(d.prints, decimalsOf(c)); ex.prints = m
         })
     }
+    function loadNoir() {
+        if (feed) { if (typeof feed.noirTrade === "function") feed.noirTrade(); return }
+        get("https://monzero.org/markets/xmz.php", function (d) { if (d && d.trades) ex.noir = { last: Number(d.last) || 0, stale: d.stale === true, trades: d.trades } })
+    }
     function loadUsd() {
         if (feed) { feed.usdPrices(); return }
         get("https://monzero.org/markets/api.php", function (d) {
@@ -198,6 +191,7 @@ ColumnLayout {
             var m = {}
             for (var i = 0; i < d.coins.length; ++i) if (Number(d.coins[i].usd) > 0) m[d.coins[i].symbol] = Number(d.coins[i].usd)
             ex.usd = m
+            if (d.history) ex.usdHistory = d.history
         })
     }
     function loadBalance(c) {
@@ -232,15 +226,12 @@ ColumnLayout {
         if (market.configured === true && market.busy !== true) dex.refreshEvmOffers(coin + "/XMZ")
     }
     function refreshAll() {
-        for (var i = 0; i < allCoins.length; ++i) { loadCandles(allCoins[i]); loadBalance(allCoins[i]) }
-        loadPrints(coin)
-        if (interval !== 3600) loadChart()
+        // Every pair's swaps: the chart shows them all in USD
+        for (var i = 0; i < allCoins.length; ++i) { loadCandles(allCoins[i]); loadBalance(allCoins[i]); loadPrints(allCoins[i]) }
     }
     function pick(c) {
         if (c === coin) return
         coin = c; pickedId = ""; localError = ""
-        chartData = interval === 3600 ? (candles[c] || []) : []
-        if (interval !== 3600) loadChart()
         loadPrints(c); loadBalance(c)
         refreshOffers()
     }
@@ -267,10 +258,10 @@ ColumnLayout {
             if (tick % 4 === 0) ex.refreshOffers()
             if (tick % 12 === 0) ex.refreshAll()
             if (tick % 120 === 0) ex.loadUsd()
+            if (tick % 24 === 0) ex.loadNoir()
             tick++
         }
     }
-    onIntervalChanged: { if (interval === 3600) chartData = candles[coin] || []; else loadChart() }
     onKeysReadyChanged: if (keysReady) refreshAll()
 
     // ---- header: title and pairs
@@ -462,12 +453,15 @@ ColumnLayout {
             Layout.preferredHeight: grid.columns === 3 ? Math.max(460, book.implicitHeight) : 380
             Layout.alignment: Qt.AlignTop
             coin: ex.coin
-            candles: ex.chartData
+            coins: ex.allCoins
+            trades: ex.prints
+            usd: ex.usd
+            usdHistory: ex.usdHistory
             interval: ex.interval
             bestBid: ex.book.bestBid
             bestAsk: ex.book.bestAsk
-            coinUsd: ex.coinUsd
-            loading: ex.chartLoading
+            noir: ex.noir
+            loading: Object.keys(ex.prints).length === 0
             now: ex.now
             onIntervalPicked: ex.interval = seconds
         }
@@ -576,7 +570,8 @@ ColumnLayout {
                             text: (modelData.state === "open" ? (modelData.kind === "offer" ? (modelData.renew ? qsTr("open · renews itself") : qsTr("open · %1").arg(X.timeLeft(modelData.expiresAt, ex.now))) : qsTr("waiting for the maker"))
                                   : modelData.state === "agreed" ? qsTr("matched: see the trade above")
                                   : modelData.state === "expired" ? qsTr("expired") : modelData.state === "cancelled" ? qsTr("cancelled")
-                                  : modelData.state === "withdrawn" ? qsTr("withdrawn: funds no longer there") : modelData.state)
+                                  : modelData.state === "withdrawn" ? qsTr("withdrawn: funds no longer there")
+                                  : modelData.state === "refused" ? qsTr("not matched: the maker refused") : modelData.state)
                                   + (modelData.detail ? " · " + modelData.detail : "")
                         }
                         Item {
@@ -591,11 +586,12 @@ ColumnLayout {
                             }
                             Text {
                                 id: cancelText
-                                visible: modelData.kind === "offer" && modelData.state === "open"
+                                visible: modelData.state === "open"
                                 anchors.right: parent.right
-                                text: qsTr("Cancel"); font.pixelSize: 13; color: "#E5677A"
+                                text: modelData.kind === "offer" ? qsTr("Cancel") : qsTr("Stop waiting"); font.pixelSize: 13; color: "#E5677A"
                                 MouseArea { anchors.fill: parent; anchors.margins: -4; cursorShape: Qt.PointingHandCursor
-                                            onClicked: ex.localError = ex.dex.cancelEvmOffer(modelData.folder) ? "" : qsTr("The offer could not be cancelled now.") }
+                                            onClicked: ex.localError = ex.dex.cancelEvmOffer(modelData.folder) ? ""
+                                                     : modelData.kind === "offer" ? qsTr("The offer could not be cancelled now.") : qsTr("The wallet is busy: try again in a few seconds.") }
                             }
                         }
                     }

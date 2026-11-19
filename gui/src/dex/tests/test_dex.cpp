@@ -419,6 +419,52 @@ private slots:
         QCOMPARE(termsB.value("ltcAtoms").toString(),QString("300000"));
     }
     // Offer amounts typed in the app become exact atomic units (no floating point)
+    // A take of someone else's offer that the maker never answered can be given up (nothing of it
+    // is locked); one the maker refused shows as refused; a matched trade cannot be dropped this way
+    void evmMarketTakesCanStopWaitingAndShowRefusals() {
+        QTemporaryDir root;QVERIFY(root.isValid());
+        const auto trades=root.filePath("trades");QVERIFY(QDir().mkpath(trades));
+        auto put=[](const QString &path,const QByteArray &data){QFile f(path);return f.open(QIODevice::WriteOnly) && f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner) && f.write(data)==data.size();};
+        auto take=[&](const QString &name,char idByte){
+            const QJsonObject listing{{"id","0x"+QString(64,QChar(idByte))},{"pair","SOL/XMZ"},{"side","buy-xmz"},{"value","0x11875da0"},{"xmz","700200000000000"},
+                {"maker","0x5138775820628775ce6d90b7fee72c854d18cbf6"},{"expiresAt",1795102612.0},{"chainId",501000101.0}};
+            const QJsonObject file{{"listing",QJsonObject{{"listing",listing},{"signature","0x00"}}},{"evmFromBlock",1.0},{"sentAt",0.0}};
+            QVERIFY(QDir().mkpath(trades+"/"+name));QVERIFY(put(trades+"/"+name+"/take.json",QJsonDocument(file).toJson()));
+        };
+        take("take-waiting",'a');take("take-refused",'b');take("take-matched",'c');
+        QVERIFY(put(trades+"/take-refused/refused","the maker can no longer pay for this offer; it was withdrawn"));
+        QVERIFY(put(trades+"/take-matched/journal.json","{}"));
+        const auto helper=QCoreApplication::applicationFilePath();
+        QFile self(helper);QVERIFY(self.open(QIODevice::ReadOnly));
+        const auto digest=QString::fromLatin1(QCryptographicHash::hash(self.readAll(),QCryptographicHash::Sha256).toHex());
+        const QJsonObject wallet{{"url","http://127.0.0.1:1"}};
+        const QJsonObject config{{"schema","monzero-private-xmz-evm-market-v1"},{"helper",helper},{"helperDigest",digest},{"tradesDir",trades},
+            {"evmRpc","http://127.0.0.1:18899"},{"chainId",501000101.0},{"accountIndex",0.0},{"mainWallet",wallet},{"swapWallet",wallet},
+            {"relays",QJsonArray{"http://127.0.0.1:2"}}};
+        const auto path=root.filePath("market.json");QVERIFY(put(path,QJsonDocument(config).toJson(QJsonDocument::Compact)));
+        auto states=[](EvmMarketJob &job){
+            QMap<QString,QString> out;
+            for (const auto &v:job.status().value("mine").toList()) {const auto m=v.toMap();out.insert(QFileInfo(m.value("folder").toString()).fileName(),m.value("state").toString()+"|"+m.value("detail").toString());}
+            return out;
+        };
+        {
+            EvmMarketJob job;QVERIFY(job.configure(path));
+            auto s=states(job);
+            QCOMPARE(s.value("take-waiting"),QString("open|"));
+            QCOMPARE(s.value("take-refused"),QString("refused|the maker can no longer pay for this offer; it was withdrawn"));
+            QCOMPARE(s.value("take-matched").section('|',0,0),QString("agreed"));
+            QByteArray seed("secret");
+            QVERIFY(job.cancel(seed,trades+"/take-waiting"));QVERIFY(seed.isEmpty());
+            QVERIFY(QFile::exists(trades+"/take-waiting/abandoned"));
+            QCOMPARE(states(job).value("take-waiting"),QString("cancelled|"));
+            seed="secret";QVERIFY(!job.cancel(seed,trades+"/take-matched"));QVERIFY(!QFile::exists(trades+"/take-matched/abandoned"));
+            seed="secret";QVERIFY(!job.cancel(seed,trades+"/take-refused"));
+        }
+        // After a restart: still given up, still refused
+        EvmMarketJob again;QVERIFY(again.configure(path));
+        QCOMPARE(states(again).value("take-waiting"),QString("cancelled|"));
+        QCOMPARE(states(again).value("take-refused").section('|',0,0),QString("refused"));
+    }
     void evmOfferAmounts() {
         QCOMPARE(DexEngine::atomic("0.005",18),QString("5000000000000000"));
         QCOMPARE(DexEngine::atomic("11193",11),QString("1119300000000000"));

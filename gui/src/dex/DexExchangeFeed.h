@@ -8,7 +8,8 @@
 class QNetworkAccessManager;
 
 // Read-only public data for the in-app exchange (Linux): candles and completed trades from the
-// open relays, the trade account's coin balance from the chain's RPC node, and USD prices from
+// open relays, the trade account's coin balance from the chain's RPC node, and USD prices and
+// the NoirTrade XMZ/USDT market (monzero.org's own copy; the app never contacts NoirTrade) from
 // monzero.org. QML may not use the network (NetworkAccessBlockingFactory), so the page asks here.
 // It names only a coin and an interval: the hosts and the account come from the engine's own
 // market configuration (the same relays and RPC nodes its helper already uses), so the page
@@ -16,7 +17,8 @@ class QNetworkAccessManager;
 class DexExchangeFeed final : public QObject {
     Q_OBJECT
     // "candles:<coin>:<interval>" -> relay candles, "prints:<coin>" -> relay prints,
-    // "balance:<coin>" -> the trade account's balance in wei/lamports (decimal text), "usd" -> {coin: price}
+    // "balance:<coin>" -> the trade account's balance in wei/lamports (decimal text), "usd" -> {coin: price},
+    // "usdHistory" -> {coin: [[seconds, usd], …]} hourly, "noir" -> NoirTrade's XMZ/USDT market from monzero.org: {last, stale, trades: [[ms, price], …]}
     Q_PROPERTY(QVariantMap data READ data NOTIFY changed)
 public:
     struct Source {QStringList relays;QString rpc,account;bool solana=false;};
@@ -27,6 +29,7 @@ public:
     Q_INVOKABLE bool prints(const QString &coin);
     Q_INVOKABLE bool balance(const QString &coin);
     Q_INVOKABLE bool usdPrices();
+    Q_INVOKABLE bool noirTrade();
     // Accepted coins and chart intervals (the relays' own list)
     static bool knownCoin(const QString &coin);
     static bool knownInterval(int interval);

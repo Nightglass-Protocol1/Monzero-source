@@ -674,6 +674,13 @@ pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Opti
         v["agreed"] = json!(true);
         return Ok(v);
     }
+    // A take the user stopped waiting for, or one the maker refused, never starts again
+    if dir.join("abandoned").exists() {
+        return Ok(json!({"agreed": false, "stopped": true}));
+    }
+    if let Ok(why) = std::fs::read_to_string(dir.join("refused")) {
+        return Ok(json!({"agreed": false, "refusedFinal": true, "refused": why.trim()}));
+    }
     let client = RelayClient::new(relays)?;
     let (seed, key) = keys(cfg)?;
     let path = dir.join("take.json");
@@ -715,6 +722,13 @@ pub async fn take(dir: &Path, cfg: &TickConfig, relays: &[String], offered: Opti
         let Some(Letter::Answer(answer)) = Letter::open(&mailbox, &sealed) else { continue };
         if answer.listing != l.id {
             continue;
+        }
+        // The maker refused (the offer was taken by someone else, withdrawn, expired...): nothing
+        // was locked for a take, so it ends here instead of waiting until the offer's end time
+        if let crate::exchange::KeyResponse::Refused(why) = &answer.response {
+            let why: String = why.chars().filter(|c| !c.is_control()).take(200).collect();
+            durable_write(&dir.join("refused"), why.as_bytes()).map_err(|e| e.to_string())?;
+            return Ok(json!({"agreed": false, "refusedFinal": true, "refused": why}));
         }
         match taker.on_answer(&answer, at) {
             Ok(saved) => {

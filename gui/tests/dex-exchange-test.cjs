@@ -94,4 +94,48 @@ t('a whole offer written as version 2 (minimum = all) is whole in the book', () 
   const r = X.book(l, 'SOL', 9, '', now).asks[0]
   assert.equal(r.partial, false); assert.equal(X.fillOk(r, 100e11), true); assert.equal(X.fillOk(r, 50e11), false)
 })
+t('NoirTrade points', () => {
+  same(X.noirPoints({ trades: [[7200500, 0.004], [1000, 0.002], [0, 9], [5000, -1], [3601000, 'x'], [3700000, 0.003]] }),
+    [{ t: 1, p: 0.002 }, { t: 3700, p: 0.003 }, { t: 7200, p: 0.004 }])
+  same(X.noirPoints(null), [])
+})
+const H = { SOL: [[3600, 100], [7200, 110], [10800, 120]] }
+t('USD at the time of a swap', () => {
+  assert.equal(X.usdAt(H, 'USDT', 5, 0), 1); assert.equal(X.usdAt(H, 'USDT-BSC', 5, 0), 1)
+  assert.equal(X.usdAt(H, 'SOL', 100, 130), 100)        // before the history: its first price
+  assert.equal(X.usdAt(H, 'SOL', 7300, 130), 110)       // the hour it falls in
+  assert.equal(X.usdAt(H, 'SOL', 10800, 130), 120)
+  assert.equal(X.usdAt(H, 'SOL', 14400, 130), 130)      // newer than the history: the price now
+  assert.equal(X.usdAt(H, 'ETH', 5, 2000), 2000)        // no history: the price now
+  assert.equal(X.usdAt(H, 'ETH', 5, 0), null)
+})
+t('chart points', () => {
+  const by = { SOL: [{ at: 7300, price: 0.0001, xmz: 100, tx: 'b' }, { at: 3700, price: 0.0002, xmz: 5, tx: 'a' }], 'USDT': [{ at: 5000, price: 0.002, xmz: 10, tx: 'c' }] }
+  same(X.chartPoints(by, ['SOL'], 'SOL', H, {}).map(p => [p.t, p.p]), [[3700, 0.0002], [7300, 0.0001]])
+  const usd = X.chartPoints(by, ['SOL', 'USDT'], 'USD', H, { SOL: 130 })
+  same(usd.map(p => [p.t, p.coin]), [[3700, 'SOL'], [5000, 'USDT'], [7300, 'SOL']])
+  assert.ok(Math.abs(usd[0].p - 0.02) < 1e-12 && Math.abs(usd[2].p - 0.011) < 1e-12 && usd[1].p === 0.002)
+  assert.equal(X.chartPoints(by, ['SOL'], 'USD', {}, {}).length, 0)   // no SOL price: nothing to plot in USD
+})
+t('candles from swaps, no filler', () => {
+  const pts = [{ t: 10, p: 2, xmz: 1 }, { t: 20, p: 3, xmz: 2 }, { t: 30, p: 1, xmz: 1 }, { t: 7300, p: 5, xmz: 4 }]
+  same(X.candlesOf(pts, 3600), [{ t: 0, o: 2, h: 3, l: 1, c: 1, v: 4, n: 3 }, { t: 7200, o: 5, h: 5, l: 5, c: 5, v: 4, n: 1 }])
+  assert.equal(X.autoKind(pts, X.candlesOf(pts, 3600)), 'trades')
+  const many = Array.from({ length: 20 }, (_, i) => ({ t: (i % 5) * 3600, p: 1, xmz: 1 }))
+  assert.equal(X.autoKind(many, X.candlesOf(many.sort((a, b) => a.t - b.t), 3600)), 'candles')
+})
+t('axis: a tiny swap does not stretch it', () => {
+  const items = [{ lo: 1.21e-5, hi: 1.21e-5, v: 2000 }, { lo: 1.44e-4, hi: 1.44e-4, v: 50 }, { lo: 0.01, hi: 0.01, v: 1 }, { lo: 4.2e-5, hi: 4.2e-5, v: 7002 }]
+  const r = X.axisRange(items, [2.8e-5, null])
+  assert.equal(r.lo, 1.21e-5); assert.equal(r.hi, 1.44e-4); same(r.off.map(i => i.hi), [0.01])
+  assert.equal(X.axisRange([], []), null)
+  assert.equal(X.axisRange([], [3]).hi, 3)
+})
+t('NoirTrade steps', () => {
+  const pts = [{ t: 1, p: 0.002 }, { t: 3700, p: 0.003 }, { t: 3800, p: 0.004 }]
+  same(X.noirSteps(pts, 'USD', 'SOL', H, 130, 3600, 0, 3 * 3600 + 5), [{ t: 0, p: 0.002 }, { t: 3600, p: 0.004 }, { t: 10800, p: 0.004 }])
+  same(X.noirSteps(pts, 'SOL', 'SOL', H, 130, 3600, 3600, 3700).map(s => s.p), [0.004 / 100])
+  same(X.noirSteps(pts, 'USD', 'SOL', H, 130, 3600, 99999, 99999), [{ t: 97200, p: 0.004 }])   // the price standing when the chart starts
+  same(X.noirSteps([], 'USD', 'SOL', H, 130, 3600, 0, 99999), [])
+})
 console.log('dex exchange: ' + n + ' checks passed')

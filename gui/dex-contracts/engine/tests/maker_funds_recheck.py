@@ -145,6 +145,11 @@ check(os.path.isfile(os.path.join(d1, "withdrawn")), "withdrawn marker written")
 check(len(state["cancels"]) == 1 and not state["listings"], "relays were told (signed cancel) and the offer left the board")
 r = helper("take", t1, taker_seed)
 check(isinstance(r.get("refused"), str) and "withdrawn" in r["refused"], f"taker learns it was refused: {r.get('refused')}")
+check(r.get("refusedFinal") is True and os.path.isfile(os.path.join(t1, "refused")), "the refusal ends the take (refused marker written)")
+mail_before = sum(len(v) for v in state["mail"].values())
+r = helper("take", t1, taker_seed)
+check(r.get("refusedFinal") is True and "withdrawn" in r.get("refused", "") and sum(len(v) for v in state["mail"].values()) == mail_before,
+      "a refused take stays ended and sends nothing more")
 r = helper("serve", d1, maker_seed)
 check(r.get("offerWithdrawn") is True and len(state["cancels"]) == 1, "a later serve keeps it withdrawn, no second cancel")
 
@@ -166,6 +171,20 @@ r = helper("serve", d2, maker_seed)
 check(r.get("offerWithdrawn") is True and len(state["cancels"]) == 2, "a take after the withdrawal: still withdrawn, no extra cancel")
 r = helper("take", t2, taker_seed)
 check(isinstance(r.get("refused"), str) and "withdrawn" in r["refused"], f"late taker is refused too: {r.get('refused')}")
+
+# 2b. a take the user stopped waiting for (the app writes "abandoned"): never sent again
+state["unlocked"] = 10**6 * XMZ
+d2b, r = post("two-b")
+check(len(state["listings"]) == 1, "offer for the stopped take posted")
+listing2b = next(iter(state["listings"].values()))
+t2b, r = take("two-b", listing2b)
+check(r.get("ok") is not False and os.path.isfile(os.path.join(t2b, "take.json")), "a take waiting for the maker")
+open(os.path.join(t2b, "abandoned"), "w").write("stopped waiting\n")
+mail_before = sum(len(v) for v in state["mail"].values())
+r = helper("take", t2b, taker_seed)
+check(r.get("stopped") is True and r.get("agreed") is False and sum(len(v) for v in state["mail"].values()) == mail_before,
+      f"a stopped take does nothing ({json.dumps(r)[:120]})")
+state["listings"].clear()  # the next case picks the one offer it posts
 
 # 3. wallet unreachable when a take arrives
 state["unlocked"] = 10**6 * XMZ

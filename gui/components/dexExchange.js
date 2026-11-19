@@ -204,6 +204,108 @@ function chartCandles(candles, interval, now, limit) {
     return out
 }
 
+// NoirTrade's XMZ/USDT market ({trades: [[ms, price], …]}) -> [{t (seconds), p (USDT per XMZ)}], oldest first
+function noirPoints(noir) {
+    var out = []
+    var list = noir && noir.trades ? noir.trades : []
+    for (var i = 0; i < list.length; ++i) {
+        var ms = Number(list[i][0]), p = Number(list[i][1])
+        if (ms > 0 && p > 0 && isFinite(p)) out.push({ t: Math.floor(ms / 1000), p: p })
+    }
+    out.sort(function (a, b) { return a.t - b.t })
+    return out
+}
+
+// ---- The price chart (one dot per swap, or candles once there is enough trading) ----
+
+function isUsdt(coin) { return coin === "USDT" || coin === "USDT-BSC" }
+
+// The coin's USD price at `at` (unix seconds): the last hourly price at or before it from
+// `history` ({coin: [[seconds, usd], …]} oldest first; the first one for older times), the price
+// now for the newest hour; 1 for USDT; null when unknown
+function usdAt(history, coin, at, nowUsd) {
+    if (isUsdt(coin)) return 1
+    var h = history && history[coin]
+    if (!h || !h.length) return nowUsd > 0 ? nowUsd : null
+    if (at >= h[h.length - 1][0] + 3600) return nowUsd > 0 ? nowUsd : h[h.length - 1][1]
+    if (at <= h[0][0]) return h[0][1]
+    var lo = 0, hi = h.length - 1
+    while (lo < hi) { var mid = (lo + hi + 1) >> 1; if (h[mid][0] <= at) lo = mid; else hi = mid - 1 }
+    return h[lo][1]
+}
+
+// The swaps to plot, oldest first: {t, p (per XMZ, in `unit`), xmz, coin, tx}. `byCoin` is coin ->
+// trades as from trades(); `coins` the pairs to include; `unit` "USD" (each swap at its coin's
+// USD price then) or the single coin itself
+function chartPoints(byCoin, coins, unit, history, usdNow) {
+    var out = []
+    for (var i = 0; i < coins.length; ++i) {
+        var c = coins[i], list = (byCoin && byCoin[c]) || []
+        for (var j = 0; j < list.length; ++j) {
+            var tr = list[j], p = tr.price
+            if (unit === "USD") { var u = usdAt(history, c, tr.at, (usdNow || {})[c]); if (!(u > 0)) continue; p = p * u }
+            if (p > 0 && tr.xmz > 0) out.push({ t: tr.at, p: p, xmz: tr.xmz, coin: c, tx: tr.tx || "" })
+        }
+    }
+    out.sort(function (a, b) { return a.t - b.t })
+    return out
+}
+
+// Candles from swaps: only intervals that had a swap (no made-up flat candles in between)
+function candlesOf(points, interval) {
+    var out = [], cur = null
+    for (var i = 0; i < points.length; ++i) {
+        var pt = points[i], t = Math.floor(pt.t / interval) * interval
+        if (!cur || cur.t !== t) { cur = { t: t, o: pt.p, h: pt.p, l: pt.p, c: pt.p, v: 0, n: 0 }; out.push(cur) }
+        cur.h = Math.max(cur.h, pt.p); cur.l = Math.min(cur.l, pt.p); cur.c = pt.p; cur.v += pt.xmz; cur.n++
+    }
+    return out
+}
+
+// Candles say something once intervals hold several swaps: at least 20 swaps, 2 or more per candle
+function autoKind(points, candles) {
+    return points.length >= 20 && points.length >= 2 * candles.length ? "candles" : "trades"
+}
+
+// The price axis: from items ({lo, hi, v}) with real volume and the extra prices (lines on the
+// chart); an item under 0.1% of the volume shown does not stretch it and is listed in `off`
+// when it lies beyond. Null when there is nothing to show.
+var TINY_SHARE = 0.001
+function axisRange(items, extras) {
+    var total = 0, lo = Infinity, hi = 0, off = []
+    for (var i = 0; i < items.length; ++i) total += items[i].v > 0 ? items[i].v : 0
+    for (var j = 0; j < items.length; ++j)
+        if (!(total > 0) || items[j].v >= total * TINY_SHARE) { lo = Math.min(lo, items[j].lo); hi = Math.max(hi, items[j].hi) }
+    for (var k = 0; k < (extras || []).length; ++k) if (extras[k] > 0) { lo = Math.min(lo, extras[k]); hi = Math.max(hi, extras[k]) }
+    if (!(hi > 0)) return null
+    for (var m = 0; m < items.length; ++m) if (items[m].hi > hi || items[m].lo < lo) off.push(items[m])
+    return { lo: lo, hi: hi, off: off }
+}
+
+// NoirTrade as steps in `unit`: the price standing at `from` (its last trade before), then the
+// last trade of each interval ({t, p}), carried to now; in a coin, each USDT price over the coin's
+// USD price at that time
+function noirSteps(points, unit, coin, history, usdNow, interval, from, now) {
+    var out = [], byT = {}, times = []
+    for (var i = 0; i < (points || []).length; ++i) {
+        var pt = points[i]
+        if (pt.t < from) {
+            if (i + 1 === points.length || points[i + 1].t >= from) { var f = Math.floor(from / interval) * interval; times.push(f); byT[f] = pt }
+            continue
+        }
+        var b = Math.floor(pt.t / interval) * interval
+        if (!(b in byT)) times.push(b)
+        byT[b] = pt
+    }
+    for (var j = 0; j < times.length; ++j) {
+        var q = byT[times[j]], u = unit === "USD" ? 1 : usdAt(history, coin, q.t, usdNow)
+        if (u > 0) out.push({ t: times[j], p: q.p / u })
+    }
+    var end = Math.floor(now / interval) * interval
+    if (out.length && out[out.length - 1].t < end) out.push({ t: end, p: out[out.length - 1].p })
+    return out
+}
+
 // Prints (relay format: {at, value (hex wei/lamports), xmz (atoms), tx, chainId}) -> newest first
 function trades(prints, decimals) {
     var out = []
