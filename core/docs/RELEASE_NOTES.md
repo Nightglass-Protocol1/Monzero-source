@@ -1,3 +1,48 @@
+# Monzero v1.3.7 release notes (Windows)
+
+Release label: v1.3.7 (Windows wallet, unsigned beta)
+
+Monzero v1.3.7 is a fix for the **Windows** wallet's Exchange. It changes no consensus rule: the chain,
+blocks, coins, wallets, seeds and addresses are the same as in v1.0.0 to v1.3.6, and nobody has to
+upgrade to stay on the network. Linux stays at v1.3.6: nothing changed for Linux.
+
+## What is fixed
+
+- **Trading starts on Windows.** In the Windows wallets v1.3.4 to v1.3.6 the Exchange never got past
+  "Trading is still starting" (and the web page with Phantom or MetaMask said "The trading wallet is
+  still starting"): a few file-safety checks for the trading wallet had a Linux version only, so on
+  Windows they always failed and the trading wallet never started. They now have Windows versions with
+  the same protections (no shortcuts or links in place of the app's own files, no file changed while it
+  is read).
+- **All five markets on Windows**, as on Linux: ETH, BNB, SOL, USDT on Solana and USDT on BNB Chain.
+  The two USDT markets appear once trading has started.
+- Everything from v1.3.6 is included: SOL and USDT withdrawals from the trade account, and Withdraw
+  shows what happened.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+- The Windows wallet is an unsigned beta: Windows SmartScreen may warn when you start it.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Windows x64 wallet (GUI, no mining), node and tools | 64-bit Windows 10 or 11 |
+
+The DEX helper `monzero-dex-evm-helper.exe` is the v1.3.6 one (unchanged).
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.7 into a new folder and start it; it uses the same wallet files,
+node data and trading keys. If an earlier version left a half-made trading wallet folder, v1.3.7
+finishes setting it up.
+
+---
+
 # Monzero v1.3.6 release notes
 
 Release label: v1.3.6

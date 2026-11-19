@@ -4,6 +4,12 @@ Back up wallet files, mnemonic seeds and the node data directory before
 replacing any binary. Never enter a Monero seed into Monzero or a Monzero seed
 into Monero.
 
+## v1.3.7: trading starts on Windows (Windows only)
+
+No consensus change; Linux stays at v1.3.6. Close the old Windows wallet, unpack v1.3.7 into a new
+folder and start it: same wallet files, node data and trading keys. To go back, start the v1.3.6 files
+again (its Exchange could not trade on Windows).
+
 ## v1.3.6: SOL/USDT withdrawals fix (Linux)
 
 No consensus change. Close the old wallet and node, unpack v1.3.6 and start it: same wallet files,
