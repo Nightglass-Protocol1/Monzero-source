@@ -307,3 +307,68 @@ function v1Xmz(string $atomic): string {
     $fraction = rtrim(substr($padded, -11), '0');
     return substr($padded, 0, -11) . ($fraction !== '' ? '.' . $fraction : '');
 }
+
+// --- Blocks found outside the official pool (solo miners or other pools) ---
+// The pool's public API lists its newest 50 blocks. Each call remembers them, so as long as the
+// endpoint is called at least once in every 50 pool blocks the window grows to V1_SOLO_WINDOW
+// blocks; if a gap appears, the window starts again from what the pool lists now. A chain block
+// whose hash is not one of the pool's was found by someone else. Nothing is guessed: the response
+// gives the exact heights it covers.
+const V1_POOL_STATS = 'https://pool.monzero.org/api/stats';
+const V1_SOLO_WINDOW = 720;    // blocks, about a day at the 120-second target
+
+final class V1PoolUnavailable extends RuntimeException {}
+
+// The official pool's newest blocks (height => hash) and its reported hashrate.
+function v1PoolBlocks(): array {
+    $ch = curl_init(V1_POOL_STATS);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT => 3, CURLOPT_TIMEOUT => 8,
+        CURLOPT_FOLLOWLOCATION => false, CURLOPT_PROTOCOLS => CURLPROTO_HTTPS, CURLOPT_USERAGENT => 'monzero.org-api-v1',
+        CURLOPT_MAXFILESIZE => V1_MAX_RESPONSE_BYTES]);
+    $body = curl_exec($ch);
+    $ok = is_string($body) && curl_getinfo($ch, CURLINFO_RESPONSE_CODE) === 200 && strlen($body) <= V1_MAX_RESPONSE_BYTES;
+    curl_close($ch);
+    $data = $ok ? json_decode($body, true) : null;
+    $list = is_array($data) ? ($data['pool']['blocks'] ?? null) : null;
+    if (!is_array($list) || !$list) throw new V1PoolUnavailable('Pool data unavailable');
+    $blocks = [];
+    foreach ($list as $b) {
+        if (!is_array($b) || !v1Uint($b['height'] ?? null) || !v1Hash($b['hash'] ?? null)) throw new V1PoolUnavailable('Pool data malformed');
+        $blocks[$b['height']] = $b['hash'];
+    }
+    $rate = $data['pool']['hashrate'] ?? null;
+    return ['blocks' => $blocks, 'hashrate' => is_int($rate) || is_float($rate) ? max(0.0, (float)$rate) : null];
+}
+
+function v1SoloMining(): array {
+    return v1Cached('solo', 120, static function (): array {
+        $network = v1NetworkObservation()['value'];
+        $tip = $network['tip']['height'];
+        $pool = v1PoolBlocks();
+        $path = v1StateDirectory() . '/pool-blocks.json';
+        $saved = json_decode((string)@file_get_contents($path), true);
+        $known = is_array($saved['blocks'] ?? null) ? $saved['blocks'] : [];
+        $listFrom = min(array_keys($pool['blocks']));
+        // The pool's list holds every block it found from its oldest entry up; joined to what was
+        // remembered only when the two cover the heights in between
+        $from = is_int($saved['covered_from'] ?? null) && is_int($saved['covered_to'] ?? null) && $listFrom <= $saved['covered_to'] + 1
+            ? min($saved['covered_from'], $listFrom) : $listFrom;
+        $from = max($from, $tip - V1_SOLO_WINDOW + 1);
+        $blocks = [];
+        foreach ($known as $h => $hash) if ((int)$h >= $from && v1Hash($hash)) $blocks[(int)$h] = $hash;
+        foreach ($pool['blocks'] as $h => $hash) if ($h >= $from) $blocks[$h] = $hash;
+        @file_put_contents($path, json_encode(['covered_from' => $from, 'covered_to' => $tip, 'blocks' => $blocks]), LOCK_EX);
+
+        $range = v1Rpc('get_block_headers_range', ['start_height' => $from, 'end_height' => $tip]);
+        $headers = array_map('v1Header', $range['headers'] ?? []);
+        if (count($headers) !== $tip - $from + 1) throw new RuntimeException('Missing block headers');
+        $poolCount = 0; $outside = [];
+        foreach ($headers as $h) {
+            if (($blocks[$h['height']] ?? null) === $h['hash']) $poolCount++;
+            else $outside[] = ['height' => $h['height'], 'hash' => $h['hash'], 'timestamp' => $h['timestamp'], 'reward_atomic' => $h['reward_atomic']];
+        }
+        return ['from' => $from, 'to' => $tip, 'pool_blocks' => $poolCount, 'outside' => $outside,
+            'difficulty' => $network['difficulty'], 'reward_atomic' => $network['tip']['reward_atomic'],
+            'pool_hashrate' => $pool['hashrate'], 'height' => $network['height']];
+    });
+}
