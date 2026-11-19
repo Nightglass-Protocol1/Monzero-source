@@ -368,8 +368,12 @@ function v1SoloMining(): array {
         foreach ($pool['blocks'] as $h => $hash) if ($h >= $from) $blocks[$h] = $hash;
         @file_put_contents($path, json_encode(['covered_from' => $from, 'covered_to' => $tip, 'blocks' => $blocks]), LOCK_EX);
 
-        $range = v1Rpc('get_block_headers_range', ['start_height' => $from, 'end_height' => $tip]);
-        $headers = array_map('v1Header', $range['headers'] ?? []);
+        // In chunks: one 720-header answer is about 0.6 MB, slow over the website's link to the node
+        $headers = [];
+        for ($start = $from; $start <= $tip; $start += 240) {
+            $range = v1Rpc('get_block_headers_range', ['start_height' => $start, 'end_height' => min($tip, $start + 239)]);
+            foreach ($range['headers'] ?? [] as $h) $headers[] = v1Header($h);
+        }
         if (count($headers) !== $tip - $from + 1) throw new RuntimeException('Missing block headers');
         $poolCount = 0; $outside = [];
         foreach ($headers as $h) {
