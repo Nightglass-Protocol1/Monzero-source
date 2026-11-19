@@ -882,6 +882,16 @@ class Pool:
             status, ctype = "200 OK", "application/json"
             if route == "/api/stats":
                 body = json.dumps(self.stats())
+            elif route == "/api/blocks":
+                # The pool's found blocks, newest first: height, hash and status only (for
+                # monzero.org's API, which matches them against the chain). ?limit=1..1000, default 720
+                lim = args.get("limit", "720")
+                n = int(lim) if lim.isdigit() else 0
+                if 1 <= n <= 1000:
+                    rows = self.store.q("SELECT height, hash, status FROM blocks ORDER BY height DESC LIMIT ?", (n,))
+                    body = json.dumps({"blocks": [{"height": h, "hash": bh, "status": st} for h, bh, st in rows]})
+                else:
+                    status, body = "400 Bad Request", '{"error":"limit must be 1-1000"}'
             elif route == "/api/miner":
                 addr = args.get("address", "")
                 body = json.dumps(self.miner_stats(addr)) if 90 <= len(addr) <= 110 and addr.isalnum() else '{"error":"address required"}'
