@@ -29,6 +29,9 @@ bool syncDirectory(const QString &directory) {
     const int fd=::open(QFile::encodeName(directory).constData(),O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd<0) return false;
     const bool synced=::fsync(fd)==0;::close(fd);return synced;
+#elif defined(Q_OS_WIN)
+    // NTFS journals folder changes (create, rename) itself; Windows has no fsync for a folder.
+    Q_UNUSED(directory);return true;
 #else
     Q_UNUSED(directory);return false;
 #endif
@@ -37,11 +40,9 @@ bool durableCommit(QSaveFile &file,const QString &directory) {
 #ifdef Q_OS_LINUX
     return file.flush() && ::fsync(file.handle())==0 && file.commit() && syncDirectory(directory);
 #elif defined(Q_OS_WIN)
-    // _commit flushes the file to disk (FlushFileBuffers); the rename in commit() is an NTFS
-    // metadata operation, journaled by the file system, so there is no directory to sync.
-    Q_UNUSED(directory);
+    // _commit flushes the file to disk (FlushFileBuffers); the rename in commit() is journaled by NTFS
     const int fd=file.handle();
-    return file.flush() && (fd<0 || ::_commit(fd)==0) && file.commit();
+    return file.flush() && (fd<0 || ::_commit(fd)==0) && file.commit() && syncDirectory(directory);
 #else
     Q_UNUSED(file);Q_UNUSED(directory);return false;
 #endif
