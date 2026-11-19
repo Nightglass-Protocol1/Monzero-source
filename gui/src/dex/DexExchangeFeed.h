@@ -18,7 +18,7 @@ class DexExchangeFeed final : public QObject {
     Q_OBJECT
     // "candles:<coin>:<interval>" -> relay candles, "prints:<coin>" -> relay prints,
     // "balance:<coin>" -> the trade account's balance in wei/lamports (decimal text), "usd" -> {coin: price},
-    // "noir" -> NoirTrade's XMZ/USDT market from monzero.org: {last, stale, trades: [[ms, price], …]}
+    // "usdHistory" -> {coin: [[seconds, usd], …]} hourly, "noir" -> NoirTrade's XMZ/USDT market from monzero.org: {last, stale, trades: [[ms, price], …]}
     Q_PROPERTY(QVariantMap data READ data NOTIFY changed)
 public:
     struct Source {QStringList relays;QString rpc,account;bool solana=false;};

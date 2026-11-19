@@ -17,6 +17,7 @@ namespace {
 const qint64 MaxReply=2*1024*1024;
 const int TimeoutMs=15000;
 const int MaxNoirTrades=2000;
+const int MaxHistory=400;
 }
 
 DexExchangeFeed::DexExchangeFeed(SourceFor sources,QObject *parent) : QObject(parent),m_sources(std::move(sources)),m_net(new QNetworkAccessManager(this)) {}
@@ -63,6 +64,21 @@ void DexExchangeFeed::get(const QStringList &bases,const QString &path,const QSt
                 const double price=coin.value("usd").toDouble();
                 if (price>0) usd.insert(coin.value("symbol").toString(),price);
             }
+            // Hourly prices of the last days ({coin: [[seconds, usd], …]}), to value each swap at its time
+            QVariantMap history;
+            const auto h=o.value("history").toObject();
+            for (auto it=h.begin();it!=h.end();++it) {
+                if (!knownCoin(it.key())) continue;
+                QVariantList points;
+                const auto list=it.value().toArray();
+                for (int i=std::max(0,int(list.size())-MaxHistory);i<list.size();++i) {
+                    const auto p=list[i].toArray();
+                    const double at=p.at(0).toDouble(),price=p.at(1).toDouble();
+                    if (at>0 && price>0 && std::isfinite(price)) points.append(QVariant(QVariantList{at,price}));
+                }
+                history.insert(it.key(),points);
+            }
+            m_data.insert("usdHistory",history);
             store(key,usd);
         } else if (key=="noir") {
             // Only numbers: trade time (ms) and price (USDT per XMZ), the newest MaxNoirTrades

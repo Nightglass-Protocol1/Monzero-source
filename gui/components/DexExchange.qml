@@ -54,11 +54,10 @@ ColumnLayout {
     property real now: Date.now() / 1000
     property int interval: 3600
     property var candles: ({})             // coin -> hourly candles (for the tabs and the stats)
-    property var chartData: []             // the chart's candles for this coin and interval
-    property bool chartLoading: false
     property var prints: ({})              // coin -> trades, newest first
     property var usd: ({})                 // coin -> USD price
     property var noir: null                // NoirTrade's XMZ/USDT market (from monzero.org), for the chart
+    property var usdHistory: ({})          // coin -> [[seconds, usd], …] hourly, to value each swap at its time
     property var balances: ({})            // coin -> trade account balance (coin)
     property string localError: ""
     property string pickedId: ""
@@ -136,9 +135,8 @@ ColumnLayout {
         }
         candles = cs; prints = ps; balances = bs
         if (d.usd) usd = d.usd
+        if (d.usdHistory) usdHistory = d.usdHistory
         if (d.noir) noir = d.noir
-        var chartKey = "candles:" + coin + ":" + interval
-        if (d[chartKey]) { chartData = d[chartKey]; chartLoading = false }
     }
     function get(url, done) {
         if (!fetchEnabled) { done(null); return }
@@ -173,17 +171,6 @@ ColumnLayout {
         relayGet("/v1/candles?interval=3600&pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
             if (!d || !d.candles) return
             var m = JSON.parse(JSON.stringify(ex.candles)); m[c] = d.candles; ex.candles = m
-            if (c === ex.coin && ex.interval === 3600) ex.chartData = d.candles
-        })
-    }
-    function loadChart() {
-        var c = coin, iv = interval
-        chartLoading = true
-        if (feed) { if (feed.data["candles:" + c + ":" + iv]) syncFeed(); feed.candles(c, iv); return }
-        relayGet("/v1/candles?interval=" + iv + "&pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
-            if (c !== ex.coin || iv !== ex.interval) return
-            ex.chartLoading = false
-            ex.chartData = d && d.candles ? d.candles : []
         })
     }
     function loadPrints(c) {
@@ -204,6 +191,7 @@ ColumnLayout {
             var m = {}
             for (var i = 0; i < d.coins.length; ++i) if (Number(d.coins[i].usd) > 0) m[d.coins[i].symbol] = Number(d.coins[i].usd)
             ex.usd = m
+            if (d.history) ex.usdHistory = d.history
         })
     }
     function loadBalance(c) {
@@ -238,15 +226,12 @@ ColumnLayout {
         if (market.configured === true && market.busy !== true) dex.refreshEvmOffers(coin + "/XMZ")
     }
     function refreshAll() {
-        for (var i = 0; i < allCoins.length; ++i) { loadCandles(allCoins[i]); loadBalance(allCoins[i]) }
-        loadPrints(coin)
-        if (interval !== 3600) loadChart()
+        // Every pair's swaps: the chart shows them all in USD
+        for (var i = 0; i < allCoins.length; ++i) { loadCandles(allCoins[i]); loadBalance(allCoins[i]); loadPrints(allCoins[i]) }
     }
     function pick(c) {
         if (c === coin) return
         coin = c; pickedId = ""; localError = ""
-        chartData = interval === 3600 ? (candles[c] || []) : []
-        if (interval !== 3600) loadChart()
         loadPrints(c); loadBalance(c)
         refreshOffers()
     }
@@ -277,7 +262,6 @@ ColumnLayout {
             tick++
         }
     }
-    onIntervalChanged: { if (interval === 3600) chartData = candles[coin] || []; else loadChart() }
     onKeysReadyChanged: if (keysReady) refreshAll()
 
     // ---- header: title and pairs
@@ -469,13 +453,15 @@ ColumnLayout {
             Layout.preferredHeight: grid.columns === 3 ? Math.max(460, book.implicitHeight) : 380
             Layout.alignment: Qt.AlignTop
             coin: ex.coin
-            candles: ex.chartData
+            coins: ex.allCoins
+            trades: ex.prints
+            usd: ex.usd
+            usdHistory: ex.usdHistory
             interval: ex.interval
             bestBid: ex.book.bestBid
             bestAsk: ex.book.bestAsk
-            coinUsd: ex.coinUsd
             noir: ex.noir
-            loading: ex.chartLoading
+            loading: Object.keys(ex.prints).length === 0
             now: ex.now
             onIntervalPicked: ex.interval = seconds
         }
