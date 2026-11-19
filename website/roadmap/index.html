@@ -39,9 +39,9 @@
 <h1 style="margin:.2em 0">The road to public swaps</h1>
 <p class="rm-lead">A non-custodial atomic-swap exchange built into the Monzero app. You trade XMZ for another coin straight from your own wallet — the two blockchains enforce the trade, so either both sides get paid or both get refunded. No account, no deposit, no custodian.</p>
 
-<div class="rm-note"><strong>Live with small limits.</strong> XMZ trades against ETH, BNB and SOL since 12 November 2026, from the Linux wallet (its own Exchange page since v1.2.0, offers open up to a month since v1.3.0), the Windows wallet beta, the <a href="/dex/">DEX page</a> and the Android wallet. Every new trade is checked against per-trade and daily limits in a document signed by the project, which can also pause new trades. The code has not had an independent security audit: trade only amounts you can afford to lose.</div>
+<div class="rm-note"><strong>Live with small limits.</strong> XMZ trades against ETH, BNB and SOL since 12 November 2026, and against USDT (on Solana and on BNB Smart Chain) since 18 November, from the Linux wallet (its own Exchange page since v1.2.0, offers open up to a month since v1.3.0), the Windows wallet beta, the <a href="/dex/">DEX page</a> and the Android wallet. Every new trade is checked against per-trade and daily limits in a document signed by the project, which can also pause new trades. The code has not had an independent security audit: trade only amounts you can afford to lose.</div>
 
-<p><em>Status as of 18 November 2026. Milestone-based delivery; no committed dates.</em></p>
+<p><em>Status as of 19 November 2026. Milestone-based delivery; no committed dates.</em></p>
 
 <h2>Released</h2>
 <div class="table-wrap"><table class="rm">
@@ -60,7 +60,7 @@
 <p><a href="/download/">Downloads and signed release files →</a></p>
 
 <h2>Where each pair stands</h2>
-<p>The DEX is crypto-only — XMZ against Bitcoin, Litecoin, BNB, Ethereum and Solana. (Earlier Bitcoin Cash and Dogecoin work was dropped: a legacy-signature malleability issue made their pre-signed refunds unsafe.)</p>
+<p>The DEX is crypto-only — XMZ against Ethereum, BNB, Solana and USDT (on Solana and BNB Smart Chain) today; Bitcoin and Litecoin are built and tested but not listed yet. (Earlier Bitcoin Cash and Dogecoin work was dropped: a legacy-signature malleability issue made their pre-signed refunds unsafe.)</p>
 <p>Monero (XMR) is in development as a trading coin against BNB, Ethereum and Solana, with XMZ/XMR as two swaps back to back through one of them. 14 Nov 2026: full swaps, refunds and restarts passed on a local Monero test chain with the official Monero 0.18.5.4 software. 15 Nov 2026: the first run on Monero's public test network (stagenet) did not finish, because the public stagenet node stopped giving blocks to the trade wallets. No swap took place; the run showed that a refund could stall while the Monero side was unreachable, which is now fixed. The run will be repeated, then the wallet apps. Not yet available to trade.</p>
 <div class="rm-grid">
   <div class="rm-card"><h3>XMZ / BTC <span class="pill done">mainnet tested</span></h3><p>Passed every test-network gate on signet and testnet4 — swap, refund, two machines, interruption and power-loss — with light wallets on both sides (no Bitcoin node needed). The first real-funds BTC↔XMZ swap on Bitcoin mainnet completed on 4&nbsp;November. On 8&nbsp;November a signet swap was started from a signed offer posted to a relay and completed through it — Bitcoin lock, XMZ lock, redemption and payout. Not listed on the public DEX yet.</p></div>
@@ -68,6 +68,7 @@
   <div class="rm-card"><h3>XMZ / SOL <span class="pill done">live</span></h3><p>A dedicated Solana atomic-swap program (native SOL and SPL). Deployed to Solana mainnet and verified with a live real-funds swap — lock → claim, escrow closed — on 6&nbsp;November. On 12&nbsp;November a SOL/XMZ swap completed on mainnet end to end through the public wallet and the DEX page with Phantom, from an offer posted to the open relays.</p></div>
   <div class="rm-card"><h3>XMZ / LTC <span class="pill prog">mainnet validating</span></h3><p>A Litecoin light wallet on both sides. Passed the public-testnet gates; the mainnet path is now enabled and validated end-to-end in a dry run (light-wallet sync and full setup). A first real-funds swap is the next step.</p></div>
   <div class="rm-card"><h3>XMZ / ETH <span class="pill done">live</span></h3><p>Uses the same EVM contract as BNB, with Ethereum's finality wait (96 blocks) before either side acts. Passed every test-network gate on Sepolia — a full swap, both refund cases, and stop-and-resume of each side — then the first real-funds XMZ↔ETH swap on Ethereum mainnet completed on 8&nbsp;November. Low-gas L2s such as Base and Arbitrum come later.</p></div>
+  <div class="rm-card"><h3>XMZ / USDT <span class="pill done">live</span></h3><p>Tether on Solana (SPL, through the Solana swap program) and on BNB Smart Chain (BEP-20, through the EVM contract). Live since 18&nbsp;November with the same small limits; needs Linux wallet v1.3.3, Android wallet 1.1.10, Windows wallet v1.3.3 (beta) or later.</p></div>
 </div>
 
 <h2>How a pair goes live — the gates</h2>
@@ -76,7 +77,7 @@
 <tr><th>Stage</th><th>What it proves</th><th>Status</th></tr>
 <tr><td>1 · Test networks</td><td>Swap, refund, interruption, power loss, two machines — with light wallets where used</td><td><span class="pill done">BTC · LTC · BNB · SOL · ETH</span></td></tr>
 <tr><td>2 · Project real-funds test</td><td>A real swap with the project's own small funds, both sides owner-held</td><td><span class="pill done">BTC · BNB · SOL · ETH</span> &nbsp; <span class="pill prog">LTC next</span></td></tr>
-<tr><td>3 · Gated public trading</td><td>Offers through open relays, small per-trade and daily caps, a signed operator pause switch</td><td><span class="pill done">ETH · BNB · SOL since 12 Nov</span></td></tr>
+<tr><td>3 · Gated public trading</td><td>Offers through open relays, small per-trade and daily caps, a signed operator pause switch</td><td><span class="pill done">ETH · BNB · SOL since 12 Nov · USDT since 18 Nov</span></td></tr>
 <tr><td>4 · Security review</td><td>Community pentest kit, then independent review — before limits are raised</td><td><span class="pill gate">pending</span></td></tr>
 <tr><td>5 · Raised limits</td><td>Weeks of clean trading; limits raised step by step by signed document</td><td><span class="pill next">later</span></td></tr>
 </table></div>
@@ -102,7 +103,7 @@
 
 </div>
 </main>
-  <footer class="footer wrap"><a class="brand" href="../"><img class="brand-mark brand-coin" src="../assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"> MONZERO</a><p>Experimental, community-run development.<br>Roadmap snapshot: 15 November 2026 · Subject to revision.</p><a href="#main">Back to top ↑</a></footer>
+  <footer class="footer wrap"><a class="brand" href="../"><img class="brand-mark brand-coin" src="../assets/monzero-emblem-20261026-96.webp" alt="" width="32" height="32"> MONZERO</a><p>Experimental, community-run development.<br>Roadmap snapshot: 19 November 2026 · Subject to revision.</p><a href="#main">Back to top ↑</a></footer>
   <script type="module" src="/community/posts.mjs?v=20261020"></script><script src="../site-nav.js?v=20261113-noticker" defer></script>
 </body>
 </html>

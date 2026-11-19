@@ -15,11 +15,11 @@
 <div class="mine-copy">
 <p class="eyebrow">Join the network</p>
 <h2>Turn spare CPU time into network security.</h2>
-<p>Run your own daemon, create a fresh Monzero wallet, and mine directly to an address you control. Solo mining rewards the machine that finds a block; rewards unlock after 60 blocks.</p>
+<p>Run your own daemon, create a fresh Monzero wallet, and mine directly to an address you control. Solo mining rewards the machine that finds a block; rewards unlock after 60 blocks. Prefer an app? The Linux desktop wallet can mine, and Monzero Miner 1.0.0 for Android is on the <a href="/download/#android">downloads page</a> (the Windows beta wallet does not mine).</p>
 <div class="warning"><strong>Keep it separate.</strong> Never reuse a Monero seed, keys, or wallet file with Monzero.</div>
 <p><a class="button secondary" href="/mining/calculator/">Estimate mining rewards and electricity costs</a> <a class="button secondary" href="/mining/dashboard/">View your pool activity</a> <a class="button secondary" href="/mining/benchmarks/">Compare CPU benchmarks</a></p>
 <h3 id="pool">Mining pool</h3>
-<p>Prefer sharing block rewards? Mine with others at <a href="https://pool.monzero.org/">pool.monzero.org</a>: the pool reported PPLNS, a 1% fee, payouts from 1 XMZ and 60 confirmations when checked on 19 October 2026. Check the pool for current terms and payout status. Point XMRig at port <code>3333</code> (CPUs and laptops) or <code>5555</code> (servers and rigs), with your Monzero address as the login:</p>
+<p>Prefer sharing block rewards? Mine with others at <a href="https://pool.monzero.org/">pool.monzero.org</a>: the pool reported PPLNS, a 1% fee, automatic payouts from 1 XMZ and 30 confirmations when checked on 19 November 2026. Check the pool for current terms and payout status. Point XMRig at port <code>3333</code> (CPUs and laptops) or <code>5555</code> (servers and rigs), with your Monzero address as the login:</p>
 <p><code>xmrig -o pool.monzero.org:3333 -u YOUR_MONZERO_ADDRESS -p rig1 -a rx/0</code></p>
 </div>
 <ol class="steps">
@@ -46,7 +46,7 @@
 <details><summary>Can I reuse my existing seed?</summary>
 <p>No. Create a new wallet and seed exclusively for Monzero. Reusing keys across forks can seriously damage privacy.</p></details>
 <details><summary>Is this a stable release?</summary>
-<p>Yes. Monzero v1.0.0 is the first stable release. It continues the pre10–pre16 chain (no reset) and switches difficulty to LWMA at block 21,000, so anyone running their own node must upgrade before then. It has not yet been independently audited; report problems to security@monzero.org.</p></details>
+<p>Yes. Monzero v1.0.0 was the first stable release; the current desktop release is listed on the <a href="/download/">downloads page</a>. The chain continues from pre10–pre16 (no reset), and difficulty switched to LWMA at block 21,000, a network upgrade that has already passed: run a current release on your own node. Monzero has not been independently audited; report problems to security@monzero.org.</p></details>
 </div>
 </section>
 <section class="section" id="nodes">

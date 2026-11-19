@@ -194,13 +194,13 @@
   // Verified roadmap phases, not gamified or invented progress percentages.
   const phases = [
     { badge: '● RELEASED', title: ['The network is real.', 'And running.'],
-      description: 'Monzero core v1.0.0, Linux graphical and command-line packages, web and Android wallets, an explorer and mining tools have been published. Check release limitations before installing.',
+      description: 'Monzero v1.3.4 for Linux (graphical wallet, node and command-line programs), a Windows wallet beta, web and Android wallets, an Android miner, an explorer and mining tools have been published. Check release limitations before installing.',
       checks: ['Independent mainnet and RandomX PoW', 'Core software and wallet downloads', 'Explorer, mining and community tools'], url: 'https://monzero.org/download/', link: 'View release evidence' },
     { badge: '◌ IN DEVELOPMENT', title: ['Testing the edges.', 'Building the future.'],
-      description: 'Broader wallet and ecosystem work continues. The roadmap records public testnet swap evidence, mobile-wallet emulator results and DEX engineering—but not an enabled public trading service.',
-      checks: ['Mobile wallet / miner: emulator checks reported', 'DEX: individual testnet and funded mainnet trials', 'Security review and release acceptance pending'], url: 'https://monzero.org/roadmap/', link: 'Read engineering updates' },
+      description: 'The DEX is open with small limits: XMZ trades against ETH, BNB, SOL and USDT from the desktop wallets, the DEX page and the Android wallet. Wallet and ecosystem work continues.',
+      checks: ['DEX: ETH, BNB, SOL and USDT open with small limits', 'Windows wallet: unsigned beta', 'Bitcoin and Litecoin: built and tested, not yet listed'], url: 'https://monzero.org/roadmap/', link: 'Read engineering updates' },
     { badge: '○ CONDITIONAL', title: ['No shortcuts.', 'No invented dates.'],
-      description: 'Broader exchange access, public trading infrastructure and other proposed services depend on testing, security review, recovery checks and operator acceptance. There is no committed public launch date.',
+      description: 'Higher trading limits, more pairs and other proposed services depend on testing, security review, recovery checks and operator acceptance. There is no committed launch date.',
       checks: ['Complete acceptance & recovery testing', 'External security evaluation', 'Public deployment only when ready'], url: 'https://monzero.org/roadmap/', link: 'Explore planned milestones' }
   ];
   const roadTabs = $$('.roadmap-stop');
