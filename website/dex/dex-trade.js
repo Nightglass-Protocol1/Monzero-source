@@ -555,8 +555,15 @@
     if (st.busy) return;
     st.busy = "cancel";
     api("/v1/cancel", { folder: folder }).then(function (r) {
-      if (!r.ok) throw new Error(r.message || ("The wallet could not stop waiting now. Try again in a few seconds; if it still cannot, your wallet is older than this page " +
-        "and the take ends by itself when the offer expires" + (expiresAt ? " (" + new Date(expiresAt * 1000).toLocaleString() + ")" : "") + "."));
+      if (!r.ok) {
+        // Past the offer's expiry the take is already over: the wallet just has not checked yet
+        var over = expiresAt && expiresAt * 1000 <= Date.now();
+        throw new Error(r.message || (over
+          ? "That offer has expired, so the take is over: nothing of yours was locked. The wallet removes it at its next check; reload this page in a minute. Your coins in the trading account can be sent back now."
+          : "The wallet could not stop waiting now. Try again in a few seconds; if it still cannot, your wallet is older than this page " +
+            "(update to Linux v1.3.5 or Android 1.1.12) and the take ends by itself when the offer expires" + (expiresAt ? " (" + new Date(expiresAt * 1000).toLocaleString() + ")" : "") +
+            ". Nothing of yours is locked by it."));
+      }
       return untilIdle();
     }).then(function () { st.busy = ""; say("Stopped waiting for that offer."); }).catch(fail);
   }
