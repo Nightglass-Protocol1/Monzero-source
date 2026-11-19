@@ -565,6 +565,27 @@ function tgHandle(array $update): ?string {
     $command = strtolower((string)preg_replace('/@.*\z/', '', $parts[0]));
     $db = tgDb();
     $settings = tgChat($chat);
+    // Giveaway: the link t.me/bot?start=gw-CODE, then the payout address as a plain reply (or /claim ADDRESS).
+    $gwText = null;
+    if ($command === '/start' && preg_match('/\\Agw-([A-Za-z0-9]{6,32})\\z/', trim($parts[1] ?? ''), $gw)) $gwText = '';
+    elseif ($command === '/claim' || ($command !== '' && $command[0] !== '/')) $gwText = $command === '/claim' ? trim($parts[1] ?? '') : trim($message['text']);
+    if ($gwText !== null && is_array($message['from'] ?? null) && is_int($message['from']['id'] ?? null)) {
+        require_once __DIR__ . '/giveaway.php';
+        $from = $message['from'];
+        $isMember = function (int $user) use ($config): bool {
+            $verifyChat = $config['verify_chat'] ?? null;
+            if (!is_string($verifyChat) || $verifyChat === '') return false;   // fail closed
+            $m = tgApi($config, 'getChatMember', ['chat_id' => $verifyChat, 'user_id' => $user]);
+            return in_array($m['result']['status'] ?? 'left', ['member', 'administrator', 'creator', 'restricted'], true);
+        };
+        if ($gwText === '' && isset($gw)) return $config ? gwStart($gw[1], $from, $isMember, time()) : null;
+        if ($command === '/claim' || gwHasSession($from['id'], time())) {
+            if (!$config) return null;
+            [$reply, $filled] = gwClaim($gwText, $from, $isMember, time());
+            if ($filled && ($c = gwConfig())) tgFeedSend($config, "🎁 {$c['title']}: all {$c['slots']} places are claimed. Thank you everyone! Payouts of {$c['amount_xmz']} XMZ each go out shortly.");
+            return $reply;
+        }
+    }
     // Airdrop deep link (t.me/bot?start=CODE) arrives as /start CODE.
     if ($command === '/start' && preg_match('/\\A[a-f0-9]{32}\\z/', strtolower(trim($parts[1] ?? '')))) { $command = '/airdrop'; $parts[1] = strtolower(trim($parts[1])); }
     switch ($command) {
