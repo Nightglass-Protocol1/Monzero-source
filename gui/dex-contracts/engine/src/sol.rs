@@ -128,12 +128,24 @@ pub fn token_account(wallet: &Pubkey, mint: &Pubkey) -> Option<Pubkey> {
 pub async fn token_balance(url: &str, wallet: &Pubkey, mint: &Pubkey) -> Result<u64, DriverError> {
     let rpc = Rpc::new(url)?;
     let Some(ata) = token_account(wallet, mint) else { return Ok(0) };
-    match rpc.call("getTokenAccountBalance", json!([to_base58(&ata), {"commitment": "confirmed"}])).await {
-        Ok(r) => Ok(r["value"]["amount"].as_str().and_then(|a| a.parse().ok()).unwrap_or(0)),
-        // No such account yet: it holds nothing
-        Err(DriverError::Chain(e)) if e.contains("could not find account") || e.contains("Invalid param") => Ok(0),
-        Err(e) => Err(e),
+    // Read the token account itself (getAccountInfo) rather than getTokenAccountBalance: public
+    // nodes have started to refuse that one as an "indexed request" (PublicNode, 19 Nov 2026).
+    // An SPL token account is mint (32) | owner (32) | amount (u64, little-endian) | …
+    let r = rpc.call("getAccountInfo", json!([to_base58(&ata), {"commitment": "confirmed", "encoding": "base64"}])).await?;
+    let v = &r["value"];
+    if v.is_null() {
+        return Ok(0); // no such account yet: it holds nothing
     }
+    let token = from_base58(TOKEN_PROGRAM)?;
+    if v["owner"].as_str() != Some(to_base58(&token).as_str()) {
+        return Err(sol_err("the token account is not owned by the token program"));
+    }
+    let data = v["data"][0].as_str().and_then(|b| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b).ok())
+        .ok_or_else(|| sol_err("unreadable token account"))?;
+    if data.len() < 72 || data[..32] != mint[..] || data[32..64] != wallet[..] {
+        return Err(sol_err("the token account does not belong to this wallet and mint"));
+    }
+    Ok(u64::from_le_bytes(data[64..72].try_into().expect("8 bytes")))
 }
 
 /// The stand-in contract addresses of the Solana clusters that have a program
