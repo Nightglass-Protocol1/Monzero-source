@@ -145,6 +145,11 @@ tr.off td{color:var(--faint)} tr.off .dot{box-shadow:none}
     <h2>Connect</h2>
     <p>XMRig: <code id="cmd">xmrig -o pool.monzero.org:3333 -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0</code></p>
     <p class="muted">Use your own Monzero wallet address as the username. Add <code>+50000</code> to the address for a fixed difficulty. Ports: <span id="ports">–</span></p>
+    <div id="solo-box" hidden>
+      <h3>Solo mining</h3>
+      <p>Keep the whole reward of every block you find (less a <span id="solo-fee">–</span> fee), instead of sharing every block: <code id="solo-cmd">xmrig -o pool.monzero.org:4444 -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0</code></p>
+      <p class="muted">Or log in as <code>solo:YOUR_XMZ_ADDRESS</code> on any port. Paid the same way as pool mining, from 1 XMZ. Solo pays only when you find a block yourself, so earnings come rarely and in large amounts. Solo now: <span id="solo-now">–</span></p>
+    </div>
   </section>
   <section class="box" id="you">
     <h2>Your stats</h2>
@@ -273,12 +278,21 @@ async function load() {
     const s = await (await fetch("/api/stats")).json();
     $("fee").textContent = s.config.fee + "%"; $("depth").textContent = s.config.depth;
     $("paymode").innerHTML = s.config.paymentsEnabled ? '<span class="ok">payments on</span>' : '<span class="warn">payments not yet enabled</span>';
-    $("nethr").textContent = hr(s.network.hashrate || 0); $("hrsplit").textContent = split(s.network.hashrate || 0, s.pool.hashrate || 0);
+    const soloOn = !!(s.solo && s.solo.enabled), soloHr = soloOn ? (s.solo.hashrate || 0) : 0;
+    $("nethr").textContent = hr(s.network.hashrate || 0); $("hrsplit").textContent = split(s.network.hashrate || 0, (s.pool.hashrate || 0) + soloHr);
     $("miners").textContent = s.pool.miners + " / " + s.pool.workers; $("height").textContent = s.network.height ?? "–";
     $("blocks").textContent = s.pool.totalBlocks; $("last").textContent = ago(s.pool.lastBlockFound/1000);
-    $("ports").textContent = s.config.ports.map(p => p.port + " (diff " + p.difficulty + ")").join(", ");
-    $("cmd").textContent = "xmrig -o " + s.config.poolHost + ":" + s.config.ports[0].port + " -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0";
-    $("blist").innerHTML = s.pool.blocks.map(b => `<tr><td>${b.height}</td><td><code>${esc(b.hash.slice(0,16))}…</code></td><td>${ago(b.timestamp)}</td><td>${xmz(b.reward)}</td><td>${esc(b.status)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No blocks yet</td></tr>';
+    $("ports").textContent = s.config.ports.map(p => p.port + " (diff " + p.difficulty + (p.solo ? ", solo" : "") + ")").join(", ");
+    $("solo-box").hidden = !soloOn;
+    if (soloOn) {
+      $("solo-fee").textContent = s.solo.fee + "%";
+      if (s.solo.ports.length) $("solo-cmd").textContent = "xmrig -o " + s.config.poolHost + ":" + s.solo.ports[0] + " -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0";
+      else $("solo-cmd").textContent = "xmrig -o " + s.config.poolHost + ":" + s.config.ports[0].port + " -u solo:YOUR_XMZ_ADDRESS -p worker1 -a rx/0";
+      $("solo-now").textContent = s.solo.miners + " miners · " + hr(soloHr) + " · " + s.solo.totalBlocks + " blocks found";
+    }
+    const shared = s.config.ports.find(p => !p.solo) || s.config.ports[0];
+    $("cmd").textContent = "xmrig -o " + s.config.poolHost + ":" + shared.port + " -u YOUR_XMZ_ADDRESS -p worker1 -a rx/0";
+    $("blist").innerHTML = s.pool.blocks.map(b => `<tr><td>${b.height}</td><td><code>${esc(b.hash.slice(0,16))}…</code></td><td>${ago(b.timestamp)}</td><td>${xmz(b.reward)}</td><td>${esc(b.status)}${b.solo ? " · solo" : ""}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">No blocks yet</td></tr>';
     $("plist").innerHTML = s.pool.payments.map(p => `<tr><td>${ago(p.timestamp)}</td><td><code>${esc(p.txid.slice(0,16))}…</code></td><td>${p.miners}</td><td>${xmz(p.amount)}</td></tr>`).join("") || '<tr><td colspan="4" class="muted">No payments yet</td></tr>';
     updateFeed("blocks-feed"); updateFeed("pays-feed");
   } catch (e) { $("nethr").textContent = "offline"; }

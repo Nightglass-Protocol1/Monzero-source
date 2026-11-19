@@ -182,6 +182,10 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(SCHEMA)
+        # Solo mining (added Nov 2026): a solo share or block is marked; older rows are PPLNS
+        for table in ("shares", "blocks"):
+            if "solo" not in [r[1] for r in self.db.execute(f"PRAGMA table_info({table})")]:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN solo INTEGER NOT NULL DEFAULT 0")
 
     def tx(self):
         return _Tx(self.db)
@@ -198,8 +202,9 @@ class _Tx:
 
 # ---------------------------------------------------------------- pool
 class Miner:
-    def __init__(self, pool, writer, address, worker, diff, fixed):
+    def __init__(self, pool, writer, address, worker, diff, fixed, solo=False):
         self.id = secrets.token_hex(8)
+        self.solo = solo           # solo mining: keeps the whole reward of a block it finds
         self.pool, self.writer = pool, writer
         self.address, self.worker = address, worker
         self.diff, self.fixed = diff, fixed
@@ -365,15 +370,22 @@ class Pool:
                        (miner_address, code, referrer, time.time()))
 
     def credit(self, height, reward, last_share, net_diff):
-        window = max(1, int(net_diff * self.cfg["pplns_window_factor"]))
+        solo, finder = self.store.q("SELECT solo, finder FROM blocks WHERE height=?", (height,))[0]
         totals, acc = {}, 0
-        for addr, diff in self.store.q("SELECT address, diff FROM shares WHERE id<=? ORDER BY id DESC", (last_share,)):
-            take = min(diff, window - acc)
-            totals[addr] = totals.get(addr, 0) + take
-            acc += take
-            if acc >= window:
-                break
-        fee = reward * self.cfg["fee_basis_points"] // 10000
+        if solo:
+            # A solo block is its finder's alone, less the solo fee
+            totals[finder] = 1
+            fee = reward * self.cfg["solo"]["fee_basis_points"] // 10000
+        else:
+            window = max(1, int(net_diff * self.cfg["pplns_window_factor"]))
+            # PPLNS counts the shared shares only: solo shares never earn from someone else's block
+            for addr, diff in self.store.q("SELECT address, diff FROM shares WHERE id<=? AND solo=0 ORDER BY id DESC", (last_share,)):
+                take = min(diff, window - acc)
+                totals[addr] = totals.get(addr, 0) + take
+                acc += take
+                if acc >= window:
+                    break
+            fee = reward * self.cfg["fee_basis_points"] // 10000
         pay = reward - fee
         shares_sum = sum(totals.values())
         with self.store.tx() as db:
@@ -391,8 +403,8 @@ class Pool:
             db.execute("INSERT INTO pool_fee VALUES (?,?)", (height, reward - given))
             referred = self.credit_referrals(db, height, reward - given, paid)
             db.execute("UPDATE blocks SET status='confirmed', reward=?, credited_at=? WHERE height=?", (reward, time.time(), height))
-        log.info("block %d confirmed: reward %.5f XMZ to %d miners, pool keeps %.5f%s",
-                 height, reward / ATOMIC, len(totals), (reward - given) / ATOMIC,
+        log.info("block %d confirmed%s: reward %.5f XMZ to %d miners, pool keeps %.5f%s",
+                 height, " (solo)" if solo else "", reward / ATOMIC, len(totals), (reward - given) / ATOMIC,
                  "" if not referred else ", referrals %.5f" % (referred / ATOMIC))
 
     def credit_referrals(self, db, height, fee, paid):
@@ -675,6 +687,13 @@ class Pool:
     async def login(self, writer, mid, params, port_cfg):
         login = str(params.get("login", "")).strip()
         diff, fixed = port_cfg["difficulty"], False
+        # Solo mining: on a solo port, or with "solo:" before the address on any port
+        solo = bool(port_cfg.get("solo"))
+        if login[:5].lower() == "solo:":
+            login, solo = login[5:].strip(), True
+        if solo and not self.cfg["solo"]["enabled"]:
+            await self.reply(writer, mid, error="Solo mining is not enabled on this pool")
+            return None
         if "+" in login:
             login, fixed_part = login.split("+", 1)
             if fixed_part.isdigit():
@@ -694,7 +713,7 @@ class Pool:
         if len(self.miners) >= self.cfg["max_miners"]:
             await self.reply(writer, mid, error="Pool is full")
             return None
-        miner = Miner(self, writer, address, worker, diff, fixed)
+        miner = Miner(self, writer, address, worker, diff, fixed, solo)
         self.miners[miner.id] = miner
         if self.cfg["referral"]["enabled"]:
             try:
@@ -704,7 +723,7 @@ class Pool:
                 log.warning("referral attribution failed for %s…: %s", address[:12], e)
         job = await self.new_job(miner)
         await self.reply(writer, mid, result={"id": miner.id, "job": job, "extensions": ["algo", "keepalive"], "status": "OK"})
-        log.info("login %s… worker %s diff %d", address[:12], worker, diff)
+        log.info("login %s… worker %s diff %d%s", address[:12], worker, diff, " solo" if solo else "")
         return miner
 
     async def submit(self, miner, params):
@@ -729,8 +748,8 @@ class Pool:
             miner.invalid += 1
             return False, "Low difficulty share"
         with self.store.tx() as db:
-            share_id = db.execute("INSERT INTO shares(ts, address, worker, diff, height) VALUES (?,?,?,?,?)",
-                                  (time.time(), miner.address, miner.worker, job["diff"], job["height"])).lastrowid
+            share_id = db.execute("INSERT INTO shares(ts, address, worker, diff, height, solo) VALUES (?,?,?,?,?,?)",
+                                  (time.time(), miner.address, miner.worker, job["diff"], job["height"], int(miner.solo))).lastrowid
         self.retarget(miner)
         if meets(pow_hash, job["net_diff"]):
             await self.found_block(miner, job, nonce, share_id)
@@ -756,9 +775,9 @@ class Pool:
             log.warning("block at %d did not make the chain", job["height"])
             return
         with self.store.tx() as db:
-            db.execute("INSERT OR IGNORE INTO blocks(height, hash, prev_hash, nonce, ts, finder, net_diff, last_share, reward, status) VALUES (?,?,?,?,?,?,?,?,?,'pending')",
-                       (job["height"], h["hash"], job["prev"], h["nonce"], time.time(), miner.address, job["net_diff"], share_id, h["reward"]))
-        log.info("BLOCK FOUND %d %s by %s…", job["height"], h["hash"], miner.address[:12])
+            db.execute("INSERT OR IGNORE INTO blocks(height, hash, prev_hash, nonce, ts, finder, net_diff, last_share, reward, status, solo) VALUES (?,?,?,?,?,?,?,?,?,'pending',?)",
+                       (job["height"], h["hash"], job["prev"], h["nonce"], time.time(), miner.address, job["net_diff"], share_id, h["reward"], int(miner.solo)))
+        log.info("BLOCK FOUND %d %s by %s…%s", job["height"], h["hash"], miner.address[:12], " (solo)" if miner.solo else "")
         self.top = None   # force new jobs for everyone
 
     def retarget(self, miner):
@@ -777,40 +796,59 @@ class Pool:
         miner.share_times, miner.last_retarget = [now], now
 
     # --- stats
-    def hashrate(self, address=None, window=600):
+    def hashrate(self, address=None, window=600, solo=False):
+        """One miner's hashrate (PPLNS and solo together), else the pool's shared (PPLNS) side or,
+        with solo=True, its solo side."""
         since = time.time() - window
         if address:
             s = self.store.q("SELECT COALESCE(SUM(diff),0) FROM shares WHERE ts>=? AND address=?", (since, address))[0][0]
         else:
-            s = self.store.q("SELECT COALESCE(SUM(diff),0) FROM shares WHERE ts>=?", (since,))[0][0]
+            s = self.store.q("SELECT COALESCE(SUM(diff),0) FROM shares WHERE ts>=? AND solo=?", (since, int(solo)))[0][0]
         return s / window
 
     def stats(self):
         c = self.cfg
-        blocks = self.store.q("SELECT height, hash, ts, reward, status, finder FROM blocks ORDER BY height DESC LIMIT 50")
+        blocks = self.store.q("SELECT height, hash, ts, reward, status, finder, solo FROM blocks ORDER BY height DESC LIMIT 50")
         last = self.store.q("SELECT MAX(ts) FROM blocks WHERE status!='orphaned'")[0][0]
-        round_start = self.store.q("SELECT COALESCE(MAX(last_share),0) FROM blocks")[0][0]
-        round_hashes = self.store.q("SELECT COALESCE(SUM(diff),0) FROM shares WHERE id>?", (round_start,))[0][0]
+        round_start = self.store.q("SELECT COALESCE(MAX(last_share),0) FROM blocks WHERE solo=0")[0][0]
+        round_hashes = self.store.q("SELECT COALESCE(SUM(diff),0) FROM shares WHERE id>? AND solo=0", (round_start,))[0][0]
         payments = self.store.q("SELECT ts, txid, fee, (SELECT SUM(amount) FROM payment_items WHERE payment=payments.id), (SELECT COUNT(*) FROM payment_items WHERE payment=payments.id) FROM payments WHERE status='sent' ORDER BY id DESC LIMIT 50")
         return {
             "config": {"coin": "monzero", "symbol": "XMZ", "algo": "rx/0", "coinUnits": ATOMIC, "coinDecimalPlaces": 11,
                        "coinDifficultyTarget": 120, "poolHost": c["public_host"],
-                       "ports": [{"port": p["port"], "difficulty": p["difficulty"], "desc": p.get("desc", "")} for p in c["stratum_ports"]],
+                       "ports": [{"port": p["port"], "difficulty": p["difficulty"], "desc": p.get("desc", ""), "solo": bool(p.get("solo"))} for p in c["stratum_ports"]],
                        "fee": c["fee_basis_points"] / 100, "paymentScheme": "PPLNS", "pplnsWindowFactor": c["pplns_window_factor"],
                        "minPaymentThreshold": int(c["payouts"]["threshold_xmz"] * ATOMIC), "depth": c["confirmations"],
                        "paymentsEnabled": self.payouts_enabled},
             "network": {"height": self.net.get("height"), "difficulty": self.net.get("difficulty"),
                         "hashrate": (self.net.get("difficulty") or 0) / 120},
-            "pool": {"hashrate": self.hashrate(), "miners": len({m.address for m in self.miners.values()}),
-                     "workers": len(self.miners), "roundHashes": round_hashes,
+            # The shared (PPLNS) side; the solo side is under "solo"
+            "pool": {"hashrate": self.hashrate(), "miners": len({m.address for m in self.miners.values() if not m.solo}),
+                     "workers": sum(1 for m in self.miners.values() if not m.solo), "roundHashes": round_hashes,
                      "lastBlockFound": int(last * 1000) if last else 0,
                      "totalBlocks": self.store.q("SELECT COUNT(*) FROM blocks WHERE status!='orphaned'")[0][0],
                      "blocks": [{"height": h, "hash": bh, "timestamp": int(ts), "reward": r, "status": st,
-                                 "finder": f[:8] + "…" + f[-4:]} for h, bh, ts, r, st, f in blocks],
+                                 "finder": f[:8] + "…" + f[-4:], "solo": bool(so)} for h, bh, ts, r, st, f, so in blocks],
                      "payments": [{"timestamp": int(ts), "txid": tx, "fee": fee, "amount": amt, "miners": n} for ts, tx, fee, amt, n in payments]},
+            "solo": self.solo_stats(),
             "liquidity": self.liquidity_stats(),
             "uptime": int(time.time() - self.started),
         }
+
+    def solo_stats(self):
+        """Solo mining: a miner on a solo port, or logged in as solo:ADDRESS on any port, keeps the
+        whole reward of each block it finds, less the solo fee; payouts as for PPLNS."""
+        c = self.cfg
+        if not c["solo"]["enabled"]:
+            return {"enabled": False}
+        found = self.store.q("SELECT COUNT(*), MAX(ts) FROM blocks WHERE solo=1 AND status!='orphaned'")[0]
+        return {"enabled": True, "fee": c["solo"]["fee_basis_points"] / 100, "paymentScheme": "SOLO",
+                "ports": [p["port"] for p in c["stratum_ports"] if p.get("solo")],
+                "login": "solo:YOUR_ADDRESS on any port, or YOUR_ADDRESS on a solo port",
+                "minPaymentThreshold": int(c["payouts"]["threshold_xmz"] * ATOMIC),
+                "hashrate": self.hashrate(solo=True), "miners": len({m.address for m in self.miners.values() if m.solo}),
+                "workers": sum(1 for m in self.miners.values() if m.solo), "totalBlocks": found[0],
+                "lastBlockFound": int(found[1] * 1000) if found[1] else 0}
 
     def liquidity_stats(self):
         lq = self.cfg["liquidity"]
@@ -888,8 +926,8 @@ class Pool:
                 lim = args.get("limit", "720")
                 n = int(lim) if lim.isdigit() else 0
                 if 1 <= n <= 1000:
-                    rows = self.store.q("SELECT height, hash, status FROM blocks ORDER BY height DESC LIMIT ?", (n,))
-                    body = json.dumps({"blocks": [{"height": h, "hash": bh, "status": st} for h, bh, st in rows]})
+                    rows = self.store.q("SELECT height, hash, status, solo FROM blocks ORDER BY height DESC LIMIT ?", (n,))
+                    body = json.dumps({"blocks": [{"height": h, "hash": bh, "status": st, "solo": bool(so)} for h, bh, st, so in rows]})
                 else:
                     status, body = "400 Bad Request", '{"error":"limit must be 1-1000"}'
             elif route == "/api/miner":
@@ -912,7 +950,7 @@ class Pool:
         servers = []
         for p in self.cfg["stratum_ports"]:
             servers.append(await asyncio.start_server(lambda r, w, p=p: self.handle(r, w, p), self.cfg["bind"], p["port"]))
-            log.info("stratum on %s:%d (difficulty %d)", self.cfg["bind"], p["port"], p["difficulty"])
+            log.info("stratum on %s:%d (difficulty %d%s)", self.cfg["bind"], p["port"], p["difficulty"], ", solo" if p.get("solo") else "")
         servers.append(await asyncio.start_server(self.http, self.cfg["api_bind"], self.cfg["api_port"]))
         log.info("stats API on %s:%d; payouts %s", self.cfg["api_bind"], self.cfg["api_port"], "ENABLED" if self.payouts_enabled else "disabled")
         await asyncio.gather(self.watch_chain(), self.unlocker(), self.payer(), self.janitor())
@@ -934,6 +972,9 @@ DEFAULTS = {
     # kept back for operating costs + payout tx fees before any referral is paid. allow_self lets an
     # address refer itself (off by default). Referrals are only paid when enabled AND payouts run.
     "referral": {"enabled": False, "basis_points": 15, "reserve_basis_points": 2000, "allow_self": False},
+    # Solo mining: a port with "solo": true in stratum_ports, or the login prefix solo:ADDRESS.
+    # fee_basis_points is the pool's share of a solo block (100 = 1%, the same as PPLNS).
+    "solo": {"enabled": True, "fee_basis_points": 100},
 }
 
 def load_config(path):
@@ -942,10 +983,14 @@ def load_config(path):
     payouts = {**cfg["payouts"], **user.pop("payouts", {})}
     liquidity = {**cfg["liquidity"], **user.pop("liquidity", {})}
     referral = {**cfg["referral"], **user.pop("referral", {})}
+    solo = {**cfg["solo"], **user.pop("solo", {})}
     cfg.update(user)
     cfg["payouts"] = payouts
     cfg["liquidity"] = liquidity
     cfg["referral"] = referral
+    cfg["solo"] = solo
+    if not 0 <= int(solo["fee_basis_points"]) <= 10000:
+        sys.exit("config: solo.fee_basis_points must be 0..10000 (100 = 1% of a solo block)")
     if not 0 <= int(liquidity["share_basis_points"]) <= 10000:
         sys.exit("config: liquidity.share_basis_points must be 0..10000 (100 = 1% of the pool fee)")
     if not 0 <= int(referral["basis_points"]) <= 100:
