@@ -1,3 +1,46 @@
+# Monzero v1.3.6 release notes
+
+Release label: v1.3.6
+
+Monzero v1.3.6 is an urgent wallet fix for the exchange. It changes no consensus rule: the chain, blocks,
+coins, wallets, seeds and addresses are the same as in v1.0.0 to v1.3.5, and **nobody has to upgrade to
+stay on the network** — but anyone who trades SOL or USDT on Solana should.
+
+## What is fixed
+
+- **Withdrawing SOL or USDT from the trade account works again.** On 19 November 2026 the public Solana
+  node the wallet uses began refusing one kind of request (token balances looked up "by index") unless
+  the caller pays for a key. A SOL withdrawal also sends any USDT in the same account, so it asked for
+  that balance first and failed, and the Exchange page's USDT balance stopped loading. The wallet now
+  reads token balances straight from the token account, which every node answers. Trades were not
+  affected.
+- **Withdraw tells you what happened.** The result now appears under the Withdraw box: sending, sent
+  (with the transaction id), or the reason it was not sent. Before, a refused withdrawal showed nothing.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
+| Complete source | Exact repository commit and recursive pinned submodules |
+
+The DEX helper programs are the v1.1.0 ones except `monzero-dex-evm-helper`, rebuilt from
+`gui/dex-contracts/engine` in the complete source.
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.6 and start it; it uses the same wallet files, node data, trading
+keys and trading wallet. A trade running in v1.3.5 carries on in v1.3.6.
+
+---
+
 # Monzero v1.3.5 release notes
 
 Release label: v1.3.5
