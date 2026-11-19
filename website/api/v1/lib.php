@@ -315,13 +315,13 @@ function v1Xmz(string $atomic): string {
 // whose hash is not one of the pool's was found by someone else. Nothing is guessed: the response
 // gives the exact heights it covers.
 const V1_POOL_STATS = 'https://pool.monzero.org/api/stats';
+const V1_POOL_BLOCKS = 'https://pool.monzero.org/api/blocks?limit=1000';   // newer pools: a whole day at once
 const V1_SOLO_WINDOW = 720;    // blocks, about a day at the 120-second target
 
 final class V1PoolUnavailable extends RuntimeException {}
 
-// The official pool's newest blocks (height => hash) and its reported hashrate.
-function v1PoolBlocks(): array {
-    $ch = curl_init(V1_POOL_STATS);
+function v1PoolGet(string $url): ?array {
+    $ch = curl_init($url);
     curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT => 3, CURLOPT_TIMEOUT => 8,
         CURLOPT_FOLLOWLOCATION => false, CURLOPT_PROTOCOLS => CURLPROTO_HTTPS, CURLOPT_USERAGENT => 'monzero.org-api-v1',
         CURLOPT_MAXFILESIZE => V1_MAX_RESPONSE_BYTES]);
@@ -329,8 +329,17 @@ function v1PoolBlocks(): array {
     $ok = is_string($body) && curl_getinfo($ch, CURLINFO_RESPONSE_CODE) === 200 && strlen($body) <= V1_MAX_RESPONSE_BYTES;
     curl_close($ch);
     $data = $ok ? json_decode($body, true) : null;
-    $list = is_array($data) ? ($data['pool']['blocks'] ?? null) : null;
+    return is_array($data) ? $data : null;
+}
+
+// The official pool's found blocks (height => hash) and its reported hashrate. /api/blocks lists
+// up to a day's worth; a pool without it still lists its newest 50 in /api/stats.
+function v1PoolBlocks(): array {
+    $stats = v1PoolGet(V1_POOL_STATS);
+    $long = v1PoolGet(V1_POOL_BLOCKS);
+    $list = is_array($long['blocks'] ?? null) && $long['blocks'] ? $long['blocks'] : ($stats['pool']['blocks'] ?? null);
     if (!is_array($list) || !$list) throw new V1PoolUnavailable('Pool data unavailable');
+    $data = $stats ?? [];
     $blocks = [];
     foreach ($list as $b) {
         if (!is_array($b) || !v1Uint($b['height'] ?? null) || !v1Hash($b['hash'] ?? null)) throw new V1PoolUnavailable('Pool data malformed');
