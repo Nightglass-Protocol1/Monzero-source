@@ -12,7 +12,11 @@ if (isset($_GET['hashrate'])) {
 }
 try { $o = v1SoloMining(); }
 catch (V1PoolUnavailable $e) { v1Error('pool_unavailable', 'The official pool\'s block list is temporarily unavailable. Please retry.', 503, 30); }
-catch (Throwable $e) { v1Unavailable(); }
+catch (Throwable $e) {
+    // Why, in a header (short, letters and digits only), so a failure on the server can be told apart
+    header('X-Monzero-Reason: ' . substr(preg_replace('/[^A-Za-z0-9 .,:_-]/', '', get_class($e) . ': ' . $e->getMessage()), 0, 160));
+    v1Unavailable();
+}
 $s = $o['value'];
 $total = $s['to'] - $s['from'] + 1;
 $outside = count($s['outside']);
