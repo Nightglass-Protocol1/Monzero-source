@@ -56,6 +56,7 @@ ColumnLayout {
     property var candles: ({})             // coin -> hourly candles (for the tabs and the stats)
     property var prints: ({})              // coin -> trades, newest first
     property var usd: ({})                 // coin -> USD price
+    property string withdrawError: ""      // the Withdraw button's own refusal (before the helper runs)
     property var noir: null                // NoirTrade's XMZ/USDT market (from monzero.org), for the chart
     property var usdHistory: ({})          // coin -> [[seconds, usd], …] hourly, to value each swap at its time
     property var balances: ({})            // coin -> trade account balance (coin)
@@ -718,9 +719,24 @@ ColumnLayout {
                             onClicked: {
                                 var a = withdrawAddress.text.trim()
                                 ex.setWithdrawTo(ex.coin, a)
-                                ex.localError = ex.dex.returnEvmFunds(ex.chainId, a) ? "" : (ex.market.message || qsTr("The withdrawal could not start."))
+                                ex.withdrawError = ex.dex.returnEvmFunds(ex.chainId, a) ? "" : (ex.market.message || qsTr("The withdrawal could not start. If the wallet is busy, try again in a few seconds."))
                             }
                         }
+                    }
+                    // What the last withdrawal did: the helper's answer, or why it was refused
+                    Text {
+                        objectName: "withdrawResult"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12
+                        readonly property var w: ex.market.withdrawal || ({})
+                        readonly property bool mine: ex.market.command === "withdraw"
+                        visible: ex.coinAccount !== "" && (mine || ex.withdrawError !== "")
+                        color: ex.withdrawError !== "" || (mine && (ex.market.state === "refused" || ex.market.state === "failed" || (ex.market.state === "ok" && !w.tx)))
+                               ? "#E5677A" : M.Style.defaultFontColor
+                        text: ex.withdrawError !== "" ? ex.withdrawError
+                              : ex.market.busy === true ? qsTr("Sending…")
+                              : ex.market.state === "refused" || ex.market.state === "failed" ? qsTr("Not sent: %1").arg(ex.market.error || qsTr("no answer"))
+                              : w.tx ? qsTr("Sent to %1. Transaction: %2").arg(w.to || "").arg(w.tx)
+                              : qsTr("Not sent: %1").arg(w.reason || qsTr("nothing to send"))
                     }
                     Text {
                         Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor

@@ -209,6 +209,7 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
             source.rpc=config.value("evmRpc").toString();
             source.solana=DexChains::solana(qint64(config.value("chainId").toDouble()));
             source.account=source.solana ? job->solAccount() : m_evmAccount;
+            if (coin=="USDT") source.tokenAccount=job->solUsdtAccount();
         } else {
             source.relays=defaultRelays();
         }

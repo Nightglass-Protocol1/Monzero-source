@@ -333,6 +333,8 @@ void EvmMarketJob::finish(bool success) {
         // This wallet's trade accounts for these keys (the Solana one is where SOL is paid in)
         const auto sol=r.value("sol").toString();
         if (DexChains::solanaAddress(sol)) m_solAccount=sol;
+        const auto usdt=r.value("solUsdt").toString();
+        if (DexChains::solanaAddress(usdt)) m_solUsdtAccount=usdt;
     } else if (m_command=="listings") {
         m_signed.clear();m_listings.clear();
         const int places=DexChains::decimals(qint64(m_config.value("chainId").toDouble()));
