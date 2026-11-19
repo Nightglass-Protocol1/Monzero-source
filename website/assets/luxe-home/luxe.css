@@ -198,8 +198,8 @@ body{background:#02080c;letter-spacing:-.007em}
 .footer-directory img{display:block;width:100%;height:auto;border-radius:8px}
 /* Independent listings: Chainquiry and MiningBoard badges side by side, wrapping on phones */
 .footer-listings{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:18px}
-.footer-listings .footer-directory{margin-top:0}
-.footer-directory-mb img{width:auto;height:56px;border-radius:6px}
+.footer-listings .footer-directory{margin-top:0;max-width:none}
+.footer-listings .footer-directory img{width:auto;height:64px;max-width:100%;object-fit:contain}
 /* Airdrop nav highlight */
 .nav-airdrop { color: var(--accent, var(--cyan)) !important; font-weight: 650; }
 .nav-airdrop::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 6px; border-radius: 50%; background: var(--accent, var(--cyan)); box-shadow: 0 0 8px var(--accent, var(--cyan)); vertical-align: middle; }
