@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="How to recover your funds from a Monzero atomic swap — resume, force a refund, or recover manually even without the Monzero app.">
+<meta name="description" content="How to recover your funds from a Monzero DEX swap (XMZ against ETH, BNB, SOL and USDT): reopen the wallet, withdraw from your trade account, cancel stuck orders, timeouts and refunds.">
 <title>Recover your swap · Monzero</title>
 <link rel="canonical" href="https://monzero.org/dex/recovery/">
-<meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/dex/recovery/"><meta property="og:title" content="Recover your swap · Monzero"><meta property="og:description" content="Non-custodial means recovery is in your hands. Resume, refund, or recover a Monzero atomic swap — even with no Monzero app."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta name="twitter:card" content="summary_large_image">
+<meta property="og:type" content="website"><meta property="og:site_name" content="Monzero"><meta property="og:url" content="https://monzero.org/dex/recovery/"><meta property="og:title" content="Recover your swap · Monzero"><meta property="og:description" content="Non-custodial means recovery is in your hands. Resume, withdraw, or refund a Monzero swap against ETH, BNB, SOL or USDT."><meta property="og:image" content="https://monzero.org/assets/monzero-share-20261026-1200x630.jpg"><meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/assets/monzero-emblem-20261026-96.webp" type="image/webp">
 <link rel="stylesheet" href="/styles.css?v=20261026-brand">
 <link rel="stylesheet" href="/theme.css?v=20261026-brand">
@@ -24,89 +24,105 @@
   <div class="rec-intro">
     <span class="rec-eyebrow">Monzero DEX · self-custody</span>
     <h1>Recover your swap from <span class="z">zero</span>.</h1>
-    <p class="rec-lede">A Monzero atomic swap is non-custodial: no one — not Monzero, not the trader on the other side — can move your coins. That also means recovery is in your hands. This guide shows how to get your funds back if a swap stalls, your app crashes, or your device is lost, from the easiest case to the most technical.</p>
+    <p class="rec-lede">A Monzero atomic swap is non-custodial: no one — not Monzero, not the trader on the other side — can move your coins. That also means recovery is in your hands. This guide covers every market on the DEX today — XMZ against <strong>ETH</strong>, <strong>BNB</strong>, <strong>SOL</strong> and <strong>USDT</strong> (on Solana and on BNB Chain) — from the everyday fixes to the rare worst case.</p>
   </div>
 
   <div class="rec-card rec-note">
     <span class="tag">Read first</span>
-    <p>A swap is short-lived — it completes or refunds within its timelock window (hours; see section 6). The entire risk is losing your swap data <strong>while a trade is in flight</strong>. Back it up (section 1) and nothing else here is ever needed.</p>
+    <p>A swap is short-lived: once coins are locked it completes or refunds within about <strong>four hours</strong> (section 6). The wallet does every protective step by itself — claims, refunds and sweeps never wait for a click. Your only job is to <strong>keep the wallet able to come back</strong>: back up its trading data and password (section 1), and reopen it if it closes mid-trade.</p>
   </div>
 
   <nav class="rec-toc" aria-label="Contents">
     <strong>On this page</strong>
     <ol>
-      <li><a href="#backup">Back up your swap data</a></li>
-      <li><a href="#resume">The quick fix: resume</a></li>
+      <li><a href="#backup">Back up your trading data</a></li>
+      <li><a href="#resume">The quick fix: reopen the wallet</a></li>
+      <li><a href="#account">Coin left in your trade account</a></li>
+      <li><a href="#stuck">An order or take that won't go away</a></li>
       <li><a href="#move">Lost the device, kept the data</a></li>
-      <li><a href="#refund">Force a refund (expert)</a></li>
+      <li><a href="#timelocks">Timeout reference</a></li>
       <li><a href="#manual">No Monzero app at all (advanced)</a></li>
-      <li><a href="#timelocks">Timelock reference</a></li>
       <li><a href="#rules">What can and can't happen to your funds</a></li>
     </ol>
   </nav>
 
-  <h2 id="backup"><span class="num">1</span>Back up your swap data</h2>
-  <p>Everything needed to recover a swap — your keys, the <strong>pre-signed refund transactions</strong>, and your XMZ key share — lives in one folder on your device: the swap data directory. Copy it somewhere safe (an encrypted USB stick, for example) whenever you have a trade running.</p>
+  <h2 id="backup"><span class="num">1</span>Back up your trading data</h2>
+  <p>Trading uses a separate set of <strong>trading keys</strong>, made when you first chose a trading password. They control your <strong>trade account</strong> (where ETH, BNB, SOL or USDT is paid in and paid out) and the small in-app XMZ trading wallet. Each trade's own keys are derived from them, and each trade keeps a journal of where it is.</p>
   <table class="rec-table">
-    <tr><th>System</th><th>Default location</th></tr>
-    <tr><td>Linux</td><td><code>~/.local/share/xmr-btc-swap/</code></td></tr>
-    <tr><td>macOS</td><td><code>~/Library/Application Support/xmr-btc-swap/</code></td></tr>
+    <tr><th>Wallet</th><th>What to keep safe</th></tr>
+    <tr><td>Linux desktop</td><td>The folder <code>~/.local/share/monzero-project/monzero-core/dex/</code> and your trading password</td></tr>
+    <tr><td>Windows desktop (beta)</td><td>The folder <code>%APPDATA%\monzero-project\monzero-core\dex\</code> and your trading password</td></tr>
+    <tr><td>Android</td><td>The twelve <strong>trading recovery words</strong> the app showed when it made your trading keys, and your trading password. Keep the phone's wallet app installed while a trade runs: its trade journals live inside the app.</td></tr>
   </table>
-  <p>The exact folder name depends on your build — the Monzero app shows its data directory in <strong>Settings</strong>, and the swap CLI prints it on start-up (or you set it with <code>--data-base-dir</code>). Inside are the swap database (SQLite) and the Bitcoin and XMZ wallet files. Treat this folder like a seed backup: it can spend your in-flight swap, so keep it private and encrypted.</p>
+  <p>On the desktop the trading keys are stored encrypted inside that folder — <strong>nobody can restore the password</strong>, and there is no separate word list, so the folder plus the password <em>is</em> the backup. Inside it, <code>trading-keys/</code> holds the keys, <code>evm-trades/</code> one folder per offer or trade (each running trade has a <code>journal.json</code>), and <code>xmz-wallet/</code> the trading XMZ wallet. Copy the whole <code>dex</code> folder (with the wallet closed) to somewhere private (an encrypted USB stick, for example), and do it again while a trade is running. Treat it like a seed backup.</p>
 
-  <h2 id="resume"><span class="num">2</span>The quick fix: resume</h2>
-  <p>If the app closed, crashed, or lost power mid-swap, you almost never need anything fancy — just reopen it. Monzero <strong>resumes unfinished swaps automatically</strong>, watches both chains, and takes the correct timelock path (including an automatic refund) without you doing anything.</p>
-  <p>On the command line that is:</p>
-  <pre><code>swap history               # find your swap id
-swap resume --swap-id &lt;id&gt;</code></pre>
-  <p>Leave it running until the swap reaches a final state — <em>completed</em>, <em>refunded</em>, or <em>cancelled</em>. As long as you resume before the refund window closes (section 6), your Bitcoin is safe.</p>
-
-  <h2 id="move"><span class="num">3</span>Lost the device, kept the data</h2>
-  <p>The data directory is portable. If your computer died but you kept the backup from section 1:</p>
-  <ol>
-    <li>Install the Monzero app (or the open-source swap CLI) on any machine.</li>
-    <li>Restore your backed-up folder to the data-directory path for that system (section 1), or point to it with <code>--data-base-dir /path/to/backup</code>.</li>
-    <li>Run <code>swap resume</code> (or simply open the app). It picks up exactly where the swap left off.</li>
-  </ol>
-  <p>Nothing secret ever left your device, so a fresh install plus your folder is a complete recovery.</p>
-
-  <h2 id="refund"><span class="num">4</span>Force a refund (expert)</h2>
-  <p>If the other side vanished and you would rather actively reclaim your Bitcoin than wait for the automatic path, the CLI exposes the two refund-path transactions directly:</p>
-  <pre><code>swap cancel --swap-id &lt;id&gt;    # publish the cancel tx (after the cancel timelock)
-swap refund --swap-id &lt;id&gt;    # reclaim your BTC (after cancel confirms)</code></pre>
-  <p>These simply broadcast transactions that were <strong>already signed before your coins were ever locked</strong>, so they cannot be blocked or redirected. Order and timing matter — see the timelock reference below. (They are marked "expert users only" because running them out of order just wastes fees; they cannot lose funds.)</p>
-
-  <h2 id="manual"><span class="num">5</span>No Monzero app at all (advanced)</h2>
-  <p>Even with no Monzero software, your funds are recoverable, because the protocol and transaction formats are fully open source — the engine is a port of <a href="https://github.com/eigenwallet/core" rel="noopener">eigenwallet/core</a> (the maintained successor to COMIT's <code>xmr-btc-swap</code>). The recovery data is standard:</p>
+  <h2 id="resume"><span class="num">2</span>The quick fix: reopen the wallet</h2>
+  <p>If the wallet closed, crashed, or lost power mid-swap, just open it again and unlock trading with your password. It <strong>resumes every unfinished trade from its journal</strong>, reads both chains, and takes the right path by itself: claim, refund, or sweep the XMZ.</p>
   <ul>
-    <li><strong>Bitcoin side:</strong> your pre-signed cancel and refund transactions are stored in the swap database. Once a refund transaction's timelock matures, <em>any</em> Bitcoin node or block-explorer broadcast tool will relay it — no special software required.</li>
-    <li><strong>XMZ side:</strong> the XMZ sits in a 2-of-2 shared key; your key share is in the same swap data and can be imported to reconstruct the wallet.</li>
+    <li><strong>Desktop:</strong> open the wallet, then <strong>Exchange</strong>, and enter your trading password. Running trades show under <em>My orders</em>.</li>
+    <li><strong>Android:</strong> open the wallet app; it asks for the trading password in a notification, then carries on. While a trade runs the app keeps itself awake — let it.</li>
+    <li><strong>Web page:</strong> monzero.org/dex only talks to the wallet on your device. Closing the browser changes nothing; the wallet runs the trade. Reload the page and connect again to watch it.</li>
+  </ul>
+  <p>Leave the wallet running until the trade says <em>swapped</em> or <em>refunded</em>. If you are the XMZ seller, it must be online at some point before the claim deadline (section 6) to collect your coin — and even if it misses that, your XMZ comes back (section 8).</p>
+
+  <h2 id="account"><span class="num">3</span>Coin left in your trade account</h2>
+  <p>ETH, BNB, SOL and USDT go through your wallet's own <strong>trade account</strong> — paid in before a trade, paid out after it. When a trade started from the web page finishes, the wallet sends the account's coin back to the MetaMask or Phantom account you connected, by itself. Coin can still be left there — an offer you cancelled, one nobody took, a take the maker refused, or proceeds from a trade made in the desktop Exchange. To move it:</p>
+  <ul>
+    <li><strong>Desktop wallet:</strong> Exchange → pick the coin → <em>Withdraw to your own … wallet</em>, paste any address of yours on that chain, and press <strong>Withdraw</strong>.</li>
+    <li><strong>Web page:</strong> connect, then <strong>Send it back to MetaMask</strong> / <strong>Phantom</strong>. It only ever pays the account you connected.</li>
+  </ul>
+  <div class="rec-card rec-warn">
+    <span class="tag">If Withdraw refuses</span>
+    <p>The wallet will not empty a trade account that something still needs. It says why: <em>"an offer of yours is still open: cancel it first"</em> or <em>"a trade is still running"</em>. Cancel your open offers on that coin (section 4), or let the running trade finish or refund, then withdraw again. SOL and USDT on Solana share one trade account, so an open offer on either market holds both.</p>
+  </div>
+
+  <h2 id="stuck"><span class="num">4</span>An order or take that won't go away</h2>
+  <p>Nothing is locked on any chain until you <strong>approve a trade</strong> in the wallet. Before that, an offer or a take is only a message, and can always be dropped:</p>
+  <ul>
+    <li><strong>Your open offer:</strong> press <strong>Cancel</strong> next to it (desktop: Exchange → My orders; web page: <em>Your open offers</em>). It leaves the order book and stops holding your trade account. If you do nothing, it ends by itself when its time runs out.</li>
+    <li><strong>A take waiting for the maker:</strong> if the other trader never answers — for example, they withdrew the offer — press <strong>Stop waiting</strong> on the web page (<em>Waiting for the maker</em>). Otherwise it ends by itself when the offer expires. Nothing of yours was locked.</li>
+    <li><strong>A trade you approved:</strong> this one can't be cancelled — it runs to <em>swapped</em> or <em>refunded</em> on its own (section 6). Keep the wallet open or reopen it.</li>
+  </ul>
+
+  <h2 id="move"><span class="num">5</span>Lost the device, kept the data</h2>
+  <ol>
+    <li><strong>Desktop:</strong> install the Monzero wallet on any computer, put your backed-up <code>dex</code> folder back in the location from section 1 (with the wallet closed), open the wallet and unlock trading with the same password. If it says your trading keys were set up by another copy of the wallet, accept the switch. Unfinished trades resume from their journals.</li>
+    <li><strong>Android:</strong> your twelve trading recovery words open the trade account in MetaMask or any Ethereum wallet: it is the standard account <code>m/44'/60'/0'/0/0</code> of those words, so ETH, BNB and USDT on BNB Chain left in it are yours to move. Restoring the words into a new phone's wallet app is not available yet; if the lost phone had a trade running, or SOL or USDT on Solana in its trade account, email us (section 7).</li>
+  </ol>
+  <p>Nothing secret ever left your device, so a fresh install plus your backup is a complete recovery. A trade can only be rebuilt with the same keys it started with; a different backup is refused rather than producing a different trade.</p>
+
+  <h2 id="timelocks"><span class="num">6</span>Timeout reference</h2>
+  <p>Every trade has two deadlines, set on chain when the buyer of XMZ locks their coin in the swap contract (the Solana program on Solana) — <strong>timeout 1</strong> two hours after the lock, <strong>timeout 2</strong> two hours after that. The same rules apply on Ethereum, BNB Chain and Solana, for the native coin and for USDT:</p>
+  <table class="rec-table">
+    <tr><th>When</th><th>Who</th><th>What happens</th></tr>
+    <tr><td>Right after agreeing</td><td>buyer of XMZ</td><td>locks ETH/BNB/SOL/USDT in the contract (the seller waits about 30 min, 1 h on Ethereum, then gives up — nothing lost)</td></tr>
+    <tr><td>Before timeout 1</td><td>seller of XMZ</td><td>locks the XMZ in a key shared by both sides</td></tr>
+    <tr><td>Before timeout 1</td><td>buyer</td><td>confirms the XMZ lock (<em>ready</em>) — or, if no correct XMZ arrived, takes the coin straight back (early refund)</td></tr>
+    <tr><td>From ready (or timeout 1) until timeout 2</td><td>seller</td><td>claims the coin; the claim reveals what the buyer needs, and the buyer's wallet sweeps the XMZ</td></tr>
+    <tr><td>From timeout 2</td><td>buyer</td><td>if the seller never claimed: refunds the coin; the refund reveals what the seller needs, and the seller's wallet sweeps the XMZ back</td></tr>
+  </table>
+  <p>So a trade is settled within about four hours of the lock, either way. The wallet keeps safety margins: it never claims in the last 30 minutes before timeout 2, and never confirms <em>ready</em> late.</p>
+
+  <h2 id="manual"><span class="num">7</span>No Monzero app at all (advanced)</h2>
+  <p>Even without Monzero software, the outcome is recoverable, because the contracts and the trade format are open source (<a href="https://github.com/Nightglass-Protocol1/Monzero-source" rel="noopener">Monzero-source</a>, under <code>gui/dex-contracts</code>):</p>
+  <ul>
+    <li><strong>Coin side:</strong> the swap contract has no owner, admin key or pause. Its <code>refund</code> and <code>claim</code> calls can be made from any Ethereum, BNB Chain or Solana tool with your trade account's key, once their time has come (section 6).</li>
+    <li><strong>XMZ side:</strong> the XMZ sits in a key shared by both sides. Your share is derived from your trading keys and the offer; the other half is revealed on chain by the claim or the refund.</li>
   </ul>
   <div class="rec-card rec-warn">
     <span class="tag">Honest limitation</span>
-    <p>This last-resort path is real but <strong>not yet a one-click, non-technical procedure</strong> — extracting the raw transactions from the database and broadcasting them by hand takes some technical comfort. We are writing a step-by-step extractor guide; until it lands, if you are ever in this situation, email <a href="mailto:security@monzero.org">security@monzero.org</a> and we will walk you through it. We can help you recover <em>your</em> funds; we cannot take them — there is no key on our side that can.</p>
+    <p>This last-resort path is real but <strong>not a one-click, non-technical procedure</strong>. If you are ever in this situation, email <a href="mailto:security@monzero.org">security@monzero.org</a> and we will walk you through it. We can help you recover your funds; we cannot take them — there is no key on our side that can.</p>
   </div>
 
-  <h2 id="timelocks"><span class="num">6</span>Timelock reference</h2>
-  <p>Timelocks are measured in Bitcoin blocks, relative to when the reference transaction confirms (BIP68). On <strong>mainnet</strong>:</p>
-  <table class="rec-table">
-    <tr><th>Window</th><th>Opens</th><th>Who</th><th>Action</th></tr>
-    <tr><td>Redeem (happy path)</td><td>immediately, before cancel</td><td>maker</td><td>settles the swap; you receive your coins</td></tr>
-    <tr><td>Cancel</td><td><strong>24 blocks</strong> (~4 h) after the lock confirms</td><td>either party</td><td>moves the lock to the cancel output</td></tr>
-    <tr><td>Refund</td><td>after cancel confirms</td><td>the Bitcoin funder</td><td>reclaims the locked BTC</td></tr>
-    <tr><td>Punish</td><td><strong>144 blocks</strong> (~24 h) after cancel</td><td>maker</td><td>only if the funder never refunded</td></tr>
-  </table>
-  <p>The 24-hour gap between cancel and punish is your safety margin: you have a full day after a cancellation to refund, far more than any normal confirmation delay. <strong>Refund within that window</strong> and your Bitcoin is never at risk. (Testnet uses shorter values; your app shows the exact numbers for your swap.)</p>
-
-  <h2 id="rules"><span class="num">7</span>What can and can't happen to your funds</h2>
+  <h2 id="rules"><span class="num">8</span>What can and can't happen to your funds</h2>
   <ul>
-    <li><strong>Your keys never leave your device.</strong> Monzero holds no copy and has no admin key. We cannot freeze, move, or seize a swap — in flight or settled.</li>
-    <li><strong>The blockchains enforce the outcome.</strong> Either both sides get paid, or both get refunded. There is no third outcome where one side keeps everything.</li>
-    <li><strong>The app's job is timing, not custody.</strong> You need it (or a resume) online within the refund window to act — but it cannot be made to lose your funds, and the servers it talks to can stall your view at worst, never steal.</li>
-    <li><strong>The only way to lose access is to lose your swap data with a trade in flight.</strong> That is exactly what section 1 prevents.</li>
+    <li><strong>Your keys never leave your device.</strong> Monzero holds no copy and has no admin key. We cannot freeze, move, or seize a swap — in flight or settled. The web page can't either: it can ask, but only the wallet signs, and only after you approve the trade there.</li>
+    <li><strong>The blockchains enforce the outcome.</strong> Either both sides get paid, or both get their coins back. There is no third outcome where one side keeps everything.</li>
+    <li><strong>The wallet's job is timing, not custody.</strong> A seller that misses the claim deadline does not lose the XMZ — the buyer's refund lets the wallet sweep it back. The relays and the website can delay a trade at worst, never redirect it.</li>
+    <li><strong>The real risk is losing your trading keys</strong> — the backup and password from section 1 — while coins are in your trade account or a trade is running.</li>
   </ul>
   <div class="rec-card rec-note">
-    <p>Questions, or stuck mid-swap? <a href="mailto:security@monzero.org">security@monzero.org</a>, or the <a href="https://t.me/MonzeroOfficial" rel="noopener">Monzero Telegram</a>. The source for everything above is open: <a href="https://github.com/eigenwallet/core" rel="noopener">eigenwallet/core</a>.</p>
+    <p>Questions, or stuck mid-swap? <a href="mailto:security@monzero.org">security@monzero.org</a>, or the <a href="https://t.me/MonzeroOfficial" rel="noopener">Monzero Telegram</a>. The source for everything above is open: <a href="https://github.com/Nightglass-Protocol1/Monzero-source" rel="noopener">Monzero-source</a>.</p>
   </div>
 
 </div>
