@@ -350,7 +350,17 @@ function v1PoolBlocks(): array {
 }
 
 function v1SoloMining(): array {
-    return v1Cached('solo', 120, static function (): array {
+    // Its own cache file name (the first one could not be opened on the live server); if the
+    // cache still cannot be used, the window is computed for this request alone
+    try { return v1Cached('solo-window', 120, 'v1SoloCompute'); }
+    catch (RuntimeException $e) {
+        if ($e->getMessage() !== 'Cache unavailable') throw $e;
+        return ['observed_at' => time(), 'value' => v1SoloCompute()];
+    }
+}
+
+function v1SoloCompute(): array {
+    return (static function (): array {
         $network = v1NetworkObservation()['value'];
         $tip = $network['tip']['height'];
         $pool = v1PoolBlocks();
@@ -383,5 +393,5 @@ function v1SoloMining(): array {
         return ['from' => $from, 'to' => $tip, 'pool_blocks' => $poolCount, 'outside' => $outside,
             'difficulty' => $network['difficulty'], 'reward_atomic' => $network['tip']['reward_atomic'],
             'pool_hashrate' => $pool['hashrate'], 'height' => $network['height']];
-    });
+    })();
 }
