@@ -227,7 +227,8 @@ function v1Unavailable(): never {
 // none minted more than the emission rule allows), new blocks are added as they come; a block that
 // mints more than allowed stops the calculation. The checkpoint moves to 200 blocks below the tip
 // and is checked against the block hash, so a reorganisation cannot leave a wrong total.
-const V1_SUPPLY_SEED = ['height' => 12949, 'generated' => '243976348592396971', 'hash' => '0044914f6efe48a9a2ae3c3f7fa8de51532edcda3811be62c6810ed4874851d7'];
+// Walked from the previous seed (block 12,949) on 19 Nov 2026 with the same per-block emission check
+const V1_SUPPLY_SEED = ['height' => 33804, 'generated' => '624432428613096564', 'hash' => '73bf38ca7473e514d2b8d687b7ccef96dccea0a17b9a273ac698e1b5b9f18ac1'];
 const V1_MONEY_SUPPLY = '10000000000000000000';
 const V1_TAIL_REWARD = 326000000000;
 const V1_SPEED_SHIFT = 19;
@@ -239,7 +240,9 @@ function v1BlockFees(int $height): int {
     $hashes = $block['tx_hashes'] ?? [];
     if (!is_array($hashes) || !$hashes) return 0;
     foreach ($hashes as $h) if (!v1Hash($h)) throw new RuntimeException('Bad transaction hash');
-    [$response, $status] = v1Transport(json_encode(['txs_hashes' => array_values($hashes), 'decode_as_json' => true]), '/get_transactions');
+    // Pruned: the fee is in the part that is never pruned, and a block of large payouts would
+    // otherwise exceed V1_MAX_RESPONSE_BYTES (blocks 33,420 and 33,955 are about 1.1 MB in full)
+    [$response, $status] = v1Transport(json_encode(['txs_hashes' => array_values($hashes), 'decode_as_json' => true, 'prune' => true]), '/get_transactions');
     $data = is_string($response) ? json_decode($response, true) : null;
     if ($status !== 200 || ($data['status'] ?? null) !== 'OK' || count($data['txs'] ?? []) !== count($hashes)) throw new RuntimeException('Transactions unavailable');
     $fees = 0;
