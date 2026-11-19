@@ -176,7 +176,7 @@
   var MAINNET = { BTC: "btc-mainnet", LTC: "ltc-mainnet" };
   var TF = { "1h": 3600, "4h": 14400, "1D": 86400 };
   var OPENING_USD = 0.01; // the DEX's opening quote, not a market price
-  var pro = { coin: "ETH", tf: "1h", rendered: false, timer: null, chart: null, candles: null, vol: null, ref: null, usd: {}, gen: 0 };
+  var pro = { coin: "ETH", tf: "1h", rendered: false, timer: null, chart: null, candles: null, vol: null, ref: null, ext: null, noir: null, usd: {}, gen: 0 };
 
   function fmt(n, d) { if (!isFinite(n)) return "0"; var s = n.toFixed(d); return s.indexOf(".") >= 0 ? s.replace(/0+$/, "").replace(/\.$/, "") : s; }
   function places(p) { return p > 0 ? Math.min(14, Math.max(2, 3 - Math.floor(Math.log(p) / Math.LN10))) : 2; }
@@ -218,7 +218,31 @@
         }
         return r;
       } });
+    // NoirTrade's XMZ/USDT trades, in the pair's coin: the exchange's market rate next to the DEX's own swaps
+    pro.ext = pro.chart.addLineSeries({ color: cssVar("--accent", "#6fd3c1"), lineWidth: 2, lineType: 1, priceLineVisible: false, crosshairMarkerVisible: true,
+      title: "NoirTrade", priceFormat: fmtOpt });
     return true;
+  }
+
+  // One point per chart interval: the last NoirTrade trade in it (USDT per XMZ, over the coin's
+  // USD price now), carried on to the latest price. Empty when there is no price for the coin.
+  function noirData(interval, from, now) {
+    var n = pro.noir, usd = /^USDT/.test(pro.coin) ? 1 : pro.usd[pro.coin];
+    if (!n || !(usd > 0) || !n.trades) return [];
+    var byT = {}, times = [];
+    n.trades.forEach(function (t) {
+      var at = Math.floor(Number(t[0]) / 1000), px = Number(t[1]);
+      if (!(at >= from) || !(px > 0)) return;
+      var b = at - at % interval;
+      if (!(b in byT)) times.push(b);
+      byT[b] = { at: at, px: px };
+    });
+    times.sort(function (a, b) { return a - b; });
+    var out = times.map(function (b) { return { time: b, value: byT[b].px / usd }; });
+    var last = Number(n.last), end = now - now % interval;
+    if (last > 0 && (!out.length || out[out.length - 1].time < end)) out.push({ time: end, value: last / usd });
+    else if (last > 0 && out.length) out[out.length - 1].value = last / usd;
+    return out;
   }
 
   function renderChart(list) {
@@ -235,11 +259,15 @@
       if (to > from) refData.push({ time: to, value: ref });
     }
     pro.ref.setData(refData);
+    var ext = noirData(interval, now - 400 * interval, now);
+    pro.ext.setData(ext);
+    pro.ext.applyOptions({ title: pro.noir && pro.noir.stale ? "NoirTrade (old)" : "NoirTrade" });
+    $("chart-sub").textContent = "XMZ / " + pro.coin + " · completed swaps" + (ext.length ? " · line: NoirTrade XMZ/USDT in " + pro.coin.replace("-BSC", "") : "");
     if (list.length) { empty.hidden = true; }
     else {
       empty.hidden = false;
       empty.textContent = (UTXO[pro.coin] ? NAME[pro.coin] + " swaps are not reported to relays yet." : "No completed swaps yet.") +
-        (usd > 0 ? " Dashed line: the $0.01 opening rate." : "");
+        (ext.length ? " Solid line: the NoirTrade rate." : "") + (usd > 0 ? " Dashed line: the $0.01 opening rate." : "");
     }
     pro.chart.timeScale().fitContent();
   }
@@ -332,8 +360,10 @@
 
   function load() {
     var gen = ++pro.gen, since = Math.floor(Date.now() / 1000) - 400 * TF[pro.tf];
-    Promise.all([get("listings"), get("prints"), get("candles", "&interval=" + TF[pro.tf] + "&since=" + since)]).then(function (r) {
+    var noir = fetch("/markets/xmz.php", { cache: "no-store" }).then(function (r) { return r.json(); }).catch(function () { return null; });
+    Promise.all([get("listings"), get("prints"), get("candles", "&interval=" + TF[pro.tf] + "&since=" + since), noir]).then(function (r) {
       if (gen !== pro.gen) return;
+      if (r[3] && r[3].trades) pro.noir = r[3];
       if (!r[0] || !r[0].relay) { noRelay("No relay is connected yet"); return; }
       $("pro-note").textContent = "Signed offers from the open relays";
       $("r-relay").textContent = r[0].relay;
@@ -394,9 +424,9 @@
   $("mode-simple").addEventListener("click", function () { setMode("simple"); if (history.replaceState) history.replaceState(null, "", location.pathname); });
   $("mode-pro").addEventListener("click", function () { setMode("pro"); if (history.replaceState) history.replaceState(null, "", "#pro"); });
   // Shareable deep link: /dex/#pro opens the market view.
-  // #pro opens the order book; #pro-ETH (or -BNB, -SOL) also picks the pair
+  // #pro opens the order book; #pro-ETH (or -BNB, -SOL, -USDT, -USDT-BSC) also picks the pair
   function fromHash() {
-    var m = /^#pro(?:-([A-Z]{3}))?$/.exec(location.hash);
+    var m = /^#pro(?:-([A-Z]{3,4}(?:-BSC)?))?$/.exec(location.hash);
     if (m && m[1] && PAIRS.indexOf(m[1]) >= 0 && m[1] !== pro.coin) { pro.coin = m[1]; if (pro.rendered) show(); else syncPair(); }
     return m ? "pro" : "simple";
   }
