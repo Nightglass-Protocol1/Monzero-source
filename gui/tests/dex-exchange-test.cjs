@@ -94,4 +94,18 @@ t('a whole offer written as version 2 (minimum = all) is whole in the book', () 
   const r = X.book(l, 'SOL', 9, '', now).asks[0]
   assert.equal(r.partial, false); assert.equal(X.fillOk(r, 100e11), true); assert.equal(X.fillOk(r, 50e11), false)
 })
+t('NoirTrade line', () => {
+  // Trades in ms, out of order, with junk; the line is the last trade by each slot's end, over the coin's USD price
+  const pts = X.noirPoints({ trades: [[7200500, 0.004], [1000, 0.002], [0, 9], [5000, -1], [3601000, 'x'], [3700000, 0.003]] })
+  same(pts, [{ t: 1, p: 0.002 }, { t: 3700, p: 0.003 }, { t: 7200, p: 0.004 }])
+  same(X.noirPoints(null), [])
+  const slots = [{ t: 0 }, { t: 3600 }, { t: 7200 }, { t: 10800 }]
+  same(X.noirSeries(pts, slots, 3600, 2), [0.001, 0.0015, 0.002, 0.002])
+  same(X.noirSeries(pts, [{ t: -3600 }, { t: 0 }], 3600, 1), [null, 0.002])
+  same(X.noirSeries(pts, slots, 3600, 0), [null, null, null, null])   // no coin price: no line
+  // With no swaps: slots from the first trade to now, at most `limit` of them
+  same(X.noirGrid(pts, 3600, 3 * 3600 + 5, 100).map(s => s.t), [0, 3600, 7200, 10800])
+  assert.equal(X.noirGrid(pts, 3600, 1000 * 3600, 5).length, 5)
+  assert.equal(X.noirGrid([], 3600, 1000, 5).length, 0)
+})
 console.log('dex exchange: ' + n + ' checks passed')

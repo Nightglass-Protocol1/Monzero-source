@@ -6,7 +6,8 @@ import "dexExchange.js" as X
 
 // The pair's price chart: candles (or a line) of completed swaps from the relays, with volume
 // below, the best bid and ask as dashed lines and a crosshair that reads out each candle. With no
-// completed swaps it still shows where the offers stand.
+// completed swaps it still shows where the offers stand. A step line shows NoirTrade's XMZ/USDT
+// market in the pair's coin (at the coin's USD price now), for comparison.
 Rectangle {
     id: chart
     property string coin: "ETH"
@@ -14,7 +15,8 @@ Rectangle {
     property int interval: 3600
     property real bestBid: 0
     property real bestAsk: 0
-    property real coinUsd: 0                 // the coin's USD price, for the read-out (0: unknown)
+    property real coinUsd: 0                 // the coin's USD price, for the read-out and the NoirTrade line (0: unknown)
+    property var noir: null                  // NoirTrade's market: {last, stale, trades: [[ms, USDT per XMZ], …]}
     property string mode: "candles"          // "candles" or "line"
     property bool loading: false
     property real now: Date.now() / 1000
@@ -23,6 +25,12 @@ Rectangle {
     readonly property color up: M.Style.green
     readonly property color down: "#E5677A"
     readonly property var shown: X.chartCandles(candles, interval, now, 160)
+    readonly property color noirColor: "#E8B04B"
+    readonly property var noirPoints: X.noirPoints(noir)
+    // The slots on screen: the candles, or with none yet, NoirTrade's time span
+    readonly property var slots: shown.length ? shown : (coinUsd > 0 ? X.noirGrid(noirPoints, interval, now, 160) : [])
+    readonly property var noirLine: X.noirSeries(noirPoints, slots, interval, coinUsd)
+    readonly property bool hasNoir: noirLine.length > 0 && noirLine[noirLine.length - 1] !== null
     property int hover: -1
 
     color: M.Style.surfaceRaised
@@ -31,6 +39,7 @@ Rectangle {
     implicitHeight: 420
 
     onShownChanged: canvas.requestPaint()
+    onNoirLineChanged: canvas.requestPaint()
     onModeChanged: canvas.requestPaint()
     onBestBidChanged: canvas.requestPaint()
     onBestAskChanged: canvas.requestPaint()
@@ -44,11 +53,23 @@ Rectangle {
             Layout.fillWidth: true
             spacing: 6
             Text {
-                text: chart.hover >= 0 && chart.hover < chart.shown.length ? chart.readout(chart.shown[chart.hover])
+                text: chart.hover >= 0 && chart.hover < chart.slots.length ? chart.readout(chart.hover)
                       : qsTr("Price of 1 XMZ in %1").arg(chart.coin)
                 color: M.Style.dimmedFontColor; font.pixelSize: 12; font.family: M.Style.fontMonoRegular.name
                 Layout.fillWidth: true; elide: Text.ElideRight
             }
+            Row {
+                visible: chart.hasNoir
+                spacing: 5
+                Rectangle { width: 14; height: 2; color: chart.noirColor; anchors.verticalCenter: parent.verticalCenter }
+                Text {
+                    text: chart.noir && chart.noir.stale ? qsTr("NoirTrade (old)") : qsTr("NoirTrade")
+                    color: M.Style.dimmedFontColor; font.pixelSize: 12
+                    M.Tooltip { id: noirTip; anchors.fill: parent; text: qsTr("The last trade on NoirTrade (XMZ/USDT), in %1 at its price now").arg(chart.coin) }
+                    MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: noirTip.tooltipPopup.open(); onExited: noirTip.tooltipPopup.close() }
+                }
+            }
+            Item { width: 4; height: 1; visible: chart.hasNoir }
             Repeater {
                 model: [ { k: "candles", t: qsTr("Candles") }, { k: "line", t: qsTr("Line") } ]
                 delegate: chart.chip
@@ -83,13 +104,14 @@ Rectangle {
                 hoverEnabled: true
                 onPositionChanged: {
                     var i = Math.floor((mouse.x - canvas.x0) / canvas.slot)
-                    chart.hover = i >= 0 && i < chart.shown.length ? i : -1
+                    chart.hover = i >= 0 && i < chart.slots.length ? i : -1
                 }
                 onExited: chart.hover = -1
             }
             Text {
                 anchors.centerIn: parent
                 visible: chart.shown.length === 0
+                anchors.verticalCenterOffset: chart.hasNoir ? -parent.height * 0.3 : 0
                 width: parent.width * 0.8
                 horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
                 color: M.Style.dimmedFontColor; font.pixelSize: 13
@@ -107,14 +129,16 @@ Rectangle {
         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: chart.mode = modelData.k }
     }
 
-    function readout(c) {
+    function readout(i) {
+        var c = chart.slots[i], noirText = chart.noirLine[i] !== null && chart.noirLine[i] !== undefined ? "  " + qsTr("NoirTrade %1").arg(X.price(chart.noirLine[i])) : ""
         var when = Qt.formatDateTime(new Date(c.t * 1000), chart.interval >= 86400 ? "d MMM yyyy" : "d MMM HH:mm")
+        if (c.empty) return when + noirText
         var change = c.o > 0 ? (c.c - c.o) / c.o * 100 : 0
         var text = when + "  O " + X.price(c.o) + "  H " + X.price(c.h) + "  L " + X.price(c.l) + "  C " + X.price(c.c)
                  + "  " + (change >= 0 ? "+" : "") + change.toFixed(2) + "%"
         if (c.v > 0) text += "  " + qsTr("Vol %1 XMZ").arg(X.amount(c.v, 0))
         if (chart.coinUsd > 0) text += "  ≈ " + X.usd(c.c * chart.coinUsd)
-        return text
+        return text + noirText
     }
 
     function paint(ctx, w, h) {
@@ -128,10 +152,13 @@ Rectangle {
             var gy = Math.round(priceTop + (priceBottom - priceTop) * g / 4) + 0.5
             ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(plotW, gy); ctx.stroke()
         }
-        var cs = chart.shown
-        // The price range: candles and the best offers, so the offers' lines are always on screen
+        var cs = chart.slots, nl = chart.noirLine
+        // The price range: candles, the NoirTrade line and the best offers, so all of them are on screen
         var hi = 0, lo = Infinity, vmax = 0
-        for (var i = 0; i < cs.length; ++i) { hi = Math.max(hi, cs[i].h); lo = Math.min(lo, cs[i].l); vmax = Math.max(vmax, cs[i].v) }
+        for (var i = 0; i < cs.length; ++i) {
+            if (!cs[i].empty) { hi = Math.max(hi, cs[i].h); lo = Math.min(lo, cs[i].l); vmax = Math.max(vmax, cs[i].v) }
+            if (nl[i] !== null) { hi = Math.max(hi, nl[i]); lo = Math.min(lo, nl[i]) }
+        }
         var marks = []
         if (chart.bestAsk > 0) marks.push({ p: chart.bestAsk, color: chart.down, label: qsTr("ask") })
         if (chart.bestBid > 0) marks.push({ p: chart.bestBid, color: chart.up, label: qsTr("bid") })
@@ -153,7 +180,7 @@ Rectangle {
         var x0 = plotW - count * slot
         canvas.slot = slot; canvas.x0 = x0 - first * slot
 
-        if (count > 0 && chart.mode === "line") {
+        if (count > 0 && chart.mode === "line" && chart.shown.length) {
             ctx.beginPath()
             for (var j = first; j < cs.length; ++j) {
                 var lx = x0 + (j - first) * slot + slot / 2
@@ -164,6 +191,7 @@ Rectangle {
             ctx.fillStyle = "rgba(41,214,203,0.10)"; ctx.fill()
         }
         for (var k = first; k < cs.length; ++k) {
+            if (cs[k].empty) continue
             var c = cs[k], rising = c.c >= c.o
             var color = c.flat ? "#3B5A5E" : rising ? chart.up : chart.down
             var cx = x0 + (k - first) * slot + slot / 2
@@ -180,6 +208,25 @@ Rectangle {
                 ctx.globalAlpha = 1
             }
         }
+        // NoirTrade: a step line across each slot from its first trade, its latest price on the axis
+        var noirLast = null
+        ctx.strokeStyle = chart.noirColor; ctx.lineWidth = 1.5
+        ctx.beginPath()
+        var drawing = false, prevY = 0
+        for (var q = first; q < cs.length; ++q) {
+            if (nl[q] === null) { drawing = false; continue }
+            var qx = x0 + (q - first) * slot, qy = y(nl[q])
+            if (!drawing) ctx.moveTo(qx, qy); else ctx.lineTo(qx, prevY), ctx.lineTo(qx, qy)
+            ctx.lineTo(qx + slot, qy)
+            drawing = true; prevY = qy; noirLast = nl[q]
+        }
+        ctx.stroke()
+        if (noirLast !== null) {
+            var ny = y(noirLast)
+            ctx.globalAlpha = 0.9; ctx.fillStyle = chart.noirColor
+            ctx.fillRect(plotW + 2, ny - 9, axis - 4, 18); ctx.globalAlpha = 1
+            ctx.fillStyle = "#062224"; ctx.fillText(X.price(noirLast), plotW + 6, ny + 4)
+        }
         // Best offers now: dashed lines with their price on the axis
         for (var n = 0; n < marks.length; ++n) {
             var my = y(marks[n].p)
@@ -190,7 +237,7 @@ Rectangle {
             ctx.fillStyle = "#062224"; ctx.fillText(X.price(marks[n].p), plotW + 6, my + 4)
         }
         // The last trade price
-        if (count > 0) {
+        if (count > 0 && chart.shown.length) {
             var last = cs[cs.length - 1], ly = y(last.c)
             ctx.fillStyle = M.Style.accent
             ctx.fillRect(plotW + 2, ly - 9, axis - 4, 18)

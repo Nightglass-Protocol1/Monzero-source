@@ -9,11 +9,14 @@
 #include <QRegularExpression>
 #include <QUrl>
 #include <QUrlQuery>
+#include <algorithm>
+#include <cmath>
 
 namespace {
 // Relay answers are small; anything larger is not what we asked for
 const qint64 MaxReply=2*1024*1024;
 const int TimeoutMs=15000;
+const int MaxNoirTrades=2000;
 }
 
 DexExchangeFeed::DexExchangeFeed(SourceFor sources,QObject *parent) : QObject(parent),m_sources(std::move(sources)),m_net(new QNetworkAccessManager(this)) {}
@@ -61,6 +64,17 @@ void DexExchangeFeed::get(const QStringList &bases,const QString &path,const QSt
                 if (price>0) usd.insert(coin.value("symbol").toString(),price);
             }
             store(key,usd);
+        } else if (key=="noir") {
+            // Only numbers: trade time (ms) and price (USDT per XMZ), the newest MaxNoirTrades
+            QVariantList trades;
+            const auto list=o.value("trades").toArray();
+            for (int i=std::max(0,int(list.size())-MaxNoirTrades);i<list.size();++i) {
+                const auto t=list[i].toArray();
+                const double at=t.at(0).toDouble(),price=t.at(1).toDouble();
+                if (at>0 && price>0 && std::isfinite(price)) trades.append(QVariant(QVariantList{at,price}));
+            }
+            const double last=o.value("last").toDouble();
+            store(key,QVariantMap{{"last",last>0 && std::isfinite(last) ? last : 0.0},{"stale",o.value("stale").toBool()},{"trades",trades}});
         }
     });
 }
@@ -93,6 +107,13 @@ bool DexExchangeFeed::usdPrices() {
     if (m_pending.value("usd")) return true;
     m_pending.insert("usd",true);
     get({QStringLiteral("https://monzero.org")},QStringLiteral("/markets/api.php"),QStringLiteral("usd"));
+    return true;
+}
+
+bool DexExchangeFeed::noirTrade() {
+    if (m_pending.value("noir")) return true;
+    m_pending.insert("noir",true);
+    get({QStringLiteral("https://monzero.org")},QStringLiteral("/markets/xmz.php"),QStringLiteral("noir"));
     return true;
 }
 

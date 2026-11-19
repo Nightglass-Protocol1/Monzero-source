@@ -204,6 +204,40 @@ function chartCandles(candles, interval, now, limit) {
     return out
 }
 
+// NoirTrade's XMZ/USDT market ({trades: [[ms, price], …]}) -> [{t (seconds), p (USDT per XMZ)}], oldest first
+function noirPoints(noir) {
+    var out = []
+    var list = noir && noir.trades ? noir.trades : []
+    for (var i = 0; i < list.length; ++i) {
+        var ms = Number(list[i][0]), p = Number(list[i][1])
+        if (ms > 0 && p > 0 && isFinite(p)) out.push({ t: Math.floor(ms / 1000), p: p })
+    }
+    out.sort(function (a, b) { return a.t - b.t })
+    return out
+}
+
+// Chart slots for NoirTrade alone (a pair with no swaps yet): from its first trade (at most `limit`
+// slots back) to now, with no candle in them
+function noirGrid(points, interval, now, limit) {
+    if (!points || !points.length) return []
+    var end = Math.floor(now / interval) * interval, start = Math.floor(points[0].t / interval) * interval
+    if (end - start > (limit - 1) * interval) start = end - (limit - 1) * interval
+    var out = []
+    for (var t = start; t <= end; t += interval) out.push({ t: t, empty: true })
+    return out
+}
+
+// For each chart slot, NoirTrade's last trade by the end of it, in the pair's coin (USDT price over
+// the coin's USD price now); null before its first trade or with no coin price
+function noirSeries(points, slots, interval, coinUsd) {
+    var out = [], j = 0, last = null
+    for (var i = 0; i < (slots || []).length; ++i) {
+        while (j < points.length && points[j].t < slots[i].t + interval) { last = points[j].p; ++j }
+        out.push(last !== null && coinUsd > 0 ? last / coinUsd : null)
+    }
+    return out
+}
+
 // Prints (relay format: {at, value (hex wei/lamports), xmz (atoms), tx, chainId}) -> newest first
 function trades(prints, decimals) {
     var out = []

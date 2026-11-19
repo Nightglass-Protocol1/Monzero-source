@@ -58,6 +58,7 @@ ColumnLayout {
     property bool chartLoading: false
     property var prints: ({})              // coin -> trades, newest first
     property var usd: ({})                 // coin -> USD price
+    property var noir: null                // NoirTrade's XMZ/USDT market (from monzero.org), for the chart
     property var balances: ({})            // coin -> trade account balance (coin)
     property string localError: ""
     property string pickedId: ""
@@ -135,6 +136,7 @@ ColumnLayout {
         }
         candles = cs; prints = ps; balances = bs
         if (d.usd) usd = d.usd
+        if (d.noir) noir = d.noir
         var chartKey = "candles:" + coin + ":" + interval
         if (d[chartKey]) { chartData = d[chartKey]; chartLoading = false }
     }
@@ -190,6 +192,10 @@ ColumnLayout {
             if (!d || !d.prints) return
             var m = JSON.parse(JSON.stringify(ex.prints)); m[c] = X.trades(d.prints, decimalsOf(c)); ex.prints = m
         })
+    }
+    function loadNoir() {
+        if (feed) { if (typeof feed.noirTrade === "function") feed.noirTrade(); return }
+        get("https://monzero.org/markets/xmz.php", function (d) { if (d && d.trades) ex.noir = { last: Number(d.last) || 0, stale: d.stale === true, trades: d.trades } })
     }
     function loadUsd() {
         if (feed) { feed.usdPrices(); return }
@@ -267,6 +273,7 @@ ColumnLayout {
             if (tick % 4 === 0) ex.refreshOffers()
             if (tick % 12 === 0) ex.refreshAll()
             if (tick % 120 === 0) ex.loadUsd()
+            if (tick % 24 === 0) ex.loadNoir()
             tick++
         }
     }
@@ -467,6 +474,7 @@ ColumnLayout {
             bestBid: ex.book.bestBid
             bestAsk: ex.book.bestAsk
             coinUsd: ex.coinUsd
+            noir: ex.noir
             loading: ex.chartLoading
             now: ex.now
             onIntervalPicked: ex.interval = seconds
