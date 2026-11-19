@@ -176,7 +176,10 @@
   var MAINNET = { BTC: "btc-mainnet", LTC: "ltc-mainnet" };
   var TF = { "1h": 3600, "4h": 14400, "1D": 86400 };
   var OPENING_USD = 0.01; // the DEX's opening quote, not a market price
-  var pro = { coin: "ETH", tf: "1h", rendered: false, timer: null, chart: null, candles: null, vol: null, ref: null, ext: null, noir: null, usd: {}, gen: 0 };
+  var pro = { coin: "ETH", tf: "1h", rendered: false, timer: null, chart: null, candles: null, vol: null, ref: null, ext: null, noir: null, range: null, usd: {}, gen: 0 };
+  // A swap under this share of the volume on the chart does not stretch the price axis (a 1 XMZ
+  // test trade at a far-off price would otherwise press every real trade flat)
+  var TINY_SHARE = 0.001;
 
   function fmt(n, d) { if (!isFinite(n)) return "0"; var s = n.toFixed(d); return s.indexOf(".") >= 0 ? s.replace(/0+$/, "").replace(/\.$/, "") : s; }
   function places(p) { return p > 0 ? Math.min(14, Math.max(2, 3 - Math.floor(Math.log(p) / Math.LN10))) : 2; }
@@ -205,7 +208,8 @@
       timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false },
       localization: { priceFormatter: price }
     });
-    pro.candles = pro.chart.addCandlestickSeries({ upColor: up, downColor: down, borderVisible: false, wickUpColor: up, wickDownColor: down, priceFormat: fmtOpt });
+    pro.candles = pro.chart.addCandlestickSeries({ upColor: up, downColor: down, borderVisible: false, wickUpColor: up, wickDownColor: down, priceFormat: fmtOpt,
+      autoscaleInfoProvider: function (base) { return pro.range ? { priceRange: pro.range } : base(); } });
     pro.vol = pro.chart.addHistogramSeries({ priceScaleId: "vol", priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false });
     pro.chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
     pro.ref = pro.chart.addLineSeries({ color: text, lineWidth: 1, lineStyle: 2, priceLineVisible: false, crosshairMarkerVisible: false, title: "Opening rate", priceFormat: fmtOpt,
@@ -249,7 +253,19 @@
     var empty = $("chart-empty"), interval = TF[pro.tf];
     if (!ensureChart()) { empty.hidden = false; empty.textContent = "The chart could not load."; return; }
     var up = cssVar("--success", "#93d9b6"), down = cssVar("--danger", "#ff8a9f");
+    // The axis from the candles that carry real volume; tiny ones beyond it are drawn off the edge
+    var total = 0, lo = Infinity, hi = 0, off = [];
+    list.forEach(function (c) { total += c.v > 0 ? c.v : 0; });
+    list.forEach(function (c) { if (!(total > 0) || c.v >= total * TINY_SHARE) { lo = Math.min(lo, c.l); hi = Math.max(hi, c.h); } });
+    pro.range = hi > 0 ? { minValue: lo, maxValue: hi } : null;
+    if (pro.range) list.forEach(function (c) { if (c.h > hi || c.l < lo) off.push(c); });
     pro.candles.setData(list.map(function (c) { return { time: c.t, open: c.o, high: c.h, low: c.l, close: c.c }; }));
+    // An off-scale swap still shows: a marker on its volume bar with its price and size
+    pro.vol.setMarkers(off.map(function (c) {
+      var above = c.h > hi;
+      return { time: c.t, position: "aboveBar", shape: above ? "arrowUp" : "arrowDown", color: cssVar("--muted", "#9eb6bd"),
+        text: price(above ? c.h : c.l) + " · " + fmt(c.v, 2) + " XMZ" };
+    }));
     pro.vol.setData(list.map(function (c) { return { time: c.t, value: c.v, color: (c.c >= c.o ? up : down) + "66" }; }));
     var usd = pro.usd[pro.coin], now = Math.floor(Date.now() / 1000), refData = [];
     if (usd > 0) {
@@ -262,7 +278,8 @@
     var ext = noirData(interval, now - 400 * interval, now);
     pro.ext.setData(ext);
     pro.ext.applyOptions({ title: pro.noir && pro.noir.stale ? "NoirTrade (old)" : "NoirTrade" });
-    $("chart-sub").textContent = "XMZ / " + pro.coin + " · completed swaps" + (ext.length ? " · line: NoirTrade XMZ/USDT in " + pro.coin.replace("-BSC", "") : "");
+    $("chart-sub").textContent = "XMZ / " + pro.coin + " · completed swaps" + (ext.length ? " · line: NoirTrade XMZ/USDT in " + pro.coin.replace("-BSC", "") : "") +
+      (off.length ? " · " + off.length + (off.length === 1 ? " tiny swap" : " tiny swaps") + " off the scale" : "");
     if (list.length) { empty.hidden = true; }
     else {
       empty.hidden = false;
