@@ -215,9 +215,13 @@ final class DexRisk {
         }
         if (control.optLong("expiresAt") <= now) return "The operator control document expired; new trades are paused.";
         if (!control.optBoolean("newTradesEnabled")) return "New trades are paused by the operator.";
-        final String coin = controlNetwork.startsWith("bnb") ? "BNB" : controlNetwork.startsWith("sol") ? "SOL" : "ETH";
-        if (amount.compareTo(new BigInteger(control.optString("maxLtcAtomsPerTrade"))) > 0) return coin + " amount exceeds the per-trade limit.";
-        if (xmzAtoms.compareTo(new BigInteger(control.optString("maxXmzAtomsPerTrade"))) > 0) return "XMZ amount exceeds the per-trade limit.";
+        final String coin = controlNetwork.contains("-usdt-") ? "USDT" : controlNetwork.startsWith("bnb") ? "BNB" : controlNetwork.startsWith("sol") ? "SOL" : "ETH";
+        final int places = controlNetwork.startsWith("sol-usdt") ? 6 : controlNetwork.startsWith("sol") ? 9 : 18;
+        // Name the cap, so a refused order says how large an order may be
+        if (amount.compareTo(new BigInteger(control.optString("maxLtcAtomsPerTrade"))) > 0)
+            return "This order is above the per-trade limit of " + DexFiles.units(control.optString("maxLtcAtomsPerTrade"), places) + " " + coin + " while the DEX is opening. Post a smaller order.";
+        if (xmzAtoms.compareTo(new BigInteger(control.optString("maxXmzAtomsPerTrade"))) > 0)
+            return "This order is above the per-trade limit of " + DexFiles.units(control.optString("maxXmzAtomsPerTrade"), 11) + " XMZ while the DEX is opening. Post a smaller order.";
         BigInteger day = BigInteger.ZERO;
         for (Iterator<String> it = started.keys(); it.hasNext(); ) {
             final JSONObject entry = started.optJSONObject(it.next());

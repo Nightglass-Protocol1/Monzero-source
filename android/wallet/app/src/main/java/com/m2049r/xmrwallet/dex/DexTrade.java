@@ -103,8 +103,16 @@ final class DexTrade {
         return release();
     }
 
+    /** The relays that may pay a USDT trade's network fees (the helper uses them for USDT trades only). */
+    private java.util.List<String> relays = new java.util.ArrayList<>();
+
+    void setRelays(java.util.List<String> relays) {
+        this.relays = new java.util.ArrayList<>(relays);
+    }
+
     private JSONObject request(String cmd) throws Exception {
-        return new JSONObject().put("schema", DexHelper.REQUEST_SCHEMA).put("command", cmd).put("tradeDir", tradeDir);
+        return new JSONObject().put("schema", DexHelper.REQUEST_SCHEMA).put("command", cmd).put("tradeDir", tradeDir)
+                .put("relays", new org.json.JSONArray(relays));
     }
 
     private JSONObject tickConfig(String seedHex) throws Exception {

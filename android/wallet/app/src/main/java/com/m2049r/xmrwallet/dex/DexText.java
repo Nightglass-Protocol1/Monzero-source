@@ -72,7 +72,8 @@ final class DexText {
 
     /** The coin side of an offer, as "0.004 BNB". */
     static String coinText(JSONObject offer) {
-        final long chain = offer.optLong("chainId");
+        // The trade's market: USDT on Solana when the terms name a token
+        final long chain = DexConfig.marketOf(offer.optLong("chainId"), offer.optString("asset"));
         try {
             final String v = offer.optString("value");
             final BigInteger value = v.startsWith("0x") ? new BigInteger(v.substring(2), 16) : new BigInteger(v);

@@ -72,6 +72,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         wallets = new DexWallets(root, new File(bin, "libmonzero_wallet_rpc.so"), node, DexConfig.networkFlag(), helper, handler, this);
         risk = new DexRisk(DexConfig.CONTROL_KEY, new File(root, "started-trades.json"), handler, this::changed);
         trade = new DexTrade(helper, this);
+        trade.setRelays(overrides.relaysOrDefault());
     }
 
     // ---- threads -------------------------------------------------------------------------------
@@ -342,9 +343,9 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     }
 
     /** minXmzAmount: empty for a whole offer, else the least XMZ one buyer or seller may take. */
-    boolean postOffer(long chainId, String side, String coinAmount, String xmzAmount, String minXmzAmount, int hours) {
+    boolean postOffer(long chainId, String side, String coinAmount, String xmzAmount, String minXmzAmount, int hours, boolean renew) {
         final String wei = DexFiles.atomic(coinAmount, DexConfig.decimals(chainId)), atoms = DexFiles.atomic(xmzAmount, 11);
-        if (wei == null || atoms == null || hours < 1 || hours > 24) return say("Check the amounts and how long the offer stays open (1-24 hours).");
+        if (wei == null || atoms == null || hours < 1 || hours > 31 * 24) return say("Check the amounts and how long the offer stays open (1 hour to 31 days).");
         String minAtoms = null;
         if (minXmzAmount != null && !minXmzAmount.trim().isEmpty()) {
             minAtoms = DexFiles.atomic(minXmzAmount.trim(), 11);
@@ -355,7 +356,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         if (!refusal.isEmpty()) return say(refusal);
         final DexMarket m = markets.get(chainId);
         if (m == null) return false;
-        final boolean started = m.post(keys.seedHex(), side, wei, atoms, minAtoms, hours * 3600L);
+        final boolean started = m.post(keys.seedHex(), side, wei, atoms, minAtoms, hours * 3600L, renew);
         marketMessage = started ? "" : "The offer could not be posted now.";
         changed();
         return started;
@@ -381,7 +382,10 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             }
             // A partial offer taken whole still names its amount: the maker then knows it was chosen
             if (atoms == null && l.has("minXmzAtoms")) atoms = l.optString("xmzAtoms");
-            final String refusal = offerRefusal(l.optLong("chainId"), wei, atoms == null ? l.optString("xmzAtoms") : atoms);
+            // A USDT offer is checked under the USDT market's limits
+            final String pairName = l.optString("pair");
+            final long market = "USDT/XMZ".equals(pairName) || "USDT-BSC/XMZ".equals(pairName) ? DexConfig.marketOf(l.optLong("chainId"), "usdt") : l.optLong("chainId");
+            final String refusal = offerRefusal(market, wei, atoms == null ? l.optString("xmzAtoms") : atoms);
             if (!refusal.isEmpty()) return say(refusal);
             final boolean started = m.take(keys.seedHex(), listingId, atoms);
             marketMessage = started ? "" : "The offer could not be taken now.";
@@ -411,6 +415,11 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         } catch (Exception e) {
             return null;
         }
+    }
+
+    boolean setOfferRenew(String folder, boolean on) {
+        final DexMarket m = folder == null ? null : marketFor(folder);
+        return m != null && m.setRenew(folder, on);
     }
 
     boolean cancelOffer(String folder) {
@@ -494,7 +503,8 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     boolean approveTrade(String commitment) {
         final JSONObject offer = trade.offer();
         if (offer == null || trade.tradeId().isEmpty()) return false;
-        final String network = DexConfig.controlNetwork(offer.optLong("chainId"));
+        // The trade's market: its chain, or for a token (USDT on Solana) the token's own market
+        final String network = DexConfig.controlNetwork(DexConfig.marketOf(offer.optLong("chainId"), offer.optString("asset")));
         if (network.isEmpty()) return refuse("This chain is not supported for trading.");
         final BigInteger value, xmz;
         try {
