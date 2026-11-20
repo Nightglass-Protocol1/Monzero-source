@@ -26,6 +26,9 @@ ColumnLayout {
     readonly property var markets: (dex && dex.evmMarketStatus) || ({})
     readonly property var trade: (dex && dex.evmTradeStatus) || ({})
     readonly property var market: markets[coin] || ({})
+    // Coin-for-coin trades (ETH, BNB, SOL straight across): their own tab, when this wallet has them
+    readonly property var direct: (dex && dex.directMarketStatus) || ({})
+    readonly property bool directMode: coin === "DIRECT" && direct.configured === true
     readonly property bool keysReady: wallet.keysReady === true
     // USDT (on Solana) appears once the wallet runs its market
     readonly property var allCoins: ["ETH", "BNB", "SOL"].concat(markets.USDT ? ["USDT"] : []).concat(markets["USDT-BSC"] ? ["USDT-BSC"] : [])
@@ -224,6 +227,7 @@ ColumnLayout {
         }
     }
     function refreshOffers() {
+        if (directMode) { dex.refreshDirectOffers(); return }
         if (market.configured === true && market.busy !== true) dex.refreshEvmOffers(coin + "/XMZ")
     }
     function refreshAll() {
@@ -233,7 +237,8 @@ ColumnLayout {
     function pick(c) {
         if (c === coin) return
         coin = c; pickedId = ""; localError = ""
-        loadPrints(c); loadBalance(c)
+        if (c === "DIRECT") { var cs = direct.chains || []; for (var i = 0; i < cs.length; ++i) loadBalance(cs[i].coin) }
+        else { loadPrints(c); loadBalance(c) }
         refreshOffers()
     }
     function setWithdrawTo(c, address) {
@@ -303,6 +308,21 @@ ColumnLayout {
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pick(modelData) }
             }
+        }
+        Rectangle {
+            objectName: "pair_DIRECT"
+            visible: ex.direct.configured === true
+            readonly property bool active: ex.coin === "DIRECT"
+            width: 190; height: 54; radius: 6
+            color: active ? M.Style.surfaceRaised : "transparent"
+            border.color: active ? M.Style.accent : M.Style.accentMuted
+            Column {
+                anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                spacing: 3
+                Text { text: "ETH · BNB · SOL"; font.pixelSize: 15; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                Text { text: qsTr("coin for coin"); font.pixelSize: 11; color: M.Style.dimmedFontColor }
+            }
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pick("DIRECT") }
         }
     }
 
@@ -402,6 +422,7 @@ ColumnLayout {
     // ---- stats bar
     Rectangle {
         Layout.fillWidth: true
+        visible: !ex.directMode
         implicitHeight: statsFlow.implicitHeight + 20
         radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
         Flow {
@@ -434,7 +455,7 @@ ColumnLayout {
     Text {
         objectName: "marketNotice"
         Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.warningColor
-        visible: text !== ""
+        visible: text !== "" && !ex.directMode
         text: ex.market.configured !== true ? ""
             : (ex.market.state === "failed" || ex.market.state === "refused") && ex.market.command === "listings"
               ? qsTr("The %1 offers could not be loaded from the relays: %2. Retrying…").arg(ex.coin).arg(ex.market.error || qsTr("no answer"))
@@ -445,6 +466,7 @@ ColumnLayout {
     GridLayout {
         id: grid
         Layout.fillWidth: true
+        visible: !ex.directMode
         columns: ex.width >= 1180 ? 3 : ex.width >= 820 ? 2 : 1
         columnSpacing: 12; rowSpacing: 12
         M.DexPriceChart {
@@ -517,9 +539,26 @@ ColumnLayout {
         }
     }
 
+    // ---- coin for coin: its own book, form, trades and accounts
+    M.DexDirectPanel {
+        objectName: "directPanel"
+        Layout.fillWidth: true
+        visible: ex.directMode
+        dex: ex.dex
+        wallet: ex.wallet
+        balances: ex.balances
+        withdrawTo: ex.withdrawTo
+        usd: ex.usd
+        now: ex.now
+        riskTick: ex.riskTick
+        networkName: ex.networkName
+        onAddressUsed: ex.setWithdrawTo(coin, address)
+    }
+
     // ---- below: orders, market trades, funds
     Rectangle {
         Layout.fillWidth: true
+        visible: !ex.directMode
         implicitHeight: bottomCol.implicitHeight + 24
         radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
         ColumnLayout {

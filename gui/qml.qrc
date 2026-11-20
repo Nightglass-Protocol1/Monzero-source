@@ -19,6 +19,7 @@
         <file>components/DexTradeCard.qml</file>
         <file>components/DexTradeProgress.qml</file>
         <file>components/DexExchange.qml</file>
+        <file>components/DexDirectPanel.qml</file>
         <file>components/AppearanceEditor.qml</file>
         <file>components/DexPriceChart.qml</file>
         <file>components/DexOrderBook.qml</file>
