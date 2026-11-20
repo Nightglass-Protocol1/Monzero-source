@@ -59,7 +59,7 @@ use NegotiationError as E;
 
 /// Proof system shared with the engine's other pairs: Pedersen blinding generators are the
 /// BIP-341 NUMS point on secp256k1 and Monero's H on ed25519.
-static PROOF_SYSTEM: LazyLock<CrossCurveDLEQ<HashTranscript<Sha256, rand_chacha::ChaCha20Rng>>> = LazyLock::new(|| {
+pub(crate) static PROOF_SYSTEM: LazyLock<CrossCurveDLEQ<HashTranscript<Sha256, rand_chacha::ChaCha20Rng>>> = LazyLock::new(|| {
     let g = secp256kfun::G.normalize().to_bytes_uncompressed();
     let h_secp = secp256kfun::Point::<secp256kfun::marker::EvenY>::from_xonly_bytes(Sha256::digest(g).into())
         .expect("SHA-256 of the uncompressed generator is a valid x-coordinate")

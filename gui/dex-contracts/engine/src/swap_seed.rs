@@ -58,6 +58,12 @@ impl SwapSeed {
         crate::mail::Mailbox::from_secret(prf(&*self.0, &[b"mailbox", listing.as_slice(), side]))
     }
 
+    /// A stream for one direct (coin <-> coin) trade: `label` names what it makes, `digest` is the
+    /// direct offer's and `side` the trader's part in it. Labels never meet the XMZ trades' ones.
+    pub(crate) fn direct_stream(&self, label: &[u8], digest: alloy::primitives::B256, side: &[u8]) -> ChaCha20Rng {
+        ChaCha20Rng::from_seed(*prf(&*self.0, &[b"direct", label, digest.as_slice(), side]))
+    }
+
     fn stream(&self, label: &[u8], offer: &Offer, role: Role) -> ChaCha20Rng {
         let role: &[u8] = match role {
             Role::Owner => b"owner",
