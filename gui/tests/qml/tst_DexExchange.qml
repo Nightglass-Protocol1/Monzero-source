@@ -47,6 +47,11 @@ Item {
         function approveTradingKeysHelper(commitment) { calls.push(["approveHelper", commitment]); return true }
         property var xmrWalletStatus: ({ coin: "xmr", state: "ready", balance: "1.5", unlocked: "1.25", address: "5" + "A".repeat(94), daemon: "31.70.193.31:38089", busy: false })
         function sendFromXmrWallet(address, amount) { calls.push(["sendXmr", address, amount]); return true }
+        // Monero markets: none until a test gives them
+        property var xmrMarketStatus: ({})
+        function refreshXmrOffers(coin) { calls.push(["refreshXmr", coin]); return true }
+        function postXmrOffer(chainId, side, coin, xmr, hours, min, renew) { calls.push(["postXmr", chainId, side, coin, xmr, hours, min].concat(renew ? ["renew"] : [])); return true }
+        function xmrOrderRefusal(chainId, coin, xmr) { return Number(coin) > capCoin ? "This order is above the per-trade limit." : "" }
     }
     M.DexExchange { id: ex; width: root.width; dex: engine; fetchEnabled: false }
 
@@ -243,6 +248,41 @@ Item {
             ex.pick("SOL")
             verify(!find(ex, "soonCard").visible)
             verify(find(ex, "exchangeForm").visible)
+        }
+        function test_monero_pairs_trade_in_xmr_with_their_own_book_and_form() {
+            // 0.5 ETH for 1.5 XMR offered (SAMPLE values); the market runs on the Monero wallet
+            engine.xmrMarketStatus = { ETH: { configured: true, busy: false, coin: "ETH", chainId: 11155111, privateCoin: "XMR", relays: [], mine: [],
+                listings: [ { id: "0xc1", pair: "ETH/XMR", side: "sell-xmz", chainId: 11155111, maker: "0x00000000000000000000000000000000000000b0",
+                              valueWei: "500000000000000000", xmzAtoms: "1500000000000", expiresAt: root.now + 7200 },
+                            { id: "0xc2", pair: "ETH/XMZ", side: "sell-xmz", chainId: 11155111, maker: "0x00000000000000000000000000000000000000b0",
+                              valueWei: "1", xmzAtoms: "1", expiresAt: root.now + 7200 } ] } }
+            verify(ex.xmrLive.indexOf("ETH/XMR") >= 0)
+            verify(ex.soonPairs.indexOf("ETH/XMR") < 0)
+            compare(ex.soonPairs.length, 14)
+            engine.calls = []
+            press("pair_ETH/XMR")
+            verify(ex.xmrPair); compare(ex.coin, "ETH"); compare(ex.base, "XMR")
+            verify(find(ex, "pair_ETH/XMR").active); verify(!find(ex, "pair_ETH").active)
+            compare(JSON.stringify(engine.calls[0]), JSON.stringify(["refreshXmr", "ETH"]))
+            // Only the Monero offer, priced per XMR (12 places)
+            compare(ex.book.asks.length, 1)
+            compare(ex.book.asks[0].xmz, 1.5)
+            compare(ex.book.asks[0].price.toFixed(6), "0.333333")
+            var f = find(ex, "exchangeForm")
+            compare(f.base, "XMR"); compare(f.places, 12)
+            compare(f.b("Amount, XMZ"), "Amount, XMR")
+            verify(find(ex, "exchangeForm").visible)
+            // A limit order to buy 0.25 XMR goes to the Monero market, in XMR
+            engine.calls = []
+            f.type = "limit"; f.side = "buy"
+            find(ex, "limitPrice").text = "0.3"
+            find(ex, "orderAmount").text = "0.25"
+            press("orderButton"); press("orderButton")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["postXmr", 11155111, "buy-xmz", "0.075", "0.25", 6, "0.1"]]))
+            // Back to the XMZ pair
+            ex.pick("SOL")
+            verify(!ex.xmrPair); compare(ex.base, "XMZ"); compare(find(ex, "exchangeForm").base, "XMZ")
+            engine.xmrMarketStatus = {}
         }
             function test_the_monero_wallet_shows_and_sends_from_the_funds_tab() {
             ex.bottomTab = "funds"

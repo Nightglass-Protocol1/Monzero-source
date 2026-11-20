@@ -6,6 +6,10 @@
 
 var XMZ_PLACES = 11
 var ATOMS = 1e11
+// The private coin of a pair: XMZ (11 decimal places) or Monero (XMR, 12). Every function that
+// turns atoms into coins takes `places`; absent, XMZ's.
+function placesOf(base) { return base === "XMR" ? 12 : XMZ_PLACES }
+function scale(places) { return Math.pow(10, places === undefined ? XMZ_PLACES : places) }
 // The longest an offer may stay open: 31 days (version-2 offers; a day for the first version)
 var MAX_HOURS = 31 * 24
 
@@ -54,23 +58,25 @@ function usd(value) {
 }
 
 // XMZ as text -> atoms (number), or -1 when it is not a positive XMZ amount with at most 11 decimals
-function xmzAtoms(text) {
-    var m = /^\s*([0-9]{1,9})(?:\.([0-9]{1,11}))?\s*$/.exec(String(text))
-    if (!m) return -1
+function xmzAtoms(text, places) {
+    var p = places === undefined ? XMZ_PLACES : places
+    var m = /^\s*([0-9]{1,9})(?:\.([0-9]{1,12}))?\s*$/.exec(String(text))
+    if (!m || (m[2] || "").length > p) return -1
     var frac = (m[2] || "")
-    while (frac.length < XMZ_PLACES) frac += "0"
-    var atoms = Number(m[1]) * ATOMS + Number(frac)
+    while (frac.length < p) frac += "0"
+    var atoms = Number(m[1]) * scale(p) + Number(frac)
     return atoms > 0 ? atoms : -1
 }
-function atomsText(atoms) { return units(String(Math.round(atoms)), XMZ_PLACES) }
+function atomsText(atoms, places) { return units(String(Math.round(atoms)), places === undefined ? XMZ_PLACES : places) }
 
 // Order book of one pair. Listings as EvmMarketJob shows them: {id, pair, side, valueWei,
 // xmzAtoms, minXmzAtoms?, maker, expiresAt}. A "sell-xmz" offer sells XMZ (an ask: you buy XMZ
 // from it), a "buy-xmz" offer buys XMZ (a bid: you sell XMZ to it). Prices are coin per XMZ.
-function book(listings, coin, decimals, myAccount, now) {
+function book(listings, coin, decimals, myAccount, now, base) {
     var asks = [], bids = []
     var me = String(myAccount || "").toLowerCase()
-    var pair = coin + "/XMZ"
+    var pair = coin + "/" + (base || "XMZ")
+    var ATOMS = scale(placesOf(base || "XMZ"))
     for (var i = 0; i < (listings || []).length; ++i) {
         var l = listings[i]
         if (String(l.pair).replace(/\s+/g, "") !== pair) continue
@@ -144,16 +150,18 @@ function planMarket(b, side, atoms, onlyId) {
 
 // Coin text for a limit order of `atoms` XMZ at `unitPrice` coin per XMZ, at most `decimals` places
 // (9 shown at most: smaller steps are not meaningful at these prices)
-function limitCoin(unitPrice, atoms, decimals) {
-    var v = unitPrice * atoms / ATOMS
+function limitCoin(unitPrice, atoms, decimals, places) {
+    var v = unitPrice * atoms / scale(places)
     if (!(v > 0) || !isFinite(v)) return ""
     return plain(v, Math.min(decimals, 9))
 }
 
 // A sensible smallest part for a new partial offer: a tenth, at least 1 XMZ, whole XMZ
-function defaultMin(atoms) {
-    var tenth = Math.floor(atoms / ATOMS / 10)
-    return Math.max(1, tenth)
+// (XMR: a tenth, at least 0.1 XMR, in tenths: the engine's smallest part is 1e11 atoms either way)
+function defaultMin(atoms, places) {
+    var least = 1e11 / scale(places)
+    var tenth = Math.floor(atoms / scale(places) / 10 / least) * least
+    return Number(plain(Math.max(least, tenth), 1))
 }
 
 // 24 h figures from hourly candles {t, o, h, l, c, v, vc, n} (relay format), `now` in seconds
@@ -307,7 +315,8 @@ function noirSteps(points, unit, coin, history, usdNow, interval, from, now) {
 }
 
 // Prints (relay format: {at, value (hex wei/lamports), xmz (atoms), tx, chainId}) -> newest first
-function trades(prints, decimals) {
+function trades(prints, decimals, places) {
+    var ATOMS = scale(places)
     var out = []
     for (var i = 0; i < (prints || []).length; ++i) {
         var p = prints[i]

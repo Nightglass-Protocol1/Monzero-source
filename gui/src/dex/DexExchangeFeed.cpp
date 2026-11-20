@@ -95,26 +95,30 @@ void DexExchangeFeed::get(const QStringList &bases,const QString &path,const QSt
     });
 }
 
+// "ETH" is the XMZ pair ETH/XMZ; "ETH/XMR" the Monero pair of the same coin
+static QString feedCoin(const QString &coin) {return coin.endsWith("/XMR") ? coin.section('/',0,0) : coin;}
+static QString feedPair(const QString &coin) {return coin.endsWith("/XMR") ? coin : coin+"/XMZ";}
+
 bool DexExchangeFeed::candles(const QString &coin,int interval) {
-    if (!knownCoin(coin) || !knownInterval(interval)) return false;
+    if (!knownCoin(feedCoin(coin)) || (coin.contains('/') && !coin.endsWith("/XMR")) || !knownInterval(interval)) return false;
     const auto key=QStringLiteral("candles:%1:%2").arg(coin).arg(interval);
     if (m_pending.value(key)) return true;
-    const auto relays=m_sources(coin).relays;
+    const auto relays=m_sources(feedCoin(coin)).relays;
     if (relays.isEmpty()) return false;
     m_pending.insert(key,true);
-    QUrlQuery q;q.addQueryItem("pair",coin+"/XMZ");q.addQueryItem("interval",QString::number(interval));
+    QUrlQuery q;q.addQueryItem("pair",feedPair(coin));q.addQueryItem("interval",QString::number(interval));
     get(relays,"/v1/candles?"+q.toString(QUrl::FullyEncoded),key);
     return true;
 }
 
 bool DexExchangeFeed::prints(const QString &coin) {
-    if (!knownCoin(coin)) return false;
+    if (!knownCoin(feedCoin(coin)) || (coin.contains('/') && !coin.endsWith("/XMR"))) return false;
     const auto key="prints:"+coin;
     if (m_pending.value(key)) return true;
-    const auto relays=m_sources(coin).relays;
+    const auto relays=m_sources(feedCoin(coin)).relays;
     if (relays.isEmpty()) return false;
     m_pending.insert(key,true);
-    QUrlQuery q;q.addQueryItem("pair",coin+"/XMZ");
+    QUrlQuery q;q.addQueryItem("pair",feedPair(coin));
     get(relays,"/v1/prints?"+q.toString(QUrl::FullyEncoded),key);
     return true;
 }

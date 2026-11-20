@@ -16,6 +16,9 @@ Rectangle {
     property int rows: 10
     property string pickedId: ""
     property var hovered: null
+    // The coin bought and sold: XMZ, or XMR on a Monero pair
+    property string base: "XMZ"
+    function b(t) { return base === "XMZ" ? t : String(t).replace(/XMZ/g, base) }
     signal picked(var row)
 
     readonly property color up: M.Style.green
@@ -39,12 +42,12 @@ Rectangle {
         RowLayout {
             Layout.fillWidth: true
             Text { text: qsTr("Price (%1)").arg(ob.coin); color: M.Style.dimmedFontColor; font.pixelSize: 11; Layout.fillWidth: true; Layout.preferredWidth: 3 }
-            Text { text: qsTr("XMZ"); color: M.Style.dimmedFontColor; font.pixelSize: 11; horizontalAlignment: Text.AlignRight; Layout.fillWidth: true; Layout.preferredWidth: 2 }
+            Text { text: ob.b(qsTr("XMZ")); color: M.Style.dimmedFontColor; font.pixelSize: 11; horizontalAlignment: Text.AlignRight; Layout.fillWidth: true; Layout.preferredWidth: 2 }
             Text { text: qsTr("Total %1").arg(ob.coin); color: M.Style.dimmedFontColor; font.pixelSize: 11; horizontalAlignment: Text.AlignRight; Layout.fillWidth: true; Layout.preferredWidth: 2 }
         }
         Text {
             visible: ob.book.asks.length === 0
-            text: qsTr("No one is selling XMZ for %1 right now").arg(ob.coin)
+            text: ob.b(qsTr("No one is selling XMZ for %1 right now")).arg(ob.coin)
             color: M.Style.dimmedFontColor; font.pixelSize: 12; Layout.topMargin: 6; Layout.bottomMargin: 6
         }
         Repeater { model: ob.asksShown; delegate: ob.rowDelegate }
@@ -77,12 +80,12 @@ Rectangle {
             wrapMode: Text.WordWrap; color: M.Style.dimmedFontColor; font.pixelSize: 11
             text: !ob.hovered ? qsTr("▪ taken whole only · • your offer · click an offer to trade it")
                 : (ob.hovered.mine ? qsTr("Your offer") + " · " : "")
-                  + (ob.hovered.partial ? qsTr("any part from %1 XMZ").arg(X.amount(ob.hovered.min, 2)) : qsTr("taken whole only"))
+                  + (ob.hovered.partial ? ob.b(qsTr("any part from %1 XMZ")).arg(X.amount(ob.hovered.min, 2)) : qsTr("taken whole only"))
                   + " · " + X.timeLeft(ob.hovered.expiresAt, Date.now() / 1000)
         }
         Text {
             visible: ob.book.bids.length === 0
-            text: qsTr("No one is buying XMZ with %1 right now").arg(ob.coin)
+            text: ob.b(qsTr("No one is buying XMZ with %1 right now")).arg(ob.coin)
             color: M.Style.dimmedFontColor; font.pixelSize: 12; Layout.topMargin: 6
         }
     }

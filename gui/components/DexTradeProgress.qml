@@ -38,24 +38,24 @@ Rectangle {
         var owner = {
             "Start": [1, false, qsTr("Waiting for your approval to lock your %1.").arg(coin)],
             "LockSent": [1, false, qsTr("Locking your %1 in the swap…").arg(coin)],
-            "Locked": [2, false, qsTr("Your %1 is locked. Waiting for the seller to lock their XMZ.").arg(coin)],
-            "ReadySent": [3, false, qsTr("The seller's XMZ is locked. Releasing the trade…")],
-            "Ready": [3, false, qsTr("The seller's XMZ is locked. Waiting for them to collect the %1, which hands you the XMZ.").arg(coin)],
-            "Sweeping": [3, false, qsTr("The seller collected. Moving your XMZ into your wallet…")],
-            "Done(Swapped)": [4, false, qsTr("Done. The XMZ is in your wallet.")],
+            "Locked": [2, false, card.b(qsTr("Your %1 is locked. Waiting for the seller to lock their XMZ.")).arg(coin)],
+            "ReadySent": [3, false, card.b(qsTr("The seller's XMZ is locked. Releasing the trade…"))],
+            "Ready": [3, false, card.b(qsTr("The seller's XMZ is locked. Waiting for them to collect the %1, which hands you the XMZ.")).arg(coin)],
+            "Sweeping": [3, false, card.b(qsTr("The seller collected. Moving your XMZ into your wallet…"))],
+            "Done(Swapped)": [4, false, card.b(qsTr("Done. The XMZ is in your wallet."))],
             "RefundSent": [2, true, qsTr("The trade did not finish in time. Refunding your %1…").arg(coin)],
             "Done(Refunded)": [2, true, qsTr("Refunded. Your %1 is back in your account.").arg(coin), true],
             "Done(Aborted)": [1, true, qsTr("Cancelled before anything was locked. Nothing moved."), true]
         }
         var claimer = {
             "WaitingForEvmLock": [1, false, qsTr("Waiting for the buyer to lock their %1.").arg(coin)],
-            "XmzLockSent": [2, false, qsTr("The buyer's %1 is locked. Locking your XMZ…").arg(coin)],
-            "XmzLocked": [2, false, qsTr("Your XMZ is locked. Waiting for the buyer to confirm it.")],
+            "XmzLockSent": [2, false, card.b(qsTr("The buyer's %1 is locked. Locking your XMZ…")).arg(coin)],
+            "XmzLocked": [2, false, card.b(qsTr("Your XMZ is locked. Waiting for the buyer to confirm it."))],
             "ClaimSent": [3, false, qsTr("Collecting your %1…").arg(coin)],
             "Done(Swapped)": [4, false, qsTr("Done. The %1 is in your account.").arg(coin)],
-            "WaitingForRefund": [3, true, qsTr("Too close to the deadline to collect safely. Your XMZ comes back after the refund time.")],
-            "SweepingBack": [3, true, qsTr("The buyer took their refund. Taking your XMZ back…")],
-            "Done(Refunded)": [3, true, qsTr("Refunded. Your XMZ is back in your wallet."), true],
+            "WaitingForRefund": [3, true, card.b(qsTr("Too close to the deadline to collect safely. Your XMZ comes back after the refund time."))],
+            "SweepingBack": [3, true, card.b(qsTr("The buyer took their refund. Taking your XMZ back…"))],
+            "Done(Refunded)": [3, true, card.b(qsTr("Refunded. Your XMZ is back in your wallet.")), true],
             "Done(Aborted)": [1, true, qsTr("Cancelled before anything was locked. Nothing moved."), true]
         }
         var row = (role === "owner" ? owner : claimer)[stage]
@@ -80,7 +80,10 @@ Rectangle {
         return Qt.formatDateTime(new Date(t * 1000), "d MMM, HH:mm")
     }
     readonly property string coinAmount: snapshot.offer ? atomic(snapshot.offer.value, coinDecimals) + " " + coin : ""
-    readonly property string xmzAmount: snapshot.offer ? atomic(snapshot.offer.xmzAmount, 11) + " XMZ" : ""
+    // The trade's private coin: XMZ, or XMR on a Monero pair (12 places)
+    readonly property string base: snapshot.offer && snapshot.offer.privateCoin === "XMR" ? "XMR" : "XMZ"
+    function b(t) { return base === "XMZ" ? t : String(t).replace(/XMZ/g, base) }
+    readonly property string xmzAmount: snapshot.offer ? atomic(snapshot.offer.xmzAmount, base === "XMR" ? 12 : 11) + " " + base : ""
 
     ColumnLayout {
         id: column
@@ -118,8 +121,8 @@ Rectangle {
             spacing: 6
             Repeater {
                 model: card.buyer
-                    ? [qsTr("Agreed"), qsTr("You lock %1").arg(card.coin), qsTr("Seller locks XMZ"), qsTr("XMZ arrives")]
-                    : [qsTr("Agreed"), qsTr("Buyer locks %1").arg(card.coin), qsTr("You lock XMZ"), qsTr("%1 arrives").arg(card.coin)]
+                    ? [qsTr("Agreed"), qsTr("You lock %1").arg(card.coin), card.b(qsTr("Seller locks XMZ")), card.b(qsTr("XMZ arrives"))]
+                    : [qsTr("Agreed"), qsTr("Buyer locks %1").arg(card.coin), card.b(qsTr("You lock XMZ")), qsTr("%1 arrives").arg(card.coin)]
                 delegate: ColumnLayout {
                     objectName: "step_" + index
                     // done: before the current step; current: the step in progress
@@ -159,7 +162,7 @@ Rectangle {
                 var d = card.snapshot.deadlines
                 if (!d || !card.when(d.timeout2)) return ""
                 return card.buyer ? qsTr("If the trade doesn't finish, your %1 can be refunded from %2.").arg(card.coin).arg(card.when(d.timeout2))
-                                  : qsTr("The %1 must be collected before %2; after that your XMZ comes back.").arg(card.coin).arg(card.when(d.timeout2))
+                                  : card.b(qsTr("The %1 must be collected before %2; after that your XMZ comes back.")).arg(card.coin).arg(card.when(d.timeout2))
             }
         }
 

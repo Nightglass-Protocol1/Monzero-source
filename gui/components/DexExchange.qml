@@ -28,7 +28,12 @@ ColumnLayout {
     readonly property bool xmrShown: xmrWallet.state !== undefined && xmrWallet.state !== "unconfigured"
     readonly property var markets: (dex && dex.evmMarketStatus) || ({})
     readonly property var trade: (dex && dex.evmTradeStatus) || ({})
-    readonly property var market: markets[coin] || ({})
+    // Monero (XMR) against the same coins: their own markets, on the app's Monero wallet
+    readonly property var xmrMarkets: (dex && dex.xmrMarketStatus) || ({})
+    property string base: "XMZ"            // the coin bought and sold on the shown pair: XMZ, or XMR
+    readonly property bool xmrPair: base === "XMR"
+    readonly property string dataKey: xmrPair ? coin + "/XMR" : coin   // its chart and swaps
+    readonly property var market: (xmrPair ? xmrMarkets : markets)[coin] || ({})
     // Coin-for-coin trades (ETH, BNB, SOL straight across): their own tab, when this wallet has them
     readonly property var direct: (dex && dex.directMarketStatus) || ({})
     readonly property bool directMode: coin === "DIRECT" && direct.configured === true
@@ -47,12 +52,16 @@ ColumnLayout {
         "ETH/USDT", "ETH/USDT-BSC", "BNB/USDT", "BNB/USDT-BSC", "SOL/USDT", "SOL/USDT-BSC",
         "ETH/XMR", "BNB/XMR", "SOL/XMR", "USDT/XMR", "USDT-BSC/XMR", "XMR/XMZ"]
     readonly property var livePairs: direct.configured === true ? (direct.pairs || []) : []
-    readonly property var soonPairs: announcedPairs.filter(function (p) { return livePairs.indexOf(p) < 0 })
+    // "USDT/XMR" -> "USDT": the coin of a Monero pair ("" for XMR/XMZ, which is two swaps)
+    function xmrCoinOf(p) { var x = String(p).split("/"); return x[1] === "XMR" ? x[0] : "" }
+    readonly property var xmrLive: announcedPairs.filter(function (p) { var c = xmrCoinOf(p); return c !== "" && (xmrMarkets[c] || {}).configured === true })
+    readonly property var soonPairs: announcedPairs.filter(function (p) { return livePairs.indexOf(p) < 0 && xmrLive.indexOf(p) < 0 })
     property string soonPair: ""            // the coming-soon pair picked in the pair row
     readonly property bool soonMode: coin === "SOON"
     // The XMZ pair screens (stats, chart, book, form, orders) give way to a direct or coming-soon pair
     readonly property bool pairMode: directMode || soonMode
     function pickSoon(p) { soonPair = p; pick("SOON") }
+    function pickXmr(p) { pick(xmrCoinOf(p), "XMR") }
     readonly property bool keysReady: wallet.keysReady === true
     // USDT (on Solana) appears once the wallet runs its market
     readonly property var allCoins: ["ETH", "BNB", "SOL"].concat(markets.USDT ? ["USDT"] : []).concat(markets["USDT-BSC"] ? ["USDT-BSC"] : [])
@@ -96,20 +105,22 @@ ColumnLayout {
         return m
     }
 
-    readonly property var book: X.book(market.listings || [], coin, coinDecimals, myAccount, now)
-    readonly property var stats: X.dayStats(candles[coin] || [], now)
+    readonly property var book: X.book(market.listings || [], coin, coinDecimals, myAccount, now, base)
+    readonly property var stats: X.dayStats(candles[dataKey] || [], now)
     readonly property real coinUsd: usd[coin] || (coin === "USDT" || coin === "USDT-BSC" ? 1 : 0)
     readonly property real xmzBalance: wallet.state === "ready" && wallet.unlocked !== undefined ? Number(wallet.unlocked) : -1
+    readonly property real xmrBalance: xmrWallet.state === "ready" && xmrWallet.unlocked !== undefined ? Number(xmrWallet.unlocked) : -1
     readonly property real coinBalance: balances[coin] !== undefined ? balances[coin] : -1
     readonly property var myOrders: {
         var out = []
-        for (var i = 0; i < allCoins.length; ++i) {
-            var mine = (markets[allCoins[i]] || {}).mine || []
+        var sets = [[markets, "XMZ"], [xmrMarkets, "XMR"]]
+        for (var s = 0; s < sets.length; ++s) for (var i = 0; i < allCoins.length; ++i) {
+            var mine = (sets[s][0][allCoins[i]] || {}).mine || []
             for (var j = 0; j < mine.length; ++j) {
                 var o = mine[j]
                 if (o.state === "renewed") continue
                 if ((o.state === "cancelled" || o.state === "withdrawn") && Number(o.expiresAt) < now - 86400) continue
-                out.push({ coin: allCoins[i], kind: o.kind, state: o.state, side: o.side, xmz: o.xmz, amount: o.coin, price: o.price,
+                out.push({ coin: allCoins[i], base: sets[s][1], kind: o.kind, state: o.state, side: o.side, xmz: o.xmz, amount: o.coin, price: o.price,
                            expiresAt: Number(o.expiresAt), folder: o.folder, detail: o.detail || "", renew: o.renew === true })
             }
         }
@@ -161,6 +172,10 @@ ColumnLayout {
             if (d["prints:" + c]) ps[c] = X.trades(d["prints:" + c], decimalsOf(c))
             if (d["balance:" + c] !== undefined) bs[c] = Number(d["balance:" + c]) / Math.pow(10, decimalsOf(c))
         }
+        if (xmrPair) {
+            if (d["candles:" + dataKey + ":3600"]) cs[dataKey] = d["candles:" + dataKey + ":3600"]
+            if (d["prints:" + dataKey]) ps[dataKey] = X.trades(d["prints:" + dataKey], decimalsOf(coin), 12)
+        }
         candles = cs; prints = ps; balances = bs
         if (d.usd) usd = d.usd
         if (d.usdHistory) usdHistory = d.usdHistory
@@ -196,16 +211,17 @@ ColumnLayout {
     }
     function loadCandles(c) {
         if (feed) { feed.candles(c, 3600); return }
-        relayGet("/v1/candles?interval=3600&pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
+        relayGet("/v1/candles?interval=3600&pair=" + encodeURIComponent(c.indexOf("/") > 0 ? c : c + "/XMZ"), function (d) {
             if (!d || !d.candles) return
             var m = JSON.parse(JSON.stringify(ex.candles)); m[c] = d.candles; ex.candles = m
         })
     }
     function loadPrints(c) {
         if (feed) { feed.prints(c); return }
-        relayGet("/v1/prints?pair=" + encodeURIComponent(c + "/XMZ"), function (d) {
+        relayGet("/v1/prints?pair=" + encodeURIComponent(c.indexOf("/") > 0 ? c : c + "/XMZ"), function (d) {
             if (!d || !d.prints) return
-            var m = JSON.parse(JSON.stringify(ex.prints)); m[c] = X.trades(d.prints, decimalsOf(c)); ex.prints = m
+            var coin = c.split("/")[0], places = c.indexOf("/XMR") > 0 ? 12 : 11
+            var m = JSON.parse(JSON.stringify(ex.prints)); m[c] = X.trades(d.prints, decimalsOf(coin), places); ex.prints = m
         })
     }
     function loadNoir() {
@@ -252,18 +268,21 @@ ColumnLayout {
     }
     function refreshOffers() {
         if (directMode) { dex.refreshDirectOffers(); return }
+        if (xmrPair) { if (market.configured === true && market.busy !== true) dex.refreshXmrOffers(coin); return }
         if (market.configured === true && market.busy !== true) dex.refreshEvmOffers(coin + "/XMZ")
     }
     function refreshAll() {
         // Every pair's swaps: the chart shows them all in USD
         for (var i = 0; i < allCoins.length; ++i) { loadCandles(allCoins[i]); loadBalance(allCoins[i]); loadPrints(allCoins[i]) }
+        if (xmrPair) { loadCandles(dataKey); loadPrints(dataKey) }
     }
-    function pick(c) {
-        if (c === coin) return
-        coin = c; pickedId = ""; localError = ""
+    function pick(c, b) {
+        b = b || "XMZ"
+        if (c === coin && b === base) return
+        coin = c; base = b; pickedId = ""; localError = ""
         if (c === "SOON") { return }
         if (c === "DIRECT") { var cs = direct.chains || []; for (var i = 0; i < cs.length; ++i) loadBalance(cs[i].coin) }
-        else { loadPrints(c); loadBalance(c) }
+        else { loadPrints(dataKey); loadBalance(c); if (xmrPair) loadCandles(dataKey) }
         refreshOffers()
     }
     function setWithdrawTo(c, address) {
@@ -312,7 +331,7 @@ ColumnLayout {
             model: ex.allCoins
             delegate: Rectangle {
                 objectName: "pair_" + modelData
-                readonly property bool active: ex.coin === modelData
+                readonly property bool active: ex.coin === modelData && !ex.xmrPair
                 readonly property var st: X.dayStats(ex.candles[modelData] || [], ex.now)
                 width: 136; height: 44; radius: 6
                 color: active ? M.Style.surfaceRaised : "transparent"
@@ -351,6 +370,26 @@ ColumnLayout {
                     Text { text: offers > 0 ? qsTr("%n offer(s)", "", offers) : qsTr("coin for coin"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pickDirect(modelData) }
+            }
+        }
+        // Monero pairs trading in this wallet
+        Repeater {
+            model: ex.xmrLive
+            delegate: Rectangle {
+                objectName: "pair_" + modelData
+                readonly property string pairCoin: ex.xmrCoinOf(modelData)
+                readonly property bool active: ex.xmrPair && ex.coin === pairCoin
+                readonly property int offers: ((ex.xmrMarkets[pairCoin] || {}).listings || []).filter(function (l) { return l.expiresAt > ex.now }).length
+                width: 136; height: 44; radius: 6
+                color: active ? M.Style.surfaceRaised : "transparent"
+                border.color: active ? M.Style.accent : M.Style.accentMuted
+                Column {
+                    anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
+                    spacing: 2
+                    Text { text: ex.directLabel(modelData); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    Text { text: offers > 0 ? qsTr("%n offer(s)", "", offers) : qsTr("Monero"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
+                }
+                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pickXmr(modelData) }
             }
         }
         // Announced pairs not trading here yet
@@ -484,7 +523,7 @@ ColumnLayout {
                     { k: qsTr("24h change"), v: isNaN(ex.stats.change) ? "—" : (ex.stats.change >= 0 ? "+" : "") + ex.stats.change.toFixed(2) + "%", c: isNaN(ex.stats.change) ? "" : ex.stats.change >= 0 ? "up" : "down" },
                     { k: qsTr("24h high"), v: ex.stats.high > 0 ? X.price(ex.stats.high) : "—" },
                     { k: qsTr("24h low"), v: ex.stats.low > 0 ? X.price(ex.stats.low) : "—" },
-                    { k: qsTr("24h volume"), v: X.amount(ex.stats.volume, 0) + " XMZ", s: ex.stats.volumeCoin > 0 ? X.plain(ex.stats.volumeCoin, 4) + " " + ex.coin : "" },
+                    { k: qsTr("24h volume"), v: X.amount(ex.stats.volume, ex.xmrPair ? 4 : 0) + " " + ex.base, s: ex.stats.volumeCoin > 0 ? X.plain(ex.stats.volumeCoin, 4) + " " + ex.coin : "" },
                     { k: qsTr("Best bid"), v: ex.book.bestBid > 0 ? X.price(ex.book.bestBid) : "—", c: "up" },
                     { k: qsTr("Best ask"), v: ex.book.bestAsk > 0 ? X.price(ex.book.bestAsk) : "—", c: "down" }
                 ]
@@ -524,14 +563,16 @@ ColumnLayout {
             Layout.preferredHeight: grid.columns === 3 ? Math.max(460, book.implicitHeight) : 380
             Layout.alignment: Qt.AlignTop
             coin: ex.coin
-            coins: ex.allCoins
-            trades: ex.prints
+            base: ex.base
+            // A Monero pair: its own swaps only (the USD view of all pairs is XMZ's)
+            coins: ex.xmrPair ? [ex.coin] : ex.allCoins
+            trades: { if (!ex.xmrPair) return ex.prints; var t = {}; t[ex.coin] = ex.prints[ex.dataKey] || []; return t }
             usd: ex.usd
             usdHistory: ex.usdHistory
             interval: ex.interval
             bestBid: ex.book.bestBid
             bestAsk: ex.book.bestAsk
-            noir: ex.noir
+            noir: ex.xmrPair ? null : ex.noir
             loading: Object.keys(ex.prints).length === 0
             now: ex.now
             onIntervalPicked: ex.interval = seconds
@@ -543,6 +584,7 @@ ColumnLayout {
             Layout.preferredWidth: grid.columns === 3 ? 330 : -1
             Layout.alignment: Qt.AlignTop
             coin: ex.coin
+            base: ex.base
             book: ex.book
             lastPrice: ex.stats.last
             coinUsd: ex.coinUsd
@@ -560,15 +602,16 @@ ColumnLayout {
             Layout.preferredWidth: grid.columns === 3 ? 340 : -1
             Layout.alignment: Qt.AlignTop
             coin: ex.coin
+            base: ex.base
             coinDecimals: ex.coinDecimals
             book: ex.book
             coinUsd: ex.coinUsd
             coinBalance: ex.coinBalance
-            xmzBalance: ex.xmzBalance
+            xmzBalance: ex.xmrPair ? ex.xmrBalance : ex.xmzBalance
             blockedReason: ex.blockedReason !== "" ? ex.blockedReason
                          : form.type === "market" && ex.tradeRunning ? qsTr("Finish your current trade first") : ""
             limitCheck: ex.chainId > 0 && typeof ex.dex.evmOrderRefusal === "function"
-                        ? function (coinText, xmzText) { return ex.dex.evmOrderRefusal(ex.chainId, coinText, xmzText) } : null
+                        ? function (coinText, xmzText) { return ex.xmrPair ? ex.dex.xmrOrderRefusal(ex.chainId, coinText, xmzText) : ex.dex.evmOrderRefusal(ex.chainId, coinText, xmzText) } : null
             limitTick: ex.riskTick
             busy: ex.market.busy === true
             message: ex.localError !== "" ? ex.localError : (ex.market.message || "")
@@ -581,7 +624,8 @@ ColumnLayout {
             }
             onPostRequested: {
                 ex.localError = ""
-                if (ex.dex.postEvmOffer(ex.chainId, side, coinAmount, xmz, hours, minXmz, renew)) ex.bottomTab = "orders"
+                if (ex.xmrPair ? ex.dex.postXmrOffer(ex.chainId, side, coinAmount, xmz, hours, minXmz, renew)
+                               : ex.dex.postEvmOffer(ex.chainId, side, coinAmount, xmz, hours, minXmz, renew)) ex.bottomTab = "orders"
                 else if (!(ex.market.message || "")) ex.localError = qsTr("The offer could not be posted now.")
             }
         }
@@ -673,7 +717,7 @@ ColumnLayout {
                     delegate: RowLayout {
                         Layout.fillWidth: true
                         readonly property bool buys: (modelData.kind === "offer") === (modelData.side === "buy-xmz")
-                        Text { text: "XMZ/" + ex.label(modelData.coin); font.pixelSize: 13; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 2 }
+                        Text { text: (modelData.base || "XMZ") + "/" + ex.label(modelData.coin); font.pixelSize: 13; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 2 }
                         Text { text: (parent.buys ? qsTr("Buy") : qsTr("Sell")) + " · " + (modelData.kind === "offer" ? qsTr("limit") : qsTr("market"))
                                font.pixelSize: 13; color: parent.buys ? M.Style.green : "#E5677A"; Layout.fillWidth: true; Layout.preferredWidth: 3 }
                         Text { text: modelData.price || "—"; font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
@@ -722,7 +766,7 @@ ColumnLayout {
             ColumnLayout {
                 Layout.fillWidth: true; spacing: 4
                 visible: ex.bottomTab === "trades"
-                readonly property var list: (ex.prints[ex.coin] || []).slice(0, 30)
+                readonly property var list: (ex.prints[ex.dataKey] || []).slice(0, 30)
                 RowLayout {
                     Layout.fillWidth: true
                     visible: parent.list.length > 0
@@ -744,7 +788,7 @@ ColumnLayout {
                 }
                 Text {
                     visible: parent.list.length === 0
-                    text: qsTr("No completed XMZ/%1 swaps yet.").arg(ex.coin)
+                    text: qsTr("No completed %2/%1 swaps yet.").arg(ex.coin).arg(ex.base)
                     font.pixelSize: 13; color: M.Style.dimmedFontColor
                 }
             }

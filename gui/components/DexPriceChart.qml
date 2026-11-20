@@ -14,6 +14,9 @@ import "dexExchange.js" as X
 Rectangle {
     id: chart
     property string coin: "ETH"
+    // The coin priced: XMZ, or XMR on a Monero pair
+    property string base: "XMZ"
+    function b(t) { return base === "XMZ" ? t : String(t).replace(/XMZ/g, base) }
     property var coins: ["ETH"]              // the pairs shown in USD
     property var trades: ({})                // coin -> completed swaps (as from X.trades)
     property var usd: ({})                   // coin -> USD price now
@@ -76,7 +79,7 @@ Rectangle {
             spacing: 6
             Text {
                 text: chart.hoverT >= 0 ? chart.readout()
-                      : chart.inUsd ? qsTr("Price of 1 XMZ in USD · all pairs") : qsTr("Price of 1 XMZ in %1").arg(chart.coinName)
+                      : chart.inUsd ? chart.b(qsTr("Price of 1 XMZ in USD · all pairs")) : chart.b(qsTr("Price of 1 XMZ in %1")).arg(chart.coinName)
                 color: M.Style.dimmedFontColor; font.pixelSize: 12; font.family: M.Style.fontMonoRegular.name
                 Layout.fillWidth: true; elide: Text.ElideRight
             }
@@ -87,8 +90,8 @@ Rectangle {
                 Text {
                     text: chart.noir && chart.noir.stale ? qsTr("NoirTrade (old)") : qsTr("NoirTrade")
                     color: M.Style.dimmedFontColor; font.pixelSize: 12
-                    M.Tooltip { id: noirTip; anchors.fill: parent; text: chart.inUsd ? qsTr("The last trade on NoirTrade (XMZ/USDT)")
-                                                                                   : qsTr("The last trade on NoirTrade (XMZ/USDT), in %1 at its USD price then").arg(chart.coinName) }
+                    M.Tooltip { id: noirTip; anchors.fill: parent; text: chart.inUsd ? chart.b(qsTr("The last trade on NoirTrade (XMZ/USDT)"))
+                                                                                   : chart.b(qsTr("The last trade on NoirTrade (XMZ/USDT), in %1 at its USD price then")).arg(chart.coinName) }
                     MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: noirTip.tooltipPopup.open(); onExited: noirTip.tooltipPopup.close() }
                 }
             }
@@ -156,7 +159,7 @@ Rectangle {
                 horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
                 color: M.Style.dimmedFontColor; font.pixelSize: 13
                 text: chart.loading ? qsTr("Loading the chart…")
-                      : (chart.inUsd ? qsTr("No completed swaps in this time range yet.") : qsTr("No completed %1/XMZ swaps in this time range yet.").arg(chart.coinName))
+                      : (chart.inUsd ? qsTr("No completed swaps in this time range yet.") : chart.b(qsTr("No completed %1/XMZ swaps in this time range yet.")).arg(chart.coinName))
                         + (chart.noirLine.length ? " " + qsTr("The amber line is NoirTrade.") : "")
                         + (chart.bid > 0 || chart.ask > 0 ? " " + qsTr("The dashed lines are the best offers now.") : "")
             }
@@ -191,11 +194,11 @@ Rectangle {
             var c = chart.candles[chart.hover], change = c.o > 0 ? (c.c - c.o) / c.o * 100 : 0
             return Qt.formatDateTime(new Date(c.t * 1000), fmt) + "  O " + X.price(c.o) + "  H " + X.price(c.h) + "  L " + X.price(c.l)
                  + "  C " + X.price(c.c) + "  " + (change >= 0 ? "+" : "") + change.toFixed(2) + "%  "
-                 + qsTr("%n swap(s)", "", c.n) + ", " + qsTr("%1 XMZ").arg(X.amount(c.v, 0)) + noirText
+                 + qsTr("%n swap(s)", "", c.n) + ", " + chart.b(qsTr("%1 XMZ")).arg(X.amount(c.v, 0)) + noirText
         }
         if (chart.drawn === "trades" && chart.hover >= 0 && chart.hover < chart.shown.length) {
             var s = chart.shown[chart.hover]
-            return Qt.formatDateTime(new Date(s.t * 1000), "d MMM HH:mm") + "  " + qsTr("%1 XMZ at %2").arg(X.amount(s.xmz, 2)).arg(money(s.p))
+            return Qt.formatDateTime(new Date(s.t * 1000), "d MMM HH:mm") + "  " + chart.b(qsTr("%1 XMZ at %2")).arg(X.amount(s.xmz, 2)).arg(money(s.p))
                  + (chart.inUsd ? "  (" + (s.coin === "USDT-BSC" ? "USDT on BNB Chain" : s.coin) + ")" : "") + noirText
         }
         return Qt.formatDateTime(new Date(chart.hoverT * 1000), fmt) + noirText

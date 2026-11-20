@@ -16,6 +16,13 @@ Rectangle {
     property real coinUsd: 0
     property real coinBalance: -1          // the trade account's coin (-1: not known yet)
     property real xmzBalance: -1           // the trading wallet's unlocked XMZ (-1: not known yet)
+    // The coin bought and sold: XMZ, or Monero on an XMR pair (12 places; the smallest part 0.1 XMR)
+    property string base: "XMZ"
+    readonly property int places: X.placesOf(base)
+    readonly property real unit: Math.pow(10, places)
+    readonly property real leastPart: 1e11 / unit
+    // A text written for XMZ, for this pair's coin
+    function b(t) { return base === "XMZ" ? t : String(t).replace(/XMZ/g, base) }
     property string blockedReason: ""      // why no order can be placed now ("" when it can)
     // function(coinText, xmzText) -> why the operator caps refuse an order of that size ("" when allowed)
     property var limitCheck: null
@@ -33,11 +40,11 @@ Rectangle {
 
     readonly property bool buying: side === "buy"
     readonly property color sideColor: buying ? M.Style.green : "#E5677A"
-    readonly property real amountAtoms: X.xmzAtoms(amountInput.text)
+    readonly property real amountAtoms: X.xmzAtoms(amountInput.text, places)
     readonly property var plan: type === "market" ? X.planMarket(book, side, amountAtoms, pickedId) : null
     readonly property real limitPrice: Number(priceInput.text)
-    readonly property string limitCoin: amountAtoms > 0 && limitPrice > 0 ? X.limitCoin(limitPrice, amountAtoms, coinDecimals) : ""
-    readonly property real minXmz: partialToggle.on ? Number(minInput.text || X.defaultMin(amountAtoms)) : 0
+    readonly property string limitCoin: amountAtoms > 0 && limitPrice > 0 ? X.limitCoin(limitPrice, amountAtoms, coinDecimals, places) : ""
+    readonly property real minXmz: partialToggle.on ? Number(minInput.text || X.defaultMin(amountAtoms, places)) : 0
     // How long a limit order stays open: a preset, or custom (an amount in hours or days)
     property int presetHours: 6
     property bool customLife: false
@@ -48,20 +55,20 @@ Rectangle {
     readonly property real payCoin: type === "market" ? (plan && plan.ok ? plan.coin : 0) : Number(limitCoin || 0)
     readonly property string problem: {
         if (blockedReason !== "") return blockedReason
-        if (amountInput.text.trim() === "") return qsTr("Enter the XMZ amount")
-        if (amountAtoms <= 0) return qsTr("Check the XMZ amount")
+        if (amountInput.text.trim() === "") return b(qsTr("Enter the XMZ amount"))
+        if (amountAtoms <= 0) return b(qsTr("Check the XMZ amount"))
         if (type === "market") {
             if (!plan || !plan.ok) return ""
             if (buying && coinBalance >= 0 && plan.coin > coinBalance) return ""   // funded during the trade: a note, not a block
-            if (!buying && xmzBalance >= 0 && plan.atoms / 1e11 > xmzBalance) return qsTr("Not enough XMZ in your trading wallet")
-            return capProblem(X.plain(plan.coin, coinDecimals), X.atomsText(plan.atoms))
+            if (!buying && xmzBalance >= 0 && plan.atoms / unit > xmzBalance) return b(qsTr("Not enough XMZ in your trading wallet"))
+            return capProblem(X.plain(plan.coin, coinDecimals), X.atomsText(plan.atoms, places))
         }
         if (!(limitPrice > 0)) return qsTr("Enter your price")
         if (hours < 1) return qsTr("An offer stays open from 1 hour to 31 days")
         if (limitCoin === "" || Number(limitCoin) <= 0) return qsTr("The total is too small")
-        if (partialToggle.on && (!(minXmz >= 1) || minXmz * 1e11 > amountAtoms)) return qsTr("The smallest part must be at least 1 XMZ and at most the amount")
-        if (!buying && xmzBalance >= 0 && amountAtoms / 1e11 > xmzBalance) return qsTr("Not enough XMZ in your trading wallet")
-        return capProblem(limitCoin, X.atomsText(amountAtoms))
+        if (partialToggle.on && (!(minXmz >= leastPart) || minXmz * unit > amountAtoms)) return b(qsTr("The smallest part must be at least %1 XMZ and at most the amount").arg(leastPart))
+        if (!buying && xmzBalance >= 0 && amountAtoms / unit > xmzBalance) return b(qsTr("Not enough XMZ in your trading wallet"))
+        return capProblem(limitCoin, X.atomsText(amountAtoms, places))
     }
     function capProblem(coinText, xmzText) {
         limitTick   // re-check when the caps document changes
@@ -73,7 +80,7 @@ Rectangle {
     readonly property string note: matchNote()
     readonly property bool suggestionShown: type === "market" && !!plan && !plan.ok && !!plan.suggestion && amountInput.text.trim() !== ""
 
-    function setAmount(atoms) { amountInput.text = X.atomsText(atoms) }
+    function setAmount(atoms) { amountInput.text = X.atomsText(atoms, places) }
     function fillFrom(row) {
         // A picked offer: trade against it now, for all of it or the part you choose
         side = row.side === "sell-xmz" ? "buy" : "sell"
@@ -86,10 +93,10 @@ Rectangle {
         if (buying) {
             var price = type === "limit" ? limitPrice : book.bestAsk
             if (!(coinBalance > 0) || !(price > 0)) return
-            setAmount(Math.floor(coinBalance * p / price * 1e11 / 1e9) * 1e9)      // to 0.01 XMZ, down
+            setAmount(Math.floor(coinBalance * p / price * unit / (unit / 100)) * (unit / 100))      // to 0.01 XMZ, down
         } else {
             if (!(xmzBalance > 0)) return
-            setAmount(Math.floor(xmzBalance * p * 1e11 / 1e9) * 1e9)
+            setAmount(Math.floor(xmzBalance * p * unit / (unit / 100)) * (unit / 100))
         }
     }
     onSideChanged: { reviewing = false; if (type === "limit") priceInput.text = defaultPrice() }
@@ -117,7 +124,7 @@ Rectangle {
             Layout.fillWidth: true
             spacing: 0
             Repeater {
-                model: [ { k: "buy", t: qsTr("Buy XMZ"), c: M.Style.green }, { k: "sell", t: qsTr("Sell XMZ"), c: "#E5677A" } ]
+                model: [ { k: "buy", t: b(qsTr("Buy XMZ")), c: M.Style.green }, { k: "sell", t: b(qsTr("Sell XMZ")), c: "#E5677A" } ]
                 delegate: Rectangle {
                     objectName: "side_" + modelData.k
                     Layout.fillWidth: true; implicitHeight: 38
@@ -148,9 +155,9 @@ Rectangle {
         Text {
             Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor
             text: form.type === "market"
-                  ? (form.buying ? qsTr("Buy now from the best offer selling XMZ.") : qsTr("Sell now to the best offer buying XMZ."))
-                  : (form.buying ? qsTr("Post an offer to buy XMZ at your price. It waits in the book until someone takes it.")
-                                 : qsTr("Post an offer to sell XMZ at your price. It waits in the book until someone takes it."))
+                  ? (form.buying ? b(qsTr("Buy now from the best offer selling XMZ.")) : b(qsTr("Sell now to the best offer buying XMZ.")))
+                  : (form.buying ? b(qsTr("Post an offer to buy XMZ at your price. It waits in the book until someone takes it."))
+                                 : b(qsTr("Post an offer to sell XMZ at your price. It waits in the book until someone takes it.")))
         }
 
         // Price (limit only)
@@ -159,9 +166,9 @@ Rectangle {
             visible: form.type === "limit"
             RowLayout {
                 Layout.fillWidth: true
-                Text { text: qsTr("Price, %1 per XMZ").arg(form.coin); font.pixelSize: 12; color: M.Style.dimmedFontColor; Layout.fillWidth: true }
+                Text { text: b(qsTr("Price, %1 per XMZ")).arg(form.coin); font.pixelSize: 12; color: M.Style.dimmedFontColor; Layout.fillWidth: true }
                 Text {
-                    text: form.coinUsd > 0 && form.limitPrice > 0 ? "≈ " + X.usd(form.limitPrice * form.coinUsd) + qsTr(" per XMZ") : ""
+                    text: form.coinUsd > 0 && form.limitPrice > 0 ? "≈ " + X.usd(form.limitPrice * form.coinUsd) + b(qsTr(" per XMZ")) : ""
                     font.pixelSize: 12; color: M.Style.dimmedFontColor
                 }
             }
@@ -191,18 +198,18 @@ Rectangle {
             Layout.fillWidth: true; spacing: 4
             RowLayout {
                 Layout.fillWidth: true
-                Text { text: qsTr("Amount, XMZ"); font.pixelSize: 12; color: M.Style.dimmedFontColor; Layout.fillWidth: true }
+                Text { text: b(qsTr("Amount, XMZ")); font.pixelSize: 12; color: M.Style.dimmedFontColor; Layout.fillWidth: true }
                 Text {
                     objectName: "available"
                     font.pixelSize: 12; color: M.Style.dimmedFontColor
                     text: form.buying ? qsTr("Available: %1 %2").arg(form.coinBalance >= 0 ? X.amount(form.coinBalance, 6) : "…").arg(form.coin)
-                                      : qsTr("Available: %1 XMZ").arg(form.xmzBalance >= 0 ? X.amount(form.xmzBalance, 2) : "…")
+                                      : b(qsTr("Available: %1 XMZ")).arg(form.xmzBalance >= 0 ? X.amount(form.xmzBalance, 2) : "…")
                 }
             }
             M.LineEdit {
                 id: amountInput; objectName: "orderAmount"
                 Layout.fillWidth: true; fontSize: 15; inputPaddingTop: 8; inputPaddingBottom: 8
-                placeholderText: "XMZ"; placeholderFontSize: 15
+                placeholderText: form.base; placeholderFontSize: 15
                 validator: RegExpValidator { regExp: /^[0-9]{0,9}(\.[0-9]{0,11})?$/ }
                 onTextChanged: form.reviewing = false
             }
@@ -239,10 +246,10 @@ Rectangle {
                     id: minInput; objectName: "minPart"
                     visible: partialToggle.on
                     Layout.preferredWidth: 90; Layout.maximumHeight: 34; fontSize: 13; inputPaddingTop: 4; inputPaddingBottom: 4
-                    placeholderText: form.amountAtoms > 0 ? String(X.defaultMin(form.amountAtoms)) : "1"; placeholderFontSize: 13
+                    placeholderText: form.amountAtoms > 0 ? String(X.defaultMin(form.amountAtoms, form.places)) : "1"; placeholderFontSize: 13
                     validator: RegExpValidator { regExp: /^[0-9]{0,9}(\.[0-9]{0,11})?$/ }
                 }
-                Text { visible: partialToggle.on; text: "XMZ"; font.pixelSize: 12; color: M.Style.dimmedFontColor }
+                Text { visible: partialToggle.on; text: form.base; font.pixelSize: 12; color: M.Style.dimmedFontColor }
             }
             RowLayout {
                 Layout.fillWidth: true
@@ -339,7 +346,7 @@ Rectangle {
                     Layout.fillWidth: true; Layout.preferredWidth: summary.width; wrapMode: Text.WordWrap; font.pixelSize: 12
                     color: M.Style.accent
                     visible: form.suggestionShown
-                    text: visible ? qsTr("Use %1 XMZ").arg(X.amount(form.plan.suggestion.atoms / 1e11, 4)) : ""
+                    text: visible ? b(qsTr("Use %1 XMZ")).arg(X.amount(form.plan.suggestion.atoms / form.unit, 4)) : ""
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: form.setAmount(form.plan.suggestion.atoms) }
                 }
             }
@@ -367,7 +374,7 @@ Rectangle {
                 text: form.busy ? qsTr("Working…")
                     : form.problem !== "" ? form.problem
                     : form.reviewing ? qsTr("Confirm")
-                    : form.type === "market" ? (form.buying ? qsTr("Buy %1 XMZ").arg(X.amount(form.plan && form.plan.ok ? form.plan.atoms / 1e11 : 0, 4)) : qsTr("Sell %1 XMZ").arg(X.amount(form.plan && form.plan.ok ? form.plan.atoms / 1e11 : 0, 4)))
+                    : form.type === "market" ? (form.buying ? b(qsTr("Buy %1 XMZ")).arg(X.amount(form.plan && form.plan.ok ? form.plan.atoms / form.unit : 0, 4)) : b(qsTr("Sell %1 XMZ")).arg(X.amount(form.plan && form.plan.ok ? form.plan.atoms / form.unit : 0, 4)))
                     : (form.buying ? qsTr("Post buy order") : qsTr("Post sell order"))
             }
             MouseArea {
@@ -377,9 +384,9 @@ Rectangle {
                     form.reviewing = false
                     if (form.type === "market") {
                         var all = form.plan.atoms === form.plan.row.atoms
-                        form.takeRequested(form.plan.row.id, all ? "" : X.atomsText(form.plan.atoms))
+                        form.takeRequested(form.plan.row.id, all ? "" : X.atomsText(form.plan.atoms, form.places))
                     } else {
-                        form.postRequested(form.buying ? "buy-xmz" : "sell-xmz", form.limitCoin, X.atomsText(form.amountAtoms), form.hours,
+                        form.postRequested(form.buying ? "buy-xmz" : "sell-xmz", form.limitCoin, X.atomsText(form.amountAtoms, form.places), form.hours,
                                            partialToggle.on ? String(form.minXmz) : "", renewToggle.on)
                     }
                 }
@@ -406,11 +413,11 @@ Rectangle {
             if (!plan || !plan.ok) return []
             return [[qsTr("Price"), X.price(plan.price) + " " + coin],
                     [buying ? qsTr("You pay") : qsTr("You receive"), X.plain(plan.coin, 8) + " " + coin + usdText(plan.coin)],
-                    [buying ? qsTr("You receive") : qsTr("You pay"), X.amount(plan.atoms / 1e11, 4) + " XMZ"]]
+                    [buying ? qsTr("You receive") : qsTr("You pay"), X.amount(plan.atoms / unit, 4) + " " + base]]
         }
         if (limitCoin === "") return []
         var rows = [[buying ? qsTr("You pay") : qsTr("You receive"), limitCoin + " " + coin + usdText(Number(limitCoin))]]
-        if (partialToggle.on) rows.push([qsTr("Partial fills"), qsTr("from %1 XMZ").arg(X.amount(minXmz, 4))])
+        if (partialToggle.on) rows.push([qsTr("Partial fills"), b(qsTr("from %1 XMZ")).arg(X.amount(minXmz, 4))])
         if (renewToggle.on) rows.push([qsTr("Keep open"), qsTr("renewed at this price while the wallet runs")])
         if (hours > 0) rows.push([qsTr("Open until"), Qt.formatDateTime(new Date(Date.now() + hours * 3600000), "d MMM yyyy HH:mm")])
         return rows
@@ -423,13 +430,13 @@ Rectangle {
                     return qsTr("Your trade account holds %1 %2. The swap asks for the rest before it locks anything.").arg(X.plain(coinBalance, 8)).arg(coin)
                 return ""
             }
-            if (plan.reason === "empty") return buying ? qsTr("No one is selling XMZ for %1 now. Post a limit order instead.").arg(coin)
-                                                       : qsTr("No one is buying XMZ with %1 now. Post a limit order instead.").arg(coin)
+            if (plan.reason === "empty") return buying ? b(qsTr("No one is selling XMZ for %1 now. Post a limit order instead.")).arg(coin)
+                                                       : b(qsTr("No one is buying XMZ with %1 now. Post a limit order instead.")).arg(coin)
             if (plan.reason === "gone") return qsTr("The offer you picked is no longer in the book.")
             if (plan.reason === "amount") return ""
             var s = plan.suggestion
-            return s.row.partial ? qsTr("The best offer allows %1 to %2 XMZ, leaving nothing or at least %1.").arg(X.amount(s.row.min, 2)).arg(X.amount(s.row.xmz, 2))
-                                 : qsTr("The best offer is %1 XMZ at %2 %3 and is taken whole.").arg(X.amount(s.row.xmz, 2)).arg(X.price(s.row.price)).arg(coin)
+            return s.row.partial ? b(qsTr("The best offer allows %1 to %2 XMZ, leaving nothing or at least %1.")).arg(X.amount(s.row.min, 2)).arg(X.amount(s.row.xmz, 2))
+                                 : b(qsTr("The best offer is %1 XMZ at %2 %3 and is taken whole.")).arg(X.amount(s.row.xmz, 2)).arg(X.price(s.row.price)).arg(coin)
         }
         if (limitPrice > 0) {
             // Prices as typed against prices from wei: equal within rounding
@@ -441,15 +448,15 @@ Rectangle {
     }
     function reviewText() {
         if (type === "market" && plan && plan.ok) {
-            return (buying ? qsTr("You buy %1 XMZ for %2 %3.") : qsTr("You sell %1 XMZ for %2 %3."))
-                       .arg(X.amount(plan.atoms / 1e11, 4)).arg(X.plain(plan.coin, 8)).arg(coin)
+            return (buying ? b(qsTr("You buy %1 XMZ for %2 %3.")) : b(qsTr("You sell %1 XMZ for %2 %3.")))
+                       .arg(X.amount(plan.atoms / unit, 4)).arg(X.plain(plan.coin, 8)).arg(coin)
                  + " " + qsTr("The app agrees the swap with the offer's maker; you then approve the lock in the trade panel below. Network fees are extra.")
         }
         if (type === "limit" && limitCoin !== "") {
-            return (buying ? qsTr("Your offer: buy %1 XMZ for %2 %3, open for %4.") : qsTr("Your offer: sell %1 XMZ for %2 %3, open for %4."))
-                       .arg(X.amount(amountAtoms / 1e11, 4)).arg(limitCoin).arg(coin).arg(X.lifetimeText(hours))
+            return (buying ? b(qsTr("Your offer: buy %1 XMZ for %2 %3, open for %4.")) : b(qsTr("Your offer: sell %1 XMZ for %2 %3, open for %4.")))
+                       .arg(X.amount(amountAtoms / unit, 4)).arg(limitCoin).arg(coin).arg(X.lifetimeText(hours))
                  + (hours > 24 ? " " + qsTr("Keep this wallet running when you can: a taker is answered only while it runs.") : "")
-                 + (partialToggle.on ? " " + qsTr("Others may take any part from %1 XMZ.").arg(X.amount(minXmz, 4)) : "")
+                 + (partialToggle.on ? " " + b(qsTr("Others may take any part from %1 XMZ.")).arg(X.amount(minXmz, 4)) : "")
                  + " " + qsTr("You can cancel it while it is open.")
         }
         return ""
