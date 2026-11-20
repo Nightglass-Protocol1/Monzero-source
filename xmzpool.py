@@ -209,8 +209,10 @@ class Miner:
         self.address, self.worker = address, worker
         self.diff, self.fixed = diff, fixed
         self.jobs = {}             # job_id -> job dict (newest last)
-        self.share_times = []
+        self.window_diff = 0       # difficulty of the accepted shares since last_retarget
+        self.window_shares = 0
         self.last_retarget = time.time()
+        self.last_share = time.time()
         self.invalid = 0
         self.last_seen = time.time()
 
@@ -252,6 +254,7 @@ class Pool:
         return ok
 
     async def new_job(self, miner):
+        self.ease_off(miner)
         extra = secrets.token_hex(8)
         t = await self.d("get_block_template", {"wallet_address": self.cfg["pool_address"], "extra_nonce": extra})
         job = {"id": secrets.token_hex(6), "height": t["height"], "prev": t["prev_hash"], "seed": t["seed_hash"],
@@ -750,7 +753,7 @@ class Pool:
         with self.store.tx() as db:
             share_id = db.execute("INSERT INTO shares(ts, address, worker, diff, height, solo) VALUES (?,?,?,?,?,?)",
                                   (time.time(), miner.address, miner.worker, job["diff"], job["height"], int(miner.solo))).lastrowid
-        self.retarget(miner)
+        self.retarget(miner, job["diff"])
         if meets(pow_hash, job["net_diff"]):
             await self.found_block(miner, job, nonce, share_id)
         return True, None
@@ -780,20 +783,36 @@ class Pool:
         log.info("BLOCK FOUND %d %s by %s…%s", job["height"], h["hash"], miner.address[:12], " (solo)" if miner.solo else "")
         self.top = None   # force new jobs for everyone
 
-    def retarget(self, miner):
+    def retarget(self, miner, share_diff):
+        """Aim for one share every target_share_seconds from the miner's measured hashrate: the work
+        it delivered (the sum of its shares' difficulty) over the whole period since the last retarget.
+        Counting shares between their arrival times (the old way) let a backlog of easy shares, answered
+        in a burst after the pool stalled, look like a huge hashrate: 2026-11-20 it pushed a 4 kH/s CPU
+        to max_difficulty, where it found no share for ten hours. A miner cannot deliver more work than
+        it did, so a burst can skew this estimate only a little."""
         now = time.time()
-        miner.share_times.append(now)
-        miner.share_times = miner.share_times[-20:]
-        if miner.fixed or now - miner.last_retarget < self.cfg["retarget_seconds"] or len(miner.share_times) < 3:
+        miner.last_share = now
+        miner.window_diff += share_diff
+        miner.window_shares += 1
+        period = now - miner.last_retarget
+        if miner.fixed or period < self.cfg["retarget_seconds"] or miner.window_shares < 3:
             return
-        span = miner.share_times[-1] - miner.share_times[0]
-        avg = span / (len(miner.share_times) - 1)
-        target = self.cfg["target_share_seconds"]
-        if 0.5 * target <= avg <= 1.5 * target:
+        want = miner.window_diff / period * self.cfg["target_share_seconds"]
+        miner.window_diff, miner.window_shares, miner.last_retarget = 0, 0, now
+        if 0.5 * miner.diff <= want <= 1.5 * miner.diff:
             return
-        factor = max(0.25, min(4.0, target / max(avg, 0.01)))
-        miner.diff = int(max(self.cfg["min_difficulty"], min(self.cfg["max_difficulty"], miner.diff * factor)))
-        miner.share_times, miner.last_retarget = [now], now
+        want = max(miner.diff * 0.25, min(miner.diff * 4.0, want))
+        miner.diff = int(max(self.cfg["min_difficulty"], min(self.cfg["max_difficulty"], want)))
+
+    def ease_off(self, miner):
+        """A miner that has gone quiet is asked for too much (a share only comes in when it finds one,
+        so retarget alone can never lower the difficulty): quarter it each retarget period without a share."""
+        now = time.time()
+        quiet = now - max(miner.last_share, miner.last_retarget)
+        if miner.fixed or quiet < max(4 * self.cfg["target_share_seconds"], self.cfg["retarget_seconds"]):
+            return
+        miner.diff = int(max(self.cfg["min_difficulty"], miner.diff // 4))
+        miner.window_diff, miner.window_shares, miner.last_retarget = 0, 0, now
 
     # --- stats
     def hashrate(self, address=None, window=600, solo=False):
