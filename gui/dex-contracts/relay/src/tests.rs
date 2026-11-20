@@ -468,3 +468,96 @@ fn a_usdt_print_is_priced_in_usdt_units() {
     let sol = Print { pair: "SOL/XMZ".into(), value: U256::from(12_000_000u64), ..p };
     assert!((sol.price() - 0.000012).abs() < 1e-15);
 }
+
+mod direct {
+    use super::*;
+    use monzero_dex_evm::direct_listing::{direct_pair, Coin, DirectListing, DIRECT_LISTING_SCHEMA};
+    use monzero_dex_evm::Chain;
+
+    const SEP: u64 = 11_155_111;
+    const BSCT: u64 = 97;
+
+    fn relay(mainnet: bool) -> Relay<Mock> {
+        let mut rules = Rules::default();
+        rules.contracts.insert(SEP, Address::repeat_byte(0xa1));
+        rules.contracts.insert(BSCT, Address::repeat_byte(0xb1));
+        rules.contracts.insert(1, Address::repeat_byte(0xa2));
+        rules.contracts.insert(56, Address::repeat_byte(0xb2));
+        let chains = BTreeMap::from([(SEP, Mock::default()), (BSCT, Mock::default()), (1, Mock::default()), (56, Mock::default())]);
+        Relay::new(rules, chains).with_direct_mainnet(mainnet)
+    }
+
+    fn offer(maker: &PrivateKeySigner, id: u8, gives: (u64, u8, u64), wants: (u64, u8, u64)) -> SignedDirectListing {
+        let coin = |(chain_id, c, value): (u64, u8, u64)| Coin { chain_id, contract: Address::repeat_byte(c), asset: Address::ZERO, value: U256::from(value) };
+        DirectListing {
+            schema: DIRECT_LISTING_SCHEMA.into(),
+            id: B256::repeat_byte(id),
+            pair: direct_pair(Chain::from_id(gives.0).unwrap(), Chain::from_id(wants.0).unwrap()),
+            maker: maker.address(),
+            maker_sol: None,
+            mailbox: B256::repeat_byte(0x5a),
+            gives: coin(gives),
+            wants: coin(wants),
+            created_at: NOW,
+            expires_at: NOW + 3600,
+        }
+        .sign(maker)
+    }
+
+    fn maker() -> PrivateKeySigner {
+        PrivateKeySigner::from_bytes(&B256::repeat_byte(0x31)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_funded_offer_is_listed_by_pair_and_closes_for_good_when_cancelled() {
+        let r = relay(false);
+        let m = maker();
+        let o = offer(&m, 1, (BSCT, 0xb1, 3 * ETH), (SEP, 0xa1, ETH));
+        assert_eq!(r.post_direct(o.clone(), NOW).await, Err(RelayError::Unfunded));
+        r.chains[&BSCT].balances.lock().unwrap().insert(m.address(), U256::from(3 * ETH));
+        assert_eq!(r.post_direct(o.clone(), NOW).await, Ok(true));
+        assert_eq!(r.post_direct(o.clone(), NOW).await, Ok(false), "the same offer again");
+        assert_eq!(r.direct_listings(Some("BNB/ETH"), NOW).len(), 1);
+        assert!(r.direct_listings(Some("ETH/SOL"), NOW).is_empty());
+        // Only its maker can cancel it
+        let other = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x32)).unwrap();
+        let bad = Cancel { schema: CANCEL_SCHEMA.into(), id: o.listing.id, maker: other.address(), at: NOW }.sign(&other);
+        assert_eq!(r.cancel_direct(&bad, NOW), Err(RelayError::NotFound));
+        let good = Cancel { schema: CANCEL_SCHEMA.into(), id: o.listing.id, maker: m.address(), at: NOW }.sign(&m);
+        assert_eq!(r.cancel_direct(&good, NOW), Ok(()));
+        assert!(r.direct_listings(None, NOW).is_empty());
+        assert_eq!(r.post_direct(o, NOW).await, Err(RelayError::Closed), "a cancelled offer never comes back");
+    }
+
+    #[tokio::test]
+    async fn real_coins_only_when_switched_on_and_tampered_offers_never() {
+        let m = maker();
+        let main = offer(&m, 2, (56, 0xb2, ETH), (1, 0xa2, ETH));
+        for r in [relay(false), relay(true)] {
+            r.chains[&56].balances.lock().unwrap().insert(m.address(), U256::from(ETH));
+            let open = r.direct_mainnet();
+            assert_eq!(r.post_direct(main.clone(), NOW).await.is_ok(), open);
+        }
+        let r = relay(false);
+        r.chains[&BSCT].balances.lock().unwrap().insert(m.address(), U256::from(9 * ETH));
+        let mut tampered = offer(&m, 3, (BSCT, 0xb1, ETH), (SEP, 0xa1, ETH));
+        tampered.listing.wants.value = U256::from(1);
+        assert!(matches!(r.post_direct(tampered, NOW).await, Err(RelayError::Listing(_))));
+        let wrong_contract = offer(&m, 4, (BSCT, 0xb9, ETH), (SEP, 0xa1, ETH));
+        assert!(matches!(r.post_direct(wrong_contract, NOW).await, Err(RelayError::Listing(_))));
+    }
+
+    #[tokio::test]
+    async fn offers_survive_a_restart_and_expire() {
+        let r = relay(false);
+        let m = maker();
+        r.chains[&BSCT].balances.lock().unwrap().insert(m.address(), U256::from(ETH));
+        r.post_direct(offer(&m, 5, (BSCT, 0xb1, ETH), (SEP, 0xa1, ETH)), NOW).await.unwrap();
+        let again = relay(false);
+        again.restore(r.snapshot());
+        assert_eq!(again.direct_listings(None, NOW).len(), 1);
+        again.prune(NOW + 3600);
+        assert!(again.direct_listings(None, NOW + 3600).is_empty());
+        assert_eq!(again.post_direct(offer(&m, 5, (BSCT, 0xb1, ETH), (SEP, 0xa1, ETH)), NOW).await, Err(RelayError::Closed));
+    }
+}

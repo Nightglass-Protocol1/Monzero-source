@@ -358,3 +358,12 @@ fn a_leader_claim_always_leaves_the_follower_a_window_on_a() {
         }
     }
 }
+
+#[test]
+fn leader_does_not_lock_when_the_follower_would_give_up_before_a_is_safe() {
+    let t = trade();
+    let late = t.lock_deadline - crate::direct_listing::LEADER_LOCK_BUDGET + 1;
+    assert_eq!(leader_step(&LeaderState::Start, &t, &snap(nothing(late), nothing(late))), (LeaderState::Done(DirectOutcome::Aborted), vec![]));
+    let in_time = late - 1;
+    assert_eq!(leader_step(&LeaderState::Start, &t, &snap(nothing(in_time), nothing(in_time))).1, vec![DirectAction::NewSwap(LegId::A)]);
+}

@@ -124,6 +124,9 @@ pub fn router<C: ChainView + 'static>(api: Arc<Api<C>>) -> Router {
         .route("/v1/utxo/listings", get(utxo_listings::<C>).post(post_utxo::<C>))
         .route("/v1/utxo/listings/{id}", get(utxo_listing::<C>))
         .route("/v1/utxo/cancel", post(cancel_utxo::<C>))
+        .route("/v1/direct/listings", get(direct_listings::<C>).post(post_direct::<C>))
+        .route("/v1/direct/listings/{id}", get(direct_listing::<C>))
+        .route("/v1/direct/cancel", post(cancel_direct::<C>))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         // Sealed letters are large (the cross-curve proof), hex in JSON doubles them
         .route("/v1/mail", get(read_mail::<C>).post(post_mail::<C>).layer(DefaultBodyLimit::max(MAX_MAIL_BODY)))
@@ -154,6 +157,8 @@ async fn info<C: ChainView>(State(api): State<Arc<Api<C>>>) -> Json<Value> {
         "api": 1,
         "chains": chains,
         "utxoNetworks": api.relay.utxo_networks(),
+        // Direct (coin <-> coin) offers between the chains above; real coins only when switched on
+        "direct": { "mainnet": api.relay.direct_mainnet() },
         "peers": api.peers,
         "intervals": INTERVALS,
         "limits": { "openOffersPerMaker": crate::MAX_PER_MAKER, "writesPerMinute": WRITES_PER_MINUTE },
@@ -305,4 +310,41 @@ async fn cancel_utxo<C: ChainView>(
     }
     api.relay.cancel_utxo(&signed, now)?;
     Ok(Json(json!({ "id": signed.cancel.get("id"), "cancelled": true })))
+}
+
+async fn direct_listings<C: ChainView>(State(api): State<Arc<Api<C>>>, Query(q): Query<PairQuery>) -> Json<Value> {
+    Json(json!({ "listings": api.relay.direct_listings(q.pair.as_deref(), now()) }))
+}
+
+async fn direct_listing<C: ChainView>(State(api): State<Arc<Api<C>>>, Path(id): Path<B256>) -> Result<Json<monzero_dex_evm::direct_listing::SignedDirectListing>, Failure> {
+    api.relay.direct_listing(id).map(Json).ok_or(Failure(StatusCode::NOT_FOUND, "no such offer".into()))
+}
+
+async fn post_direct<C: ChainView>(
+    State(api): State<Arc<Api<C>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(signed): Json<monzero_dex_evm::direct_listing::SignedDirectListing>,
+) -> Result<Json<Value>, Failure> {
+    let now = now();
+    if !api.allow_write(&headers, peer, now) {
+        return Err(limited());
+    }
+    let id = signed.listing.id;
+    let new = api.relay.post_direct(signed, now).await?;
+    Ok(Json(json!({ "id": id, "new": new })))
+}
+
+async fn cancel_direct<C: ChainView>(
+    State(api): State<Arc<Api<C>>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(signed): Json<SignedCancel>,
+) -> Result<Json<Value>, Failure> {
+    let now = now();
+    if !api.allow_write(&headers, peer, now) {
+        return Err(limited());
+    }
+    api.relay.cancel_direct(&signed, now)?;
+    Ok(Json(json!({ "id": signed.cancel.id, "cancelled": true })))
 }

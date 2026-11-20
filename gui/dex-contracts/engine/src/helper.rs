@@ -95,6 +95,21 @@ pub struct Request {
     /// `xmzWallet`: the app's DEX XMZ wallet
     #[serde(default)]
     pub xmz_wallet: Option<crate::helper_wallet::XmzWalletRequest>,
+    /// Direct (coin <-> coin) commands: keys and a node per chain
+    #[serde(default)]
+    pub direct: Option<crate::helper_direct::DirectConfig>,
+    /// `directPost`: the offer to make
+    #[serde(default)]
+    pub direct_offer: Option<crate::helper_direct::DirectOfferParams>,
+    /// `directTake`: the offer to take, as `directListings` returned it (first call only)
+    #[serde(default)]
+    pub direct_listing: Option<crate::direct_listing::SignedDirectListing>,
+    /// Direct offers with real coins: off until direct pairs are opened in the app's edition
+    #[serde(default)]
+    pub direct_mainnet: bool,
+    /// Tests only: swap contracts on the local chain (31337), what we give and what we want
+    #[serde(default)]
+    pub local_direct_contracts: Option<(alloy::primitives::Address, alloy::primitives::Address)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -124,6 +139,16 @@ pub enum Command {
     Accounts,
     /// XMZ → XMR routes among the relays' offers on one chain (`chainId`, `evmRpc`), best first
     Routes,
+    /// Direct (coin <-> coin) trades: see `helper_direct`
+    DirectListings,
+    DirectPost,
+    DirectServe,
+    DirectTake,
+    DirectCancel,
+    DirectStatus,
+    DirectApprove,
+    DirectTick,
+    DirectPayout,
 }
 
 #[derive(Deserialize)]
@@ -257,7 +282,35 @@ async fn dispatch(r: Request) -> Result<Value, String> {
             crate::helper_market::withdraw(&r.trade_dir, r.tick.as_ref().ok_or("withdraw needs tick")?, r.chain_id.ok_or("withdraw needs chainId")?, to, now, keep_wei(&r)?).await
         }
         Command::XmzWallet => crate::helper_wallet::run(r.xmz_wallet.as_ref().ok_or("xmzWallet needs xmzWallet")?).await,
+        Command::DirectListings => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            crate::helper_direct::listings(relays(&r)?, r.pair.as_deref(), &direct_accept(&r), now).await
+        }
+        Command::DirectPost => {
+            let offer = r.direct_offer.as_ref().ok_or("directPost needs directOffer")?;
+            let local = r.local_direct_contracts.map(|(g, w)| (Some(g), Some(w))).unwrap_or((None, None));
+            crate::helper_direct::post(&r.trade_dir, direct_cfg(&r)?, relays(&r)?, offer, &direct_accept(&r), local).await
+        }
+        Command::DirectServe => crate::helper_direct::serve(&r.trade_dir, direct_cfg(&r)?, relays(&r)?).await,
+        Command::DirectTake => crate::helper_direct::take(&r.trade_dir, direct_cfg(&r)?, relays(&r)?, r.direct_listing.clone(), &direct_accept(&r)).await,
+        Command::DirectCancel => crate::helper_direct::cancel(&r.trade_dir, direct_cfg(&r)?, relays(&r)?).await,
+        Command::DirectStatus => crate::helper_direct::status(&r.trade_dir, None),
+        Command::DirectApprove => crate::helper_direct::approve(&r.trade_dir, r.commitment),
+        Command::DirectTick => crate::helper_direct::tick(&r.trade_dir, direct_cfg(&r)?).await,
+        Command::DirectPayout => {
+            let to = r.payout_address.as_deref().ok_or("directPayout needs payoutAddress")?;
+            crate::helper_direct::payout(&r.trade_dir, direct_cfg(&r)?, r.chain_id.ok_or("directPayout needs chainId")?, to).await
+        }
     }
+}
+
+fn direct_cfg(r: &Request) -> Result<&crate::helper_direct::DirectConfig, String> {
+    r.direct.as_ref().ok_or_else(|| "this command needs direct (keys and nodes)".to_string())
+}
+
+fn direct_accept(r: &Request) -> crate::helper_direct::DirectAccept {
+    let local = r.local_direct_contracts.map(|(g, w)| vec![g, w]).unwrap_or_default();
+    crate::helper_direct::DirectAccept { mainnet: r.direct_mainnet, local_contracts: local }
 }
 
 fn accept(r: &Request) -> crate::helper_market::Accept {
@@ -576,6 +629,15 @@ pub(crate) fn parse_address(text: &str) -> Result<alloy::primitives::Address, St
 /// The swap seed and the EVM account key: derived by the vault (`swapKeys`), or from the
 /// wallet seed in the prototype (`walletSeedHex` + `accountIndex`).
 pub(crate) fn keys(cfg: &TickConfig) -> Result<(SwapSeed, alloy::signers::local::PrivateKeySigner), String> {
+    keys_from(&cfg.swap_keys, &cfg.wallet_seed_hex, cfg.account_index)
+}
+
+/// As `keys`, from the parts of any configuration that carries them
+pub(crate) fn keys_from(
+    swap_keys: &Option<SwapKeys>,
+    wallet_seed_hex: &Option<Zeroizing<String>>,
+    account_index: Option<u32>,
+) -> Result<(SwapSeed, alloy::signers::local::PrivateKeySigner), String> {
     let bytes32 = |hex_text: &str, what: &str| -> Result<Zeroizing<[u8; 32]>, String> {
         let v = Zeroizing::new(hex::decode(hex_text.trim()).map_err(|_| format!("{what} is not hex"))?);
         let mut out = Zeroizing::new([0u8; 32]);
@@ -585,7 +647,7 @@ pub(crate) fn keys(cfg: &TickConfig) -> Result<(SwapSeed, alloy::signers::local:
         out.copy_from_slice(&v);
         Ok(out)
     };
-    match (&cfg.swap_keys, &cfg.wallet_seed_hex, cfg.account_index) {
+    match (swap_keys, wallet_seed_hex, account_index) {
         (Some(k), None, None) => {
             let seed = bytes32(&k.swap_seed_hex, "swapSeedHex")?;
             let key = bytes32(&k.evm_key_hex, "evmKeyHex")?;

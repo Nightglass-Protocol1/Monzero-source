@@ -62,6 +62,10 @@ struct Config {
     /// test networks accept XMR offers either way.
     #[serde(default)]
     xmr_mainnet: bool,
+    /// Accept direct (coin <-> coin: ETH, BNB, SOL) offers with real coins. Leave off until direct
+    /// pairs are opened; test networks accept them either way.
+    #[serde(default)]
+    direct_mainnet: bool,
     /// Pay USDT traders' network fees, paid back in USDT (absent: this relay does not)
     #[serde(default)]
     sponsor: Option<SponsorConfig>,
@@ -143,6 +147,14 @@ async fn sync(relay: &Relay<View>, client: &reqwest::Client, peer: &str) -> Resu
         let account = accounts.get(&signed.listing.id).cloned();
         if relay.listing(signed.listing.id).is_none() && relay.post_with(signed, account, now).await == Ok(true) {
             offers += 1;
+        }
+    }
+    // Direct offers: a peer from before them has none (the request fails quietly)
+    if let Ok(d) = fetch::<Listings>(client, &format!("{base}/v1/direct/listings")).await {
+        for signed in d.listings.into_iter().take(2000).filter_map(|v| serde_json::from_value::<monzero_dex_evm::direct_listing::SignedDirectListing>(v).ok()) {
+            if relay.direct_listing(signed.listing.id).is_none() && relay.post_direct(signed, now).await == Ok(true) {
+                offers += 1;
+            }
         }
     }
     if !relay.utxo_networks().is_empty() {
@@ -237,7 +249,10 @@ async fn main() {
             fail(format!("unknown BTC/LTC network {n}"));
         }
     }
-    let relay = Arc::new(Relay::new(rules, chains).with_utxo_networks(config.utxo_networks.clone()));
+    if config.direct_mainnet {
+        eprintln!("direct (coin <-> coin) offers on the main networks: accepted");
+    }
+    let relay = Arc::new(Relay::new(rules, chains).with_utxo_networks(config.utxo_networks.clone()).with_direct_mainnet(config.direct_mainnet));
     if let Ok(bytes) = std::fs::read(config.data_dir.join("relay.json")) {
         match serde_json::from_slice::<Snapshot>(&bytes) {
             Ok(snap) => relay.restore(snap),

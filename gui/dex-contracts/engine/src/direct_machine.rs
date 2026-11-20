@@ -133,6 +133,9 @@ pub fn leader_step(state: &LeaderState, trade: &DirectTrade, snap: &DirectSnapsh
     }
     let a_now = snap.a.now;
     match state {
+        // Not enough time left for the follower to see A safely locked before it gives up: a lock
+        // now would only sit there until A's second time limit
+        Start if a_now + crate::direct_listing::LEADER_LOCK_BUDGET > trade.lock_deadline => (Done(DirectOutcome::Aborted), vec![]),
         Start => (LockSent, vec![DirectAction::NewSwap(LegId::A)]),
         LockSent => match &snap.a.lock {
             None => (LockSent, vec![DirectAction::NewSwap(LegId::A)]),

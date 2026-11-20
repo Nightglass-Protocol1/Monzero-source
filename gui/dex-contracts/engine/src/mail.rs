@@ -108,11 +108,33 @@ pub struct Answer {
     pub response: KeyResponse,
 }
 
+/// A taker asks to take a direct (coin <-> coin) offer: it leads, so it sends its frame first
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DirectTake {
+    pub listing: B256,
+    /// The taker's account: the trade's leader
+    pub taker: Address,
+    pub reply_to: B256,
+    pub frame: crate::negotiation::SignedFrame,
+}
+
+/// The maker's answer to a direct take: its own frame, or why not
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DirectAnswer {
+    pub listing: B256,
+    pub response: KeyResponse,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
 pub enum Letter {
     Take(Take),
     Answer(Answer),
+    /// Apps from before direct pairs cannot open these and skip them
+    DirectTake(DirectTake),
+    DirectAnswer(DirectAnswer),
 }
 
 impl Letter {

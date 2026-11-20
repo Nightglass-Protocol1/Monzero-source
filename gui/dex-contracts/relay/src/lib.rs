@@ -12,6 +12,7 @@ pub mod sponsor;
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use monzero_dex_evm::mail::MAX_SEALED;
+use monzero_dex_evm::direct_listing::{DirectRules, SignedDirectListing};
 use monzero_dex_evm::listing::{ListingError, Rules, SignedCancel, SignedListing, SignedSolAccount};
 use monzero_dex_evm::negotiation::Role;
 use monzero_dex_evm::Swap;
@@ -216,6 +217,18 @@ pub struct Snapshot {
     pub utxo_active: Vec<utxo::SignedUtxoListing>,
     #[serde(default)]
     pub utxo_closed: Vec<(B256, u64)>,
+    /// Direct (coin <-> coin) offers
+    #[serde(default)]
+    pub direct_active: Vec<SignedDirectListing>,
+    #[serde(default)]
+    pub direct_closed: Vec<(B256, u64)>,
+}
+
+/// Direct (coin <-> coin) offers: open ones, and the ids of closed ones (never accepted again)
+#[derive(Default)]
+struct DirectBook {
+    active: HashMap<B256, SignedDirectListing>,
+    closed: HashMap<B256, u64>,
 }
 
 #[derive(Default)]
@@ -240,6 +253,11 @@ pub struct Relay<C> {
     /// BTC/XMZ and LTC/XMZ offers, for the networks this relay serves ("btc-mainnet", "ltc-mainnet", ...)
     utxo_networks: std::collections::BTreeSet<String>,
     utxo: Mutex<utxo::UtxoBook>,
+    /// Direct offers with real coins are accepted (off until direct pairs open)
+    direct_mainnet: bool,
+    direct: Mutex<DirectBook>,
+    /// Tests only: more swap contracts on the local test chain (31337)
+    direct_local: Vec<Address>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -251,7 +269,94 @@ pub enum PrintStatus {
 
 impl<C: ChainView> Relay<C> {
     pub fn new(rules: Rules, chains: BTreeMap<u64, C>) -> Self {
-        Relay { rules, chains, state: Mutex::default(), utxo_networks: Default::default(), utxo: Mutex::default() }
+        Relay { rules, chains, state: Mutex::default(), utxo_networks: Default::default(), utxo: Mutex::default(), direct_mainnet: false, direct: Mutex::default(), direct_local: vec![] }
+    }
+
+    pub fn with_direct_mainnet(mut self, on: bool) -> Self {
+        self.direct_mainnet = on;
+        self
+    }
+
+    /// Tests only: one local node standing for both chains of a pair
+    pub fn with_local_direct_contracts(mut self, contracts: Vec<Address>) -> Self {
+        self.direct_local = contracts;
+        self
+    }
+
+    pub fn direct_mainnet(&self) -> bool {
+        self.direct_mainnet
+    }
+
+    fn direct_book(&self) -> std::sync::MutexGuard<'_, DirectBook> {
+        self.direct.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What direct offers must keep to here: this relay's contracts and caps, on the chains it serves
+    pub fn direct_rules(&self) -> DirectRules {
+        DirectRules { contracts: self.rules.contracts.clone(), max_value: self.rules.max_value.clone(), mainnet: self.direct_mainnet, local_contracts: self.direct_local.clone() }
+    }
+
+    /// Accepts a signed direct offer. Idempotent for the same offer. The maker's account must hold
+    /// what it gives (on Solana: its named Solana account).
+    pub async fn post_direct(&self, signed: SignedDirectListing, now: u64) -> Result<bool, RelayError> {
+        signed.verify(&self.direct_rules(), now)?;
+        let l = &signed.listing;
+        let gives = self.chain(l.gives.chain_id)?;
+        self.chain(l.wants.chain_id)?;
+        {
+            let book = self.direct_book();
+            if book.closed.contains_key(&l.id) {
+                return Err(RelayError::Closed);
+            }
+            if let Some(known) = book.active.get(&l.id) {
+                return if known == &signed { Ok(false) } else { Err(RelayError::Closed) };
+            }
+            if book.active.values().filter(|o| o.listing.maker == l.maker && o.listing.expires_at > now).count() >= MAX_PER_MAKER {
+                return Err(RelayError::MakerLimit);
+            }
+            if book.active.len() >= MAX_LISTINGS {
+                return Err(RelayError::Full);
+            }
+        }
+        let balance = match (gives.solana(), l.maker_sol) {
+            (true, Some(account)) => gives.sol_balance(account).await,
+            (true, None) => return Err(RelayError::SolAccount),
+            (false, _) => gives.balance(l.maker).await,
+        }
+        .map_err(RelayError::ChainRead)?;
+        if balance < l.gives.value {
+            return Err(RelayError::Unfunded);
+        }
+        let mut book = self.direct_book();
+        if book.closed.contains_key(&l.id) || book.active.contains_key(&l.id) {
+            return Ok(false);
+        }
+        book.active.insert(l.id, signed);
+        Ok(true)
+    }
+
+    pub fn cancel_direct(&self, signed: &SignedCancel, now: u64) -> Result<(), RelayError> {
+        signed.verify()?;
+        let mut book = self.direct_book();
+        let listing = book.active.get(&signed.cancel.id).ok_or(RelayError::NotFound)?;
+        if listing.listing.maker != signed.cancel.maker {
+            return Err(RelayError::NotFound);
+        }
+        book.active.remove(&signed.cancel.id);
+        book.closed.insert(signed.cancel.id, now);
+        Ok(())
+    }
+
+    /// Open direct offers, oldest first (`pair`: one pair only, e.g. "BNB/ETH")
+    pub fn direct_listings(&self, pair: Option<&str>, now: u64) -> Vec<SignedDirectListing> {
+        let book = self.direct_book();
+        let mut out: Vec<_> = book.active.values().filter(|o| o.listing.expires_at > now && pair.is_none_or(|p| o.listing.pair == p)).cloned().collect();
+        out.sort_by(|a, b| a.listing.created_at.cmp(&b.listing.created_at).then(a.listing.id.cmp(&b.listing.id)));
+        out
+    }
+
+    pub fn direct_listing(&self, id: B256) -> Option<SignedDirectListing> {
+        self.direct_book().active.get(&id).cloned()
     }
 
     pub fn with_utxo_networks(mut self, networks: impl IntoIterator<Item = String>) -> Self {
@@ -539,6 +644,15 @@ impl<C: ChainView> Relay<C> {
         s.mail_bytes -= freed;
         drop(s);
         self.utxo_book().prune(now);
+        {
+            let mut book = self.direct_book();
+            let expired: Vec<_> = book.active.iter().filter(|(_, o)| o.listing.expires_at <= now).map(|(id, o)| (*id, o.listing.expires_at)).collect();
+            for (id, at) in expired {
+                book.active.remove(&id);
+                book.closed.insert(id, at);
+            }
+            book.closed.retain(|_, at| *at + ARCHIVE_SECS > now);
+        }
         let mut s = self.state();
         let expired: Vec<_> = s.active.iter().filter(|(_, o)| o.listing.expires_at <= now).map(|(id, _)| *id).collect();
         for id in expired {
@@ -578,6 +692,10 @@ impl<C: ChainView> Relay<C> {
     pub fn snapshot(&self) -> Snapshot {
         // One lock of the BTC book at a time (a guard lives to the end of its expression)
         let (utxo_active, utxo_closed) = self.utxo_book().snapshot();
+        let (direct_active, direct_closed) = {
+            let book = self.direct_book();
+            (book.active.values().cloned().collect(), book.closed.iter().map(|(k, v)| (*k, *v)).collect())
+        };
         let s = self.state();
         Snapshot {
             active: s.active.values().cloned().collect(),
@@ -588,6 +706,8 @@ impl<C: ChainView> Relay<C> {
             sol_accounts: s.sol_accounts.values().cloned().collect(),
             utxo_active,
             utxo_closed,
+            direct_active,
+            direct_closed,
         }
     }
 
@@ -619,6 +739,14 @@ impl<C: ChainView> Relay<C> {
         s.pending.extend(snap.pending.into_iter().map(|(c, t, at)| ((c, t), at)));
         drop(s);
         self.utxo_book().restore(snap.utxo_active, snap.utxo_closed, &self.utxo_networks);
+        let rules = self.direct_rules();
+        let mut book = self.direct_book();
+        book.closed.extend(snap.direct_closed);
+        for o in snap.direct_active {
+            if !book.closed.contains_key(&o.listing.id) && o.verify(&rules, o.listing.created_at).is_ok() {
+                book.active.insert(o.listing.id, o);
+            }
+        }
     }
 }
 

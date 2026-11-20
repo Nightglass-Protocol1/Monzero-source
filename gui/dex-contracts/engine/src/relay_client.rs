@@ -206,6 +206,42 @@ impl RelayClient {
         out
     }
 
+    /// Open direct (coin <-> coin) offers from every relay that answers, each checked
+    pub async fn direct_listings(&self, pair: Option<&str>, rules: &crate::direct_listing::DirectRules, now: u64) -> (Vec<(crate::direct_listing::SignedDirectListing, Vec<String>)>, Vec<Value>) {
+        use crate::direct_listing::SignedDirectListing;
+        let mut found: BTreeMap<B256, (SignedDirectListing, Vec<String>)> = BTreeMap::new();
+        let mut errors = vec![];
+        for r in &self.relays {
+            let url = match pair {
+                Some(p) => format!("{r}/v1/direct/listings?pair={}", p.replace('/', "%2F")),
+                None => format!("{r}/v1/direct/listings"),
+            };
+            match self.get::<Listings>(&url).await {
+                Ok(l) => {
+                    for signed in l.listings.into_iter().take(5000).filter_map(|v| serde_json::from_value::<SignedDirectListing>(v).ok()) {
+                        if signed.verify(rules, now).is_err() || pair.is_some_and(|p| signed.listing.pair != p) {
+                            continue;
+                        }
+                        let entry = found.entry(signed.listing.id).or_insert_with(|| (signed.clone(), vec![]));
+                        if entry.0 == signed {
+                            entry.1.push(r.clone());
+                        }
+                    }
+                }
+                Err(e) => errors.push(json!({"relay": r, "error": e})),
+            }
+        }
+        (found.into_values().collect(), errors)
+    }
+
+    pub async fn post_direct_listing(&self, signed: &crate::direct_listing::SignedDirectListing) -> Vec<Value> {
+        self.post_all("/v1/direct/listings", &serde_json::to_value(signed).expect("serializes")).await
+    }
+
+    pub async fn direct_cancel(&self, signed: &SignedCancel) -> Vec<Value> {
+        self.post_all("/v1/direct/cancel", &serde_json::to_value(signed).expect("serializes")).await
+    }
+
     /// `tx`: the claim's id as its chain shows it (0x… hash, or a Solana signature in base58)
     pub async fn report(&self, chain_id: u64, tx: &str) -> Vec<Value> {
         self.post_all("/v1/prints", &json!({"chainId": chain_id, "tx": tx})).await
