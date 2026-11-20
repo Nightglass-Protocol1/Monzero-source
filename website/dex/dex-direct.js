@@ -30,8 +30,13 @@
 
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return "&#" + c.charCodeAt(0) + ";"; }); }
   function short(a) { return a ? a.slice(0, 6) + "…" + a.slice(-4) : ""; }
-  function solana(id) { id = Number(id); return id >= 501000101 && id <= 501000103; }
-  function net(id) { return (NETWORKS[Number(id)] || {}).name || "chain " + id; }
+  // Coins by market id: a chain's own coin is its chain id; its USDT is a market of its own
+  // (Solana's: the chain id + 100; BNB Chain's: + 100,000,000), as in the XMZ pairs
+  function chainOfMarket(id) { id = Number(id); return id >= 501000201 && id <= 501000203 ? id - 100 : id >= 100000000 && id < 200000000 ? id - 100000000 : id; }
+  function solana(id) { id = chainOfMarket(id); return id >= 501000101 && id <= 501000103; }
+  function net(id) { return (NETWORKS[chainOfMarket(id)] || {}).name || "chain " + id; }
+  function label(coin) { return coin === "USDT" ? "USDT-SOL" : coin; }
+  function pairLabel(p) { var x = String(p).split("/"); return label(x[0]) + " / " + label(x[1]); }
   function units(text, places) {
     var d = String(text || "0");
     if (!/^[0-9]+$/.test(d)) return "?";
@@ -94,7 +99,7 @@
 
   // Paying a missing amount into the trade account from MetaMask (ETH, BNB); a Solana amount is
   // shown with the account to send it to
-  function payEvm(chainId, to, wei) {
+  function payEvm(chainId, to, wei, token) {
     var n = NETWORKS[chainId];
     if (!window.ethereum || !n || !n.hex) return Promise.reject(new Error("MetaMask is not in this browser."));
     var eth = function (m, p) { return window.ethereum.request({ method: m, params: p || [] }); };
@@ -107,7 +112,12 @@
         if (e && e.code === 4902 && n.add) return eth("wallet_addEthereumChain", [n.add]);
         throw e;
       });
-    }).then(function () { return eth("eth_sendTransaction", [{ from: st.status.account, to: to, value: "0x" + BigInt(wei).toString(16) }]); });
+    }).then(function () {
+      if (!token || /^(0x)?0*$/.test(token)) return eth("eth_sendTransaction", [{ from: st.status.account, to: to, value: "0x" + BigInt(wei).toString(16) }]);
+      // A token (USDT on BNB Chain): transfer(to, amount) on the token contract
+      var pad = function (h) { return String(h).replace(/^0x/, "").toLowerCase().padStart(64, "0"); };
+      return eth("eth_sendTransaction", [{ from: st.status.account, to: token, data: "0xa9059cbb" + pad(to) + pad(BigInt(wei).toString(16)) }]);
+    });
   }
 
   function refresh() {
@@ -131,33 +141,33 @@
     var list = (d.listings || []).filter(function (l) { return l.pair === st.pair && l.expiresAt > now; });
     var asks = list.filter(function (l) { return l.side === "sell"; }).sort(function (a, b) { return Number(a.price) - Number(b.price); });
     var bids = list.filter(function (l) { return l.side === "buy"; }).sort(function (a, b) { return Number(b.price) - Number(a.price); });
-    function rows(set, label, verb) {
-      var h = "<h3>" + esc(label) + "</h3>";
+    function rows(set, title, verb) {
+      var h = "<h3>" + esc(title) + "</h3>";
       if (!set.length) return h + '<p class="tp-note">none</p>';
       return h + '<ul class="tp-offers">' + set.slice(0, 8).map(function (l) {
         var mine = String(l.maker || "").toLowerCase() === mineAcct, confirming = st.confirm === l.id;
-        return "<li><span>" + esc(l.base) + " " + esc(base) + " for " + esc(l.quote) + " " + esc(quote) + '<span class="tp-min">' + esc(l.price) + " " + esc(quote) + " per " + esc(base) + " · " + timeLeft(l.expiresAt) + "</span>" +
-          (confirming ? '<span class="tp-min">You lock ' + esc(l.wants.amount) + " " + esc(l.wants.coin) + " and receive " + esc(l.gives.amount) + " " + esc(l.gives.coin) +
-            ". Your wallet asks you to approve before anything is locked; if the maker then does not lock theirs, your " + esc(l.wants.coin) + " comes back after about 9 hours.</span>" : "") + "</span>" +
+        return "<li><span>" + esc(l.base) + " " + esc(label(base)) + " for " + esc(l.quote) + " " + esc(label(quote)) + '<span class="tp-min">' + esc(l.price) + " " + esc(label(quote)) + " per " + esc(label(base)) + " · " + timeLeft(l.expiresAt) + "</span>" +
+          (confirming ? '<span class="tp-min">You lock ' + esc(l.wants.amount) + " " + esc(label(l.wants.coin)) + " and receive " + esc(l.gives.amount) + " " + esc(label(l.gives.coin)) +
+            ". Your wallet asks you to approve before anything is locked; if the maker then does not lock theirs, your " + esc(label(l.wants.coin)) + " comes back after about 9 hours.</span>" : "") + "</span>" +
           (mine ? '<span class="tp-min">yours</span>' : '<span class="tp-take"><button class="button ' + (confirming ? "primary" : "secondary") + '" type="button" data-act="take" data-id="' + esc(l.id) + '"' + (st.busy || d.keys !== true ? " disabled" : "") + ">" +
             (confirming ? "Confirm" : verb) + "</button></span>") + "</li>";
       }).join("") + "</ul>";
     }
-    return rows(asks, "Selling " + base, "Buy " + base) + rows(bids, "Buying " + base, "Sell " + base);
+    return rows(asks, "Selling " + label(base), "Buy " + label(base)) + rows(bids, "Buying " + label(base), "Sell " + label(base));
   }
 
   function formHTML(base, quote) {
     var give = st.give === quote ? quote : base, get = give === base ? quote : base;
     var g = Number(st.form.give), w = Number(st.form.get);
-    var line = g > 0 && w > 0 ? price(give === base ? w / g : g / w) + " " + quote + " per " + base : "";
+    var line = g > 0 && w > 0 ? price(give === base ? w / g : g / w) + " " + label(quote) + " per " + label(base) : "";
     return "<h3>Post an offer</h3>" +
-      '<div class="tp-side"><button type="button" data-act="give" data-coin="' + esc(base) + '"' + (give === base ? ' class="on"' : "") + ">I give " + esc(base) + '</button><button type="button" data-act="give" data-coin="' + esc(quote) + '"' + (give === quote ? ' class="on"' : "") + ">I give " + esc(quote) + "</button></div>" +
-      '<div class="tp-form"><label>You give (' + esc(give) + ')<input id="dd-give" inputmode="decimal" autocomplete="off" value="' + esc(st.form.give) + '"></label>' +
-      "<label>You get (" + esc(get) + ')<input id="dd-get" inputmode="decimal" autocomplete="off" value="' + esc(st.form.get) + '"></label>' +
+      '<div class="tp-side"><button type="button" data-act="give" data-coin="' + esc(base) + '"' + (give === base ? ' class="on"' : "") + ">I give " + esc(label(base)) + '</button><button type="button" data-act="give" data-coin="' + esc(quote) + '"' + (give === quote ? ' class="on"' : "") + ">I give " + esc(label(quote)) + "</button></div>" +
+      '<div class="tp-form"><label>You give (' + esc(label(give)) + ')<input id="dd-give" inputmode="decimal" autocomplete="off" value="' + esc(st.form.give) + '"></label>' +
+      "<label>You get (" + esc(label(get)) + ')<input id="dd-get" inputmode="decimal" autocomplete="off" value="' + esc(st.form.get) + '"></label>' +
       '<label>Open for<select id="dd-hours">' + [["6", "6 hours"], ["24", "1 day"], ["168", "1 week"]].map(function (o) { return '<option value="' + o[0] + '"' + (st.form.hours === o[0] ? " selected" : "") + ">" + o[1] + "</option>"; }).join("") + "</select></label></div>" +
       '<p class="tp-note" id="dd-price">' + (line ? "Price: " + esc(line) : "") + "</p>" +
-      '<button class="button primary" type="button" data-act="post" data-give="' + esc(give) + '" data-get="' + esc(get) + '"' + (st.busy || !(g > 0 && w > 0) ? " disabled" : "") + ">Post: give " + esc(give) + " for " + esc(get) + "</button>" +
-      '<p class="tp-note">Posting is your approval: when someone takes the offer, your wallet locks your ' + esc(give) + " once they have locked their " + esc(get) + ", and collects it. Keep the wallet running while the offer is open, with a little " + esc(get) + " in its trade account for the network fee.</p>";
+      '<button class="button primary" type="button" data-act="post" data-give="' + esc(give) + '" data-get="' + esc(get) + '"' + (st.busy || !(g > 0 && w > 0) ? " disabled" : "") + ">Post: give " + esc(label(give)) + " for " + esc(label(get)) + "</button>" +
+      '<p class="tp-note">Posting is your approval: when someone takes the offer, your wallet locks your ' + esc(label(give)) + " once they have locked their " + esc(label(get)) + ", and collects it. Keep the wallet running while the offer is open, with a little of each chain's own coin in its trade account for the network fees.</p>";
   }
 
   function tradesHTML(d) {
@@ -166,18 +176,18 @@
     if (!mine.length) return "";
     return "<h3>Your coin-for-coin trades</h3>" + '<ul class="tp-offers">' + mine.slice(0, 12).map(function (t) {
       var tr = t.trade || {}, need = tr.awaitingFunding, paid = tr.payout && (tr.payout.tx || tr.payout.note);
-      var h = "<li><span>" + esc(t.pair) + ": give " + esc(t.gives.amount) + " " + esc(t.gives.coin) + " → get " + esc(t.wants.amount) + " " + esc(t.wants.coin) +
+      var h = "<li><span>" + esc(pairLabel(t.pair)) + ": give " + esc(t.gives.amount) + " " + esc(label(t.gives.coin)) + " → get " + esc(t.wants.amount) + " " + esc(label(t.wants.coin)) +
         '<span class="tp-min">' + esc(stageText(t)) + "</span>";
       if (need) {
         h += '<span class="tp-min tp-warn">Waiting for funds: ' + esc(need.text) + "</span>";
       }
       if (paid) {
-        var n = NETWORKS[Number(((tr.stage === "Done(Swapped)" ? t.wants : t.gives) || {}).chainId)] || {};
+        var n = NETWORKS[chainOfMarket(((tr.stage === "Done(Swapped)" ? t.wants : t.gives) || {}).chainId)] || {};
         h += '<span class="tp-min">Sent to ' + esc(short(tr.payout.to)) + (tr.payout.tx && n.tx ? ' · <a href="' + esc(n.tx + tr.payout.tx + (n.txEnd || "")) + '" rel="noopener" target="_blank">transaction</a>' : "") + "</span>";
       }
       h += "</span>";
       if (t.state === "open") h += '<span class="tp-take"><button class="button secondary" type="button" data-act="cancel" data-folder="' + esc(t.folder) + '"' + (st.busy ? " disabled" : "") + ">" + (t.kind === "offer" ? "Cancel" : "Stop waiting") + "</button></span>";
-      else if (need && !solana(need.chainId)) h += '<span class="tp-take"><button class="button primary" type="button" data-act="fund" data-chain="' + esc(need.chainId) + '" data-to="' + esc(need.account) + '" data-wei="' + esc(need.missing) + '"' + (st.busy ? " disabled" : "") + ">Pay with MetaMask</button></span>";
+      else if (need && !solana(need.chainId)) h += '<span class="tp-take"><button class="button primary" type="button" data-act="fund" data-chain="' + esc(need.chainId) + '" data-to="' + esc(need.account) + '" data-wei="' + esc(need.missing) + '" data-token="' + esc(need.asset || "") + '"' + (st.busy ? " disabled" : "") + ">Pay with MetaMask</button></span>";
       return h + "</li>";
     }).join("") + "</ul>";
   }
@@ -189,15 +199,15 @@
     var pairs = d.pairs || [];
     if (pairs.indexOf(st.pair) < 0) st.pair = pairs[0] || "";
     var base = st.pair.split("/")[0] || "", quote = st.pair.split("/")[1] || "";
-    var h = '<p class="pro-order-lede">Swap ETH, BNB and SOL straight across, with no XMZ in between. Each side locks its coin in the swap contract on its own chain and one secret releases both; if the other side does not follow through, your coin comes back after its time limit. Your Monzero wallet runs it and asks you to approve each trade you take.</p>';
-    h += '<div class="tp-side">' + pairs.map(function (p) { return '<button type="button" data-act="pair" data-pair="' + esc(p) + '"' + (p === st.pair ? ' class="on"' : "") + ">" + esc(p) + "</button>"; }).join("") + "</div>";
+    var h = '<p class="pro-order-lede">Swap ETH, BNB, SOL and USDT straight across, with no XMZ in between. Each side locks its coin in the swap contract on its own chain and one secret releases both; if the other side does not follow through, your coin comes back after its time limit. Your Monzero wallet runs it and asks you to approve each trade you take.</p>';
+    h += '<div class="dd-pairs">' + pairs.map(function (p) { return '<button type="button" data-act="pair" data-pair="' + esc(p) + '"' + (p === st.pair ? ' class="on"' : "") + ">" + esc(pairLabel(p)) + "</button>"; }).join("") + "</div>";
     if (d.keys !== true) h += '<p class="tp-act">Unlock your trading keys in the wallet to trade (the order book panel above asks for it).</p>';
     if ((d.state === "failed" || d.state === "refused") && d.error && (d.command === "directListings" || d.command === "directPost" || d.command === "directTake" || d.command === "directPayout"))
       h += '<p class="tp-err">' + (d.command === "directListings" ? "The offers could not be loaded: " : "Not done: ") + esc(d.error) + "</p>";
     if (d.message) h += '<p class="tp-err">' + esc(d.message) + "</p>";
     h += '<div class="dd-grid"><div>' + bookHTML(d, base, quote) + "</div><div>" + formHTML(base, quote) + "</div></div>";
     h += tradesHTML(d);
-    var accts = (d.chains || []).map(function (c) { var a = tradeAccount(c.chainId); return a ? "<li><span>" + esc(c.coin) + " trade account (" + esc(net(c.chainId)) + ")</span><strong>" + esc(a) + "</strong></li>" : ""; }).join("");
+    var accts = (d.chains || []).map(function (c) { var a = tradeAccount(c.chainId); return a ? "<li><span>" + esc(label(c.coin)) + " trade account (" + esc(net(c.chainId)) + ")</span><strong>" + esc(a) + "</strong></li>" : ""; }).join("");
     if (accts) h += '<h3>Trade accounts</h3><ul class="relay-facts">' + accts + '</ul><p class="tp-note">Your coin is locked from, and paid into, the wallet\'s trade account on each chain. What a finished trade brings in is sent on to ' +
       (own(1) || own(501000101) ? "the MetaMask or Phantom account you connected" : "your connected wallet") + ".</p>";
     if (st.error) h += '<p class="tp-err">' + esc(st.error) + "</p>";
@@ -225,7 +235,7 @@
     else if (a === "cancel") act("/v1/direct/cancel", { folder: b.getAttribute("data-folder") }, "Done.");
     else if (a === "fund") {
       st.busy = "fund"; render();
-      payEvm(Number(b.getAttribute("data-chain")), b.getAttribute("data-to"), b.getAttribute("data-wei"))
+      payEvm(Number(b.getAttribute("data-chain")), b.getAttribute("data-to"), b.getAttribute("data-wei"), b.getAttribute("data-token"))
         .then(function () { st.busy = ""; say("Paid in. The trade continues by itself."); }).catch(fail);
     }
   });

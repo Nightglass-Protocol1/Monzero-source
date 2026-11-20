@@ -347,3 +347,6 @@ a.trade-row:hover, a.trade-row:focus-visible { background: color-mix(in srgb, va
 .dd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 @media (max-width: 760px) { .dd-grid { grid-template-columns: 1fr; } }
 .tp-warn { color: #e0a84a; }
+.dd-pairs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
+.dd-pairs button { padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line, #2c3a47); background: transparent; color: var(--muted); font: 600 12px inherit; cursor: pointer; }
+.dd-pairs button.on { background: var(--accent, #3b82f6); border-color: var(--accent, #3b82f6); color: #fff; }
