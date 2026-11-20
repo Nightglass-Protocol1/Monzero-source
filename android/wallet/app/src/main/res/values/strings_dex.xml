@@ -67,6 +67,7 @@
     <string name="dex_approve_title">Approve this trade?</string>
     <string name="dex_approve_body">You pay %1$s\nYou receive %2$s\n\nNetwork: %3$s\nThese amounts are from the signed offer this wallet holds, not from the web page. Once approved the swap runs by itself; keep the DEX link on and the phone connected until it is finished. If the other side stops, your funds are returned after the time limit.\n\n%4$s left in the trade account afterwards goes to %5$s</string>
     <string name="dex_approve_no_account">(no wallet connected for this coin yet)</string>
+    <string name="dex_direct_approve_body">You pay %1$s\nYou receive %2$s\n\nYou pay on: %3$s\nYou receive on: %4$s\nThese amounts are from the signed offer this wallet holds, not from the web page. Once approved the swap runs by itself; keep the DEX link on and the phone connected until it is finished. If the other side does not lock its coin, yours comes back after its time limit (about 9 hours).\n\nWhat you receive goes to %5$s</string>
     <string name="dex_approve">Approve</string>
     <string name="dex_approve_cancel">Cancel this trade</string>
     <string name="dex_return_title">Move your trading XMZ back?</string>

@@ -34,6 +34,9 @@ public class DexPromptActivity extends SecureActivity {
         boolean keysWanted, keysExist, keysReady, keysBusy, approval, returnWanted, walletBusy;
         String keysMessage = "", commitment = "", startRefusal = "", unlocked = "0", payoutAccount = "", walletError = "";
         JSONObject snapshot;
+        // A direct (coin <-> coin) take of ours waiting for approval, and where its coin goes
+        JSONObject direct;
+        String directMessage = "", directPayout = "";
     }
 
     @Override
@@ -111,6 +114,10 @@ public class DexPromptActivity extends SecureActivity {
             w.walletError = wallet.optString("error");
             final JSONObject offer = w.snapshot == null ? null : w.snapshot.optJSONObject("offer");
             if (offer != null) w.payoutAccount = bridge.payoutAccount(offer.optLong("chainId"));
+            w.direct = engine.directAwaitingApproval();
+            w.directMessage = engine.directMessage();
+            final JSONObject gets = w.direct == null ? null : w.direct.optJSONObject("trade").optJSONObject("gets");
+            if (gets != null) w.directPayout = bridge.payoutAccount(gets.optLong("chainId"));
             return w;
         }, null);
     }
@@ -228,6 +235,22 @@ public class DexPromptActivity extends SecureActivity {
                 finish();
             });
             return;
+        }
+        if (w.direct != null && w.direct.optJSONObject("trade") != null) {
+            // The terms are the wallet's own (the trade's journal), never the page's
+            final JSONObject t = w.direct.optJSONObject("trade"), gives = t.optJSONObject("gives"), gets = t.optJSONObject("gets");
+            if (gives != null && gets != null) {
+                final long gc = gives.optLong("chainId"), wc = gets.optLong("chainId");
+                final String pays = DexFiles.units(gives.optString("value"), DexDirect.decimals(gc)) + " " + DexDirect.ticker(gc);
+                final String receives = DexFiles.units(gets.optString("value"), DexDirect.decimals(wc)) + " " + DexDirect.ticker(wc);
+                if (!w.directMessage.isEmpty()) notice = w.directMessage;
+                show("approve-direct", getString(R.string.dex_approve_title), getString(R.string.dex_direct_approve_body, pays, receives,
+                        DexConfig.networkName(gc), DexConfig.networkName(wc), w.directPayout.isEmpty() ? getString(R.string.dex_approve_no_account) : w.directPayout));
+                final String folder = w.direct.optString("folder"), commitment = t.optString("commitment");
+                yes.setText(R.string.dex_approve);
+                yes.setOnClickListener(v -> engine.post(() -> engine.approveDirect(folder, commitment)));
+                return;
+            }
         }
         if (w.returnWanted || returnAsked) {
             final String home = DexService.prefs(this).getString(DexService.PREF_HOME, "");

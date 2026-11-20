@@ -24,7 +24,7 @@ import java.util.regex.Pattern;
  * running trade, and steps them with the trade helper. Everything here runs on one thread (the
  * engine's); other threads use call() and post().
  */
-final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTrade.Listener {
+final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTrade.Listener, DexDirect.Listener {
     interface Listener {
         /** On the engine's thread, after any change of wallet, keys, market or trade. */
         void engineChanged();
@@ -44,6 +44,10 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     private final DexRisk risk;
     private final DexTrade trade;
     private final Map<Long, DexMarket> markets = new LinkedHashMap<>();
+    /** Direct (coin <-> coin) trades: test networks only until direct pairs are opened */
+    private DexDirect direct;
+    private String directMessage = "";
+    private final java.util.Set<String> directRecorded = new java.util.HashSet<>();
     private final List<Listener> listeners = new ArrayList<>();
     private String marketMessage = "", startRefusal = "", keysMessage = "", evmAccount = "", solAccount = "", reportedTrade = "";
     private boolean keysBusy, resumed, resuming, stopped, marketsUp, accountsAsked;
@@ -120,7 +124,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
 
     /** True while a trade is running: the app must stay up until it finishes or refunds. */
     boolean tradeRunning() {
-        return trade.configured() && !trade.done() && trade.snapshot().optBoolean("approved");
+        return (trade.configured() && !trade.done() && trade.snapshot().optBoolean("approved")) || (direct != null && direct.hasRunningTrade());
     }
 
     void stop() {
@@ -257,8 +261,169 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             m.setSolAccount(solAccount);
             markets.put(chain, m);
         }
+        // Direct trades: each chain's own coin, on the same nodes. Not on the main networks until
+        // direct pairs are opened there (the relays refuse such offers until then too).
+        if (!DexConfig.mainnet()) {
+            final Map<Long, String> rpcs = new LinkedHashMap<>();
+            for (long chain : DexConfig.chains()) if (!DexConfig.token(chain)) rpcs.put(chain, overrides.rpcFor(chain));
+            if (rpcs.size() >= 2)
+                direct = new DexDirect(new File(new File(root, "evm-trades"), "direct"), rpcs, overrides.relaysOrDefault(), false, "",
+                        (request, done) -> helper.run(request, 120000, 8 * 1024 * 1024, done), this);
+        }
         resumeTrades();
         changed();
+    }
+
+    // ---- direct (coin <-> coin) trades ---------------------------------------------------------
+
+    @Override
+    public void directChanged() {
+        recordDirectStarts();
+        changed();
+    }
+
+    /** The direct market as the screens show it; {"configured": false} where there is none. */
+    JSONObject directStatus() {
+        if (direct == null) {
+            try {
+                return new JSONObject().put("configured", false);
+            } catch (Exception e) {
+                return new JSONObject();
+            }
+        }
+        return direct.status(directMessage, keys.ready());
+    }
+
+    private boolean sayDirect(String message) {
+        directMessage = message;
+        changed();
+        return false;
+    }
+
+    /** Both coins' kill switch and limits (amounts in base units); "" when it may go ahead. */
+    private String directRefusal(String ledgerId, long givesChain, String givesUnits, long wantsChain, String wantsUnits) {
+        final long[][] legs = {{givesChain}, {wantsChain}};
+        final String[] units = {givesUnits, wantsUnits};
+        for (int i = 0; i < 2; i++) {
+            final String network = DexConfig.controlNetwork(legs[i][0]);
+            if (network.isEmpty()) return DexDirect.ticker(legs[i][0]) + " is not supported for trading.";
+            try {
+                final String refusal = risk.refusal(network, ledgerId, new BigInteger(units[i]), BigInteger.ZERO, 0);
+                if (!refusal.isEmpty()) return refusal;
+            } catch (Exception e) {
+                return "The amount could not be read.";
+            }
+        }
+        return "";
+    }
+
+    boolean refreshDirect() {
+        return direct != null && direct.refreshListings();
+    }
+
+    String directOrderRefusal(long givesChain, String givesAmount, long wantsChain, String wantsAmount) {
+        final String g = DexFiles.atomic(givesAmount, DexDirect.decimals(givesChain)), w = DexFiles.atomic(wantsAmount, DexDirect.decimals(wantsChain));
+        return g == null || w == null ? "" : directRefusal(OFFER_CHECK_ID, givesChain, g, wantsChain, w);
+    }
+
+    boolean postDirect(long givesChain, String givesAmount, long wantsChain, String wantsAmount, int hours) {
+        if (direct == null) return sayDirect("Direct trades are not available in this wallet.");
+        if (!keys.ready()) return sayDirect("Unlock your trading keys first.");
+        final String g = DexFiles.atomic(givesAmount, DexDirect.decimals(givesChain)), w = DexFiles.atomic(wantsAmount, DexDirect.decimals(wantsChain));
+        if (g == null || w == null || hours < 1 || hours > 31 * 24) return sayDirect("Check the amounts and how long the offer stays open (1 hour to 31 days).");
+        if (DexDirect.ticker(givesChain).equals(DexDirect.ticker(wantsChain))) return sayDirect("Pick two different coins.");
+        // The maker's posting is its approval: the limits are checked now, and counted when it is taken
+        final String refusal = directRefusal(OFFER_CHECK_ID, givesChain, g, wantsChain, w);
+        if (!refusal.isEmpty()) return sayDirect(refusal);
+        final boolean started = direct.post(keys.seedHex(), givesChain, g, wantsChain, w, hours * 3600L);
+        directMessage = started ? "" : "The offer could not be posted now.";
+        changed();
+        return started;
+    }
+
+    boolean takeDirect(String listingId) {
+        if (direct == null) return sayDirect("Direct trades are not available in this wallet.");
+        if (!keys.ready()) return sayDirect("Unlock your trading keys first.");
+        final JSONObject l = direct.listing(listingId);
+        if (l == null) return sayDirect("That offer is no longer listed.");
+        if (!evmAccount.isEmpty() && l.optString("maker").equalsIgnoreCase(evmAccount)) return sayDirect("That is your own offer.");
+        // We give what the maker wants
+        final JSONObject gives = l.optJSONObject("wants"), gets = l.optJSONObject("gives");
+        final String refusal = directRefusal(OFFER_CHECK_ID, gives.optLong("chainId"), gives.optString("units"), gets.optLong("chainId"), gets.optString("units"));
+        if (!refusal.isEmpty()) return sayDirect(refusal);
+        final boolean started = direct.take(keys.seedHex(), listingId);
+        directMessage = started ? "" : "The offer could not be taken now.";
+        changed();
+        return started;
+    }
+
+    boolean cancelDirect(String folder) {
+        return direct != null && keys.ready() && direct.cancel(keys.seedHex(), folder);
+    }
+
+    /** The taker's approval of the terms its trade shows; checked and counted under both coins' limits first. */
+    boolean approveDirect(String folder, String commitment) {
+        if (direct == null || !keys.ready()) return false;
+        final JSONObject f = direct.folder(folder);
+        final JSONObject trade = f == null ? null : f.optJSONObject("trade");
+        if (trade == null || !trade.optString("commitment").equals(commitment)) return sayDirect("The trade changed; check it again.");
+        final String id = ledgerId(trade.optString("tradeId"));
+        final JSONObject gives = trade.optJSONObject("gives"), gets = trade.optJSONObject("gets");
+        if (id == null || gives == null || gets == null) return sayDirect("The trade could not be checked; not started.");
+        final String refusal = directRefusal(id, gives.optLong("chainId"), gives.optString("value"), gets.optLong("chainId"), gets.optString("value"));
+        if (!refusal.isEmpty()) return sayDirect(refusal);
+        // Counted under the coin we lock (its daily limit), before anything is locked
+        try {
+            if (!risk.recordStart(DexConfig.controlNetwork(gives.optLong("chainId")), id, new BigInteger(gives.optString("value")), 0))
+                return sayDirect("The trade could not be recorded; not started.");
+        } catch (Exception e) {
+            return sayDirect("The trade could not be recorded; not started.");
+        }
+        directRecorded.add(id);
+        directMessage = "";
+        return direct.approve(folder, commitment);
+    }
+
+    /** A maker's trade starts when it is taken, with no click: it is counted when first seen. */
+    private void recordDirectStarts() {
+        if (direct == null) return;
+        final org.json.JSONArray mine = direct.status("", false).optJSONArray("mine");
+        for (int i = 0; mine != null && i < mine.length(); i++) {
+            final JSONObject f = mine.optJSONObject(i), trade = f == null ? null : f.optJSONObject("trade");
+            if (trade == null || !"offer".equals(f.optString("kind"))) continue;
+            final String id = ledgerId(trade.optString("tradeId"));
+            final JSONObject gives = trade.optJSONObject("gives");
+            if (id == null || gives == null || directRecorded.contains(id)) continue;
+            final String network = DexConfig.controlNetwork(gives.optLong("chainId"));
+            try {
+                if (!network.isEmpty() && risk.recordStart(network, id, new BigInteger(gives.optString("value")), 0)) directRecorded.add(id);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** A take of ours that its maker answered and that waits for the user's approval, or null. */
+    JSONObject directAwaitingApproval() {
+        if (direct == null) return null;
+        final org.json.JSONArray mine = direct.status("", false).optJSONArray("mine");
+        for (int i = 0; mine != null && i < mine.length(); i++) {
+            final JSONObject f = mine.optJSONObject(i), trade = f == null ? null : f.optJSONObject("trade");
+            if (trade != null && "take".equals(f.optString("kind")) && "agreed".equals(f.optString("state")) && !trade.optBoolean("approved")
+                    && !trade.optString("commitment").isEmpty()) return f;
+        }
+        return null;
+    }
+
+    String directMessage() {
+        return directMessage;
+    }
+
+    boolean payoutDirect(String folder, String address) {
+        if (direct == null || !keys.ready()) return false;
+        final boolean started = direct.payout(keys.seedHex(), folder, address);
+        directMessage = started ? "" : "Check the address: it must be on the chain the coin came in on.";
+        changed();
+        return started;
     }
 
     @Override
@@ -306,7 +471,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     boolean tradeWaitsForKeys() {
         if (keys.ready() || !keys.exist()) return false;
         for (DexMarket m : markets.values()) if (!m.agreedFolders().isEmpty()) return true;
-        return false;
+        return direct != null && direct.hasRunningTrade();
     }
 
     private DexMarket marketFor(String tradeDir) {
@@ -447,6 +612,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         if (!keys.ready()) return;
         if (evmAccount.isEmpty()) askAccounts();
         for (DexMarket m : markets.values()) if (!m.busy()) m.step(keys.seedHex());
+        if (direct != null) direct.step(keys.seedHex());
     }
 
     // ---- the trade -----------------------------------------------------------------------------

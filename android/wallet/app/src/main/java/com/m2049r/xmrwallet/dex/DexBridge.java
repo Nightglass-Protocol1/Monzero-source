@@ -70,6 +70,8 @@ final class DexBridge implements DexEngine.Listener {
     private String pairResult = "", pairResultId = "", pairResultToken = "";
     private boolean keysWanted, returnWanted, warnedLocked;
     private String announcedTrade = "", paidTrade = "";
+    private final java.util.Set<String> announcedDirect = new java.util.HashSet<>();
+    private final java.util.Map<String, Long> directPayoutTried = new java.util.HashMap<>();   // folder -> when its payout was last asked for
 
     DexBridge(DexEngine engine, File settings, Listener listener) {
         this.engine = engine;
@@ -266,6 +268,7 @@ final class DexBridge implements DexEngine.Listener {
             listener.attention("keys", "A trade is waiting for your trading password", "Tap to unlock your trading keys so the trade can continue.");
         }
         if (tokenHash != null) watchTrade();
+        if (tokenHash != null) watchDirect();
         listener.bridgeChanged();
     }
 
@@ -288,6 +291,36 @@ final class DexBridge implements DexEngine.Listener {
         if (!to.isEmpty() && engine.payoutTrade(to)) paidTrade = id;
     }
 
+    /** Direct trades: announce a take waiting for approval; pay a finished one to the accepted account. */
+    private void watchDirect() {
+        final JSONObject direct = engine.directStatus();
+        if (!direct.optBoolean("configured")) return;
+        final JSONArray mine = direct.optJSONArray("mine");
+        final long now = System.currentTimeMillis() / 1000;
+        for (int i = 0; mine != null && i < mine.length(); i++) {
+            final JSONObject f = mine.optJSONObject(i);
+            if (f == null) continue;
+            final JSONObject trade = f.optJSONObject("trade") == null ? new JSONObject() : f.optJSONObject("trade");
+            final String folder = f.optString("folder");
+            if (f.optString("kind").equals("take") && f.optString("state").equals("agreed") && !trade.optBoolean("approved")
+                    && !trade.optString("commitment").isEmpty() && announcedDirect.add(folder))
+                listener.attention("approve", "A trade is waiting for your approval", "Check the amounts in your Monzero wallet and approve the trade there.");
+            // Finished: what it brought in goes to the account the user accepted for this page, on the
+            // chain it came in on (asked again after a while if a payout did not go through)
+            final String stage = trade.optString("stage");
+            if (!f.optString("state").equals("done") || (!stage.equals("Done(Swapped)") && !stage.equals("Done(Refunded)"))) continue;
+            final JSONObject payout = trade.optJSONObject("payout");
+            if (payout != null && (!payout.optString("tx").isEmpty() || !payout.optString("note").isEmpty())) continue;
+            final Long tried = directPayoutTried.get(folder);
+            if (tried != null && now - tried < 300) continue;
+            final JSONObject in = stage.equals("Done(Swapped)") ? f.optJSONObject("wants") : f.optJSONObject("gives");
+            final String to = in == null ? "" : payoutAccount(in.optLong("chainId"));
+            if (to.isEmpty()) continue;
+            directPayoutTried.put(folder, now);
+            engine.payoutDirect(folder, to);
+        }
+    }
+
     // ---- requests ------------------------------------------------------------------------------
 
     private static JSONObject pick(JSONObject from, String... keys) throws Exception {
@@ -306,11 +339,17 @@ final class DexBridge implements DexEngine.Listener {
         final JSONObject tradeOut = pick(trade, "configured", "busy", "state", "tradeId", "commitment", "awaitingApproval", "awaitingFunding",
                 "startRefusal", "error", "payout", "account", "solAccount");
         tradeOut.put("snapshot", pick(trade.optJSONObject("snapshot"), "stage", "role", "done", "offer", "evmTxs", "xmzSweeps", "approved", "progress", "deadlines"));
-        return new JSONObject()
+        final JSONArray features = new JSONArray().put("partial").put("long-offers").put("renew").put("usdt-v2");
+        // Direct trades, as the wallet checked them (the page shows these offers, not its own reading)
+        final JSONObject direct = engine.directStatus();
+        final JSONObject directOut = direct.optBoolean("configured")
+                ? pick(direct, "configured", "keys", "busy", "state", "error", "command", "message", "listings", "mine", "pairs", "chains", "payout") : null;
+        if (directOut != null) features.put("direct");
+        return new JSONObject().putOpt("direct", directOut)
                 .put("wallet", pick(engine.walletStatus(), "state", "balance", "unlocked", "address", "keysReady", "keysExist", "keysBusy", "tradeAccount", "solTradeAccount", "error"))
                 .put("markets", marketOut).put("trade", tradeOut).put("account", account).put("solAccount", solAccount)
                 // What this wallet can do beyond the first page protocol: the page offers only these
-                .put("features", new JSONArray().put("partial").put("long-offers").put("renew").put("usdt-v2"));
+                .put("features", features);
     }
 
     private static final class Reply {
@@ -410,6 +449,21 @@ final class DexBridge implements DexEngine.Listener {
             }
             case "/v1/cancel":
                 return ok(new JSONObject().put("ok", engine.cancelOffer(body.optString("folder"))));
+            // Direct (coin <-> coin) offers: the same asks; approval and payouts stay with the wallet
+            case "/v1/direct/refresh":
+                return ok(new JSONObject().put("ok", engine.refreshDirect()));
+            case "/v1/direct/offer": {
+                final boolean posted = engine.postDirect(body.optLong("givesChainId"), body.optString("gives"), body.optLong("wantsChainId"), body.optString("wants"), body.optInt("hours", 24));
+                return ok(new JSONObject().put("ok", posted).put("message", engine.directMessage()));
+            }
+            case "/v1/direct/take": {
+                final String id = body.optString("id");
+                if (!LISTING_ID.matcher(id).matches()) return fail(400, "id");
+                final boolean taken = engine.takeDirect(id);
+                return ok(new JSONObject().put("ok", taken).put("message", taken ? "" : engine.directMessage()));
+            }
+            case "/v1/direct/cancel":
+                return ok(new JSONObject().put("ok", engine.cancelDirect(body.optString("folder"))));
             case "/v1/renew":
                 return ok(new JSONObject().put("ok", engine.setOfferRenew(body.optString("folder"), body.optBoolean("on"))));
             case "/v1/return": {
