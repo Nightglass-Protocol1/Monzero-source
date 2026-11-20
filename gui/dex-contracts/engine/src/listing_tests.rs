@@ -28,6 +28,7 @@ fn listing(maker: &PrivateKeySigner) -> Listing {
         xmz_network: XmzNetwork::Mainnet,
         created_at: NOW,
         expires_at: NOW + 3600,
+        min_xmz: None,
     }
 }
 
@@ -91,7 +92,8 @@ fn listings_outside_the_rules_are_refused() {
     assert_eq!(check(Listing { expires_at: NOW + MAX_LIFETIME + 1, ..base.clone() }), Err(ListingError::Time));
     assert_eq!(check(Listing { mailbox: B256::ZERO, ..base.clone() }), Err(ListingError::Mailbox));
     assert_eq!(check(Listing { id: B256::ZERO, ..base.clone() }), Err(ListingError::Id));
-    assert_eq!(check(Listing { schema: "monzero-dex-listing/2".into(), ..base.clone() }), Err(ListingError::Schema));
+    assert_eq!(check(Listing { schema: "monzero-dex-listing/3".into(), ..base.clone() }), Err(ListingError::Schema));
+    assert_eq!(check(Listing { schema: PARTIAL_SCHEMA.into(), ..base.clone() }), Err(ListingError::Schema), "a /2 listing names its minimum");
 }
 
 #[test]
@@ -126,4 +128,144 @@ fn only_the_maker_can_cancel() {
     assert_eq!(cancel.clone().sign(&key).verify(), Ok(()));
     let other = PrivateKeySigner::random();
     assert_eq!(cancel.sign(&other).verify(), Err(ListingError::BadSignature));
+}
+
+fn partial(maker: &PrivateKeySigner) -> Listing {
+    Listing { schema: PARTIAL_SCHEMA.into(), min_xmz: Some(100 * MIN_FILL_FLOOR), ..listing(maker) }
+}
+
+#[test]
+fn a_partial_listing_verifies_and_a_whole_one_keeps_its_bytes() {
+    let key = PrivateKeySigner::random();
+    let signed = partial(&key).sign(&key);
+    assert_eq!(signed.verify(&rules(), NOW + 10), Ok(Chain::EthMainnet));
+    let json = serde_json::to_string(&signed).unwrap();
+    assert!(json.contains(r#""minXmz":"10000000000000""#), "{json}");
+    assert_eq!(serde_json::from_str::<SignedListing>(&json).unwrap(), signed);
+    // A whole offer has no minXmz field at all: its signed form is as before partial offers
+    let whole = serde_json::to_string(&listing(&key).sign(&key)).unwrap();
+    assert!(!whole.contains("minXmz"), "{whole}");
+    // The schema is part of what is signed: a partial offer relabelled is not the maker's
+    let mut relabelled = signed.clone();
+    relabelled.listing.min_xmz = Some(MIN_FILL_FLOOR);
+    assert_eq!(relabelled.verify(&rules(), NOW + 10), Err(ListingError::BadSignature));
+}
+
+#[test]
+fn a_partial_listing_needs_its_schema_and_a_sane_minimum() {
+    let key = PrivateKeySigner::random();
+    let check = |l: Listing| l.check(&rules(), NOW + 10);
+    let base = partial(&key);
+    assert_eq!(check(Listing { schema: LISTING_SCHEMA.into(), ..base.clone() }), Err(ListingError::Schema));
+    assert_eq!(check(Listing { min_xmz: None, ..base.clone() }), Err(ListingError::Schema));
+    assert_eq!(check(Listing { min_xmz: Some(MIN_FILL_FLOOR - 1), ..base.clone() }), Err(ListingError::Minimum));
+    assert_eq!(check(Listing { min_xmz: Some(base.xmz + 1), ..base.clone() }), Err(ListingError::Minimum));
+    assert!(check(Listing { min_xmz: Some(base.xmz), ..base.clone() }).is_ok(), "a minimum of all of it is a whole offer in effect");
+}
+
+#[test]
+fn a_version_2_listing_may_stay_open_a_month_a_first_version_one_a_day() {
+    let key = PrivateKeySigner::random();
+    let check = |l: Listing| l.check(&rules(), NOW + 10);
+    let whole = listing(&key);
+    let month = MAX_LIFETIME_V2;
+    assert_eq!(check(Listing { expires_at: whole.created_at + MAX_LIFETIME + 1, ..whole.clone() }), Err(ListingError::Time));
+    let long = Listing { schema: PARTIAL_SCHEMA.into(), min_xmz: Some(whole.xmz), expires_at: whole.created_at + month, ..whole.clone() };
+    assert!(check(long.clone()).is_ok(), "a month, as a version-2 offer");
+    assert_eq!(check(Listing { expires_at: whole.created_at + month + 1, ..long.clone() }), Err(ListingError::Time));
+    // A minimum of all of it: whole, taken only whole
+    assert!(!long.is_partial());
+    assert!(long.fill_ok(long.xmz) && !long.fill_ok(long.xmz / 2));
+    assert!(partial(&key).is_partial());
+}
+
+#[test]
+fn usdt_is_a_pair_on_solana_mainnet_only_and_trades_carry_its_mint() {
+    let mint = crate::sol::usdt_mint(Chain::SolMainnet).expect("Tether's mint is pinned");
+    assert_eq!(crate::sol::to_base58(&mint), "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
+    assert_eq!(Chain::SolMainnet.pairs(), vec!["SOL/XMZ", "USDT/XMZ"]);
+    assert_eq!(Chain::BscMainnet.pairs(), vec!["BNB/XMZ", "USDT-BSC/XMZ"]);
+    assert_eq!(Chain::SolMainnet.asset_of("SOL/XMZ"), Some(Address::ZERO));
+    assert_eq!(Chain::SolMainnet.asset_of("USDT/XMZ"), Some(crate::sol::asset_address(&mint)));
+    assert_eq!(Chain::BscMainnet.asset_of("USDT/XMZ"), None, "BNB Chain USDT has its own pair name");
+    assert_eq!(Chain::SolDevnet.asset_of("USDT/XMZ"), None, "no USDT pinned on devnet");
+
+    let program = crate::sol::program_of(Chain::SolMainnet).expect("mainnet program");
+    let mut r = Rules::default();
+    r.contracts.insert(Chain::SolMainnet.id(), crate::sol::contract_address(&program));
+    let key = PrivateKeySigner::random();
+    let mut l = listing(&key);
+    l.chain_id = Chain::SolMainnet.id();
+    l.contract = crate::sol::contract_address(&program);
+    l.pair = "USDT/XMZ".into();
+    l.value = U256::from(25_000_000u64); // 25 USDT
+    assert_eq!(l.check(&r, NOW), Ok(Chain::SolMainnet));
+    assert_eq!(l.asset(), crate::sol::asset_address(&mint));
+    let offer = crate::market::offer_for(&l, Address::repeat_byte(9), l.xmz);
+    assert_eq!(offer.asset, crate::sol::asset_address(&mint), "the trade is paid in USDT, not SOL");
+    assert_eq!(crate::sol::mint_of(Chain::SolMainnet, offer.asset).unwrap(), Some(mint));
+    // A token this app does not know is refused, as is USDT named on a chain without it
+    l.pair = "DOGE/XMZ".into();
+    assert_eq!(l.check(&r, NOW), Err(ListingError::Pair("DOGE/XMZ".into())));
+    let mut eth = listing(&key);
+    eth.pair = "USDT/XMZ".into();
+    assert_eq!(eth.check(&rules(), NOW), Err(ListingError::Pair("USDT/XMZ".into())));
+}
+
+#[test]
+fn token_accounts_are_program_addresses_of_wallet_and_mint() {
+    let mint = crate::sol::usdt_mint(Chain::SolMainnet).unwrap();
+    let a = crate::sol::token_account(&[1u8; 32], &mint).unwrap();
+    let b = crate::sol::token_account(&[2u8; 32], &mint).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(crate::sol::token_account(&[1u8; 32], &mint), Some(a), "deterministic");
+    assert!(curve25519_dalek::edwards::CompressedEdwardsY(a).decompress().is_none(), "a program address is off the curve");
+    // The same address Solana's own tool gives (spl-token address --owner … --token <USDT>)
+    let wallet = crate::sol::from_base58("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM").unwrap();
+    assert_eq!(crate::sol::to_base58(&crate::sol::token_account(&wallet, &mint).unwrap()), "TB5FCqbNsnuLQgEjUuPaT9qtVPTT4U1A8rvi7qzEj2M");
+}
+
+#[test]
+fn bep20_usdt_is_its_own_pair_on_bnb_smart_chain_only() {
+    let token = crate::chain::usdt_token(Chain::BscMainnet).expect("BSC-USD is pinned");
+    assert_eq!(token.to_string().to_lowercase(), "0x55d398326f99059ff775485246999027b3197955");
+    assert_eq!(Chain::BscMainnet.pairs(), vec!["BNB/XMZ", "USDT-BSC/XMZ"]);
+    assert_eq!(Chain::EthMainnet.pairs(), vec!["ETH/XMZ"], "no ERC-20 USDT: fees too high");
+    assert_eq!(Chain::BscMainnet.asset_of("USDT-BSC/XMZ"), Some(token));
+    assert_eq!(Chain::BscMainnet.asset_of("USDT/XMZ"), None, "Solana's USDT pair is not BNB Chain's");
+    assert_eq!(Chain::SolMainnet.asset_of("USDT-BSC/XMZ"), None);
+    let mut r = Rules::default();
+    r.contracts.insert(56, contract());
+    let key = PrivateKeySigner::random();
+    let mut l = listing(&key);
+    l.chain_id = 56;
+    l.pair = "USDT-BSC/XMZ".into();
+    l.value = U256::from(25u64) * U256::from(10u64).pow(U256::from(18u64)); // 25 USDT (18 decimals)
+    assert_eq!(l.check(&r, NOW), Ok(Chain::BscMainnet));
+    let offer = crate::market::offer_for(&l, Address::repeat_byte(9), l.xmz);
+    assert_eq!(offer.asset, token, "the lock is in USDT, not BNB");
+}
+
+#[test]
+fn monero_pairs_trade_only_the_chains_own_coin() {
+    // "BNB/XMR" pays in BNB itself; no token is quoted in XMR (USDT/XMR is not a market)
+    assert_eq!(Chain::BscMainnet.asset_of("BNB/XMR"), Some(Address::ZERO));
+    assert_eq!(Chain::SolMainnet.asset_of("SOL/XMR"), Some(Address::ZERO));
+    assert_eq!(Chain::BscMainnet.asset_of("ETH/XMR"), None);
+    assert_eq!(Chain::BscMainnet.asset_of("USDT-BSC/XMR"), None);
+    assert_eq!(Chain::SolMainnet.asset_of("USDT/XMR"), None);
+
+    let token = crate::chain::usdt_token(Chain::BscMainnet).expect("BEP-20 USDT pinned");
+    let key = PrivateKeySigner::random();
+    let mut r = Rules { xmr_mainnet: true, ..Rules::default() };
+    r.contracts.insert(56, contract());
+    let bsc = Listing { chain_id: 56, pair: "BNB/XMR".into(), xmz_network: XmzNetwork::XmrMainnet, ..listing(&key) };
+    let check = |l: Listing| l.sign(&key).verify(&r, NOW);
+    assert!(check(bsc.clone()).is_ok());
+    assert_eq!(check(Listing { pair: "USDT-BSC/XMR".into(), ..bsc.clone() }), Err(ListingError::Pair("USDT-BSC/XMR".into())));
+    // A USDT offer must quote XMZ: the same pair with a Monero network is refused
+    assert_eq!(check(Listing { pair: "USDT-BSC/XMZ".into(), ..bsc.clone() }), Err(ListingError::Pair("USDT-BSC/XMZ".into())));
+    let usdt = Listing { pair: "USDT-BSC/XMZ".into(), xmz_network: XmzNetwork::Mainnet, ..bsc };
+    assert!(check(usdt.clone()).is_ok());
+    assert_eq!(usdt.asset(), token);
 }

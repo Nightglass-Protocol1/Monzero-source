@@ -308,7 +308,9 @@ final class DexBridge implements DexEngine.Listener {
         tradeOut.put("snapshot", pick(trade.optJSONObject("snapshot"), "stage", "role", "done", "offer", "evmTxs", "xmzSweeps", "approved", "progress", "deadlines"));
         return new JSONObject()
                 .put("wallet", pick(engine.walletStatus(), "state", "balance", "unlocked", "address", "keysReady", "keysExist", "keysBusy", "tradeAccount", "solTradeAccount", "error"))
-                .put("markets", marketOut).put("trade", tradeOut).put("account", account).put("solAccount", solAccount);
+                .put("markets", marketOut).put("trade", tradeOut).put("account", account).put("solAccount", solAccount)
+                // What this wallet can do beyond the first page protocol: the page offers only these
+                .put("features", new JSONArray().put("partial"));
     }
 
     private static final class Reply {
@@ -396,13 +398,13 @@ final class DexBridge implements DexEngine.Listener {
                 final long chainId = body.optLong("chainId");
                 final String side = body.optString("side");
                 if (!side.equals("buy-xmz") && !side.equals("sell-xmz")) return fail(400, "side");
-                final boolean posted = engine.postOffer(chainId, side, body.optString("coin"), body.optString("xmz"), body.optInt("hours", 6));
+                final boolean posted = engine.postOffer(chainId, side, body.optString("coin"), body.optString("xmz"), body.optString("minXmz"), body.optInt("hours", 6));
                 return ok(new JSONObject().put("ok", posted).put("message", marketMessage()));
             }
             case "/v1/take": {
                 final String id = body.optString("id");
                 if (!LISTING_ID.matcher(id).matches()) return fail(400, "id");
-                final boolean taken = engine.takeOffer(id);
+                final boolean taken = engine.takeOffer(id, body.optString("xmz"));
                 return ok(new JSONObject().put("ok", taken).put("message", taken ? "" : marketMessage()));
             }
             case "/v1/cancel":

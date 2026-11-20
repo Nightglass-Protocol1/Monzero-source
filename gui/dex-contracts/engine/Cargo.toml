@@ -42,7 +42,7 @@ chacha20poly1305 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # The helper binary's runtime (alloy already uses tokio)
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 # Android only: the stand-alone helper checks TLS servers against built-in roots (see chain.rs http_client)
 [target.'cfg(target_os = "android")'.dependencies]

@@ -1,8 +1,13 @@
-FROM ubuntu:18.04
+# gui/Dockerfile.linux with two changes for Monzero's DEX code: Qt is built with TLS (linked to the
+# static OpenSSL built above; the wallet fetches signed control documents over HTTPS), and zstd is added.
+# Ubuntu 22.04: the DEX code needs glibc 2.34 (posix_spawn_file_actions_addclosefrom_np) and C++17;
+# glibc 2.35 is also the floor of the v1.0.0 command-line package.
+FROM docker.io/library/ubuntu@sha256:281c5745f657873d78e5531fc5ba8575f46ab7769b94550ac99543f122679986
 
 ARG THREADS=1
 ARG QT_VERSION=v5.15.19-lts-lgpl
 
+ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8
 ENV CFLAGS="-fPIC"
 ENV CPPFLAGS="-fPIC"
 ENV CXXFLAGS="-fPIC"
@@ -11,7 +16,8 @@ ENV SOURCE_DATE_EPOCH=1397818193
 RUN apt update && \
     apt install -y automake autopoint bison gettext git gperf libgl1-mesa-dev libglib2.0-dev ninja-build \
     libpng-dev libpthread-stubs0-dev libsodium-dev libtool-bin libudev-dev libusb-1.0-0-dev mesa-common-dev \
-    pkg-config python wget xutils-dev
+    pkg-config python2 wget xutils-dev build-essential ca-certificates file xz-utils bzip2 patch && \
+    ln -s /usr/bin/python2 /usr/bin/python
 
 RUN git clone -b xorgproto-2020.1 --depth 1 https://gitlab.freedesktop.org/xorg/proto/xorgproto && \
     cd xorgproto && \
@@ -27,6 +33,7 @@ RUN git clone -b 1.12 --depth 1 https://gitlab.freedesktop.org/xorg/proto/xcbpro
     ./autogen.sh && \
     make -j$THREADS && \
     make -j$THREADS install && \
+    sed -i 's#${PYTHON_PREFIX}#/usr/local#' /usr/local/lib/pkgconfig/xcb-proto.pc && \
     rm -rf $(pwd)
 
 RUN git clone -b libXau-1.0.9 --depth 1 https://gitlab.freedesktop.org/xorg/lib/libxau && \
@@ -165,14 +172,15 @@ RUN wget https://archives.boost.io/release/1.80.0/source/boost_1_80_0.tar.gz && 
     ./b2 --with-atomic --with-system --with-filesystem --with-thread --with-date_time --with-chrono --with-regex --with-serialization --with-program_options --with-locale variant=release link=static runtime-link=static cflags="${CFLAGS}" cxxflags="${CXXFLAGS}" install -a --prefix=/usr && \
     rm -rf $(pwd)
 
-RUN wget https://www.openssl.org/source/openssl-1.1.1u.tar.gz && \
-    echo "e2f8d84b523eecd06c7be7626830370300fbcc15386bf5142d72758f6963ebc6 openssl-1.1.1u.tar.gz" | sha256sum -c && \
-    tar -xzf openssl-1.1.1u.tar.gz && \
-    rm openssl-1.1.1u.tar.gz && \
-    cd openssl-1.1.1u && \
-    ./config no-shared no-zlib-dynamic --prefix=/usr --openssldir=/usr && \
+# OpenSSL 3.5 LTS (upstream's recipe has 1.1.1u, which is out of support; the DEX code uses the OpenSSL 3 API)
+RUN wget https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz && \
+    echo "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a openssl-3.5.9.tar.gz" | sha256sum -c && \
+    tar -xzf openssl-3.5.9.tar.gz && \
+    rm openssl-3.5.9.tar.gz && \
+    cd openssl-3.5.9 && \
+    ./config no-shared no-zlib-dynamic no-tests no-docs --prefix=/usr --libdir=lib --openssldir=/usr && \
     make -j$THREADS && \
-    make -j$THREADS install && \
+    make -j$THREADS install_sw && \
     rm -rf $(pwd)
 
 RUN wget https://www.nlnetlabs.nl/downloads/unbound/unbound-1.16.2.tar.gz && \
@@ -185,9 +193,10 @@ RUN wget https://www.nlnetlabs.nl/downloads/unbound/unbound-1.16.2.tar.gz && \
     make -j$THREADS install && \
     rm -rf $(pwd)
 
-RUN rm /usr/lib/x86_64-linux-gnu/libX11.a && \
-    rm /usr/lib/x86_64-linux-gnu/libXext.a && \
-    rm /usr/lib/x86_64-linux-gnu/libX11-xcb.a && \
+# On Ubuntu 18.04 these came in with libgl1-mesa-dev; Qt's xlib and xcb-xlib checks need them
+RUN apt update && apt install -y libx11-xcb-dev libxext-dev
+
+RUN rm -f /usr/lib/x86_64-linux-gnu/libX11.a /usr/lib/x86_64-linux-gnu/libXext.a /usr/lib/x86_64-linux-gnu/libX11-xcb.a && \
     git clone https://code.qt.io/qt/qt5.git -b ${QT_VERSION} --depth 1 && \
     cd qt5 && \
     git reset --hard dc2ac680fa9d0ef7b0d9520859593d13951bedea && \
@@ -196,9 +205,9 @@ RUN rm /usr/lib/x86_64-linux-gnu/libX11.a && \
     sed -ri s/\(Libs:.*\)/\\1\ -lz/ /usr/local/lib/pkgconfig/freetype2.pc && \
     sed -ri s/\(Libs:.*\)/\\1\ -lXau/ /usr/local/lib/pkgconfig/xcb.pc && \
     sed -i s/\\/usr\\/X11R6\\/lib64/\\/usr\\/local\\/lib/ qtbase/mkspecs/linux-g++-64/qmake.conf && \
-    ./configure --prefix=/usr -platform linux-g++-64 -opensource -confirm-license -release -static -no-avx \
+    OPENSSL_LIBS="-lssl -lcrypto -ldl -lpthread" ./configure --prefix=/usr -platform linux-g++-64 -opensource -confirm-license -release -static -no-avx \
     -opengl desktop -qpa xcb -xcb -xcb-xlib -feature-xlib -system-freetype -fontconfig -glib \
-    -no-dbus -no-feature-qml-worker-script -no-linuxfb -no-openssl -no-sql-sqlite -no-kms -no-use-gold-linker \
+    -no-dbus -no-feature-qml-worker-script -no-linuxfb -openssl-linked -no-sql-sqlite -no-kms -no-use-gold-linker \
     -qt-harfbuzz -qt-libjpeg -qt-libpng -qt-pcre -qt-zlib \
     -skip qt3d -skip qtandroidextras -skip qtcanvas3d -skip qtcharts -skip qtconnectivity -skip qtdatavis3d \
     -skip qtdoc -skip qtgamepad -skip qtlocation -skip qtmacextras -skip qtnetworkauth -skip qtpurchasing \
@@ -275,3 +284,10 @@ RUN git clone -b v3.24.0 --depth 1 https://github.com/Kitware/CMake && \
     make -j$THREADS && \
     make -j$THREADS install && \
     rm -rf $(pwd)
+
+# zstd (static), used by core/src/common
+RUN git clone -b v1.5.6 --depth 1 https://github.com/facebook/zstd && \
+    cd zstd && git reset --hard 794ea1b0afca0f020f4e57b6732332231fb23c70 && \
+    make -j$THREADS -C lib libzstd.a && \
+    install -m 644 lib/libzstd.a /usr/local/lib/ && install -m 644 lib/zstd.h lib/zstd_errors.h lib/zdict.h /usr/local/include/ && \
+    cd .. && rm -rf zstd

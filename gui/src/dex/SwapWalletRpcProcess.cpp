@@ -19,6 +19,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#elif defined(Q_OS_WIN)
+#include <io.h>
 #endif
 
 namespace {
@@ -27,6 +29,9 @@ bool syncDirectory(const QString &directory) {
     const int fd=::open(QFile::encodeName(directory).constData(),O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd<0) return false;
     const bool synced=::fsync(fd)==0;::close(fd);return synced;
+#elif defined(Q_OS_WIN)
+    // NTFS journals folder changes (create, rename) itself; Windows has no fsync for a folder.
+    Q_UNUSED(directory);return true;
 #else
     Q_UNUSED(directory);return false;
 #endif
@@ -34,6 +39,10 @@ bool syncDirectory(const QString &directory) {
 bool durableCommit(QSaveFile &file,const QString &directory) {
 #ifdef Q_OS_LINUX
     return file.flush() && ::fsync(file.handle())==0 && file.commit() && syncDirectory(directory);
+#elif defined(Q_OS_WIN)
+    // _commit flushes the file to disk (FlushFileBuffers); the rename in commit() is journaled by NTFS
+    const int fd=file.handle();
+    return file.flush() && (fd<0 || ::_commit(fd)==0) && file.commit() && syncDirectory(directory);
 #else
     Q_UNUSED(file);Q_UNUSED(directory);return false;
 #endif
@@ -44,6 +53,13 @@ bool privateDirectory(const QString &path) {
     return directory.isAbsolute() && directory.isDir() && !directory.isSymLink()
         && directory.ownerId() == geteuid() && !(directory.permissions() &
         (QFile::ReadGroup | QFile::WriteGroup | QFile::ExeGroup | QFile::ReadOther | QFile::WriteOther | QFile::ExeOther));
+#elif defined(Q_OS_WIN)
+    // A real folder (not a symlink or junction) under the app's data folder, which Windows keeps
+    // private to the user by its ACL; there are no Unix owner/mode bits to check.
+    const QFileInfo directory(path);
+    if (!directory.isAbsolute() || !directory.isDir() || directory.isSymLink()) return false;
+    const DWORD attrs=::GetFileAttributesW(QDir::toNativeSeparators(path).toStdWString().c_str());
+    return attrs!=INVALID_FILE_ATTRIBUTES && (attrs&FILE_ATTRIBUTE_DIRECTORY) && !(attrs&FILE_ATTRIBUTE_REPARSE_POINT);
 #else
     return false;
 #endif
@@ -131,6 +147,31 @@ bool SwapWalletRpcProcess::startBoundWithDigest(const QString &program,const QSt
     return launch(program,directory,daemonPort,walletPort,false,binding);
 }
 
+// A new copy of the app (an upgrade, or the folder moved) brings its own wallet RPC: same trade,
+// same ports, another program path or digest. The app has already checked that program against
+// the digest compiled into it, so the folder may move to it, but only from a clean stop and only
+// when nothing but "program" and "programSha256" differ in an intact (canonical) binding.
+bool SwapWalletRpcProcess::rebindProgram(const QString &directory,const QByteArray &binding) {
+    const QString bindingPath=QDir(directory).filePath("service.binding"),statePath=QDir(directory).filePath("service.state");
+    const auto recorded=LitecoinJournalProtocol::privateConfig(bindingPath);
+    const auto before=QJsonDocument::fromJson(recorded),after=QJsonDocument::fromJson(binding);
+    if (!before.isObject() || !after.isObject() || before.toJson(QJsonDocument::Compact)!=recorded) return false;
+    const auto old=before.object(),next=after.object();
+    if (old.keys()!=next.keys() || old.value("schema")!="monzero-bound-swap-rpc-v1") return false;
+    for (const auto &key:old.keys())
+        if (key!="program" && key!="programSha256" && old.value(key)!=next.value(key)) return false;
+    const QFileInfo stateInfo(statePath);
+    QFile state(statePath);
+    if (!stateInfo.isFile() || stateInfo.isSymLink() || stateInfo.size()>64
+        || !state.open(QIODevice::ReadOnly) || state.read(65)!="monzero-swap-rpc-v1\nstopped\n") return false;
+    state.close();
+    QSaveFile record(bindingPath);
+    if (!record.open(QIODevice::WriteOnly) || !record.setPermissions(QFile::ReadOwner | QFile::WriteOwner)
+        || record.write(binding)!=binding.size() || !durableCommit(record,directory)) return false;
+    qWarning("DEX wallet service %s: now run by %s",qPrintable(QFileInfo(directory).fileName()),qPrintable(next.value("program").toString()));
+    return true;
+}
+
 bool SwapWalletRpcProcess::launch(const QString &program, const QString &directory,
     quint16 daemonPort, quint16 walletPort, bool resume,const QByteArray &binding) {
     if (m_used || !validProgram(program) || !privateDirectory(directory)
@@ -144,7 +185,7 @@ bool SwapWalletRpcProcess::launch(const QString &program, const QString &directo
     if (!binding.isEmpty()) {
         const QFileInfo bindingInfo(bindingPath);
         if (bindingInfo.exists() || bindingInfo.isSymLink()) {
-            if (LitecoinJournalProtocol::privateConfig(bindingPath)!=binding
+            if ((LitecoinJournalProtocol::privateConfig(bindingPath)!=binding && !rebindProgram(directory,binding))
                 || !privateDirectory(QDir(directory).filePath("wallets"))) return false;
             resume=true;
         } else {

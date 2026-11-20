@@ -50,6 +50,11 @@ Item {
     function solana(chainId) { var id = Number(chainId); return id >= 501000101 && id <= 501000103 }
     function coin(chainId) { var id = Number(chainId); return solana(id) ? "SOL" : id === 56 || id === 97 ? "BNB" : "ETH" }
     function places(chainId) { return solana(chainId) ? 9 : 18 }
+    // What a trade is paid in: the chain's coin, or USDT on Solana (a token asset in the terms)
+    // (on Solana or on BNB Smart Chain: a non-zero asset)
+    function token(o) { return !!o && !!o.asset && !/^(0x)?0*$/.test(String(o.asset)) }
+    function offerCoin(o) { return token(o) ? "USDT" : coin(o ? o.chainId : 0) }
+    function offerPlaces(o) { return token(o) && solana(o.chainId) ? 6 : places(o ? o.chainId : 0) }
     // The user's own account for a chain, as accepted when the page connected
     function ownAccount(chainId) { return (solana(chainId) ? link.solAccount : link.account) || "" }
     function accountsText(a) {
@@ -111,7 +116,7 @@ Item {
         width: Math.min(560, prompt.width - 40); padding: 24
         background: Rectangle { color: "#202b36"; radius: 10; border.color: "#526b80" }
         readonly property bool buying: (prompt.trade.snapshot || ({})).role === "owner"
-        readonly property string coinText: prompt.units(prompt.offer.value, prompt.places(prompt.offer.chainId)) + " " + prompt.coin(prompt.offer.chainId)
+        readonly property string coinText: prompt.units(prompt.offer.value, prompt.offerPlaces(prompt.offer)) + " " + prompt.offerCoin(prompt.offer)
         readonly property string xmzText: prompt.units(prompt.offer.xmzAmount, 11) + " XMZ"
         contentItem: ColumnLayout {
             spacing: 14
@@ -126,7 +131,7 @@ Item {
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; color: "#a9b8c6"
                 text: qsTr("Network: %1\nThese amounts are from the signed offer this wallet holds, not from the web page. Once approved the swap runs by itself; keep the wallet open until it is finished. If the other side stops, your funds are returned after the time limit.\n%2 left in the trade account afterwards goes to %3")
-                    .arg(prompt.network(prompt.offer.chainId)).arg(prompt.coin(prompt.offer.chainId)).arg(prompt.ownAccount(prompt.offer.chainId) || qsTr("(no wallet connected for this coin yet)"))
+                    .arg(prompt.network(prompt.offer.chainId)).arg(prompt.offerCoin(prompt.offer)).arg(prompt.ownAccount(prompt.offer.chainId) || qsTr("(no wallet connected for this coin yet)"))
             }
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.errorColor

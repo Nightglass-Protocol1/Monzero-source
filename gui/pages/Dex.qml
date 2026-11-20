@@ -11,8 +11,18 @@ Rectangle {
     // With the web link available the page is just "connect to the DEX website"; the full trading
     // screen (charts, offers, coin wallets) stays one click away
     readonly property bool webLinkAvailable: typeof dexWeb !== "undefined" && dexWeb !== null
-    property bool simpleView: webLinkAvailable
-    property real dexHeight: simpleView ? connectPage.height : page.height
+    // Linux: the full exchange inside the app (pairs, chart, order book, buy and sell); the website
+    // is not needed. Developer builds can still open the older trading screen and the testnet lab.
+    readonly property bool nativeExchange: dexPrototypeEnabled && typeof dexNativeExchange !== "undefined" && dexNativeExchange === true
+    readonly property bool labAvailable: typeof dexPublicEdition !== "undefined" && dexPublicEdition === false
+    property bool labView: false
+    // Shown in the middle panel (it calls these): the exchange fetches and refreshes only then
+    property bool pageOpen: false
+    function onPageCompleted() { pageOpen = true }
+    function onPageClosed() { pageOpen = false }
+    readonly property bool exchangeView: nativeExchange && !labView
+    property bool simpleView: webLinkAvailable && !nativeExchange
+    property real dexHeight: exchangeView ? exchangeColumn.implicitHeight : simpleView ? connectPage.height : page.height
     function formatLtcAtomic(value) {
         if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(value)) return "—"
         while (value.length < 9) value = "0" + value
@@ -422,6 +432,27 @@ Rectangle {
         refreshOffers()
     }
 
+    ColumnLayout {
+        id: exchangeColumn
+        objectName: "dexExchangeView"
+        anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+        visible: root.exchangeView
+        spacing: 12
+        M.DexExchange {
+            objectName: "dexExchange"
+            Layout.fillWidth: true
+            visible: root.exchangeView
+            active: root.pageOpen
+            dex: root.dex
+        }
+        M.TextPlain {
+            visible: root.labAvailable
+            themeTransition: false; color: M.Style.dimmedFontColor; font.pixelSize: 12
+            text: qsTr("Developer tools: the older trading screen and the testnet lab ›")
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.labView = true }
+        }
+    }
+
     M.DexConnect {
         id: connectPage
         objectName: "dexConnect"
@@ -437,8 +468,14 @@ Rectangle {
         id: page
         anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
         spacing: 12
-        visible: !root.simpleView
+        visible: !root.simpleView && !root.exchangeView
 
+        M.TextPlain {
+            visible: root.nativeExchange
+            themeTransition: false; color: M.Style.dimmedFontColor; font.pixelSize: 13
+            text: "‹ " + qsTr("Back to the exchange")
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.labView = false }
+        }
         M.TextPlain {
             objectName: "dexSimpleViewLink"
             visible: root.webLinkAvailable
@@ -2877,11 +2914,17 @@ Later addresses may be missing from this backup. Payment and active swap recover
                         text: (modelData.side === "sell-xmz" ? qsTr("Sells %1 XMZ for %2 %3") : qsTr("Buys %1 XMZ for %2 %3")).arg(modelData.xmz).arg(modelData.coin).arg(offerBoard.coin)
                             + "  ·  " + qsTr("%1 %2 per XMZ").arg(modelData.price).arg(offerBoard.coin)
                             + "  ·  " + qsTr("%1 h left").arg(offerBoard.hoursLeft(modelData.expiresAt))
+                            + (modelData.minXmz ? "  ·  " + qsTr("any part from %1 XMZ").arg(modelData.minXmz) : "")
+                    }
+                    // A partial offer: the XMZ to take (empty: all of it)
+                    M.LineEdit {
+                        id: takePart; visible: !!modelData.minXmz; Layout.preferredWidth: 110
+                        placeholderText: qsTr("all")
                     }
                     M.StandardButton {
                         text: modelData.side === "sell-xmz" ? qsTr("Buy this XMZ") : qsTr("Sell XMZ here")
                         enabled: root.evmMarket.busy !== true
-                        onClicked: root.evmMarketError = root.dex.takeEvmOffer(modelData.id) ? "" : (root.evmMarket.message || qsTr("The offer could not be taken now."))
+                        onClicked: root.evmMarketError = root.dex.takeEvmOffer(modelData.id, takePart.visible ? takePart.text : "") ? "" : (root.evmMarket.message || qsTr("The offer could not be taken now."))
                     }
                 }
             }
@@ -2899,11 +2942,13 @@ Later addresses may be missing from this backup. Payment and active swap recover
                 M.LineEdit { id: offerXmz; Layout.fillWidth: true; placeholderText: qsTr("XMZ amount") }
                 M.LineEdit { id: offerCoin; Layout.fillWidth: true; placeholderText: qsTr("%1 amount").arg(offerBoard.coin) }
                 M.LineEdit { id: offerHours; Layout.preferredWidth: 80; text: "6"; placeholderText: qsTr("hours") }
+                // Optional: with a smallest part, others may take any amount from it; the rest stays on offer
+                M.LineEdit { id: offerMin; Layout.preferredWidth: 150; placeholderText: qsTr("smallest part (optional)") }
                 M.StandardButton {
                     objectName: "evmOfferPost"; text: qsTr("Post")
                     enabled: root.evmMarket.busy !== true && offerXmz.text !== "" && offerCoin.text !== ""
                     onClicked: root.evmMarketError = root.dex.postEvmOffer(root.evmMarket.chainId, offerSide.sell ? "sell-xmz" : "buy-xmz",
-                        offerCoin.text, offerXmz.text, parseInt(offerHours.text) || 0) ? "" : (root.evmMarket.message || qsTr("The offer could not be posted now."))
+                        offerCoin.text, offerXmz.text, parseInt(offerHours.text) || 0, offerMin.text) ? "" : (root.evmMarket.message || qsTr("The offer could not be posted now."))
                 }
             }
             Repeater {

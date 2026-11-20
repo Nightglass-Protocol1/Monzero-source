@@ -19,8 +19,12 @@ public:
     // Private config (0600): monzero-private-xmz-evm-market-v1
     bool configure(const QString &path);
     bool refreshListings(const QString &pair);
-    bool post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,qint64 lifetimeSecs);
-    bool take(QByteArray &walletSeed,const QString &listingId);
+    // minXmzAtoms: empty for a whole offer, else the least one take may be (a partial offer)
+    bool post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,const QString &minXmzAtoms,qint64 lifetimeSecs,bool renew=false);
+    // Keep one of our open offers open (renewed before it expires) or not; a mark in its folder
+    bool setRenew(const QString &folder,bool on);
+    // xmzAtoms: empty to take all of it, else how much of a partial offer
+    bool take(QByteArray &walletSeed,const QString &listingId,const QString &xmzAtoms=QString());
     bool cancel(QByteArray &walletSeed,const QString &folder);
     bool report(const QString &folder);
     // Send the trade account's unused coin to the user's own wallet; the helper refuses while a
@@ -31,7 +35,8 @@ public:
     QVariantMap status() const;
 private:
     QVariantMap m_withdrawal;
-    QString m_solAccount;
+    QString m_solAccount,m_evmAccount;
+    QString m_solUsdtAccount;   // the Solana trade account's USDT token account (from the helper)
 public:
     // Keys of the trade account from the light-wallet vault (hex); used instead of a wallet seed
     void setSwapKeys(const QByteArray &swapSeedHex,const QByteArray &evmKeyHex);
@@ -47,13 +52,15 @@ public:
     // Ask the helper for this wallet's trade accounts (Solana chains: where SOL is paid in)
     bool requestAccounts(QByteArray &walletSeed);
     QString solAccount() const {return m_solAccount;}
+    QString evmAccount() const {return m_evmAccount;}
+    QString solUsdtAccount() const {return m_solUsdtAccount;}
     void rescan() {scanFolders();emit changed();}
 signals:
     void changed();
     void agreed(const QString &tradeDir);
 private:
     QByteArray m_swapSeedHex,m_evmKeyHex;
-    struct Folder {QString path,kind,listingId,state,detail;QJsonObject listing;};
+    struct Folder {QString path,kind,listingId,state,detail;QJsonObject listing;bool renew=false;};
     bool run(const QJsonObject &request,const QString &folder);
     bool tickConfig(QByteArray &walletSeed,QJsonObject *out) const;
     void scanFolders();

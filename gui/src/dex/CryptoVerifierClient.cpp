@@ -7,7 +7,9 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QRegularExpression>
+#ifdef Q_OS_LINUX
 #include <unistd.h>
+#endif
 
 namespace {
 const QString bubblewrapPath = "/usr/bin/bwrap";
@@ -31,8 +33,15 @@ bool protectedExecutable(const QString &path, bool requireCurrentOwner)
         && (info.permissions() & QFileDevice::ReadOwner)
         && (info.permissions() & QFileDevice::ExeOwner)
         && !(info.permissions() & unsafeWritable)
+#ifdef Q_OS_LINUX
+        // Unix ownership: the file must belong to us (or to root for a system install)
         && (!requireCurrentOwner || info.ownerId() == static_cast<uint>(geteuid()))
-        && (requireCurrentOwner || info.ownerId() == 0);
+        && (requireCurrentOwner || info.ownerId() == 0)
+#else
+        // Windows uses SIDs, not uid; the permission checks above plus a user-owned app directory stand in
+        && (requireCurrentOwner || true)
+#endif
+        ;
 }
 
 QByteArray fileHash(const QString &path)

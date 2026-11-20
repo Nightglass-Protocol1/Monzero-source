@@ -4,6 +4,69 @@ Back up wallet files, mnemonic seeds and the node data directory before
 replacing any binary. Never enter a Monero seed into Monzero or a Monzero seed
 into Monero.
 
+## v1.3.7: trading starts on Windows (Windows only)
+
+No consensus change; Linux stays at v1.3.6. Close the old Windows wallet, unpack v1.3.7 into a new
+folder and start it: same wallet files, node data and trading keys. To go back, start the v1.3.6 files
+again (its Exchange could not trade on Windows).
+
+## v1.3.6: SOL/USDT withdrawals fix (Linux)
+
+No consensus change. Close the old wallet and node, unpack v1.3.6 and start it: same wallet files,
+node data, trading keys and trading wallet. A running trade carries on; to go back, start the v1.3.5
+files again.
+
+## v1.3.5: optional, exchange fixes and new price chart (Linux)
+
+No consensus change. Close the old wallet and node, unpack v1.3.5 and start it: same wallet files,
+node data, trading keys and trading wallet. A running trade carries on; to go back, start the v1.3.4
+files again.
+
+## v1.3.4: optional, large sends fix (Linux)
+
+No consensus change. Close the old wallet and node, unpack v1.3.4 and start it: same wallet files,
+node data, trading keys and trading wallet. A running trade carries on; to go back, start the v1.3.3
+files again.
+
+## v1.3.3: optional, USDT trade fee fix (Linux)
+
+No consensus change. Close the old wallet and node, unpack v1.3.3 and start it: same wallet files,
+node data, trading keys and trading wallet. A running trade carries on; to go back, start the v1.3.2
+files again (do not trade USDT with v1.3.2).
+
+## v1.3.2: optional, USDT markets and order upkeep (Linux)
+
+No consensus change. Close the old wallet and node, unpack v1.3.2 and start it: same wallet files,
+node data, trading keys and trading wallet. Finish or refund a running trade first; to go back,
+start the v1.3.1 files again (v1.3.1 does not show USDT offers).
+
+## v1.3.1: optional, DEX fixes (Linux)
+
+No consensus change. Close the old wallet and node, unpack v1.3.1 and start it: same wallet files,
+node data, trading keys and trading wallet. Finish or refund a running trade first; to go back,
+start the v1.3.0 files again.
+
+## v1.3.0: optional, longer offers and your own look (Linux)
+
+No consensus change. Close the old wallet and node, unpack v1.3.0 and start it: same wallet files,
+node data, trading keys and trading wallet. Finish or refund a running trade first; to go back,
+start the v1.2.0 files again (v1.2.0 does not show offers open longer than a day).
+
+## v1.2.0: optional, adds the exchange page to the Linux wallet
+
+Monzero v1.2.0 changes no consensus rule. Install it on Linux to trade from the wallet's own
+Exchange page: close the old wallet and node, unpack v1.2.0 and start it. It uses the same wallet
+files, node data, trading keys and trading wallet. Finish or refund a running trade before
+switching versions; to go back, start the v1.1.0 files again.
+
+## v1.1.0: optional, adds DEX trading
+
+Monzero v1.1.0 changes no consensus rule. A v1.0.0 node or wallet keeps working and nothing has
+to be done before any block height. Install v1.1.0 if you want the wallet to trade on the DEX
+page: unpack it, close the v1.0.0 wallet and node, and start the v1.1.0 ones. They use the same
+wallet files and the same node data directory. To go back, start the v1.0.0 files again; a trade
+that is still running must be finished or refunded in v1.1.0 first.
+
 ## v1.0.0: upgrade before block 21,000
 
 Monzero v1.0.0 schedules hard fork 17 at block 21,000, which changes how

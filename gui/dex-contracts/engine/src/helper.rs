@@ -41,6 +41,10 @@ pub struct Request {
     /// `payout` only: where the trade's account sends what it holds
     #[serde(default)]
     pub payout_address: Option<String>,
+    /// `payout` and `withdraw`: leave this much (wei or lamports, decimal) in the trade account,
+    /// for the network fees of its next trade (the liquidity bot). Default: send everything.
+    #[serde(default)]
+    pub keep_wei: Option<String>,
     /// Market commands: the open relays to use
     #[serde(default)]
     pub relays: Option<Vec<String>>,
@@ -53,6 +57,12 @@ pub struct Request {
     /// `take`: the offer to take, as `listings` returned it (first call only)
     #[serde(default)]
     pub listing: Option<crate::listing::SignedListing>,
+    /// `take` of a partial offer: the XMZ to take, in atoms (decimal; first call only). Absent: all.
+    #[serde(default)]
+    pub xmz_atoms: Option<String>,
+    /// `listings`: include partial offers (apps that can take part of an offer ask for them)
+    #[serde(default)]
+    pub partial: bool,
     /// The contract on a local test chain (31337) only; real chains use the pinned ones
     #[serde(default)]
     pub local_contract: Option<alloy::primitives::Address>,
@@ -63,6 +73,12 @@ pub struct Request {
     /// The swap program on a local Solana test validator only; real clusters use the pinned ones
     #[serde(default)]
     pub local_sol_program: Option<String>,
+    /// The USDT mint on a local Solana test validator only; mainnet uses Tether's
+    #[serde(default)]
+    pub local_sol_usdt_mint: Option<String>,
+    /// A test USDT token on a local EVM chain (31337) only; BNB Smart Chain uses BSC-USD
+    #[serde(default)]
+    pub local_usdt_token: Option<alloy::primitives::Address>,
     /// `withdraw`: the chain whose trade account is emptied
     #[serde(default)]
     pub chain_id: Option<u64>,
@@ -131,10 +147,11 @@ pub struct TickConfig {
     /// the other trader's lock before it counts. A Monero main-network trade needs at least two.
     #[serde(default)]
     pub witness_daemons: Vec<String>,
-    /// Who pays the claimer's claim gas when its account is empty: "give" (a maker that
-    /// advances it), "expect" (a seller holding none of the chain's coin), default off
+    /// Who pays the claimer's claim fee when its account is empty: "give" (the owner advances
+    /// it), "expect" (a seller holding none of the chain's coin), "off". Absent: the chain's
+    /// default (`default_gas_advance`).
     #[serde(default)]
-    pub gas_advance: crate::driver::GasAdvance,
+    pub gas_advance: Option<crate::driver::GasAdvance>,
 }
 
 #[derive(Deserialize)]
@@ -192,15 +209,32 @@ async fn dispatch(r: Request) -> Result<Value, String> {
     if let Some(program) = &r.local_sol_program {
         crate::sol::set_local_program(crate::sol::from_base58(program).map_err(|e| e.to_string())?);
     }
+    if let Some(relays) = &r.relays {
+        crate::sponsor::set_relays(relays.clone());
+    }
+    if let Some(token) = r.local_usdt_token {
+        crate::chain::set_local_usdt_token(token);
+    }
+    if let Some(mint) = &r.local_sol_usdt_mint {
+        crate::sol::set_local_usdt_mint(crate::sol::from_base58(mint).map_err(|e| e.to_string())?);
+    }
     match r.command {
         Command::Accounts => {
             let (_, key) = keys(r.tick.as_ref().ok_or("accounts needs tick (the keys)")?)?;
-            Ok(json!({"evm": key.address().to_string(), "sol": crate::sol::to_base58(&crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes())}))
+            let sol = crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes();
+            // Its USDT (Solana) token account too: balances are read from the account itself, as
+            // public nodes refuse the "indexed" token lookups by owner
+            let usdt = crate::sol::usdt_mint(Chain::SolMainnet).and_then(|m| crate::sol::token_account(&sol, &m));
+            Ok(json!({"evm": key.address().to_string(), "sol": crate::sol::to_base58(&sol), "solUsdt": usdt.map(|a| crate::sol::to_base58(&a))}))
         }
         Command::Status => status(&r.trade_dir),
         Command::Approve => approve(&r.trade_dir, r.commitment),
-        Command::Tick => tick(&r.trade_dir, r.tick).await,
-        Command::Payout => payout(&r.trade_dir, r.tick, r.payout_address.as_deref()).await,
+        // The relays, when given, may pay a USDT trade's network fees (paid back in USDT)
+        Command::Tick => tick(&r.trade_dir, r.tick, r.relays.clone().unwrap_or_default()).await,
+        Command::Payout => {
+            let keep = keep_wei(&r)?;
+            payout(&r.trade_dir, r.tick, r.payout_address.as_deref(), keep).await
+        }
         Command::Listings => market_listings(&r).await,
         Command::Routes => market_routes(&r).await,
         Command::Post => match (&r.tick, &r.offer) {
@@ -209,14 +243,18 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         },
         Command::Serve => crate::helper_market::serve(&r.trade_dir, r.tick.as_ref().ok_or("serve needs tick")?, relays(&r)?).await,
         Command::Take => {
-            crate::helper_market::take(&r.trade_dir, r.tick.as_ref().ok_or("take needs tick")?, relays(&r)?, r.listing.clone(), accept(&r), r.xmz_sale).await
+            let xmz = match &r.xmz_atoms {
+                Some(t) => Some(t.trim().parse::<u64>().ok().filter(|x| *x > 0 && t.trim().bytes().all(|b| b.is_ascii_digit())).ok_or("xmzAtoms must be a whole number of atoms above zero")?),
+                None => None,
+            };
+            crate::helper_market::take(&r.trade_dir, r.tick.as_ref().ok_or("take needs tick")?, relays(&r)?, r.listing.clone(), xmz, accept(&r), r.xmz_sale).await
         }
         Command::Cancel => crate::helper_market::cancel(&r.trade_dir, r.tick.as_ref().ok_or("cancel needs tick")?, relays(&r)?).await,
         Command::Report => crate::helper_market::report(&r.trade_dir, relays(&r)?).await,
         Command::Withdraw => {
             let to = r.payout_address.as_deref().ok_or("withdraw needs payoutAddress")?;
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            crate::helper_market::withdraw(&r.trade_dir, r.tick.as_ref().ok_or("withdraw needs tick")?, r.chain_id.ok_or("withdraw needs chainId")?, to, now).await
+            crate::helper_market::withdraw(&r.trade_dir, r.tick.as_ref().ok_or("withdraw needs tick")?, r.chain_id.ok_or("withdraw needs chainId")?, to, now, keep_wei(&r)?).await
         }
         Command::XmzWallet => crate::helper_wallet::run(r.xmz_wallet.as_ref().ok_or("xmzWallet needs xmzWallet")?).await,
     }
@@ -232,7 +270,7 @@ fn relays(r: &Request) -> Result<&[String], String> {
 
 async fn market_listings(r: &Request) -> Result<Value, String> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    crate::helper_market::listings(relays(r)?, r.pair.as_deref(), accept(r), now).await
+    crate::helper_market::listings(relays(r)?, r.pair.as_deref(), r.partial, accept(r), now).await
 }
 
 /// XMZ → XMR routes on one EVM chain. The fees kept back are what the taker's leg-2 lock,
@@ -248,7 +286,7 @@ async fn market_routes(r: &Request) -> Result<Value, String> {
     let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
     let fees = provider.estimate_eip1559_fees().await.map_err(|e| e.to_string())?;
     let reserve = alloy::primitives::U256::from(crate::driver::GAS_PER_CALL * 3 * 2) * alloy::primitives::U256::from(fees.max_fee_per_gas);
-    let found = crate::helper_market::listings(relays(r)?, None, accept(r), now).await?;
+    let found = crate::helper_market::listings(relays(r)?, None, false, accept(r), now).await?;
     let offers: Vec<crate::listing::SignedListing> =
         found["listings"].as_array().into_iter().flatten().filter_map(|l| serde_json::from_value(l["signed"].clone()).ok()).collect();
     Ok(json!({"routes": crate::route::buy_xmr_routes(&offers, chain, reserve), "reserveWei": reserve.to_string(), "relayErrors": found["relayErrors"]}))
@@ -334,14 +372,18 @@ fn approve(dir: &Path, commitment: Option<B256>) -> Result<Value, String> {
     status(dir)
 }
 
-async fn tick(dir: &Path, cfg: Option<TickConfig>) -> Result<Value, String> {
+async fn tick(dir: &Path, cfg: Option<TickConfig>, sponsors: Vec<String>) -> Result<Value, String> {
     let cfg = cfg.ok_or("tick needs its configuration")?;
     let (swap_seed, key) = keys(&cfg)?;
     let saved = journal(dir).load().map_err(|e| e.to_string())?.trade.ok_or("the journal holds no saved trade")?;
     let agreed = saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
-    let chain = trade_chain(&cfg, &saved, &agreed, &key)?;
+    // Only relays that offer to pay now count: unfunded or unreachable relays leave the trade as
+    // it was (the trader pays the fees in SOL/BNB, with the usual fee advance)
+    let sponsors = crate::sponsor::trade_sponsors(&sponsors, saved.offer.asset != alloy::primitives::Address::ZERO, Chain::from_id(saved.offer.chain_id).is_some_and(Chain::is_solana)).await;
+    let sponsored = !sponsors.is_empty();
+    let chain = trade_chain(&cfg, &saved, &agreed, &key)?.with_sponsors(sponsors);
     let xmz = xmz_parts(dir, &cfg, &saved, &agreed, &swap_seed)?;
-    let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?.with_gas_advance(cfg.gas_advance);
+    let mut driver = Driver::resume(&swap_seed, &key, chain, xmz, journal(dir)).map_err(|e| e.to_string())?.with_gas_advance(cfg.gas_advance.unwrap_or_else(|| if sponsored { crate::driver::GasAdvance::Off } else { default_gas_advance(&saved) }));
     let (awaiting, funding) = match driver.tick().await {
         Ok(_) => (false, None),
         Err(DriverError::AwaitingApproval) => (true, None),
@@ -407,6 +449,22 @@ pub(crate) fn xmz_parts(
 
 /// The chain client of a saved trade: an EVM chain, or Solana with the accounts and points both
 /// traders signed in their frames.
+/// The fee advance when the configuration names none. On Solana and BNB Smart Chain a claim
+/// costs cents, so the owner (who locks the coin) always tops up an empty claimer account,
+/// once the claimer's XMZ is locked, and a claimer locks XMZ without holding the coin first.
+/// A claimer facing an owner whose app does not advance can still collect by paying the fee in
+/// itself; otherwise the owner refunds after the deadline and the claimer takes its XMZ back.
+/// On Ethereum a claim can cost dollars, so each side pays its own.
+pub(crate) fn default_gas_advance(saved: &crate::exchange::SavedTrade) -> crate::driver::GasAdvance {
+    use crate::driver::GasAdvance;
+    let cheap = matches!(Chain::from_id(saved.offer.chain_id), Some(c) if c.is_solana() || matches!(c, Chain::BscMainnet | Chain::BscTestnet));
+    match (cheap, saved.role) {
+        (false, _) => GasAdvance::Off,
+        (true, crate::negotiation::Role::Owner) => GasAdvance::Give,
+        (true, _) => GasAdvance::Expect,
+    }
+}
+
 pub(crate) fn trade_chain(
     cfg: &TickConfig,
     saved: &crate::exchange::SavedTrade,
@@ -432,11 +490,24 @@ pub(crate) fn trade_chain(
         return Err("the trade's Solana account is not this wallet's".into());
     }
     let nonce = u64::try_from(saved.swap_nonce()).map_err(|_| "the swap nonce does not fit")?;
-    crate::sol::SolChain::new(&cfg.evm_rpc, kind, program, sol_key, binding, nonce, saved.offer.value).map(crate::sol::AnyChain::Sol).map_err(|e| e.to_string())
+    crate::sol::SolChain::with_asset(&cfg.evm_rpc, kind, program, sol_key, binding, nonce, saved.offer.value, saved.offer.asset)
+        .map(crate::sol::AnyChain::Sol)
+        .map_err(|e| e.to_string())
 }
 
 /// After the trade is done, send the trade account's balance to the user's own address.
-async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>) -> Result<Value, String> {
+/// What a payout leaves in the trade account (`keepWei`), 0 when not given
+fn keep_wei(r: &Request) -> Result<alloy::primitives::U256, String> {
+    match r.keep_wei.as_deref() {
+        None => Ok(alloy::primitives::U256::ZERO),
+        Some(t) if !t.is_empty() && t.len() <= 40 && t.bytes().all(|b| b.is_ascii_digit()) => {
+            alloy::primitives::U256::from_str_radix(t, 10).map_err(|_| "keepWei is not a number".to_string())
+        }
+        Some(_) => Err("keepWei must be a decimal amount".into()),
+    }
+}
+
+async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>, keep: alloy::primitives::U256) -> Result<Value, String> {
     let cfg = cfg.ok_or("payout needs the tick configuration")?;
     let to_text = to.ok_or("payout needs payoutAddress")?;
     let (swap_seed, key) = keys(&cfg)?;
@@ -449,7 +520,9 @@ async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>) -> Result
             }
             saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
             let to = crate::sol::from_base58(to_text).map_err(|e| e.to_string())?;
-            let sent = crate::sol::pay_out(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to).await.map_err(|e| e.to_string())?;
+            let keep = u64::try_from(keep).map_err(|_| "keepWei is too large for Solana")?;
+            let mint = Chain::from_id(saved.offer.chain_id).and_then(crate::sol::usdt_mint);
+            let sent = crate::sol::pay_out_with(&cfg.evm_rpc, &crate::sol::account_key(&key.to_bytes().0), &to, keep, mint).await.map_err(|e| e.to_string())?;
             let mut v = status(dir)?;
             v["payout"] = match sent {
                 Some((tx, amount)) => {
@@ -472,7 +545,7 @@ async fn payout(dir: &Path, cfg: Option<TickConfig>, to: Option<&str>) -> Result
     saved.agreed(&swap_seed, &key).map_err(|e| e.to_string())?;
     let chain_kind = Chain::from_id(saved.offer.chain_id).ok_or("unknown chain")?;
     let chain = AlloyChain::new(&cfg.evm_rpc, chain_kind, saved.offer.contract, saved.evm_from_block, key).map_err(|e| e.to_string())?;
-    let sent = chain.pay_out(to).await.map_err(|e| e.to_string())?;
+    let sent = chain.pay_out_all(to, keep).await.map_err(|e| e.to_string())?;
     let mut v = status(dir)?;
     v["payout"] = match sent {
         Some((tx, amount)) => {

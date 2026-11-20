@@ -78,6 +78,8 @@ pub enum EvmCall {
     /// A plain payment from the owner to the claimer's account, so a claimer who holds none
     /// of the chain's coin can pay for its claim (see `GasAdvance`)
     GasAdvance { to: Address, amount: U256 },
+    /// Let the swap contract take `amount` of `token` from us (a BEP-20 USDT lock needs it first)
+    Approve { token: Address, amount: U256 },
 }
 
 /// Who pays the gas for the claimer's claim when the claimer's account is empty.
@@ -119,6 +121,27 @@ pub trait EvmChain {
     /// What another account holds (wei). Chains without gas advances need not answer.
     async fn balance_of(&self, _who: Address) -> Result<U256, DriverError> {
         Err(DriverError::Chain("this chain has no gas advance".into()))
+    }
+    /// What a side needs besides gas, in the chain's coin: on Solana a token swap opens a token
+    /// vault (the owner) and a token account (the claimer), each holding a deposit
+    fn reserve(&self, _owner: bool) -> U256 {
+        U256::ZERO
+    }
+    /// How much of `token` the swap contract may take from us (no approval needed: everything)
+    async fn allowance(&self, _token: Address) -> Result<U256, DriverError> {
+        Ok(U256::MAX)
+    }
+    /// A relay can claim for us, paid in the swap's token (a USDT trade): we need none of the coin
+    fn relayed_claim(&self) -> bool {
+        false
+    }
+    /// A relay can pay for our lock, paid in the swap's token (USDT on Solana)
+    fn sponsored_lock(&self) -> bool {
+        false
+    }
+    /// Have a relay claim for us; Ok(false) when none would
+    async fn relay_claim(&self, _swap: &Swap, _secret: B256) -> Result<bool, DriverError> {
+        Ok(false)
     }
 }
 
@@ -360,13 +383,17 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         if first_lock {
             let funds = self.chain.funds().await?;
             let owner = matches!(record.state, RoleState::Owner(_));
-            let claim_gas = funding_needed(&self.trade.terms, false, funds.fee_per_gas);
+            let claim_gas = funding_needed(&self.trade.terms, false, funds.fee_per_gas) + self.chain.reserve(false);
             let needed = match (owner, self.gas_advance) {
+                // USDT with a relay paying the fees: the coin is not needed (the tokens are checked
+                // before the offer is made or taken)
+                (true, _) if self.chain.sponsored_lock() => U256::ZERO,
+                (false, _) if self.chain.relayed_claim() => U256::ZERO,
                 // The owner also holds what it may have to advance
-                (true, GasAdvance::Give) => funding_needed(&self.trade.terms, true, funds.fee_per_gas) + claim_gas,
+                (true, GasAdvance::Give) => funding_needed(&self.trade.terms, true, funds.fee_per_gas) + self.chain.reserve(true) + claim_gas,
                 // The claimer counts on the advance
                 (false, GasAdvance::Expect) => U256::ZERO,
-                _ => funding_needed(&self.trade.terms, owner, funds.fee_per_gas),
+                _ => funding_needed(&self.trade.terms, owner, funds.fee_per_gas) + self.chain.reserve(owner),
             };
             if funds.balance < needed {
                 return Err(DriverError::AwaitingFunding { needed, have: funds.balance });
@@ -405,6 +432,13 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
     async fn execute(&mut self, action: Action) -> Result<(), DriverError> {
         match action {
             Action::SendNewSwap => {
+                // A token lock: the contract must be allowed to take the tokens first. The approval
+                // is kept and sent again like any step; the lock follows on a later tick, once the
+                // chain shows the allowance (the lock's own gas estimate needs it)
+                let terms = &self.trade.terms;
+                if terms.asset != Address::ZERO && !self.journal.load()?.retained.contains_key("new_swap") && self.chain.allowance(terms.asset).await? < terms.value {
+                    return self.evm("approve", EvmCall::Approve { token: terms.asset, amount: terms.value }).await;
+                }
                 let call = EvmCall::NewSwap { terms: self.trade.terms.clone(), nonce: self.swap_nonce };
                 self.evm("new_swap", call).await
             }
@@ -418,12 +452,61 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
                 self.evm("set_ready", EvmCall::SetReady((&swap).into())).await
             }
             Action::SendRefund(swap) => self.evm("refund", EvmCall::Refund((&swap).into(), self.secret.to_evm())).await,
-            Action::SendClaim(swap) => self.evm("claim", EvmCall::Claim((&swap).into(), self.secret.to_evm())).await,
+            Action::SendClaim(swap) if self.chain.relayed_claim() => {
+                let swap: Swap = (&swap).into();
+                match self.claim_route().await? {
+                    ClaimRoute::Own => self.evm_claim(swap).await,
+                    // A relay was asked a moment ago: its claim may be on its way
+                    ClaimRoute::Wait => Ok(()),
+                    ClaimRoute::Relay => {
+                        if self.chain.relay_claim(&swap, self.secret.to_evm()).await? {
+                            self.note_relayed_claim()
+                        } else {
+                            // No relay would: claim ourselves, which asks for the coin to be paid in
+                            self.evm_claim(swap).await
+                        }
+                    }
+                }
+            }
+            Action::SendClaim(swap) => self.evm_claim((&swap).into()).await,
             Action::LockXmz { amount } => self.xmz.ensure_lock(amount).await,
             Action::SweepXmz { their_secret } => {
                 let theirs = SecretShare::from_evm(their_secret)?;
                 self.xmz.ensure_sweep(combined_spend_key(&self.secret, &theirs)).await
             }
+        }
+    }
+
+    /// How to claim: ourselves when our account can pay for it, else through a relay (asked again
+    /// only a minute after the last time, while its claim may still be on its way)
+    async fn claim_route(&mut self) -> Result<ClaimRoute, DriverError> {
+        let funds = self.chain.funds().await?;
+        let needed = funding_needed(&self.trade.terms, false, funds.fee_per_gas) + self.chain.reserve(false);
+        if funds.balance >= needed {
+            return Ok(ClaimRoute::Own);
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let asked = self.journal.load()?.retained.get("relayed_claim").and_then(|v| v.last()).map(|r| r.block);
+        Ok(if asked.is_some_and(|at| now < at + 60) { ClaimRoute::Wait } else { ClaimRoute::Relay })
+    }
+
+    fn note_relayed_claim(&mut self) -> Result<(), DriverError> {
+        let mut record = self.journal.load()?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        record.retained.insert("relayed_claim".into(), vec![Signed { raw: Bytes::new(), block: now }]);
+        self.journal.save(&record)
+    }
+
+    async fn evm_claim(&mut self, swap: Swap) -> Result<(), DriverError> {
+        match self.evm("claim", EvmCall::Claim(swap, self.secret.to_evm())).await {
+            // A claim the account cannot pay for (no advance came) asks for the coin to be paid
+            // in, as the lock's funding rule does, rather than failing with the chain's error
+            Err(e) => {
+                let funds = self.chain.funds().await?;
+                let needed = funding_needed(&self.trade.terms, false, funds.fee_per_gas) + self.chain.reserve(false);
+                if funds.balance < needed { Err(DriverError::AwaitingFunding { needed, have: funds.balance }) } else { Err(e) }
+            }
+            ok => ok,
         }
     }
 
@@ -439,7 +522,7 @@ impl<C: EvmChain, X: XmzSide, J: Journal> Driver<C, X, J> {
         if record.retained.contains_key("set_ready") {
             return Ok(());
         }
-        let needed = funding_needed(&self.trade.terms, false, self.chain.funds().await?.fee_per_gas);
+        let needed = funding_needed(&self.trade.terms, false, self.chain.funds().await?.fee_per_gas) + self.chain.reserve(false);
         let have = self.chain.balance_of(to).await?;
         if have >= needed {
             return Ok(());
@@ -491,4 +574,14 @@ fn raw_swap(lock: &ObservedLock) -> Swap {
         value: e.value,
         nonce: e.nonce,
     }
+}
+
+/// How the claimer's claim goes out this tick
+enum ClaimRoute {
+    /// From our own account (it can pay the fee)
+    Own,
+    /// Through a relay, paid in the swap's token
+    Relay,
+    /// A relay was asked a moment ago
+    Wait,
 }

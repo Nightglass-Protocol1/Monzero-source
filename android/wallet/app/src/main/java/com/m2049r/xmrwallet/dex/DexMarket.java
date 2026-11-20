@@ -172,21 +172,25 @@ final class DexMarket {
     boolean refreshListings(String pair) {
         if (!pair.equals(coin() + "/XMZ")) return false;
         try {
-            return run(base("listings", null).put("pair", pair), "");
+            // Partial offers too: this wallet can take part of one
+            return run(base("listings", null).put("pair", pair).put("partial", true), "");
         } catch (Exception e) {
             return false;
         }
     }
 
-    boolean post(String seedHex, String side, String valueWei, String xmzAtoms, long lifetimeSecs) {
+    /** minXmzAtoms: the least one take may be (a partial offer), or null for a whole offer. */
+    boolean post(String seedHex, String side, String valueWei, String xmzAtoms, String minXmzAtoms, long lifetimeSecs) {
         if (busy || (!side.equals("sell-xmz") && !side.equals("buy-xmz")) || !DIGITS.matcher(valueWei).matches()
-                || !DIGITS.matcher(xmzAtoms).matches() || lifetimeSecs <= 0 || lifetimeSecs > 86400) return false;
+                || !DIGITS.matcher(xmzAtoms).matches() || lifetimeSecs <= 0 || lifetimeSecs > 86400
+                || (minXmzAtoms != null && !DIGITS.matcher(minXmzAtoms).matches())) return false;
         try {
             final JSONObject t = tickConfig(seedHex, null);
             if (t == null) return false;
             final String dir = new File(tradesDir, "offer-" + Long.toHexString(new SecureRandom().nextLong())).getPath();
             final JSONObject offer = new JSONObject().put("chainId", chainId).put("side", side).put("valueWei", valueWei)
                     .put("xmzAtoms", xmzAtoms).put("lifetimeSecs", lifetimeSecs);
+            if (minXmzAtoms != null) offer.put("minXmzAtoms", minXmzAtoms);
             return run(base("post", dir).put("tick", t).put("offer", offer), dir);
         } catch (Exception e) {
             return false;
@@ -202,15 +206,19 @@ final class DexMarket {
         return null;
     }
 
-    boolean take(String seedHex, String listingId) {
+    /** xmzAtoms: how much of a partial offer to take, or null for all of it. */
+    boolean take(String seedHex, String listingId, String xmzAtoms) {
         final JSONObject signedListing = signed.get(listingId);
+        if (xmzAtoms != null && !DIGITS.matcher(xmzAtoms).matches()) return false;
         if (busy || signedListing == null) return false;
         for (Folder f : folders) if (listingId.equals(f.listingId)) return false;
         try {
             final JSONObject t = tickConfig(seedHex, null);
             if (t == null) return false;
             final String dir = new File(tradesDir, "take-" + listingId.substring(2, 18)).getPath();
-            return run(base("take", dir).put("tick", t).put("listing", signedListing), dir);
+            final JSONObject r = base("take", dir).put("tick", t).put("listing", signedListing);
+            if (xmzAtoms != null) r.put("xmzAtoms", xmzAtoms);
+            return run(r, dir);
         } catch (Exception e) {
             return false;
         }
@@ -305,10 +313,14 @@ final class DexMarket {
                         final String id = l.optString("id");
                         signed.put(id, s);
                         final JSONArray at = entry.optJSONArray("relays");
-                        listings.put(new JSONObject().put("id", id).put("pair", l.optString("pair")).put("side", l.optString("side"))
+                        final JSONObject shown = new JSONObject().put("id", id).put("pair", l.optString("pair")).put("side", l.optString("side"))
                                 .put("chainId", l.optLong("chainId")).put("maker", l.optString("maker")).put("valueWei", wei).put("xmzAtoms", xmz)
                                 .put("coin", DexFiles.units(wei, places)).put("xmz", DexFiles.units(xmz, 11)).put("price", priceText(wei, xmz, places))
-                                .put("expiresAt", l.optLong("expiresAt")).put("relays", at == null ? 0 : at.length()));
+                                .put("expiresAt", l.optLong("expiresAt")).put("relays", at == null ? 0 : at.length());
+                        // A partial offer: any amount from its minimum may be taken
+                        final String min = l.has("minXmz") ? amountText(l.opt("minXmz")) : null;
+                        if (min != null) shown.put("minXmzAtoms", min).put("minXmz", DexFiles.units(min, 11));
+                        listings.put(shown);
                     }
                     break;
                 }
@@ -320,6 +332,13 @@ final class DexMarket {
                     boolean known = false;
                     for (Folder f : folders) known = known || f.path.equals(folder);
                     if (command.equals("take") && !known) scanFolders();   // a first take creates its folder
+                    // Part of a partial offer of ours was taken: the rest is a new offer in its own folder
+                    if (r.optJSONObject("remainder") != null) {
+                        boolean have = false;
+                        final String rest = r.optJSONObject("remainder").optString("folder");
+                        for (Folder f : folders) have = have || f.path.equals(rest);
+                        if (!have) scanFolders();
+                    }
                     final boolean done = r.optBoolean("taken") || r.optBoolean("agreed");
                     for (Folder f : folders)
                         if (f.path.equals(folder)) {
@@ -368,7 +387,7 @@ final class DexMarket {
                 mine.put(new JSONObject().put("folder", f.path).put("kind", f.kind).put("state", f.state).put("detail", f.detail).put("id", f.listingId)
                         .put("pair", l.optString("pair")).put("side", l.optString("side")).put("coin", wei == null ? "" : DexFiles.units(wei, places))
                         .put("xmz", xmz == null ? "" : DexFiles.units(xmz, 11)).put("price", wei == null || xmz == null ? "" : priceText(wei, xmz, places))
-                        .put("expiresAt", l.optLong("expiresAt")));
+                        .put("expiresAt", l.optLong("expiresAt")).put("partial", l.has("minXmz")));
             }
             return new JSONObject().put("configured", true).put("busy", busy).put("state", state).put("error", error).put("command", command)
                     .put("listings", listings).put("mine", mine).put("withdrawal", withdrawal).put("chainId", chainId).put("coin", coin())

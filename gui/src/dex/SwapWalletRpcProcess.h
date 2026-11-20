@@ -49,6 +49,7 @@ signals:
     void stopped(bool cleanExit);
 private:
     void notifyAvailabilityChanged();
+    static bool rebindProgram(const QString &directory,const QByteArray &binding);
     bool launch(const QString &program, const QString &directory, quint16 daemonPort,
         quint16 walletPort, bool resume,const QByteArray &binding=QByteArray());
     bool recordState(const QByteArray &state);

@@ -88,10 +88,10 @@ Rectangle {
         fallBackColor: MonzeroComponents.Style.middlePanelBackgroundColor
         initialStartColor: MonzeroComponents.Style.middlePanelBackgroundGradientStart
         initialStopColor: MonzeroComponents.Style.middlePanelBackgroundGradientStop
-        blackColorStart: MonzeroComponents.Style._b_middlePanelBackgroundGradientStart
-        blackColorStop: MonzeroComponents.Style._b_middlePanelBackgroundGradientStop
-        whiteColorStart: MonzeroComponents.Style._w_middlePanelBackgroundGradientStart
-        whiteColorStop: MonzeroComponents.Style._w_middlePanelBackgroundGradientStop
+        blackColorStart: MonzeroComponents.Style.custom.background || MonzeroComponents.Style._b_middlePanelBackgroundGradientStart
+        blackColorStop: MonzeroComponents.Style.custom.background || MonzeroComponents.Style._b_middlePanelBackgroundGradientStop
+        whiteColorStart: MonzeroComponents.Style.custom.background || MonzeroComponents.Style._w_middlePanelBackgroundGradientStart
+        whiteColorStop: MonzeroComponents.Style.custom.background || MonzeroComponents.Style._w_middlePanelBackgroundGradientStop
         start: Qt.point(0, 0)
         end: Qt.point(height, width)
     }
@@ -255,8 +255,8 @@ Rectangle {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-            whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
         }
     }
 

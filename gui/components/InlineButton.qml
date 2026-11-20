@@ -80,8 +80,8 @@ Item {
 
             MonzeroEffects.ColorTransition {
                 targetObj: inlineText
-                blackColor: MonzeroComponents.Style._b_inlineButtonTextColor
-                whiteColor: MonzeroComponents.Style._w_inlineButtonTextColor
+                blackColor: MonzeroComponents.Style.custom.accent || MonzeroComponents.Style._b_inlineButtonTextColor
+                whiteColor: MonzeroComponents.Style.custom.accent || MonzeroComponents.Style._w_inlineButtonTextColor
             }
         }
 

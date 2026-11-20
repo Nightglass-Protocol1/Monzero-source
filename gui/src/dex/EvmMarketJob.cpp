@@ -29,7 +29,7 @@ bool localEndpoint(const QJsonValue &value) {
 bool configValid(const QJsonObject &c) {
     const QSet<QString> required{"schema","helper","helperDigest","tradesDir","evmRpc","chainId","accountIndex","mainWallet","swapWallet","relays"};
     for (const auto &key:required) if (!c.contains(key)) return false;
-    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk" && i.key()!="localContract" && i.key()!="localSolProgram") return false;
+    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk" && i.key()!="localContract" && i.key()!="localSolProgram" && i.key()!="localSolUsdtMint") return false;
     static const QRegularExpression rpc("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?|http://127\\.0\\.0\\.1:[0-9]{1,5})\\z");
     static const QRegularExpression relay("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?|http://(127\\.0\\.0\\.1|localhost):[0-9]{1,5})\\z");
     const auto relays=c.value("relays").toArray();
@@ -39,7 +39,8 @@ bool configValid(const QJsonObject &c) {
     const auto chain=c.value("chainId").toDouble(-1);
     if (chain!=double(qint64(chain)) || !DexChains::known(qint64(chain))) return false;
     // A local Solana test validator's swap program (that chain only), as the local EVM contract
-    if (c.contains("localSolProgram") && !(qint64(chain)==DexChains::SolLocal && DexChains::solanaAddress(c.value("localSolProgram").toString()))) return false;
+    if (c.contains("localSolProgram") && !(DexChains::helperChain(qint64(chain))==DexChains::SolLocal && DexChains::solanaAddress(c.value("localSolProgram").toString()))) return false;
+    if (c.contains("localSolUsdtMint") && !(qint64(chain)==DexChains::SolUsdtLocal && DexChains::solanaAddress(c.value("localSolUsdtMint").toString()))) return false;
     return c.value("schema")=="monzero-private-xmz-evm-market-v1" && cleanAbsolute(c.value("helper").toString())
         && cleanAbsolute(c.value("tradesDir").toString()) && rpc.match(c.value("evmRpc").toString()).hasMatch()
         && index>=0 && index<2147483648.0 && index==double(qint64(index))
@@ -73,7 +74,7 @@ bool listingValid(const QJsonObject &signedListing) {
     const auto l=signedListing.value("listing").toObject();
     static const QRegularExpression address("\\A0x[0-9a-fA-F]{40}\\z");
     return signedListing.size()==2 && Hash.match(l.value("id").toString()).hasMatch()
-        && (l.value("pair")=="ETH/XMZ" || l.value("pair")=="BNB/XMZ" || l.value("pair")=="SOL/XMZ")
+        && (l.value("pair")=="ETH/XMZ" || l.value("pair")=="BNB/XMZ" || l.value("pair")=="SOL/XMZ" || l.value("pair")=="USDT/XMZ" || l.value("pair")=="USDT-BSC/XMZ")
         && (l.value("side")=="sell-xmz" || l.value("side")=="buy-xmz")
         && HexQty.match(l.value("value").toString()).hasMatch() && Digits.match(l.value("xmz").toString()).hasMatch()
         && address.match(l.value("maker").toString()).hasMatch() && l.value("expiresAt").isDouble() && l.value("chainId").isDouble();
@@ -136,6 +137,21 @@ void EvmMarketJob::scanFolders() {
         f.listingId=f.listing.value("listing").toObject().value("id").toString();
         f.state=QFile::exists(path+"/journal.json") ? "agreed" : (maker && !o.value("takenBy").isNull() ? "agreed" : "open");
         if (QFile::exists(path+"/cancelled") || QFile::exists(path+"/abandoned")) f.state="cancelled";
+        // A take the maker refused: it ended there, nothing was locked
+        if (f.state=="open" && !maker && QFile::exists(path+"/refused")) {
+            f.state="refused";
+            QFile why(path+"/refused");
+            if (why.open(QIODevice::ReadOnly)) f.detail=QString::fromUtf8(why.read(400)).left(200);
+        }
+        f.renew=maker && QFile::exists(path+"/renew");
+        // Renewed (kept open): the new offer has its own folder; this one is retired
+        if (QFile::exists(path+"/renewed")) f.state="renewed";
+        // Taken off the board by our own helper: our side could no longer pay for it
+        if (f.state=="open" && QFile::exists(path+"/withdrawn")) {
+            f.state="withdrawn";
+            QFile why(path+"/withdrawn");
+            if (why.open(QIODevice::ReadOnly)) f.detail=QString::fromUtf8(why.read(400)).left(200);
+        }
         m_folders.append(f);
     }
 }
@@ -152,6 +168,7 @@ QJsonObject EvmMarketJob::base(const QString &command,const QString &folder) con
         {"relays",m_config.value("relays")}};
     if (m_config.contains("localContract")) r.insert("localContract",m_config.value("localContract"));
     if (m_config.contains("localSolProgram")) r.insert("localSolProgram",m_config.value("localSolProgram"));
+    if (m_config.contains("localSolUsdtMint")) r.insert("localSolUsdtMint",m_config.value("localSolUsdtMint"));
     return r;
 }
 
@@ -179,6 +196,9 @@ QJsonObject EvmMarketJob::tradeConfig(const QString &tradeDir) const {
         {"mainWallet",m_config.value("mainWallet")},{"swapWallet",m_config.value("swapWallet")}};
     if (m_config.contains("evmLogChunk")) c.insert("evmLogChunk",m_config.value("evmLogChunk"));
     if (m_config.contains("localSolProgram")) c.insert("localSolProgram",m_config.value("localSolProgram"));
+    if (m_config.contains("localSolUsdtMint")) c.insert("localSolUsdtMint",m_config.value("localSolUsdtMint"));
+    // The trade's relays: a USDT trade's network fees may be paid by them (in USDT)
+    if (DexChains::token(qint64(m_config.value("chainId").toDouble()))) c.insert("relays",m_config.value("relays"));
     return c;
 }
 
@@ -190,32 +210,59 @@ bool EvmMarketJob::requestAccounts(QByteArray &walletSeed) {
 }
 
 bool EvmMarketJob::refreshListings(const QString &pair) {
-    if (pair!="ETH/XMZ" && pair!="BNB/XMZ" && pair!="SOL/XMZ") return false;
-    auto r=base("listings",{});r.insert("pair",pair);
+    // This market's pair only (USDT and SOL share the Solana chain but are separate markets)
+    if (pair!=DexChains::pair(qint64(m_config.value("chainId").toDouble()))) return false;
+    // Partial offers too: this wallet can take part of one
+    auto r=base("listings",{});r.insert("pair",pair);r.insert("partial",true);
     return run(r,{});
 }
 
-bool EvmMarketJob::post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,qint64 lifetimeSecs) {
+bool EvmMarketJob::post(QByteArray &walletSeed,qint64 chainId,const QString &side,const QString &valueWei,const QString &xmzAtoms,const QString &minXmzAtoms,qint64 lifetimeSecs,bool renew) {
     if (m_busy || m_path.isEmpty() || chainId!=qint64(m_config.value("chainId").toDouble()) || (side!="sell-xmz" && side!="buy-xmz") || !Digits.match(valueWei).hasMatch()
-        || !Digits.match(xmzAtoms).hasMatch() || lifetimeSecs<=0 || lifetimeSecs>86400) {walletSeed.fill('\0');walletSeed.clear();return false;}
+        || !Digits.match(xmzAtoms).hasMatch() || lifetimeSecs<=0 || lifetimeSecs>31*86400 || (!minXmzAtoms.isEmpty() && !Digits.match(minXmzAtoms).hasMatch())) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
     const auto folder=m_tradesDir+"/offer-"+QString::number(QRandomGenerator::system()->generate64(),16);
     auto r=base("post",folder);r.insert("tick",t);
-    r.insert("offer",QJsonObject{{"chainId",chainId},{"side",side},{"valueWei",valueWei},{"xmzAtoms",xmzAtoms},{"lifetimeSecs",lifetimeSecs}});
+    // The helper trades the market on its chain; a token market names its pair
+    QJsonObject offer{{"chainId",DexChains::helperChain(chainId)},{"side",side},{"valueWei",valueWei},{"xmzAtoms",xmzAtoms},{"lifetimeSecs",lifetimeSecs}};
+    if (DexChains::token(chainId)) offer.insert("pair",DexChains::pair(chainId));
+    if (!minXmzAtoms.isEmpty()) offer.insert("minXmzAtoms",minXmzAtoms);
+    if (renew) offer.insert("renew",true);
+    r.insert("offer",offer);
     return run(r,folder);
 }
 
-bool EvmMarketJob::take(QByteArray &walletSeed,const QString &listingId) {
+bool EvmMarketJob::setRenew(const QString &folder,bool on) {
+    for (auto &f:m_folders) if (f.path==folder && f.kind=="offer" && f.state=="open") {
+        QFile mark(folder+"/renew");
+        const bool ok=on ? (mark.open(QIODevice::WriteOnly) && (mark.close(),true)) : (!mark.exists() || mark.remove());
+        if (ok) {f.renew=on;emit changed();}
+        return ok;
+    }
+    return false;
+}
+
+bool EvmMarketJob::take(QByteArray &walletSeed,const QString &listingId,const QString &xmzAtoms) {
     const auto signedListing=m_signed.value(listingId);
-    if (m_busy || m_path.isEmpty() || signedListing.isEmpty()) {walletSeed.fill('\0');walletSeed.clear();return false;}
+    if (m_busy || m_path.isEmpty() || signedListing.isEmpty() || (!xmzAtoms.isEmpty() && !Digits.match(xmzAtoms).hasMatch())) {walletSeed.fill('\0');walletSeed.clear();return false;}
     for (const auto &f:m_folders) if (f.listingId==listingId) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
     const auto folder=m_tradesDir+"/take-"+listingId.mid(2,16);
     auto r=base("take",folder);r.insert("tick",t);r.insert("listing",signedListing);
+    if (!xmzAtoms.isEmpty()) r.insert("xmzAtoms",xmzAtoms);
     return run(r,folder);
 }
 
 bool EvmMarketJob::cancel(QByteArray &walletSeed,const QString &folder) {
+    // A take still waiting for the maker's answer: nothing of it is locked, so we just stop
+    // waiting (no helper step runs meanwhile: the job is idle). Its folder keeps a mark.
+    for (auto &f:m_folders) if (f.path==folder && f.kind=="take" && f.state=="open") {
+        walletSeed.fill('\0');walletSeed.clear();
+        if (m_busy || QFile::exists(folder+"/journal.json")) return false;
+        QFile marker(folder+"/abandoned");
+        if (!marker.open(QIODevice::WriteOnly) || marker.write("stopped waiting for the maker\n")<0) return false;
+        marker.close();f.state="cancelled";emit changed();return true;
+    }
     bool ours=false;for (const auto &f:m_folders) ours=ours || (f.path==folder && f.kind=="offer" && f.state=="open");
     if (m_busy || !ours) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
@@ -226,7 +273,8 @@ bool EvmMarketJob::cancel(QByteArray &walletSeed,const QString &folder) {
 bool EvmMarketJob::withdraw(QByteArray &walletSeed,const QString &address) {
     if (m_busy || m_path.isEmpty() || !DexChains::address(qint64(m_config.value("chainId").toDouble()),address)) {walletSeed.fill('\0');walletSeed.clear();return false;}
     QJsonObject t;if (!tickConfig(walletSeed,&t)) return false;
-    auto r=base("withdraw",QString());r.insert("tick",t);r.insert("payoutAddress",address);r.insert("chainId",m_config.value("chainId"));
+    auto r=base("withdraw",QString());r.insert("tick",t);r.insert("payoutAddress",address);
+    r.insert("chainId",double(DexChains::helperChain(qint64(m_config.value("chainId").toDouble()))));
     m_withdrawal.clear();
     return run(r,QString());
 }
@@ -285,6 +333,10 @@ void EvmMarketJob::finish(bool success) {
         // This wallet's trade accounts for these keys (the Solana one is where SOL is paid in)
         const auto sol=r.value("sol").toString();
         if (DexChains::solanaAddress(sol)) m_solAccount=sol;
+        const auto evm=r.value("evm").toString();
+        if (DexChains::evmAddress(evm)) m_evmAccount=evm;
+        const auto usdt=r.value("solUsdt").toString();
+        if (DexChains::solanaAddress(usdt)) m_solUsdtAccount=usdt;
     } else if (m_command=="listings") {
         m_signed.clear();m_listings.clear();
         const int places=DexChains::decimals(qint64(m_config.value("chainId").toDouble()));
@@ -296,21 +348,35 @@ void EvmMarketJob::finish(bool success) {
             if (wei.isEmpty()) continue;
             const auto id=l.value("id").toString();
             m_signed.insert(id,s);
-            m_listings.append(QVariantMap{{"id",id},{"pair",l.value("pair")},{"side",l.value("side")},{"chainId",l.value("chainId").toDouble()},
+            QVariantMap shown{{"id",id},{"pair",l.value("pair")},{"side",l.value("side")},{"chainId",l.value("chainId").toDouble()},
                 {"maker",l.value("maker")},{"valueWei",wei},{"xmzAtoms",l.value("xmz")},{"coin",weiToCoin(wei,places)},
                 {"xmz",units(l.value("xmz").toString(),11)},{"price",priceText(wei,l.value("xmz").toString(),places)},
-                {"expiresAt",l.value("expiresAt").toDouble()},{"relays",entry.value("relays").toArray().size()}});
+                {"expiresAt",l.value("expiresAt").toDouble()},{"relays",entry.value("relays").toArray().size()}};
+            // A partial offer: any amount from its minimum may be taken
+            if (Digits.match(l.value("minXmz").toString()).hasMatch()) {shown.insert("minXmzAtoms",l.value("minXmz").toString());shown.insert("minXmz",units(l.value("minXmz").toString(),11));}
+            m_listings.append(shown);
         }
     } else if (m_command=="post") {
         scanFolders();
     } else if (m_command=="serve" || m_command=="take") {
         // A first take creates its folder: track it, so later steps collect the maker's answer
         if (m_command=="take" && std::none_of(m_folders.cbegin(),m_folders.cend(),[this](const Folder &f){return f.path==m_folder;})) scanFolders();
+        // Part of a partial offer of ours was taken: the rest is a new offer in its own folder
+        const auto rest=r.value("remainder").toObject().value("folder").toString();
+        if (!rest.isEmpty() && std::none_of(m_folders.cbegin(),m_folders.cend(),[&rest](const Folder &f){return f.path==rest;})) scanFolders();
+        // A kept-open offer was posted again: serve the new folder from now on
+        const auto renewed=r.value("renewed").toObject().value("folder").toString();
+        if (!renewed.isEmpty()) scanFolders();
         const bool done=r.value("taken").toBool() || r.value("agreed").toBool();
         for (auto &f:m_folders) if (f.path==m_folder) {
             if (done) f.state="agreed";
+            else if (!renewed.isEmpty()) f.state="renewed";
+            else if (r.value("offerWithdrawn").toBool()) f.state="withdrawn";
             else if (r.value("expired").toBool()) f.state="expired";
-            f.detail=r.value("refused").isString() ? r.value("refused").toString().left(200) : QString();
+            else if (r.value("refusedFinal").toBool()) f.state="refused";
+            else if (r.value("stopped").toBool()) f.state="cancelled";
+            f.detail=r.value("refused").isString() ? r.value("refused").toString().left(200)
+                : r.value("offerWithdrawn").toBool() ? r.value("reason").toString().left(200) : QString();
         }
         if (done) {const auto folder=m_folder;emit changed();emit agreed(folder);return;}
     } else if (m_command=="withdraw") {
@@ -329,13 +395,13 @@ QVariantMap EvmMarketJob::status() const {
     for (const auto &f:m_folders) {
         const auto l=f.listing.value("listing").toObject();
         const auto wei=hexToDecimal(l.value("value").toString());
-        folders.append(QVariantMap{{"folder",f.path},{"kind",f.kind},{"state",f.state},{"detail",f.detail},{"id",f.listingId},
+        folders.append(QVariantMap{{"folder",f.path},{"kind",f.kind},{"state",f.state},{"detail",f.detail},{"id",f.listingId},{"renew",f.renew},
             {"pair",l.value("pair")},{"side",l.value("side")},{"coin",weiToCoin(wei,places)},{"xmz",units(l.value("xmz").toString(),11)},
             {"price",priceText(wei,l.value("xmz").toString(),places)},{"expiresAt",l.value("expiresAt").toDouble()}});
     }
     return {{"configured",!m_path.isEmpty()},{"busy",m_busy},{"state",m_state},{"error",m_error},{"command",m_command},
         {"listings",m_listings},{"mine",folders},{"withdrawal",m_withdrawal},{"relays",m_config.value("relays").toArray().toVariantList()},
-        {"chainId",m_config.value("chainId").toDouble()},{"coin",DexChains::coin(qint64(m_config.value("chainId").toDouble()))},{"decimals",DexChains::decimals(qint64(m_config.value("chainId").toDouble()))},{"solAccount",m_solAccount}};
+        {"chainId",m_config.value("chainId").toDouble()},{"coin",DexChains::coin(qint64(m_config.value("chainId").toDouble()))},{"decimals",DexChains::decimals(qint64(m_config.value("chainId").toDouble()))},{"solAccount",m_solAccount},{"evmAccount",m_evmAccount}};
 }
 
 QString EvmMarketJob::weiToCoin(const QString &valueWei,int decimals) {

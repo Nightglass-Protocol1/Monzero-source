@@ -70,6 +70,17 @@ sol! {
 
 pub use XmzSwap::Swap;
 
+sol! {
+    /// The token calls a USDT (BEP-20) trade needs
+    #[sol(rpc)]
+    interface IErc20 {
+        function approve(address spender, uint256 amount) external returns (bool);
+        function allowance(address owner, address spender) external view returns (uint256);
+        function balanceOf(address who) external view returns (uint256);
+        function transfer(address to, uint256 amount) external returns (bool);
+    }
+}
+
 /// Domain tag of a relayed claim; must match `claimRelayer` in the contract.
 pub const RELAY_TAG: &str = "XMZ-SWAP-RELAY-V1";
 
@@ -365,6 +376,7 @@ pub mod secret;
 pub mod driver;
 pub mod chain;
 pub mod sol;
+pub mod sponsor;
 pub mod xmz;
 pub mod negotiation;
 pub mod swap_seed;

@@ -22,6 +22,23 @@ struct Scan {
     logs: Vec<Log>,
 }
 
+static LOCAL_USDT_TOKEN: std::sync::OnceLock<Address> = std::sync::OnceLock::new();
+
+/// A test USDT token on a local EVM test chain (31337) only, given with the request
+pub fn set_local_usdt_token(token: Address) {
+    let _ = LOCAL_USDT_TOKEN.set(token);
+}
+
+/// The pinned USDT (BEP-20) of an EVM chain: Binance-Peg BSC-USD on BNB Smart Chain (18 decimals).
+/// None where USDT is not traded (Ethereum: ERC-20 fees are too high).
+pub fn usdt_token(chain: Chain) -> Option<Address> {
+    match chain {
+        Chain::BscMainnet => Some(Address::from(alloy::primitives::address!("55d398326f99059fF775485246999027B3197955"))),
+        Chain::Local => LOCAL_USDT_TOKEN.get().copied(),
+        _ => None,
+    }
+}
+
 pub struct AlloyChain {
     chain: Chain,
     contract: Address,
@@ -33,6 +50,10 @@ pub struct AlloyChain {
     log_chunk: u64,
     /// Searches by key, so each tick queries only blocks it has not seen
     scans: std::sync::Mutex<std::collections::HashMap<B256, Scan>>,
+    /// Our key, for signing a relayed claim's permission
+    signer: PrivateKeySigner,
+    /// Relays that may claim for us in a token (USDT) trade, paid in the token; none: we pay gas
+    sponsors: Vec<String>,
 }
 
 fn chain_err(e: impl std::fmt::Display) -> DriverError {
@@ -55,8 +76,14 @@ fn retrying_client(url: alloy::transports::http::reqwest::Url) -> alloy::rpc::cl
 /// On Android the helper is a stand-alone program: the system's certificate checker is reachable
 /// only from an app's Java side, and the default client stops ("rustls-platform-verifier to be
 /// initialized"). There, servers are checked against the built-in Mozilla root certificates, as
-/// the relay client does on every system.
+/// the relay client does on every system. Every client of alloy's reqwest (EVM, Solana, the XMZ
+/// wallet) is made here, never with `reqwest::Client::new()` or `::builder()`.
 pub(crate) fn http_client() -> alloy::transports::http::reqwest::Client {
+    http_client_builder().build().expect("TLS client")
+}
+
+/// `http_client`, for callers that add settings (a timeout)
+pub(crate) fn http_client_builder() -> alloy::transports::http::reqwest::ClientBuilder {
     #[cfg(target_os = "android")]
     {
         let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
@@ -65,11 +92,11 @@ pub(crate) fn http_client() -> alloy::transports::http::reqwest::Client {
             .expect("TLS protocol versions")
             .with_root_certificates(roots)
             .with_no_client_auth();
-        alloy::transports::http::reqwest::Client::builder().tls_backend_preconfigured(tls).build().expect("TLS client")
+        alloy::transports::http::reqwest::Client::builder().tls_backend_preconfigured(tls)
     }
     #[cfg(not(target_os = "android"))]
     {
-        alloy::transports::http::reqwest::Client::new()
+        alloy::transports::http::reqwest::Client::builder()
     }
 }
 
@@ -77,6 +104,7 @@ impl AlloyChain {
     pub fn new(url: &str, chain: Chain, contract: Address, from_block: u64, key: PrivateKeySigner) -> Result<Self, DriverError> {
         let url: alloy::transports::http::reqwest::Url = url.parse().map_err(chain_err)?;
         let from = key.address();
+        let signer = key.clone();
         Ok(AlloyChain {
             chain,
             contract,
@@ -86,7 +114,15 @@ impl AlloyChain {
             from,
             log_chunk: LOG_CHUNK,
             scans: Default::default(),
+            signer,
+            sponsors: vec![],
         })
+    }
+
+    /// Relays that may claim for us in a token (USDT) trade, paid out of the tokens
+    pub fn with_sponsors(mut self, relays: Vec<String>) -> Self {
+        self.sponsors = relays;
+        self
     }
 
     pub fn with_log_chunk(mut self, blocks: u64) -> Self {
@@ -173,7 +209,58 @@ impl AlloyChain {
     /// After a trade: send everything our account holds, less the fee of this transfer, to
     /// `to` (the user's own wallet, e.g. MetaMask). Returns the transaction and the amount, or
     /// None when a payout is still pending or nothing is left to send. Repeating it is safe.
-    pub async fn pay_out(&self, to: Address) -> Result<Option<(B256, U256)>, DriverError> {
+    /// Sends the account's balance to `to`, less the fee and less `keep` (left for later fees)
+    /// Units of `token` (USDT) an account holds
+    pub async fn token_balance(&self, token: Address, who: Address) -> Result<U256, DriverError> {
+        crate::IErc20::new(token, self.reader.clone()).balanceOf(who).call().await.map_err(chain_err)
+    }
+
+    /// Send all of `token` the account holds to `to` (before its coin, which pays for this too)
+    pub async fn pay_out_token(&self, token: Address, to: Address) -> Result<Option<B256>, DriverError> {
+        let units = self.token_balance(token, self.from).await?;
+        if units.is_zero() {
+            return Ok(None);
+        }
+        let latest = self.reader.get_transaction_count(self.from).block_id(BlockId::latest()).await.map_err(chain_err)?;
+        let pending = self.reader.get_transaction_count(self.from).pending().await.map_err(chain_err)?;
+        if pending > latest {
+            return Ok(None); // a payment is still pending; tried again on the next call
+        }
+        let input = crate::IErc20::transferCall { to, amount: units }.abi_encode();
+        let probe = TransactionRequest::default().with_from(self.from).with_to(token).with_input(input.clone());
+        let gas = self.reader.estimate_gas(probe).await.map_err(chain_err)?;
+        let fees = self.reader.estimate_eip1559_fees().await.map_err(chain_err)?;
+        let tx = TransactionRequest::default()
+            .with_from(self.from)
+            .with_to(token)
+            .with_input(input)
+            .with_nonce(latest)
+            .with_chain_id(self.check_network().await?)
+            .with_gas_limit(gas + gas / 5)
+            .with_max_fee_per_gas(fees.max_fee_per_gas)
+            .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas.min(fees.max_fee_per_gas));
+        let envelope = tx.build(&self.wallet).await.map_err(chain_err)?;
+        self.broadcast(&Bytes::from(envelope.encoded_2718())).await?;
+        Ok(Some(*envelope.tx_hash()))
+    }
+
+    /// Everything the account holds to `to`: its USDT first (where USDT is traded), then, once that
+    /// payment is mined, its coin less the fee and `keep`
+    pub async fn pay_out_all(&self, to: Address, keep: U256) -> Result<Option<(B256, U256)>, DriverError> {
+        if let Some(token) = usdt_token(self.chain) {
+            if let Some(tx) = self.pay_out_token(token, to).await? {
+                for _ in 0..40 {
+                    if self.reader.get_transaction_receipt(tx).await.map_err(chain_err)?.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+            }
+        }
+        self.pay_out(to, keep).await
+    }
+
+    pub async fn pay_out(&self, to: Address, keep: U256) -> Result<Option<(B256, U256)>, DriverError> {
         let latest = self.reader.get_transaction_count(self.from).block_id(BlockId::latest()).await.map_err(chain_err)?;
         let pending = self.reader.get_transaction_count(self.from).pending().await.map_err(chain_err)?;
         if pending > latest {
@@ -193,10 +280,10 @@ impl AlloyChain {
         }
         // Pay the full max fee up front so the amount plus fee never exceeds the balance
         let fee = U256::from(gas) * U256::from(fees.max_fee_per_gas);
-        if balance <= fee {
+        if balance <= fee + keep {
             return Ok(None);
         }
-        let amount = balance - fee;
+        let amount = balance - fee - keep;
         let tx = TransactionRequest::default()
             .with_from(self.from)
             .with_to(to)
@@ -214,6 +301,44 @@ impl AlloyChain {
 }
 
 impl EvmChain for AlloyChain {
+    fn relayed_claim(&self) -> bool {
+        !self.sponsors.is_empty()
+    }
+
+    /// Our claim through a relay (the contract's claimRelayer): we sign (swap, fee, relayer); the
+    /// relay sends it and the contract pays it `fee` of the tokens, us the rest
+    async fn relay_claim(&self, swap: &Swap, secret: B256) -> Result<bool, DriverError> {
+        if swap.asset == Address::ZERO {
+            return Ok(false);
+        }
+        let chain_id = self.check_network().await?;
+        let id = crate::swap_id(swap);
+        for relay in &self.sponsors {
+            let Some(info) = crate::sponsor::info(relay).await else { continue };
+            let (Some(relayer), Some(fee)) = (info.evm, info.bsc_claim_fee.as_deref().and_then(|f| f.parse::<U256>().ok())) else { continue };
+            if fee > crate::sponsor::max_evm_claim_fee() || fee >= swap.value {
+                continue;
+            }
+            let digest = crate::relay_digest(chain_id, self.contract, id, fee, relayer);
+            let signature = alloy::signers::SignerSync::sign_hash_sync(&self.signer, &digest).map_err(chain_err)?;
+            let request = crate::sponsor::EvmClaimRequest {
+                chain_id,
+                swap: swap.abi_encode().into(),
+                secret,
+                fee,
+                signature: signature.as_bytes().to_vec().into(),
+            };
+            if crate::sponsor::post(relay, crate::sponsor::EVM_CLAIM_PATH, &request).await.is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn allowance(&self, token: Address) -> Result<U256, DriverError> {
+        crate::IErc20::new(token, self.reader.clone()).allowance(self.from, self.contract).call().await.map_err(chain_err)
+    }
+
     async fn now(&self) -> Result<u64, DriverError> {
         let head = self.reader.get_block_number().await.map_err(chain_err)?;
         self.block_timestamp(head).await
@@ -271,6 +396,7 @@ impl EvmChain for AlloyChain {
         let chain_id = self.check_network().await?;
         let (to, input, value) = match call {
             EvmCall::GasAdvance { to, amount } => (*to, Vec::new(), *amount),
+            EvmCall::Approve { token, amount } => (*token, crate::IErc20::approveCall { spender: self.contract, amount: *amount }.abi_encode(), U256::ZERO),
             EvmCall::NewSwap { terms, nonce } => (
                 self.contract,
                 XmzSwap::newSwapCall {

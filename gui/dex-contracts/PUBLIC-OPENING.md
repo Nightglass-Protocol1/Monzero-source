@@ -54,6 +54,33 @@ the direct exchange, so a relay can delay or drop letters but never change a tra
 build the same trade from the listing: trade id = listing id, both timeouts 2 h. A letter is
 about 340 KB (the cross-curve proof); relays keep up to 512 KB per letter, 16 per mailbox, 2 h.
 
+## Partial offers (listing v2)
+
+A maker may let takers take part of an offer: schema `monzero-dex-listing/2` adds `minXmz` (XMZ
+atoms, decimal string, at least 1 XMZ and at most `xmz`); everything else is as v1, and v1 offers
+keep their exact signed bytes. The schema is in the signed message, so a v2 offer cannot be passed
+off as v1 or the other way round.
+
+- **Take:** the take letter names `xmz`, the amount taken: at least `minXmz`, at most `xmz`, and
+  leaving none or at least `minXmz` (no dust). The coin is `value · part / xmz`, rounded in the
+  maker's favour (up when the maker sells XMZ, down when it pays). Both sides build the trade from
+  that amount, so a frame for another amount does not match the maker's.
+- **Still one trade per offer:** an offer is taken once, for the amount named; the trade id is
+  still the offer id (the claim's nonce still finds it). The maker's `serve` then posts what is
+  left as a new v2 offer of its own: id `keccak256("monzero-dex-rest/1" ‖ parent id)`, the same
+  price, minimum and expiry, value = the parent's less the part's (fills and the rest always add up
+  to the original). It lives in a folder next to the parent's (`<parent>-rest-<id>`), which the
+  apps pick up as one of their offers; making it again (a restart) gives the same offer.
+- **Relays:** `GET /v1/listings` leaves v2 offers out unless asked with `partial=1`: apps from
+  before them parse the whole list or nothing. A claim of part of a v2 offer is a print with the
+  XMZ at the offer's price. Relays sync each other with `partial=1`.
+- **Apps:** the helper's `listings` takes `partial: true`, `post` an optional `minXmzAtoms`, `take`
+  an optional `xmzAtoms`; `serve` answers `remainder: {folder, listing}` after a partial fill.
+  The wallets' page bridges accept `minXmz` (offer) and `xmz` (take) and report
+  `features: ["partial"]` in `/v1/status`; the page shows partial offers only to wallets that do.
+- **Limits:** the relays' per-chain cap still applies to the whole offer's coin; the wallet checks
+  the control document's per-trade limits against the part taken.
+
 ## Relay HTTP API v1
 
 ```

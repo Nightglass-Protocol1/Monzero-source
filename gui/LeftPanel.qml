@@ -89,10 +89,10 @@ Rectangle {
         fallBackColor: MonzeroComponents.Style.middlePanelBackgroundColor
         initialStartColor: MonzeroComponents.Style.leftPanelBackgroundGradientStart
         initialStopColor: MonzeroComponents.Style.leftPanelBackgroundGradientStop
-        blackColorStart: MonzeroComponents.Style._b_leftPanelBackgroundGradientStart
-        blackColorStop: MonzeroComponents.Style._b_leftPanelBackgroundGradientStop
-        whiteColorStart: MonzeroComponents.Style._w_leftPanelBackgroundGradientStart
-        whiteColorStop: MonzeroComponents.Style._w_leftPanelBackgroundGradientStop
+        blackColorStart: MonzeroComponents.Style.custom.sidebar || MonzeroComponents.Style._b_leftPanelBackgroundGradientStart
+        blackColorStop: MonzeroComponents.Style.custom.sidebar || MonzeroComponents.Style._b_leftPanelBackgroundGradientStop
+        whiteColorStart: MonzeroComponents.Style.custom.sidebar || MonzeroComponents.Style._w_leftPanelBackgroundGradientStart
+        whiteColorStop: MonzeroComponents.Style.custom.sidebar || MonzeroComponents.Style._w_leftPanelBackgroundGradientStop
         posStart: 0.6
         start: Qt.point(0, 0)
         end: Qt.point(height, width)
@@ -125,10 +125,35 @@ Rectangle {
                     radius: 10
                     border.color: MonzeroComponents.Style.inputBorderColorInActive
                     gradient: Gradient {
-                        GradientStop { position: 0; color: MonzeroComponents.Style.blackTheme ? "#14545B" : "#CCF3EF" }
-                        GradientStop { position: 1; color: MonzeroComponents.Style.blackTheme ? "#08262E" : "#EAFBF8" }
+                        GradientStop { position: 0; color: MonzeroComponents.Style.custom.cardStart || (MonzeroComponents.Style.blackTheme ? "#14545B" : "#CCF3EF") }
+                        GradientStop { position: 1; color: MonzeroComponents.Style.custom.cardEnd || (MonzeroComponents.Style.blackTheme ? "#08262E" : "#EAFBF8") }
+                    }
+                    // The user's own picture (Settings > Layout > Appearance), cropped to the card's
+                    // rounded corners, darkened so the balance stays readable
+                    Rectangle { id: cardMask; anchors.fill: parent; radius: card.radius; visible: false }
+                    Item {
+                        id: cardPicture
+                        anchors.fill: parent
+                        visible: cardImage.status === Image.Ready
+                        layer.enabled: visible && isOpenGL
+                        layer.effect: OpacityMask { maskSource: cardMask }
+                        Image {
+                            id: cardImage
+                            anchors.fill: parent
+                            source: MonzeroComponents.Style.custom.cardImage || ""
+                            fillMode: Image.PreserveAspectCrop
+                            asynchronous: true
+                            sourceSize.width: 520
+                            mipmap: true
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            color: "black"
+                            opacity: MonzeroComponents.Style.custom.cardDim !== undefined ? Number(MonzeroComponents.Style.custom.cardDim) : 0.35
+                        }
                     }
                     Image {
+                        visible: !cardPicture.visible
                         anchors { right: parent.right; bottom: parent.bottom; margins: 8 }
                         width: 115; height: 115
                         source: "qrc:///images/monzero-xmz-coin.png"
@@ -423,8 +448,9 @@ Rectangle {
                 visible: dexPrototypeEnabled && (typeof dexFullPage === "undefined" || dexFullPage)
                 anchors.left: parent.left
                 anchors.right: parent.right
-                text: qsTr("Trade") + translationManager.emptyString
-                symbol: qsTr("Preview") + translationManager.emptyString
+                readonly property bool exchange: typeof dexNativeExchange !== "undefined" && dexNativeExchange === true
+                text: (exchange ? qsTr("Exchange") : qsTr("Trade")) + translationManager.emptyString
+                symbol: (exchange ? "" : qsTr("Preview")) + translationManager.emptyString
                 onClicked: {
                     parent.previousButton.checked = false
                     parent.previousButton = dexButton
@@ -532,7 +558,9 @@ Rectangle {
                 visible: appWindow.walletMode >= 2
                 anchors.left: parent.left
                 anchors.right: parent.right
-                text: qsTr("Mining / tools") + translationManager.emptyString
+                // No-mining builds (miningEnabled=false) drop "Mining" from the label; the page then
+                // shows only the tools (prove/check payment, sign/verify), no mining tab.
+                text: (miningEnabled ? qsTr("Mining / tools") : qsTr("Tools")) + translationManager.emptyString
                 symbol: (isMac ? "⌃" : qsTr("Ctrl+")) + "D" + translationManager.emptyString
                 onClicked: {
                     parent.previousButton.checked = false

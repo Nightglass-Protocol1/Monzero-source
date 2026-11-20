@@ -98,6 +98,7 @@ mod tests {
             xmz_network: network,
             created_at: 1000,
             expires_at: 5000,
+            min_xmz: None,
         }
         .sign(&key)
     }

@@ -19,10 +19,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const LISTING_SCHEMA: &str = "monzero-dex-listing/1";
+/// A listing that may be partly filled: it names `minXmz`, the least a taker may take
+pub const PARTIAL_SCHEMA: &str = "monzero-dex-listing/2";
+/// The least a partial offer's minimum may be (1 XMZ): every fill is a whole swap with its own fees
+pub const MIN_FILL_FLOOR: u64 = 100_000_000_000;
 pub const CANCEL_SCHEMA: &str = "monzero-dex-cancel/1";
 pub const SOL_ACCOUNT_SCHEMA: &str = "monzero-dex-sol-account/1";
-/// The longest a listing may stay open
+/// The longest a first-version listing may stay open (what every app since the opening accepts)
 pub const MAX_LIFETIME: u64 = 24 * 3600;
+/// The longest a version-2 listing may stay open: a month. Apps older than partial offers never
+/// see version-2 listings (relays hide them), so a longer life cannot reach an app that refuses it.
+pub const MAX_LIFETIME_V2: u64 = 31 * 24 * 3600;
 /// How far in the future a maker's clock may be
 pub const CLOCK_SKEW: u64 = 300;
 
@@ -64,6 +71,12 @@ pub struct Listing {
     pub xmz_network: XmzNetwork,
     pub created_at: u64,
     pub expires_at: u64,
+    /// Partial offers only (schema `/2`): the least XMZ (atoms) one take may be. A take is any
+    /// amount from this up to `xmz` that leaves either nothing or at least this much; the maker
+    /// then offers what is left as a new listing at the same price. Absent on whole offers, so
+    /// their signed bytes are what they always were.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_u64_string")]
+    pub min_xmz: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,10 +184,44 @@ pub enum ListingError {
     Mailbox,
     #[error("the id must not be zero")]
     Id,
+    #[error("a partial offer's minimum must be at least 1 XMZ and at most the offer")]
+    Minimum,
+    #[error("this amount cannot be taken from the offer: at least its minimum, at most all of it, and leaving none or at least the minimum")]
+    FillAmount,
 }
 
 impl Chain {
-    /// The pair a listing on this chain trades
+    /// Every pair listings on this chain may trade: the chain's coin, and its tokens (USDT on
+    /// Solana). Apps from before tokens check against `pair` alone and so never take a token offer.
+    pub fn pairs(self) -> Vec<&'static str> {
+        let mut out = vec![self.pair()];
+        if self.is_solana() && crate::sol::usdt_mint(self).is_some() {
+            out.push("USDT/XMZ");
+        }
+        if !self.is_solana() && crate::chain::usdt_token(self).is_some() {
+            out.push("USDT-BSC/XMZ");
+        }
+        out
+    }
+
+    /// The asset of a pair on this chain, as the trade terms name it: zero for the chain's coin
+    pub fn asset_of(self, pair: &str) -> Option<Address> {
+        if pair == self.pair() {
+            return Some(Address::ZERO);
+        }
+        // The chain's coin against Monero ("BNB/XMR"): the coin itself. Tokens against Monero are not traded.
+        if let Some(base) = pair.strip_suffix("/XMR") {
+            return (self.pair().strip_suffix("/XMZ") == Some(base)).then_some(Address::ZERO);
+        }
+        match pair {
+            "USDT/XMZ" if self.is_solana() => crate::sol::usdt_mint(self).map(|m| crate::sol::asset_address(&m)),
+            // USDT on BNB Smart Chain (BEP-20): its own pair name, so its book and chart never mix with Solana's
+            "USDT-BSC/XMZ" if !self.is_solana() => crate::chain::usdt_token(self),
+            _ => None,
+        }
+    }
+
+    /// The pair a listing on this chain trades in the chain's own coin
     pub fn pair(self) -> &'static str {
         match self {
             Chain::BscMainnet | Chain::BscTestnet => "BNB/XMZ",
@@ -215,7 +262,7 @@ impl Listing {
     }
 
     pub fn sign(self, key: &PrivateKeySigner) -> SignedListing {
-        let signature = key.sign_message_sync(message(LISTING_SCHEMA, &self.canonical()).as_bytes()).expect("local signing");
+        let signature = key.sign_message_sync(message(&self.schema, &self.canonical()).as_bytes()).expect("local signing");
         SignedListing { listing: self, signature: signature.as_bytes().to_vec().into() }
     }
 
@@ -229,16 +276,80 @@ impl Listing {
         U256::from_be_slice(&self.id[..8])
     }
 
+    /// Whether takers may take part of it (a version-2 listing whose minimum is all of it is whole)
+    /// What the offer is paid in, as the trade terms name it (zero: the chain's own coin)
+    pub fn asset(&self) -> Address {
+        Chain::from_id(self.chain_id).and_then(|c| c.asset_of(&self.pair)).unwrap_or(Address::repeat_byte(0xEE))
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.min_xmz.is_some_and(|m| m < self.xmz)
+    }
+
+    /// The longest this listing's kind may stay open
+    pub fn max_lifetime(&self) -> u64 {
+        if self.schema == PARTIAL_SCHEMA { MAX_LIFETIME_V2 } else { MAX_LIFETIME }
+    }
+
+    /// Whether `xmz` atoms may be taken: all of it, or (partial offers) at least the minimum while
+    /// leaving none or at least the minimum, so no offer ends as dust nobody may take
+    pub fn fill_ok(&self, xmz: u64) -> bool {
+        match self.min_xmz {
+            None => xmz == self.xmz,
+            Some(min) => xmz == self.xmz || (xmz >= min && xmz < self.xmz && self.xmz - xmz >= min),
+        }
+    }
+
+    /// The coin for `xmz` atoms of this offer, at its price, rounded in the maker's favour: up when
+    /// the maker receives the coin (sells XMZ), down when it pays it. All of it is `value` exactly.
+    pub fn fill_value(&self, xmz: u64) -> U256 {
+        if xmz == self.xmz {
+            return self.value;
+        }
+        let product = self.value * U256::from(xmz);
+        let total = U256::from(self.xmz);
+        match self.side {
+            Side::SellXmz => product.div_ceil(total),
+            Side::BuyXmz => product / total,
+        }
+    }
+
+    /// The listing left after `xmz` atoms were taken (None when all was): a new id, the same price,
+    /// minimum and expiry, unsigned. The remaining coin is `value` less the fill's, so a run of
+    /// fills never adds up to more or less than the offer.
+    pub fn remainder(&self, xmz: u64, id: B256, mailbox: B256, now: u64) -> Option<Listing> {
+        if xmz >= self.xmz || !self.fill_ok(xmz) {
+            return None;
+        }
+        Some(Listing {
+            id,
+            mailbox,
+            value: self.value - self.fill_value(xmz),
+            xmz: self.xmz - xmz,
+            created_at: now.max(self.created_at).min(self.expires_at.saturating_sub(1)),
+            ..self.clone()
+        })
+    }
+
     pub fn check(&self, rules: &Rules, now: u64) -> Result<Chain, ListingError> {
-        if self.schema != LISTING_SCHEMA {
-            return Err(ListingError::Schema);
+        match (self.schema.as_str(), self.min_xmz) {
+            (LISTING_SCHEMA, None) => {}
+            (PARTIAL_SCHEMA, Some(min)) => {
+                if min < MIN_FILL_FLOOR || min > self.xmz {
+                    return Err(ListingError::Minimum);
+                }
+            }
+            _ => return Err(ListingError::Schema),
         }
         if self.id == B256::ZERO {
             return Err(ListingError::Id);
         }
         let chain = Chain::from_id(self.chain_id).ok_or(ListingError::Chain(self.chain_id))?;
         let pinned = rules.contracts.get(&self.chain_id).ok_or(ListingError::Chain(self.chain_id))?;
-        if self.pair != chain.pair_for(self.xmz_network) {
+        // The pair must be one this chain trades (its coin, or a token) and quote the listing's
+        // private coin: "BNB/XMZ" and "USDT/XMZ" with XMZ, "BNB/XMR" with Monero (no tokens yet)
+        if chain.asset_of(&self.pair).is_none() || !self.pair.ends_with(&format!("/{}", self.xmz_network.coin().ticker()))
+            || (self.xmz_network.coin() != crate::xmz::PrivateCoin::Xmz && self.pair != chain.pair_for(self.xmz_network)) {
             return Err(ListingError::Pair(self.pair.clone()));
         }
         if &self.contract != pinned {
@@ -256,7 +367,7 @@ impl Listing {
         if rules.max_value.get(&self.chain_id).is_some_and(|max| self.value > *max) {
             return Err(ListingError::TooLarge);
         }
-        if self.created_at > now + CLOCK_SKEW || self.expires_at <= now || self.expires_at <= self.created_at || self.expires_at - self.created_at > MAX_LIFETIME {
+        if self.created_at > now + CLOCK_SKEW || self.expires_at <= now || self.expires_at <= self.created_at || self.expires_at - self.created_at > self.max_lifetime() {
             return Err(ListingError::Time);
         }
         if self.mailbox == B256::ZERO {
@@ -272,7 +383,7 @@ impl SignedListing {
         let chain = self.listing.check(rules, now)?;
         let signature = Signature::try_from(self.signature.as_ref()).map_err(|_| ListingError::BadSignature)?;
         let signer = signature
-            .recover_address_from_msg(message(LISTING_SCHEMA, &self.listing.canonical()).as_bytes())
+            .recover_address_from_msg(message(&self.listing.schema, &self.listing.canonical()).as_bytes())
             .map_err(|_| ListingError::BadSignature)?;
         if signer != self.listing.maker {
             return Err(ListingError::BadSignature);
@@ -300,6 +411,21 @@ impl SignedCancel {
             Ok(a) if a == self.cancel.maker => Ok(()),
             _ => Err(ListingError::BadSignature),
         }
+    }
+}
+
+mod opt_u64_string {
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => super::u64_string::serialize(v, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        super::u64_string::deserialize(d).map(Some)
     }
 }
 

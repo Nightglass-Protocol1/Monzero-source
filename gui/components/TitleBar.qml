@@ -81,10 +81,10 @@ Rectangle {
         fallBackColor: MonzeroComponents.Style.middlePanelBackgroundColor
         initialStartColor: MonzeroComponents.Style.titleBarBackgroundGradientStart
         initialStopColor: MonzeroComponents.Style.titleBarBackgroundGradientStop
-        blackColorStart: MonzeroComponents.Style._b_titleBarBackgroundGradientStart
-        blackColorStop: MonzeroComponents.Style._b_titleBarBackgroundGradientStop
-        whiteColorStart: MonzeroComponents.Style._w_titleBarBackgroundGradientStart
-        whiteColorStop: MonzeroComponents.Style._w_titleBarBackgroundGradientStop
+        blackColorStart: MonzeroComponents.Style.custom.sidebar || MonzeroComponents.Style._b_titleBarBackgroundGradientStart
+        blackColorStop: MonzeroComponents.Style.custom.sidebar || MonzeroComponents.Style._b_titleBarBackgroundGradientStop
+        whiteColorStart: MonzeroComponents.Style.custom.sidebar || MonzeroComponents.Style._w_titleBarBackgroundGradientStart
+        whiteColorStop: MonzeroComponents.Style.custom.sidebar || MonzeroComponents.Style._w_titleBarBackgroundGradientStop
         start: Qt.point(width, 0)
         end: Qt.point(0, 0)
     }
@@ -419,8 +419,8 @@ Rectangle {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_titleBarBackgroundBorderColor
-            whiteColor: MonzeroComponents.Style._w_titleBarBackgroundBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_titleBarBackgroundBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_titleBarBackgroundBorderColor
         }
     }
 

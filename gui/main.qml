@@ -93,8 +93,11 @@ ApplicationWindow {
     property var cameraUi
     property bool androidCloseTapped: false;
     property int userLastActive;  // epoch
-    // Default daemon addresses
-    readonly property string localDaemonAddress : "localhost:" + getDefaultDaemonRpcPort(persistentSettings.nettype)
+    // Default daemon addresses. Use the IPv4 literal, not "localhost": the embedded node binds its
+    // RPC on 127.0.0.1 only, while on Windows "localhost" resolves to ::1 (IPv6) first, so the
+    // wallet silently fails to connect and the balance never refreshes even though the node is
+    // synced. 127.0.0.1 behaves identically to localhost on Linux.
+    readonly property string localDaemonAddress : "127.0.0.1:" + getDefaultDaemonRpcPort(persistentSettings.nettype)
     property string currentDaemonAddress;
     property int disconnectedEpoch: 0
     property int estimatedBlockchainSize: persistentSettings.pruneBlockchain ? 110 : 270 // GB
@@ -1619,6 +1622,8 @@ ApplicationWindow {
         property int walletMode: 2
         property int lockOnUserInActivityInterval: 10  // minutes
         property bool blackTheme: MonzeroComponents.Style.blackTheme
+        // The user's own colours and wallet-card picture (JSON; see Style.custom)
+        property string customTheme: "{}"
         property bool checkForUpdates: true
         property bool autosave: true
         property int autosaveMinutes: 10
@@ -1657,6 +1662,7 @@ ApplicationWindow {
 
         Component.onCompleted: {
             MonzeroComponents.Style.blackTheme = persistentSettings.blackTheme
+            try { MonzeroComponents.Style.custom = JSON.parse(persistentSettings.customTheme || "{}") || {} } catch (e) { MonzeroComponents.Style.custom = {} }
         }
     }
 
@@ -2550,8 +2556,8 @@ ApplicationWindow {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-            whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
         }
     }
 
@@ -2566,8 +2572,8 @@ ApplicationWindow {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-            whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
         }
     }
 
@@ -2582,8 +2588,8 @@ ApplicationWindow {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-            whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
         }
     }
 
@@ -2598,8 +2604,8 @@ ApplicationWindow {
 
         MonzeroEffects.ColorTransition {
             targetObj: parent
-            blackColor: MonzeroComponents.Style._b_appWindowBorderColor
-            whiteColor: MonzeroComponents.Style._w_appWindowBorderColor
+            blackColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._b_appWindowBorderColor
+            whiteColor: MonzeroComponents.Style.custom.accentSoft || MonzeroComponents.Style._w_appWindowBorderColor
         }
     }
 

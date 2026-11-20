@@ -341,31 +341,76 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         return m != null && m.refreshListings(pair);
     }
 
-    boolean postOffer(long chainId, String side, String coinAmount, String xmzAmount, int hours) {
+    /** minXmzAmount: empty for a whole offer, else the least XMZ one buyer or seller may take. */
+    boolean postOffer(long chainId, String side, String coinAmount, String xmzAmount, String minXmzAmount, int hours) {
         final String wei = DexFiles.atomic(coinAmount, DexConfig.decimals(chainId)), atoms = DexFiles.atomic(xmzAmount, 11);
         if (wei == null || atoms == null || hours < 1 || hours > 24) return say("Check the amounts and how long the offer stays open (1-24 hours).");
+        String minAtoms = null;
+        if (minXmzAmount != null && !minXmzAmount.trim().isEmpty()) {
+            minAtoms = DexFiles.atomic(minXmzAmount.trim(), 11);
+            if (minAtoms == null || new BigInteger(minAtoms).compareTo(MIN_FILL) < 0 || new BigInteger(minAtoms).compareTo(new BigInteger(atoms)) > 0)
+                return say("The smallest part must be at least 1 XMZ and at most the whole offer.");
+        }
         final String refusal = offerRefusal(chainId, wei, atoms);
         if (!refusal.isEmpty()) return say(refusal);
         final DexMarket m = markets.get(chainId);
         if (m == null) return false;
-        final boolean started = m.post(keys.seedHex(), side, wei, atoms, hours * 3600L);
+        final boolean started = m.post(keys.seedHex(), side, wei, atoms, minAtoms, hours * 3600L);
         marketMessage = started ? "" : "The offer could not be posted now.";
         changed();
         return started;
     }
 
-    boolean takeOffer(String listingId) {
+    /** xmzAmount: empty to take all of the offer, else how much of a partial offer (in XMZ). */
+    boolean takeOffer(String listingId, String xmzAmount) {
         for (DexMarket m : markets.values()) {
             final JSONObject l = m.listing(listingId);
             if (l == null) continue;
-            final String refusal = offerRefusal(l.optLong("chainId"), l.optString("valueWei"), l.optString("xmzAtoms"));
+            String atoms = null, wei = l.optString("valueWei");
+            if (xmzAmount != null && !xmzAmount.trim().isEmpty()) {
+                atoms = DexFiles.atomic(xmzAmount.trim(), 11);
+                final String part = atoms == null ? null : partValue(l, new BigInteger(atoms));
+                if (part == null) {
+                    final String min = l.optString("minXmz");
+                    return say(min.isEmpty() ? "This offer can only be taken whole."
+                            : "Take at least " + min + " XMZ and at most " + l.optString("xmz") + " XMZ, leaving none or at least " + min + " XMZ.");
+                }
+                // All of it is a whole take: nothing to name
+                if (atoms.equals(l.optString("xmzAtoms"))) atoms = null;
+                else wei = part;
+            }
+            // A partial offer taken whole still names its amount: the maker then knows it was chosen
+            if (atoms == null && l.has("minXmzAtoms")) atoms = l.optString("xmzAtoms");
+            final String refusal = offerRefusal(l.optLong("chainId"), wei, atoms == null ? l.optString("xmzAtoms") : atoms);
             if (!refusal.isEmpty()) return say(refusal);
-            final boolean started = m.take(keys.seedHex(), listingId);
+            final boolean started = m.take(keys.seedHex(), listingId, atoms);
             marketMessage = started ? "" : "The offer could not be taken now.";
             changed();
             return started;
         }
         return false;
+    }
+
+    /** The least a partial offer's smallest part may be: 1 XMZ (as the engine checks). */
+    private static final BigInteger MIN_FILL = BigInteger.valueOf(100_000_000_000L);
+
+    /**
+     * The coin (smallest unit) for `atoms` XMZ of a listing the relays showed, at its price, rounded
+     * in the maker's favour as the engine does; null when the offer does not allow that amount.
+     */
+    static String partValue(JSONObject l, BigInteger atoms) {
+        try {
+            final BigInteger total = new BigInteger(l.optString("xmzAtoms")), value = new BigInteger(l.optString("valueWei"));
+            if (atoms.equals(total)) return value.toString();
+            if (!l.has("minXmzAtoms")) return null;
+            final BigInteger min = new BigInteger(l.optString("minXmzAtoms"));
+            if (atoms.compareTo(min) < 0 || atoms.compareTo(total) >= 0 || total.subtract(atoms).compareTo(min) < 0) return null;
+            final BigInteger[] qr = value.multiply(atoms).divideAndRemainder(total);
+            final boolean up = l.optString("side").equals("sell-xmz") && qr[1].signum() != 0;
+            return (up ? qr[0].add(BigInteger.ONE) : qr[0]).toString();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     boolean cancelOffer(String folder) {

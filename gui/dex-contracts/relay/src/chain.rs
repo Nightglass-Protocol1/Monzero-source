@@ -134,7 +134,8 @@ impl ChainView for View {
                 Ok(match claim_lookup(&v.url, &v.program, &signature).await.map_err(|e| e.to_string())? {
                     ClaimSeen::Pending => ClaimLookup::Pending,
                     ClaimSeen::NotAClaim(why) => ClaimLookup::NotAClaim(why),
-                    ClaimSeen::Final(s) => ClaimLookup::FinalSol { owner: s.owner.into(), claimer: s.claimer.into(), lamports: s.lamports, nonce: s.nonce, at: s.at },
+                    ClaimSeen::Final(s) => ClaimLookup::FinalSol { owner: s.owner.into(), claimer: s.claimer.into(), lamports: s.lamports, nonce: s.nonce, at: s.at,
+                        asset: s.mint.map(|m| monzero_dex_evm::sol::asset_address(&m)).unwrap_or(Address::ZERO) },
                 })
             }
         }

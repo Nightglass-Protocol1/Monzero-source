@@ -8,6 +8,7 @@
 pub mod utxo;
 pub mod chain;
 pub mod http;
+pub mod sponsor;
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use monzero_dex_evm::mail::MAX_SEALED;
@@ -122,7 +123,8 @@ pub enum ClaimLookup {
     Pending,
     Final { swap: Swap, at: u64 },
     /// As `Final`, on Solana: the traders are Solana accounts and the amount is in lamports
-    FinalSol { owner: B256, claimer: B256, lamports: u64, nonce: u64, at: u64 },
+    /// `asset`: what was claimed, as a listing names it (zero: SOL; a token's stand-in address)
+    FinalSol { owner: B256, claimer: B256, lamports: u64, nonce: u64, at: u64, asset: Address },
     NotAClaim(String),
 }
 
@@ -150,7 +152,7 @@ pub struct Print {
     pub at: u64,
     /// Coin amount (wei), from the chain
     pub value: U256,
-    /// XMZ atoms, from the maker-signed offer
+    /// XMZ atoms, from the maker-signed offer (a part of a partial offer: at the offer's price)
     #[serde(with = "u64_string")]
     pub xmz: u64,
     pub listing: B256,
@@ -168,8 +170,14 @@ pub fn private_unit(pair: &str) -> f64 {
 impl Print {
     /// Coin per XMZ (or per XMR on a Monero pair)
     pub fn price(&self) -> f64 {
-        // The coin's smallest unit: wei (18 places), or lamports on Solana (9)
-        let unit = if monzero_dex_evm::Chain::from_id(self.chain_id).is_some_and(|c| c.is_solana()) { 1e9 } else { 1e18 };
+        // The coin's smallest unit: wei (18 places), lamports on Solana (9), USDT base units (6)
+        let unit = if self.pair == "USDT/XMZ" {
+            1e6
+        } else if monzero_dex_evm::Chain::from_id(self.chain_id).is_some_and(|c| c.is_solana()) {
+            1e9
+        } else {
+            1e18
+        };
         let coin = self.value.to_string().parse::<f64>().unwrap_or(0.0) / unit;
         coin / (self.xmz as f64 / private_unit(&self.pair))
     }
@@ -357,10 +365,16 @@ impl<C: ChainView> Relay<C> {
         Ok(())
     }
 
-    /// Open offers, lowest price (coin per XMZ) first
-    pub fn listings(&self, pair: Option<&str>, now: u64) -> Vec<SignedListing> {
+    /// Open offers, lowest price (coin per XMZ) first. `partial`: also offers that may be partly
+    /// taken, which apps from before them cannot read (they read the whole list or nothing).
+    pub fn listings(&self, pair: Option<&str>, partial: bool, now: u64) -> Vec<SignedListing> {
         let s = self.state();
-        let mut out: Vec<_> = s.active.values().filter(|o| o.listing.expires_at > now && pair.is_none_or(|p| o.listing.pair == p)).cloned().collect();
+        let mut out: Vec<_> = s
+            .active
+            .values()
+            .filter(|o| o.listing.expires_at > now && pair.is_none_or(|p| o.listing.pair == p) && (partial || o.listing.schema == monzero_dex_evm::listing::LISTING_SCHEMA))
+            .cloned()
+            .collect();
         // a.value / a.xmz against b.value / b.xmz, without rounding
         let key = |o: &SignedListing, other: &SignedListing| o.listing.value.saturating_mul(U256::from(other.listing.xmz));
         out.sort_by(|a, b| key(a, b).cmp(&key(b, a)).then(a.listing.id.cmp(&b.listing.id)));
@@ -432,10 +446,10 @@ impl<C: ChainView> Relay<C> {
                 return Ok(PrintStatus::Pending);
             }
             ClaimLookup::Final { swap, at } => {
-                let native = swap.asset == Address::ZERO;
+                let asset = swap.asset;
                 let (owner, claimer) = (swap.owner, swap.claimer);
                 (swap.nonce, swap.value, at, Box::new(move |o, _| {
-                    native
+                    asset == o.listing.asset()
                         && match o.listing.maker_role() {
                             Role::Owner => owner == o.listing.maker,
                             Role::Claimer => claimer == o.listing.maker,
@@ -443,8 +457,8 @@ impl<C: ChainView> Relay<C> {
                 }))
             }
             // On Solana the maker's side is the account its signed note names
-            ClaimLookup::FinalSol { owner, claimer, lamports, nonce, at } => (U256::from(nonce), U256::from(lamports), at, Box::new(move |o, account| {
-                account.is_some_and(|a| match o.listing.maker_role() {
+            ClaimLookup::FinalSol { owner, claimer, lamports, nonce, at, asset } => (U256::from(nonce), U256::from(lamports), at, Box::new(move |o, account| {
+                asset == o.listing.asset() && account.is_some_and(|a| match o.listing.maker_role() {
                     Role::Owner => owner == a.note.account,
                     Role::Claimer => claimer == a.note.account,
                 })
@@ -456,12 +470,20 @@ impl<C: ChainView> Relay<C> {
         let listing = s.active.values().chain(s.archive.values()).find(|o| o.listing.swap_nonce() == nonce).cloned().ok_or(RelayError::UnknownListing)?;
         let id = listing.listing.id;
         let l = &listing.listing;
-        if l.chain_id != chain_id || value != l.value || !maker_ok(&listing, s.sol_accounts.get(&id)) {
+        // All of the offer, or for a partial offer any part it allows (from its minimum up)
+        let amount_ok = value == l.value || l.min_xmz.is_some_and(|min| value >= l.fill_value(min) && value < l.value);
+        if l.chain_id != chain_id || !amount_ok || !maker_ok(&listing, s.sol_accounts.get(&id)) {
             return Err(RelayError::UnknownListing);
         }
+        // The XMZ of a part, at the offer's price (the chain shows only the coin)
+        let xmz = if value == l.value {
+            l.xmz
+        } else {
+            u64::try_from(value * U256::from(l.xmz) / l.value).unwrap_or(l.xmz).min(l.xmz)
+        };
         // One trade per offer: a second claim under the same offer is not another trade
         if s.print_txs.insert(tx.clone()) && !s.prints.iter().any(|p| p.listing == id) {
-            s.prints.push(Print { pair: l.pair.clone(), chain_id, tx, at, value, xmz: l.xmz, listing: id });
+            s.prints.push(Print { pair: l.pair.clone(), chain_id, tx, at, value, xmz, listing: id });
         }
         if let Some(filled) = s.active.remove(&id) {
             s.archive.insert(id, filled);

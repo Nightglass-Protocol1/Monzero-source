@@ -10,6 +10,7 @@
 #include <QFutureWatcher>
 #include <QPointer>
 #include <QHash>
+class DexExchangeFeed;
 
 enum class OfferState { Draft, Quoted, Matched, XmzLocked, ExternalLocked, Redeemable, Settled, Refunding, Refunded, Expired, Cancelled };
 class NativeFeePreviewController;
@@ -67,6 +68,8 @@ class DexEngine : public QObject {
     Q_PROPERTY(QVariantMap evmMarketStatus READ evmMarketStatus NOTIFY evmMarketChanged)
     Q_PROPERTY(QVariantMap btcMarketStatus READ btcMarketStatus NOTIFY btcMarketChanged)
     Q_PROPERTY(QVariantMap dexWalletStatus READ dexWalletStatus NOTIFY dexWalletChanged)
+    // Read-only public data for the in-app exchange (Linux): candles, trades, balance, USD prices
+    Q_PROPERTY(QObject *exchangeFeed READ exchangeFeed CONSTANT)
     Q_PROPERTY(QVariantMap bchSuccessReleaseReviewStatus READ bchSuccessReleaseReviewStatus NOTIFY bchSuccessReleaseReviewChanged)
     Q_PROPERTY(QVariantMap bchPublicationRepairStatus READ bchPublicationRepairStatus NOTIFY bchPublicationRepairChanged)
     Q_PROPERTY(QVariantMap bchSuccessPreparationStatus READ bchSuccessPreparationStatus NOTIFY bchSuccessPreparationChanged)
@@ -262,8 +265,18 @@ public:
     QVariantMap evmMarketStatus() const;
     Q_INVOKABLE bool refreshEvmOffers(const QString &pair);
     // side: "sell-xmz" (we sell XMZ for the coin) or "buy-xmz"; amounts as decimal text in coins
-    Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours);
-    Q_INVOKABLE bool takeEvmOffer(const QString &listingId);
+    // minXmzAmount: empty for a whole offer, else the least XMZ one take may be (a partial offer)
+    Q_INVOKABLE bool postEvmOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmzAmount,int lifetimeHours,const QString &minXmzAmount=QString(),bool renew=false);
+    // Keep an open offer of ours open (posted again shortly before it expires, while the wallet runs)
+    Q_INVOKABLE bool setEvmOfferRenew(const QString &folder,bool on);
+    // Why an order of these amounts (decimal text in coins) would be refused by the kill switch and
+    // caps, before it is posted or taken; "" when it may go ahead. Nothing is recorded.
+    Q_INVOKABLE QString evmOrderRefusal(int chainId,const QString &coinAmount,const QString &xmzAmount);
+    // xmzAmount: empty to take all of the offer, else how much of a partial offer
+    Q_INVOKABLE bool takeEvmOffer(const QString &listingId,const QString &xmzAmount=QString());
+    // The coin for `atoms` XMZ of a listing as the market shows it, at its price, rounded in the
+    // maker's favour as the helper does; empty when the offer does not allow that amount
+    static QString evmPartValue(const QVariantMap &listing,const QString &atoms);
     Q_INVOKABLE bool cancelEvmOffer(const QString &folder);
     // Coin paid into the trade account that no trade or open offer needs goes back to the user's wallet
     Q_INVOKABLE bool returnEvmFunds(int chainId,const QString &address);
@@ -282,6 +295,20 @@ public:
     // One step for a new user: makes the app's own key wallet (a Bitcoin light wallet kept in the
     // app's data folder) if there is none, opens it and unlocks the trade keys with this password
     Q_INVOKABLE bool setUpTradingKeys(const QString &password);
+    // Trade keys kept in a self-contained encrypted store (builds with no bundled light wallet)
+    bool usingTradeKeyStore() const;
+    QString tradeKeyStorePath() const;
+    void applyUnlockedTradeKeys(QByteArray seed,QByteArray key,const QString &address);
+    // Derive the EVM/Solana trade account through a market helper once the keys are unlocked and the
+    // store holds no cached address. Markets are briefly busy on each 20s listings refresh, so this
+    // waits (polling every 500ms up to a bound) for one to be free rather than failing on a busy one.
+    void deriveTradeAccount(int attempt);
+    // The key wallet's folder (app data). When it was made by another copy of the app, the review
+    // of moving it to this copy's helper; approving it (its commitment) lets it be unlocked here.
+    QString tradingKeysDirectory() const;
+    QString tradingKeysWallet() const;
+    Q_INVOKABLE QVariantMap reviewTradingKeysHelper() const;
+    Q_INVOKABLE bool approveTradingKeysHelper(const QString &commitment);
     bool dexKeysReady() const {return !m_evmAccount.isEmpty();}
     // Send XMZ from the trading wallet to `address` (amount in XMZ as text; empty sends everything)
     Q_INVOKABLE bool sendFromDexWallet(const QString &address,const QString &amount);
@@ -553,6 +580,10 @@ private:
     QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();
     QHash<int,EvmMarketJob*> m_evmMarkets;   // by chain id
+    DexExchangeFeed *m_exchangeFeed=nullptr;
+public:
+    QObject *exchangeFeed() const;
+private:
     EvmMarketJob *evmMarketFor(const QString &tradeDir) const;
     EvmMarketJob *evmMarketForCoin(const QString &coin) const;
     QByteArray m_evmSwapSeedHex,m_evmKeyHex;
@@ -563,6 +594,7 @@ private:
     BtcMarketJob *m_btcMarket=nullptr;
     DexWalletService *m_dexWallets=nullptr;
     QString m_evmAccount,m_keysMessage;
+    QMetaObject::Connection m_accountsConn;   // one-shot: the store path pulls the EVM address from the helper
     bool m_keysBusy=false;
     QString m_keysSetupPassword;
     int m_keysSetupSteps=0;
