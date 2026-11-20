@@ -1016,8 +1016,12 @@ void DexEngine::setUpXmrMarkets() {
         f.write(QJsonDocument(config).toJson(QJsonDocument::Compact));f.close();
         if (!addEvmMarket(path)) qWarning("The DEX XMR market for chain %d could not start",c.first);
     }
-    // A trade of these markets may have been running when the app closed
-    m_evmResumed=false;resumeEvmTrades();
+    // A trade of these markets may have been running when the app closed. Before the first resume,
+    // it covers these markets too; after it (the Monero node answered late), their trades join the queue.
+    if (!m_evmResumed) {resumeEvmTrades();return;}
+    if (m_evmResuming || m_evmTrade->status().value("configured").toBool()) return;
+    for (auto *job:m_xmrMarkets) for (const auto &dir:job->agreedFolders()) m_evmResume.append({job,dir});
+    nextEvmResume();
 }
 QVariantMap DexEngine::xmrMarketStatus() const {
     QVariantMap all;
