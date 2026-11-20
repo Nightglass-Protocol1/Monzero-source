@@ -25,7 +25,14 @@ bool configValid(const QJsonObject &c) {
     const QSet<QString> required{"schema","helper","helperDigest","tradeDir","evmRpc","accountIndex","mainWallet","swapWallet"};
     for (const auto &key:required) if (!c.contains(key)) return false;
     for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk" && i.key()!="localSolProgram"
-        && i.key()!="localSolUsdtMint" && i.key()!="relays") return false;
+        && i.key()!="localSolUsdtMint" && i.key()!="relays" && i.key()!="witnessDaemons") return false;
+    // A Monero trade's independent nodes (https; plain http only on this computer)
+    if (c.contains("witnessDaemons")) {
+        static const QRegularExpression node("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?|http://(127\\.0\\.0\\.1|localhost):[0-9]{1,5})/?\\z");
+        const auto list=c.value("witnessDaemons").toArray();
+        if (!c.value("witnessDaemons").isArray() || list.size()>8) return false;
+        for (const auto &w:list) if (!node.match(w.toString()).hasMatch()) return false;
+    }
     if (c.contains("localSolProgram") && !DexChains::solanaAddress(c.value("localSolProgram").toString())) return false;
     if (c.contains("localSolUsdtMint") && !DexChains::solanaAddress(c.value("localSolUsdtMint").toString())) return false;
     // The relays that may pay a USDT trade's network fees (paid back in USDT): https, or local in tests
@@ -175,6 +182,7 @@ bool EvmTradeJob::tickConfig(QByteArray &walletSeed,QJsonObject *out) const {
         QJsonObject t{{"evmRpc",m_config.value("evmRpc")},{"swapKeys",QJsonObject{{"swapSeedHex",QString::fromLatin1(m_swapSeedHex)},
             {"evmKeyHex",QString::fromLatin1(m_evmKeyHex)}}},{"mainWallet",m_config.value("mainWallet")},{"swapWallet",m_config.value("swapWallet")}};
         if (m_config.contains("evmLogChunk")) t.insert("evmLogChunk",m_config.value("evmLogChunk"));
+        if (m_config.contains("witnessDaemons")) t.insert("witnessDaemons",m_config.value("witnessDaemons"));
         *out=t;return true;
     }
     const bool valid=walletSeed.size()>=16 && walletSeed.size()<=64;
@@ -184,6 +192,7 @@ bool EvmTradeJob::tickConfig(QByteArray &walletSeed,QJsonObject *out) const {
         {"accountIndex",m_config.value("accountIndex")},{"mainWallet",m_config.value("mainWallet")},{"swapWallet",m_config.value("swapWallet")}};
     seedHex.fill('\0');
     if (m_config.contains("evmLogChunk")) t.insert("evmLogChunk",m_config.value("evmLogChunk"));
+    if (m_config.contains("witnessDaemons")) t.insert("witnessDaemons",m_config.value("witnessDaemons"));
     *out=t;return true;
 }
 bool EvmTradeJob::run(const QJsonObject &request) {

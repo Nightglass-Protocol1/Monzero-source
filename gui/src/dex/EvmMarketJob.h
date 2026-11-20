@@ -45,7 +45,13 @@ public:
     QJsonObject tradeConfig(const QString &tradeDir) const;
     // Coin per XMZ, as text, from wei and atoms (display only)
     // decimals: of the coin's smallest unit (18 for wei, 9 for Solana's lamports)
-    static QString priceText(const QString &valueWei,const QString &xmzAtoms,int decimals=18);
+    // privateDecimals: 11 for XMZ atoms, 12 for Monero's
+    static QString priceText(const QString &valueWei,const QString &xmzAtoms,int decimals=18,int privateDecimals=11);
+    // A Monero market (config "coin": "xmr"): the private side is XMR, on the app's Monero wallets
+    bool xmr() const;
+    int privatePlaces() const;
+    // "ETH/XMZ", "USDT/XMZ", "ETH/XMR", "USDT-BSC/XMR"
+    QString pairName() const;
     static QString weiToCoin(const QString &valueWei,int decimals=18);
     // Folders of trades whose keys were agreed and that are not marked finished
     QStringList agreedFolders() const;

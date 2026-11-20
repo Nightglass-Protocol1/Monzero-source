@@ -26,10 +26,23 @@ bool localEndpoint(const QJsonValue &value) {
     return value.isObject() && local.match(e.value("url").toString()).hasMatch()
         && (!e.contains("loginFile") || cleanAbsolute(e.value("loginFile").toString()));
 }
+// Independent Monero nodes that must also see a Monero lock (https; plain http only on this computer)
+bool witnessesValid(const QJsonValue &value) {
+    static const QRegularExpression node("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?|http://(127\\.0\\.0\\.1|localhost):[0-9]{1,5})/?\\z");
+    const auto list=value.toArray();
+    if (!value.isArray() || list.size()>8) return false;
+    for (const auto &w:list) if (!node.match(w.toString()).hasMatch()) return false;
+    return true;
+}
 bool configValid(const QJsonObject &c) {
     const QSet<QString> required{"schema","helper","helperDigest","tradesDir","evmRpc","chainId","accountIndex","mainWallet","swapWallet","relays"};
+    // A Monero market ("coin": "xmr"): its witness nodes, and whether real XMR offers are accepted
+    const QSet<QString> optional{"evmLogChunk","localContract","localSolProgram","localSolUsdtMint","coin","witnessDaemons","xmrMainnet"};
     for (const auto &key:required) if (!c.contains(key)) return false;
-    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && i.key()!="evmLogChunk" && i.key()!="localContract" && i.key()!="localSolProgram" && i.key()!="localSolUsdtMint") return false;
+    for (auto i=c.begin();i!=c.end();++i) if (!required.contains(i.key()) && !optional.contains(i.key())) return false;
+    if (c.contains("coin") && c.value("coin")!="xmr") return false;
+    if (c.contains("witnessDaemons") && !witnessesValid(c.value("witnessDaemons"))) return false;
+    if (c.contains("xmrMainnet") && !c.value("xmrMainnet").isBool()) return false;
     static const QRegularExpression rpc("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?|http://127\\.0\\.0\\.1:[0-9]{1,5})\\z");
     static const QRegularExpression relay("\\A(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?|http://(127\\.0\\.0\\.1|localhost):[0-9]{1,5})\\z");
     const auto relays=c.value("relays").toArray();
@@ -74,7 +87,7 @@ bool listingValid(const QJsonObject &signedListing) {
     const auto l=signedListing.value("listing").toObject();
     static const QRegularExpression address("\\A0x[0-9a-fA-F]{40}\\z");
     return signedListing.size()==2 && Hash.match(l.value("id").toString()).hasMatch()
-        && (l.value("pair")=="ETH/XMZ" || l.value("pair")=="BNB/XMZ" || l.value("pair")=="SOL/XMZ" || l.value("pair")=="USDT/XMZ" || l.value("pair")=="USDT-BSC/XMZ")
+        && QSet<QString>{"ETH/XMZ","BNB/XMZ","SOL/XMZ","USDT/XMZ","USDT-BSC/XMZ","ETH/XMR","BNB/XMR","SOL/XMR","USDT/XMR","USDT-BSC/XMR"}.contains(l.value("pair").toString())
         && (l.value("side")=="sell-xmz" || l.value("side")=="buy-xmz")
         && HexQty.match(l.value("value").toString()).hasMatch() && Digits.match(l.value("xmz").toString()).hasMatch()
         && address.match(l.value("maker").toString()).hasMatch() && l.value("expiresAt").isDouble() && l.value("chainId").isDouble();
@@ -169,7 +182,15 @@ QJsonObject EvmMarketJob::base(const QString &command,const QString &folder) con
     if (m_config.contains("localContract")) r.insert("localContract",m_config.value("localContract"));
     if (m_config.contains("localSolProgram")) r.insert("localSolProgram",m_config.value("localSolProgram"));
     if (m_config.contains("localSolUsdtMint")) r.insert("localSolUsdtMint",m_config.value("localSolUsdtMint"));
+    if (m_config.value("xmrMainnet").toBool()) r.insert("xmrMainnet",true);
     return r;
+}
+
+bool EvmMarketJob::xmr() const {return m_config.value("coin")=="xmr";}
+int EvmMarketJob::privatePlaces() const {return xmr() ? 12 : 11;}
+QString EvmMarketJob::pairName() const {
+    const auto pair=DexChains::pair(qint64(m_config.value("chainId").toDouble()));
+    return xmr() ? pair.section('/',0,0)+"/XMR" : pair;
 }
 
 bool EvmMarketJob::tickConfig(QByteArray &walletSeed,QJsonObject *out) const {
@@ -178,6 +199,7 @@ bool EvmMarketJob::tickConfig(QByteArray &walletSeed,QJsonObject *out) const {
         QJsonObject t{{"evmRpc",m_config.value("evmRpc")},{"swapKeys",QJsonObject{{"swapSeedHex",QString::fromLatin1(m_swapSeedHex)},
             {"evmKeyHex",QString::fromLatin1(m_evmKeyHex)}}},{"mainWallet",m_config.value("mainWallet")},{"swapWallet",m_config.value("swapWallet")}};
         if (m_config.contains("evmLogChunk")) t.insert("evmLogChunk",m_config.value("evmLogChunk"));
+        if (m_config.contains("witnessDaemons")) t.insert("witnessDaemons",m_config.value("witnessDaemons"));
         *out=t;return true;
     }
     const bool valid=walletSeed.size()>=16 && walletSeed.size()<=64;
@@ -187,6 +209,7 @@ bool EvmMarketJob::tickConfig(QByteArray &walletSeed,QJsonObject *out) const {
         {"accountIndex",m_config.value("accountIndex")},{"mainWallet",m_config.value("mainWallet")},{"swapWallet",m_config.value("swapWallet")}};
     seedHex.fill('\0');
     if (m_config.contains("evmLogChunk")) t.insert("evmLogChunk",m_config.value("evmLogChunk"));
+    if (m_config.contains("witnessDaemons")) t.insert("witnessDaemons",m_config.value("witnessDaemons"));
     *out=t;return true;
 }
 
@@ -199,6 +222,7 @@ QJsonObject EvmMarketJob::tradeConfig(const QString &tradeDir) const {
     if (m_config.contains("localSolUsdtMint")) c.insert("localSolUsdtMint",m_config.value("localSolUsdtMint"));
     // The trade's relays: a USDT trade's network fees may be paid by them (in USDT)
     if (DexChains::token(qint64(m_config.value("chainId").toDouble()))) c.insert("relays",m_config.value("relays"));
+    if (m_config.contains("witnessDaemons")) c.insert("witnessDaemons",m_config.value("witnessDaemons"));
     return c;
 }
 
@@ -211,7 +235,7 @@ bool EvmMarketJob::requestAccounts(QByteArray &walletSeed) {
 
 bool EvmMarketJob::refreshListings(const QString &pair) {
     // This market's pair only (USDT and SOL share the Solana chain but are separate markets)
-    if (pair!=DexChains::pair(qint64(m_config.value("chainId").toDouble()))) return false;
+    if (pair!=pairName()) return false;
     // Partial offers too: this wallet can take part of one
     auto r=base("listings",{});r.insert("pair",pair);r.insert("partial",true);
     return run(r,{});
@@ -225,7 +249,8 @@ bool EvmMarketJob::post(QByteArray &walletSeed,qint64 chainId,const QString &sid
     auto r=base("post",folder);r.insert("tick",t);
     // The helper trades the market on its chain; a token market names its pair
     QJsonObject offer{{"chainId",DexChains::helperChain(chainId)},{"side",side},{"valueWei",valueWei},{"xmzAtoms",xmzAtoms},{"lifetimeSecs",lifetimeSecs}};
-    if (DexChains::token(chainId)) offer.insert("pair",DexChains::pair(chainId));
+    if (DexChains::token(chainId) || xmr()) offer.insert("pair",pairName());
+    if (xmr()) offer.insert("coin","xmr");
     if (!minXmzAtoms.isEmpty()) offer.insert("minXmzAtoms",minXmzAtoms);
     if (renew) offer.insert("renew",true);
     r.insert("offer",offer);
@@ -350,10 +375,10 @@ void EvmMarketJob::finish(bool success) {
             m_signed.insert(id,s);
             QVariantMap shown{{"id",id},{"pair",l.value("pair")},{"side",l.value("side")},{"chainId",l.value("chainId").toDouble()},
                 {"maker",l.value("maker")},{"valueWei",wei},{"xmzAtoms",l.value("xmz")},{"coin",weiToCoin(wei,places)},
-                {"xmz",units(l.value("xmz").toString(),11)},{"price",priceText(wei,l.value("xmz").toString(),places)},
+                {"xmz",units(l.value("xmz").toString(),privatePlaces())},{"price",priceText(wei,l.value("xmz").toString(),places,privatePlaces())},
                 {"expiresAt",l.value("expiresAt").toDouble()},{"relays",entry.value("relays").toArray().size()}};
             // A partial offer: any amount from its minimum may be taken
-            if (Digits.match(l.value("minXmz").toString()).hasMatch()) {shown.insert("minXmzAtoms",l.value("minXmz").toString());shown.insert("minXmz",units(l.value("minXmz").toString(),11));}
+            if (Digits.match(l.value("minXmz").toString()).hasMatch()) {shown.insert("minXmzAtoms",l.value("minXmz").toString());shown.insert("minXmz",units(l.value("minXmz").toString(),privatePlaces()));}
             m_listings.append(shown);
         }
     } else if (m_command=="post") {
@@ -396,24 +421,26 @@ QVariantMap EvmMarketJob::status() const {
         const auto l=f.listing.value("listing").toObject();
         const auto wei=hexToDecimal(l.value("value").toString());
         folders.append(QVariantMap{{"folder",f.path},{"kind",f.kind},{"state",f.state},{"detail",f.detail},{"id",f.listingId},{"renew",f.renew},
-            {"pair",l.value("pair")},{"side",l.value("side")},{"coin",weiToCoin(wei,places)},{"xmz",units(l.value("xmz").toString(),11)},
-            {"price",priceText(wei,l.value("xmz").toString(),places)},{"expiresAt",l.value("expiresAt").toDouble()}});
+            {"pair",l.value("pair")},{"side",l.value("side")},{"coin",weiToCoin(wei,places)},{"xmz",units(l.value("xmz").toString(),privatePlaces())},
+            {"price",priceText(wei,l.value("xmz").toString(),places,privatePlaces())},{"expiresAt",l.value("expiresAt").toDouble()}});
     }
     return {{"configured",!m_path.isEmpty()},{"busy",m_busy},{"state",m_state},{"error",m_error},{"command",m_command},
         {"listings",m_listings},{"mine",folders},{"withdrawal",m_withdrawal},{"relays",m_config.value("relays").toArray().toVariantList()},
-        {"chainId",m_config.value("chainId").toDouble()},{"coin",DexChains::coin(qint64(m_config.value("chainId").toDouble()))},{"decimals",DexChains::decimals(qint64(m_config.value("chainId").toDouble()))},{"solAccount",m_solAccount},{"evmAccount",m_evmAccount}};
+        {"chainId",m_config.value("chainId").toDouble()},{"coin",DexChains::coin(qint64(m_config.value("chainId").toDouble()))},{"decimals",DexChains::decimals(qint64(m_config.value("chainId").toDouble()))},{"solAccount",m_solAccount},{"evmAccount",m_evmAccount},
+        // The private side: XMZ (11 places) or Monero (12)
+        {"privateCoin",xmr() ? "XMR" : "XMZ"},{"privateDecimals",privatePlaces()},{"pair",pairName()}};
 }
 
 QString EvmMarketJob::weiToCoin(const QString &valueWei,int decimals) {
     return Digits.match(valueWei).hasMatch() ? units(valueWei,decimals) : QString();
 }
 
-QString EvmMarketJob::priceText(const QString &valueWei,const QString &xmzAtoms,int decimals) {
+QString EvmMarketJob::priceText(const QString &valueWei,const QString &xmzAtoms,int decimals,int privateDecimals) {
     // coin per XMZ = (wei / 1e18) / (atoms / 1e11); for display only
     const double wei=valueWei.toDouble(),atoms=xmzAtoms.toDouble();
     if (!(wei>0) || !(atoms>0)) return {};
     // Plain decimals with six significant digits (never "5e-05"), trailing zeros trimmed
-    const double price=wei/std::pow(10.0,decimals)/(atoms/1e11);
+    const double price=wei/std::pow(10.0,decimals)/(atoms/std::pow(10.0,privateDecimals));
     const int places=qBound(0,5-int(std::floor(std::log10(price))),18);
     QString text=QString::number(price,'f',places);
     if (text.contains('.')) {while (text.endsWith('0')) text.chop(1);if (text.endsWith('.')) text.chop(1);}

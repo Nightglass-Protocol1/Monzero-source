@@ -496,6 +496,70 @@ private slots:
         QCOMPARE(states(again).value("take-waiting"),QString("cancelled|"));
         QCOMPARE(states(again).value("take-refused").section('|',0,0),QString("refused"));
     }
+    // A Monero market: the same offers and trades as an XMZ market, with XMR (12 places) as the
+    // private coin, its own pair name, the Monero witness nodes on every keyed request
+    void xmrMarketPostsAndPricesInMonero() {
+        QTemporaryDir root;QVERIFY(root.isValid());
+        const auto dir=root.path(),trades=dir+"/xmr-97";
+        auto put=[](const QString &path,const QByteArray &data){QFile f(path);return f.open(QIODevice::WriteOnly|QIODevice::Truncate) && f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner|QFileDevice::ExeOwner) && f.write(data)==data.size();};
+        // 0.5 BNB for 1.5 XMR (SAMPLE values)
+        const QJsonObject listing{{"id","0x"+QString(64,'a')},{"pair","BNB/XMR"},{"side","sell-xmz"},{"value","0x6f05b59d3b20000"},{"xmz","1500000000000"},
+            {"maker","0x5138775820628775ce6d90b7fee72c854d18cbf6"},{"expiresAt",4000000000.0},{"chainId",97.0},{"minXmz","500000000000"}};
+        const auto ok=[](QJsonObject o){o.insert("schema","monzero-xmz-evm-helper-response-v1");o.insert("ok",true);return QJsonDocument(o).toJson(QJsonDocument::Compact);};
+        QVERIFY(put(dir+"/resp-listings.json",ok({{"listings",QJsonArray{QJsonObject{{"signed",QJsonObject{{"listing",listing},{"signature","0x00"}}},{"relays",QJsonArray{"r1"}}}}}})));
+        QVERIFY(put(dir+"/resp-post.json",ok({{"posted",1}})));
+        const auto helper=dir+"/helper";
+        QVERIFY(put(helper,QStringLiteral("#!/bin/sh\nreq=$(cat)\nprintf '%s\\n' \"$req\" >> %1/log\n"
+            "cmd=$(printf %s \"$req\" | sed -n 's/.*\"command\":\"\\([A-Za-z]*\\)\".*/\\1/p')\n"
+            "cat %1/resp-$cmd.json\n").arg(dir).toUtf8()));
+        QFile self(helper);QVERIFY(self.open(QIODevice::ReadOnly));
+        const auto digest=QString::fromLatin1(QCryptographicHash::hash(self.readAll(),QCryptographicHash::Sha256).toHex());
+        const QJsonObject wallet{{"url","http://127.0.0.1:1"}};
+        QJsonObject config{{"schema","monzero-private-xmz-evm-market-v1"},{"helper",helper},{"helperDigest",digest},{"tradesDir",trades},
+            {"evmRpc","http://127.0.0.1:18546"},{"chainId",97.0},{"accountIndex",0.0},{"mainWallet",wallet},{"swapWallet",wallet},
+            {"relays",QJsonArray{"http://127.0.0.1:2"}},{"coin","xmr"},{"witnessDaemons",QJsonArray{"https://node.example:38089","http://127.0.0.1:38081"}}};
+        auto write=[&](const QString &name,const QJsonObject &c){
+            const auto path=dir+"/"+name;
+            if (!put(path,QJsonDocument(c).toJson(QJsonDocument::Compact)) || !QFile::setPermissions(path,QFileDevice::ReadOwner|QFileDevice::WriteOwner)) return QString();
+            return path;
+        };
+        {   // Only Monero besides XMZ, and witness nodes over https (plain http only on this computer)
+            auto other=config;other.insert("coin","btc");
+            EvmMarketJob a;QVERIFY(!a.configure(write("bad1.json",other)));
+            auto plain=config;plain.insert("witnessDaemons",QJsonArray{"http://node.example:38089"});
+            EvmMarketJob b;QVERIFY(!b.configure(write("bad2.json",plain)));
+        }
+        EvmMarketJob job;QVERIFY(job.configure(write("market.json",config)));
+        QVERIFY(job.xmr());QCOMPARE(job.privatePlaces(),12);QCOMPARE(job.pairName(),QString("BNB/XMR"));
+        auto s=job.status();
+        QCOMPARE(s.value("privateCoin").toString(),QString("XMR"));QCOMPARE(s.value("coin").toString(),QString("BNB"));QCOMPARE(s.value("pair").toString(),QString("BNB/XMR"));
+        auto idle=[&]{for (int i=0;i<200 && job.status().value("busy").toBool();++i) QTest::qWait(25);};
+        QVERIFY(!job.refreshListings("BNB/XMZ"));   // the XMZ book is the other market's
+        QVERIFY(job.refreshListings("BNB/XMR"));idle();
+        const auto shown=job.status().value("listings").toList();
+        QCOMPARE(shown.size(),1);
+        const auto l=shown.first().toMap();
+        QCOMPARE(l.value("xmz").toString(),QString("1.5"));          // XMR, 12 places
+        QCOMPARE(l.value("minXmz").toString(),QString("0.5"));
+        QCOMPARE(l.value("coin").toString(),QString("0.5"));
+        QCOMPARE(l.value("price").toString(),QString("0.333333"));   // BNB per XMR
+        QByteArray seed(32,'\x11');
+        QVERIFY(job.post(seed,97,"buy-xmz","500000000000000000","1500000000000",QString(),3600));idle();
+        QFile log(dir+"/log");QVERIFY(log.open(QIODevice::ReadOnly));
+        const auto lines=log.readAll().split('\n');
+        const auto listReq=QJsonDocument::fromJson(lines.at(0)).object(),postReq=QJsonDocument::fromJson(lines.at(1)).object();
+        QCOMPARE(listReq.value("pair").toString(),QString("BNB/XMR"));
+        QCOMPARE(postReq.value("offer").toObject().value("coin").toString(),QString("xmr"));
+        QCOMPARE(postReq.value("offer").toObject().value("pair").toString(),QString("BNB/XMR"));
+        QCOMPARE(postReq.value("tick").toObject().value("witnessDaemons").toArray().size(),2);
+        QVERIFY(!postReq.contains("xmrMainnet"));   // test networks: never real XMR
+        QCOMPARE(job.tradeConfig(trades+"/x").value("witnessDaemons").toArray().size(),2);
+        // USDT against XMR on BNB Chain: its own pair name
+        auto usdt=config;usdt.insert("chainId",100000097.0);usdt.insert("tradesDir",dir+"/xmr-usdt");
+        EvmMarketJob u;
+        if (u.configure(write("usdt.json",usdt))) QCOMPARE(u.pairName(),QString("USDT-BSC/XMR"));
+        QCOMPARE(EvmMarketJob::priceText("500000000000000000","1500000000000",18,12),QString("0.333333"));
+    }
     // Direct (coin <-> coin) trades through a stand-in helper: the offers shown in book terms, a
     // take that agrees, the taker's approval of exactly the terms shown, steps until it swapped,
     // then the payout on the chain the coin came in on; our own offer posted and withdrawn.

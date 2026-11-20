@@ -226,6 +226,7 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     m_dexWallets=new DexWalletService(this);
     m_xmrWallets=new DexWalletService(this);
     connect(m_xmrWallets,&DexWalletService::changed,this,&DexEngine::xmrWalletChanged);
+    connect(m_xmrWallets,&DexWalletService::changed,this,&DexEngine::setUpXmrMarkets);
     connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::dexWalletChanged);
     connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::setUpEvmMarkets);
     connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::setUpUtxoMarket);
@@ -860,10 +861,12 @@ bool DexEngine::approveEvmTrade(const QString &commitment) {
     const quint64 xmzAtoms=xmzValue.isString()?xmzValue.toString().toULongLong(&xmzOk)
         :(xmzOk=(xmzValue.isDouble() && xmzValue.toDouble()>=0 && xmzValue.toDouble()<9.007199254740992e15),quint64(xmzValue.toDouble()));
     if (!valueOk || !xmzOk) return refuse(tr("The trade amount could not be read."));
+    // A Monero trade: the coin's caps apply; the XMZ cap does not (XMR atoms are not XMZ)
+    const quint64 capAtoms=offer.value("privateCoin").toString()=="XMR" ? 0 : xmzAtoms;
     const auto ledgerId=evmLedgerId(trade);
     if (ledgerId.isEmpty()) return refuse(tr("The trade identifier could not be read."));
     bindEvmNetwork(network);
-    const auto refusal=m_evmRiskControl->refusal(ledgerId,valueWei,xmzAtoms);
+    const auto refusal=m_evmRiskControl->refusal(ledgerId,valueWei,capAtoms);
     if (!refusal.isEmpty()) return refuse(refusal);
     if (!m_evmRiskControl->recordStart(ledgerId,valueWei)) return refuse(tr("The trade could not be recorded; not started."));
     m_evmStartRefusal.clear();
@@ -880,7 +883,7 @@ bool DexEngine::abandonEvmTrade() {
     if (!m_evmTrade->abandon()) return false;
     if (!dir.isEmpty()) m_dexWallets->releaseTradeService(dir);
     m_evmTicker->stop();m_evmStartRefusal.clear();
-    for (auto *job:m_evmMarkets) job->rescan();
+    for (auto *job:allMarkets()) job->rescan();
     emit evmTradeChanged();emit evmMarketChanged();return true;
 }
 void DexEngine::stepEvmTrade() {
@@ -906,7 +909,7 @@ QByteArray DexEngine::evmSeed() const {
     return seed;
 }
 EvmMarketJob *DexEngine::evmMarketFor(const QString &tradeDir) const {
-    for (auto *job:m_evmMarkets) if (tradeDir.startsWith(job->config().value("tradesDir").toString()+"/")) return job;
+    for (auto *job:allMarkets()) if (tradeDir.startsWith(job->config().value("tradesDir").toString()+"/")) return job;
     return nullptr;
 }
 EvmMarketJob *DexEngine::evmMarketForCoin(const QString &coin) const {
@@ -917,13 +920,14 @@ bool DexEngine::addEvmMarket(const QString &config) {
     auto *job=new EvmMarketJob(this);
     if (!job->configure(config)) {job->deleteLater();return false;}
     const auto chain=int(job->config().value("chainId").toDouble());
-    if (m_evmMarkets.contains(chain)) {job->deleteLater();return false;}
+    auto &markets=job->xmr() ? m_xmrMarkets : m_evmMarkets;
+    if (markets.contains(chain)) {job->deleteLater();return false;}
     connect(job,&EvmMarketJob::changed,this,&DexEngine::evmMarketChanged);
     connect(job,&EvmMarketJob::changed,this,[this,job,known=QString()]() mutable {
         if (job->solAccount()!=known) {known=job->solAccount();emit dexWalletChanged();}
     });
     connect(job,&EvmMarketJob::agreed,this,[this,job](const QString &tradeDir){evmOfferAgreed(job,tradeDir);});
-    m_evmMarkets.insert(chain,job);
+    markets.insert(chain,job);
     if (!m_evmSwapSeedHex.isEmpty()) job->setSwapKeys(m_evmSwapSeedHex,m_evmKeyHex);
     m_marketTicker->start();
     // Start fetching this chain's control document now, so the first offer is not refused for lack of it
@@ -979,8 +983,74 @@ void DexEngine::setUpEvmMarkets() {
         // Direct trades: each chain's own coin (no tokens), on the same nodes
         directChains.append({c.id,config.value("evmRpc").toString()});
     }
+    m_marketChains=directChains;
     setUpDirectMarket(relays,directChains);
+    setUpXmrMarkets();
     resumeEvmTrades();
+}
+void DexEngine::setUpXmrMarkets() {
+    // Both wallets must run: the XMZ one's helper and keys, the Monero one for the private side
+    if (!m_xmrMarkets.isEmpty() || m_marketChains.isEmpty() || m_xmrWallets->coin()!="xmr" || !m_xmrWallets->ready() || !m_dexWallets->ready()) return;
+    const bool mainnet=DexDeployment::mainnetStage();
+    // Independent Monero nodes that must also see the other trader's XMR lock (a main-network
+    // trade needs two; the engine refuses it otherwise). MONZERO_DEX_XMR_WITNESSES: comma-separated.
+    QJsonArray witnesses;
+    for (const auto &w:qEnvironmentVariable("MONZERO_DEX_XMR_WITNESSES").split(',',Qt::SkipEmptyParts)) if (witnesses.size()<8) witnesses.append(w.trimmed());
+    QJsonArray relays;for (const auto &r:defaultRelays()) relays.append(r);
+    const auto root=m_xmrWallets->root();
+    for (const auto &c:m_marketChains) {
+        QJsonObject config{{"schema","monzero-private-xmz-evm-market-v1"},{"helper",m_dexWallets->helper()},{"helperDigest",m_dexWallets->helperSha256()},
+            {"tradesDir",QStringLiteral("%1/evm-trades/xmr-%2").arg(m_dexWallets->root()).arg(c.first)},{"evmRpc",c.second},
+            {"chainId",c.first},{"accountIndex",0},{"mainWallet",m_xmrWallets->mainEndpoint()},{"swapWallet",m_xmrWallets->mainEndpoint()},
+            {"relays",relays},{"coin","xmr"}};
+        if (!witnesses.isEmpty()) config.insert("witnessDaemons",witnesses);
+        if (mainnet) config.insert("xmrMainnet",true);
+        const auto program=qEnvironmentVariable("MONZERO_DEX_SOL_LOCAL_PROGRAM");
+        if (DexChains::helperChain(c.first)==DexChains::SolLocal && DexChains::solanaAddress(program)) config.insert("localSolProgram",program);
+        if (c.first==int(DexChains::SolUsdtLocal)) config.insert("localSolUsdtMint",qEnvironmentVariable("MONZERO_DEX_SOL_LOCAL_USDT_MINT"));
+        const auto path=QStringLiteral("%1/xmr-market-%2.json").arg(root).arg(c.first);
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly|QIODevice::Truncate) || !f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner)) continue;
+        f.write(QJsonDocument(config).toJson(QJsonDocument::Compact));f.close();
+        if (!addEvmMarket(path)) qWarning("The DEX XMR market for chain %d could not start",c.first);
+    }
+    // A trade of these markets may have been running when the app closed
+    m_evmResumed=false;resumeEvmTrades();
+}
+QVariantMap DexEngine::xmrMarketStatus() const {
+    QVariantMap all;
+    for (auto *job:m_xmrMarkets) {auto s=job->status();s.insert("message",m_marketMessage);all.insert(s.value("coin").toString(),s);}
+    return all;
+}
+bool DexEngine::refreshXmrOffers(const QString &coin) {
+    for (auto *job:m_xmrMarkets) if (job->status().value("coin")==coin) return job->refreshListings(job->pairName());
+    return false;
+}
+QString DexEngine::xmrOrderRefusal(int chainId,const QString &coinAmount,const QString &xmrAmount) {
+    const auto wei=atomic(coinAmount,DexChains::decimals(chainId));
+    if (wei.isEmpty() || atomic(xmrAmount,12).isEmpty()) return {};
+    // The coin's own kill switch and caps (the XMZ cap does not apply to XMR)
+    return evmOfferRefusal(chainId,wei,QStringLiteral("0"));
+}
+bool DexEngine::postXmrOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmrAmount,int lifetimeHours,const QString &minXmrAmount,bool renew) {
+    const auto wei=atomic(coinAmount,DexChains::decimals(chainId)),atoms=atomic(xmrAmount,12);
+    if (wei.isEmpty() || atoms.isEmpty() || lifetimeHours<1 || lifetimeHours>31*24) {m_marketMessage=tr("Check the amounts and how long the offer stays open (1 hour to 31 days).");emit evmMarketChanged();return false;}
+    QString minAtoms;
+    if (!minXmrAmount.trimmed().isEmpty()) {
+        minAtoms=atomic(minXmrAmount,12);
+        // The engine's smallest part is 1e11 atoms: 0.1 XMR
+        if (minAtoms.isEmpty() || minAtoms.toULongLong()<100000000000ULL || minAtoms.toULongLong()>atoms.toULongLong()) {
+            m_marketMessage=tr("The smallest part must be at least 0.1 XMR and at most the whole offer.");emit evmMarketChanged();return false;
+        }
+    }
+    const auto refusal=evmOfferRefusal(chainId,wei,QStringLiteral("0"));
+    if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
+    auto *job=m_xmrMarkets.value(chainId);
+    if (!job) return false;
+    QByteArray seed=evmSeed();
+    const bool started=job->post(seed,chainId,side,wei,atoms,minAtoms,qint64(lifetimeHours)*3600,renew);
+    m_marketMessage=started ? QString() : tr("The offer could not be posted now.");
+    emit evmMarketChanged();return started;
 }
 void DexEngine::setUpDirectMarket(const QJsonArray &relays,const QList<QPair<int,QString>> &chains) {
     if (m_direct || !m_dexWallets->ready()) return;
@@ -1276,17 +1346,19 @@ QString DexEngine::evmPartValue(const QVariantMap &l,const QString &atomsText) {
     return QString::number(quint64(part));
 }
 bool DexEngine::takeEvmOffer(const QString &listingId,const QString &xmzAmount) {
-    for (auto *job:m_evmMarkets) for (const auto &v:job->status().value("listings").toList()) {
+    for (auto *job:allMarkets()) for (const auto &v:job->status().value("listings").toList()) {
         const auto l=v.toMap();
         if (l.value("id")!=listingId) continue;
+        // On a Monero market the amount is XMR (12 places); the XMZ cap does not apply there
+        const QString unit=job->xmr() ? QStringLiteral("XMR") : QStringLiteral("XMZ");
         QString atoms,wei=l.value("valueWei").toString();
         if (!xmzAmount.trimmed().isEmpty()) {
-            atoms=atomic(xmzAmount,11);
+            atoms=atomic(xmzAmount,job->privatePlaces());
             const auto part=atoms.isEmpty() ? QString() : evmPartValue(l,atoms);
             if (part.isEmpty()) {
                 const auto min=l.value("minXmz").toString();
                 m_marketMessage=min.isEmpty() ? tr("This offer can only be taken whole.")
-                    : tr("Take at least %1 XMZ and at most %2 XMZ, leaving none or at least %1 XMZ.").arg(min,l.value("xmz").toString());
+                    : tr("Take at least %1 %3 and at most %2 %3, leaving none or at least %1 %3.").arg(min,l.value("xmz").toString(),unit);
                 emit evmMarketChanged();return false;
             }
             if (atoms==l.value("xmzAtoms").toString()) atoms.clear(); else wei=part;
@@ -1294,8 +1366,8 @@ bool DexEngine::takeEvmOffer(const QString &listingId,const QString &xmzAmount) 
         // A USDT offer is checked under the USDT market's limits, not the chain coin's
         const qint64 chain=qint64(l.value("chainId").toDouble());
         const auto pairName=l.value("pair").toString();
-        const qint64 market=pairName=="USDT/XMZ" || pairName=="USDT-BSC/XMZ" ? DexChains::marketOf(chain,QStringLiteral("usdt")) : chain;
-        const auto refusal=evmOfferRefusal(market,wei,atoms.isEmpty() ? l.value("xmzAtoms").toString() : atoms);
+        const qint64 market=pairName.startsWith("USDT/") || pairName.startsWith("USDT-BSC/") ? DexChains::marketOf(chain,QStringLiteral("usdt")) : chain;
+        const auto refusal=evmOfferRefusal(market,wei,job->xmr() ? QStringLiteral("0") : atoms.isEmpty() ? l.value("xmzAtoms").toString() : atoms);
         if (!refusal.isEmpty()) {m_marketMessage=refusal;emit evmMarketChanged();return false;}
         QByteArray seed=evmSeed();
         const bool started=job->take(seed,listingId,atoms);
@@ -1407,7 +1479,7 @@ void DexEngine::applyUnlockedTradeKeys(QByteArray seed,QByteArray key,const QStr
     m_keysBusy=false;
     if (seed.isEmpty()||key.isEmpty()) {m_keysMessage=tr("The trading keys could not be unlocked; check the password.");emit dexWalletChanged();return;}
     m_evmTrade->setSwapKeys(seed,key);
-    for (auto *job:m_evmMarkets) job->setSwapKeys(seed,key);
+    for (auto *job:allMarkets()) job->setSwapKeys(seed,key);
     if (m_direct) m_direct->setSwapKeys(seed,key);
     sodium_memzero(m_evmSwapSeedHex.data(),m_evmSwapSeedHex.size());sodium_memzero(m_evmKeyHex.data(),m_evmKeyHex.size());
     m_evmSwapSeedHex=seed;m_evmKeyHex=key;
@@ -1608,7 +1680,7 @@ bool DexEngine::takeBtcOffer(const QString &listingId) {
 bool DexEngine::cancelBtcOffer(const QString &folder) {return m_btcMarket->cancel(folder);}
 void DexEngine::stepEvmMarket() {
     if (m_evmSeedFile.isEmpty() && !dexKeysReady()) return;
-    for (auto *job:m_evmMarkets) {
+    for (auto *job:allMarkets()) {
         if (job->status().value("busy").toBool()) continue;
         QByteArray seed=evmSeed();
         // A Solana market first learns this wallet's account there (once)
@@ -1626,7 +1698,7 @@ void DexEngine::resumeEvmTrades() {
     m_evmResumed=true;
     if (m_evmTrade->status().value("configured").toBool()) return;
     QList<QPair<qint64,QPair<QPointer<EvmMarketJob>,QString>>> found;
-    for (auto *job:m_evmMarkets) for (const auto &dir:job->agreedFolders()) {
+    for (auto *job:allMarkets()) for (const auto &dir:job->agreedFolders()) {
         const QFileInfo journal(dir+"/journal.json");
         found.append({(journal.exists() ? journal : QFileInfo(dir)).lastModified().toSecsSinceEpoch(),{job,dir}});
     }
@@ -1653,6 +1725,7 @@ bool DexEngine::releaseEvmTrade() {
         QFile mark(dir+"/finished");
         if (!mark.exists() && mark.open(QIODevice::WriteOnly)) {mark.write("finished\n");mark.close();}
         m_dexWallets->releaseTradeService(dir);
+        m_xmrWallets->releaseTradeService(dir);
     }
     return true;
 }
@@ -1701,14 +1774,16 @@ void DexEngine::evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir) {
             if (m_evmResuming) QTimer::singleShot(0,this,&DexEngine::nextEvmResume);
         }
     };
-    if (!m_dexWallets->ready()) {open({});return;}
+    // A Monero trade's shared wallet runs in Monero's own wallet RPC, on the Monero node
+    auto *wallets=job->xmr() ? m_xmrWallets : m_dexWallets;
+    if (!wallets->ready()) {open({});return;}
     // The trade id is the listing id (from the folder's listing or take record)
     QString trade;
     for (const auto &name:{"/listing.json","/take.json"}) {
         QFile f(tradeDir+name);
         if (f.open(QIODevice::ReadOnly)) {trade=QJsonDocument::fromJson(f.readAll()).object().value("listing").toObject().value("listing").toObject().value("id").toString();break;}
     }
-    m_dexWallets->tradeService(tradeDir,trade,[this,open,tradeDir](const QJsonObject &endpoint){
+    wallets->tradeService(tradeDir,trade,[this,open,tradeDir](const QJsonObject &endpoint){
         if (endpoint.isEmpty()) {m_marketMessage=tr("The trade's swap wallet could not start: %1").arg(tradeDir);emit evmMarketChanged();return;}
         open(endpoint);
     });

@@ -69,6 +69,7 @@ class DexEngine : public QObject {
     Q_PROPERTY(QVariantMap bchNativeObservationStatus READ bchNativeObservationStatus NOTIFY bchNativeObservationChanged)
     Q_PROPERTY(QVariantMap evmTradeStatus READ evmTradeStatus NOTIFY evmTradeChanged)
     Q_PROPERTY(QVariantMap evmMarketStatus READ evmMarketStatus NOTIFY evmMarketChanged)
+    Q_PROPERTY(QVariantMap xmrMarketStatus READ xmrMarketStatus NOTIFY evmMarketChanged)
     Q_PROPERTY(QVariantMap directMarketStatus READ directMarketStatus NOTIFY directMarketChanged)
     Q_PROPERTY(QVariantMap btcMarketStatus READ btcMarketStatus NOTIFY btcMarketChanged)
     Q_PROPERTY(QVariantMap dexWalletStatus READ dexWalletStatus NOTIFY dexWalletChanged)
@@ -285,6 +286,16 @@ public:
     Q_INVOKABLE bool cancelEvmOffer(const QString &folder);
     // Coin paid into the trade account that no trade or open offer needs goes back to the user's wallet
     Q_INVOKABLE bool returnEvmFunds(int chainId,const QString &address);
+    // Monero (XMR) against ETH, BNB, SOL and USDT: the same offers and trades as the XMZ markets,
+    // with the private side on the app's Monero wallets. By coin ("ETH", "USDT-BSC"), like
+    // evmMarketStatus. Real XMR only where the Monero wallet runs on mainnet (MONZERO_DEX_XMR_MAINNET=1).
+    QVariantMap xmrMarketStatus() const;
+    Q_INVOKABLE bool refreshXmrOffers(const QString &coin);
+    // side: "sell-xmz" (we sell XMR for the coin) or "buy-xmz", as the helper names both sides
+    Q_INVOKABLE bool postXmrOffer(int chainId,const QString &side,const QString &coinAmount,const QString &xmrAmount,int lifetimeHours,const QString &minXmrAmount=QString(),bool renew=false);
+    Q_INVOKABLE QString xmrOrderRefusal(int chainId,const QString &coinAmount,const QString &xmrAmount);
+    // Writes and starts the XMR markets once both the XMZ markets and the Monero wallet run
+    void setUpXmrMarkets();
     // Direct (coin <-> coin) trades: ETH, BNB and SOL against each other, no XMZ leg (see
     // DirectMarketJob). They use the same trade account per chain as the XMZ markets. On the main
     // networks they stay off until direct pairs are opened (MONZERO_DEX_DIRECT_MAINNET=1 tests).
@@ -616,6 +627,9 @@ private:
     QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();
     QHash<int,EvmMarketJob*> m_evmMarkets;   // by chain id
+    QHash<int,EvmMarketJob*> m_xmrMarkets;   // Monero markets, by chain id (market id for USDT)
+    QList<QPair<int,QString>> m_marketChains; // this stage's markets and their nodes (set with the XMZ markets)
+    QList<EvmMarketJob*> allMarkets() const {return m_evmMarkets.values()+m_xmrMarkets.values();}
     DirectMarketJob *m_direct=nullptr;
     QString m_directMessage;
     QSet<QString> m_directRecorded;   // direct trades already counted in the trade-limit ledger
