@@ -20,6 +20,18 @@ Item {
     readonly property bool connected: (link.account || "") !== "" || (link.solAccount || "") !== ""
     readonly property bool approvalWanted: connected && trade.awaitingApproval === true && (trade.commitment || "") !== ""
     property string dismissedTrade: ""
+    // A direct (coin <-> coin) take of ours that its maker answered: approved here, never by the page
+    readonly property var direct: dex ? (dex.directMarketStatus || ({})) : ({})
+    readonly property var directPending: {
+        var mine = direct.mine || []
+        for (var i = 0; i < mine.length; ++i) {
+            var f = mine[i], t = f.trade || {}
+            if (f.kind === "take" && f.state === "agreed" && t.approved !== true && (t.commitment || "") !== "" && dismissedDirect.indexOf(t.commitment) < 0) return f
+        }
+        return null
+    }
+    property var dismissedDirect: []
+    readonly property bool directWanted: connected && directPending !== null
     readonly property var wallet: dex ? (dex.dexWalletStatus || ({})) : ({})
     readonly property bool keysWanted: web ? web.keysWanted === true && wallet.keysReady !== true : false
     function mainAddress() {
@@ -72,6 +84,49 @@ Item {
 
     onPairingChanged: if ((pairing.id || "") !== "") pairDialog.open(); else pairDialog.close()
     onApprovalWantedChanged: if (approvalWanted && dismissedTrade !== trade.commitment) approveDialog.open(); else if (!approvalWanted) approveDialog.close()
+    onDirectWantedChanged: if (directWanted) directDialog.open(); else directDialog.close()
+
+    Popup {
+        id: directDialog
+        objectName: "dexWebDirectDialog"
+        modal: true; focus: true; closePolicy: Popup.NoAutoClose
+        x: Math.round((prompt.width - width) / 2); y: Math.round((prompt.height - height) / 2)
+        width: Math.min(560, prompt.width - 40); padding: 24
+        background: Rectangle { color: "#202b36"; radius: 10; border.color: "#526b80" }
+        readonly property var f: prompt.directPending || ({})
+        readonly property var t: f.trade || ({})
+        readonly property var gives: t.gives || ({})
+        readonly property var gets: t.gets || ({})
+        readonly property string error: (prompt.direct.message || "")
+        contentItem: ColumnLayout {
+            spacing: 14
+            M.TextPlain { text: qsTr("Approve this trade?"); font.bold: true; font.pixelSize: 20; color: "#f0f5fa" }
+            M.TextPlain {
+                objectName: "dexWebDirectTerms"
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 17; color: "#f0f5fa"
+                text: qsTr("You pay %1 %2\nYou receive %3 %4")
+                    .arg(prompt.units(directDialog.gives.value, prompt.places(directDialog.gives.chainId))).arg(prompt.coin(directDialog.gives.chainId))
+                    .arg(prompt.units(directDialog.gets.value, prompt.places(directDialog.gets.chainId))).arg(prompt.coin(directDialog.gets.chainId))
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; color: "#a9b8c6"
+                text: qsTr("You pay on: %1\nYou receive on: %2\nThese amounts are from the signed offer this wallet holds, not from the web page. Once approved the swap runs by itself; keep the wallet open until it is finished. If the other side does not lock its coin, yours comes back after its time limit (about 9 hours).\nWhat you receive goes to %3")
+                    .arg(prompt.network(directDialog.gives.chainId)).arg(prompt.network(directDialog.gets.chainId))
+                    .arg(prompt.ownAccount(directDialog.gets.chainId) || qsTr("(no wallet connected for this coin yet: it stays in the trade account)"))
+            }
+            M.TextPlain {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; color: M.Style.errorColor
+                visible: text !== ""; text: directDialog.error
+            }
+            RowLayout {
+                Layout.alignment: Qt.AlignRight; spacing: 12
+                M.StandardButton { objectName: "dexWebDirectLater"; text: qsTr("Not now"); primary: false
+                                   onClicked: { prompt.dismissedDirect = prompt.dismissedDirect.concat([directDialog.t.commitment]); directDialog.close() } }
+                M.StandardButton { objectName: "dexWebDirectApprove"; text: qsTr("Approve")
+                                   onClicked: if (prompt.dex.approveDirectTrade(directDialog.f.folder, directDialog.t.commitment)) directDialog.close() }
+            }
+        }
+    }
 
     Popup {
         id: pairDialog

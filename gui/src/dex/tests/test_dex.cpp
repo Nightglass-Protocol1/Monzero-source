@@ -65,6 +65,36 @@
 #include <QUuid>
 #include <functional>
 
+#include "../DexWebBridge.h"
+#include <QTcpSocket>
+// A stand-in engine for the web bridge: the properties the bridge reads, the calls it may make
+class FakeBridgeEngine : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(QVariantMap dexWalletStatus READ wallet NOTIFY dexWalletChanged)
+    Q_PROPERTY(QVariantMap evmTradeStatus READ trade NOTIFY evmTradeChanged)
+    Q_PROPERTY(QVariantMap evmMarketStatus READ markets NOTIFY evmMarketChanged)
+    Q_PROPERTY(QVariantMap directMarketStatus READ direct NOTIFY directMarketChanged)
+public:
+    QVariantMap directState{{"configured",true},{"keys",true},{"mine",QVariantList{}},{"listings",QVariantList{}},{"pairs",QStringList{"BNB/ETH"}}};
+    QStringList calls;
+    QVariantMap wallet() const {return {{"state","ready"},{"keysReady",true}};}
+    QVariantMap trade() const {return {};}
+    QVariantMap markets() const {return {};}
+    QVariantMap direct() const {return directState;}
+    void setDirect(const QVariantMap &d) {directState=d;emit directMarketChanged();}
+    Q_INVOKABLE bool refreshDirectOffers() {calls<<"refresh";return true;}
+    Q_INVOKABLE bool postDirectOffer(int g,const QString &ga,int w,const QString &wa,int hours) {calls<<QString("post %1 %2 %3 %4 %5").arg(g).arg(ga).arg(w).arg(wa).arg(hours);return true;}
+    Q_INVOKABLE bool takeDirectOffer(const QString &id) {calls<<"take "+id;return true;}
+    Q_INVOKABLE bool cancelDirectOffer(const QString &folder) {calls<<"cancel "+folder;return true;}
+    Q_INVOKABLE bool payoutDirectTrade(const QString &folder,const QString &to) {calls<<"payout "+folder+" "+to;return true;}
+    Q_INVOKABLE bool approveDirectTrade(const QString &folder,const QString &c) {calls<<"approve "+folder+" "+c;return true;}
+signals:
+    void dexWalletChanged();
+    void evmTradeChanged();
+    void evmMarketChanged();
+    void directMarketChanged();
+};
+
 class DexEngineTest : public QObject
 {
     Q_OBJECT
@@ -583,6 +613,63 @@ private slots:
         QStringList states;for (const auto &v:again.status().value("mine").toList()) states<<v.toMap().value("kind").toString()+":"+v.toMap().value("state").toString();
         states.sort();
         QCOMPARE(states,(QStringList{"offer:cancelled","take:agreed"}));   // its next step reads it as finished
+    }
+    // The web page's direct (coin <-> coin) asks through the loopback bridge: refused before the
+    // page is connected; once connected, list/post/take/cancel reach the engine as asked, approval
+    // is not something the page can ask for, and a finished trade is paid to the accepted account
+    void webBridgeDirectRoutes() {
+        QTemporaryDir root;QVERIFY(root.isValid());
+        FakeBridgeEngine engine;
+        DexWebBridge bridge(&engine,{"https://monzero.org"},false);
+        QVERIFY(bridge.listen(root.filePath("bridge.ini")));
+        const int port=bridge.port();
+        QVERIFY(port>=DexWebBridge::FirstPort);
+        auto http=[&](const QByteArray &method,const QByteArray &path,const QJsonObject &body,const QByteArray &token){
+            QTcpSocket socket;socket.connectToHost(QHostAddress::LocalHost,quint16(port));
+            if (!socket.waitForConnected(3000)) return QPair<int,QJsonObject>{0,{}};
+            const auto data=body.isEmpty() ? QByteArray() : QJsonDocument(body).toJson(QJsonDocument::Compact);
+            QByteArray req=method+" "+path+" HTTP/1.1\r\nHost: 127.0.0.1:"+QByteArray::number(port)+"\r\nOrigin: https://monzero.org\r\n";
+            if (!token.isEmpty()) req+="Authorization: Bearer "+token+"\r\n";
+            req+="Content-Type: application/json\r\nContent-Length: "+QByteArray::number(data.size())+"\r\n\r\n"+data;
+            socket.write(req);
+            QByteArray reply;
+            for (int i=0;i<100 && socket.state()!=QAbstractSocket::UnconnectedState;++i) {QTest::qWait(20);reply+=socket.readAll();}
+            reply+=socket.readAll();
+            const int status=reply.mid(9,3).toInt();
+            return QPair<int,QJsonObject>{status,QJsonDocument::fromJson(reply.mid(reply.indexOf("\r\n\r\n")+4)).object()};
+        };
+        QCOMPARE(http("POST","/v1/direct/take",{{"id","0x"+QString(64,'a')}},{}).first,401);
+        QVERIFY(engine.calls.isEmpty());
+        // Connect: MetaMask and a Solana wallet, accepted in the wallet
+        const auto pair=http("POST","/v1/pair",{{"account","0xaD13C3F11Dd4FeE608e6764ac3e48b03952E630b"},{"solAccount","7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"}},{});
+        QCOMPARE(pair.first,200);
+        QVERIFY(bridge.acceptPairing(pair.second.value("id").toString()));
+        const auto token=http("GET","/v1/pair?id="+pair.second.value("id").toString().toLatin1(),{},{}).second.value("token").toString().toLatin1();
+        QVERIFY(!token.isEmpty());
+        // The status carries the wallet's own view of the direct market
+        const auto status=http("GET","/v1/status",{},token).second;
+        QVERIFY(status.value("features").toArray().contains("direct"));
+        QCOMPARE(status.value("direct").toObject().value("pairs").toArray().first().toString(),QString("BNB/ETH"));
+        QCOMPARE(http("POST","/v1/direct/refresh",{},token).second.value("ok").toBool(),true);
+        QCOMPARE(http("POST","/v1/direct/offer",{{"givesChainId",97},{"gives","0.5"},{"wantsChainId",11155111},{"wants","0.01"},{"hours",6}},token).second.value("ok").toBool(),true);
+        QCOMPARE(http("POST","/v1/direct/take",{{"id","not-an-id"}},token).first,400);
+        QCOMPARE(http("POST","/v1/direct/take",{{"id","0x"+QString(64,'a')}},token).second.value("ok").toBool(),true);
+        QCOMPARE(http("POST","/v1/direct/cancel",{{"folder","/t/offer-1"}},token).second.value("ok").toBool(),true);
+        // Approval is the wallet's alone; there is no such ask
+        QCOMPARE(http("POST","/v1/direct/approve",{{"folder","/t/take-1"},{"commitment","0x"+QString(64,'c')}},token).first,404);
+        QCOMPARE(engine.calls,(QStringList{"refresh","post 97 0.5 11155111 0.01 6","take 0x"+QString(64,'a'),"cancel /t/offer-1"}));
+        // A finished swap pays what came in (SOL) to the Solana wallet accepted above; once
+        engine.calls.clear();
+        QSignalSpy attention(&bridge,&DexWebBridge::attention);
+        auto finished=engine.directState;
+        finished.insert("mine",QVariantList{
+            QVariantMap{{"folder","/t/take-1"},{"kind","take"},{"state","agreed"},{"trade",QVariantMap{{"approved",false},{"commitment","0x"+QString(64,'c')}}}},
+            QVariantMap{{"folder","/t/take-2"},{"kind","take"},{"state","done"},{"wants",QVariantMap{{"chainId",501000102.0},{"coin","SOL"}}},
+                        {"gives",QVariantMap{{"chainId",11155111.0},{"coin","ETH"}}},{"trade",QVariantMap{{"stage","Done(Swapped)"},{"done",true}}}}});
+        engine.setDirect(finished);
+        engine.setDirect(finished);
+        QCOMPARE(engine.calls,(QStringList{"payout /t/take-2 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"}));
+        QCOMPARE(attention.count(),1);   // the take waiting for approval, announced once
     }
     void directMarketAmounts() {
         QCOMPARE(DirectMarketJob::pairOf(501000101,1),QString("ETH/SOL"));

@@ -2,6 +2,7 @@
 #define MONZERO_DEX_WEB_BRIDGE_H
 #include <QObject>
 #include <QPointer>
+#include <QHash>
 #include <QSet>
 #include <QStringList>
 #include <QVariantMap>
@@ -20,6 +21,7 @@ class QTcpSocket;
 // shows the site, the MetaMask account and a code that the page shows too):
 //   read    the trading wallet's balance, the trade account, this app's offers and trade state
 //   ask     to post, take or cancel an offer
+//   ask     the same for direct (coin <-> coin) offers: list, post, take, cancel
 // What it can never do: approve a trade, change where the proceeds go, or read a key. A trade
 // starts only when the user approves the terms the wallet itself shows; the proceeds go to the
 // account accepted at connection time. A page that lies about a price changes nothing.
@@ -51,6 +53,8 @@ signals:
     void xmzReturnRequested();
 private slots:
     void watchTrade();
+    // Direct (coin <-> coin) trades: announce one waiting for approval, pay out finished ones
+    void watchDirect();
 private:
     struct Request {QByteArray method,path,query,body;QByteArray origin,host,token;};
     void serve(QTcpSocket *socket);
@@ -74,6 +78,8 @@ private:
     QString m_origin,m_account,m_solAccount;
     QString payoutAccount(qint64 chainId) const;
     QString m_paidTrade,m_announcedTrade;
+    QSet<QString> m_announcedDirect;
+    QHash<QString,qint64> m_directPayoutTried;   // folder -> when its payout was last asked for
     bool m_keysWanted=false;
     qint64 m_lastAsk=0;
 };

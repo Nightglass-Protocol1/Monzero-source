@@ -64,6 +64,8 @@ bool DexWebBridge::listen(const QString &settingsFile) {
     connect(m_server,&QTcpServer::newConnection,this,[this]{while (auto *s=m_server->nextPendingConnection()) serve(s);});
     connect(m_engine,SIGNAL(evmTradeChanged()),this,SLOT(watchTrade()));
     connect(m_engine,SIGNAL(evmMarketChanged()),this,SLOT(watchTrade()));
+    // An engine without direct trades has no such signal: then nothing is connected
+    if (m_engine->metaObject()->indexOfSignal("directMarketChanged()")>=0) connect(m_engine,SIGNAL(directMarketChanged()),this,SLOT(watchDirect()));
     emit changed();
     return true;
 }
@@ -129,10 +131,46 @@ QVariantMap DexWebBridge::statusFor() const {
         marketOut.insert(it.key(),pick(it.value().toMap(),{"coin","chainId","decimals","configured","busy","state","mine","message","error","withdrawal"}));
     auto tradeOut=pick(trade,{"configured","busy","state","tradeId","commitment","awaitingApproval","awaitingFunding","startRefusal","error","payout","account","solAccount"});
     tradeOut.insert("snapshot",pick(trade.value("snapshot").toMap(),{"stage","role","done","offer","evmTxs","xmzSweeps","approved","progress","deadlines"}));
-    return {{"wallet",pick(wallet,{"state","balance","unlocked","address","keysReady","keysExist","keysBusy","tradeAccount","solTradeAccount","error"})},
+    QVariantMap out{{"wallet",pick(wallet,{"state","balance","unlocked","address","keysReady","keysExist","keysBusy","tradeAccount","solTradeAccount","error"})},
         {"markets",marketOut},{"trade",tradeOut},{"account",m_account},{"solAccount",m_solAccount},
         // What this wallet can do beyond the first page protocol: the page offers only these
         {"features",QStringList{"partial","long-offers","renew","usdt-v2"}}};
+    // Direct trades, as the wallet checked them (the page shows these offers, not its own reading)
+    const auto direct=m_engine->property("directMarketStatus").toMap();
+    if (direct.value("configured").toBool()) {
+        out.insert("direct",pick(direct,{"configured","keys","busy","state","error","command","message","listings","mine","pairs","chains","payout"}));
+        auto features=out.value("features").toStringList();features<<"direct";out.insert("features",features);
+    }
+    return out;
+}
+
+void DexWebBridge::watchDirect() {
+    if (!m_engine || m_tokenHash.isEmpty()) return;
+    const auto direct=m_engine->property("directMarketStatus").toMap();
+    if (!direct.value("configured").toBool()) return;
+    const auto now=QDateTime::currentSecsSinceEpoch();
+    for (const auto &v:direct.value("mine").toList()) {
+        const auto f=v.toMap(),trade=f.value("trade").toMap();
+        const auto folder=f.value("folder").toString();
+        // A take of ours that the maker answered: the user approves its terms in the wallet
+        if (f.value("kind")=="take" && f.value("state")=="agreed" && !trade.value("approved").toBool() && !trade.value("commitment").toString().isEmpty()
+            && !m_announcedDirect.contains(folder)) {
+            m_announcedDirect.insert(folder);
+            emit attention(tr("A trade is waiting for your approval"),tr("Check the amounts in your Monzero wallet and approve the trade there."));
+        }
+        // Finished: what it brought in goes to the account the user accepted for this page, on
+        // the chain it came in on (asked again after a while if a payout did not go through)
+        const auto stage=trade.value("stage").toString();
+        if (f.value("state")!="done" || (stage!="Done(Swapped)" && stage!="Done(Refunded)")) continue;
+        const auto payout=trade.value("payout").toMap();
+        if (!payout.value("tx").toString().isEmpty() || !payout.value("note").toString().isEmpty()) continue;
+        if (now-m_directPayoutTried.value(folder,0)<300) continue;
+        const auto in=(stage=="Done(Swapped)" ? f.value("wants") : f.value("gives")).toMap();
+        const auto to=payoutAccount(qint64(in.value("chainId").toDouble()));
+        if (to.isEmpty()) continue;
+        m_directPayoutTried.insert(folder,now);
+        call("payoutDirectTrade",{folder,to});
+    }
 }
 
 void DexWebBridge::watchTrade() {
@@ -222,6 +260,24 @@ QByteArray DexWebBridge::respond(const Request &r,int *status) {
         if (!QRegularExpression("\\A0x[0-9a-fA-F]{64}\\z").match(id).hasMatch()) return fail(400,"id");
         const bool ok=call("takeEvmOffer",{id,body.value("xmz").toString()});
         return json({{"ok",ok},{"message",ok ? QString() : message("ETH")}});   // the engine's message is one for all coins
+    }
+    // Direct (coin <-> coin) offers: the same asks; approval and payouts stay with the wallet
+    if (r.path=="/v1/direct/refresh") return json({{"ok",call("refreshDirectOffers",{})}});
+    if (r.path.startsWith("/v1/direct/")) {
+        const auto directMessage=[this]{return m_engine->property("directMarketStatus").toMap().value("message").toString();};
+        if (r.path=="/v1/direct/offer") {
+            const bool ok=call("postDirectOffer",{body.value("givesChainId").toInt(),body.value("gives").toString(),body.value("wantsChainId").toInt(),
+                                                   body.value("wants").toString(),body.value("hours").toInt(24)});
+            return json({{"ok",ok},{"message",directMessage()}});
+        }
+        if (r.path=="/v1/direct/take") {
+            const auto id=body.value("id").toString();
+            if (!QRegularExpression("\\A0x[0-9a-fA-F]{64}\\z").match(id).hasMatch()) return fail(400,"id");
+            const bool ok=call("takeDirectOffer",{id});
+            return json({{"ok",ok},{"message",ok ? QString() : directMessage()}});
+        }
+        if (r.path=="/v1/direct/cancel") return json({{"ok",call("cancelDirectOffer",{body.value("folder").toString()})}});
+        return fail(404,"unknown");
     }
     if (r.path=="/v1/cancel") return json({{"ok",call("cancelEvmOffer",{body.value("folder").toString()})}});
     if (r.path=="/v1/renew") return json({{"ok",call("setEvmOfferRenew",{body.value("folder").toString(),body.value("on").toBool()})}});

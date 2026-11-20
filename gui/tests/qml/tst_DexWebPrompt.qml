@@ -40,6 +40,9 @@ TestCase {
         function approveEvmTrade(commitment) { approved = commitment; return true }
         property int abandoned: 0
         function abandonEvmTrade() { abandoned++; evmTradeStatus = ({}); return true }
+        property var directMarketStatus: ({ configured: true, mine: [] })
+        property var directApproved: []
+        function approveDirectTrade(folder, commitment) { directApproved = [folder, commitment]; return true }
     }
     Components.DexWebPrompt { id: prompt; dex: test.dex; web: test.web }
 
@@ -185,5 +188,36 @@ TestCase {
         compare(prompt.accountsText(prompt.pairing), "ETH / BNB: 0xaD13C3F11Dd4FeE608e6764ac3e48b03952E630b\nSOL: 9idXkjjEeyu6nLrYSnCcX6PjmRemKQvuz7VwwwYMtihh")
         mouseClick(inside(pair.contentItem, "dexWebPairRefuse"))
         tryVerify(function () { return !pair.opened })
+    }
+    function test_9_a_direct_trade_is_approved_here_from_the_wallets_terms() {
+        var dialog = popup("dexWebDirectDialog")
+        web.connection = { origin: "https://monzero.org", account: "0xaD13C3F11Dd4FeE608e6764ac3e48b03952E630b", solAccount: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU" }
+        verify(!dialog.opened)
+        // The amounts the page might show are ignored: the terms are the wallet's own (SAMPLE values)
+        dex.directMarketStatus = { configured: true, mine: [
+            { folder: "/t/offer-1", kind: "offer", state: "agreed", trade: { approved: false, commitment: "0x111" } },
+            { folder: "/t/take-1", kind: "take", state: "agreed", gives: { amount: "999", coin: "ETH" },
+              trade: { approved: false, commitment: "0x222", gives: { chainId: 11155111, value: "20000000000000000" }, gets: { chainId: 501000102, value: "1500000000" } } } ] }
+        tryVerify(function () { return dialog.opened })
+        var terms = inside(dialog.contentItem, "dexWebDirectTerms").text
+        verify(terms.indexOf("You pay 0.02 ETH") === 0, terms)
+        verify(terms.indexOf("You receive 1.5 SOL") > 0, terms)
+        mouseClick(inside(dialog.contentItem, "dexWebDirectApprove"))
+        compare(JSON.stringify(dex.directApproved), JSON.stringify(["/t/take-1", "0x222"]))
+        dex.directMarketStatus = { configured: true, mine: [] }
+        tryVerify(function () { return !dialog.opened })
+        // "Not now" approves nothing and does not ask again for the same terms
+        dex.directApproved = []
+        dex.directMarketStatus = { configured: true, mine: [{ folder: "/t/take-2", kind: "take", state: "agreed",
+            trade: { approved: false, commitment: "0x333", gives: { chainId: 97, value: "1" }, gets: { chainId: 11155111, value: "1" } } }] }
+        tryVerify(function () { return dialog.opened })
+        mouseClick(inside(dialog.contentItem, "dexWebDirectLater"))
+        tryVerify(function () { return !dialog.opened })
+        compare(dex.directApproved.length, 0)
+        dex.directMarketStatus = { configured: true, mine: [{ folder: "/t/take-2", kind: "take", state: "agreed",
+            trade: { approved: false, commitment: "0x333", gives: { chainId: 97, value: "1" }, gets: { chainId: 11155111, value: "1" } } }] }
+        wait(100)
+        verify(!dialog.opened)
+        dex.directMarketStatus = { configured: true, mine: [] }
     }
 }
