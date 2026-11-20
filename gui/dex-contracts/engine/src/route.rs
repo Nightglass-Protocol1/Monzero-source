@@ -61,8 +61,12 @@ pub const SALE_WINDOW_SECS: u64 = 24 * 3600;
 
 /// XMR is sold only to an account that has just sold XMZ (the owner's rule): an offer that
 /// sells XMR asks its taker for that sale. Local test chains have no relay record to ask.
-pub fn needs_xmz_sale(listing: &crate::listing::Listing) -> bool {
-    listing.side == Side::SellXmz && listing.xmz_network.coin() == PrivateCoin::Xmr && Chain::from_id(listing.chain_id).is_some_and(|c| c != Chain::Local)
+///
+/// 2026-11-20 the owner opened direct XMR pairs (XMR/ETH, XMR/BNB, XMR/SOL, XMR/USDT): XMR is
+/// bought with any of those coins, so no offer asks for an XMZ sale any more. The check stays
+/// (an app may still send its sale; old makers asked for it) but nothing requires it.
+pub fn needs_xmz_sale(_listing: &crate::listing::Listing) -> bool {
+    false
 }
 
 /// Does this recorded swap pay for taking `listing`: an XMZ sale on the same chain, recent, and
@@ -132,7 +136,7 @@ mod tests {
         use crate::relay_client::Print;
         use XmzNetwork::{Mainnet, XmrMainnet};
         let xmr = offer(5, Side::SellXmz, XmrMainnet, 900, 30).listing;
-        assert!(needs_xmz_sale(&xmr));
+        assert!(!needs_xmz_sale(&xmr), "direct XMR pairs (2026-11-20): no XMZ sale is asked for");
         assert!(!needs_xmz_sale(&offer(1, Side::SellXmz, Mainnet, 900, 30).listing), "XMZ offers ask for nothing");
         assert!(!needs_xmz_sale(&offer(7, Side::BuyXmz, XmrMainnet, 900, 30).listing), "selling XMR to a maker ends in XMZ by the route, not by proof");
         let sale = |pair: &str, chain_id, value: u64, at| Print { pair: pair.into(), chain_id, tx: String::new(), at, value: U256::from(value) };

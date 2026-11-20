@@ -247,24 +247,31 @@ fn bep20_usdt_is_its_own_pair_on_bnb_smart_chain_only() {
 }
 
 #[test]
-fn monero_pairs_trade_only_the_chains_own_coin() {
-    // "BNB/XMR" pays in BNB itself; no token is quoted in XMR (USDT/XMR is not a market)
+fn monero_pairs_trade_the_chains_coin_and_its_usdt() {
+    // "BNB/XMR" pays in BNB itself; "USDT-BSC/XMR" and Solana's "USDT/XMR" in USDT (owner 2026-11-20)
     assert_eq!(Chain::BscMainnet.asset_of("BNB/XMR"), Some(Address::ZERO));
     assert_eq!(Chain::SolMainnet.asset_of("SOL/XMR"), Some(Address::ZERO));
     assert_eq!(Chain::BscMainnet.asset_of("ETH/XMR"), None);
-    assert_eq!(Chain::BscMainnet.asset_of("USDT-BSC/XMR"), None);
-    assert_eq!(Chain::SolMainnet.asset_of("USDT/XMR"), None);
-
     let token = crate::chain::usdt_token(Chain::BscMainnet).expect("BEP-20 USDT pinned");
+    assert_eq!(Chain::BscMainnet.asset_of("USDT-BSC/XMR"), Some(token));
+    assert_eq!(Chain::BscMainnet.asset_of("USDT/XMR"), None, "Solana's USDT is not on BNB Chain");
+    let mint = crate::sol::usdt_mint(Chain::SolMainnet).map(|m| crate::sol::asset_address(&m));
+    assert!(mint.is_some());
+    assert_eq!(Chain::SolMainnet.asset_of("USDT/XMR"), mint);
+    assert_eq!(Chain::EthMainnet.asset_of("USDT-BSC/XMR"), None, "no Ethereum USDT");
+
     let key = PrivateKeySigner::random();
     let mut r = Rules { xmr_mainnet: true, ..Rules::default() };
     r.contracts.insert(56, contract());
     let bsc = Listing { chain_id: 56, pair: "BNB/XMR".into(), xmz_network: XmzNetwork::XmrMainnet, ..listing(&key) };
     let check = |l: Listing| l.sign(&key).verify(&r, NOW);
     assert!(check(bsc.clone()).is_ok());
-    assert_eq!(check(Listing { pair: "USDT-BSC/XMR".into(), ..bsc.clone() }), Err(ListingError::Pair("USDT-BSC/XMR".into())));
-    // A USDT offer must quote XMZ: the same pair with a Monero network is refused
+    let usdt_xmr = Listing { pair: "USDT-BSC/XMR".into(), ..bsc.clone() };
+    assert!(check(usdt_xmr.clone()).is_ok());
+    assert_eq!(usdt_xmr.asset(), token, "the lock is in USDT");
+    // The pair must quote the listing's own private coin
     assert_eq!(check(Listing { pair: "USDT-BSC/XMZ".into(), ..bsc.clone() }), Err(ListingError::Pair("USDT-BSC/XMZ".into())));
+    assert_eq!(check(Listing { pair: "USDT-BSC/XMR".into(), xmz_network: XmzNetwork::Mainnet, ..bsc.clone() }), Err(ListingError::Pair("USDT-BSC/XMR".into())));
     let usdt = Listing { pair: "USDT-BSC/XMZ".into(), xmz_network: XmzNetwork::Mainnet, ..bsc };
     assert!(check(usdt.clone()).is_ok());
     assert_eq!(usdt.asset(), token);

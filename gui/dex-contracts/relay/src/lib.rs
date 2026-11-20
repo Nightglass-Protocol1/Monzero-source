@@ -172,7 +172,7 @@ impl Print {
     /// Coin per XMZ (or per XMR on a Monero pair)
     pub fn price(&self) -> f64 {
         // The coin's smallest unit: wei (18 places), lamports on Solana (9), USDT base units (6)
-        let unit = if self.pair == "USDT/XMZ" {
+        let unit = if self.pair == "USDT/XMZ" || self.pair == "USDT/XMR" {
             1e6
         } else if monzero_dex_evm::Chain::from_id(self.chain_id).is_some_and(|c| c.is_solana()) {
             1e9

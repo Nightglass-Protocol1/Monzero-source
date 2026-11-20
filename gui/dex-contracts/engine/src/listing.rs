@@ -211,9 +211,10 @@ impl Chain {
         if pair == self.pair() {
             return Some(Address::ZERO);
         }
-        // The chain's coin against Monero ("BNB/XMR"): the coin itself. Tokens against Monero are not traded.
+        // Against Monero: the chain's coin ("BNB/XMR") or its USDT ("USDT/XMR" on Solana,
+        // "USDT-BSC/XMR" on BNB Smart Chain), as against XMZ
         if let Some(base) = pair.strip_suffix("/XMR") {
-            return (self.pair().strip_suffix("/XMZ") == Some(base)).then_some(Address::ZERO);
+            return self.asset_of(&format!("{base}/XMZ"));
         }
         match pair {
             "USDT/XMZ" if self.is_solana() => crate::sol::usdt_mint(self).map(|m| crate::sol::asset_address(&m)),
@@ -349,9 +350,8 @@ impl Listing {
         let chain = Chain::from_id(self.chain_id).ok_or(ListingError::Chain(self.chain_id))?;
         let pinned = rules.contracts.get(&self.chain_id).ok_or(ListingError::Chain(self.chain_id))?;
         // The pair must be one this chain trades (its coin, or a token) and quote the listing's
-        // private coin: "BNB/XMZ" and "USDT/XMZ" with XMZ, "BNB/XMR" with Monero (no tokens yet)
-        if chain.asset_of(&self.pair).is_none() || !self.pair.ends_with(&format!("/{}", self.xmz_network.coin().ticker()))
-            || (self.xmz_network.coin() != crate::xmz::PrivateCoin::Xmz && self.pair != chain.pair_for(self.xmz_network)) {
+        // private coin: "BNB/XMZ" and "USDT/XMZ" with XMZ, "BNB/XMR" and "USDT/XMR" with Monero
+        if chain.asset_of(&self.pair).is_none() || !self.pair.ends_with(&format!("/{}", self.xmz_network.coin().ticker())) {
             return Err(ListingError::Pair(self.pair.clone()));
         }
         if &self.contract != pinned {

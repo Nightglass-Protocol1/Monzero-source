@@ -144,9 +144,11 @@ async fn info<C: ChainView>(State(api): State<Arc<Api<C>>>) -> Json<Value> {
             let pair = chain.map(|c| c.pair());
             // Monero pairs: always on test networks, on main networks only when switched on
             let main = chain.is_some_and(|c| matches!(c, monzero_dex_evm::Chain::BscMainnet | monzero_dex_evm::Chain::EthMainnet | monzero_dex_evm::Chain::SolMainnet));
-            let mut pairs: Vec<String> = pair.iter().map(|p| p.to_string()).collect();
-            if let (Some(p), true) = (pair, !main || rules.xmr_mainnet) {
-                pairs.push(p.replace("/XMZ", "/XMR"));
+            let mut pairs: Vec<String> = chain.map(|c| c.pairs().iter().map(|p| p.to_string()).collect()).unwrap_or_default();
+            if chain.is_some() && (!main || rules.xmr_mainnet) {
+                // Each XMZ pair's Monero twin: the chain's coin and its USDT against XMR
+                let xmr: Vec<String> = pairs.iter().map(|p| p.replace("/XMZ", "/XMR")).collect();
+                pairs.extend(xmr);
             }
             json!({ "chainId": id, "pair": pair, "pairs": pairs, "contract": contract, "maxValue": rules.max_value.get(id) })
         })
