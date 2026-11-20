@@ -26,6 +26,7 @@ ColumnLayout {
     spacing: 12
 
     property string pair: ""
+    property bool showPairs: true          // its own pair buttons (off when the page's pair row picks)
     readonly property string pairNow: pair !== "" && pairs.indexOf(pair) >= 0 ? pair : (pairs.length ? pairs[0] : "")
     readonly property var pairs: direct.pairs || []
     readonly property string base: pairNow.split("/")[0] || ""
@@ -111,6 +112,7 @@ ColumnLayout {
     }
     Flow {
         Layout.fillWidth: true; spacing: 8
+        visible: dp.showPairs
         Repeater {
             model: dp.pairs
             delegate: Rectangle {

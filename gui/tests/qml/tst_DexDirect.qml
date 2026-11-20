@@ -89,13 +89,16 @@ Item {
         when: windowShown
         function init() {
             engine.calls = []; engine.refusal = ""
-            ex.pick("ETH"); ex.pick("DIRECT")
-            var p = panel(); p.pair = ""; p.confirmId = ""; p.giveCoin = ""; p.localError = ""
+            ex.pick("ETH"); ex.pickDirect("BNB/ETH")
+            var p = panel(); p.confirmId = ""; p.giveCoin = ""; p.localError = ""
             ex.balances = { ETH: 1, BNB: 1, SOL: 10 }
             find(ex, "directGiveAmount").text = ""; find(ex, "directGetAmount").text = ""
         }
         function test_the_tab_shows_the_panel_and_hides_the_xmz_market() {
-            verify(find(ex, "pair_DIRECT").visible)
+            // Each direct pair is its own tile in the pair row, beside the XMZ pairs
+            verify(find(ex, "pair_BNB/ETH").visible); verify(find(ex, "pair_BNB/SOL").visible); verify(find(ex, "pair_ETH/SOL").visible)
+            verify(find(ex, "pair_BNB/ETH").active); verify(!find(ex, "pair_ETH/SOL").active)
+            compare(find(ex, "pair_BNB/ETH").offers, 5)
             verify(ex.directMode)
             verify(panel().visible)
             verify(!find(ex, "exchangeBook").visible)
@@ -109,7 +112,9 @@ Item {
             compare(p.asks.map(function (l) { return l.id }).join(), "0xa2,0xa1,0xa3")
             compare(p.bids.map(function (l) { return l.id }).join(), "0xb2,0xb1")
             verify(p.mine(p.asks[2]))
-            p.pair = "ETH/SOL"
+            click(find(ex, "pair_ETH/SOL"))
+            compare(p.pairNow, "ETH/SOL")
+            verify(find(ex, "pair_ETH/SOL").active)
             compare(p.asks.map(function (l) { return l.id }).join(), "0xc1")
         }
         function test_taking_asks_for_confirmation_first() {

@@ -29,6 +29,8 @@ ColumnLayout {
     // Coin-for-coin trades (ETH, BNB, SOL straight across): their own tab, when this wallet has them
     readonly property var direct: (dex && dex.directMarketStatus) || ({})
     readonly property bool directMode: coin === "DIRECT" && direct.configured === true
+    property string directPair: ""          // the direct pair picked in the pair row ("BNB/ETH")
+    function pickDirect(p) { directPair = p; pick("DIRECT") }
     readonly property bool keysReady: wallet.keysReady === true
     // USDT (on Solana) appears once the wallet runs its market
     readonly property var allCoins: ["ETH", "BNB", "SOL"].concat(markets.USDT ? ["USDT"] : []).concat(markets["USDT-BSC"] ? ["USDT-BSC"] : [])
@@ -289,40 +291,44 @@ ColumnLayout {
                 objectName: "pair_" + modelData
                 readonly property bool active: ex.coin === modelData
                 readonly property var st: X.dayStats(ex.candles[modelData] || [], ex.now)
-                width: 190; height: 54; radius: 6
+                width: 136; height: 44; radius: 6
                 color: active ? M.Style.surfaceRaised : "transparent"
                 border.color: active ? M.Style.accent : M.Style.accentMuted
                 Column {
-                    anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
-                    spacing: 3
-                    Text { text: "XMZ / " + ex.label(modelData); font.pixelSize: 15; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
+                    spacing: 2
+                    Text { text: "XMZ / " + ex.label(modelData); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
                     Row {
                         spacing: 8
-                        Text { text: st.last > 0 ? X.price(st.last) + " " + modelData : qsTr("no trades yet"); font.pixelSize: 11; color: M.Style.dimmedFontColor }
+                        Text { text: st.last > 0 ? X.price(st.last) + " " + modelData : qsTr("no trades yet"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
                         Text {
                             visible: !isNaN(st.change)
                             text: isNaN(st.change) ? "" : (st.change >= 0 ? "+" : "") + st.change.toFixed(2) + "%"
-                            font.pixelSize: 11; color: st.change >= 0 ? M.Style.green : "#E5677A"
+                            font.pixelSize: 10; color: st.change >= 0 ? M.Style.green : "#E5677A"
                         }
                     }
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pick(modelData) }
             }
         }
-        Rectangle {
-            objectName: "pair_DIRECT"
-            visible: ex.direct.configured === true
-            readonly property bool active: ex.coin === "DIRECT"
-            width: 190; height: 54; radius: 6
-            color: active ? M.Style.surfaceRaised : "transparent"
-            border.color: active ? M.Style.accent : M.Style.accentMuted
-            Column {
-                anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
-                spacing: 3
-                Text { text: "ETH · BNB · SOL"; font.pixelSize: 15; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
-                Text { text: qsTr("coin for coin"); font.pixelSize: 11; color: M.Style.dimmedFontColor }
+        // Coin-for-coin pairs (ETH, BNB, SOL straight across), each its own tile
+        Repeater {
+            model: ex.direct.configured === true ? (ex.direct.pairs || []) : []
+            delegate: Rectangle {
+                objectName: "pair_" + modelData
+                readonly property bool active: ex.directMode && ex.directPair === modelData
+                readonly property int offers: (ex.direct.listings || []).filter(function (l) { return l.pair === modelData && l.expiresAt > ex.now }).length
+                width: 136; height: 44; radius: 6
+                color: active ? M.Style.surfaceRaised : "transparent"
+                border.color: active ? M.Style.accent : M.Style.accentMuted
+                Column {
+                    anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
+                    spacing: 2
+                    Text { text: modelData.replace("/", " / "); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    Text { text: offers > 0 ? qsTr("%n offer(s)", "", offers) : qsTr("coin for coin"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
+                }
+                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pickDirect(modelData) }
             }
-            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pick("DIRECT") }
         }
     }
 
@@ -544,6 +550,8 @@ ColumnLayout {
         objectName: "directPanel"
         Layout.fillWidth: true
         visible: ex.directMode
+        pair: ex.directPair
+        showPairs: false
         dex: ex.dex
         wallet: ex.wallet
         balances: ex.balances
