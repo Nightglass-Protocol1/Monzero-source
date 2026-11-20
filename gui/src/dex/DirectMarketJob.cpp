@@ -32,7 +32,7 @@ bool coinValid(const QJsonObject &c) {
 bool listingValid(const QJsonObject &signedListing) {
     const auto l=signedListing.value("listing").toObject();
     static const QRegularExpression address("\\A0x[0-9a-fA-F]{40}\\z");
-    static const QRegularExpression pair("\\A(BNB|ETH|SOL)/(BNB|ETH|SOL)\\z");
+    static const QRegularExpression pair("\\A(BNB|ETH|SOL|USDT|USDT-BSC)/(BNB|ETH|SOL|USDT|USDT-BSC)\\z");
     return signedListing.size()==2 && l.value("schema")=="monzero-dex-direct-listing/1" && Hash.match(l.value("id").toString()).hasMatch()
         && pair.match(l.value("pair").toString()).hasMatch() && address.match(l.value("maker").toString()).hasMatch()
         && coinValid(l.value("gives").toObject()) && coinValid(l.value("wants").toObject())
@@ -88,6 +88,11 @@ bool DirectMarketJob::configure(const QJsonObject &c) {
     }
     for (const auto &r:relays) if (!relay.match(r.toString()).hasMatch()) return false;
     if (c.contains("localSolProgram") && !DexChains::solanaAddress(c.value("localSolProgram").toString())) return false;
+    // USDT markets (Solana's, BNB Chain's): each on a chain with a node
+    for (const auto &t:c.value("tokens").toArray()) {
+        const qint64 m=qint64(t.toDouble());
+        if (!DexChains::token(m) || !rpcs.contains(QString::number(DexChains::helperChain(m)))) return false;
+    }
     if (!BackendExecutable::matches(c.value("helper").toString(),c.value("helperDigest").toString())) return false;
     m_config=c;m_program=c.value("helper").toString();m_digest=c.value("helperDigest").toString();m_tradesDir=c.value("tradesDir").toString();
     QDir().mkpath(m_tradesDir);QFile::setPermissions(m_tradesDir,QFileDevice::ReadOwner|QFileDevice::WriteOwner|QFileDevice::ExeOwner);
@@ -101,16 +106,20 @@ void DirectMarketJob::setSwapKeys(const QByteArray &swapSeedHex,const QByteArray
 }
 
 QList<qint64> DirectMarketJob::chains() const {
+    // The coins this market trades, by market id: each chain's own coin, and its USDT where enabled
     QList<qint64> out;
     for (const auto &k:m_config.value("rpcs").toObject().keys()) out.append(k.toLongLong());
+    for (const auto &t:m_config.value("tokens").toArray()) out.append(qint64(t.toDouble()));
     std::sort(out.begin(),out.end());
     return out;
 }
 
 QString DirectMarketJob::tickerOf(qint64 id) {
+    if (DexChains::usdt(id)) return QStringLiteral("USDT");
+    if (DexChains::usdtBsc(id)) return QStringLiteral("USDT-BSC");
     return DexChains::solana(id) ? QStringLiteral("SOL") : (id==56 || id==97) ? QStringLiteral("BNB") : QStringLiteral("ETH");
 }
-int DirectMarketJob::decimalsOf(qint64 id) {return DexChains::solana(id) ? 9 : 18;}
+int DirectMarketJob::decimalsOf(qint64 id) {return DexChains::decimals(id);}
 QString DirectMarketJob::pairOf(qint64 a,qint64 b) {
     const auto x=tickerOf(a),y=tickerOf(b);
     return x<=y ? x+"/"+y : y+"/"+x;
@@ -180,8 +189,12 @@ bool DirectMarketJob::post(qint64 givesChain,const QString &givesValue,qint64 wa
         || !Digits.match(givesValue).hasMatch() || !Digits.match(wantsValue).hasMatch() || lifetimeSecs<600 || lifetimeSecs>31*86400) return false;
     const auto folder=m_tradesDir+"/offer-"+QString::number(QRandomGenerator::system()->generate64(),16);
     auto r=base("directPost",folder);
-    r.insert("directOffer",QJsonObject{{"givesChainId",double(givesChain)},{"givesValue",givesValue},{"wantsChainId",double(wantsChain)},
-        {"wantsValue",wantsValue},{"lifetimeSecs",double(lifetimeSecs)}});
+    // The helper names a coin by its chain, and a token (USDT) besides
+    QJsonObject offer{{"givesChainId",double(DexChains::helperChain(givesChain))},{"givesValue",givesValue},{"wantsChainId",double(DexChains::helperChain(wantsChain))},
+        {"wantsValue",wantsValue},{"lifetimeSecs",double(lifetimeSecs)}};
+    if (DexChains::token(givesChain)) offer.insert("givesToken","usdt");
+    if (DexChains::token(wantsChain)) offer.insert("wantsToken","usdt");
+    r.insert("directOffer",offer);
     return enqueue(r,folder,true);
 }
 
@@ -192,7 +205,8 @@ bool DirectMarketJob::take(const QString &listingId) {
     // Both of its chains must be ones this wallet has a node for
     const auto l=signedListing.value("listing").toObject();
     const auto list=chains();
-    if (!list.contains(qint64(l.value("gives").toObject().value("chainId").toDouble())) || !list.contains(qint64(l.value("wants").toObject().value("chainId").toDouble()))) return false;
+    const auto market=[](const QJsonObject &c){return DexChains::marketOf(qint64(c.value("chainId").toDouble()),c.value("asset").toString());};
+    if (!list.contains(market(l.value("gives").toObject())) || !list.contains(market(l.value("wants").toObject()))) return false;
     const auto folder=m_tradesDir+"/take-"+listingId.mid(2,16);
     auto r=base("directTake",folder);r.insert("directListing",signedListing);
     return enqueue(r,folder,true);
@@ -352,7 +366,9 @@ void DirectMarketJob::handle(const QJsonObject &r) {
 
 QVariantMap DirectMarketJob::shown(const QJsonObject &s,int relays) const {
     const auto l=s.value("listing").toObject(),gives=l.value("gives").toObject(),wants=l.value("wants").toObject();
-    const qint64 gc=qint64(gives.value("chainId").toDouble()),wc=qint64(wants.value("chainId").toDouble());
+    // Coins by market id: the chain's own coin, or its USDT
+    const qint64 gc=DexChains::marketOf(qint64(gives.value("chainId").toDouble()),gives.value("asset").toString());
+    const qint64 wc=DexChains::marketOf(qint64(wants.value("chainId").toDouble()),wants.value("asset").toString());
     const auto gv=hexToDecimal(gives.value("value").toString()),wv=hexToDecimal(wants.value("value").toString());
     if (gv.isEmpty() || wv.isEmpty() || tickerOf(gc)==tickerOf(wc)) return {};
     const auto pair=pairOf(gc,wc);

@@ -975,7 +975,7 @@ void DexEngine::setUpEvmMarkets() {
         f.write(QJsonDocument(config).toJson(QJsonDocument::Compact));f.close();
         if (!addEvmMarket(path)) qWarning("The DEX market for chain %d could not start",c.id);
         // Direct trades: each chain's own coin (no tokens), on the same nodes
-        if (!DexChains::token(c.id)) directChains.append({c.id,config.value("evmRpc").toString()});
+        directChains.append({c.id,config.value("evmRpc").toString()});
     }
     setUpDirectMarket(relays,directChains);
     resumeEvmTrades();
@@ -986,10 +986,13 @@ void DexEngine::setUpDirectMarket(const QJsonArray &relays,const QList<QPair<int
     // the relays refuse real-coin direct offers until they are opened there too)
     const bool mainnet=DexDeployment::mainnetStage();
     if (mainnet && qEnvironmentVariable("MONZERO_DEX_DIRECT_MAINNET")!=QLatin1String("1")) return;
-    QJsonObject rpcs;
-    for (const auto &c:chains) rpcs.insert(QString::number(c.first),c.second);
+    // Each chain's node; its USDT (Solana's, BNB Chain's) where this stage trades it
+    QJsonObject rpcs;QJsonArray tokens;
+    for (const auto &c:chains) if (!DexChains::token(c.first)) rpcs.insert(QString::number(c.first),c.second);
+    for (const auto &c:chains) if (DexChains::token(c.first) && rpcs.contains(QString::number(DexChains::helperChain(c.first)))) tokens.append(c.first);
     QJsonObject config{{"helper",m_dexWallets->helper()},{"helperDigest",m_dexWallets->helperSha256()},
         {"tradesDir",m_dexWallets->root()+"/evm-trades/direct"},{"rpcs",rpcs},{"relays",relays},{"mainnet",mainnet}};
+    if (!tokens.isEmpty()) config.insert("tokens",tokens);
     const auto localSolProgram=qEnvironmentVariable("MONZERO_DEX_SOL_LOCAL_PROGRAM");
     for (const auto &c:chains) if (c.first==int(DexChains::SolLocal) && DexChains::solanaAddress(localSolProgram)) config.insert("localSolProgram",localSolProgram);
     auto *job=new DirectMarketJob(this);
@@ -1067,7 +1070,9 @@ bool DexEngine::approveDirectTrade(const QString &folder,const QString &commitme
     if (f.isEmpty() || trade.value("commitment")!=commitment) return say(tr("The trade changed; check it again."));
     const auto ledgerId=evmLedgerId(trade.value("tradeId").toString());
     const auto gives=trade.value("gives").toMap(),gets=trade.value("gets").toMap();
-    const qint64 gc=qint64(gives.value("chainId").toDouble()),wc=qint64(gets.value("chainId").toDouble());
+    // Each coin under its own market's limits (USDT has its own document)
+    const qint64 gc=DexChains::marketOf(qint64(gives.value("chainId").toDouble()),gives.value("asset").toString());
+    const qint64 wc=DexChains::marketOf(qint64(gets.value("chainId").toDouble()),gets.value("asset").toString());
     if (ledgerId.isEmpty()) return say(tr("The trade could not be checked; not started."));
     const auto refusal=directRefusal(ledgerId,gc,gives.value("value").toString(),wc,gets.value("value").toString());
     if (!refusal.isEmpty()) return say(refusal);
@@ -1088,7 +1093,7 @@ void DexEngine::recordDirectStarts() {
         const auto ledgerId=evmLedgerId(trade.value("tradeId").toString());
         if (ledgerId.isEmpty() || m_directRecorded.contains(ledgerId)) continue;
         const auto gives=trade.value("gives").toMap();
-        const auto network=evmControlNetwork(qint64(gives.value("chainId").toDouble()));
+        const auto network=evmControlNetwork(DexChains::marketOf(qint64(gives.value("chainId").toDouble()),gives.value("asset").toString()));
         if (network.isEmpty()) continue;
         bindEvmNetwork(network);
         if (m_evmRiskControl->recordStart(ledgerId,gives.value("value").toString().toULongLong())) m_directRecorded.insert(ledgerId);

@@ -219,5 +219,14 @@ TestCase {
         wait(100)
         verify(!dialog.opened)
         dex.directMarketStatus = { configured: true, mine: [] }
+        // USDT is shown as USDT with its own decimals (6 on Solana)
+        dex.directMarketStatus = { configured: true, mine: [{ folder: "/t/take-3", kind: "take", state: "agreed",
+            trade: { approved: false, commitment: "0x444", gives: { chainId: 501000101, coin: "USDT", decimals: 6, value: "25000000" }, gets: { chainId: 501000101, coin: "SOL", decimals: 9, value: "150000000" } } }] }
+        tryVerify(function () { return dialog.opened })
+        var t2 = inside(dialog.contentItem, "dexWebDirectTerms").text
+        verify(t2.indexOf("You pay 25 USDT (Solana)") === 0, t2)
+        verify(t2.indexOf("You receive 0.15 SOL") > 0, t2)
+        dex.directMarketStatus = { configured: true, mine: [] }
+        tryVerify(function () { return !dialog.opened })
     }
 }

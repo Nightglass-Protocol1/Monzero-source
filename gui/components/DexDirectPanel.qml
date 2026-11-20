@@ -43,7 +43,10 @@ ColumnLayout {
         for (var i = 0; i < c.length; ++i) if (c[i].coin === coin) return Number(c[i].chainId)
         return 0
     }
-    function accountOf(coin) { return coin === "SOL" ? (wallet.solTradeAccount || "") : (wallet.tradeAccount || "") }
+    // Solana's coin and its USDT share the Solana trade account; the EVM coins and BNB Chain's USDT the other
+    function accountOf(coin) { return coin === "SOL" || coin === "USDT" ? (wallet.solTradeAccount || "") : (wallet.tradeAccount || "") }
+    // Solana's USDT and BNB Chain's, named by their chains
+    function label(coin) { return coin === "USDT" ? "USDT-SOL" : coin }
     function mine(l) { return String(l.maker || "").toLowerCase() === String(wallet.tradeAccount || "").toLowerCase() }
     // The pair's book: asks give the base (cheapest first), bids want it (dearest first)
     function side(which) {
@@ -67,7 +70,7 @@ ColumnLayout {
     // What a trade is doing now, in the user's words
     function stageText(t) {
         var tr = t.trade || {}, s = tr.stage || "", leader = t.kind === "take"
-        var give = (t.gives || {}).coin || "", get = (t.wants || {}).coin || ""
+        var give = label((t.gives || {}).coin || ""), get = label((t.wants || {}).coin || "")
         if (t.state === "open") return t.kind === "offer" ? qsTr("open · %1").arg(X.timeLeft(t.expiresAt, now)) : qsTr("waiting for the maker's answer")
         if (t.state === "cancelled") return qsTr("cancelled")
         if (t.state === "expired") return qsTr("expired, not taken")
@@ -159,13 +162,13 @@ ColumnLayout {
                 RowLayout {
                     Layout.fillWidth: true
                     Repeater {
-                        model: [[qsTr("Price (%1)").arg(dp.quote), 3], [dp.base, 3], [dp.quote, 3], [qsTr("Expires"), 2], ["", 3]]
+                        model: [[qsTr("Price (%1)").arg(dp.label(dp.quote)), 3], [dp.label(dp.base), 3], [dp.label(dp.quote), 3], [qsTr("Expires"), 2], ["", 3]]
                         delegate: Text { text: modelData[0]; font.pixelSize: 11; color: M.Style.dimmedFontColor; Layout.fillWidth: true; Layout.preferredWidth: modelData[1] }
                     }
                 }
                 Repeater {
-                    model: [ { k: "sell", rows: dp.asks, label: qsTr("Selling %1").arg(dp.base), c: "#E5677A" },
-                             { k: "buy", rows: dp.bids, label: qsTr("Buying %1").arg(dp.base), c: M.Style.green } ]
+                    model: [ { k: "sell", rows: dp.asks, label: qsTr("Selling %1").arg(dp.label(dp.base)), c: "#E5677A" },
+                             { k: "buy", rows: dp.bids, label: qsTr("Buying %1").arg(dp.label(dp.base)), c: M.Style.green } ]
                     delegate: ColumnLayout {
                         Layout.fillWidth: true; spacing: 4
                         readonly property var group: modelData
@@ -199,7 +202,7 @@ ColumnLayout {
                                     visible: confirming
                                     Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.defaultFontColor
                                     text: qsTr("You lock %1 %2 and receive %3 %4. Nothing is locked until you approve the trade below; if the maker then does not lock theirs, your %2 comes back after its time limit (about 9 hours).")
-                                          .arg(l.wants.amount).arg(l.wants.coin).arg(l.gives.amount).arg(l.gives.coin)
+                                          .arg(l.wants.amount).arg(dp.label(l.wants.coin)).arg(l.gives.amount).arg(dp.label(l.gives.coin))
                                 }
                                 Text {
                                     visible: confirming
@@ -232,7 +235,7 @@ ColumnLayout {
                     return dp.dex.directOrderRefusal(dp.chainOf(dp.giving), giveField.text.trim(), dp.chainOf(dp.getting), getField.text.trim())
                 }
                 readonly property string problem: !(giveAmount > 0) || !(getAmount > 0) ? ""
-                    : giveBalance >= 0 && giveAmount > giveBalance ? qsTr("Your %1 trade account holds %2 %1.").arg(dp.giving).arg(X.plain(giveBalance, 8))
+                    : giveBalance >= 0 && giveAmount > giveBalance ? qsTr("Your %1 trade account holds %2 %1.").arg(dp.label(dp.giving)).arg(X.plain(giveBalance, 8))
                     : refusal
                 Text { text: qsTr("Post an offer"); font.pixelSize: 15; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
                 Row {
@@ -244,21 +247,21 @@ ColumnLayout {
                             readonly property bool active: dp.giving === modelData
                             width: 140; height: 32; radius: 5
                             color: active ? M.Style.accentMuted : "transparent"; border.color: M.Style.accentMuted
-                            Text { anchors.centerIn: parent; text: qsTr("I give %1").arg(modelData); font.pixelSize: 13; color: M.Style.defaultFontColor }
+                            Text { anchors.centerIn: parent; text: qsTr("I give %1").arg(dp.label(modelData)); font.pixelSize: 13; color: M.Style.defaultFontColor }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: dp.giveCoin = modelData }
                         }
                     }
                 }
-                Text { text: qsTr("You give (%1)").arg(dp.giving); font.pixelSize: 12; color: M.Style.dimmedFontColor }
+                Text { text: qsTr("You give (%1)").arg(dp.label(dp.giving)); font.pixelSize: 12; color: M.Style.dimmedFontColor }
                 M.LineEdit { id: giveField; objectName: "directGiveAmount"; Layout.fillWidth: true; fontSize: 14; inputPaddingTop: 6; inputPaddingBottom: 6; placeholderText: "0.0"; placeholderFontSize: 14 }
-                Text { text: qsTr("You get (%1)").arg(dp.getting); font.pixelSize: 12; color: M.Style.dimmedFontColor }
+                Text { text: qsTr("You get (%1)").arg(dp.label(dp.getting)); font.pixelSize: 12; color: M.Style.dimmedFontColor }
                 M.LineEdit { id: getField; objectName: "directGetAmount"; Layout.fillWidth: true; fontSize: 14; inputPaddingTop: 6; inputPaddingBottom: 6; placeholderText: "0.0"; placeholderFontSize: 14 }
                 Text {
                     visible: formCol.giveAmount > 0 && formCol.getAmount > 0
                     font.pixelSize: 12; color: M.Style.dimmedFontColor
                     text: {
                         var b = dp.giving === dp.base ? formCol.giveAmount : formCol.getAmount, q = dp.giving === dp.base ? formCol.getAmount : formCol.giveAmount
-                        return qsTr("Price: %1 %2 per %3").arg(X.price(q / b)).arg(dp.quote).arg(dp.base)
+                        return qsTr("Price: %1 %2 per %3").arg(X.price(q / b)).arg(dp.label(dp.quote)).arg(dp.label(dp.base))
                     }
                 }
                 Text { text: qsTr("Open for"); font.pixelSize: 12; color: M.Style.dimmedFontColor }
@@ -281,7 +284,7 @@ ColumnLayout {
                 M.StandardButton {
                     objectName: "directPost"
                     Layout.fillWidth: true
-                    text: qsTr("Post: give %1 for %2").arg(dp.giving).arg(dp.getting)
+                    text: qsTr("Post: give %1 for %2").arg(dp.label(dp.giving)).arg(dp.label(dp.getting))
                     enabled: dp.direct.keys === true && formCol.giveAmount > 0 && formCol.getAmount > 0 && formCol.problem === "" && dp.direct.busy !== true
                     onClicked: {
                         dp.localError = ""
@@ -291,7 +294,7 @@ ColumnLayout {
                 }
                 Text {
                     Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 11; color: M.Style.dimmedFontColor
-                    text: qsTr("Posting is your approval: when someone takes the offer, the wallet locks your %1 once they have locked their %2, and collects their %2. Keep the wallet running while an offer is open, and keep a little %2 in its trade account for the network fee to collect it.").arg(dp.giving).arg(dp.getting)
+                    text: qsTr("Posting is your approval: when someone takes the offer, the wallet locks your %1 once they have locked their %2, and collects their %2. Keep the wallet running while an offer is open, and keep a little of that chain's coin in its trade account for the network fee to collect it.").arg(dp.label(dp.giving)).arg(dp.label(dp.getting))
                 }
             }
         }
@@ -320,7 +323,7 @@ ColumnLayout {
                     RowLayout {
                         Layout.fillWidth: true
                         Text { text: t.pair; font.pixelSize: 13; color: M.Style.defaultFontColor; Layout.preferredWidth: 80 }
-                        Text { text: qsTr("give %1 %2 → get %3 %4").arg(t.gives.amount).arg(t.gives.coin).arg(t.wants.amount).arg(t.wants.coin)
+                        Text { text: qsTr("give %1 %2 → get %3 %4").arg(t.gives.amount).arg(dp.label(t.gives.coin)).arg(t.wants.amount).arg(dp.label(t.wants.coin))
                                font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; elide: Text.ElideRight }
                         Text {
                             objectName: "directCancel"
@@ -349,13 +352,13 @@ ColumnLayout {
                         Text {
                             Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 13; color: M.Style.defaultFontColor
                             text: qsTr("You lock %1 %2 on %3 and receive %4 %5 on %6. If the maker does not lock their %5 in time, your %2 comes back after about 9 hours. Approve before %7, or the trade lapses with nothing locked.")
-                                  .arg(t.gives.amount).arg(t.gives.coin).arg(dp.networkName(Number(t.gives.chainId)) || t.gives.coin)
-                                  .arg(t.wants.amount).arg(t.wants.coin).arg(dp.networkName(Number(t.wants.chainId)) || t.wants.coin)
+                                  .arg(t.gives.amount).arg(dp.label(t.gives.coin)).arg(dp.networkName(Number(t.gives.chainId)) || dp.label(t.gives.coin))
+                                  .arg(t.wants.amount).arg(dp.label(t.wants.coin)).arg(dp.networkName(Number(t.wants.chainId)) || dp.label(t.wants.coin))
                                   .arg(tr.lockDeadline ? Qt.formatDateTime(new Date((tr.lockDeadline - 3600) * 1000), "d MMM HH:mm") : "—")
                         }
                         M.StandardButton {
                             objectName: "directApprove"
-                            small: true; text: qsTr("Approve and lock %1").arg(t.gives.coin)
+                            small: true; text: qsTr("Approve and lock %1").arg(dp.label(t.gives.coin))
                             onClicked: dp.localError = dp.dex.approveDirectTrade(t.folder, tr.commitment) ? "" : (dp.direct.message || qsTr("The trade could not be approved now."))
                         }
                     }
@@ -364,7 +367,7 @@ ColumnLayout {
                         visible: inCoin !== "" && !paid
                         Layout.fillWidth: true
                         M.LineEdit { id: payTo; objectName: "directPayoutAddress"; Layout.fillWidth: true; fontSize: 13; inputPaddingTop: 6; inputPaddingBottom: 6
-                                     text: dp.withdrawTo[inCoin] || ""; placeholderText: inCoin === "SOL" ? qsTr("Your Solana address") : qsTr("Your 0x… address"); placeholderFontSize: 13 }
+                                     text: dp.withdrawTo[inCoin] || ""; placeholderText: inCoin === "SOL" || inCoin === "USDT" ? qsTr("Your Solana address") : qsTr("Your 0x… address"); placeholderFontSize: 13 }
                         M.StandardButton {
                             objectName: "directPayout"
                             small: true; text: qsTr("Send %1 to my wallet").arg(inCoin)
@@ -410,9 +413,9 @@ ColumnLayout {
                 model: dp.direct.chains || []
                 delegate: RowLayout {
                     Layout.fillWidth: true
-                    Text { text: modelData.coin; font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor; Layout.preferredWidth: 50 }
+                    Text { text: dp.label(modelData.coin); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor; Layout.preferredWidth: 70 }
                     Text {
-                        text: dp.balances[modelData.coin] !== undefined ? X.plain(dp.balances[modelData.coin], 8) + " " + modelData.coin : "—"
+                        text: dp.balances[modelData.coin] !== undefined ? X.plain(dp.balances[modelData.coin], 8) + " " + dp.label(modelData.coin) : "—"
                         font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.preferredWidth: 160
                     }
                     M.LineEdit { Layout.fillWidth: true; readOnly: true; copyButton: true; fontSize: 12; text: dp.accountOf(modelData.coin); visible: text !== "" }

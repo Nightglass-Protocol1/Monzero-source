@@ -31,6 +31,9 @@ ColumnLayout {
     readonly property bool directMode: coin === "DIRECT" && direct.configured === true
     property string directPair: ""          // the direct pair picked in the pair row ("BNB/ETH")
     function pickDirect(p) { directPair = p; pick("DIRECT") }
+    // A direct pair as people read it: Solana's USDT and BNB Chain's named by their chains
+    function directCoin(t) { return t === "USDT" ? "USDT-SOL" : t }
+    function directLabel(p) { var x = String(p).split("/"); return directCoin(x[0]) + " / " + directCoin(x[1]) }
     readonly property bool keysReady: wallet.keysReady === true
     // USDT (on Solana) appears once the wallet runs its market
     readonly property var allCoins: ["ETH", "BNB", "SOL"].concat(markets.USDT ? ["USDT"] : []).concat(markets["USDT-BSC"] ? ["USDT-BSC"] : [])
@@ -324,7 +327,7 @@ ColumnLayout {
                 Column {
                     anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
                     spacing: 2
-                    Text { text: modelData.replace("/", " / "); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    Text { text: ex.directLabel(modelData); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
                     Text { text: offers > 0 ? qsTr("%n offer(s)", "", offers) : qsTr("coin for coin"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pickDirect(modelData) }

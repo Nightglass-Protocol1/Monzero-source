@@ -31,6 +31,9 @@ Item {
         return null
     }
     property var dismissedDirect: []
+    // A direct trade's coin as its terms name it: the chain's coin, or USDT (Solana's, BNB Chain's)
+    function legCoin(leg) { var c = leg && leg.coin; return c === "USDT" ? "USDT (Solana)" : c === "USDT-BSC" ? "USDT (BNB Chain)" : c ? c : coin(leg ? leg.chainId : 0) }
+    function legPlaces(leg) { return leg && leg.decimals !== undefined ? Number(leg.decimals) : places(leg ? leg.chainId : 0) }
     readonly property bool directWanted: connected && directPending !== null
     readonly property var wallet: dex ? (dex.dexWalletStatus || ({})) : ({})
     readonly property bool keysWanted: web ? web.keysWanted === true && wallet.keysReady !== true : false
@@ -105,8 +108,8 @@ Item {
                 objectName: "dexWebDirectTerms"
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 17; color: "#f0f5fa"
                 text: qsTr("You pay %1 %2\nYou receive %3 %4")
-                    .arg(prompt.units(directDialog.gives.value, prompt.places(directDialog.gives.chainId))).arg(prompt.coin(directDialog.gives.chainId))
-                    .arg(prompt.units(directDialog.gets.value, prompt.places(directDialog.gets.chainId))).arg(prompt.coin(directDialog.gets.chainId))
+                    .arg(prompt.units(directDialog.gives.value, prompt.legPlaces(directDialog.gives))).arg(prompt.legCoin(directDialog.gives))
+                    .arg(prompt.units(directDialog.gets.value, prompt.legPlaces(directDialog.gets))).arg(prompt.legCoin(directDialog.gets))
             }
             M.TextPlain {
                 Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; color: "#a9b8c6"
