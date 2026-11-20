@@ -305,7 +305,7 @@ async fn a_leader_without_the_coin_is_asked_to_fund_its_account_first() {
     s.world.borrow_mut().contracts[0].balances.clear();
     s.leader.approve(s.transcript).unwrap();
     match s.leader.tick().await {
-        Err(DirectError::AwaitingFunding { chain_id, needed, have }) => {
+        Err(DirectError::AwaitingFunding { chain_id, needed, have, .. }) => {
             assert_eq!((chain_id, needed, have), (Chain::Local.id(), U256::from(VALUE_A), U256::ZERO));
         }
         other => panic!("{other:?}"),

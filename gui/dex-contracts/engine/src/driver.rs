@@ -127,6 +127,11 @@ pub trait EvmChain {
     fn reserve(&self, _owner: bool) -> U256 {
         U256::ZERO
     }
+    /// How much of the trade's `token` our account holds (chains that cannot tell: unlimited, so
+    /// the lock itself is what fails)
+    async fn token_held(&self, _token: Address) -> Result<U256, DriverError> {
+        Ok(U256::MAX)
+    }
     /// How much of `token` the swap contract may take from us (no approval needed: everything)
     async fn allowance(&self, _token: Address) -> Result<U256, DriverError> {
         Ok(U256::MAX)

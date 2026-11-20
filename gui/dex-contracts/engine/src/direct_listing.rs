@@ -43,8 +43,38 @@ impl Chain {
 /// The name of a direct pair: both tickers, alphabetical ("BNB/ETH", "BNB/SOL", "ETH/SOL"), so
 /// both directions of a pair share one book
 pub fn direct_pair(a: Chain, b: Chain) -> String {
-    let (x, y) = (a.ticker(), b.ticker());
+    pair_name(a.ticker(), b.ticker())
+}
+
+fn pair_name(x: &str, y: &str) -> String {
     if x <= y { format!("{x}/{y}") } else { format!("{y}/{x}") }
+}
+
+/// The coin a chain's asset is, by its ticker: the chain's own coin (zero asset), or the pinned
+/// USDT there ("USDT" on Solana, "USDT-BSC" on BNB Smart Chain, as the XMZ pairs name them).
+/// None for any other token.
+pub fn coin_ticker(chain: Chain, asset: Address) -> Option<&'static str> {
+    if asset == Address::ZERO {
+        return Some(chain.ticker());
+    }
+    if chain.is_solana() {
+        return crate::sol::usdt_mint(chain).filter(|m| crate::sol::asset_address(m) == asset).map(|_| "USDT");
+    }
+    crate::chain::usdt_token(chain).filter(|t| *t == asset).map(|_| "USDT-BSC")
+}
+
+/// Places of a coin's base unit: SOL 9 (lamports), USDT on Solana 6, the EVM coins and BSC USDT 18
+pub fn coin_decimals(chain: Chain, asset: Address) -> u32 {
+    match (chain.is_solana(), asset == Address::ZERO) {
+        (true, true) => 9,
+        (true, false) => 6,
+        _ => 18,
+    }
+}
+
+/// The pinned USDT of a chain as the trade terms name it (a mint's stand-in address on Solana)
+pub fn usdt_asset(chain: Chain) -> Option<Address> {
+    if chain.is_solana() { crate::sol::usdt_mint(chain).map(|m| crate::sol::asset_address(&m)) } else { crate::chain::usdt_token(chain) }
 }
 
 /// One side of a direct offer: a coin on a chain, in base units (wei, lamports)
@@ -63,6 +93,20 @@ impl Coin {
     pub fn chain(&self) -> Result<Chain, ListingError> {
         Chain::from_id(self.chain_id).ok_or(ListingError::Chain(self.chain_id))
     }
+
+    /// What the coin is ("ETH", "USDT-BSC"…); an unknown token is no coin of a direct pair
+    pub fn ticker(&self) -> Result<&'static str, ListingError> {
+        coin_ticker(self.chain()?, self.asset).ok_or(ListingError::Asset)
+    }
+
+    pub fn decimals(&self) -> Result<u32, ListingError> {
+        Ok(coin_decimals(self.chain()?, self.asset))
+    }
+}
+
+/// The name of the pair two coins make ("ETH/USDT-BSC", "SOL/USDT")
+pub fn coins_pair(a: &Coin, b: &Coin) -> Result<String, ListingError> {
+    Ok(pair_name(a.ticker()?, b.ticker()?))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,7 +191,8 @@ impl DirectListing {
             if !rules.pinned(coin.chain_id, coin.contract) {
                 return Err(ListingError::Contract);
             }
-            if coin.asset != Address::ZERO {
+            // The chain's coin or its pinned USDT, nothing else
+            if coin_ticker(chain, coin.asset).is_none() {
                 return Err(ListingError::Pair(self.pair.clone()));
             }
             if coin.value.is_zero() {
@@ -160,16 +205,17 @@ impl DirectListing {
                 return Err(ListingError::Chain(coin.chain_id));
             }
         }
-        // Two different chains, both real or both test networks (two local test chains are one chain
-        // with two contracts: tests only)
+        // Two different coins (on one chain or two), both real or both test networks. One coin
+        // against itself only on a local test chain with two contracts (tests).
         let local = |c: Chain| matches!(c, Chain::Local | Chain::SolLocal);
-        if give == want && !(local(give) && self.gives.contract != self.wants.contract) {
+        let (tg, tw) = (self.gives.ticker()?, self.wants.ticker()?);
+        if tg == tw && !(local(give) && give == want && self.gives.contract != self.wants.contract) {
             return Err(ListingError::Pair(self.pair.clone()));
         }
         if give.is_mainnet() != want.is_mainnet() || local(give) != local(want) {
             return Err(ListingError::Pair(self.pair.clone()));
         }
-        if self.pair != direct_pair(give, want) {
+        if self.pair != pair_name(tg, tw) {
             return Err(ListingError::Pair(self.pair.clone()));
         }
         if self.uses_solana() != self.maker_sol.is_some() || self.maker_sol == Some(B256::ZERO) {
@@ -298,5 +344,47 @@ mod tests {
         assert_eq!(l.check(&open, 1_100), Ok(()));
         open.max_value.insert(Chain::BscMainnet.id(), U256::from(29));
         assert_eq!(l.check(&open, 1_100), Err(ListingError::TooLarge));
+    }
+
+    #[test]
+    fn usdt_on_solana_and_bnb_chain_trades_against_the_coins_on_its_own_chain_or_another() {
+        let mut open = rules();
+        open.mainnet = true;
+        open.contracts.insert(Chain::SolMainnet.id(), Address::repeat_byte(6));
+        let bsc_usdt = usdt_asset(Chain::BscMainnet).unwrap();
+        let sol_usdt = usdt_asset(Chain::SolMainnet).unwrap();
+        let coin = |chain: Chain, contract: u8, asset: Address| Coin { chain_id: chain.id(), contract: Address::repeat_byte(contract), asset, value: U256::from(5) };
+        let make = |gives: Coin, wants: Coin| {
+            let mut l = listing();
+            l.pair = coins_pair(&gives, &wants).unwrap();
+            l.maker_sol = (gives.chain().unwrap().is_solana() || wants.chain().unwrap().is_solana()).then(|| B256::repeat_byte(4));
+            (l.gives, l.wants) = (gives, wants);
+            l
+        };
+        // ETH for USDT on BNB Chain, and on Solana: two pairs, named apart
+        let l = make(coin(Chain::EthMainnet, 4, Address::ZERO), coin(Chain::BscMainnet, 5, bsc_usdt));
+        assert_eq!((l.pair.as_str(), l.check(&open, 1_100)), ("ETH/USDT-BSC", Ok(())));
+        let l = make(coin(Chain::EthMainnet, 4, Address::ZERO), coin(Chain::SolMainnet, 6, sol_usdt));
+        assert_eq!((l.pair.as_str(), l.check(&open, 1_100)), ("ETH/USDT", Ok(())));
+        // BNB for USDT and SOL for USDT on one chain each
+        let l = make(coin(Chain::BscMainnet, 5, Address::ZERO), coin(Chain::BscMainnet, 5, bsc_usdt));
+        assert_eq!((l.pair.as_str(), l.check(&open, 1_100)), ("BNB/USDT-BSC", Ok(())));
+        let l = make(coin(Chain::SolMainnet, 6, sol_usdt), coin(Chain::SolMainnet, 6, Address::ZERO));
+        assert_eq!((l.pair.as_str(), l.check(&open, 1_100)), ("SOL/USDT", Ok(())));
+        // USDT for USDT across the two chains is a pair too; one coin for itself is not
+        let l = make(coin(Chain::SolMainnet, 6, sol_usdt), coin(Chain::BscMainnet, 5, bsc_usdt));
+        assert_eq!((l.pair.as_str(), l.check(&open, 1_100)), ("USDT/USDT-BSC", Ok(())));
+        let mut l = make(coin(Chain::BscMainnet, 5, bsc_usdt), coin(Chain::EthMainnet, 4, Address::ZERO));
+        l.wants = l.gives.clone();
+        l.pair = "USDT-BSC/USDT-BSC".into();
+        assert!(l.check(&open, 1_100).is_err());
+        // Any other token is refused, and a token's offer still names its pair exactly
+        let mut l = make(coin(Chain::EthMainnet, 4, Address::ZERO), coin(Chain::BscMainnet, 5, bsc_usdt));
+        l.wants.asset = Address::repeat_byte(0x42);
+        assert!(l.check(&open, 1_100).is_err());
+        let mut l = make(coin(Chain::EthMainnet, 4, Address::ZERO), coin(Chain::BscMainnet, 5, bsc_usdt));
+        l.pair = "BNB/ETH".into();
+        assert!(l.check(&open, 1_100).is_err());
+        assert_eq!((coin_decimals(Chain::SolMainnet, sol_usdt), coin_decimals(Chain::BscMainnet, bsc_usdt), coin_decimals(Chain::SolMainnet, Address::ZERO)), (6, 18, 9));
     }
 }

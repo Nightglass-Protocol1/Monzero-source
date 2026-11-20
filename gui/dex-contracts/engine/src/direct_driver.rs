@@ -26,8 +26,9 @@ pub enum DirectError {
     Driver(#[from] DriverError),
     /// Nothing was locked: our account on `chain_id` holds `have` and needs `needed` (base units)
     /// before our lock — the coin we lock plus its fees, or the fees of our claim on the other leg
+    /// `asset`: what is missing (zero: the chain's coin; else the trade's token, e.g. USDT)
     #[error("waiting for funding on chain {chain_id}: the account holds {have} and needs {needed}")]
-    AwaitingFunding { chain_id: u64, needed: U256, have: U256 },
+    AwaitingFunding { chain_id: u64, asset: Address, needed: U256, have: U256 },
 }
 
 impl From<crate::negotiation::NegotiationError> for DirectError {
@@ -311,7 +312,14 @@ async fn enough<C: EvmChain>(chain: &C, terms: &AgreedTerms, owner: bool) -> Res
     let funds = chain.funds().await?;
     let needed = funding_needed(terms, owner, funds.fee_per_gas) + chain.reserve(owner);
     if funds.balance < needed {
-        return Err(DirectError::AwaitingFunding { chain_id: terms.chain.id(), needed, have: funds.balance });
+        return Err(DirectError::AwaitingFunding { chain_id: terms.chain.id(), asset: Address::ZERO, needed, have: funds.balance });
+    }
+    // A token we lock: the tokens themselves too (the coin above pays the fees)
+    if owner && terms.asset != Address::ZERO {
+        let held = chain.token_held(terms.asset).await?;
+        if held < terms.value {
+            return Err(DirectError::AwaitingFunding { chain_id: terms.chain.id(), asset: terms.asset, needed: terms.value, have: held });
+        }
     }
     Ok(())
 }

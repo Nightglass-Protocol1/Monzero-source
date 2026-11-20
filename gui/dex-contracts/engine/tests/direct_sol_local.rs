@@ -109,7 +109,14 @@ async fn trade(e: &Env, evm_first: bool, tag: &str) -> (DirectRole, DirectRole) 
     }
     let evm = Leg { chain_id: Chain::Local.id(), contract, asset: Address::ZERO, value: U256::from(WEI), duration1: 0, duration2: 0 };
     let solana = Leg { chain_id: Chain::SolLocal.id(), contract: sol::contract_address(&e.program), asset: Address::ZERO, value: U256::from(LAMPORTS), duration1: 0, duration2: 0 };
-    let (mut a, mut b) = if evm_first { (evm, solana) } else { (solana, evm) };
+    let (a, b) = if evm_first { (evm, solana) } else { (solana, evm) };
+    run_trade(e, a, b, evm_first, tag).await
+}
+
+/// One trade of legs `a` (the leader locks) and `b` (the follower locks), both traders stepping
+/// from their journals until done. `evm_clock`: the lock deadline runs on the local EVM node's clock.
+async fn run_trade(e: &Env, mut a: Leg, mut b: Leg, evm_clock: bool, tag: &str) -> (DirectRole, DirectRole) {
+    let (lk, fk) = (signer(LEADER_KEY), signer(FOLLOWER_KEY));
     (a.duration1, a.duration2, b.duration1, b.duration2) = (3600, 8 * 3600, 3600, 4 * 3600);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let offer = DirectOffer { trade_id: keccak256(format!("{tag}-{now}")), leader: lk.address(), follower: fk.address(), leg_a: a, leg_b: b, expires_at: now + 600 };
@@ -123,7 +130,7 @@ async fn trade(e: &Env, evm_first: bool, tag: &str) -> (DirectRole, DirectRole) 
     // The EVM leg's search starts at its head; Solana reads the swap account itself. The lock
     // deadline runs on leg A's clock (a local node's clock may have been moved on by other tests)
     let evm_now = provider.get_block_by_number(head.into()).await.unwrap().unwrap().header.timestamp;
-    let deadline = if evm_first { evm_now } else { now } + 2 * 3600;
+    let deadline = if evm_clock { evm_now } else { now } + 2 * 3600;
     let dir = std::env::temp_dir().join(format!("monzero-direct-sol-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mk = |seed: SwapSeed, key: PrivateKeySigner, sess: &DirectSession, name: &str| Party {
@@ -176,4 +183,51 @@ async fn sol_for_eth_the_leader_reveals_on_the_evm_chain_and_the_follower_claims
     let (l, f) = trade(&e, false, "sol-for-eth").await;
     assert_eq!(l.stage(), "Done(Swapped)");
     assert_eq!(f.stage(), "Done(Swapped)");
+}
+
+/// SOL for USDT on Solana: both legs on one cluster and one program, the taker paying SOL and the
+/// maker 25 test USDT (a local mint). Needs MONZERO_SOL_USDT_MINT and MONZERO_SOL_USDT_BANK (hex
+/// seed of an account holding the mint's tokens and SOL) as well.
+#[tokio::test]
+async fn sol_for_usdt_on_one_solana_cluster() {
+    let Some(e) = env() else { return };
+    let (Ok(mint), Ok(bank)) = (std::env::var("MONZERO_SOL_USDT_MINT"), std::env::var("MONZERO_SOL_USDT_BANK")) else { return };
+    sol::set_local_program(e.program);
+    let mint = sol::from_base58(&mint).unwrap();
+    sol::set_local_usdt_mint(mint);
+    let bank = ed25519_dalek::SigningKey::from_bytes(&hex::decode(bank).unwrap().try_into().unwrap());
+    let (lk, fk) = (signer(LEADER_KEY), signer(FOLLOWER_KEY));
+    for k in [&lk, &fk] {
+        airdrop(&e.sol, &sol_account(k), 1_000_000_000).await;
+    }
+    let units = 25_000_000u64; // 25 USDT
+    let maker_sol = sol_account(&fk);
+    let before = sol::token_balance(&e.sol, &maker_sol, &mint).await.unwrap_or(0);
+    sol::send_token(&e.sol, &bank, &maker_sol, &mint, units).await.unwrap().unwrap();
+    for _ in 0..60 {
+        if sol::token_balance(&e.sol, &maker_sol, &mint).await.unwrap_or(0) >= before + units {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let taker_sol = sol_account(&lk);
+    let taker_before = sol::token_balance(&e.sol, &taker_sol, &mint).await.unwrap_or(0);
+    let contract = sol::contract_address(&e.program);
+    // The taker locks what the maker wants (leg A: SOL); the maker locks USDT (leg B)
+    let a = Leg { chain_id: Chain::SolLocal.id(), contract, asset: Address::ZERO, value: U256::from(LAMPORTS), duration1: 0, duration2: 0 };
+    let b = Leg { chain_id: Chain::SolLocal.id(), contract, asset: sol::asset_address(&mint), value: U256::from(units), duration1: 0, duration2: 0 };
+    let (l, f) = run_trade(&e, a, b, false, "sol-for-usdt").await;
+    assert_eq!(l.stage(), "Done(Swapped)");
+    assert_eq!(f.stage(), "Done(Swapped)");
+    assert_eq!(sol::token_balance(&e.sol, &taker_sol, &mint).await.unwrap(), taker_before + units, "the taker collected exactly 25 USDT");
+    // And sends exactly those 25 on to its own wallet, nothing else
+    let home = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]).verifying_key().to_bytes();
+    sol::send_token(&e.sol, &sol::account_key(&lk.to_bytes().0), &home, &mint, units).await.unwrap().unwrap();
+    for _ in 0..60 {
+        if sol::token_balance(&e.sol, &home, &mint).await.unwrap_or(0) >= units {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(sol::token_balance(&e.sol, &home, &mint).await.unwrap() >= units);
 }

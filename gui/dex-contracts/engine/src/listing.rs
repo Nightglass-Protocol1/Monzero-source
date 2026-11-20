@@ -176,6 +176,8 @@ pub enum ListingError {
     MoneroClosed,
     #[error("amounts must be above zero")]
     Zero,
+    #[error("the token is not one this DEX trades")]
+    Asset,
     #[error("above this relay's limit for the chain")]
     TooLarge,
     #[error("expired, from the future, or open longer than 24 hours")]

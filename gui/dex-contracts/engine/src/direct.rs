@@ -129,8 +129,10 @@ impl DirectOffer {
     /// The offer's own rules, checked by both traders before any keys are made.
     pub fn check(&self) -> Result<(), NegotiationError> {
         let (a, b) = (self.leg_a.chain()?, self.leg_b.chain()?);
-        if (a, self.leg_a.contract) == (b, self.leg_b.contract) {
-            return Err(E::InvalidShare("both legs on the same contract"));
+        // Two coins of one chain may share its contract (BNB for USDT on BNB Smart Chain: each leg is
+        // its own swap, owned by the other trader); one coin against itself may not
+        if (a, self.leg_a.contract, self.leg_a.asset) == (b, self.leg_b.contract, self.leg_b.asset) {
+            return Err(E::InvalidShare("both legs the same coin on the same contract"));
         }
         if self.leader == self.follower || self.leader == Address::ZERO || self.follower == Address::ZERO {
             return Err(E::InvalidShare("traders' accounts"));

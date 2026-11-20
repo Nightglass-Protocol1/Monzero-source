@@ -324,7 +324,10 @@ impl<C: ChainView> Relay<C> {
             (false, _) => gives.balance(l.maker).await,
         }
         .map_err(RelayError::ChainRead)?;
-        if balance < l.gives.value {
+        // The coin itself, or for a token (USDT) the chain's coin for its fees: the relay does not
+        // read token balances (the maker's own app checks the tokens before posting)
+        let backed = if l.gives.asset == Address::ZERO { balance >= l.gives.value } else { !balance.is_zero() };
+        if !backed {
             return Err(RelayError::Unfunded);
         }
         let mut book = self.direct_book();

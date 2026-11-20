@@ -239,6 +239,37 @@ pub async fn pay_out_with(url: &str, key: &SigningKey, to: &Pubkey, keep: u64, m
     Ok(Some((id, if ixs.iter().any(|(p, _, _)| p == &SYSTEM_PROGRAM) { sol } else { 0 })))
 }
 
+/// Send `units` of `mint` (USDT) to `to`'s token account (opened if it has none, paid by us), and
+/// nothing else: the rest of our tokens and our SOL stay. Returns the transaction, or None when
+/// there is nothing to send.
+pub async fn send_token(url: &str, key: &SigningKey, to: &Pubkey, mint: &Pubkey, units: u64) -> Result<Option<String>, DriverError> {
+    let rpc = Rpc::new(url)?;
+    let me = key.verifying_key().to_bytes();
+    if units == 0 || to == &me {
+        return Ok(None);
+    }
+    let have = token_balance(url, &me, mint).await?;
+    if have < units {
+        return Err(sol_err(format!("the trade account holds {have} units of the token, not {units}")));
+    }
+    let token = from_base58(TOKEN_PROGRAM)?;
+    let ata_program = from_base58(ATA_PROGRAM)?;
+    let ours = token_account(&me, mint).ok_or_else(|| sol_err("no token account address"))?;
+    let theirs = token_account(to, mint).ok_or_else(|| sol_err("no token account address"))?;
+    let mut ixs: Vec<(Pubkey, Vec<Meta>, Vec<u8>)> = vec![];
+    // Opens their token account if it has none (idempotent: nothing happens if it is there)
+    ixs.push((ata_program, vec![meta(me, true, true), meta(theirs, false, true), meta(*to, false, false), meta(*mint, false, false), meta(SYSTEM_PROGRAM, false, false), meta(token, false, false)], vec![1u8]));
+    let mut data = vec![12u8];
+    data.extend_from_slice(&units.to_le_bytes());
+    data.push(token_decimals(mint));
+    ixs.push((token, vec![meta(ours, false, true), meta(*mint, false, false), meta(theirs, false, true), meta(me, true, true)], data));
+    let list: Vec<(&Pubkey, &[Meta], &[u8])> = ixs.iter().map(|(p, a, d)| (p, a.as_slice(), d.as_slice())).collect();
+    let raw = signed(key, message_many(&me, &list, &rpc.blockhash().await?));
+    let id = bs58::encode(&raw[1..65]).into_string();
+    rpc.send(&raw).await?;
+    Ok(Some(id))
+}
+
 /// Decimals of a pinned token (USDT: 6)
 fn token_decimals(_mint: &Pubkey) -> u8 {
     6
@@ -1102,6 +1133,13 @@ impl EvmChain for SolChain {
     }
 
     /// The claimer's balance, for the gas advance: always the swap's bound claimer
+    async fn token_held(&self, _token: Address) -> Result<U256, DriverError> {
+        match self.mint {
+            Some(mint) => token_balance(&self.rpc.url, &self.account(), &mint).await.map(U256::from),
+            None => Ok(U256::MAX),
+        }
+    }
+
     async fn balance_of(&self, _who: Address) -> Result<U256, DriverError> {
         let r = self.rpc.call("getBalance", json!([to_base58(&self.binding.claimer), {"commitment": "confirmed"}])).await?;
         Ok(U256::from(r["value"].as_u64().unwrap_or(0)))
@@ -1153,6 +1191,9 @@ impl EvmChain for AnyChain {
     }
     async fn balance_of(&self, who: Address) -> Result<U256, DriverError> {
         either!(self, c => c.balance_of(who).await)
+    }
+    async fn token_held(&self, token: Address) -> Result<U256, DriverError> {
+        either!(self, c => c.token_held(token).await)
     }
     fn reserve(&self, owner: bool) -> U256 {
         either!(self, c => c.reserve(owner))

@@ -218,6 +218,12 @@ impl AlloyChain {
     /// Send all of `token` the account holds to `to` (before its coin, which pays for this too)
     pub async fn pay_out_token(&self, token: Address, to: Address) -> Result<Option<B256>, DriverError> {
         let units = self.token_balance(token, self.from).await?;
+        self.send_token(token, to, units).await
+    }
+
+    /// Send `units` of `token` to `to` (no more, whatever else the account holds). None when there
+    /// is nothing to send or a payment of ours is still pending.
+    pub async fn send_token(&self, token: Address, to: Address, units: U256) -> Result<Option<B256>, DriverError> {
         if units.is_zero() {
             return Ok(None);
         }
@@ -437,6 +443,10 @@ impl EvmChain for AlloyChain {
 
     async fn balance_of(&self, who: Address) -> Result<U256, DriverError> {
         self.reader.get_balance(who).await.map_err(chain_err)
+    }
+
+    async fn token_held(&self, token: Address) -> Result<U256, DriverError> {
+        self.token_balance(token, self.from).await
     }
 
     async fn funds(&self) -> Result<crate::driver::Funds, DriverError> {

@@ -20,7 +20,7 @@
 use crate::chain::AlloyChain;
 use crate::direct::{DirectSession, DirectTiming, SavedDirect, Side};
 use crate::direct_driver::{approve_direct, DirectDriver, DirectError, DirectFileJournal, DirectJournal, DirectRecord, DirectRole};
-use crate::direct_listing::{direct_pair, Coin, DirectListing, DirectRules, SignedDirectListing, DIRECT_LISTING_SCHEMA, LOCK_WINDOW};
+use crate::direct_listing::{coin_decimals, coin_ticker, coins_pair, usdt_asset, Coin, DirectListing, DirectRules, SignedDirectListing, DIRECT_LISTING_SCHEMA, LOCK_WINDOW};
 use crate::direct_machine::{FollowerState, LeaderState};
 use crate::driver::{durable_write, DriverError};
 use crate::exchange::KeyResponse;
@@ -80,6 +80,11 @@ pub struct DirectOfferParams {
     /// What we want in return
     pub wants_chain_id: u64,
     pub wants_value: String,
+    /// "usdt": the chain's pinned USDT instead of its own coin (absent: the coin)
+    #[serde(default)]
+    pub gives_token: Option<String>,
+    #[serde(default)]
+    pub wants_token: Option<String>,
     /// How long the offer stays open (at most 31 days)
     pub lifetime_secs: u64,
 }
@@ -212,11 +217,19 @@ async fn clock(cfg: &DirectConfig, chain: Chain) -> Result<(u64, u64), String> {
     Ok((block.header.timestamp, head))
 }
 
-/// What our trade account holds on `chain` (base units)
-async fn balance(cfg: &DirectConfig, chain: Chain, key: &PrivateKeySigner) -> Result<U256, String> {
+/// What our trade account holds on `chain` of `asset` (zero: the chain's coin), in base units
+async fn balance(cfg: &DirectConfig, chain: Chain, asset: Address, key: &PrivateKeySigner) -> Result<U256, String> {
     let rpc = cfg.rpc(chain)?;
     if chain.is_solana() {
+        if asset != Address::ZERO {
+            let mint = crate::sol::mint_of(chain, asset).map_err(|e| e.to_string())?.ok_or("unknown token")?;
+            return crate::sol::token_balance(rpc, &sol_account(key), &mint).await.map(U256::from).map_err(|e| e.to_string());
+        }
         return crate::sol::balance(rpc, &sol_account(key)).await.map(U256::from).map_err(|e| e.to_string());
+    }
+    if asset != Address::ZERO {
+        let view = AlloyChain::new(rpc, chain, Address::ZERO, 0, key.clone()).map_err(|e| e.to_string())?;
+        return view.token_balance(asset, key.address()).await.map_err(|e| e.to_string());
     }
     let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), rpc.parse().map_err(|e| format!("node for chain {}: {e}", chain.id()))?);
     provider.get_balance(key.address()).await.map_err(|e| e.to_string())
@@ -228,26 +241,43 @@ fn account_text(chain: Chain, key: &PrivateKeySigner) -> String {
 }
 
 fn amount_text(chain: Chain, v: U256) -> String {
-    let places = if chain.is_solana() { 9 } else { 18 };
+    coin_text(chain, Address::ZERO, v)
+}
+
+/// An amount of a chain's coin or token as people read it ("1.5 ETH", "25 USDT")
+fn coin_text(chain: Chain, asset: Address, v: U256) -> String {
+    let places = coin_decimals(chain, asset) as usize;
+    let ticker = match coin_ticker(chain, asset) {
+        Some("USDT-BSC") | Some("USDT") => "USDT",
+        Some(t) => t,
+        None => "units",
+    };
     let s = v.to_string();
     let s = format!("{s:0>width$}", width = places + 1);
     let (whole, part) = s.split_at(s.len() - places);
     let part = part.trim_end_matches('0');
-    if part.is_empty() { format!("{whole} {}", chain.ticker()) } else { format!("{whole}.{part} {}", chain.ticker()) }
+    if part.is_empty() { format!("{whole} {ticker}") } else { format!("{whole}.{part} {ticker}") }
 }
 
 /// Can our account lock `lock` on its chain, and pay for a claim on the other (`claim_on`)? None
 /// when it can; else what to send where. Errors: a balance could not be read.
 async fn funds_short(cfg: &DirectConfig, key: &PrivateKeySigner, lock: &Coin, claim_on: Chain) -> Result<Option<String>, String> {
     let chain = lock.chain().map_err(|e| e.to_string())?;
-    let have = balance(cfg, chain, key).await?;
+    let have = balance(cfg, chain, lock.asset, key).await?;
     if have < lock.value {
         return Ok(Some(format!(
             "the trade account {} holds {}; this trade needs {} plus network fees. Send at least {} more to it, then try again",
-            account_text(chain, key), amount_text(chain, have), amount_text(chain, lock.value), amount_text(chain, lock.value - have)
+            account_text(chain, key), coin_text(chain, lock.asset, have), coin_text(chain, lock.asset, lock.value), coin_text(chain, lock.asset, lock.value - have)
         )));
     }
-    if balance(cfg, claim_on, key).await?.is_zero() {
+    // A token lock is paid for in the chain's coin
+    if lock.asset != Address::ZERO && balance(cfg, chain, Address::ZERO, key).await?.is_zero() {
+        return Ok(Some(format!(
+            "the trade account {} holds no {}: locking the token costs a small network fee. Send a little {} to it, then try again",
+            account_text(chain, key), chain.ticker(), chain.ticker()
+        )));
+    }
+    if balance(cfg, claim_on, Address::ZERO, key).await?.is_zero() {
         return Ok(Some(format!(
             "the trade account {} holds no {}: collecting your coins there costs a small network fee. Send a little {} to it, then try again",
             account_text(claim_on, key), claim_on.ticker(), claim_on.ticker()
@@ -300,8 +330,15 @@ pub async fn post(dir: &Path, cfg: &DirectConfig, relays: &[String], params: &Di
             _ => rules.contracts.get(&chain.id()).copied().ok_or_else(|| format!("no pinned swap contract for chain {}", chain.id())),
         }
     };
-    let gives = Coin { chain_id: give.id(), contract: contract(give, local.0)?, asset: Address::ZERO, value: parse_amount(&params.gives_value, "givesValue")? };
-    let wants = Coin { chain_id: want.id(), contract: contract(want, local.1)?, asset: Address::ZERO, value: parse_amount(&params.wants_value, "wantsValue")? };
+    let asset = |chain: Chain, token: &Option<String>| -> Result<Address, String> {
+        match token.as_deref() {
+            None | Some("") => Ok(Address::ZERO),
+            Some("usdt") => usdt_asset(chain).ok_or_else(|| format!("USDT is not traded on chain {}", chain.id())),
+            Some(other) => Err(format!("unknown token {other}")),
+        }
+    };
+    let gives = Coin { chain_id: give.id(), contract: contract(give, local.0)?, asset: asset(give, &params.gives_token)?, value: parse_amount(&params.gives_value, "givesValue")? };
+    let wants = Coin { chain_id: want.id(), contract: contract(want, local.1)?, asset: asset(want, &params.wants_token)?, value: parse_amount(&params.wants_value, "wantsValue")? };
     let (now, _) = clock(cfg, give).await?;
     let mut id = [0u8; 32];
     OsRng.fill_bytes(&mut id);
@@ -309,7 +346,7 @@ pub async fn post(dir: &Path, cfg: &DirectConfig, relays: &[String], params: &Di
     let listing = DirectListing {
         schema: DIRECT_LISTING_SCHEMA.into(),
         id,
-        pair: direct_pair(give, want),
+        pair: coins_pair(&gives, &wants).map_err(|e| e.to_string())?,
         maker: key.address(),
         maker_sol: (give.is_solana() || want.is_solana()).then(|| B256::from(sol_account(&key))),
         mailbox: seed.mailbox(id, true).address(),
@@ -570,7 +607,7 @@ pub fn status(dir: &Path, key: Option<&PrivateKeySigner>) -> Result<Value, Strin
         let chain = if kind.starts_with("a:") { ca } else { cb };
         txs.insert(kind.clone(), json!(tx_ids(chain, signed)));
     }
-    let leg = |l: &crate::direct::Leg, chain: Chain| json!({"chainId": l.chain_id, "coin": chain.ticker(), "contract": l.contract.to_string(), "value": l.value.to_string(), "duration1": l.duration1, "duration2": l.duration2});
+    let leg = |l: &crate::direct::Leg, chain: Chain| json!({"chainId": l.chain_id, "coin": coin_ticker(chain, l.asset).unwrap_or("?"), "asset": l.asset.to_string(), "decimals": coin_decimals(chain, l.asset), "contract": l.contract.to_string(), "value": l.value.to_string(), "duration1": l.duration1, "duration2": l.duration2});
     // What we give and what we get, in the user's terms
     let (gives, gets) = match saved.side {
         Side::Leader => (leg(&o.leg_a, ca), leg(&o.leg_b, cb)),
@@ -580,7 +617,7 @@ pub fn status(dir: &Path, key: Option<&PrivateKeySigner>) -> Result<Value, Strin
         "direct": true,
         "side": format!("{:?}", saved.side).to_lowercase(),
         "role": match saved.side { Side::Leader => "taker", Side::Follower => "maker" },
-        "pair": direct_pair(ca, cb),
+        "pair": crate::direct_listing::coin_ticker(ca, o.leg_a.asset).zip(coin_ticker(cb, o.leg_b.asset)).map(|(x, y)| if x <= y { format!("{x}/{y}") } else { format!("{y}/{x}") }).unwrap_or_default(),
         "stage": record.state.stage(),
         "done": record.state.is_done(),
         "approved": record.approved == Some(saved.transcript),
@@ -642,15 +679,15 @@ pub async fn tick(dir: &Path, cfg: &DirectConfig) -> Result<Value, String> {
     let (awaiting, funding) = match driver.tick().await {
         Ok(_) => (false, None),
         Err(DirectError::Driver(DriverError::AwaitingApproval)) => (true, None),
-        Err(DirectError::AwaitingFunding { chain_id, needed, have }) => (false, Some((chain_id, needed, have))),
+        Err(DirectError::AwaitingFunding { chain_id, asset, needed, have }) => (false, Some((chain_id, asset, needed, have))),
         Err(e) => return Err(e.to_string()),
     };
     let mut v = status(dir, Some(&key))?;
     v["awaitingApproval"] = json!(awaiting);
     v["awaitingFunding"] = match funding {
-        Some((chain_id, needed, have)) => {
+        Some((chain_id, asset, needed, have)) => {
             let chain = chain_of(chain_id)?;
-            json!({"chainId": chain_id, "account": account_text(chain, &key), "needed": needed.to_string(), "have": have.to_string(), "missing": (needed - have).to_string(), "text": format!("send at least {} to {}", amount_text(chain, needed - have), account_text(chain, &key))})
+            json!({"chainId": chain_id, "asset": asset.to_string(), "coin": coin_ticker(chain, asset).unwrap_or("?"), "account": account_text(chain, &key), "needed": needed.to_string(), "have": have.to_string(), "missing": (needed - have).to_string(), "text": format!("send at least {} to {}", coin_text(chain, asset, needed - have), account_text(chain, &key))})
         }
         None => Value::Null,
     };
@@ -685,7 +722,7 @@ pub async fn payout(dir: &Path, cfg: &DirectConfig, chain_id: u64, to: &str) -> 
         return Ok(json!({"payout": done}));
     }
     let chain = chain_of(chain_id)?;
-    let have = balance(cfg, chain, &key).await?;
+    let have = balance(cfg, chain, leg.asset, &key).await?;
     let intent_path = dir.join("direct-payout-intent.json");
     match read::<Value>(&intent_path)? {
         // A payout may already have gone out before a restart: if the balance fell by about the
@@ -702,7 +739,23 @@ pub async fn payout(dir: &Path, cfg: &DirectConfig, chain_id: u64, to: &str) -> 
     }
     // Leave everything else in the account: other trades or offers may need it
     let keep = have.saturating_sub(amount);
-    let sent = if chain.is_solana() {
+    let sent = if leg.asset != Address::ZERO {
+        // A token: exactly the trade's amount (or what is left of it), paid for in the chain's coin
+        let units = amount.min(have);
+        if chain.is_solana() {
+            let to_key = crate::sol::from_base58(to).map_err(|e| e.to_string())?;
+            let mint = crate::sol::mint_of(chain, leg.asset).map_err(|e| e.to_string())?.ok_or("unknown token")?;
+            let units = u64::try_from(units).map_err(|_| "amount out of range")?;
+            crate::sol::send_token(cfg.rpc(chain)?, &crate::sol::account_key(&key.to_bytes().0), &to_key, &mint, units)
+                .await
+                .map_err(|e| e.to_string())?
+                .map(|tx| (tx, U256::from(units)))
+        } else {
+            let to_addr = crate::helper::parse_address(to)?;
+            let view = AlloyChain::new(cfg.rpc(chain)?, chain, leg.contract, saved.from_block_a.min(saved.from_block_b), key.clone()).map_err(|e| e.to_string())?;
+            view.send_token(leg.asset, to_addr, units).await.map_err(|e| e.to_string())?.map(|tx| (tx.to_string(), units))
+        }
+    } else if chain.is_solana() {
         let to_key = crate::sol::from_base58(to).map_err(|e| e.to_string())?;
         let keep = u64::try_from(keep).map_err(|_| "amount out of range")?;
         crate::sol::pay_out_with(cfg.rpc(chain)?, &crate::sol::account_key(&key.to_bytes().0), &to_key, keep, None)
