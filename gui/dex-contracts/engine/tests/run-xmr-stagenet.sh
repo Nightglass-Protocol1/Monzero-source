@@ -15,10 +15,10 @@ cd "$(dirname "$0")/.."
 ROOT=${MONZERO_ROOT:-$HOME/projects/Monzero-App}
 MONERO_DIR=${MONERO_DIR:-$ROOT/core/build/monero-official}
 WORK=${WORK:-$ROOT/core/build/xmr-stagenet}
-# Monero stagenet nodes to try: XMZ_NODE, or these public ones. The one used is the first that
+# Monero stagenet nodes to try: XMZ_NODE, or the project's own (31.70.193.31) then these public ones. The one used is the first that
 # a wallet can really sync from (answering get_height is not enough: 2026-11-14 a node did
 # that and still gave the wallets no blocks all night).
-NODES=${XMZ_NODE:-node2.monerodevs.org:38089 node3.monerodevs.org:38089 stagenet.xmr-tw.org:38081 node.monerodevs.org:38089}
+NODES=${XMZ_NODE:-31.70.193.31:38089 node2.monerodevs.org:38089 node3.monerodevs.org:38089 stagenet.xmr-tw.org:38081 node.monerodevs.org:38089}
 T=$ROOT/core/build/dex-rust-toolchain-1.95.0/sysroot/usr
 export PATH=$T/bin:$PATH LD_LIBRARY_PATH=$T/lib/x86_64-linux-gnu CARGO_HOME=$ROOT/core/build/dex-cargo-home
 FUNDER_PORT=38183; RELAY_PORT=18796
