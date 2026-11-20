@@ -833,6 +833,8 @@ bool DexEngine::configureEvmTrade(const QString &config,const QString &seedFile)
 }
 QVariantMap DexEngine::evmTradeStatus() const {
     auto s=m_evmTrade->status();s.insert("stepping",m_evmTicker->isActive());s.insert("startRefusal",m_evmStartRefusal);
+    // Which take or offer folder this trade is (the XMR/XMZ route follows its first swap by it)
+    s.insert("tradeDir",m_evmTrade->tradeDir());
     // What the trade is paid in, for the trade card: the chain's coin, or USDT on Solana
     const auto offer=m_evmTrade->offer();
     if (!offer.isEmpty()) {

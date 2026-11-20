@@ -148,6 +148,24 @@ function planMarket(b, side, atoms, onlyId) {
              suggestion: { row: best, atoms: a, coin: fillCoin(best, a) } }
 }
 
+// Spend at most `budget` coin on the best ask that allows it (one offer: a trade is one offer):
+// all of a whole offer that costs no more, or the largest part of a partial one that fits.
+// {ok, row, atoms, coin, price} or {ok: false, reason: "empty" | "short"}
+function planSpend(b, budget) {
+    var rows = b.asks.filter(function (r) { return !r.mine })
+    if (!rows.length) return { ok: false, reason: "empty" }
+    if (!(budget > 0)) return { ok: false, reason: "short" }
+    for (var i = 0; i < rows.length; ++i) {
+        var r = rows[i]
+        if (r.coin <= budget) return { ok: true, row: r, atoms: r.atoms, coin: r.coin, price: r.price }
+        if (!r.partial) continue
+        var atoms = Math.floor(budget / r.coin * r.atoms)
+        if (atoms < r.atoms && r.atoms - atoms < r.minAtoms) atoms = r.atoms - r.minAtoms
+        if (fillOk(r, atoms)) return { ok: true, row: r, atoms: atoms, coin: fillCoin(r, atoms), price: r.price }
+    }
+    return { ok: false, reason: "short" }
+}
+
 // Coin text for a limit order of `atoms` XMZ at `unitPrice` coin per XMZ, at most `decimals` places
 // (9 shown at most: smaller steps are not meaningful at these prices)
 function limitCoin(unitPrice, atoms, decimals, places) {

@@ -258,7 +258,7 @@ Item {
                               valueWei: "1", xmzAtoms: "1", expiresAt: root.now + 7200 } ] } }
             verify(ex.xmrLive.indexOf("ETH/XMR") >= 0)
             verify(ex.soonPairs.indexOf("ETH/XMR") < 0)
-            compare(ex.soonPairs.length, 14)
+            compare(ex.soonPairs.length, 13)   // ETH/XMR, and XMR/XMZ through ETH
             engine.calls = []
             press("pair_ETH/XMR")
             verify(ex.xmrPair); compare(ex.coin, "ETH"); compare(ex.base, "XMR")
@@ -283,6 +283,40 @@ Item {
             ex.pick("SOL")
             verify(!ex.xmrPair); compare(ex.base, "XMZ"); compare(find(ex, "exchangeForm").base, "XMZ")
             engine.xmrMarketStatus = {}
+        }
+        function test_xmr_for_xmz_runs_as_two_swaps_through_a_coin() {
+            // Someone sells up to 0.5 XMR for 0.1 SOL, any part from 0.1 XMR (SAMPLE values)
+            engine.xmrMarketStatus = { SOL: { configured: true, busy: false, coin: "SOL", chainId: 501000101, privateCoin: "XMR", relays: [], mine: [],
+                listings: [ { id: "0xd1", pair: "SOL/XMR", side: "sell-xmz", chainId: 501000101, maker: "0x00000000000000000000000000000000000000b0",
+                              valueWei: "100000000", xmzAtoms: "500000000000", minXmzAtoms: "100000000000", expiresAt: root.now + 7200 } ] } }
+            verify(ex.routeOpen); verify(ex.xmrLive.indexOf("XMR/XMZ") >= 0)
+            engine.calls = []
+            press("pair_XMR/XMZ")
+            verify(ex.routeMode); verify(find(ex, "routePanel").visible); verify(!find(ex, "exchangeForm").visible)
+            var rp = find(ex, "routePanel")
+            compare(rp.viaNow, "SOL")
+            find(ex, "routeAmount").text = "500"
+            // 1: 500 XMZ into the best bid (0xb1, partial): 0.06 SOL; 2: 98% of it buys 0.294 XMR
+            compare(find(ex, "routeStepOne").text, "1. Sell 500 XMZ for 0.06 SOL")
+            verify(find(ex, "routeStepTwo").text.indexOf("2. Buy 0.294 XMR with 0.0588 SOL") === 0, find(ex, "routeStepTwo").text)
+            press("routeStartOne")
+            compare(JSON.stringify(engine.calls.filter(function (c) { return c[0] === "take" })), JSON.stringify([["take", "0xb1", "500"]]))
+            compare(rp.step, 1)
+            // An earlier finished trade is not step 1
+            engine.evmTradeStatus = { configured: true, tradeDir: "/t/evm-trades/501000101/take-a2", snapshot: { done: true, stage: "Done(Swapped)" } }
+            verify(!rp.stepOneDone)
+            engine.evmTradeStatus = { configured: true, tradeDir: "/t/evm-trades/501000101/take-b1", snapshot: { done: false, stage: "Locked" } }
+            verify(!rp.stepOneDone)
+            engine.evmTradeStatus = { configured: true, tradeDir: "/t/evm-trades/501000101/take-b1", snapshot: { done: true, stage: "Done(Swapped)" } }
+            verify(rp.stepOneDone)
+            press("routeStartTwo")
+            compare(JSON.stringify(engine.calls.filter(function (c) { return c[0] === "take" })), JSON.stringify([["take", "0xb1", "500"], ["take", "0xd1", "0.294"]]))
+            compare(rp.step, 2)
+            rp.reset()
+            engine.evmTradeStatus = { configured: false }
+            engine.xmrMarketStatus = {}
+            verify(!ex.routeOpen)
+            ex.pick("SOL")
         }
             function test_the_monero_wallet_shows_and_sends_from_the_funds_tab() {
             ex.bottomTab = "funds"

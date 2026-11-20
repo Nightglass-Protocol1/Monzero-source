@@ -54,12 +54,18 @@ ColumnLayout {
     readonly property var livePairs: direct.configured === true ? (direct.pairs || []) : []
     // "USDT/XMR" -> "USDT": the coin of a Monero pair ("" for XMR/XMZ, which is two swaps)
     function xmrCoinOf(p) { var x = String(p).split("/"); return x[1] === "XMR" ? x[0] : "" }
-    readonly property var xmrLive: announcedPairs.filter(function (p) { var c = xmrCoinOf(p); return c !== "" && (xmrMarkets[c] || {}).configured === true })
+    // XMR/XMZ runs as two swaps through a coin with both an XMZ and an XMR market here
+    readonly property bool routeOpen: allCoins.some(function (c) { return (markets[c] || {}).configured === true && (xmrMarkets[c] || {}).configured === true })
+    readonly property var xmrLive: announcedPairs.filter(function (p) {
+        if (p === "XMR/XMZ") return routeOpen
+        var c = xmrCoinOf(p); return c !== "" && (xmrMarkets[c] || {}).configured === true
+    })
     readonly property var soonPairs: announcedPairs.filter(function (p) { return livePairs.indexOf(p) < 0 && xmrLive.indexOf(p) < 0 })
     property string soonPair: ""            // the coming-soon pair picked in the pair row
     readonly property bool soonMode: coin === "SOON"
+    readonly property bool routeMode: coin === "ROUTE"
     // The XMZ pair screens (stats, chart, book, form, orders) give way to a direct or coming-soon pair
-    readonly property bool pairMode: directMode || soonMode
+    readonly property bool pairMode: directMode || soonMode || routeMode
     function pickSoon(p) { soonPair = p; pick("SOON") }
     function pickXmr(p) { pick(xmrCoinOf(p), "XMR") }
     readonly property bool keysReady: wallet.keysReady === true
@@ -280,7 +286,7 @@ ColumnLayout {
         b = b || "XMZ"
         if (c === coin && b === base) return
         coin = c; base = b; pickedId = ""; localError = ""
-        if (c === "SOON") { return }
+        if (c === "SOON" || c === "ROUTE") { return }
         if (c === "DIRECT") { var cs = direct.chains || []; for (var i = 0; i < cs.length; ++i) loadBalance(cs[i].coin) }
         else { loadPrints(dataKey); loadBalance(c); if (xmrPair) loadCandles(dataKey) }
         refreshOffers()
@@ -378,7 +384,8 @@ ColumnLayout {
             delegate: Rectangle {
                 objectName: "pair_" + modelData
                 readonly property string pairCoin: ex.xmrCoinOf(modelData)
-                readonly property bool active: ex.xmrPair && ex.coin === pairCoin
+                readonly property bool route: modelData === "XMR/XMZ"
+                readonly property bool active: route ? ex.routeMode : ex.xmrPair && ex.coin === pairCoin
                 readonly property int offers: ((ex.xmrMarkets[pairCoin] || {}).listings || []).filter(function (l) { return l.expiresAt > ex.now }).length
                 width: 136; height: 44; radius: 6
                 color: active ? M.Style.surfaceRaised : "transparent"
@@ -387,9 +394,9 @@ ColumnLayout {
                     anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
                     spacing: 2
                     Text { text: ex.directLabel(modelData); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
-                    Text { text: offers > 0 ? qsTr("%n offer(s)", "", offers) : qsTr("Monero"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
+                    Text { text: route ? qsTr("two swaps") : offers > 0 ? qsTr("%n offer(s)", "", offers) : qsTr("Monero"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
                 }
-                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pickXmr(modelData) }
+                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: route ? ex.pick("ROUTE") : ex.pickXmr(modelData) }
             }
         }
         // Announced pairs not trading here yet
@@ -654,6 +661,21 @@ ColumnLayout {
                       : qsTr("Coin for coin, straight across. It opens here once it has passed its test-network and real-funds tests (USDT has no test-network token, so USDT pairs show only on the real networks).")
             }
         }
+    }
+
+    // ---- XMR for XMZ: two swaps through a coin both trade against
+    M.DexRoutePanel {
+        objectName: "routePanel"
+        Layout.fillWidth: true
+        visible: ex.routeMode
+        dex: ex.dex
+        xmzMarkets: ex.markets
+        xmrMarkets: ex.xmrMarkets
+        trade: ex.trade
+        coins: ex.allCoins
+        myAccount: ex.myAccount
+        now: ex.now
+        keysReady: ex.keysReady
     }
 
     // ---- coin for coin: its own book, form, trades and accounts
