@@ -224,6 +224,8 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     connect(m_marketTicker,&QTimer::timeout,this,[this]{if (m_direct && dexKeysReady()) m_direct->step();});
     m_btcMarket=new BtcMarketJob(this);m_btcTicker=new QTimer(this);
     m_dexWallets=new DexWalletService(this);
+    m_xmrWallets=new DexWalletService(this);
+    connect(m_xmrWallets,&DexWalletService::changed,this,&DexEngine::xmrWalletChanged);
     connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::dexWalletChanged);
     connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::setUpEvmMarkets);
     connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::setUpUtxoMarket);
@@ -1369,6 +1371,29 @@ QVariantMap DexEngine::dexWalletStatus() const {
     return s;
 }
 bool DexEngine::refreshDexWallet() {return m_dexWallets->refresh();}
+bool DexEngine::configureXmrWallets(const QString &root,const QString &walletRpc,const QString &walletRpcSha256,const QString &node,
+        const QString &networkFlag,const QString &helper,const QString &helperSha256) {
+    // node: "host:port" of a Monero node's wallet (restricted) RPC
+    static const QRegularExpression format("\\A([A-Za-z0-9][A-Za-z0-9.-]{0,252}):([0-9]{1,5})\\z");
+    const auto m=format.match(node);
+    bool ok=false;const auto port=m.captured(2).toUShort(&ok);
+    if (!m.hasMatch() || !ok || port==0) return false;
+    return m_xmrWallets->setCoin(QStringLiteral("xmr"),m.captured(1))
+        && m_xmrWallets->configure(root,walletRpc,walletRpcSha256,port,networkFlag,helper,helperSha256) && m_xmrWallets->start();
+}
+QVariantMap DexEngine::xmrWalletStatus() const {
+    auto s=m_xmrWallets->status();
+    // Not set up in this app (no Monero wallet RPC installed with it, or Monero not open on this network)
+    if (m_xmrWallets->coin()!="xmr") s.insert("state","unconfigured");
+    return s;
+}
+bool DexEngine::refreshXmrWallet() {return m_xmrWallets->coin()=="xmr" && m_xmrWallets->refresh();}
+bool DexEngine::sendFromXmrWallet(const QString &address,const QString &amount) {
+    if (m_xmrWallets->coin()!="xmr") return false;
+    QString atoms;
+    if (!amount.trimmed().isEmpty()) {atoms=atomic(amount,12);if (atoms.isEmpty()) return false;}
+    return m_xmrWallets->send(address.trimmed(),atoms);
+}
 // Where no light wallet holds the trade keys (e.g. Windows): keep them in a self-contained,
 // password-encrypted store next to the trading wallet.
 bool DexEngine::usingTradeKeyStore() const { return m_lightSetupHelper.isEmpty(); }

@@ -25,6 +25,12 @@ public:
     ~DexWalletService() override;
     bool configure(const QString &root,const QString &walletRpc,const QString &walletRpcSha256,quint16 daemonPort,
                    const QString &networkFlag,const QString &helper,const QString &helperSha256);
+    // Before configure: the coin these wallets hold. "xmr": Monero's own wallet RPC on a remote
+    // Monero node (`daemonHost`), the trading wallet and per-trade wallets only (no BTC/LTC
+    // journal services), amounts in 12 places. Default "xmz" on the app's local node.
+    bool setCoin(const QString &coin,const QString &daemonHost);
+    QString coin() const {return m_coin;}
+    QString daemonHost() const {return m_daemonHost;}
     bool start();
     void stop();
     bool ready() const {return m_state=="ready";}
@@ -50,11 +56,13 @@ private:
     bool runHelper(const QJsonObject &walletRequest,std::function<void(const QJsonObject&)> done);
     void openWallet();
     bool makePasswordFile(const QString &path);
+    QString passwordFile() const {return m_root+(m_coin=="xmr" ? "/xmr-wallet.password" : "/xmz-wallet.password");}
     bool resumeAfterUncleanExit(const QString &serviceDir,const QString &portPath);
     bool stopLeftover(const QString &serviceDir,const QString &pidPath);
     static void writePid(const QString &path,qint64 pid);
     bool startService(const QString &name,const QString &id,QPointer<SwapWalletRpcProcess> &slot,quint16 &port,std::function<void()> listening);
     static quint16 freePort();
+    QString m_coin=QStringLiteral("xmz"),m_daemonHost=QStringLiteral("127.0.0.1");
     QString m_root,m_walletRpc,m_walletRpcSha256,m_networkFlag,m_helper,m_helperSha256,m_state="unconfigured",m_error;
     quint16 m_daemonPort=0,m_walletPort=0;
     QPointer<SwapWalletRpcProcess> m_main,m_claim,m_observer;

@@ -72,6 +72,7 @@ class DexEngine : public QObject {
     Q_PROPERTY(QVariantMap directMarketStatus READ directMarketStatus NOTIFY directMarketChanged)
     Q_PROPERTY(QVariantMap btcMarketStatus READ btcMarketStatus NOTIFY btcMarketChanged)
     Q_PROPERTY(QVariantMap dexWalletStatus READ dexWalletStatus NOTIFY dexWalletChanged)
+    Q_PROPERTY(QVariantMap xmrWalletStatus READ xmrWalletStatus NOTIFY xmrWalletChanged)
     // Read-only public data for the in-app exchange (Linux): candles, trades, balance, USD prices
     Q_PROPERTY(QObject *exchangeFeed READ exchangeFeed CONSTANT)
     Q_PROPERTY(QVariantMap bchSuccessReleaseReviewStatus READ bchSuccessReleaseReviewStatus NOTIFY bchSuccessReleaseReviewChanged)
@@ -311,6 +312,16 @@ public:
                              const QString &networkFlag,const QString &helper,const QString &helperSha256);
     QVariantMap dexWalletStatus() const;
     DexWalletService *dexWallets() const {return m_dexWallets;}
+    // The app's Monero (XMR) trading wallet: Monero's own wallet RPC (installed with the app) on a
+    // Monero node (`host:port`; the project's own by default). Like the XMZ trading wallet, the
+    // user moves XMR in and out of it; XMR trades lock from it and pay into it.
+    bool configureXmrWallets(const QString &root,const QString &walletRpc,const QString &walletRpcSha256,const QString &node,
+                             const QString &networkFlag,const QString &helper,const QString &helperSha256);
+    QVariantMap xmrWalletStatus() const;
+    DexWalletService *xmrWallets() const {return m_xmrWallets;}
+    Q_INVOKABLE bool refreshXmrWallet();
+    // Send XMR from the trading wallet to `address` (a Monero address; amount in XMR, empty: everything)
+    Q_INVOKABLE bool sendFromXmrWallet(const QString &address,const QString &amount);
     Q_INVOKABLE bool refreshDexWallet();
     // Unlocks this session's trade keys (ETH/BNB) from the Bitcoin or Litecoin light wallet's vault;
     // the password goes only to the vault helper and the keys stay in native memory until exit.
@@ -549,6 +560,7 @@ signals:
     void directMarketChanged();
     void btcMarketChanged();
     void dexWalletChanged();
+    void xmrWalletChanged();
     void bchSuccessReleaseReviewChanged();
     void bchSuccessSignedReleaseReviewChanged();
     void bchSuccessSignatureReviewChanged();
@@ -623,6 +635,7 @@ private:
     void stepEvmMarket();
     BtcMarketJob *m_btcMarket=nullptr;
     DexWalletService *m_dexWallets=nullptr;
+    DexWalletService *m_xmrWallets=nullptr;
     QString m_evmAccount,m_keysMessage;
     QMetaObject::Connection m_accountsConn;   // one-shot: the store path pulls the EVM address from the helper
     bool m_keysBusy=false;

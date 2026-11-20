@@ -25,6 +25,8 @@ const QString WalletName="dex";
 const QString MainServiceId="6d6f6e7a-6572-4f64-8578-77616c6c6574";
 const QString ClaimServiceId="6d6f6e7a-6572-4f64-8578-636c61696d73";
 const QString ObserverServiceId="6d6f6e7a-6572-4f64-8578-6f6273657276";
+// The Monero trading wallet's binding (its own folder and id)
+const QString XmrServiceId="6d6f6e7a-6572-4f64-8578-786d72776c74";
 // A port kept next to a service folder: the service binding records it, so a restart reuses it
 quint16 keptPort(const QString &path,quint16 fresh) {
     QFile f(path);
@@ -56,6 +58,12 @@ quint16 DexWalletService::freePort() {
     QTcpServer probe;
     if (!probe.listen(QHostAddress::LocalHost,0)) return 0;
     const auto port=probe.serverPort();probe.close();return port;
+}
+
+bool DexWalletService::setCoin(const QString &coin,const QString &daemonHost) {
+    static const QRegularExpression host("\\A[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\\z");
+    if (m_state!="unconfigured" || (coin!="xmz" && coin!="xmr") || !host.match(daemonHost).hasMatch()) return false;
+    m_coin=coin;m_daemonHost=daemonHost;return true;
 }
 
 bool DexWalletService::configure(const QString &root,const QString &walletRpc,const QString &walletRpcSha256,quint16 daemonPort,
@@ -125,7 +133,7 @@ bool DexWalletService::resumeAfterUncleanExit(const QString &serviceDir,const QS
         if (stopLeftover(serviceDir,pidPath)) for (int i=0;i<50 && !portFree();++i) QThread::msleep(100);
     }
     if (!portFree()) {m_error=tr("A DEX wallet service is still running from an earlier session.");return false;}
-    for (const auto &name:QDir(serviceDir).entryList({"monzero-wallet-rpc.*.login"},QDir::Files)) QFile::remove(serviceDir+"/"+name);
+    for (const auto &name:QDir(serviceDir).entryList({"monzero-wallet-rpc.*.login","monero-wallet-rpc.*.login"},QDir::Files)) QFile::remove(serviceDir+"/"+name);
     QSaveFile reset(statePath);
     const QByteArray stopped="monzero-swap-rpc-v1\nstopped\n";
     const bool ok=reset.open(QIODevice::WriteOnly) && reset.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner)
@@ -141,7 +149,8 @@ bool DexWalletService::startService(const QString &name,const QString &id,QPoint
     if ((!QFileInfo::exists(serviceDir) && !privateDir(serviceDir)) || !resumeAfterUncleanExit(serviceDir,portPath)) return false;
     auto *service=new SwapWalletRpcProcess(this);
     slot=service;port=keptPort(portPath,freePort());
-    service->setNetworkFlag(m_networkFlag);
+    service->setNetworkFlag(m_networkFlag);service->setDaemonHost(m_daemonHost);
+    if (m_coin=="xmr") service->setMoneroWallet();
     const auto pidPath=m_root+"/"+name+".pid";
     connect(service,&SwapWalletRpcProcess::processStarted,this,[this,service,name,listening,pidPath]{
         writePid(pidPath,service->processId());
@@ -172,9 +181,11 @@ bool DexWalletService::start() {
     const auto fail=[this](const QString &why){m_state="failed";if (!why.isEmpty()) m_error=why;qWarning("DEX wallets: %s",qPrintable(m_error));emit changed();return false;};
     if (!privateDir(m_root)) return fail(tr("The DEX folder could not be created."));
     // Passwords made once: the trading wallet's, and the one the swap journal gives the wallets it creates
-    if (!makePasswordFile(m_root+"/xmz-wallet.password") || !makePasswordFile(m_root+"/claim-wallet.password"))
+    if (!makePasswordFile(passwordFile()) || (m_coin=="xmz" && !makePasswordFile(m_root+"/claim-wallet.password")))
         return fail(tr("The DEX wallet password could not be saved."));
     m_state="starting";m_claimUp=m_observerUp=false;m_stopping=false;emit changed();
+    // Monero: the trading wallet only (its trades get their own wallets as XMZ trades do)
+    if (m_coin=="xmr") return startService("xmr-wallet",XmrServiceId,m_main,m_walletPort,[this]{openWallet();}) || fail({});
     // The trading wallet (also the XMZ source when selling XMZ for BTC/LTC), the claim service the
     // swap journal creates claim wallets in, and the observer service it watches XMZ locks with
     if (!startService("xmz-wallet",MainServiceId,m_main,m_walletPort,[this]{openWallet();})) return fail({});
@@ -229,7 +240,7 @@ bool DexWalletService::runHelper(const QJsonObject &walletRequest,std::function<
 
 void DexWalletService::openWallet() {
     runHelper({{"wallet",QJsonObject{{"url",QStringLiteral("http://127.0.0.1:%1").arg(m_walletPort)},{"loginFile",m_main->loginFile()}}},
-        {"action","open"},{"name",WalletName},{"passwordFile",m_root+"/xmz-wallet.password"}},[this](const QJsonObject &r){
+        {"action","open"},{"name",WalletName},{"passwordFile",passwordFile()}},[this](const QJsonObject &r){
         if (!r.value("ok").toBool()) {m_state="failed";m_error=r.value("error").toString().left(300);qWarning("DEX trading wallet: %s",qPrintable(m_error));emit changed();return;}
         m_wallet=r;m_state="ready";m_error.clear();m_poll.start();emit changed();
     });
@@ -237,7 +248,7 @@ void DexWalletService::openWallet() {
 
 bool DexWalletService::refresh() {
     if (!ready() || m_running>0) return false;
-    return runHelper({{"wallet",mainEndpoint()},{"action","status"},{"name",WalletName},{"passwordFile",m_root+"/xmz-wallet.password"}},
+    return runHelper({{"wallet",mainEndpoint()},{"action","status"},{"name",WalletName},{"passwordFile",passwordFile()}},
         [this](const QJsonObject &r){
             if (r.value("ok").toBool()) {m_wallet=r;m_error.clear();} else m_error=r.value("error").toString().left(300);
             emit changed();
@@ -247,7 +258,7 @@ bool DexWalletService::refresh() {
 bool DexWalletService::send(const QString &address,const QString &atoms) {
     static const QRegularExpression addressPattern("\\A[0-9A-Za-z]{90,110}\\z"),digits("\\A[1-9][0-9]{0,19}\\z");
     if (!ready() || !addressPattern.match(address).hasMatch() || (!atoms.isEmpty() && !digits.match(atoms).hasMatch())) return false;
-    QJsonObject request{{"wallet",mainEndpoint()},{"action","send"},{"name",WalletName},{"passwordFile",m_root+"/xmz-wallet.password"},{"to",address}};
+    QJsonObject request{{"wallet",mainEndpoint()},{"action","send"},{"name",WalletName},{"passwordFile",passwordFile()},{"to",address}};
     if (!atoms.isEmpty()) request.insert("atoms",atoms);
     return runHelper(request,[this](const QJsonObject &r){
         if (r.value("ok").toBool()) {m_wallet=r;m_error.clear();} else m_error=r.value("error").toString().left(300);
@@ -267,7 +278,8 @@ void DexWalletService::tradeService(const QString &tradeDir,const QString &trade
     if (id.isEmpty() || (!QFileInfo::exists(dir) && !privateDir(dir)) || !resumeAfterUncleanExit(dir,tradeDir+"/swap-service.port")) {done({});return;}
     auto *service=new SwapWalletRpcProcess(this);
     const auto port=keptPort(tradeDir+"/swap-service.port",freePort());
-    service->setNetworkFlag(m_networkFlag);
+    service->setNetworkFlag(m_networkFlag);service->setDaemonHost(m_daemonHost);
+    if (m_coin=="xmr") service->setMoneroWallet();
     connect(service,&SwapWalletRpcProcess::processStarted,this,[this,service,tradeDir,port,done]{
         writePid(tradeDir+"/swap-service.pid",service->processId());
         auto *wait=new QTimer(this);wait->setInterval(250);
@@ -292,12 +304,14 @@ void DexWalletService::releaseTradeService(const QString &tradeDir) {
 }
 
 QVariantMap DexWalletService::status() const {
-    const auto atoms=[](const QString &a){
-        QString d=a.isEmpty()?QStringLiteral("0"):a;while (d.size()<=11) d.prepend('0');
-        QString w=d.left(d.size()-11),f=d.mid(d.size()-11);while (f.endsWith('0')) f.chop(1);
+    // XMZ has 11 decimal places, Monero 12
+    const int places=m_coin=="xmr" ? 12 : 11;
+    const auto atoms=[places](const QString &a){
+        QString d=a.isEmpty()?QStringLiteral("0"):a;while (d.size()<=places) d.prepend('0');
+        QString w=d.left(d.size()-places),f=d.mid(d.size()-places);while (f.endsWith('0')) f.chop(1);
         return f.isEmpty()?w:w+"."+f;
     };
-    return {{"state",m_state},{"error",m_error},{"busy",m_running>0},{"address",m_wallet.value("address").toString()},
+    return {{"coin",m_coin},{"daemon",m_coin=="xmr" ? QStringLiteral("%1:%2").arg(m_daemonHost).arg(m_daemonPort) : QString()},{"state",m_state},{"error",m_error},{"busy",m_running>0},{"address",m_wallet.value("address").toString()},
         {"balance",atoms(m_wallet.value("balanceAtoms").toString())},{"unlocked",atoms(m_wallet.value("unlockedAtoms").toString())},
         {"height",m_wallet.value("height").toDouble()},{"trades",m_trades.size()}};
 }

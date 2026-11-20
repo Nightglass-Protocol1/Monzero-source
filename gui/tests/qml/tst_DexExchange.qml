@@ -45,6 +45,8 @@ Item {
         function postEvmOffer(chainId, side, coin, xmz, hours, min, renew) { calls.push(["post", chainId, side, coin, xmz, hours, min].concat(renew ? ["renew"] : [])); return true }
         function cancelEvmOffer(folder) { calls.push(["cancel", folder]); return true }
         function approveTradingKeysHelper(commitment) { calls.push(["approveHelper", commitment]); return true }
+        property var xmrWalletStatus: ({ coin: "xmr", state: "ready", balance: "1.5", unlocked: "1.25", address: "5" + "A".repeat(94), daemon: "31.70.193.31:38089", busy: false })
+        function sendFromXmrWallet(address, amount) { calls.push(["sendXmr", address, amount]); return true }
     }
     M.DexExchange { id: ex; width: root.width; dex: engine; fetchEnabled: false }
 
@@ -222,5 +224,17 @@ Item {
             engine.evmTradeStatus = { configured: false }
             verify(f.ready)
         }
-    }
+            function test_the_monero_wallet_shows_and_sends_from_the_funds_tab() {
+            ex.bottomTab = "funds"
+            verify(find(ex, "fundsXmrColumn").visible)
+            compare(find(ex, "fundsXmr").text, "1.25 XMR available · 1.5 XMR in total")
+            compare(find(ex, "xmrAddress").text, "5" + "A".repeat(94))
+            find(ex, "xmrSendTo").text = "5" + "B".repeat(94)
+            find(ex, "xmrSendAmount").text = "0.5"
+            press("xmrSend")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["sendXmr", "5" + "B".repeat(94), "0.5"]]))
+            engine.xmrWalletStatus = { state: "unconfigured" }
+            verify(!find(ex, "fundsXmrColumn").visible)
+        }
+}
 }

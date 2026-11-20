@@ -23,6 +23,9 @@ ColumnLayout {
 
     // ---- state from the engine
     readonly property var wallet: (dex && dex.dexWalletStatus) || ({})
+    // The Monero trading wallet, where this app runs one
+    readonly property var xmrWallet: (dex && dex.xmrWalletStatus) || ({})
+    readonly property bool xmrShown: xmrWallet.state !== undefined && xmrWallet.state !== "unconfigured"
     readonly property var markets: (dex && dex.evmMarketStatus) || ({})
     readonly property var trade: (dex && dex.evmTradeStatus) || ({})
     readonly property var market: markets[coin] || ({})
@@ -723,6 +726,37 @@ ColumnLayout {
                             small: true; primary: false; text: qsTr("Move to my wallet")
                             enabled: ex.wallet.busy !== true && ex.mainAddress() !== ""
                             onClicked: ex.localError = ex.dex.sendFromDexWallet(ex.mainAddress(), xmzMove.text) ? "" : qsTr("The XMZ could not be moved now.")
+                        }
+                    }
+                }
+                // XMR: the app's Monero trading wallet (on a Monero node), moved in and out like the XMZ one
+                ColumnLayout {
+                    objectName: "fundsXmrColumn"
+                    Layout.fillWidth: true; Layout.alignment: Qt.AlignTop; spacing: 8
+                    visible: ex.xmrShown
+                    Text { text: qsTr("XMR · Monero trading wallet"); font.pixelSize: 14; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    Text {
+                        objectName: "fundsXmr"
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 13; color: M.Style.defaultFontColor
+                        text: ex.xmrWallet.state === "ready" ? qsTr("%1 XMR available · %2 XMR in total").arg(ex.xmrWallet.unlocked).arg(ex.xmrWallet.balance)
+                            : ex.xmrWallet.state === "failed" ? qsTr("The Monero wallet is not running: %1").arg(ex.xmrWallet.error || "")
+                            : qsTr("Starting the Monero wallet…")
+                    }
+                    Text {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.dimmedFontColor
+                        text: qsTr("Send XMR here from any Monero wallet to trade it. XMR you buy arrives here; send it on to your own Monero wallet whenever you like. Node: %1").arg(ex.xmrWallet.daemon || "—")
+                    }
+                    M.LineEdit { objectName: "xmrAddress"; Layout.fillWidth: true; readOnly: true; copyButton: true; fontSize: 12; text: ex.xmrWallet.address || ""; visible: (ex.xmrWallet.address || "") !== "" }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        visible: ex.xmrWallet.state === "ready"
+                        M.LineEdit { id: xmrTo; objectName: "xmrSendTo"; Layout.fillWidth: true; fontSize: 13; inputPaddingTop: 6; inputPaddingBottom: 6; placeholderText: qsTr("Your Monero address"); placeholderFontSize: 13 }
+                        M.LineEdit { id: xmrAmount; objectName: "xmrSendAmount"; Layout.preferredWidth: 120; fontSize: 13; inputPaddingTop: 6; inputPaddingBottom: 6; placeholderText: qsTr("XMR (empty: all)"); placeholderFontSize: 13 }
+                        M.StandardButton {
+                            objectName: "xmrSend"
+                            small: true; text: qsTr("Send XMR")
+                            enabled: xmrTo.text.trim() !== "" && ex.xmrWallet.busy !== true
+                            onClicked: ex.localError = ex.dex.sendFromXmrWallet(xmrTo.text.trim(), xmrAmount.text.trim()) ? "" : qsTr("The XMR could not be sent: check the address and amount.")
                         }
                     }
                 }

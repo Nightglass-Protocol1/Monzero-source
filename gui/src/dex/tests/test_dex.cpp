@@ -697,6 +697,46 @@ private slots:
         QCOMPARE(engine.calls,(QStringList{"payout /t/take-2 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"}));
         QCOMPARE(attention.count(),1);   // the take waiting for approval, announced once
     }
+    // The Monero trading wallet: Monero's own wallet RPC (a stand-in named like it) started on a
+    // remote Monero node for the network, its wallet opened through the helper, XMR in 12 places
+    void xmrWalletServiceRunsMoneroWalletRpcOnARemoteNode() {
+        QTemporaryDir root;QVERIFY(root.isValid());
+        const auto dir=root.path();
+        auto put=[](const QString &path,const QByteArray &data){QFile f(path);return f.open(QIODevice::WriteOnly|QIODevice::Truncate) && f.write(data)==data.size()
+            && f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner|QFileDevice::ExeOwner);};
+        const auto rpc=dir+"/monero-wallet-rpc",helper=dir+"/helper";
+        QVERIFY(put(rpc,QStringLiteral("#!/bin/sh\nprintf '%s\\n' \"$@\" > %1/args\nport=; prev=\nfor a in \"$@\"; do [ \"$prev\" = --rpc-bind-port ] && port=$a; prev=$a; done\n"
+            "echo 'monero:secret' > \"monero-wallet-rpc.$port.login\"\nexec sleep 30\n").arg(dir).toUtf8()));
+        QVERIFY(put(helper,QStringLiteral("#!/bin/sh\ncat > %1/helper-request\n"
+            "echo '{\"schema\":\"monzero-xmz-evm-helper-response-v1\",\"ok\":true,\"address\":\"5AAAA\",\"balanceAtoms\":\"1500000000000\",\"unlockedAtoms\":\"1250000000000\",\"height\":1}'\n").arg(dir).toUtf8()));
+        const auto digest=[](const QString &p){QFile f(p);f.open(QIODevice::ReadOnly);return QString::fromLatin1(QCryptographicHash::hash(f.readAll(),QCryptographicHash::Sha256).toHex());};
+        DexEngine engine;
+        QCOMPARE(engine.xmrWalletStatus().value("state").toString(),QString("unconfigured"));
+        QVERIFY(!engine.configureXmrWallets(dir+"/xmr",rpc,digest(rpc),"no-port",QStringLiteral("--stagenet"),helper,digest(helper)));
+        QVERIFY(engine.configureXmrWallets(dir+"/xmr",rpc,digest(rpc),"31.70.193.31:38089",QStringLiteral("--stagenet"),helper,digest(helper)));
+        QTRY_COMPARE_WITH_TIMEOUT(engine.xmrWalletStatus().value("state").toString(),QString("ready"),15000);
+        const auto s=engine.xmrWalletStatus();
+        QCOMPARE(s.value("coin").toString(),QString("xmr"));
+        QCOMPARE(s.value("balance").toString(),QString("1.5"));
+        QCOMPARE(s.value("unlocked").toString(),QString("1.25"));
+        QCOMPARE(s.value("daemon").toString(),QString("31.70.193.31:38089"));
+        QFile args(dir+"/args");QVERIFY(args.open(QIODevice::ReadOnly));
+        const auto list=QString::fromUtf8(args.readAll()).split('\n');
+        QCOMPARE(list.value(0),QString("--stagenet"));
+        QCOMPARE(list.value(list.indexOf("--daemon-address")+1),QString("31.70.193.31:38089"));
+        QVERIFY(list.value(list.indexOf("--wallet-dir")+1).startsWith(dir+"/xmr/xmr-wallet/"));
+        // The wallet was opened through the helper with the Monero wallet's own password file
+        QFile request(dir+"/helper-request");QVERIFY(request.open(QIODevice::ReadOnly));
+        const auto r=QJsonDocument::fromJson(request.readAll()).object().value("xmzWallet").toObject();
+        QCOMPARE(r.value("action").toString(),QString("open"));
+        QCOMPARE(r.value("passwordFile").toString(),dir+"/xmr/xmr-wallet.password");
+        QVERIFY(r.value("wallet").toObject().value("loginFile").toString().contains("/monero-wallet-rpc."));
+        // Amounts in XMR become 12-place atoms; a bad amount sends nothing
+        QVERIFY(!engine.sendFromXmrWallet("5"+QString(94,'B'),"0.0000000000001"));
+        QVERIFY(engine.sendFromXmrWallet("5"+QString(94,'B'),"0.5"));
+        QTRY_VERIFY_WITH_TIMEOUT(QJsonDocument::fromJson([&]{QFile f(dir+"/helper-request");f.open(QIODevice::ReadOnly);return f.readAll();}()).object()
+            .value("xmzWallet").toObject().value("atoms").toString()=="500000000000",10000);
+    }
     void directMarketAmounts() {
         QCOMPARE(DirectMarketJob::pairOf(501000101,1),QString("ETH/SOL"));
         QCOMPARE(DirectMarketJob::pairOf(56,1),QString("BNB/ETH"));

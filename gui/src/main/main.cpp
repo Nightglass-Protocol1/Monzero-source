@@ -859,6 +859,24 @@ int main(int argc, char *argv[])
                     QCoreApplication::applicationDirPath()+QString::fromLatin1(BundledDexHelpers::evmRelativePath),QString::fromLatin1(BundledDexHelpers::evmSha256)))
                 qWarning("The DEX trading wallet could not start");
         }
+        // The Monero (XMR) trading wallet, when Monero's own wallet RPC is installed with the app:
+        // on the project's Monero node unless MONZERO_DEX_XMR_NODE (host:port) names another.
+        // Monero's main network only once XMR trading is opened (MONZERO_DEX_XMR_MAINNET=1 for tests).
+#ifdef Q_OS_WIN
+        const auto xmrRpc=QCoreApplication::applicationDirPath()+"/monero-wallet-rpc.exe";
+#else
+        const auto xmrRpc=QCoreApplication::applicationDirPath()+"/monero-wallet-rpc";
+#endif
+        const bool xmrMainnet=DexDeployment::mainnetStage();
+        QFile xmrFile(xmrRpc);QCryptographicHash xmrHash(QCryptographicHash::Sha256);
+        if ((!xmrMainnet || qgetenv("MONZERO_DEX_XMR_MAINNET")=="1") && xmrFile.open(QIODevice::ReadOnly) && xmrHash.addData(&xmrFile)) {
+            const auto override=qEnvironmentVariable("MONZERO_DEX_XMR_NODE");
+            const auto node=!override.isEmpty() ? override : xmrMainnet ? QStringLiteral("31.70.193.31:18089") : QStringLiteral("31.70.193.31:38089");
+            const auto root=QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath(xmrMainnet ? "dex/mainnet/xmr" : "dex/testnet/xmr");
+            if (!dexEngine.configureXmrWallets(root,xmrRpc,QString::fromLatin1(xmrHash.result().toHex()),node,xmrMainnet ? QString() : QStringLiteral("--stagenet"),
+                    QCoreApplication::applicationDirPath()+QString::fromLatin1(BundledDexHelpers::evmRelativePath),QString::fromLatin1(BundledDexHelpers::evmSha256)))
+                qWarning("The DEX Monero wallet could not start");
+        }
     }
     if (parser.isSet(dexBtcMarketOption)) {
         if (!dexPrototypeEnabled || !dexEngine.configureBtcMarket(parser.value(dexBtcMarketOption))) {

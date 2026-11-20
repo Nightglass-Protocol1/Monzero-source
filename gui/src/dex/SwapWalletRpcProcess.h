@@ -29,6 +29,11 @@ public:
     void stop();
     // The XMZ network of the daemon ("--testnet" or "--stagenet"; none for mainnet). Before start.
     bool setNetworkFlag(const QString &flag);
+    // The node the wallet reads the chain from: 127.0.0.1 (the app's own node, the default) or a
+    // remote node's host name or IPv4 address (Monero: the project's or the user's own node)
+    bool setDaemonHost(const QString &host);
+    // The program is Monero's own wallet RPC (its login file is named after it)
+    bool setMoneroWallet();
     // Caller must record before dispatch and complete only after verifying the
     // native operation. Tokens prevent late callbacks completing a newer action.
     bool walletOperationAvailable() const;
@@ -54,6 +59,8 @@ private:
         quint16 walletPort, bool resume,const QByteArray &binding=QByteArray());
     bool recordState(const QByteArray &state);
     QString m_networkFlag;
+    QString m_daemonHost=QStringLiteral("127.0.0.1");
+    QString m_loginPrefix=QStringLiteral("monzero-wallet-rpc");
     bool finishRecord(bool clean);
     bool removeLoginAfterExit();
     std::unique_ptr<QLockFile> m_lock;

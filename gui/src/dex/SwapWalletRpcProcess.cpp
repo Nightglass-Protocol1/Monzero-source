@@ -14,6 +14,7 @@
 #include <QTemporaryFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <sodium.h>
 #ifdef Q_OS_LINUX
 #include <unistd.h>
@@ -212,7 +213,9 @@ bool SwapWalletRpcProcess::launch(const QString &program, const QString &directo
     m_directory = directory;
     m_lock = std::move(lock);
     if (!recordState("active")) { m_lock.reset(); return false; }
-    m_login = QDir(m_directory).filePath(QString("monzero-wallet-rpc.%1.login").arg(walletPort));
+    // The wallet RPC's login file has a name fixed in its own code: "monzero-wallet-rpc." here,
+    // "monero-wallet-rpc." in Monero's (see setMoneroWallet)
+    m_login = QDir(m_directory).filePath(QString("%1.%2.login").arg(m_loginPrefix).arg(walletPort));
     m_daemonPort = daemonPort;
     m_walletPort = walletPort;
     m_used = true;
@@ -223,13 +226,24 @@ bool SwapWalletRpcProcess::launch(const QString &program, const QString &directo
     m_process->setStandardOutputFile(QProcess::nullDevice());
     m_process->setStandardErrorFile(QProcess::nullDevice());
     QStringList arguments{"--wallet-dir",QDir(m_directory).filePath("wallets"),
-        "--daemon-address",QString("127.0.0.1:%1").arg(daemonPort),
+        "--daemon-address",QString("%1:%2").arg(m_daemonHost).arg(daemonPort),
         "--rpc-bind-ip","127.0.0.1","--rpc-bind-port",QString::number(walletPort),
         "--non-interactive","--max-concurrency","2",
         "--log-file",QDir(m_directory).filePath("rpc.log")};
     if (!m_networkFlag.isEmpty()) arguments.prepend(m_networkFlag);
     m_process->start(program,arguments);
     return true;
+}
+
+bool SwapWalletRpcProcess::setMoneroWallet() {
+    if (m_used) return false;
+    m_loginPrefix=QStringLiteral("monero-wallet-rpc");return true;
+}
+
+bool SwapWalletRpcProcess::setDaemonHost(const QString &host) {
+    static const QRegularExpression name("\\A[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\\z");
+    if (m_used || !name.match(host).hasMatch()) return false;
+    m_daemonHost=host;return true;
 }
 
 bool SwapWalletRpcProcess::setNetworkFlag(const QString &flag) {
