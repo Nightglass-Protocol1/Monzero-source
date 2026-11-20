@@ -157,6 +157,48 @@ fn sol_account(key: &PrivateKeySigner) -> [u8; 32] {
     crate::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes()
 }
 
+/// Why the trade account's coin on `chain_id` must stay where it is, if it must: a direct trade
+/// on that chain still running, an open offer of ours that gives it, or a take of ours waiting
+/// for its maker that would lock it. `root` holds the direct trade folders. The XMZ markets'
+/// `withdraw` asks this too: both kinds of trade share one trade account per chain.
+pub fn funds_in_use(root: &Path, chain_id: u64, now: u64) -> Result<Option<String>, String> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("the direct trades folder could not be read: {e}")),
+    };
+    for entry in entries {
+        let dir = entry.map_err(|e| e.to_string())?.path();
+        if !dir.is_dir() || dir.join("abandoned").exists() {
+            continue;
+        }
+        if dir.join("direct-journal.json").exists() {
+            // A journal we cannot read is treated as a running trade
+            let record = journal(&dir).load().map_err(|e| format!("a direct trade's record could not be read: {e}"))?;
+            if let Some(saved) = &record.trade {
+                let on_chain = saved.offer.leg_a.chain_id == chain_id || saved.offer.leg_b.chain_id == chain_id;
+                if on_chain && !record.state.is_done() {
+                    return Ok(Some("a direct trade is still running: its account needs its funds until it finishes or refunds".into()));
+                }
+                continue;
+            }
+        }
+        if let Some(file) = read::<MakerFile>(&dir.join("direct-listing.json"))? {
+            let l = &file.listing.listing;
+            if l.gives.chain_id == chain_id && !file.closed && (file.taken_by.is_some() || l.expires_at > now) {
+                return Ok(Some("a direct offer of yours is still open: cancel it first".into()));
+            }
+        }
+        if let Some(file) = read::<TakerFile>(&dir.join("direct-take.json"))? {
+            let l = &file.listing.listing;
+            if l.wants.chain_id == chain_id && !dir.join("refused").exists() && l.expires_at > now {
+                return Ok(Some("a direct offer you took is waiting for its maker: its account needs its funds".into()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The chain's clock and head (EVM block; Solana finalized slot)
 async fn clock(cfg: &DirectConfig, chain: Chain) -> Result<(u64, u64), String> {
     crate::helper::step("reading the coins' networks");
@@ -692,5 +734,56 @@ mod tests {
         assert_eq!(amount_text(Chain::EthMainnet, U256::from(15u64) * U256::from(10u64.pow(17))), "1.5 ETH");
         assert_eq!(amount_text(Chain::SolMainnet, U256::from(2_000_000_000u64)), "2 SOL");
         assert_eq!(amount_text(Chain::BscMainnet, U256::from(1u64)), "0.000000000000000001 BNB");
+    }
+
+    fn listing(gives: u64, wants: u64, expires_at: u64) -> SignedDirectListing {
+        let coin = |chain_id| Coin { chain_id, contract: Address::repeat_byte(1), asset: Address::ZERO, value: U256::from(1u64) };
+        let key = PrivateKeySigner::random();
+        DirectListing {
+            schema: DIRECT_LISTING_SCHEMA.into(),
+            id: B256::repeat_byte(7),
+            pair: "BNB/ETH".into(),
+            maker: key.address(),
+            maker_sol: None,
+            mailbox: B256::repeat_byte(9),
+            gives: coin(gives),
+            wants: coin(wants),
+            created_at: 1,
+            expires_at,
+        }
+        .sign(&key)
+    }
+
+    #[test]
+    fn direct_offers_and_takes_keep_the_funds_they_need() {
+        const NOW: u64 = 1_800_000_000;
+        let root = std::env::temp_dir().join(format!("monzero-direct-funds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(funds_in_use(&root, 1, NOW).unwrap(), None, "no folder: nothing in use");
+        // Our open offer gives ETH (1) for BNB (56): ETH is held, BNB is not
+        let offer = root.join("offer-1");
+        std::fs::create_dir_all(&offer).unwrap();
+        let mut maker = MakerFile { listing: listing(1, 56, NOW + 60), taken_by: None, answered: BTreeSet::new(), closed: false };
+        write(&offer.join("direct-listing.json"), &maker).unwrap();
+        assert!(funds_in_use(&root, 1, NOW).unwrap().is_some());
+        assert_eq!(funds_in_use(&root, 56, NOW).unwrap(), None);
+        // Expired or closed: free again
+        assert_eq!(funds_in_use(&root, 1, NOW + 61).unwrap(), None);
+        maker.closed = true;
+        write(&offer.join("direct-listing.json"), &maker).unwrap();
+        assert_eq!(funds_in_use(&root, 1, NOW).unwrap(), None);
+        // A take of a SOL-for-BNB offer: we would lock BNB (what the maker wants)
+        let take = root.join("take-1");
+        std::fs::create_dir_all(&take).unwrap();
+        let taker = TakerFile { listing: listing(Chain::SolMainnet.id(), 56, NOW + 60), from_block_a: 0, from_block_b: 0, first_sent_at: NOW, sent_at: NOW };
+        write(&take.join("direct-take.json"), &taker).unwrap();
+        assert!(funds_in_use(&root, 56, NOW).unwrap().is_some());
+        assert_eq!(funds_in_use(&root, Chain::SolMainnet.id(), NOW).unwrap(), None);
+        std::fs::write(take.join("refused"), "no").unwrap();
+        assert_eq!(funds_in_use(&root, 56, NOW).unwrap(), None);
+        // A journal we cannot read counts as a running trade
+        std::fs::write(take.join("direct-journal.json"), "not json").unwrap();
+        assert!(funds_in_use(&root, 56, NOW).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

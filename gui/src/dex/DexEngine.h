@@ -10,6 +10,8 @@
 #include <QFutureWatcher>
 #include <QPointer>
 #include <QHash>
+#include <QJsonArray>
+#include <QSet>
 class DexExchangeFeed;
 
 enum class OfferState { Draft, Quoted, Matched, XmzLocked, ExternalLocked, Redeemable, Settled, Refunding, Refunded, Expired, Cancelled };
@@ -27,6 +29,7 @@ class BchNativeProofJob;
 class BchNativeObservationJob;
 class EvmTradeJob;
 class EvmMarketJob;
+class DirectMarketJob;
 class BtcMarketJob;
 class DexWalletService;
 class BchSuccessReleaseReviewJob;
@@ -66,6 +69,7 @@ class DexEngine : public QObject {
     Q_PROPERTY(QVariantMap bchNativeObservationStatus READ bchNativeObservationStatus NOTIFY bchNativeObservationChanged)
     Q_PROPERTY(QVariantMap evmTradeStatus READ evmTradeStatus NOTIFY evmTradeChanged)
     Q_PROPERTY(QVariantMap evmMarketStatus READ evmMarketStatus NOTIFY evmMarketChanged)
+    Q_PROPERTY(QVariantMap directMarketStatus READ directMarketStatus NOTIFY directMarketChanged)
     Q_PROPERTY(QVariantMap btcMarketStatus READ btcMarketStatus NOTIFY btcMarketChanged)
     Q_PROPERTY(QVariantMap dexWalletStatus READ dexWalletStatus NOTIFY dexWalletChanged)
     // Read-only public data for the in-app exchange (Linux): candles, trades, balance, USD prices
@@ -280,6 +284,25 @@ public:
     Q_INVOKABLE bool cancelEvmOffer(const QString &folder);
     // Coin paid into the trade account that no trade or open offer needs goes back to the user's wallet
     Q_INVOKABLE bool returnEvmFunds(int chainId,const QString &address);
+    // Direct (coin <-> coin) trades: ETH, BNB and SOL against each other, no XMZ leg (see
+    // DirectMarketJob). They use the same trade account per chain as the XMZ markets. On the main
+    // networks they stay off until direct pairs are opened (MONZERO_DEX_DIRECT_MAINNET=1 tests).
+    QVariantMap directMarketStatus() const;
+    Q_INVOKABLE bool refreshDirectOffers();
+    // Amounts as decimal text in coins; lifetime 1 hour to 31 days
+    Q_INVOKABLE bool postDirectOffer(int givesChain,const QString &givesAmount,int wantsChain,const QString &wantsAmount,int lifetimeHours);
+    // Why an order of these amounts would be refused by either coin's kill switch or caps; "" if none
+    Q_INVOKABLE QString directOrderRefusal(int givesChain,const QString &givesAmount,int wantsChain,const QString &wantsAmount);
+    Q_INVOKABLE bool takeDirectOffer(const QString &listingId);
+    Q_INVOKABLE bool cancelDirectOffer(const QString &folder);
+    // The taker's approval of its trade's terms (the commitment its trade shows); checked and
+    // counted under both coins' limits first
+    Q_INVOKABLE bool approveDirectTrade(const QString &folder,const QString &commitment);
+    // After a direct trade: what it brought in goes to the user's own wallet
+    Q_INVOKABLE bool payoutDirectTrade(const QString &folder,const QString &address);
+    // Starts the direct market on this stage's chains (called with the XMZ markets)
+    void setUpDirectMarket(const QJsonArray &relays,const QList<QPair<int,QString>> &chains);
+    DirectMarketJob *directMarket() const {return m_direct;}
     // BTC/XMZ offers through the open relays (see BtcMarketJob). An agreed trade opens in the
     // trade setup review (reviewLitecoinTradeSetup / importLitecoinTradeSetup) like any other.
     bool configureBtcMarket(const QString &config);
@@ -523,6 +546,7 @@ signals:
     void bchNativeObservationChanged();
     void evmTradeChanged();
     void evmMarketChanged();
+    void directMarketChanged();
     void btcMarketChanged();
     void dexWalletChanged();
     void bchSuccessReleaseReviewChanged();
@@ -580,6 +604,12 @@ private:
     QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();
     QHash<int,EvmMarketJob*> m_evmMarkets;   // by chain id
+    DirectMarketJob *m_direct=nullptr;
+    QString m_directMessage;
+    QSet<QString> m_directRecorded;   // direct trades already counted in the trade-limit ledger
+    // Kill switch and caps of both coins of a direct trade (units as decimal digits)
+    QString directRefusal(const QString &ledgerId,qint64 givesChain,const QString &givesUnits,qint64 wantsChain,const QString &wantsUnits);
+    void recordDirectStarts();
     DexExchangeFeed *m_exchangeFeed=nullptr;
 public:
     QObject *exchangeFeed() const;

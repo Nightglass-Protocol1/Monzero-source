@@ -931,6 +931,10 @@ pub async fn withdraw(root: &Path, cfg: &TickConfig, chain_id: u64, to: &str, no
     if let Some(why) = funds_in_use(root, now)? {
         return Err(why);
     }
+    // Direct (coin <-> coin) trades use the same trade account: their folders sit beside the chains'
+    if let Some(why) = crate::helper_direct::funds_in_use(&root.with_file_name("direct"), chain_id, now)? {
+        return Err(why);
+    }
     // On Solana the SOL and USDT markets share one trade account (folders <chain id> and the app's
     // USDT market <chain id + 100>): an open offer or trade in either keeps its funds
     if Chain::from_id(chain_id).is_some_and(Chain::is_solana) {

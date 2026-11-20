@@ -15,6 +15,7 @@
 #include "BchNativeObservationJob.h"
 #include "EvmTradeJob.h"
 #include "EvmMarketJob.h"
+#include "DirectMarketJob.h"
 #include "BtcMarketJob.h"
 #include "DexWalletService.h"
 #include "BchSuccessReleaseReviewJob.h"
@@ -219,6 +220,8 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     m_marketTicker=new QTimer(this);
     m_marketTicker->setInterval(20000);
     connect(m_marketTicker,&QTimer::timeout,this,&DexEngine::stepEvmMarket);
+    // Direct trades step on the same beat: every open offer, take and running trade, each time
+    connect(m_marketTicker,&QTimer::timeout,this,[this]{if (m_direct && dexKeysReady()) m_direct->step();});
     m_btcMarket=new BtcMarketJob(this);m_btcTicker=new QTimer(this);
     m_dexWallets=new DexWalletService(this);
     connect(m_dexWallets,&DexWalletService::changed,this,&DexEngine::dexWalletChanged);
@@ -957,6 +960,7 @@ void DexEngine::setUpEvmMarkets() {
             chains.append({int(DexChains::SolUsdtLocal),c.rpc});
     }
     QJsonArray relays;for (const auto &r:defaultRelays()) relays.append(r);
+    QList<QPair<int,QString>> directChains;
     for (const auto &c:chains) {
         const auto rpcOverride=qEnvironmentVariable(QStringLiteral("MONZERO_DEX_EVM_RPC_%1").arg(c.id).toLatin1().constData());
         // Until a trade agrees, the swap wallet is the trading wallet's service; each trade gets its own
@@ -970,8 +974,131 @@ void DexEngine::setUpEvmMarkets() {
         if (!f.open(QIODevice::WriteOnly|QIODevice::Truncate) || !f.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner)) continue;
         f.write(QJsonDocument(config).toJson(QJsonDocument::Compact));f.close();
         if (!addEvmMarket(path)) qWarning("The DEX market for chain %d could not start",c.id);
+        // Direct trades: each chain's own coin (no tokens), on the same nodes
+        if (!DexChains::token(c.id)) directChains.append({c.id,config.value("evmRpc").toString()});
     }
+    setUpDirectMarket(relays,directChains);
     resumeEvmTrades();
+}
+void DexEngine::setUpDirectMarket(const QJsonArray &relays,const QList<QPair<int,QString>> &chains) {
+    if (m_direct || !m_dexWallets->ready()) return;
+    // Real coins: off until direct pairs are opened (the owner's real-funds test sets the variable;
+    // the relays refuse real-coin direct offers until they are opened there too)
+    const bool mainnet=DexDeployment::mainnetStage();
+    if (mainnet && qEnvironmentVariable("MONZERO_DEX_DIRECT_MAINNET")!=QLatin1String("1")) return;
+    QJsonObject rpcs;
+    for (const auto &c:chains) rpcs.insert(QString::number(c.first),c.second);
+    QJsonObject config{{"helper",m_dexWallets->helper()},{"helperDigest",m_dexWallets->helperSha256()},
+        {"tradesDir",m_dexWallets->root()+"/evm-trades/direct"},{"rpcs",rpcs},{"relays",relays},{"mainnet",mainnet}};
+    const auto localSolProgram=qEnvironmentVariable("MONZERO_DEX_SOL_LOCAL_PROGRAM");
+    for (const auto &c:chains) if (c.first==int(DexChains::SolLocal) && DexChains::solanaAddress(localSolProgram)) config.insert("localSolProgram",localSolProgram);
+    auto *job=new DirectMarketJob(this);
+    if (!job->configure(config)) {qWarning("The DEX direct market could not start");job->deleteLater();return;}
+    m_direct=job;
+    connect(job,&DirectMarketJob::changed,this,&DexEngine::directMarketChanged);
+    connect(job,&DirectMarketJob::changed,this,&DexEngine::recordDirectStarts);
+    if (!m_evmSwapSeedHex.isEmpty()) job->setSwapKeys(m_evmSwapSeedHex,m_evmKeyHex);
+    // Each coin's control document, so the first order is not refused for lack of one
+    for (const auto &c:chains) {const auto network=evmControlNetwork(c.first);if (!network.isEmpty()) bindEvmNetwork(network);}
+    m_marketTicker->start();
+    emit directMarketChanged();
+}
+QVariantMap DexEngine::directMarketStatus() const {
+    if (!m_direct) return {{"configured",false}};
+    auto s=m_direct->status();s.insert("message",m_directMessage);
+    return s;
+}
+bool DexEngine::refreshDirectOffers() {return m_direct && m_direct->refreshListings();}
+QString DexEngine::directRefusal(const QString &ledgerId,qint64 givesChain,const QString &givesUnits,qint64 wantsChain,const QString &wantsUnits) {
+    // Both coins' documents apply: either kill switch stops the trade, and each coin has its caps
+    const QList<QPair<qint64,QString>> legs{{givesChain,givesUnits},{wantsChain,wantsUnits}};
+    for (const auto &leg:legs) {
+        const auto network=evmControlNetwork(leg.first);
+        if (network.isEmpty()) return tr("%1 is not supported for trading.").arg(DirectMarketJob::tickerOf(leg.first));
+        bool ok=false;const quint64 units=leg.second.toULongLong(&ok);
+        if (!ok) return tr("The amount is too large while the DEX is opening.");
+        bindEvmNetwork(network);
+        const auto refusal=m_evmRiskControl->refusal(ledgerId,units,0);
+        if (!refusal.isEmpty()) return refusal;
+    }
+    return {};
+}
+QString DexEngine::directOrderRefusal(int givesChain,const QString &givesAmount,int wantsChain,const QString &wantsAmount) {
+    const auto g=atomic(givesAmount,DirectMarketJob::decimalsOf(givesChain)),w=atomic(wantsAmount,DirectMarketJob::decimalsOf(wantsChain));
+    if (g.isEmpty() || w.isEmpty()) return {};   // the form reports unreadable amounts itself
+    return directRefusal(OfferCheckId,givesChain,g,wantsChain,w);
+}
+bool DexEngine::postDirectOffer(int givesChain,const QString &givesAmount,int wantsChain,const QString &wantsAmount,int lifetimeHours) {
+    const auto say=[this](const QString &why){m_directMessage=why;emit directMarketChanged();return false;};
+    if (!m_direct) return say(tr("Direct trades are not available in this wallet."));
+    if (!dexKeysReady()) return say(tr("Unlock your trading keys first."));
+    const auto g=atomic(givesAmount,DirectMarketJob::decimalsOf(givesChain)),w=atomic(wantsAmount,DirectMarketJob::decimalsOf(wantsChain));
+    if (g.isEmpty() || w.isEmpty() || lifetimeHours<1 || lifetimeHours>31*24) return say(tr("Check the amounts and how long the offer stays open (1 hour to 31 days)."));
+    if (DirectMarketJob::tickerOf(givesChain)==DirectMarketJob::tickerOf(wantsChain)) return say(tr("Pick two different coins."));
+    // The maker's posting is its approval: the limits are checked now, and counted when it is taken
+    const auto refusal=directRefusal(OfferCheckId,givesChain,g,wantsChain,w);
+    if (!refusal.isEmpty()) return say(refusal);
+    const bool started=m_direct->post(givesChain,g,wantsChain,w,qint64(lifetimeHours)*3600);
+    m_directMessage=started ? QString() : tr("The offer could not be posted now.");
+    emit directMarketChanged();return started;
+}
+bool DexEngine::takeDirectOffer(const QString &listingId) {
+    const auto say=[this](const QString &why){m_directMessage=why;emit directMarketChanged();return false;};
+    if (!m_direct) return say(tr("Direct trades are not available in this wallet."));
+    if (!dexKeysReady()) return say(tr("Unlock your trading keys first."));
+    const auto l=m_direct->listing(listingId);
+    if (l.isEmpty()) return say(tr("That offer is no longer listed."));
+    if (l.value("maker").toString().compare(m_evmAccount,Qt::CaseInsensitive)==0) return say(tr("That is your own offer."));
+    // We give what the maker wants
+    const auto gives=l.value("wants").toMap(),wants=l.value("gives").toMap();
+    const auto refusal=directRefusal(OfferCheckId,qint64(gives.value("chainId").toDouble()),gives.value("units").toString(),
+        qint64(wants.value("chainId").toDouble()),wants.value("units").toString());
+    if (!refusal.isEmpty()) return say(refusal);
+    const bool started=m_direct->take(listingId);
+    m_directMessage=started ? QString() : tr("The offer could not be taken now.");
+    emit directMarketChanged();return started;
+}
+bool DexEngine::cancelDirectOffer(const QString &folder) {return m_direct && m_direct->cancel(folder);}
+bool DexEngine::approveDirectTrade(const QString &folder,const QString &commitment) {
+    const auto say=[this](const QString &why){m_directMessage=why;emit directMarketChanged();return false;};
+    if (!m_direct || !dexKeysReady()) return false;
+    const auto f=m_direct->folder(folder);
+    const auto trade=f.value("trade").toMap();
+    if (f.isEmpty() || trade.value("commitment")!=commitment) return say(tr("The trade changed; check it again."));
+    const auto ledgerId=evmLedgerId(trade.value("tradeId").toString());
+    const auto gives=trade.value("gives").toMap(),gets=trade.value("gets").toMap();
+    const qint64 gc=qint64(gives.value("chainId").toDouble()),wc=qint64(gets.value("chainId").toDouble());
+    if (ledgerId.isEmpty()) return say(tr("The trade could not be checked; not started."));
+    const auto refusal=directRefusal(ledgerId,gc,gives.value("value").toString(),wc,gets.value("value").toString());
+    if (!refusal.isEmpty()) return say(refusal);
+    // Counted under the coin we lock (its daily limit), before anything is locked
+    bindEvmNetwork(evmControlNetwork(gc));
+    if (!m_evmRiskControl->recordStart(ledgerId,gives.value("value").toString().toULongLong()))
+        return say(tr("The trade could not be recorded; not started."));
+    m_directRecorded.insert(ledgerId);
+    m_directMessage.clear();
+    return m_direct->approve(folder,commitment);
+}
+void DexEngine::recordDirectStarts() {
+    // A maker's trade starts when it is taken, with no click: it is counted when first seen
+    if (!m_direct) return;
+    for (const auto &v:m_direct->status().value("mine").toList()) {
+        const auto f=v.toMap(),trade=f.value("trade").toMap();
+        if (f.value("kind")!="offer" || trade.isEmpty()) continue;
+        const auto ledgerId=evmLedgerId(trade.value("tradeId").toString());
+        if (ledgerId.isEmpty() || m_directRecorded.contains(ledgerId)) continue;
+        const auto gives=trade.value("gives").toMap();
+        const auto network=evmControlNetwork(qint64(gives.value("chainId").toDouble()));
+        if (network.isEmpty()) continue;
+        bindEvmNetwork(network);
+        if (m_evmRiskControl->recordStart(ledgerId,gives.value("value").toString().toULongLong())) m_directRecorded.insert(ledgerId);
+    }
+}
+bool DexEngine::payoutDirectTrade(const QString &folder,const QString &address) {
+    if (!m_direct || !dexKeysReady()) return false;
+    const bool started=m_direct->payout(folder,address);
+    m_directMessage=started ? QString() : tr("Check the address: it must be on the chain the coin came in on.");
+    emit directMarketChanged();return started;
 }
 namespace {
 // Trade settings of each swap network: confirmations and timelocks, the fee of each contract spend,
@@ -1251,6 +1378,7 @@ void DexEngine::applyUnlockedTradeKeys(QByteArray seed,QByteArray key,const QStr
     if (seed.isEmpty()||key.isEmpty()) {m_keysMessage=tr("The trading keys could not be unlocked; check the password.");emit dexWalletChanged();return;}
     m_evmTrade->setSwapKeys(seed,key);
     for (auto *job:m_evmMarkets) job->setSwapKeys(seed,key);
+    if (m_direct) m_direct->setSwapKeys(seed,key);
     sodium_memzero(m_evmSwapSeedHex.data(),m_evmSwapSeedHex.size());sodium_memzero(m_evmKeyHex.data(),m_evmKeyHex.size());
     m_evmSwapSeedHex=seed;m_evmKeyHex=key;
     m_keysMessage.clear();

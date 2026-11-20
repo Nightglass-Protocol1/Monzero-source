@@ -11,6 +11,7 @@
 #include "BchRefundWalletWorkerTestFixture.h"
 #include "../DexEngine.h"
 #include "../EvmMarketJob.h"
+#include "../DirectMarketJob.h"
 #include "../BtcTradeSetup.h"
 #include "../BtcMarketJob.h"
 #include "../LitecoinAppConfig.h"
@@ -464,6 +465,133 @@ private slots:
         EvmMarketJob again;QVERIFY(again.configure(path));
         QCOMPARE(states(again).value("take-waiting"),QString("cancelled|"));
         QCOMPARE(states(again).value("take-refused").section('|',0,0),QString("refused"));
+    }
+    // Direct (coin <-> coin) trades through a stand-in helper: the offers shown in book terms, a
+    // take that agrees, the taker's approval of exactly the terms shown, steps until it swapped,
+    // then the payout on the chain the coin came in on; our own offer posted and withdrawn.
+    void directMarketRunsOffersTakesTradesAndPayouts() {
+        QTemporaryDir root;QVERIFY(root.isValid());
+        const auto dir=root.path(),trades=dir+"/direct";
+        auto put=[](const QString &path,const QByteArray &data){QFile f(path);return f.open(QIODevice::WriteOnly|QIODevice::Truncate) && f.write(data)==data.size();};
+        const QString maker="0x5138775820628775ce6d90b7fee72c854d18cbf6",contract="0x1111111111111111111111111111111111111111",zero="0x0000000000000000000000000000000000000000";
+        auto coin=[&](double chain,const QString &hex){return QJsonObject{{"chainId",chain},{"contract",contract},{"asset",zero},{"value",hex}};};
+        // 0.5 BNB (testnet 97) offered for 0.01 ETH (Sepolia)
+        const QJsonObject listing{{"schema","monzero-dex-direct-listing/1"},{"id","0x"+QString(64,'a')},{"pair","BNB/ETH"},{"maker",maker},
+            {"mailbox","0x"+QString(64,'b')},{"gives",coin(97,"0x6f05b59d3b20000")},{"wants",coin(11155111,"0x2386f26fc10000")},
+            {"createdAt",1800000000.0},{"expiresAt",4000000000.0}};
+        const QJsonObject signedListing{{"listing",listing},{"signature","0x00"}};
+        const auto ok=[](QJsonObject o){o.insert("schema","monzero-xmz-evm-helper-response-v1");o.insert("ok",true);return QJsonDocument(o).toJson(QJsonDocument::Compact);};
+        const QVariantMap give{{"chainId",11155111.0},{"coin","ETH"},{"value","10000000000000000"}},get{{"chainId",97.0},{"coin","BNB"},{"value","500000000000000000"}};
+        const auto trade=[&](const QString &stage,bool done){return QJsonObject{{"direct",true},{"role","taker"},{"pair","BNB/ETH"},{"stage",stage},{"done",done},
+            {"commitment","0x"+QString(64,'c')},{"tradeId","0x"+QString(64,'d')},{"gives",QJsonObject::fromVariantMap(give)},{"gets",QJsonObject::fromVariantMap(get)}};};
+        auto agreedAnswer=trade("Leader(Start)",false);agreedAnswer.insert("agreed",true);
+        QVERIFY(put(dir+"/resp-directListings.json",ok({{"listings",QJsonArray{QJsonObject{{"signed",signedListing},{"relays",QJsonArray{"r1","r2"}}}}},{"relayErrors",QJsonArray{}}})));
+        QVERIFY(put(dir+"/resp-directTake.json",ok(agreedAnswer)));
+        QVERIFY(put(dir+"/resp-directApprove.json",ok(trade("Leader(Start)",false))));
+        QVERIFY(put(dir+"/resp-directTick.json",ok(trade("Done(Swapped)",true))));
+        QVERIFY(put(dir+"/resp-directPayout.json",ok({{"payout",QJsonObject{{"to",maker},{"tx","0x"+QString(64,'e')},{"amount","500000000000000000"}}}})));
+        QVERIFY(put(dir+"/resp-directPost.json",ok({{"posted",1}})));
+        QVERIFY(put(dir+"/resp-directCancel.json",ok({{"cancelled",true}})));
+        QVERIFY(put(dir+"/resp-directServe.json",ok({{"taken",false},{"expired",false}})));
+        QVERIFY(put(dir+"/take.json",QJsonDocument(QJsonObject{{"listing",signedListing}}).toJson()));
+        auto ours=listing;ours.insert("id","0x"+QString(64,'f'));
+        QVERIFY(put(dir+"/offer.json",QJsonDocument(QJsonObject{{"listing",QJsonObject{{"listing",ours},{"signature","0x00"}}},{"closed",false},{"answered",QJsonArray{}}}).toJson()));
+        // The stand-in helper: logs each request, makes the folder a post or take makes, answers
+        const auto helper=dir+"/helper";
+        QVERIFY(put(helper,QStringLiteral("#!/bin/sh\nreq=$(cat)\nprintf '%s\\n' \"$req\" >> %1/log\n"
+            "cmd=$(printf %s \"$req\" | sed -n 's/.*\"command\":\"\\([A-Za-z]*\\)\".*/\\1/p')\n"
+            "folder=$(printf %s \"$req\" | sed -n 's/.*\"tradeDir\":\"\\([^\"]*\\)\".*/\\1/p')\n"
+            "case $cmd in directTake) mkdir -p \"$folder\"; cp %1/take.json \"$folder/direct-take.json\"; echo '{}' > \"$folder/direct-journal.json\";;\n"
+            " directPost) mkdir -p \"$folder\"; cp %1/offer.json \"$folder/direct-listing.json\";; esac\n"
+            "cat %1/resp-$cmd.json\n").arg(dir).toUtf8()));
+        QVERIFY(QFile::setPermissions(helper,QFileDevice::ReadOwner|QFileDevice::WriteOwner|QFileDevice::ExeOwner));
+        QFile self(helper);QVERIFY(self.open(QIODevice::ReadOnly));
+        const auto digest=QString::fromLatin1(QCryptographicHash::hash(self.readAll(),QCryptographicHash::Sha256).toHex());
+        QJsonObject config{{"helper",helper},{"helperDigest",digest},{"tradesDir",trades},
+            {"rpcs",QJsonObject{{"11155111","http://127.0.0.1:18545"},{"97","http://127.0.0.1:18546"}}},{"relays",QJsonArray{"http://127.0.0.1:2"}},{"mainnet",false}};
+        {   // Malformed configs are refused
+            auto one=config;one.insert("rpcs",QJsonObject{{"97","http://127.0.0.1:1"}});
+            DirectMarketJob a;QVERIFY(!a.configure(one));
+            auto token=config;token.insert("rpcs",QJsonObject{{"97","http://127.0.0.1:1"},{"501000201","http://127.0.0.1:1"}});
+            DirectMarketJob b;QVERIFY(!b.configure(token));
+            auto digestBad=config;digestBad.insert("helperDigest",QString(64,'0'));
+            DirectMarketJob c;QVERIFY(!c.configure(digestBad));
+        }
+        DirectMarketJob job;QVERIFY(job.configure(config));
+        auto idle=[&]{for (int i=0;i<200 && (job.status().value("busy").toBool() || job.status().value("queued").toInt()>0);++i) QTest::qWait(25);QTest::qWait(30);};
+        auto mine=[&](const QString &kind){for (const auto &v:job.status().value("mine").toList()) if (v.toMap().value("kind")==kind) return v.toMap();return QVariantMap();};
+        QCOMPARE(job.status().value("pairs").toStringList(),QStringList{"BNB/ETH"});
+        QVERIFY(job.refreshListings());idle();
+        const auto shown=job.status().value("listings").toList();
+        QCOMPARE(shown.size(),1);
+        const auto l=shown.first().toMap();
+        QCOMPARE(l.value("side").toString(),QString("sell"));    // it gives the pair's base (BNB)
+        QCOMPARE(l.value("base").toString(),QString("0.5"));
+        QCOMPARE(l.value("quote").toString(),QString("0.01"));
+        QCOMPARE(l.value("price").toString(),QString("0.02"));
+        QCOMPARE(l.value("relays").toInt(),2);
+        // Nothing that spends runs without the trade keys
+        QVERIFY(!job.take(l.value("id").toString()));QVERIFY(!job.step());
+        job.setSwapKeys(QByteArray(64,'1'),QByteArray(64,'2'));
+        QVERIFY(job.take(l.value("id").toString()));idle();
+        QVERIFY(!job.take(l.value("id").toString()));   // once
+        auto t=mine("take");
+        QCOMPARE(t.value("state").toString(),QString("agreed"));
+        QCOMPARE(t.value("gives").toMap().value("coin").toString(),QString("ETH"));   // we give what the maker wants
+        QCOMPARE(t.value("trade").toMap().value("commitment").toString(),"0x"+QString(64,'c'));
+        // Only the terms shown are approved
+        QVERIFY(!job.approve(t.value("folder").toString(),"0x"+QString(64,'9')));
+        QVERIFY(job.approve(t.value("folder").toString(),"0x"+QString(64,'c')));idle();
+        QVERIFY(job.payout(t.value("folder").toString(),maker)==false);   // not finished yet
+        QVERIFY(job.step());idle();
+        t=mine("take");
+        QCOMPARE(t.value("state").toString(),QString("done"));
+        QVERIFY(!job.step());   // a finished trade needs no more steps
+        // The BNB came in on chain 97: an EVM address there, not a Solana one
+        QVERIFY(!job.payout(t.value("folder").toString(),"7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"));
+        QVERIFY(job.payout(t.value("folder").toString(),maker));idle();
+        QCOMPARE(job.status().value("payout").toMap().value("amount").toString(),QString("500000000000000000"));
+        // Our own offer: posted, served, withdrawn
+        QVERIFY(!job.post(97,"1000",97,"2000",3600));   // one coin for itself
+        QVERIFY(!job.post(97,"1000",501000102,"2000",3600));   // no node for that chain here
+        QVERIFY(job.post(97,"1000",11155111,"2000",3600));idle();
+        auto o=mine("offer");
+        QCOMPARE(o.value("state").toString(),QString("open"));
+        QVERIFY(job.step());idle();
+        QCOMPARE(mine("offer").value("state").toString(),QString("open"));
+        QVERIFY(job.cancel(o.value("folder").toString()));idle();
+        QCOMPARE(mine("offer").value("state").toString(),QString("cancelled"));
+        // What went to the helper: both nodes, the keys, and never the real-coin switch
+        QFile log(dir+"/log");QVERIFY(log.open(QIODevice::ReadOnly));
+        const auto lines=log.readAll().split('\n');
+        QStringList commands;
+        for (const auto &line:lines) {
+            if (line.isEmpty()) continue;
+            const auto r=QJsonDocument::fromJson(line).object();
+            commands<<r.value("command").toString();
+            QVERIFY(!r.contains("directMainnet"));
+            QCOMPARE(r.value("direct").toObject().value("rpcs").toObject().size(),2);
+            if (r.value("command")=="directApprove") QCOMPARE(r.value("commitment").toString(),"0x"+QString(64,'c'));
+            if (r.value("command")=="directPayout") {QCOMPARE(r.value("chainId").toDouble(),97.0);QCOMPARE(r.value("payoutAddress").toString(),maker);}
+            if (r.value("command")=="directPost") QCOMPARE(r.value("directOffer").toObject().value("lifetimeSecs").toDouble(),3600.0);
+            if (r.value("command")!="directListings") QVERIFY(r.value("direct").toObject().contains("swapKeys"));
+        }
+        QVERIFY2(commands.join(',').startsWith("directListings,directTake,directApprove,directTick,directPayout,directPost"),qPrintable(commands.join(',')));
+        QVERIFY(commands.contains("directServe"));QVERIFY(commands.contains("directCancel"));
+        // After a restart: the finished trade and the withdrawn offer are found again
+        DirectMarketJob again;QVERIFY(again.configure(config));
+        QStringList states;for (const auto &v:again.status().value("mine").toList()) states<<v.toMap().value("kind").toString()+":"+v.toMap().value("state").toString();
+        states.sort();
+        QCOMPARE(states,(QStringList{"offer:cancelled","take:agreed"}));   // its next step reads it as finished
+    }
+    void directMarketAmounts() {
+        QCOMPARE(DirectMarketJob::pairOf(501000101,1),QString("ETH/SOL"));
+        QCOMPARE(DirectMarketJob::pairOf(56,1),QString("BNB/ETH"));
+        QCOMPARE(DirectMarketJob::pairOf(97,501000102),QString("BNB/SOL"));
+        QCOMPARE(DirectMarketJob::hexToDecimal("0x6f05b59d3b20000"),QString("500000000000000000"));
+        QCOMPARE(DirectMarketJob::unitsText("2500000000",9),QString("2.5"));
+        QCOMPARE(DirectMarketJob::priceText("2000000000",9,"100000000000000000",18),QString("0.05"));   // 2 SOL for 0.1 ETH
+        QVERIFY(DirectMarketJob::priceText("0",9,"1",18).isEmpty());
     }
     void evmOfferAmounts() {
         QCOMPARE(DexEngine::atomic("0.005",18),QString("5000000000000000"));
