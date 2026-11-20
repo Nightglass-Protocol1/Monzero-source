@@ -99,6 +99,8 @@ Item {
             verify(find(ex, "pair_BNB/ETH").visible); verify(find(ex, "pair_BNB/SOL").visible); verify(find(ex, "pair_ETH/SOL").visible)
             verify(find(ex, "pair_BNB/ETH").active); verify(!find(ex, "pair_ETH/SOL").active)
             compare(find(ex, "pair_BNB/ETH").offers, 5)
+            // Live pairs are not repeated as "coming soon"; the rest still are
+            verify(ex.soonPairs.indexOf("BNB/ETH") < 0); compare(ex.soonPairs.length, 12); verify(ex.soonPairs.indexOf("ETH/XMR") >= 0)
             verify(ex.directMode)
             verify(panel().visible)
             verify(!find(ex, "exchangeBook").visible)

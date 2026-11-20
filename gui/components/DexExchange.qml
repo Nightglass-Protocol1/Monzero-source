@@ -36,7 +36,23 @@ ColumnLayout {
     function pickDirect(p) { directPair = p; pick("DIRECT") }
     // A direct pair as people read it: Solana's USDT and BNB Chain's named by their chains
     function directCoin(t) { return t === "USDT" ? "USDT-SOL" : t }
-    function directLabel(p) { var x = String(p).split("/"); return directCoin(x[0]) + " / " + directCoin(x[1]) }
+    function directLabel(p) {
+        var x = String(p).split("/")
+        if (x[1] === "XMR") x = [x[1], x[0]]   // Monero pairs read XMR first
+        return directCoin(x[0]) + " / " + directCoin(x[1])
+    }
+    // Every pair announced for the exchange. Those not trading in this wallet yet (the XMR pairs, and
+    // USDT where no USDT is pinned on this network) still get a tile, marked "coming soon".
+    readonly property var announcedPairs: ["BNB/ETH", "BNB/SOL", "ETH/SOL",
+        "ETH/USDT", "ETH/USDT-BSC", "BNB/USDT", "BNB/USDT-BSC", "SOL/USDT", "SOL/USDT-BSC",
+        "ETH/XMR", "BNB/XMR", "SOL/XMR", "USDT/XMR", "USDT-BSC/XMR", "XMR/XMZ"]
+    readonly property var livePairs: direct.configured === true ? (direct.pairs || []) : []
+    readonly property var soonPairs: announcedPairs.filter(function (p) { return livePairs.indexOf(p) < 0 })
+    property string soonPair: ""            // the coming-soon pair picked in the pair row
+    readonly property bool soonMode: coin === "SOON"
+    // The XMZ pair screens (stats, chart, book, form, orders) give way to a direct or coming-soon pair
+    readonly property bool pairMode: directMode || soonMode
+    function pickSoon(p) { soonPair = p; pick("SOON") }
     readonly property bool keysReady: wallet.keysReady === true
     // USDT (on Solana) appears once the wallet runs its market
     readonly property var allCoins: ["ETH", "BNB", "SOL"].concat(markets.USDT ? ["USDT"] : []).concat(markets["USDT-BSC"] ? ["USDT-BSC"] : [])
@@ -245,6 +261,7 @@ ColumnLayout {
     function pick(c) {
         if (c === coin) return
         coin = c; pickedId = ""; localError = ""
+        if (c === "SOON") { return }
         if (c === "DIRECT") { var cs = direct.chains || []; for (var i = 0; i < cs.length; ++i) loadBalance(cs[i].coin) }
         else { loadPrints(c); loadBalance(c) }
         refreshOffers()
@@ -319,7 +336,7 @@ ColumnLayout {
         }
         // Coin-for-coin pairs (ETH, BNB, SOL straight across), each its own tile
         Repeater {
-            model: ex.direct.configured === true ? (ex.direct.pairs || []) : []
+            model: ex.livePairs
             delegate: Rectangle {
                 objectName: "pair_" + modelData
                 readonly property bool active: ex.directMode && ex.directPair === modelData
@@ -334,6 +351,25 @@ ColumnLayout {
                     Text { text: offers > 0 ? qsTr("%n offer(s)", "", offers) : qsTr("coin for coin"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pickDirect(modelData) }
+            }
+        }
+        // Announced pairs not trading here yet
+        Repeater {
+            model: ex.soonPairs
+            delegate: Rectangle {
+                objectName: "pair_" + modelData
+                readonly property bool active: ex.soonMode && ex.soonPair === modelData
+                width: 136; height: 44; radius: 6
+                color: active ? M.Style.surfaceRaised : "transparent"
+                border.color: active ? M.Style.accent : M.Style.accentMuted
+                opacity: active ? 1 : 0.6
+                Column {
+                    anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
+                    spacing: 2
+                    Text { text: ex.directLabel(modelData); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                    Text { text: qsTr("coming soon"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
+                }
+                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pickSoon(modelData) }
             }
         }
     }
@@ -434,7 +470,7 @@ ColumnLayout {
     // ---- stats bar
     Rectangle {
         Layout.fillWidth: true
-        visible: !ex.directMode
+        visible: !ex.pairMode
         implicitHeight: statsFlow.implicitHeight + 20
         radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
         Flow {
@@ -467,7 +503,7 @@ ColumnLayout {
     Text {
         objectName: "marketNotice"
         Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.warningColor
-        visible: text !== "" && !ex.directMode
+        visible: text !== "" && !ex.pairMode
         text: ex.market.configured !== true ? ""
             : (ex.market.state === "failed" || ex.market.state === "refused") && ex.market.command === "listings"
               ? qsTr("The %1 offers could not be loaded from the relays: %2. Retrying…").arg(ex.coin).arg(ex.market.error || qsTr("no answer"))
@@ -478,7 +514,7 @@ ColumnLayout {
     GridLayout {
         id: grid
         Layout.fillWidth: true
-        visible: !ex.directMode
+        visible: !ex.pairMode
         columns: ex.width >= 1180 ? 3 : ex.width >= 820 ? 2 : 1
         columnSpacing: 12; rowSpacing: 12
         M.DexPriceChart {
@@ -551,6 +587,31 @@ ColumnLayout {
         }
     }
 
+    // ---- a pair that is announced but not trading in this wallet yet
+    Rectangle {
+        objectName: "soonCard"
+        Layout.fillWidth: true
+        visible: ex.soonMode
+        implicitHeight: soonCol.implicitHeight + 28
+        radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
+        ColumnLayout {
+            id: soonCol
+            anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 14
+            spacing: 6
+            Text { text: ex.directLabel(ex.soonPair) + " · " + qsTr("coming soon"); font.pixelSize: 18; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+            Text {
+                objectName: "soonText"
+                Layout.fillWidth: true; wrapMode: Text.WordWrap
+                font.pixelSize: 13; color: M.Style.dimmedFontColor
+                text: ex.soonPair === "XMR/XMZ"
+                      ? qsTr("XMR for XMZ will run as two atomic swaps behind this one pair (XMZ to ETH, BNB or SOL, then that coin to XMR). It opens here once it has passed its test-network and real-funds tests.")
+                      : ex.soonPair.indexOf("XMR") >= 0
+                      ? qsTr("Monero swapped straight across, coin for coin, from this wallet's own Monero trading wallet. It opens here once it has passed its test-network and real-funds tests.")
+                      : qsTr("Coin for coin, straight across. It opens here once it has passed its test-network and real-funds tests (USDT has no test-network token, so USDT pairs show only on the real networks).")
+            }
+        }
+    }
+
     // ---- coin for coin: its own book, form, trades and accounts
     M.DexDirectPanel {
         objectName: "directPanel"
@@ -572,7 +633,7 @@ ColumnLayout {
     // ---- below: orders, market trades, funds
     Rectangle {
         Layout.fillWidth: true
-        visible: !ex.directMode
+        visible: !ex.pairMode
         implicitHeight: bottomCol.implicitHeight + 24
         radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
         ColumnLayout {

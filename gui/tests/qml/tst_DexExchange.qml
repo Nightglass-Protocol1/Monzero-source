@@ -224,6 +224,26 @@ Item {
             engine.evmTradeStatus = { configured: false }
             verify(f.ready)
         }
+        function test_every_announced_pair_has_a_tile_and_the_ones_not_trading_say_coming_soon() {
+            // No direct market in this wallet: all fifteen announced pairs show, each "coming soon"
+            compare(ex.soonPairs.length, 15)
+            var names = ["BNB/ETH", "ETH/USDT", "SOL/USDT-BSC", "ETH/XMR", "BNB/XMR", "SOL/XMR", "USDT/XMR", "USDT-BSC/XMR", "XMR/XMZ"]
+            for (var i = 0; i < names.length; ++i) verify(find(ex, "pair_" + names[i]) !== null, names[i])
+            compare(ex.directLabel("USDT/XMR"), "XMR / USDT-SOL")
+            compare(ex.directLabel("ETH/XMR"), "XMR / ETH")
+            compare(ex.directLabel("ETH/USDT-BSC"), "ETH / USDT-BSC")
+            press("pair_ETH/XMR")
+            verify(ex.soonMode)
+            verify(find(ex, "soonCard").visible)
+            verify(!find(ex, "exchangeForm").visible)
+            verify(find(ex, "soonText").text.indexOf("Monero") >= 0)
+            press("pair_XMR/XMZ")
+            verify(find(ex, "soonText").text.indexOf("two atomic swaps") >= 0)
+            compare(engine.calls.length, 0)   // nothing is sent for a pair that is not trading
+            ex.pick("SOL")
+            verify(!find(ex, "soonCard").visible)
+            verify(find(ex, "exchangeForm").visible)
+        }
             function test_the_monero_wallet_shows_and_sends_from_the_funds_tab() {
             ex.bottomTab = "funds"
             verify(find(ex, "fundsXmrColumn").visible)
