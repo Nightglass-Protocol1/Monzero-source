@@ -37,7 +37,7 @@ final class DexDirect {
 
     private static final Pattern HASH = Pattern.compile("\\A0x[0-9a-f]{64}\\z"), DIGITS = Pattern.compile("\\A[0-9]{1,78}\\z"),
             HEX_QTY = Pattern.compile("\\A0x[0-9a-f]{1,64}\\z"), ADDRESS = Pattern.compile("\\A0x[0-9a-fA-F]{40}\\z"),
-            PAIR = Pattern.compile("\\A(BNB|ETH|SOL)/(BNB|ETH|SOL)\\z");
+            PAIR = Pattern.compile("\\A(BNB|ETH|SOL|USDT|USDT-BSC)/(BNB|ETH|SOL|USDT|USDT-BSC)\\z");
 
     private static final class Folder {
         String path, kind, state, detail = "", listingId;
@@ -57,6 +57,8 @@ final class DexDirect {
 
     final File tradesDir;
     private final Map<Long, String> rpcs;
+    /** USDT markets (Solana's, BNB Chain's) traded besides each chain's coin, by market id */
+    private final List<Long> tokens = new ArrayList<>();
     private final List<String> relays;
     private final boolean mainnet;
     private final String localSolProgram;
@@ -71,8 +73,13 @@ final class DexDirect {
     private boolean busy;
 
     DexDirect(File tradesDir, Map<Long, String> rpcs, List<String> relays, boolean mainnet, String localSolProgram, Runner runner, Listener listener) {
+        this(tradesDir, rpcs, new ArrayList<>(), relays, mainnet, localSolProgram, runner, listener);
+    }
+
+    DexDirect(File tradesDir, Map<Long, String> rpcs, List<Long> tokenMarkets, List<String> relays, boolean mainnet, String localSolProgram, Runner runner, Listener listener) {
         this.tradesDir = tradesDir;
         this.rpcs = new TreeMap<>(rpcs);
+        for (long m : tokenMarkets) if (DexConfig.token(m) && this.rpcs.containsKey(DexConfig.helperChain(m))) tokens.add(m);
         this.relays = relays;
         this.mainnet = mainnet;
         this.localSolProgram = localSolProgram == null ? "" : localSolProgram;
@@ -89,12 +96,15 @@ final class DexDirect {
                 || id == DexConfig.SOL_MAINNET || id == DexConfig.SOL_DEVNET || id == DexConfig.SOL_LOCAL;
     }
 
+    /** A coin by market id: the chain's own coin (its chain id) or its USDT (a market of its own). */
     static String ticker(long id) {
+        if (DexConfig.usdt(id)) return "USDT";
+        if (DexConfig.usdtBsc(id)) return "USDT-BSC";
         return DexConfig.solana(id) ? "SOL" : (id == 56 || id == 97) ? "BNB" : "ETH";
     }
 
     static int decimals(long id) {
-        return DexConfig.solana(id) ? 9 : 18;
+        return DexConfig.decimals(id);
     }
 
     static String pairOf(long a, long b) {
@@ -118,8 +128,16 @@ final class DexDirect {
         }
     }
 
+    /** The coins traded here, by market id. */
     List<Long> chains() {
-        return new ArrayList<>(rpcs.keySet());
+        final List<Long> out = new ArrayList<>(rpcs.keySet());
+        out.addAll(tokens);
+        java.util.Collections.sort(out);
+        return out;
+    }
+
+    private static long market(JSONObject coin) {
+        return DexConfig.marketOf(coin.optLong("chainId"), coin.optString("asset"));
     }
 
     private static boolean coinValid(JSONObject c) {
@@ -216,12 +234,16 @@ final class DexDirect {
     }
 
     boolean post(String seedHex, long givesChain, String givesValue, long wantsChain, String wantsValue, long lifetimeSecs) {
-        if (seedHex == null || !rpcs.containsKey(givesChain) || !rpcs.containsKey(wantsChain) || ticker(givesChain).equals(ticker(wantsChain))
+        final List<Long> coins = chains();
+        if (seedHex == null || !coins.contains(givesChain) || !coins.contains(wantsChain) || ticker(givesChain).equals(ticker(wantsChain))
                 || !DIGITS.matcher(givesValue).matches() || !DIGITS.matcher(wantsValue).matches() || lifetimeSecs < 600 || lifetimeSecs > 31 * 86400L) return false;
         try {
             final String dir = new File(tradesDir, "offer-" + Long.toHexString(new SecureRandom().nextLong())).getPath();
-            final JSONObject offer = new JSONObject().put("givesChainId", givesChain).put("givesValue", givesValue).put("wantsChainId", wantsChain)
-                    .put("wantsValue", wantsValue).put("lifetimeSecs", lifetimeSecs);
+            // The helper names a coin by its chain, and a token (USDT) besides
+            final JSONObject offer = new JSONObject().put("givesChainId", DexConfig.helperChain(givesChain)).put("givesValue", givesValue)
+                    .put("wantsChainId", DexConfig.helperChain(wantsChain)).put("wantsValue", wantsValue).put("lifetimeSecs", lifetimeSecs);
+            if (DexConfig.token(givesChain)) offer.put("givesToken", "usdt");
+            if (DexConfig.token(wantsChain)) offer.put("wantsToken", "usdt");
             return enqueue(base("directPost", dir, seedHex).put("directOffer", offer), dir, true);
         } catch (Exception e) {
             return false;
@@ -233,7 +255,7 @@ final class DexDirect {
         if (seedHex == null || signedListing == null) return false;
         for (Folder f : folders) if (listingId.equals(f.listingId)) return false;
         final JSONObject l = signedListing.optJSONObject("listing");
-        if (!rpcs.containsKey(l.optJSONObject("gives").optLong("chainId")) || !rpcs.containsKey(l.optJSONObject("wants").optLong("chainId"))) return false;
+        if (!chains().contains(market(l.optJSONObject("gives"))) || !chains().contains(market(l.optJSONObject("wants")))) return false;
         try {
             final String dir = new File(tradesDir, "take-" + listingId.substring(2, 18)).getPath();
             return enqueue(base("directTake", dir, seedHex).put("directListing", signedListing), dir, true);
@@ -413,7 +435,8 @@ final class DexDirect {
 
     static JSONObject shown(JSONObject s, int relays) throws Exception {
         final JSONObject l = s.getJSONObject("listing"), gives = l.getJSONObject("gives"), wants = l.getJSONObject("wants");
-        final long gc = gives.getLong("chainId"), wc = wants.getLong("chainId");
+        // Coins by market id: the chain's own coin, or its USDT
+        final long gc = market(gives), wc = market(wants);
         final String gv = hexToDecimal(gives.getString("value")), wv = hexToDecimal(wants.getString("value"));
         if (gv == null || wv == null || ticker(gc).equals(ticker(wc))) return null;
         final String pair = pairOf(gc, wc);
@@ -467,9 +490,9 @@ final class DexDirect {
                 if (s != null) mine.put(s);
             }
             final JSONArray chainList = new JSONArray();
-            for (long id : rpcs.keySet()) chainList.put(new JSONObject().put("chainId", id).put("coin", ticker(id)).put("decimals", decimals(id)));
+            for (long id : chains()) chainList.put(new JSONObject().put("chainId", id).put("coin", ticker(id)).put("decimals", decimals(id)));
             final List<String> pairs = new ArrayList<>();
-            for (long a : rpcs.keySet()) for (long b : rpcs.keySet()) if (ticker(a).compareTo(ticker(b)) < 0 && !pairs.contains(pairOf(a, b))) pairs.add(pairOf(a, b));
+            for (long a : chains()) for (long b : chains()) if (ticker(a).compareTo(ticker(b)) < 0 && !pairs.contains(pairOf(a, b))) pairs.add(pairOf(a, b));
             java.util.Collections.sort(pairs);
             out.put("configured", true).put("keys", keys).put("busy", busy).put("queued", queue.size()).put("state", state).put("error", error).put("command", command)
                     .put("message", message).put("listings", listings).put("mine", mine).put("payout", lastPayout).put("chains", chainList)

@@ -265,9 +265,10 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         // direct pairs are opened there (the relays refuse such offers until then too).
         if (!DexConfig.mainnet()) {
             final Map<Long, String> rpcs = new LinkedHashMap<>();
-            for (long chain : DexConfig.chains()) if (!DexConfig.token(chain)) rpcs.put(chain, overrides.rpcFor(chain));
+            final List<Long> tokens = new ArrayList<>();
+            for (long chain : DexConfig.chains()) if (!DexConfig.token(chain)) rpcs.put(chain, overrides.rpcFor(chain)); else tokens.add(chain);
             if (rpcs.size() >= 2)
-                direct = new DexDirect(new File(new File(root, "evm-trades"), "direct"), rpcs, overrides.relaysOrDefault(), false, "",
+                direct = new DexDirect(new File(new File(root, "evm-trades"), "direct"), rpcs, tokens, overrides.relaysOrDefault(), false, "",
                         (request, done) -> helper.run(request, 120000, 8 * 1024 * 1024, done), this);
         }
         resumeTrades();
@@ -370,11 +371,13 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         final String id = ledgerId(trade.optString("tradeId"));
         final JSONObject gives = trade.optJSONObject("gives"), gets = trade.optJSONObject("gets");
         if (id == null || gives == null || gets == null) return sayDirect("The trade could not be checked; not started.");
-        final String refusal = directRefusal(id, gives.optLong("chainId"), gives.optString("value"), gets.optLong("chainId"), gets.optString("value"));
+        // Each coin under its own market's limits (USDT has its own document)
+        final long gm = DexConfig.marketOf(gives.optLong("chainId"), gives.optString("asset")), wm = DexConfig.marketOf(gets.optLong("chainId"), gets.optString("asset"));
+        final String refusal = directRefusal(id, gm, gives.optString("value"), wm, gets.optString("value"));
         if (!refusal.isEmpty()) return sayDirect(refusal);
         // Counted under the coin we lock (its daily limit), before anything is locked
         try {
-            if (!risk.recordStart(DexConfig.controlNetwork(gives.optLong("chainId")), id, new BigInteger(gives.optString("value")), 0))
+            if (!risk.recordStart(DexConfig.controlNetwork(gm), id, new BigInteger(gives.optString("value")), 0))
                 return sayDirect("The trade could not be recorded; not started.");
         } catch (Exception e) {
             return sayDirect("The trade could not be recorded; not started.");
@@ -394,7 +397,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             final String id = ledgerId(trade.optString("tradeId"));
             final JSONObject gives = trade.optJSONObject("gives");
             if (id == null || gives == null || directRecorded.contains(id)) continue;
-            final String network = DexConfig.controlNetwork(gives.optLong("chainId"));
+            final String network = DexConfig.controlNetwork(DexConfig.marketOf(gives.optLong("chainId"), gives.optString("asset")));
             try {
                 if (!network.isEmpty() && risk.recordStart(network, id, new BigInteger(gives.optString("value")), 0)) directRecorded.add(id);
             } catch (Exception ignored) {

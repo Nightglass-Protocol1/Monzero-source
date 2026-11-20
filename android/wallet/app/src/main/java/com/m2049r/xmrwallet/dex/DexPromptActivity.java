@@ -240,12 +240,13 @@ public class DexPromptActivity extends SecureActivity {
             // The terms are the wallet's own (the trade's journal), never the page's
             final JSONObject t = w.direct.optJSONObject("trade"), gives = t.optJSONObject("gives"), gets = t.optJSONObject("gets");
             if (gives != null && gets != null) {
-                final long gc = gives.optLong("chainId"), wc = gets.optLong("chainId");
+                // Coins by market id (USDT has its own decimals), networks by chain
+                final long gc = DexConfig.marketOf(gives.optLong("chainId"), gives.optString("asset")), wc = DexConfig.marketOf(gets.optLong("chainId"), gets.optString("asset"));
                 final String pays = DexFiles.units(gives.optString("value"), DexDirect.decimals(gc)) + " " + DexDirect.ticker(gc);
                 final String receives = DexFiles.units(gets.optString("value"), DexDirect.decimals(wc)) + " " + DexDirect.ticker(wc);
                 if (!w.directMessage.isEmpty()) notice = w.directMessage;
                 show("approve-direct", getString(R.string.dex_approve_title), getString(R.string.dex_direct_approve_body, pays, receives,
-                        DexConfig.networkName(gc), DexConfig.networkName(wc), w.directPayout.isEmpty() ? getString(R.string.dex_approve_no_account) : w.directPayout));
+                        DexConfig.networkName(DexConfig.helperChain(gc)), DexConfig.networkName(DexConfig.helperChain(wc)), w.directPayout.isEmpty() ? getString(R.string.dex_approve_no_account) : w.directPayout));
                 final String folder = w.direct.optString("folder"), commitment = t.optString("commitment");
                 yes.setText(R.string.dex_approve);
                 yes.setOnClickListener(v -> engine.post(() -> engine.approveDirect(folder, commitment)));

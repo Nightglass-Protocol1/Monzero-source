@@ -160,6 +160,34 @@ public class DexDirectTest {
     }
 
     @Test
+    public void usdtCoinsByMarketId() throws Exception {
+        final Map<Long, String> rpcs = new LinkedHashMap<>();
+        rpcs.put(11155111L, "https://sepolia.example");
+        rpcs.put(97L, "https://bsc-testnet.example");
+        final List<JSONObject> sent = new ArrayList<>();
+        final DexDirect d = new DexDirect(tmp.newFolder("usdt"), rpcs, Arrays.asList(DexConfig.BSC_USDT_TESTNET, DexConfig.SOL_USDT_DEVNET), Arrays.asList("https://relay.example"), false, "",
+                (request, done) -> { sent.add(request); try { done.done(new JSONObject().put("ok", true).put("posted", 0)); } catch (Exception e) { done.done(null); } }, () -> { });
+        // Solana's USDT has no node here, so only BNB Chain's is traded
+        assertEquals(Arrays.asList(97L, 11155111L, DexConfig.BSC_USDT_TESTNET), d.chains());
+        assertEquals("[\"BNB/ETH\",\"BNB/USDT-BSC\",\"ETH/USDT-BSC\"]", d.status("", true).getJSONArray("pairs").toString());
+        // A USDT offer as the relays carry it: shown as its own coin, with its decimals
+        final JSONObject l = listing("0x" + "ab".repeat(32));
+        l.getJSONObject("listing").put("pair", "ETH/USDT-BSC").getJSONObject("gives").put("asset", "0x55d398326f99059ff775485246999027b3197955").put("value", "0x15af1d78b58c40000");
+        final JSONObject shown = DexDirect.shown(l, 1);
+        assertEquals("USDT-BSC", shown.getJSONObject("gives").getString("coin"));
+        assertEquals(DexConfig.BSC_USDT_TESTNET, shown.getJSONObject("gives").getLong("chainId"));
+        assertEquals("25", shown.getJSONObject("gives").getString("amount"));
+        assertEquals("2500", shown.getString("price"));
+        // Posting it goes to the helper as its chain plus the token
+        assertTrue(d.post(SEED, DexConfig.BSC_USDT_TESTNET, "1000", 97, "2000", 3600));
+        JSONObject offer = null;
+        for (JSONObject r : sent) if (r.getString("command").equals("directPost")) offer = r.getJSONObject("directOffer");
+        assertEquals(97, offer.getLong("givesChainId"));
+        assertEquals("usdt", offer.getString("givesToken"));
+        assertFalse(offer.has("wantsToken"));
+    }
+
+    @Test
     public void amountsAndPairs() {
         assertEquals("ETH/SOL", DexDirect.pairOf(DexConfig.SOL_MAINNET, 1));
         assertEquals("BNB/ETH", DexDirect.pairOf(56, 1));
