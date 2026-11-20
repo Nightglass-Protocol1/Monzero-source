@@ -339,3 +339,11 @@ a.trade-row:hover, a.trade-row:focus-visible { background: color-mix(in srgb, va
 /* Keep open (auto-renew) choice in the post form */
 .tp-check{display:flex;gap:8px;align-items:flex-start;margin:.5rem 0;font-size:.92rem;line-height:1.35}
 .tp-check input{margin-top:.2rem;flex:none}
+
+/* Coin for coin (ETH, BNB, SOL straight across): shown only for a connected wallet that trades them */
+.dex-direct { margin: 24px 0; padding: 18px; border-radius: 14px; border: 1px solid var(--line, #2c3a47); }
+.dex-direct h2 { margin: 0 0 10px; font-size: 20px; }
+.dex-direct h3 { margin: 14px 0 6px; font-size: 14px; color: var(--muted); }
+.dd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 760px) { .dd-grid { grid-template-columns: 1fr; } }
+.tp-warn { color: #e0a84a; }
