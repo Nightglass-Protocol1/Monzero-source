@@ -22,6 +22,9 @@ NODES=${XMZ_NODE:-31.70.193.31:38089 node2.monerodevs.org:38089 node3.monerodevs
 T=$ROOT/core/build/dex-rust-toolchain-1.95.0/sysroot/usr
 export PATH=$T/bin:$PATH LD_LIBRARY_PATH=$T/lib/x86_64-linux-gnu CARGO_HOME=$ROOT/core/build/dex-cargo-home
 FUNDER_PORT=38183; RELAY_PORT=18796
+# The traders read the contract's logs back to the trade's start block; publicnode Sepolia now prunes
+# old history ("pruned history unavailable"), so default to an endpoint that keeps it.
+export EVM_RPC=${EVM_RPC:-https://sepolia.gateway.tenderly.co}
 ATOMS=${XMZ_ATOMS:-10000000000}                 # 0.01 XMR traded
 NEED=$((3 * ATOMS))                             # funding wallet must hold this, unlocked
 
