@@ -7,23 +7,30 @@
 #   scp install-monero-node.sh SERVER: && ssh SERVER sudo bash install-monero-node.sh mainnet
 #   ssh SERVER sudo bash install-monero-node.sh stagenet     # the test network (small, syncs in hours)
 #   ssh SERVER sudo bash install-monero-node.sh status
+#   ssh SERVER sudo bash install-monero-node.sh prune mainnet   # turn an existing full chain into a pruned one
 # Safe to run again (an upgrade: set MONERO_VERSION to the new release).
 #
 # Ports (mainnet / stagenet):
 #   18080 / 38080  peer-to-peer, open to all (helps the network)
 #   18089 / 38089  restricted RPC, open to all: wallets and the DEX use it; it cannot control the node
 #   18081 / 38081  full RPC, this machine only
-# Disk: the whole mainnet chain is about 250 GB and growing; with less than PRUNE_BELOW_GB free the
-# node keeps a pruned chain (about 100 GB), which serves wallets and the DEX just as well.
+# Disk: nodes are PRUNED by default (mainnet about 100 GB instead of 300 GB and growing); a pruned
+# node serves wallets and the DEX just as well. PRUNE=0 for a full node on a new install.
+# `prune <net>` converts an existing full chain: it stops the node, writes a pruned copy with the
+# official monero-blockchain-prune, swaps it in, starts the node, and deletes the full copy only
+# after the node answers as pruned. Needs about 110 GB free (mainnet); the node is down meanwhile.
 set -euo pipefail
 VERSION=${MONERO_VERSION:-v0.18.5.4}
-PRUNE_BELOW_GB=${PRUNE_BELOW_GB:-400}
+PRUNE=${PRUNE:-1}
 NET=${1:-}
 # binaryFate signs the Monero release hashes (the key in the monero repository, utils/gpg_keys)
 SIGNER_FPR=81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92
 HASHES_URL=https://www.getmonero.org/downloads/hashes.txt
 KEY_URL=https://raw.githubusercontent.com/monero-project/monero/master/utils/gpg_keys/binaryfate.asc
 TARBALL=monero-linux-x64-$VERSION.tar.bz2
+
+# get_info has no pruning field; ask the node itself (full RPC, this machine)
+pruned_state() { curl -s -m 10 http://127.0.0.1:$1/json_rpc -d '{"jsonrpc":"2.0","id":0,"method":"prune_blockchain","params":{"check":true}}' | python3 -c 'import sys,json; print("pruned" if json.load(sys.stdin)["result"]["pruned"] else "full")' 2>/dev/null || echo unknown; }
 
 case "$NET" in
   mainnet)  P2P=18080; RPC=18081; RRPC=18089; FLAG="" ;;
@@ -33,12 +40,49 @@ case "$NET" in
       systemctl is-active --quiet "monerod@$n" 2>/dev/null || continue
       port=$([ $n = mainnet ] && echo 18081 || echo 38081)
       echo "== $n: $(systemctl is-active monerod@$n)"
-      curl -s -m 10 http://127.0.0.1:$port/get_info | python3 -c 'import sys,json; i=json.load(sys.stdin); print("height %s of %s, synced %s, peers in %s out %s, pruned %s" % (i["height"], i["target_height"] or i["height"], i["synchronized"], i["incoming_connections_count"], i["outgoing_connections_count"], i.get("pruning_seed",0)!=0))' || echo "   (not answering yet)"
+      curl -s -m 10 http://127.0.0.1:$port/get_info | python3 -c 'import sys,json; i=json.load(sys.stdin); print("height %s of %s, synced %s, peers in %s out %s" % (i["height"], i["target_height"] or i["height"], i["synchronized"], i["incoming_connections_count"], i["outgoing_connections_count"]))' || echo "   (not answering yet)"
+      echo "   chain: $(pruned_state $port)"
     done
     df -h /var/lib/monero | tail -1
     exit 0;;
-  *) sed -n '2,20p' "$0"; exit 2;;
+  prune)
+    PNET=${2:-}; case "$PNET" in mainnet) PP=18081; PF="";; stagenet) PP=38081; PF="--stagenet";; *) echo "usage: $0 prune mainnet|stagenet"; exit 2;; esac
+    [ "$(id -u)" = 0 ] || { echo "run as root (sudo)"; exit 1; }
+    [ -x /opt/monero/monero-blockchain-prune ] || { echo "monero-blockchain-prune missing: run  $0 $PNET  first (installs it)"; exit 1; }
+    CONF=/etc/monero/$PNET.conf; D=/var/lib/monero/$PNET
+    # monerod keeps the stagenet chain one folder deeper (<data-dir>/stagenet/lmdb); the prune tool does the same
+    DB=$D; [ "$PNET" = stagenet ] && DB=$D/stagenet
+    [ -f "$DB/lmdb/data.mdb" ] || { echo "!! no chain at $DB/lmdb"; exit 1; }
+    [ ! -e "$DB/lmdb-old" ] || { echo "!! $DB/lmdb-old exists (an earlier run?): check and remove it first"; exit 1; }
+    set_flag() { grep -q '^prune-blockchain=1' "$CONF" || sed -i 's/^db-sync-mode=/prune-blockchain=1\ndb-sync-mode=/' "$CONF"; grep -q '^prune-blockchain=1' "$CONF" || echo 'prune-blockchain=1' >> "$CONF"; }
+    if [ "$(pruned_state $PP)" = pruned ]; then echo "$PNET is already pruned"; set_flag; exit 0; fi
+    FULL_GB=$(du -s --block-size=1G "$DB/lmdb" | cut -f1); [ -n "$FULL_GB" ] || exit 1
+    NEED_GB=$(( FULL_GB * 38 / 100 + 10 ))
+    FREE_GB=$(df -BG --output=avail "$D" | tail -1 | tr -dc 0-9)
+    [ "$FREE_GB" -ge "$NEED_GB" ] || { echo "!! need about $NEED_GB GB free, have $FREE_GB"; exit 1; }
+    echo "== stopping monerod@$PNET ($(date -u +%H:%M) UTC)"
+    systemctl stop "monerod@$PNET"
+    echo "== writing the pruned copy (mainnet: a few hours)"
+    # On success the tool itself swaps the pruned copy in as lmdb and keeps the full one as lmdb-old.
+    if ! runuser -u monero -- /opt/monero/monero-blockchain-prune $PF --data-dir "$D" --log-level 0 || [ ! -d "$DB/lmdb-old" ]; then
+      echo "!! pruning failed; starting the node on the chain it has"; systemctl start "monerod@$PNET"; exit 1
+    fi
+    set_flag
+    systemctl start "monerod@$PNET"
+    echo "== waiting for the node to answer"
+    for i in $(seq 1 120); do curl -s -m 5 http://127.0.0.1:$PP/get_info >/dev/null && break; sleep 10; done
+    if [ "$(pruned_state $PP)" = pruned ]; then
+      rm -rf "$DB/lmdb-old"
+      echo "done: $PNET pruned, full copy deleted"; du -sh "$DB/lmdb"; df -h "$D" | tail -1
+    else
+      echo "!! the node does not answer as pruned; the full copy is kept in $DB/lmdb-old"
+      echo "   to go back: systemctl stop monerod@$PNET; mv $DB/lmdb $DB/lmdb-pruned; mv $DB/lmdb-old $DB/lmdb; remove prune-blockchain from $CONF; systemctl start monerod@$PNET"
+      exit 1
+    fi
+    exit 0;;
+  *) sed -n '2,25p' "$0"; exit 2;;
 esac
+case "$NET" in mainnet|stagenet) ;; *) echo "!! unknown network $NET"; exit 2;; esac
 [ "$(id -u)" = 0 ] || { echo "run as root (sudo)"; exit 1; }
 [ "$(uname -m)" = x86_64 ] || { echo "this installs the x86_64 release"; exit 1; }
 
@@ -47,7 +91,7 @@ apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl gnupg bzip2 ca-certificates ufw >/dev/null
 
 echo "== 2. Monero $VERSION, verified"
-if [ "$(/opt/monero/monerod --version 2>/dev/null | grep -o 'v[0-9.]*' | head -1)" = "$VERSION" ]; then
+if [ "$(/opt/monero/monerod --version 2>/dev/null | grep -o 'v[0-9.]*' | head -1)" = "$VERSION" ] && [ -x /opt/monero/monero-blockchain-prune ]; then
   echo "already installed"
 else
   W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
@@ -64,6 +108,7 @@ else
   tar -xjf "$W/$TARBALL" -C "$W"
   install -d /opt/monero
   install -m 755 "$W"/monero-x86_64-linux-gnu-*/monerod /opt/monero/monerod
+  install -m 755 "$W"/monero-x86_64-linux-gnu-*/monero-blockchain-prune /opt/monero/monero-blockchain-prune
   echo "installed $(/opt/monero/monerod --version | head -1)"
 fi
 
@@ -73,8 +118,6 @@ install -d -o monero -g monero -m 750 /var/lib/monero/$NET /var/log/monero
 install -d -m 755 /etc/monero
 CONF=/etc/monero/$NET.conf
 if [ ! -f "$CONF" ]; then
-  FREE_GB=$(df -BG --output=avail /var/lib/monero | tail -1 | tr -dc 0-9)
-  PRUNE=0; [ "$NET" = mainnet ] && [ "$FREE_GB" -lt "$PRUNE_BELOW_GB" ] && PRUNE=1
   cat > "$CONF" <<EOF
 # Monzero's own Monero node ($NET). Written by install-monero-node.sh; edit and restart monerod@$NET.
 $FLAG
@@ -83,7 +126,7 @@ log-file=/var/log/monero/$NET.log
 log-level=0
 max-log-file-size=10000000
 max-log-files=5
-$( [ $PRUNE = 1 ] && echo "prune-blockchain=1   # $FREE_GB GB free when installed" )
+$( [ "$PRUNE" = 1 ] && printf 'prune-blockchain=1\nsync-pruned-blocks=1' )
 db-sync-mode=safe:sync
 p2p-bind-ip=0.0.0.0
 p2p-bind-port=$P2P
