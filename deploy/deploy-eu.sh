@@ -48,8 +48,20 @@ else
 fi
 
 echo "== users and folders"
-id xmzwallet >/dev/null 2>&1 || useradd --system --home /var/lib/xmzwallet --shell /usr/sbin/nologin xmzwallet
-id xmzpool  >/dev/null 2>&1 || useradd --system --home /var/lib/xmzpool  --shell /usr/sbin/nologin xmzpool
+# Create each system user, and REPAIR a broken/partial passwd entry (a prior failed
+# run can leave an entry that `id` sees but that has no home/shell, which makes
+# `sudo -u`/`runuser` fail with "unknown user"/"does not contain all required fields").
+ensure_user() {  # name home
+  if id "$1" >/dev/null 2>&1 && getent passwd "$1" | awk -F: 'NF>=7 && $6!="" && $7!=""{ok=1} END{exit !ok}'; then
+    return
+  fi
+  echo "   (re)creating system user $1"
+  userdel "$1" 2>/dev/null || true
+  sed -i "\#^$1:#d" /etc/passwd 2>/dev/null || true
+  useradd --system --home-dir "$2" --shell /usr/sbin/nologin "$1"
+}
+ensure_user xmzwallet /var/lib/xmzwallet
+ensure_user xmzpool  /var/lib/xmzpool
 install -d -o xmzwallet -g xmzwallet -m 700 /var/lib/xmzwallet
 install -d -o root -g xmzwallet -m 750 /etc/xmzwallet
 install -d -o xmzpool -g xmzpool -m 700 /var/lib/xmzpool
@@ -61,7 +73,7 @@ LOGIN=$(cat /etc/xmzwallet/rpc-login)
 
 echo "== pool wallet"
 if [ ! -f /var/lib/xmzwallet/pool.keys ]; then
-  sudo -u xmzwallet /usr/bin/monzero-wallet-rpc --daemon-address 127.0.0.1:6185 --trusted-daemon --rpc-bind-ip 127.0.0.1 \
+  runuser -u xmzwallet -- /usr/bin/monzero-wallet-rpc --daemon-address 127.0.0.1:6185 --trusted-daemon --rpc-bind-ip 127.0.0.1 \
     --rpc-bind-port 6191 --disable-rpc-login --wallet-dir /var/lib/xmzwallet --non-interactive --log-file /var/lib/xmzwallet/create.log >/dev/null 2>&1 &
   CPID=$!
   for i in $(seq 1 60); do rpc 6191 get_version | grep -q result && break; sleep 1; done
@@ -133,7 +145,7 @@ print("   stratum answers:", json.loads(s.makefile().readline())["error"]["messa
 PY
 echo
 echo "Pool wallet address: $ADDR"
-echo "Back up its seed now (on the server as root): sudo -u xmzwallet monzero-wallet-cli --wallet-file /var/lib/xmzwallet/pool --password-file /etc/xmzwallet/password --daemon-address 127.0.0.1:6185   then type: seed   and write the 25 words down offline; then: exit"
+echo "Back up its seed now (on the server as root): runuser -u xmzwallet -- monzero-wallet-cli --wallet-file /var/lib/xmzwallet/pool --password-file /etc/xmzwallet/password --daemon-address 127.0.0.1:6185   then type: seed   and write the 25 words down offline; then: exit"
 REMOTE
 
 echo

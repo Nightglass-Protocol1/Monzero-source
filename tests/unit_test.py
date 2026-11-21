@@ -217,6 +217,76 @@ class Payouts(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class Liquidity(unittest.TestCase):
+    """The DEX liquidity share: only from the pool's fee, never before the miners are covered."""
+    ADDR = "F" + "L" * 94
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        cfg = xp.load_config(_write(self.tmp, {"daemon_rpc": "http://127.0.0.1:1", "wallet_rpc": "http://127.0.0.1:1",
+                                               "pool_address": "P", "database": os.path.join(self.tmp, "p.sqlite"),
+                                               "stratum_ports": [{"port": 1, "difficulty": 100}],
+                                               "payouts": {"enabled": True, "threshold_xmz": 1, "fee_reserve_xmz": 0.1},
+                                               "liquidity": {"enabled": True, "address": self.ADDR, "share_basis_points": 100,
+                                                             "min_transfer_xmz": 1}}))
+        self.pool = xp.Pool(cfg, enable_payouts=True)
+        async def ok(address): return address == self.ADDR
+        self.pool.valid_address = ok
+        db = self.pool.store.db
+        db.execute("INSERT INTO pool_fee VALUES (100, ?)", (5000 * xp.ATOMIC,))   # history before the share was on
+        self.assertEqual(self.pool.liquidity_owed(), 0, "the pool's past fee is not paid out")
+        db.execute("INSERT INTO pool_fee VALUES (101, ?)", (300 * xp.ATOMIC,))
+        db.execute("INSERT INTO pool_fee VALUES (102, ?)", (200 * xp.ATOMIC,))
+        self.sent = []
+
+    def run_with(self, unlocked, miners_pending, transfer=None):
+        self.pool.store.db.execute("DELETE FROM balances")
+        if miners_pending:
+            self.pool.store.db.execute("INSERT INTO balances(address,pending) VALUES ('M', ?)", (miners_pending,))
+        def default(p):
+            self.sent.append(p); return {"tx_hash": "cd" * 32, "fee": 7}
+        async def w(method, params=None, timeout=60):
+            if method == "get_balance":
+                return {"unlocked_balance": unlocked}
+            return (transfer or default)(params)
+        self.pool.w = w
+        return asyncio.run(self.pool.liquidity_once())
+
+    def test_one_percent_of_new_fee(self):
+        self.assertEqual(self.run_with(10_000 * xp.ATOMIC, 0), "cd" * 32)
+        self.assertEqual(self.sent[0]["destinations"], [{"address": self.ADDR, "amount": 5 * xp.ATOMIC}])
+        self.assertIsNone(self.run_with(10_000 * xp.ATOMIC, 0), "nothing twice")
+        self.assertEqual(self.pool.liquidity_stats()["sent"], 5 * xp.ATOMIC)
+
+    def test_miners_come_first(self):
+        # 100 unlocked, miners are owed 99.85: after the 0.1 reserve and 0.1 margin nothing is spare
+        self.assertIsNone(self.run_with(100 * xp.ATOMIC, int(99.85 * xp.ATOMIC)))
+        self.assertEqual(self.sent, [])
+        # 3 XMZ spare: a part is sent now, the rest later
+        self.run_with(100 * xp.ATOMIC, int(96.8 * xp.ATOMIC))
+        self.assertEqual(self.sent[0]["destinations"][0]["amount"], 3 * xp.ATOMIC)
+        self.assertEqual(self.pool.liquidity_owed(), 2 * xp.ATOMIC)
+
+    def test_refused_is_retried_later_uncertain_halts(self):
+        def refuse(_): raise xp.RpcError("not enough money")
+        self.assertIsNone(self.run_with(10_000 * xp.ATOMIC, 0, refuse))
+        self.assertEqual(self.pool.liquidity_owed(), 5 * xp.ATOMIC, "a refused transfer is still owed")
+        def lost(_): raise xp.RpcUncertain("timed out")
+        self.run_with(10_000 * xp.ATOMIC, 0, lost)
+        self.assertTrue(self.pool.halt_file.exists())
+        self.assertEqual(self.pool.liquidity_owed(), 0, "an uncertain transfer counts as sent until reconciled")
+        self.assertIsNone(self.run_with(10_000 * xp.ATOMIC, 0))
+        self.assertEqual(self.sent, [])
+
+    def test_off_or_payouts_off_sends_nothing(self):
+        self.pool.cfg["liquidity"]["enabled"] = False
+        self.assertIsNone(self.run_with(10_000 * xp.ATOMIC, 0))
+        self.pool.cfg["liquidity"]["enabled"] = True
+        self.pool.payouts_enabled = False
+        self.assertIsNone(self.run_with(10_000 * xp.ATOMIC, 0))
+        self.assertEqual(self.sent, [])
+
+
 class WalletLogin(unittest.TestCase):
     """monero-wallet-rpc offers MD5 and MD5-sess digest challenges together."""
 
