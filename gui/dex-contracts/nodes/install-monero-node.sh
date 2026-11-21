@@ -142,6 +142,8 @@ rpc-restricted-bind-ip=0.0.0.0
 rpc-restricted-bind-port=$RRPC
 confirm-external-bind=1
 public-node=1
+# Each DEX user runs several wallets (main + trade wallets) from one address; the default (3) refuses the rest
+rpc-max-connections-per-public-ip=16
 EOF
   echo "wrote $CONF (pruned: $PRUNE)"
 else
