@@ -204,6 +204,11 @@ impl AlloyChain {
 
 /// The most gas a payout may spend on the receiving account's own code.
 const PAYOUT_GAS_LIMIT: u64 = 150_000;
+/// A receiver with no code is an ordinary account; sending to one that was never used costs more
+/// where the network charges for creating accounts (Sepolia since its late-2026 upgrade: about
+/// 207,000 gas instead of 21,000). That cost is the network's, not the receiver's code, so a
+/// higher ceiling applies to code-less receivers.
+const PAYOUT_NEW_ACCOUNT_GAS_LIMIT: u64 = 500_000;
 
 impl AlloyChain {
     /// After a trade: send everything our account holds, less the fee of this transfer, to
@@ -281,7 +286,8 @@ impl AlloyChain {
         let probe = TransactionRequest::default().with_from(self.from).with_to(to).with_value(U256::from(1u8));
         let needed = self.reader.estimate_gas(probe).await.map_err(chain_err)?;
         let gas: u64 = if needed <= 21_000 { 21_000 } else { needed + needed / 5 };
-        if gas > PAYOUT_GAS_LIMIT {
+        let plain = self.reader.get_code_at(to).await.map_err(chain_err)?.is_empty();
+        if gas > if plain { PAYOUT_NEW_ACCOUNT_GAS_LIMIT } else { PAYOUT_GAS_LIMIT } {
             return Err(DriverError::Chain(format!("the payout address needs {needed} gas to receive a payment; send to a plain account instead")));
         }
         // Pay the full max fee up front so the amount plus fee never exceeds the balance
