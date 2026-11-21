@@ -528,6 +528,7 @@ private:
     LitecoinJournalJob *m_ltcJournal;
     LitecoinReservationJob *m_ltcReservation;
     LitecoinLightFundingController *m_ltcLightFunding;
+    QByteArray m_ltcLightRecoveryPsbt;  // latched from LightFundingController::prepared; the funding status clears it before the recovery gate opens
     LitecoinRedemptionJob *m_ltcRedemption;
     QPointer<LitecoinNegotiationSession> m_ltcNegotiation;
     NativeFeePreviewController *m_feePreviewController;

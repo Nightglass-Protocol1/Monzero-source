@@ -432,8 +432,13 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     // is transiently false and the start would be silently dropped (the swap then stalls forever at
     // recoveryState=not-started). So attempt it on prepared AND retry on each funding-state change via a
     // queued call, once the busy flag clears. startRecovery() is self-guarded, so retries are safe no-ops.
-    connect(m_ltcLightFunding,&LitecoinLightFundingController::prepared,this,[this](const QByteArray &){maybeStartLitecoinLightRecovery();});
+    connect(m_ltcLightFunding,&LitecoinLightFundingController::prepared,this,[this](const QByteArray &psbt){m_ltcLightRecoveryPsbt=psbt;maybeStartLitecoinLightRecovery();});
     connect(m_ltcLightFunding,&LitecoinLightFundingController::changed,this,&DexEngine::maybeStartLitecoinLightRecovery,Qt::QueuedConnection);
+    // Also retry on the broader state/negotiation signals: on a live chain the event that opens the gate
+    // (a sub-job going idle, the peer channel settling) may surface on one of these rather than the funding
+    // controller's own changed(). Queued + self-guarded, so this is safe and idempotent.
+    connect(this,&DexEngine::litecoinStateChanged,this,&DexEngine::maybeStartLitecoinLightRecovery,Qt::QueuedConnection);
+    connect(this,&DexEngine::litecoinNegotiationChanged,this,&DexEngine::maybeStartLitecoinLightRecovery,Qt::QueuedConnection);
     connect(this,&DexEngine::litecoinNegotiationChanged,this,&DexEngine::litecoinReservationChanged);
     connect(m_ltcReservation,&LitecoinReservationJob::prepared,this,[this](const QByteArray &psbt){startLitecoinRecovery(psbt);});
     connect(m_ltcJournal,&LitecoinJournalJob::changed,this,&DexEngine::litecoinJournalChanged);
@@ -1082,12 +1087,28 @@ bool DexEngine::submitLitecoinLockFunding(const QString &commitment) {return !li
 bool DexEngine::prepareLitecoinReservation() {return !litecoinLightFundingSelected() && litecoinOperationAllowed() && litecoinReservationStatus().value("canPrepare").toBool() && m_ltcReservation->prepare();}
 bool DexEngine::startLitecoinRecovery(const QByteArray &psbt) { return litecoinOperationAllowed() && m_ltcNegotiation && m_ltcNegotiation->startRecovery(psbt); }
 void DexEngine::maybeStartLitecoinLightRecovery() {
-    // Retry-safe entry point for starting the light funder's peer recovery: litecoinLightFundingAllowed()
-    // and startRecovery()'s own guards make this a no-op unless the light path is selected, its lock PSBT
-    // is prepared, and recovery has not already started. Called on prepared() and on each funding change.
-    if (!litecoinLightFundingAllowed()) return;
-    const auto psbt = m_ltcLightFunding->status().value("result").toMap().value("fundingPsbt").toString().toLatin1();
-    if (!psbt.isEmpty()) startLitecoinRecovery(psbt);
+    // Retry-safe entry point for starting the light funder's peer recovery. Self-guarded: a no-op unless
+    // the gate (litecoinLightFundingAllowed) is open, the prepared lock PSBT is available, and recovery
+    // has not already started. Set MONZERO_DEX_RECOVERY_DEBUG to log the exact refused condition.
+    const bool allowed = litecoinLightFundingAllowed();
+    const auto fstatus = m_ltcLightFunding->status();
+    // Use the PSBT latched from the prepared() signal: the funding status' result.fundingPsbt is
+    // cleared by the time the recovery gate opens on mainnet (observed: allowed=1 but psbtLen=0),
+    // which is why reading it from status left recovery unstarted.
+    const auto psbt = m_ltcLightRecoveryPsbt;
+    const bool started = allowed && !psbt.isEmpty() && startLitecoinRecovery(psbt);
+    if (qEnvironmentVariableIsSet("MONZERO_DEX_RECOVERY_DEBUG") && m_ltcNegotiation
+            && !m_ltcNegotiation->status().value("recoveryStarted").toBool()) {
+        const auto neg = m_ltcNegotiation->status();
+        qWarning().noquote() << QStringLiteral("[recovery-debug] started=%1 allowed=%2 psbtLen=%3 appBusy=%4 "
+            "ctxEmpty=%5 tradeMatch=%6 qcMatch=%7 role=%8 complete=%9 negBusy=%10 transport=%11")
+            .arg(int(started)).arg(int(allowed)).arg(psbt.size()).arg(int(litecoinAppBusy()))
+            .arg(int(m_ltcNegotiation->lightFundingContext().isEmpty()))
+            .arg(int(neg.value("tradeId")==fstatus.value("tradeId")))
+            .arg(int(neg.value("quoteCommitment")==fstatus.value("quoteCommitment")))
+            .arg(neg.value("role").toString()).arg(int(neg.value("complete").toBool()))
+            .arg(int(neg.value("busy").toBool())).arg(int(neg.value("transportAuthenticated").toBool()));
+    }
 }
 QVariantMap DexEngine::litecoinJournalStatus() const { return litecoinAppView(m_ltcJournal->status()); }
 bool DexEngine::configureLitecoinJournal(const QString &path) {
