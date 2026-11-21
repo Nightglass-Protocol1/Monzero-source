@@ -1,0 +1,60 @@
+# Monzero DEX appliance, Docker edition: three images from one file (build with build-images.sh).
+#   node    monzerod (p2p 6174 public; RPC 6175 for the wallet on the compose network only)
+#   relay   the DEX relay (offers board, peers with relay1/relay2)
+#   wallet  the wallet + DEX app on a virtual screen, shown in your browser (noVNC over TLS)
+# The Monzero release comes in through monzero-update: signed release file, pinned key, SHA-256.
+
+FROM docker.io/library/debian:trixie-slim AS release
+ARG MONZERO_VERSION
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 gpgv ca-certificates >/dev/null
+COPY rootfs/usr/local/sbin/monzero-update /usr/local/sbin/monzero-update
+COPY release-keyring.gpg /usr/share/monzero/release-keyring.gpg
+RUN MONZERO_UPDATE_VERSION=$MONZERO_VERSION python3 -I /usr/local/sbin/monzero-update \
+ && test "$(cat /opt/monzero/current/VERSION)" = "$MONZERO_VERSION" \
+ && cp -a /opt/monzero/releases/$MONZERO_VERSION /monzero
+
+FROM docker.io/library/debian:trixie-slim AS base
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates libudev1 tini >/dev/null \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --uid 10001 --create-home --home-dir /home/monzero --shell /usr/sbin/nologin monzero
+
+FROM base AS node
+ARG MONZERO_VERSION
+LABEL org.opencontainers.image.title="Monzero node" org.monzero.version=$MONZERO_VERSION
+COPY --from=release /monzero/monzerod /usr/local/bin/monzerod
+USER monzero
+VOLUME /data
+EXPOSE 6174
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s CMD ["/usr/local/bin/monzerod", "--rpc-bind-port", "6175", "status"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/monzerod", "--data-dir", "/data", "--non-interactive", "--log-level", "0", \
+  "--p2p-bind-ip", "0.0.0.0", "--p2p-bind-port", "6174", "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "6175", \
+  "--no-igd", "--out-peers", "24", "--in-peers", "48", "--db-sync-mode", "safe:sync", \
+  "--add-priority-node", "node.monzero.org:6174", "--add-priority-node", "node2.monzero.org:6174"]
+
+FROM base AS relay
+ARG MONZERO_VERSION
+LABEL org.opencontainers.image.title="Monzero DEX relay" org.monzero.version=$MONZERO_VERSION
+COPY monzero-dex-relay /usr/local/bin/monzero-dex-relay
+COPY docker/relay.json /etc/monzero-dex-relay/config.json
+USER monzero
+VOLUME /data
+EXPOSE 8790
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/monzero-dex-relay", "/etc/monzero-dex-relay/config.json"]
+
+FROM base AS wallet
+ARG MONZERO_VERSION
+LABEL org.opencontainers.image.title="Monzero wallet + DEX (browser screen)" org.monzero.version=$MONZERO_VERSION
+USER root
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      xvfb openbox x11vnc novnc python3-websockify openssl x11-xserver-utils fonts-dejavu-core \
+      libgl1 libegl1 libgl1-mesa-dri libglib2.0-0t64 libx11-xcb1 libxcb1 libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-shm0 \
+      libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-render0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
+      libxkbcommon-x11-0 libxkbcommon0 libpcre2-8-0 >/dev/null \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=release /monzero /opt/monzero
+COPY docker/wallet-entry.sh /usr/local/bin/wallet-entry
+USER monzero
+ENV HOME=/home/monzero
+VOLUME /home/monzero
+EXPOSE 6080
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/wallet-entry"]

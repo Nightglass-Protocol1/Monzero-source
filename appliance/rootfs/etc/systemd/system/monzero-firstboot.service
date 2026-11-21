@@ -1,0 +1,13 @@
+[Unit]
+Description=Monzero appliance first start (unique keys, setup code)
+ConditionPathExists=!/var/lib/monzero-appliance/firstboot-done
+Before=getty@tty1.service monzero-web.service ssh.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/monzero-firstboot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

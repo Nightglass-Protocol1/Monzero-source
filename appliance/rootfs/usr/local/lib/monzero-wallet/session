@@ -1,0 +1,9 @@
+#!/bin/sh
+# The wallet session: a plain window manager and the wallet, restarted if it is closed. The
+# wallet connects to this box's own node (127.0.0.1:6175) when the node role is on.
+xset s off -dpms 2>/dev/null
+openbox &
+while true; do
+  /opt/monzero/current/monzero-wallet-gui
+  sleep 2
+done

@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch for changes requested by the setup page
+
+[Path]
+DirectoryNotEmpty=/var/lib/monzero-web/requests
+
+[Install]
+WantedBy=multi-user.target

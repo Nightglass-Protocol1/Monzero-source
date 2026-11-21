@@ -1,0 +1,49 @@
+#!/bin/bash
+# First start of a Monzero appliance: everything that must be unique to this box is made here,
+# never in the image (SSH host keys, the setup code, the setup page's TLS key).
+set -euo pipefail
+umask 077
+STATE=/var/lib/monzero-appliance
+mkdir -p $STATE
+
+# Grow the root filesystem to the whole disk/SD card (VM and Raspberry Pi images ship small)
+if [ ! -f /.dockerenv ] && command -v growpart >/dev/null; then
+  ROOT=$(findmnt -no SOURCE /)
+  DISK=/dev/$(lsblk -no PKNAME "$ROOT" | head -1)
+  PART=$(cat /sys/class/block/$(basename "$ROOT")/partition 2>/dev/null || true)
+  if [ -n "$PART" ] && [ -b "$DISK" ]; then
+    growpart "$DISK" "$PART" || true
+    resize2fs "$ROOT" || true
+  fi
+fi
+
+# New SSH host keys (SSH stays off until the owner turns it on in the setup page)
+rm -f /etc/ssh/ssh_host_*
+ssh-keygen -A >/dev/null 2>&1 || true
+
+# One-time setup code: 12 characters from an alphabet without look-alikes, shown on the
+# console only. The setup page needs it once; after setup it is deleted.
+CODE=$(python3 -I -c 'import secrets; a="ABCDEFGHJKMNPQRSTUVWXYZ23456789"; print("".join(secrets.choice(a) for _ in range(12)))')
+[ ${#CODE} = 12 ]
+install -d -o root -g monzero-web -m 750 /etc/monzero/web
+printf '%s' "$CODE" > /etc/monzero/web/setup-code
+chown root:monzero-web /etc/monzero/web/setup-code; chmod 640 /etc/monzero/web/setup-code
+
+# The setup page's own TLS key (self-signed: the browser asks once; compare the fingerprint
+# shown on the console)
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+  -subj "/CN=monzero-box" -keyout /etc/monzero/web/tls.key -out /etc/monzero/web/tls.crt 2>/dev/null
+chown root:monzero-web /etc/monzero/web/tls.key /etc/monzero/web/tls.crt; chmod 640 /etc/monzero/web/tls.key
+FPR=$(openssl x509 -in /etc/monzero/web/tls.crt -noout -fingerprint -sha256 | cut -d= -f2)
+
+mkdir -p /etc/issue.d
+cat > /etc/issue.d/50-monzero.issue <<ISSUE
+
+  Monzero box - set it up from a browser on your network:
+      https://\4:8443
+  One-time setup code:   ${CODE:0:4}-${CODE:4:4}-${CODE:8:4}
+  Page certificate (SHA-256): $FPR
+
+ISSUE
+chmod 644 /etc/issue.d/50-monzero.issue
+touch $STATE/firstboot-done

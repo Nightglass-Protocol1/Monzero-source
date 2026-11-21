@@ -1,0 +1,255 @@
+#!/usr/bin/python3 -I
+"""Monzero appliance updater: installs only releases signed with the project release key.
+
+  monzero-update            check and install (the daily timer runs this)
+  monzero-update --check    only say whether a newer release exists
+  monzero-update --status   print the last result (JSON)
+
+Flow: monzero.org/releases/latest.json names the newest version (unsigned: it can only point,
+never vouch). The release file v<version>.json must carry a valid signature by the release key
+pinned in this image (fingerprint below), name that same version and the Monzero network, and
+list an artifact for this machine with its size and SHA-256. Only then is the artifact
+downloaded from monzero.org/downloads, checked, unpacked into its own folder and switched in.
+Never installs an older or equal version. After switching, the node must answer again within
+two minutes or the previous version is put back. A running wallet is never restarted: it
+picks the new version up the next time it starts.
+"""
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+RELEASE_FPR = "4C37C618789F86D81FEF28DF390AEFB735F270D6"
+KEYRING = "/usr/share/monzero/release-keyring.gpg"
+GENESIS = "84f9ebdac8924806f037482ec16fd59b271e954d3e00363dd6c7e4ce9dd659e4"
+BASE = os.environ.get("MONZERO_UPDATE_BASE", "https://monzero.org")
+ROOT = "/opt/monzero"
+STATE = "/var/lib/monzero-update"
+CACHE = "/var/cache/monzero-update"
+KEEP = 2
+MAX_DOWNLOAD = 400 * 1024 * 1024
+ARCH = {"x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(platform.machine(), platform.machine())
+# What this box installs from a release: the node+wallet bundle, and the relay when the release has one
+PARTS = {
+    "core": {"platform": f"linux-{ARCH}-gui", "dir": ROOT, "services": ["monzerod"], "health": "node"},
+    "relay": {"platform": f"linux-{ARCH}-relay", "dir": f"{ROOT}/relay", "services": ["monzero-dex-relay"], "health": "relay"},
+}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def fetch(url, limit=2 * 1024 * 1024):
+    req = urllib.request.Request(url, headers={"User-Agent": "monzero-appliance-updater"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise RuntimeError(f"{url}: larger than {limit} bytes")
+    return data
+
+
+def version_key(v):
+    if not re.fullmatch(r"\d+(\.\d+){1,3}", v):
+        raise RuntimeError(f"not a version: {v!r}")
+    return tuple(int(x) for x in v.split("."))
+
+
+def installed(part):
+    try:
+        return open(f"{PARTS[part]['dir']}/current/VERSION").read().strip()
+    except OSError:
+        return None
+
+
+def verify_signature(data, sig):
+    with tempfile.TemporaryDirectory() as t:
+        open(f"{t}/f", "wb").write(data)
+        open(f"{t}/f.asc", "wb").write(sig)
+        out = subprocess.run(["gpgv", "--status-fd", "1", "--keyring", KEYRING, f"{t}/f.asc", f"{t}/f"], capture_output=True, text=True)
+    fprs = re.findall(r"^\[GNUPG:\] VALIDSIG ([0-9A-F]{40}) .* ([0-9A-F]{40})$", out.stdout, re.M)
+    # VALIDSIG <signing subkey> ... <primary key>: the primary must be the pinned release key
+    if out.returncode != 0 or not any(primary == RELEASE_FPR for _, primary in fprs):
+        raise RuntimeError("release file signature is not from the Monzero release key")
+
+
+def release(version):
+    raw = fetch(f"{BASE}/releases/v{version}.json")
+    verify_signature(raw, fetch(f"{BASE}/releases/v{version}.json.asc"))
+    d = json.loads(raw)
+    if d.get("version") != version:
+        raise RuntimeError(f"signed release file is for {d.get('version')}, not {version}")
+    if d.get("genesis_hash") != GENESIS:
+        raise RuntimeError("signed release file is for another network")
+    return d
+
+
+def download(art):
+    name = art["filename"]
+    if not re.fullmatch(r"monzero-v[0-9.]+-[a-z0-9_.-]+\.tar\.gz", name):
+        raise RuntimeError(f"unexpected artifact name {name!r}")
+    if not 0 < int(art["size_bytes"]) <= MAX_DOWNLOAD:
+        raise RuntimeError("artifact size out of range")
+    os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    path = f"{CACHE}/{name}"
+    h = hashlib.sha256()
+    req = urllib.request.Request(f"{BASE}/downloads/{name}", headers={"User-Agent": "monzero-appliance-updater"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(path + ".part", "wb") as f:
+        n = 0
+        while chunk := r.read(1 << 20):
+            n += len(chunk)
+            if n > int(art["size_bytes"]):
+                raise RuntimeError("artifact larger than the signed size")
+            h.update(chunk)
+            f.write(chunk)
+    if n != int(art["size_bytes"]) or h.hexdigest() != art["sha256"].lower():
+        os.unlink(path + ".part")
+        raise RuntimeError(f"{name}: size or SHA-256 differs from the signed release file")
+    os.replace(path + ".part", path)
+    return path
+
+
+def unpack(tarball, dest):
+    tmp = dest + ".new"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    with tarfile.open(tarball) as t:
+        t.extractall(tmp, filter="data")   # no absolute paths, no .., no devices, no setuid
+    # The archive holds one top folder; its contents become the release folder
+    entries = os.listdir(tmp)
+    top = f"{tmp}/{entries[0]}" if len(entries) == 1 and os.path.isdir(f"{tmp}/{entries[0]}") else tmp
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.move(top, dest)
+    shutil.rmtree(tmp, ignore_errors=True)
+    subprocess.run(["chown", "-R", "root:root", dest], check=True)
+    subprocess.run(["chmod", "-R", "go-w", dest], check=True)
+
+
+def switch(base, version):
+    link = f"{base}/current"
+    old = os.path.realpath(link) if os.path.islink(link) else None
+    tmp = f"{base}/.current.tmp"
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(f"releases/{version}", tmp)
+    os.replace(tmp, link)
+    return old
+
+
+def enabled(service):
+    try:
+        return subprocess.run(["systemctl", "is-enabled", "--quiet", service], stderr=subprocess.DEVNULL).returncode == 0
+    except FileNotFoundError:   # no systemd (Docker): the container's own restart handles it
+        return False
+
+
+def healthy(kind):
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            if kind == "node":
+                req = urllib.request.Request("http://127.0.0.1:6175/get_info", data=b"{}", headers={"Content-Type": "application/json"})
+                if json.load(urllib.request.urlopen(req, timeout=5)).get("status") == "OK":
+                    return True
+            else:
+                if urllib.request.urlopen("http://127.0.0.1:8790/v1/info", timeout=5).status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(5)
+    return False
+
+
+def prune(base, keep_version):
+    rel = f"{base}/releases"
+    versions = sorted((v for v in os.listdir(rel) if re.fullmatch(r"[0-9.]+", v)), key=version_key)
+    current = os.path.basename(os.path.realpath(f"{base}/current"))
+    for v in versions[:-KEEP]:
+        if v not in (current, keep_version):
+            shutil.rmtree(f"{rel}/{v}", ignore_errors=True)
+
+
+def install_part(part, d, version):
+    spec = PARTS[part]
+    arts = [a for a in d.get("artifacts", []) if a.get("platform") == spec["platform"]]
+    if not arts:
+        return f"{part}: no {spec['platform']} artifact in v{version}"
+    have = installed(part)
+    if have and version_key(version) <= version_key(have):
+        return f"{part}: {have} installed"
+    tarball = download(arts[0])
+    dest = f"{spec['dir']}/releases/{version}"
+    os.makedirs(f"{spec['dir']}/releases", exist_ok=True)
+    unpack(tarball, dest)
+    open(f"{dest}/VERSION", "w").write(version + "\n")
+    old = switch(spec["dir"], version)
+    restart = [s for s in spec["services"] if enabled(s)]
+    for s in restart:
+        subprocess.run(["systemctl", "restart", s])
+    if restart and not healthy(spec["health"]):
+        if old:
+            switch(spec["dir"], os.path.basename(old))
+            for s in restart:
+                subprocess.run(["systemctl", "restart", s])
+        raise RuntimeError(f"{part} v{version} did not come up; went back to {os.path.basename(old) if old else 'nothing'}")
+    if part == "core" and any(open(f"/proc/{p}/comm").read().strip() == "monzero-wallet-g" for p in os.listdir("/proc") if p.isdigit() and os.path.exists(f"/proc/{p}/comm")):
+        open("/run/monzero-update-wallet-restart", "w").write(version)
+    os.unlink(tarball)
+    prune(spec["dir"], version)
+    return f"{part}: {have or 'nothing'} -> {version}"
+
+
+def write_status(**kw):
+    os.makedirs(STATE, exist_ok=True)
+    kw["time"] = int(time.time())
+    kw["installed"] = {p: installed(p) for p in PARTS}
+    tmp = f"{STATE}/status.json.tmp"
+    json.dump(kw, open(tmp, "w"))
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, f"{STATE}/status.json")
+
+
+def main():
+    if "--status" in sys.argv:
+        print(open(f"{STATE}/status.json").read() if os.path.exists(f"{STATE}/status.json") else "{}")
+        return 0
+    if os.geteuid() != 0:
+        sys.exit("run as root")
+    os.umask(0o022)
+    os.makedirs(STATE, exist_ok=True)
+    lock = open(f"{STATE}/lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        # MONZERO_UPDATE_VERSION pins a version (image builds); otherwise the published pointer
+        latest = os.environ.get("MONZERO_UPDATE_VERSION") or json.loads(fetch(f"{BASE}/releases/latest.json", 4096))["version"]
+        version_key(latest)
+        newer = [p for p in PARTS if installed(p) is None or version_key(latest) > version_key(installed(p))]
+        if "--check" in sys.argv:
+            log(f"latest {latest}; installed {', '.join(f'{p} {installed(p)}' for p in PARTS)}")
+            return 0
+        if not newer:
+            write_status(ok=True, latest=latest, result="up to date")
+            log(f"up to date ({latest})")
+            return 0
+        d = release(latest)
+        results = [install_part(p, d, latest) for p in newer]
+        write_status(ok=True, latest=latest, result="; ".join(results))
+        log("; ".join(results))
+        return 0
+    except Exception as e:
+        write_status(ok=False, result=str(e))
+        log(f"update failed: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,39 @@
+[Unit]
+Description=Monzero box setup and status page (https://<box>:8443)
+After=network-online.target monzero-firstboot.service
+Wants=network-online.target
+
+[Service]
+User=monzero-web
+Group=monzero-web
+ExecStart=/usr/bin/python3 -I /usr/local/lib/monzero-web/server.py
+Restart=always
+RestartSec=5
+StateDirectory=monzero-web
+StateDirectoryMode=0750
+AmbientCapabilities=
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/monzero-web
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Monzero wallet on the box's screen (tty1)
+After=systemd-user-sessions.service monzerod.service
+Conflicts=getty@tty1.service
+
+[Service]
+User=monzero-wallet
+PAMName=login
+TTYPath=/dev/tty1
+StandardInput=tty
+UnsetEnvironment=TERM
+UtmpIdentifier=tty1
+UtmpMode=user
+WorkingDirectory=/home/monzero-wallet
+ExecStart=/usr/bin/startx /usr/local/lib/monzero-wallet/session -- :0 vt1 -nolisten tcp -keeptty
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

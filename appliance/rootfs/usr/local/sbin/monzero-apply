@@ -1,0 +1,177 @@
+#!/usr/bin/python3 -I
+"""Carries out what the setup page asked for (runs as root, started by monzero-apply.path).
+
+Every request is checked strictly here, because the page runs as an unprivileged user: only
+known kinds, known roles, and SSH keys of known types are accepted; anything else is dropped.
+"""
+import json
+import os
+import re
+import secrets
+import subprocess
+import time
+
+REQUESTS = "/var/lib/monzero-web/requests"
+CONFIG = "/etc/monzero/appliance.json"
+RESULT = "/var/lib/monzero-web/last-result.json"
+ROLES = {"node": ["monzerod"], "relay": ["monzero-dex-relay"], "wallet": ["monzero-wallet-session"]}
+KEY_RE = re.compile(r"^(ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|sk-ssh-ed25519@openssh\.com|ssh-rsa) [A-Za-z0-9+/=]{60,1200}( [^\n]{0,100})?$")
+ADMIN = "monzero-admin"
+
+
+def run(*cmd):
+    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def load():
+    try:
+        return json.load(open(CONFIG))
+    except Exception:
+        return {"roles": [], "vnc": False, "sshkey": ""}
+
+
+def save(cfg):
+    tmp = CONFIG + ".tmp"
+    json.dump(cfg, open(tmp, "w"), indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, CONFIG)
+
+
+def is_docker():
+    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+
+def apply_roles(roles):
+    for role, units in ROLES.items():
+        for u in units:
+            if role in roles:
+                run("systemctl", "enable", "--now", u)
+            else:
+                run("systemctl", "disable", "--now", u)
+    firewall()
+
+
+def apply_ssh(key):
+    if not key:
+        run("systemctl", "disable", "--now", "ssh")
+        if os.path.exists(f"/home/{ADMIN}/.ssh/authorized_keys"):
+            os.unlink(f"/home/{ADMIN}/.ssh/authorized_keys")
+        return
+    os.makedirs(f"/home/{ADMIN}/.ssh", mode=0o700, exist_ok=True)
+    path = f"/home/{ADMIN}/.ssh/authorized_keys"
+    open(path, "w").write(key + "\n")
+    os.chmod(path, 0o600)
+    run("chown", "-R", f"{ADMIN}:{ADMIN}", f"/home/{ADMIN}/.ssh")
+    run("systemctl", "enable", "--now", "ssh")
+    firewall()
+
+
+def apply_vnc(on):
+    if on:
+        # The VNC password: a fresh random one only this box and the page know (VNC
+        # passwords are 8 characters at most); the page shows it after sign-in
+        pw = secrets.token_urlsafe(6)[:8]
+        os.makedirs("/etc/monzero/vnc", mode=0o750, exist_ok=True)
+        subprocess.run(["x11vnc", "-storepasswd", pw, "/etc/monzero/vnc/passwd"], check=False, capture_output=True)
+        # Its own copy of the page's certificate: the wallet user gets no access to the page's files
+        for f in ("tls.crt", "tls.key"):
+            run("install", "-o", "root", "-g", "monzero-wallet", "-m", "640", f"/etc/monzero/web/{f}", f"/etc/monzero/vnc/{f}")
+        run("chown", "-R", "root:monzero-wallet", "/etc/monzero/vnc")
+        run("chmod", "640", "/etc/monzero/vnc/passwd")
+        open("/var/lib/monzero-web/vnc-password", "w").write(pw)
+        run("chown", "monzero-web", "/var/lib/monzero-web/vnc-password")
+        os.chmod("/var/lib/monzero-web/vnc-password", 0o600)
+        run("systemctl", "enable", "--now", "monzero-wallet-vnc")
+    else:
+        run("systemctl", "disable", "--now", "monzero-wallet-vnc")
+    firewall()
+
+
+def firewall():
+    if not is_docker():
+        run("/usr/local/sbin/monzero-firewall")
+
+
+def handle(req, cfg):
+    kind = req.get("kind")
+    if kind == "setup":
+        if cfg.get("configured"):
+            return "setup refused: already set up"
+        roles = sorted(set(r for r in req.get("roles", []) if r in ROLES))
+        key = req.get("sshkey", "")
+        if key and not KEY_RE.match(key):
+            key = ""
+        cfg.update(roles=roles, sshkey=key, configured=True, vnc=False)
+        save(cfg)
+        apply_roles(roles)
+        apply_ssh(key)
+        if os.path.exists("/etc/monzero/web/setup-code"):
+            os.unlink("/etc/monzero/web/setup-code")
+        if os.path.exists("/etc/issue.d/50-monzero.issue"):
+            open("/etc/issue.d/50-monzero.issue", "w").write("\n  Monzero box: https://\\4:8443\n\n")
+        return f"set up: {', '.join(roles) or 'no roles'}{', SSH on' if key else ''}"
+    if not cfg.get("configured"):
+        return f"{kind} refused: not set up yet"
+    if kind == "roles":
+        roles = sorted(set(r for r in req.get("roles", []) if r in ROLES))
+        cfg["roles"] = roles
+        save(cfg)
+        apply_roles(roles)
+        if "wallet" not in roles and cfg.get("vnc"):
+            cfg["vnc"] = False
+            save(cfg)
+            apply_vnc(False)
+        return f"roles: {', '.join(roles) or 'none'}"
+    if kind == "ssh":
+        key = req.get("sshkey", "")
+        if key and not KEY_RE.match(key):
+            return "SSH key refused: not a single OpenSSH public key"
+        cfg["sshkey"] = key
+        save(cfg)
+        apply_ssh(key)
+        return "SSH on" if key else "SSH off"
+    if kind == "vnc":
+        on = bool(req.get("on")) and "wallet" in cfg.get("roles", [])
+        cfg["vnc"] = on
+        save(cfg)
+        apply_vnc(on)
+        return "remote screen on" if on else "remote screen off"
+    if kind == "password":
+        if cfg.get("vnc"):
+            apply_vnc(True)
+        return "password changed"
+    if kind == "update":
+        run("systemctl", "start", "--no-block", "monzero-update.service")
+        return "update check started"
+    return f"unknown request {kind!r} dropped"
+
+
+def main():
+    if not os.path.isdir(REQUESTS):
+        return
+    cfg = load()
+    for name in sorted(os.listdir(REQUESTS)):
+        path = f"{REQUESTS}/{name}"
+        if name.startswith(".") or not name.endswith(".json"):
+            continue
+        try:
+            st = os.lstat(path)
+            if not os.path.isfile(path) or os.path.islink(path) or st.st_size > 8192:
+                raise ValueError("not a plain small file")
+            req = json.load(open(path))
+            if not isinstance(req, dict):
+                raise ValueError("not an object")
+            result = handle(req, cfg)
+        except Exception as e:
+            result = f"request dropped: {e}"
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        json.dump({"time": int(time.time()), "result": result}, open(RESULT, "w"))
+        os.chmod(RESULT, 0o644)
+
+
+if __name__ == "__main__":
+    main()
