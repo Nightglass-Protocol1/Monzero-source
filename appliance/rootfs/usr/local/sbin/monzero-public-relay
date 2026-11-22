@@ -84,4 +84,25 @@ EOF
     status off "" "only this box and your home network use the relay"
     ;;
 esac
+# Has the network listed it? (the hubs check a relay before they list it; give them a few
+# minutes after a change)
+if [ -s "$URL" ] && [ -f "$STATUS" ]; then
+  python3 -I - "$STATUS" <<'PY' || true
+import json, sys, urllib.request
+p = sys.argv[1]
+st = json.load(open(p))
+listed = []
+for hub in ("https://relay1.monzero.org", "https://relay2.monzero.org"):
+    try:
+        d = json.load(urllib.request.urlopen(urllib.request.Request(hub + "/v1/relays", headers={"User-Agent": "monzero-box"}), timeout=20))
+        if any(r.get("url", "").rstrip("/") == st["url"].rstrip("/") for r in d.get("relays", [])):
+            listed.append(hub.split("//")[1].split(".")[0])
+    except Exception:
+        pass
+st["listedBy"] = listed
+st["message"] = st["message"].split(" (listed")[0] + (f" (listed by {' and '.join(listed)})" if listed else " (not listed by the network yet)")
+json.dump(st, open(p + ".tmp", "w"))
+PY
+  [ -f "$STATUS.tmp" ] && { chmod 644 "$STATUS.tmp"; mv "$STATUS.tmp" "$STATUS"; }
+fi
 /usr/local/sbin/monzero-firewall >/dev/null 2>&1 || true
