@@ -69,9 +69,12 @@ case "$NET" in
     fi
     set_flag
     systemctl start "monerod@$PNET"
-    echo "== waiting for the node to answer"
-    for i in $(seq 1 120); do curl -s -m 5 http://127.0.0.1:$PP/get_info >/dev/null && break; sleep 10; done
-    if [ "$(pruned_state $PP)" = pruned ]; then
+    # After the swap the node walks the whole database once more and answers no RPC meanwhile
+    # (mainnet: about an hour), so wait for the pruned answer itself, up to four hours.
+    echo "== waiting for the node to answer as pruned (mainnet: up to an hour)"
+    STATE=unknown
+    for i in $(seq 1 240); do STATE=$(pruned_state $PP); [ "$STATE" = unknown ] || break; sleep 60; done
+    if [ "$STATE" = pruned ]; then
       rm -rf "$DB/lmdb-old"
       echo "done: $PNET pruned, full copy deleted"; du -sh "$DB/lmdb"; df -h "$D" | tail -1
     else
