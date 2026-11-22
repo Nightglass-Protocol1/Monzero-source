@@ -28,7 +28,7 @@ ADMIN = f"{DATA}/admin.json"
 ROLES = ("node", "relay", "wallet")
 SESSION_SECS = 12 * 3600
 sessions = {}           # token -> (expires, csrf)
-failures = {"n": 0, "until": 0.0}
+failures = {}          # address -> [wrong answers, blocked until]
 
 
 def is_setup():
@@ -58,15 +58,19 @@ def check_password(pw):
     return hmac.compare_digest(hash_password(pw, bytes.fromhex(a["salt"]))["hash"], a["hash"])
 
 
-def throttled():
-    """Slow down guessing: after 5 wrong answers, wait 2^n seconds (up to an hour)."""
-    return time.time() < failures["until"]
+def throttled(ip):
+    """Slow down guessing, per address (so one device cannot lock the owner out): after 5
+    wrong answers, wait 2^n seconds, up to an hour."""
+    return time.time() < failures.get(ip, [0, 0.0])[1]
 
 
-def failed():
-    failures["n"] += 1
-    if failures["n"] >= 5:
-        failures["until"] = time.time() + min(3600, 2 ** (failures["n"] - 4))
+def failed(ip):
+    if len(failures) > 1000:
+        failures.clear()
+    f = failures.setdefault(ip, [0, 0.0])
+    f[0] += 1
+    if f[0] >= 5:
+        f[1] = time.time() + min(3600, 2 ** (f[0] - 4))
 
 
 def request_change(kind, **fields):
@@ -255,11 +259,12 @@ Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
         if not self.same_origin():
             return self.send(403, page("<p>Refused (other site).</p>"))
         get = lambda k: (f.get(k) or [""])[0]
+        ip = self.client_address[0]
         if self.path == "/setup" and not is_setup():
-            if throttled():
+            if throttled(ip):
                 return self.send(429, page(self.setup_form("Too many wrong codes: wait and try again.")))
             if not check_code(get("code")):
-                failed()
+                failed(ip)
                 return self.send(200, page(self.setup_form("That setup code is not right.")))
             if len(get("pw")) < 12 or get("pw") != get("pw2"):
                 return self.send(200, page(self.setup_form("The passwords differ or are shorter than 12 characters.")))
@@ -267,16 +272,16 @@ Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
             json.dump(hash_password(get("pw")), open(ADMIN + ".tmp", "w"))
             os.chmod(ADMIN + ".tmp", 0o600)
             os.replace(ADMIN + ".tmp", ADMIN)
-            failures.update(n=0, until=0.0)
+            failures.pop(ip, None)
             request_change("setup", roles=roles, sshkey=get("sshkey").strip(), share=get("share") == "1")
             return self.redirect_new_session()
         if self.path == "/login" and is_setup():
-            if throttled():
+            if throttled(ip):
                 return self.send(429, page(self.login_form("Too many wrong passwords: wait and try again.")))
             if not check_password(get("pw")):
-                failed()
+                failed(ip)
                 return self.send(200, page(self.login_form("Wrong password.")))
-            failures.update(n=0, until=0.0)
+            failures.pop(ip, None)
             return self.redirect_new_session()
         s = self.session()
         if not s or not hmac.compare_digest(get("csrf"), sessions[s][1]):

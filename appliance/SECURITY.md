@@ -34,7 +34,7 @@ version.
 - No JavaScript, no outside resources, strict Content-Security-Policy, frame denial,
   no-referrer, no-store.
 - The one-time code is compared in constant time; wrong codes and passwords slow down
-  exponentially after five tries. The password is stored as scrypt (N=2^15, r=8, p=1).
+  exponentially after five tries, counted per address (one device cannot lock the owner out). The password is stored as scrypt (N=2^15, r=8, p=1).
 - Sessions: random 256-bit token, `Secure; HttpOnly; SameSite=Strict`, 12 hours; every change
   needs a per-session CSRF token and a same-origin request.
 
