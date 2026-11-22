@@ -9,6 +9,9 @@ LAN_PORTS="8443"
 WAN_PORTS=""
 has node && { WAN_PORTS="6174"; LAN_PORTS="$LAN_PORTS, 6177"; }
 has relay && LAN_PORTS="$LAN_PORTS, 8790"
+if has relay && [ "$(python3 -I -c 'import json; print(json.load(open("/etc/monzero/appliance.json")).get("publicRelay", "off"))' 2>/dev/null)" = port ]; then
+  WAN_PORTS="${WAN_PORTS:+$WAN_PORTS, }8790"
+fi
 has vnc && LAN_PORTS="$LAN_PORTS, 6080"
 [ -s /home/monzero-admin/.ssh/authorized_keys ] && LAN_PORTS="$LAN_PORTS, 22"
 cat > /etc/nftables.conf <<NFT

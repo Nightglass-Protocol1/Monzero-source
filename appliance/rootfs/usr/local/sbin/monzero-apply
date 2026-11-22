@@ -51,6 +51,19 @@ def apply_roles(roles):
     firewall()
 
 
+def apply_public_relay():
+    run("/usr/local/sbin/monzero-public-relay")
+
+
+def public_ipv4(text):
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(text)
+        return ip.version == 4 and ip.is_global
+    except ValueError:
+        return False
+
+
 def apply_ssh(key):
     if not key:
         run("systemctl", "disable", "--now", "ssh")
@@ -101,10 +114,12 @@ def handle(req, cfg):
         key = req.get("sshkey", "")
         if key and not KEY_RE.match(key):
             key = ""
-        cfg.update(roles=roles, sshkey=key, configured=True, vnc=False)
+        share = req.get("share", True) is True and "relay" in roles
+        cfg.update(roles=roles, sshkey=key, configured=True, vnc=False, publicRelay="onion" if share else "off", publicRelayIp="")
         save(cfg)
         apply_roles(roles)
         apply_ssh(key)
+        apply_public_relay()
         if os.path.exists("/etc/monzero/web/setup-code"):
             os.unlink("/etc/monzero/web/setup-code")
         if os.path.exists("/etc/issue.d/50-monzero.issue"):
@@ -117,11 +132,23 @@ def handle(req, cfg):
         cfg["roles"] = roles
         save(cfg)
         apply_roles(roles)
+        apply_public_relay()
         if "wallet" not in roles and cfg.get("vnc"):
             cfg["vnc"] = False
             save(cfg)
             apply_vnc(False)
         return f"roles: {', '.join(roles) or 'none'}"
+    if kind == "public_relay":
+        mode = req.get("mode")
+        if mode not in ("onion", "port", "off"):
+            return "public relay: unknown choice"
+        ip = req.get("ip", "").strip()
+        if ip and not public_ipv4(ip):
+            return "public relay refused: that is not a public IPv4 address"
+        cfg.update(publicRelay=mode, publicRelayIp=ip if mode == "port" else "")
+        save(cfg)
+        apply_public_relay()
+        return {"onion": "relay shared through Tor", "port": "relay shared through a router port", "off": "relay not shared"}[mode]
     if kind == "ssh":
         key = req.get("sshkey", "")
         if key and not KEY_RE.match(key):

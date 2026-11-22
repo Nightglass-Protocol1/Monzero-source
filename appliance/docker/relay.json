@@ -29,5 +29,13 @@
   "utxoNetworks": [
     "btc-mainnet",
     "ltc-mainnet"
-  ]
+  ],
+  "announce": {
+    "urlFile": "/share/public-url",
+    "keyFile": "/data/mesh.key",
+    "to": [
+      "https://relay1.monzero.org",
+      "https://relay2.monzero.org"
+    ]
+  }
 }

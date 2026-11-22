@@ -1,0 +1,7 @@
+[Unit]
+Description=Keep the shared relay address up to date (Tor onion / router port)
+After=network-online.target monzero-dex-relay.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/monzero-public-relay

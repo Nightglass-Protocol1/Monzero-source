@@ -182,6 +182,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 <label>New password for this page (12 characters or more)</label><input type="password" name="pw" minlength="12" required autocomplete="new-password">
 <label>Password again</label><input type="password" name="pw2" minlength="12" required autocomplete="new-password">
 <h2 style="margin-top:20px">What should it run?</h2>{role_boxes(("node", "relay"))}
+<label><input type="checkbox" name="share" value="1" checked> Share my relay with the Monzero network through Tor (recommended: no router setup, your home IP stays hidden; it carries signed offers only, never funds)</label>
 <label>SSH public key (optional; SSH stays off without one)</label><textarea name="sshkey" rows="3" placeholder="ssh-ed25519 AAAA... you@pc"></textarea>
 <button type="submit">Set up</button></form></div>"""
 
@@ -205,6 +206,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
 {f'<p class="muted">Last change: {html.escape(result.get("result", ""))}</p>' if result else ''}</div>
 <div class="card"><h2>Roles</h2><form method="post" action="/roles">{tok}{role_boxes(roles)}<button>Save</button></form></div>
+<div class="card"><h2>Share the relay with the Monzero network</h2>
+<p class="muted">Other relays and apps can then read the offers your relay carries (signed offers only: it never holds funds or keys).</p>
+{self.public_relay_info()}
+<form method="post" action="/public-relay">{tok}
+<label><input type="radio" name="mode" value="onion"{' checked' if cfg.get('publicRelay', 'off') == 'onion' else ''}> Through Tor (recommended: no router setup, home IP hidden)</label>
+<label><input type="radio" name="mode" value="port"{' checked' if cfg.get('publicRelay') == 'port' else ''}> Through a router port (UPnP, or forward TCP 8790 yourself)</label>
+<label>Your public IPv4 address (only if your router has no UPnP)</label><input type="text" name="ip" value="{html.escape(cfg.get('publicRelayIp', ''))}" placeholder="leave empty to ask the router">
+<label><input type="radio" name="mode" value="off"{' checked' if cfg.get('publicRelay', 'off') == 'off' else ''}> Not shared (only this box and your home network)</label>
+<button>Save</button></form></div>
 <div class="card"><h2>Remote screen for the wallet</h2>
 <p class="muted">Shows the wallet's screen in your browser (HTTPS, your network only). Off unless you need it.</p>
 {self.vnc_info(cfg)}
@@ -217,6 +227,13 @@ Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
 <label>New password</label><input type="password" name="pw" minlength="12" required autocomplete="new-password">
 <label>Again</label><input type="password" name="pw2" minlength="12" required autocomplete="new-password"><button>Change</button></form>
 <form method="post" action="/logout">{tok}<button>Sign out</button></form></div>"""
+
+    def public_relay_info(self):
+        st = read_json(f"{DATA}/public-relay.json", {})
+        if not st:
+            return ""
+        url = f'<br>Address: <code>{html.escape(st["url"])}</code>' if st.get("url") else ""
+        return f'<p>{html.escape(st.get("message", ""))}{url}</p>'
 
     def vnc_info(self, cfg):
         if not cfg.get("vnc"):
@@ -249,7 +266,7 @@ Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
             os.chmod(ADMIN + ".tmp", 0o600)
             os.replace(ADMIN + ".tmp", ADMIN)
             failures.update(n=0, until=0.0)
-            request_change("setup", roles=roles, sshkey=get("sshkey").strip())
+            request_change("setup", roles=roles, sshkey=get("sshkey").strip(), share=get("share") == "1")
             return self.redirect_new_session()
         if self.path == "/login" and is_setup():
             if throttled():
@@ -264,6 +281,8 @@ Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
             return self.send(403, page('<p>Please <a href="/">sign in</a> again.</p>'))
         if self.path == "/roles":
             request_change("roles", roles=[r for r in f.get("role", []) if r in ROLES])
+        elif self.path == "/public-relay":
+            request_change("public_relay", mode=get("mode"), ip=get("ip").strip())
         elif self.path == "/vnc":
             request_change("vnc", on=get("on") == "1")
         elif self.path == "/ssh":

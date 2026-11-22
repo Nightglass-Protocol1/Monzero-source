@@ -15,10 +15,10 @@ if [ -z "${RELAY_BIN:-}" ]; then
 fi
 mkdir -p "$W/rootfs/usr/local/sbin" "$W/docker"
 cp "$HERE/rootfs/usr/local/sbin/monzero-update" "$W/rootfs/usr/local/sbin/"
-cp "$HERE/docker/relay.json" "$HERE/docker/wallet-entry.sh" "$W/docker/"
+cp "$HERE/docker/relay.json" "$HERE/docker/wallet-entry.sh" "$HERE/docker/tor-entry.sh" "$W/docker/"
 cp "$RELAY_BIN" "$W/monzero-dex-relay"
 gpg --dearmor < "$HERE/rootfs/usr/share/monzero/release-public.asc" > "$W/release-keyring.gpg"
-for t in node relay wallet; do
+for t in node relay tor wallet; do
   echo "== monzero/$t:$VERSION"
   $ENGINE build -q --target $t --build-arg MONZERO_VERSION="$VERSION" -t monzero/$t:$VERSION -t monzero/$t:latest -f "$HERE/docker/Containerfile" "$W" >/dev/null
 done

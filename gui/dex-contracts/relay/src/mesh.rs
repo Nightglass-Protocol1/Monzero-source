@@ -399,7 +399,11 @@ impl Announcer {
 
     /// The address to announce, if the box has one now (public relay on)
     pub fn url(&self) -> Option<String> {
-        let url = std::fs::read_to_string(&self.url_file).ok()?.trim().to_string();
+        let mut url = std::fs::read_to_string(&self.url_file).ok()?.trim().to_string();
+        // Tor's hostname file holds the bare onion name
+        if url.ends_with(".onion") && !url.contains("://") {
+            url = format!("http://{url}");
+        }
         check_url(&url).ok().map(|_| url)
     }
 

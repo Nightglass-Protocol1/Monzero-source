@@ -58,3 +58,14 @@ ENV HOME=/home/monzero
 VOLUME /home/monzero
 EXPOSE 6080
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/wallet-entry"]
+
+FROM base AS tor
+ARG MONZERO_VERSION
+LABEL org.opencontainers.image.title="Tor onion service for the Monzero relay" org.monzero.version=$MONZERO_VERSION
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends tor >/dev/null && rm -rf /var/lib/apt/lists/*
+COPY docker/tor-entry.sh /usr/local/bin/tor-entry
+# The shared address volume takes this folder's owner when it is first created
+RUN install -d -o monzero -g monzero /share /home/monzero/tor
+USER monzero
+VOLUME /home/monzero/tor
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/tor-entry"]
