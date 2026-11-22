@@ -1,0 +1,167 @@
+#!/usr/bin/python3 -I
+"""The box's own screen (HDMI / VM console) while the wallet is not shown there: the Monzero
+artwork with what the owner needs: the setup page's address and, before setup, the one-time
+setup code; afterwards the node and relay status. Redrawn every 15 seconds straight into the
+framebuffer. A console login stays on the second screen (Alt+F2).
+  monzero-screen            draw until stopped (systemd: monzero-screen.service)
+  monzero-screen --once F   draw once into the PNG file F (for tests)"""
+import json, os, socket, subprocess, sys, time, urllib.request
+from PIL import Image, ImageDraw, ImageFont
+from monzero_i18n import CJK, CJK_FONT, box_language, tr
+
+ART = "/usr/share/monzero/branding/wallpaper-1920x1080.jpg"
+FB = "/sys/class/graphics/fb0"
+FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+CYAN, WHITE, GREY = (25, 214, 230), (235, 240, 244), (150, 160, 170)
+
+
+def read_json(p, d):
+    try:
+        return json.load(open(p))
+    except Exception:
+        return d
+
+
+def address():
+    try:   # the address this box uses to reach other machines (no packet is sent)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return None
+
+
+def node(L):
+    try:
+        req = urllib.request.Request("http://127.0.0.1:6175/get_info", data=b"{}", headers={"Content-Type": "application/json"})
+        i = json.load(urllib.request.urlopen(req, timeout=3))
+        peers = i.get("outgoing_connections_count", 0) + i.get("incoming_connections_count", 0)
+        return (tr(L, "scr_block", height=f"{i['height']:,}") + "  ·  " + tr(L, "synced" if i.get("synchronized") else "syncing")
+                + "  ·  " + tr(L, "scr_peers", n=peers))
+    except Exception:
+        return tr(L, "scr_starting")
+
+
+def lines():
+    """[(text, size, colour)] under the artwork, in the box's language (English before setup)."""
+    L = box_language()
+    ip = address()
+    url = f"https://{ip}:8443" if ip else tr(L, "scr_no_network")
+    out = []
+    if not os.path.exists("/var/lib/monzero-web/admin.json"):
+        code = ""
+        try:
+            c = open("/etc/monzero/web/setup-code").read().strip()
+            code = f"{c[0:4]}-{c[4:8]}-{c[8:12]}"
+        except OSError:
+            pass
+        out.append((tr(L, "scr_setup"), 30, GREY))
+        out.append((url, 44, WHITE))
+        if code:
+            out.append((f"{tr(L, 'setup_code')}   {code}", 44, CYAN))
+    else:
+        cfg = read_json("/etc/monzero/appliance.json", {})
+        roles = cfg.get("roles", [])
+        out.append((f"Monzero Box  ·  {url}", 38, WHITE))
+        parts = []
+        if "node" in roles:
+            parts.append(tr(L, "scr_node", status=node(L)))
+        if "relay" in roles:
+            st = read_json("/var/lib/monzero-web/public-relay.json", {})
+            shared = tr(L, {"onion": "scr_shared_tor", "port": "scr_shared_port"}.get(st.get("mode"), "scr_home_only"))
+            parts.append(tr(L, "scr_relay", status=shared))
+        if parts:
+            out.append(("     ".join(parts), 28, CYAN))
+    ver = os.path.basename(os.path.realpath("/opt/monzero/current")) if os.path.exists("/opt/monzero/current") else ""
+    out.append((("Monzero " + ver.lstrip("v") + "  ·  " if ver else "") + tr(L, "scr_console"), 22, GREY))
+    return out
+
+
+def render(size):
+    w, h = size
+    art = Image.open(ART).convert("RGB")
+    # cover the screen, keep the middle (the logo)
+    scale = max(w / art.width, h / art.height)
+    art = art.resize((max(1, round(art.width * scale)), max(1, round(art.height * scale))), Image.LANCZOS)
+    left, top = (art.width - w) // 2, (art.height - h) // 2
+    img = art.crop((left, top, left + w, top + h))
+    d = ImageDraw.Draw(img)
+    k = h / 1080
+    rows = lines()
+    cjk = box_language() in CJK and os.path.exists(CJK_FONT)
+    y = round(h * 0.80)
+    if len(rows) > 3:
+        y = round(h * 0.77)
+    for text, size_px, colour in rows:
+        f = ImageFont.truetype(CJK_FONT if cjk else BOLD if size_px >= 38 else FONT, max(10, round(size_px * k)))
+        tw = d.textlength(text, font=f)
+        d.text(((w - tw) / 2, y), text, font=f, fill=colour)
+        y += round(size_px * k * 1.45)
+    return img
+
+
+def fb_info():
+    vw, vh = (int(x) for x in open(f"{FB}/virtual_size").read().strip().split(","))
+    bpp = int(open(f"{FB}/bits_per_pixel").read())
+    stride = int(open(f"{FB}/stride").read())
+    return vw, vh, bpp, stride
+
+
+def show(img, bpp, stride):
+    w, h = img.size
+    if bpp == 32:
+        raw, bpr = img.tobytes("raw", "BGRX"), w * 4
+    elif bpp == 16:
+        raw, bpr = img.tobytes("raw", "BGR;16"), w * 2
+    else:
+        raise SystemExit(f"framebuffer depth {bpp} is not supported")
+    with open("/dev/fb0", "r+b", buffering=0) as fb:
+        if stride == bpr:
+            fb.write(raw)
+        else:
+            for row in range(h):
+                fb.seek(row * stride)
+                fb.write(raw[row * bpr:(row + 1) * bpr])
+
+
+def quiet_console():
+    try:
+        with open("/dev/tty1", "w") as t:
+            t.write("\033[?25l\033[2J\033[9;0]")   # no cursor, clear, no blanking
+    except OSError:
+        pass
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--once":
+        render((1920, 1080)).save(sys.argv[2])
+        return
+    if "wallet" in read_json("/etc/monzero/appliance.json", {}).get("roles", []) and os.path.exists("/opt/monzero/current/monzero-wallet-gui"):
+        return   # the wallet has the screen
+    for _ in range(30):   # the graphics driver may come up after this service
+        if os.path.exists(f"{FB}/virtual_size") and os.path.exists("/dev/fb0"):
+            break
+        time.sleep(2)
+    else:
+        print("no framebuffer: nothing to draw on")
+        while True:
+            time.sleep(3600)
+    subprocess.run(["chvt", "1"], check=False)
+    last = None
+    while True:
+        vw, vh, bpp, stride = fb_info()
+        quiet_console()
+        img = render((vw, vh))
+        show(img, bpp, stride)
+        state = "status" if os.path.exists("/var/lib/monzero-web/admin.json") else "setup"
+        if state != last:
+            print(f"screen: {state} ({vw}x{vh}, {bpp} bit)", flush=True)
+            last = state
+        time.sleep(15)
+
+
+if __name__ == "__main__":
+    main()

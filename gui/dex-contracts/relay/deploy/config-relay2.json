@@ -32,5 +32,7 @@
   "sponsor": {
     "solKeyFile": "/etc/monzero-dex-relay/sponsor-solana.json",
     "evmKeyFile": "/etc/monzero-dex-relay/sponsor-bsc.key"
-  }
+  },
+  "mesh": true,
+  "torSocks": "127.0.0.1:9050"
 }

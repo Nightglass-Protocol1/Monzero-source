@@ -1,0 +1,67 @@
+# Monzero DEX appliance (Docker). Start:  docker compose up -d     Logs: docker compose logs -f
+# Wallet screen: https://127.0.0.1:6080/vnc.html  (password: docker compose logs wallet)
+# To reach the screen or relay from other machines on your network, change 127.0.0.1 below to
+# this computer's LAN address. Never publish 6080 to the internet.
+name: monzero
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  tmpfs: ["/tmp:size=64m,mode=1777"]
+  logging: {driver: local, options: {max-size: "10m", max-file: "3"}}
+
+services:
+  node:
+    <<: *hardening
+    image: monzero/node:${MONZERO_VERSION:-latest}
+    volumes: ["node-data:/data"]
+    ports:
+      - "6174:6174"                 # peer-to-peer: helps the network (open to the internet is fine)
+      - "127.0.0.1:6080:6080"       # the wallet's browser screen (the wallet shares this network)
+    mem_limit: 3g
+    pids_limit: 256
+
+  relay:
+    <<: *hardening
+    image: monzero/relay:${MONZERO_VERSION:-latest}
+    volumes: ["relay-data:/data", "relay-address:/share:ro"]
+    ports: ["127.0.0.1:8790:8790"]
+    mem_limit: 1g
+    pids_limit: 128
+
+  # Shares the relay with the Monzero network as a Tor onion service (no router setup, your IP
+  # stays hidden). Leave it out to keep the relay private:  docker compose up -d node relay
+  # Router port instead: publish 8790 to the internet and write http://<public IP>:8790 into
+  # the relay-address volume's public-url file.
+  tor:
+    <<: *hardening
+    image: monzero/tor:${MONZERO_VERSION:-latest}
+    network_mode: "service:relay"   # the onion points at the relay's 127.0.0.1:8790
+    depends_on: [relay]
+    volumes: ["tor-data:/home/monzero/tor", "relay-address:/share"]
+    mem_limit: 256m
+    pids_limit: 64
+
+  wallet:
+    <<: *hardening
+    image: monzero/wallet:${MONZERO_VERSION:-latest}
+    profiles: ["wallet"]            # docker compose --profile wallet up -d
+    network_mode: "service:node"    # reaches the node at 127.0.0.1:6175, nothing else exposed
+    depends_on: [node]
+    volumes: ["wallet-home:/home/monzero"]
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    shm_size: 256m
+    environment:
+      MONZERO_SCREEN: "1600x1000"
+      MONZERO_LANG: "en"              # en es fr de it pt nl pl tr ru zh ja
+    mem_limit: 3g
+    pids_limit: 512
+
+volumes:
+  node-data:
+  relay-data:
+  wallet-home:
+  tor-data:
+  relay-address:

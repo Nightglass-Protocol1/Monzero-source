@@ -1,0 +1,6 @@
+[Unit]
+Description=Carry out changes requested by the setup page
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/monzero-apply

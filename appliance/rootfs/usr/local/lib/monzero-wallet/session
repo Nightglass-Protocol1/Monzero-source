@@ -1,0 +1,6 @@
+#!/bin/sh
+# The box's screen when the wallet role is on (startx from monzero-wallet-session.service): the
+# Monzero desktop with the wallet. The wallet connects to this box's own node (127.0.0.1:6175)
+# when the node role is on.
+xset s off -dpms 2>/dev/null
+exec /usr/local/lib/monzero-wallet/desktop

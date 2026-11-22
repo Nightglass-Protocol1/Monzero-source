@@ -1,0 +1,39 @@
+#!/bin/bash
+# Firewall from the box's roles: nothing comes in except what a role needs. The node's
+# peer-to-peer port is open to everyone (that is how it helps the network); everything else
+# (setup page, relay, wallet RPC, remote screen, SSH) only from your own network.
+set -euo pipefail
+CFG=/etc/monzero/appliance.json
+has() { python3 -I -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(0 if sys.argv[2] in c.get("roles",[]) or c.get(sys.argv[2]) else 1)' "$CFG" "$1" 2>/dev/null; }
+LAN_PORTS="8443"
+WAN_PORTS=""
+has node && { WAN_PORTS="6174"; LAN_PORTS="$LAN_PORTS, 6177"; }
+has relay && LAN_PORTS="$LAN_PORTS, 8790"
+if has relay && [ "$(python3 -I -c 'import json; print(json.load(open("/etc/monzero/appliance.json")).get("publicRelay", "off"))' 2>/dev/null)" = port ]; then
+  WAN_PORTS="${WAN_PORTS:+$WAN_PORTS, }8790"
+fi
+has vnc && LAN_PORTS="$LAN_PORTS, 6080"
+[ -s /home/monzero-admin/.ssh/authorized_keys ] && LAN_PORTS="$LAN_PORTS, 22"
+cat > /etc/nftables.conf <<NFT
+#!/usr/sbin/nft -f
+# Written by monzero-firewall from /etc/monzero/appliance.json; it rewrites this file.
+flush ruleset
+table inet monzero {
+  set lan4 { type ipv4_addr; flags interval; elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 } }
+  set lan6 { type ipv6_addr; flags interval; elements = { fc00::/7, fe80::/10 } }
+  chain input {
+    type filter hook input priority 0; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    iif lo accept
+    meta l4proto { icmp, ipv6-icmp } limit rate 20/second accept
+    udp dport { 67, 68, 546, 547, 5353 } accept
+    $( [ -n "$WAN_PORTS" ] && echo "tcp dport { $WAN_PORTS } ct state new limit rate 60/minute burst 120 packets accept" )
+    ip saddr @lan4 tcp dport { $LAN_PORTS } accept
+    ip6 saddr @lan6 tcp dport { $LAN_PORTS } accept
+  }
+  chain forward { type filter hook forward priority 0; policy drop; }
+  chain output { type filter hook output priority 0; policy accept; }
+}
+NFT
+nft -f /etc/nftables.conf

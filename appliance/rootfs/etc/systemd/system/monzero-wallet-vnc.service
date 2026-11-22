@@ -1,0 +1,18 @@
+[Unit]
+Description=Wallet screen in the browser (noVNC over TLS, port 6080)
+After=monzero-wallet-session.service
+Requires=monzero-wallet-session.service
+
+[Service]
+User=monzero-wallet
+Group=monzero-wallet
+# x11vnc only on this box; websockify serves it over TLS with the setup page's certificate
+ExecStart=/bin/sh -c 'x11vnc -display :0 -localhost -rfbport 5900 -rfbauth /etc/monzero/vnc/passwd -forever -shared -noxdamage -quiet & exec websockify --cert=/etc/monzero/vnc/tls.crt --key=/etc/monzero/vnc/tls.key --ssl-only --web=/usr/share/novnc 6080 127.0.0.1:5900'
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,108 @@
+#!/bin/bash
+# Makes this box's DEX relay reachable by the Monzero relay network, the way the owner chose in
+# the setup page (/etc/monzero/appliance.json "publicRelay"):
+#   onion  a Tor onion service (no router setup; the home IP stays hidden)  [default]
+#   port   a router port: UPnP asks the router, or the owner gives the public IP and forwards
+#          TCP 8790 to this box by hand
+#   off    the relay serves only this box and the home network
+# The relay announces the address written here to relay1/relay2 every ten minutes.
+# Run by monzero-apply after a change, and every 15 minutes by its timer (renews the UPnP
+# mapping, picks up the onion name once Tor has made it).
+set -euo pipefail
+CFG=/etc/monzero/appliance.json
+URL=/var/lib/monzero-dex-relay/public-url
+STATUS=/var/lib/monzero-web/public-relay.json
+HS=/var/lib/tor/monzero-relay
+
+get() { python3 -I -c 'import json,sys; c=json.load(open(sys.argv[1])); v=c.get(sys.argv[2], sys.argv[3]); print(v if not isinstance(v, list) else " ".join(v))' "$CFG" "$@"; }
+status() {  # mode url message
+  python3 -I -c 'import json,sys,time; json.dump({"mode": sys.argv[1], "url": sys.argv[2], "message": sys.argv[3], "time": int(time.time())}, open(sys.argv[4], "w"))' "$1" "$2" "$3" "$STATUS.tmp"
+  chmod 644 "$STATUS.tmp"; mv "$STATUS.tmp" "$STATUS"
+}
+write_url() {
+  install -d -o monzero-relay -g monzero-relay -m 700 /var/lib/monzero-dex-relay
+  printf '%s\n' "$1" > "$URL.tmp"; chown monzero-relay:monzero-relay "$URL.tmp"; chmod 600 "$URL.tmp"; mv "$URL.tmp" "$URL"
+}
+public_ip() {  # the address must be a public IPv4 (CGNAT, private and local ranges cannot be reached)
+  python3 -I -c 'import ipaddress,sys; ip=ipaddress.ip_address(sys.argv[1]); sys.exit(0 if ip.version == 4 and ip.is_global else 1)' "$1" 2>/dev/null
+}
+
+ROLES=$(get roles "")
+MODE=$(get publicRelay off)
+case " $ROLES " in *" relay "*) ;; *) MODE=off ;; esac
+
+if [ "$MODE" != onion ]; then
+  systemctl disable --now tor >/dev/null 2>&1 || true
+fi
+if [ "$MODE" != port ] && command -v upnpc >/dev/null; then
+  upnpc -d 8790 TCP >/dev/null 2>&1 || true
+fi
+
+case "$MODE" in
+  onion)
+    if ! grep -q "^HiddenServiceDir $HS/" /etc/tor/torrc 2>/dev/null; then
+      cat > /etc/tor/torrc <<EOF
+# Written by monzero-public-relay: this box's relay as a Tor onion service. Nothing else
+# goes through Tor here (no SOCKS port), and the box is not a Tor relay.
+SocksPort 0
+HiddenServiceDir $HS/
+HiddenServicePort 80 127.0.0.1:8790
+EOF
+      systemctl enable tor >/dev/null 2>&1 || true
+      systemctl restart tor
+    else
+      systemctl enable --now tor >/dev/null 2>&1 || true
+    fi
+    for _ in $(seq 1 30); do [ -s "$HS/hostname" ] && break; sleep 2; done
+    if [ -s "$HS/hostname" ]; then
+      ONION=$(tr -d '[:space:]' < "$HS/hostname")
+      write_url "$ONION"
+      status onion "http://$ONION" "shared through Tor"
+    else
+      rm -f "$URL"; status onion "" "Tor is still starting; the address follows in a few minutes"
+    fi
+    ;;
+  port)
+    IP=$(get publicRelayIp "")
+    MSG="router port 8790"
+    if [ -z "$IP" ] && command -v upnpc >/dev/null; then
+      if upnpc -e "Monzero relay" -r 8790 TCP >/dev/null 2>&1; then
+        IP=$(upnpc -s 2>/dev/null | awk -F'= ' '/ExternalIPAddress/{print $2}' | tr -d '[:space:]')
+        MSG="router port 8790 opened by UPnP"
+      fi
+    fi
+    if [ -n "$IP" ] && public_ip "$IP"; then
+      write_url "http://$IP:8790"
+      status port "http://$IP:8790" "$MSG"
+    else
+      rm -f "$URL"
+      status port "" "No public address: the router did not answer UPnP, or your internet line has no public IPv4 (CGNAT). Forward TCP 8790 to this box and enter your public IP, or use Tor."
+    fi
+    ;;
+  *)
+    rm -f "$URL"
+    status off "" "only this box and your home network use the relay"
+    ;;
+esac
+# Has the network listed it? (the hubs check a relay before they list it; give them a few
+# minutes after a change)
+if [ -s "$URL" ] && [ -f "$STATUS" ]; then
+  python3 -I - "$STATUS" <<'PY' || true
+import json, sys, urllib.request
+p = sys.argv[1]
+st = json.load(open(p))
+listed = []
+for hub in ("https://relay1.monzero.org", "https://relay2.monzero.org"):
+    try:
+        d = json.load(urllib.request.urlopen(urllib.request.Request(hub + "/v1/relays", headers={"User-Agent": "monzero-box"}), timeout=20))
+        if any(r.get("url", "").rstrip("/") == st["url"].rstrip("/") for r in d.get("relays", [])):
+            listed.append(hub.split("//")[1].split(".")[0])
+    except Exception:
+        pass
+st["listedBy"] = listed
+st["message"] = st["message"].split(" (listed")[0] + (f" (listed by {' and '.join(listed)})" if listed else " (not listed by the network yet)")
+json.dump(st, open(p + ".tmp", "w"))
+PY
+  [ -f "$STATUS.tmp" ] && { chmod 644 "$STATUS.tmp"; mv "$STATUS.tmp" "$STATUS"; }
+fi
+/usr/local/sbin/monzero-firewall >/dev/null 2>&1 || true

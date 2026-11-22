@@ -1,0 +1,9 @@
+[Unit]
+Description=Monzero signed update check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/monzero-update
+Nice=10
