@@ -25,3 +25,16 @@ binary as needing x86-64-v4 and the servers stop it with "CPU ISA level is lower
 monzero-eu runs a custom Caddy build: validate and reload with /usr/local/bin/caddy-ratelimit
 (`systemctl reload caddy` uses it), never the packaged `caddy` (it lacks rate_limit). Append
 Caddyfile.snippet with HOST replaced, after backing up /etc/caddy/Caddyfile.
+
+## Relay mesh (Monzero boxes)
+
+Both relays are hubs (`"mesh": true`): Monzero boxes announce their own relays to them, and
+they list them at `/v1/relays` and pull their offers (each offer is checked again as always).
+Most boxes are Tor onion services, so the hubs read them through a local Tor client:
+
+    sudo apt-get install -y tor            # SOCKS on 127.0.0.1:9050, the Debian default
+    sudo systemctl enable --now tor
+
+Without Tor the relay still starts and lists boxes with public IPs; onions are refused.
+The Caddy snippet passes the sender's address (`header_up X-Real-IP {remote_host}`): without
+it every sender looks like 127.0.0.1 and all of them share one write limit (older snippet).
