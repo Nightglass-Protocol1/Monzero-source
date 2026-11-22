@@ -1,0 +1,57 @@
+#!/bin/bash
+# Smoke test of a built VM image in QEMU (KVM + OVMF), as a user would set it up:
+#   bash appliance/tests/vm-smoke.sh <image.qcow2>
+# First start (setup code on the console), wrong code refused, setup with node + relay +
+# relay shared over Tor + an SSH key, then: signed-in status page, node answering, relay
+# answering from the "home network", onion address made, firewall per roles, a second setup
+# refused, a change without the CSRF token refused, no session -> sign-in page.
+set -uo pipefail
+IMG=${1:?usage: vm-smoke.sh <image.qcow2>}
+OVMF=${OVMF:-/usr/share/edk2/x64}
+S=$(mktemp -d); trap 'kill $(cat $S/vm.pid 2>/dev/null) 2>/dev/null; rm -rf "$S"' EXIT
+PASS=0; FAIL=0
+ok() { echo "  ok   $1"; PASS=$((PASS+1)); }
+no() { echo "  FAIL $1"; FAIL=$((FAIL+1)); }
+check() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else no "$1"; fi; }
+
+cp "$IMG" "$S/disk.qcow2"; cp "$OVMF/OVMF_VARS.4m.fd" "$S/vars.fd"
+qemu-system-x86_64 -enable-kvm -m 4096 -smp 2 -machine q35 \
+  -drive if=pflash,format=raw,readonly=on,file="$OVMF/OVMF_CODE.4m.fd" -drive if=pflash,format=raw,file="$S/vars.fd" \
+  -drive file="$S/disk.qcow2",if=virtio \
+  -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:28443-:8443,hostfwd=tcp:127.0.0.1:28022-:22,hostfwd=tcp:127.0.0.1:28790-:8790 \
+  -display none -vga std -serial file:"$S/serial.log" -daemonize -pidfile "$S/vm.pid" || exit 1
+U=https://127.0.0.1:28443; J=$S/cookies
+echo "== first start"
+timeout 240 bash -c "until curl -sk -m 3 $U/ >/dev/null && tr -d '\r' < $S/serial.log | grep -aqE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}'; do sleep 5; done"
+CODE=$(tr -d '\r' < "$S/serial.log" | grep -aoE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}' | tail -1)
+check "setup code on the console" '[ -n "$CODE" ]'
+check "console shows the box address" "tr -d '\r' < $S/serial.log | grep -aq 'https://[0-9]'"
+check "hostname monzero-box" "tr -d '\r' < $S/serial.log | grep -aq 'monzero-box login'"
+echo "== setup"
+check "wrong code refused" "curl -sk $U/setup --data-urlencode code=AAAA-BBBB-CCCC -d pw=correcthorsebattery -d pw2=correcthorsebattery | grep -q 'not right'"
+ssh-keygen -q -t ed25519 -N '' -f "$S/key" -C smoke
+code=$(curl -sk -c "$J" -b "$J" -o /dev/null -w '%{http_code}' $U/setup --data-urlencode code="$CODE" -d pw=correcthorsebattery -d pw2=correcthorsebattery -d role=node -d role=relay -d share=1 --data-urlencode "sshkey=$(cat "$S/key.pub")")
+check "setup accepted" '[ "$code" = 303 ]'
+timeout 240 bash -c "until curl -sk -b $J $U/ | grep -q '\.onion'; do sleep 10; done"
+PAGE=$(curl -sk -b "$J" $U/ | sed 's/<[^>]*>/ /g' | tr -s ' \n')
+check "status page after sign-in" 'echo "$PAGE" | grep -q "Node active"'
+check "relay active" 'echo "$PAGE" | grep -q "DEX relay active"'
+check "node answering" 'echo "$PAGE" | grep -qE "Node: height [0-9]+"'
+check "onion address made" 'echo "$PAGE" | grep -qE "[a-z2-7]{56}\.onion"'
+check "relay answers the home network" "curl -s -m 5 http://127.0.0.1:28790/v1/info | grep -q chains"
+echo "== guards"
+check "second setup refused" "! curl -sk -o /dev/null -w '%{http_code}' $U/setup --data-urlencode code=$CODE -d pw=x -d pw2=x | grep -q 303"
+check "change without CSRF token refused" "[ \$(curl -sk -b $J -o /dev/null -w '%{http_code}' $U/roles -d role=node) = 403 ]"
+check "no session -> sign-in page" "curl -sk $U/ | grep -q 'Sign in'"
+echo "== inside (SSH with the key from setup)"
+SSHO=(-i "$S/key" -p 28022 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR)
+IN=$(ssh "${SSHO[@]}" monzero-admin@127.0.0.1 'sudo nft list ruleset; echo ===; systemctl is-active tor monzero-update.timer monzero-public-relay.timer; echo ===; ls /etc/ssh/ssh_host_ed25519_key; cat /etc/monzero/appliance.json; echo ===; sudo -n true && echo sudo-ok' 2>/dev/null)
+check "SSH with the setup key" '[ -n "$IN" ]'
+check "firewall: 6174 open, rate-limited" 'echo "$IN" | grep -q "tcp dport 6174 ct state new limit"'
+check "firewall: 8790/8443 home network only" 'echo "$IN" | grep -qE "saddr @lan4 tcp dport \{.*8443.*8790"'
+check "firewall: relay not open to the internet (Tor mode)" '! echo "$IN" | grep -qE "dport \{[^}]*8790[^}]*\} ct state new limit"'
+check "Tor and timers running" '[ $(echo "$IN" | grep -c "^active") -ge 3 ]'
+check "settings saved (publicRelay onion)" 'echo "$IN" | grep -q "\"publicRelay\": \"onion\""'
+echo
+echo "passed $PASS, failed $FAIL"
+[ "$FAIL" = 0 ]
