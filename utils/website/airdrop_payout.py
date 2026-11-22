@@ -21,7 +21,7 @@ Safety:
   until you check the wallet's outgoing transfers and record the result:
      --resolve BATCH_ID=sent:TXHASH   or   --resolve BATCH_ID=failed
 """
-import argparse, csv, json, re, secrets, sys, time, urllib.error, urllib.request
+import argparse, csv, json, re, secrets, sys, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 ATOMIC = 10**11
@@ -38,26 +38,63 @@ class RpcError(Exception):
 
 
 class Wallet:
+    """monzero-wallet-rpc client. Digest login is done here: Python's own digest handler fails
+    against the wallet RPC (seen with Python 3.14), and a 401 happens before the wallet runs
+    anything, so answering the challenge can never send a transfer twice."""
+
     def __init__(self, url, login=None, timeout=180):
         self.url = url.rstrip("/") + ("" if url.rstrip("/").endswith("/json_rpc") else "/json_rpc")
         self.timeout = timeout
-        handlers = []
-        if login:
-            user, _, pw = login.partition(":")
-            mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-            mgr.add_password(None, self.url, user, pw)
-            handlers.append(urllib.request.HTTPDigestAuthHandler(mgr))
-        self.opener = urllib.request.build_opener(*handlers)
+        self.user, _, self.pw = (login or "").partition(":")
+        self.nc = 0
+
+    def _digest(self, challenge, body_path="/json_rpc"):
+        import hashlib, urllib.request as _u
+        f = _u.parse_keqv_list(_u.parse_http_list(challenge.split(" ", 1)[1]))
+        md5 = lambda x: hashlib.md5(x.encode()).hexdigest()
+        self.nc += 1
+        nc, cnonce = f"{self.nc:08x}", secrets.token_hex(8)
+        ha1 = md5(f"{self.user}:{f['realm']}:{self.pw}")
+        ha2 = md5(f"POST:{body_path}")
+        if "auth" in [q.strip() for q in f.get("qop", "").split(",")]:
+            resp = md5(f"{ha1}:{f['nonce']}:{nc}:{cnonce}:auth:{ha2}")
+            extra = f', qop=auth, nc={nc}, cnonce="{cnonce}"'
+        else:
+            resp, extra = md5(f"{ha1}:{f['nonce']}:{ha2}"), ""
+        op = f', opaque="{f["opaque"]}"' if "opaque" in f else ""
+        return (f'Digest username="{self.user}", realm="{f["realm"]}", nonce="{f["nonce"]}", '
+                f'uri="{body_path}", algorithm=MD5, response="{resp}"{op}{extra}')
 
     def call(self, method, params=None):
+        # One HTTP connection for the challenge and the answer: the wallet RPC ties its digest
+        # challenge to the connection it was sent on.
+        import http.client
+        u = urllib.parse.urlsplit(self.url)
         body = json.dumps({"jsonrpc": "2.0", "id": "0", "method": method, "params": params or {}}).encode()
-        req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
-        with self.opener.open(req, timeout=self.timeout) as r:   # network errors propagate (outcome unknown)
-            reply = json.loads(r.read())
+        headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
+        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=self.timeout)
+        try:   # network errors propagate (outcome unknown)
+            conn.request("POST", u.path, body, headers)
+            r = conn.getresponse()
+            if r.status == 401 and self.user:
+                challenges = [v for k, v in r.getheaders() if k.lower() == "www-authenticate" and v.lower().startswith("digest")]
+                r.read()
+                md5 = [c for c in challenges if "md5-sess" not in c.lower()] or challenges
+                if not md5:
+                    raise RpcError("wallet asked for a login it did not describe")
+                conn.request("POST", u.path, body, {**headers, "Authorization": self._digest(md5[0], u.path)})
+                r = conn.getresponse()
+            data = r.read()
+            if r.status == 401:
+                raise RpcError("wallet RPC login refused (check --rpc-login)")
+            if r.status != 200:
+                raise urllib.error.HTTPError(self.url, r.status, r.reason, None, None)
+        finally:
+            conn.close()
+        reply = json.loads(data)
         if "error" in reply:
             raise RpcError(f"{reply['error'].get('code')}: {reply['error'].get('message')}")
         return reply["result"]
-
 
 def load_csv(path):
     owed = {}
