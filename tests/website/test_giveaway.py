@@ -111,5 +111,19 @@ php('gwDb()->exec("UPDATE sessions SET started_at = started_at - 1801");')
 assert 'Send /help' in msg(7, ADDR[2]) or 'ran out' in msg(7, '/claim ' + ADDR[2])
 # Existing bot commands still work
 assert 'Monzero pool alerts' in msg(8, '/help')
+
+# Finished (paid out): refused for good, even if the config is switched back on with that code
+config(code='abc123def456', slots=5)
+assert '3 places left' in msg(9, LINK)                      # re-enabled with room: would take claims...
+php('gwFinish("abc123def456", "paid", time());')
+r = msg(9, ADDR[2]); assert 'Place' not in r and 'Send /help' in r, r   # ...but the open session is gone
+assert 'finished and been paid out' in msg(9, '/claim ' + ADDR[2])
+assert 'finished and been paid out' in msg(10, LINK)
+assert 'finished and been paid out' in msg(1, LINK)            # earlier claimants too
+assert php('echo gwClaimed("abc123def456");') == '2'
+config(code='abc123def456', slots=5, enabled=False)
+assert 'finished and been paid out' in msg(10, LINK)
+# the export still works for the records
+assert len(list(csv.DictReader(io.StringIO(php('echo gwExportCsv("abc123def456");'))))) == 2
 print('giveaway: all checks passed')
 srv.shutdown()

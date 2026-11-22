@@ -40,6 +40,7 @@ function gwDb(): PDO {
             PRIMARY KEY (code, slot), UNIQUE (code, user_id), UNIQUE (code, handle), UNIQUE (code, address));
         CREATE TABLE IF NOT EXISTS sessions (user_id INTEGER PRIMARY KEY, code TEXT NOT NULL, started_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS finished (code TEXT PRIMARY KEY, finished_at INTEGER NOT NULL, note TEXT NOT NULL);
     SQL);
     return $db;
 }
@@ -50,6 +51,22 @@ function gwClaimed(string $code): int {
     return (int)$s->fetchColumn();
 }
 
+// A finished giveaway (paid out) never takes a claim again, whatever its config says. Permanent:
+// the only way back is editing the database by hand.
+function gwFinished(string $code): bool {
+    $s = gwDb()->prepare('SELECT 1 FROM finished WHERE code = ?');
+    $s->execute([$code]);
+    return $s->fetchColumn() !== false;
+}
+
+function gwFinish(string $code, string $note, int $now): void {
+    $db = gwDb();
+    $db->prepare('INSERT OR IGNORE INTO finished (code, finished_at, note) VALUES (?, ?, ?)')->execute([$code, $now, mb_substr($note, 0, 200)]);
+    $db->prepare('DELETE FROM sessions WHERE code = ?')->execute([$code]);
+}
+
+const GW_FINISHED_TEXT = 'This giveaway has finished and been paid out. Follow https://t.me/MonzeroOfficial for the next one.';
+
 function gwClaimOf(string $code, int $user): ?array {
     $s = gwDb()->prepare('SELECT * FROM claims WHERE code = ? AND user_id = ?');
     $s->execute([$code, $user]);
@@ -58,6 +75,7 @@ function gwClaimOf(string $code, int $user): ?array {
 
 // Why the giveaway is not taking claims right now, or null when it is.
 function gwClosedReason(?array $c, int $now): ?string {
+    if ($c && gwFinished($c['code'])) return GW_FINISHED_TEXT;
     if (!$c || !$c['enabled']) return 'This giveaway is not running. Follow https://t.me/MonzeroOfficial for the next one.';
     if ($c['opens_at'] && $now < $c['opens_at']) return 'The giveaway opens at ' . gmdate('H:i', $c['opens_at']) . ' UTC on ' . gmdate('j M Y', $c['opens_at']) . '. Open the link again then.';
     if ($c['closes_at'] && $now >= $c['closes_at']) return 'This giveaway has ended.';
@@ -70,6 +88,7 @@ function gwHandle(array $from): string { return is_string($from['username'] ?? n
 // $isMember(int $userId): bool checks the community group. Returns the bot's reply.
 function gwStart(string $code, array $from, callable $isMember, int $now): string {
     $c = gwConfig();
+    if (gwFinished($code)) return GW_FINISHED_TEXT;
     if (!$c || !hash_equals($c['code'], $code)) return 'That giveaway link is not valid. Follow https://t.me/MonzeroOfficial for the next one.';
     $user = (int)$from['id'];
     if ($mine = gwClaimOf($c['code'], $user)) return gwClaimedText($mine, $c);
@@ -98,6 +117,7 @@ function gwClaim(string $text, array $from, callable $isMember, int $now): array
     $s = $db->prepare('SELECT code FROM sessions WHERE user_id = ?');
     $s->execute([$user]);
     $c = gwConfig();
+    if ($c && gwFinished($c['code'])) return [GW_FINISHED_TEXT, false];
     if (!$c || $s->fetchColumn() !== $c['code']) return ['Open the giveaway link again to take part.', false];
     if (!gwHasSession($user, $now)) return ['Your ' . GW_ADDRESS_MINUTES . ' minutes to send an address ran out. Open the giveaway link again.', false];
     if ($mine = gwClaimOf($c['code'], $user)) return [gwClaimedText($mine, $c), false];

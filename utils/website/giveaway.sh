@@ -7,6 +7,7 @@
 #   bash utils/website/giveaway.sh status                                  # places taken, with handles
 #   bash utils/website/giveaway.sh export                                  # payout CSV to ~/monzero-giveaways/
 #   bash utils/website/giveaway.sh close                                   # stop taking claims
+#   bash utils/website/giveaway.sh finish                                  # paid out: lock this code for good
 # Paying: the export prints the airdrop_payout.py command (its own ledger, so nobody is paid twice).
 set -euo pipefail
 WEB=${WEB_HOST:-monzero-webspace}
@@ -19,7 +20,7 @@ case "$MODE" in
     CODE=$(openssl rand -hex 6)
     echo "Opening: $SLOTS places x $AMOUNT XMZ = $((SLOTS * AMOUNT)) XMZ in total"
     ;;
-  status|export|close) ;;
+  status|export|close|finish) ;;
   *) sed -n '2,10p' "$0"; exit 2;;
 esac
 
@@ -54,10 +55,16 @@ if ($mode === "open") {
 }
 $g = gwConfig();
 if (!$g) { fwrite(STDERR, "!! no giveaway is set up (run: giveaway.sh open)\n"); exit(1); }
+if ($mode === "finish") {
+  if (!function_exists("gwFinish")) { fwrite(STDERR, "!! the server has an older lib/giveaway.php: deploy the site first\n"); exit(1); }
+  gwFinish($g["code"], "finished by giveaway.sh after payout", time());
+  $c["enabled"] = false; $save($c);
+  echo "finished: code " . $g["code"] . " is locked for good (" . gwClaimed($g["code"]) . " claims kept for the records)\n"; exit;
+}
 if ($mode === "close") { $c["enabled"] = false; $save($c); echo "closed: no more claims for code " . $g["code"] . "\n"; exit; }
 if ($mode === "export") { echo gwExportCsv($g["code"]); exit; }
 $n = gwClaimed($g["code"]);
-echo ($g["enabled"] ? "OPEN" : "CLOSED") . ": " . $g["title"] . "  code " . $g["code"] . "  " . $n . "/" . $g["slots"] . " claimed  (" . $g["amount_xmz"] . " XMZ each)\n";
+echo (function_exists("gwFinished") && gwFinished($g["code"]) ? "FINISHED (locked)" : ($g["enabled"] ? "OPEN" : "CLOSED")) . ": " . $g["title"] . "  code " . $g["code"] . "  " . $n . "/" . $g["slots"] . " claimed  (" . $g["amount_xmz"] . " XMZ each)\n";
 $s = gwDb()->prepare("SELECT slot, handle, user_id, address, claimed_at FROM claims WHERE code = ? ORDER BY slot");
 $s->execute([$g["code"]]);
 foreach ($s->fetchAll() as $r) printf("%3d  %-24s id %-12s %s  %s UTC\n", $r["slot"], $r["handle"], $r["user_id"], gwShort($r["address"]), gmdate("Y-m-d H:i:s", (int)$r["claimed_at"]));
