@@ -64,6 +64,15 @@ def apply_language(cfg):
     with open("/etc/default/locale.tmp", "w") as f:
         f.write(f"LANG={loc}\n")
     os.replace("/etc/default/locale.tmp", "/etc/default/locale")
+    # the console keyboard (Raspberry Pi OS reads it; the desktop sets its own with setxkbmap)
+    kb = cfg.get("keyboard") or LANGS[cfg["language"]][3]
+    layout, variant = kb, ""
+    with open("/etc/default/keyboard.tmp", "w") as f:
+        f.write(f'XKBMODEL="pc105"\nXKBLAYOUT="{layout}"\nXKBVARIANT="{variant}"\n'
+                f'XKBOPTIONS="{"grp:alt_shift_toggle" if "," in layout else ""}"\nBACKSPACE="guess"\n')
+    os.replace("/etc/default/keyboard.tmp", "/etc/default/keyboard")
+    if os.path.exists("/usr/bin/setupcon"):
+        run("setupcon", "--force", "--keyboard-only")
     if "wallet" not in cfg.get("roles", []):
         run("systemctl", "restart", "monzero-screen")
 
