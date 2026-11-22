@@ -13,7 +13,8 @@ if [ -z "${RELAY_BIN:-}" ]; then
   . "$HERE/build/relay.sh"
   RELAY_BIN=$(build_relay "$REPO" "$ROOT" | tail -1)
 fi
-mkdir -p "$W/rootfs/usr/local/sbin" "$W/docker"
+mkdir -p "$W/rootfs/usr/local/sbin" "$W/rootfs/usr/local/lib/monzero-wallet" "$W/docker"
+cp "$HERE/rootfs/usr/local/lib/monzero-wallet/openbox-rc.xml" "$W/rootfs/usr/local/lib/monzero-wallet/"
 cp "$HERE/rootfs/usr/local/sbin/monzero-update" "$W/rootfs/usr/local/sbin/"
 cp "$HERE/docker/relay.json" "$HERE/docker/wallet-entry.sh" "$HERE/docker/tor-entry.sh" "$W/docker/"
 cp "$RELAY_BIN" "$W/monzero-dex-relay"

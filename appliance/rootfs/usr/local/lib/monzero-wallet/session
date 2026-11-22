@@ -1,8 +1,15 @@
 #!/bin/sh
 # The wallet session: a plain window manager and the wallet, restarted if it is closed. The
 # wallet connects to this box's own node (127.0.0.1:6175) when the node role is on.
+# First start only: no "desktop shortcut" question (meaningless on a box); the user's own
+# settings are never overwritten.
+CONF="$HOME/.config/monzero-project/monzero-core.conf"
+if [ ! -f "$CONF" ]; then
+  mkdir -p "$(dirname "$CONF")"
+  printf '[General]\naskDesktopShortcut=false\n' > "$CONF"
+fi
 xset s off -dpms 2>/dev/null
-openbox &
+openbox --config-file /usr/local/lib/monzero-wallet/openbox-rc.xml &
 while true; do
   /opt/monzero/current/monzero-wallet-gui
   sleep 2

@@ -46,13 +46,14 @@ ARG MONZERO_VERSION
 LABEL org.opencontainers.image.title="Monzero wallet + DEX (browser screen)" org.monzero.version=$MONZERO_VERSION
 USER root
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-      xvfb openbox x11vnc novnc python3-websockify openssl x11-xserver-utils fonts-dejavu-core \
+      xvfb openbox x11vnc novnc python3-websockify openssl x11-xserver-utils fonts-dejavu-core fonts-wqy-microhei \
       libgl1 libegl1 libgl1-mesa-dri libglib2.0-0t64 libx11-xcb1 libxcb1 libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-shm0 \
       libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-render0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
       libxkbcommon-x11-0 libxkbcommon0 libpcre2-8-0 >/dev/null \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=release /monzero /opt/monzero
 COPY docker/wallet-entry.sh /usr/local/bin/wallet-entry
+COPY rootfs/usr/local/lib/monzero-wallet/openbox-rc.xml /usr/local/lib/monzero-wallet/openbox-rc.xml
 USER monzero
 ENV HOME=/home/monzero
 VOLUME /home/monzero

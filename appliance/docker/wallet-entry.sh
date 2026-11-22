@@ -19,7 +19,9 @@ fi
 Xvfb :0 -screen 0 ${MONZERO_SCREEN:-1600x1000}x24 -nolisten tcp &
 export DISPLAY=:0
 sleep 1
-openbox &
+CONF="$HOME/.config/monzero-project/monzero-core.conf"
+[ -f "$CONF" ] || { mkdir -p "$(dirname "$CONF")"; printf '[General]\naskDesktopShortcut=false\n' > "$CONF"; }
+openbox --config-file /usr/local/lib/monzero-wallet/openbox-rc.xml &
 ( while true; do /opt/monzero/monzero-wallet-gui; sleep 2; done ) &
 x11vnc -display :0 -localhost -rfbport 5900 -rfbauth "$S/passwd" -forever -shared -quiet &
 exec websockify --cert="$S/tls.crt" --key="$S/tls.key" --ssl-only --web=/usr/share/novnc 6080 127.0.0.1:5900

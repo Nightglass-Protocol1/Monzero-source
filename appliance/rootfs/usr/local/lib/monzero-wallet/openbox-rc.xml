@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Monzero box: every window full screen, no title bars (a kiosk) -->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <applications>
+    <application class="*">
+      <decor>no</decor>
+      <maximized>true</maximized>
+    </application>
+  </applications>
+</openbox_config>
