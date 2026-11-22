@@ -330,10 +330,19 @@ async fn main() {
         eprintln!("announce: relay key {}", hex::encode(announcer.key.verifying_key().to_bytes()));
         tokio::spawn(async move {
             let client = reqwest::Client::builder().timeout(Duration::from_secs(90)).user_agent("monzero-dex-relay").build().expect("client");
-            let mut tick = tokio::time::interval(Duration::from_secs(600));
+            // Look every minute; announce as soon as there is an address (Tor makes the onion a
+            // little after start) or it changed, then every ten minutes
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
             let mut last = Vec::new();
+            let (mut last_url, mut last_time) = (None, 0u64);
             loop {
                 tick.tick().await;
+                let url = announcer.url();
+                if url.is_none() || (url == last_url && now() < last_time + 600) {
+                    continue;
+                }
+                last_url = url;
+                last_time = now();
                 let results = announcer.announce_once(&client).await;
                 if results != last {
                     for r in &results {
