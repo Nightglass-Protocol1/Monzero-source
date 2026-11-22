@@ -163,13 +163,16 @@ pub struct KeyPoints {
     pub ed: B256,
 }
 
-/// The leader's claim key, with the proof that both points hide the same secret.
+/// The leader's claim key. When a leg is on Solana (ed25519) it carries the proof that both
+/// points hide the same secret; between EVM chains both legs use the secp256k1 point alone, so
+/// the proof (about 170 KB) is left out.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ClaimKey {
     pub secp: FixedBytes<33>,
     pub ed: B256,
-    pub proof: CrossCurveDLEQProof,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<CrossCurveDLEQProof>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -223,9 +226,14 @@ impl DirectKeys {
     /// seed makes it the same bytes every time, see [`SwapSeed::direct_frame`]).
     pub fn frame<R: RngCore + CryptoRng>(&self, offer: &DirectOffer, side: Side, account: &PrivateKeySigner, rng: &mut R) -> Result<SignedFrame, NegotiationError> {
         let claim = self.claim.as_ref().map(|secret| {
-            let k = NgScalar::from_canonical_bytes(secret.to_ed25519_le()).expect("canonical share");
-            let (proof, (secp, ed)) = PROOF_SYSTEM.prove(&k, rng);
-            ClaimKey { secp: FixedBytes(secp.to_bytes()), ed: B256::from(ed.compress().to_bytes()), proof }
+            if offer.uses_solana() {
+                let k = NgScalar::from_canonical_bytes(secret.to_ed25519_le()).expect("canonical share");
+                let (proof, (secp, ed)) = PROOF_SYSTEM.prove(&k, rng);
+                ClaimKey { secp: FixedBytes(secp.to_bytes()), ed: B256::from(ed.compress().to_bytes()), proof: Some(proof) }
+            } else {
+                let p = points(secret);
+                ClaimKey { secp: p.secp, ed: p.ed, proof: None }
+            }
         });
         let sol_account = offer.uses_solana().then(|| B256::from(crate::sol::account_key(&account.to_bytes().0).verifying_key().to_bytes()));
         let frame = DirectFrame { schema: DIRECT_SCHEMA.into(), offer: offer.digest(), side, claim, refund: points(&self.refund), sol_account };
@@ -270,11 +278,20 @@ fn check_points(p: &KeyPoints) -> Result<Checked, NegotiationError> {
     Ok(Checked { commitment: Address::from_raw_public_key(&raw.as_bytes()[1..]), ed: p.ed.0 })
 }
 
-fn check_claim(c: &ClaimKey) -> Result<Checked, NegotiationError> {
-    let secp = secp256kfun::Point::<secp256kfun::marker::Normal>::from_bytes(c.secp.0).ok_or(E::InvalidShare("secp256k1 point"))?;
-    let ed = ed_point(&c.ed)?;
-    if !PROOF_SYSTEM.verify(&c.proof, (secp, ed)) {
-        return Err(E::InvalidShare("cross-curve proof does not verify"));
+/// A Solana leg needs the cross-curve proof (its claim uses the ed25519 point); EVM-only trades
+/// must not carry one (one encoding per frame, and nothing unchecked rides along).
+fn check_claim(c: &ClaimKey, solana: bool) -> Result<Checked, NegotiationError> {
+    match (&c.proof, solana) {
+        (Some(proof), true) => {
+            let secp = secp256kfun::Point::<secp256kfun::marker::Normal>::from_bytes(c.secp.0).ok_or(E::InvalidShare("secp256k1 point"))?;
+            let ed = ed_point(&c.ed)?;
+            if !PROOF_SYSTEM.verify(proof, (secp, ed)) {
+                return Err(E::InvalidShare("cross-curve proof does not verify"));
+            }
+        }
+        (None, false) => {}
+        (None, true) => return Err(E::InvalidShare("a Solana leg needs the cross-curve proof")),
+        (Some(_), false) => return Err(E::InvalidShare("no cross-curve proof between EVM chains")),
     }
     check_points(&KeyPoints { secp: c.secp, ed: c.ed })
 }
@@ -364,7 +381,7 @@ impl DirectExchange {
             return Err(E::BadSignature(role_of(side)));
         }
         let claim = match (side, &frame.claim) {
-            (Side::Leader, Some(c)) => Some(check_claim(c)?),
+            (Side::Leader, Some(c)) => Some(check_claim(c, self.offer.uses_solana())?),
             (Side::Follower, None) => None,
             _ => return Err(E::InvalidShare("only the leader sends a claim key")),
         };

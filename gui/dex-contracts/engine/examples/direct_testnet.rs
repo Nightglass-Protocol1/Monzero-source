@@ -25,6 +25,18 @@ use std::time::{Duration, Instant};
 
 const SEPOLIA: u64 = 11155111;
 const BSC_TESTNET: u64 = 97;
+const SOL_DEVNET: u64 = 501_000_102;
+
+/// PAIR=eth-bnb (default): the maker gives Sepolia ETH for BSC testnet BNB;
+/// PAIR=eth-sol: the maker gives Sepolia ETH for devnet SOL
+fn wanted_chain() -> u64 {
+    if env("PAIR", "eth-bnb") == "eth-sol" { SOL_DEVNET } else { BSC_TESTNET }
+}
+
+fn sol_address(seed: &[u8], index: u32) -> String {
+    let evm = evm_account(seed, index).unwrap();
+    monzero_dex_evm::sol::to_base58(&monzero_dex_evm::sol::account_key(&evm.to_bytes().0).verifying_key().to_bytes())
+}
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -72,6 +84,13 @@ impl Trader {
         t
     }
 
+    fn payout_address_on(&self, chain: u64) -> String {
+        if chain == SOL_DEVNET {
+            return sol_address(&hex::decode(&self.seed_hex).unwrap(), self.index + 10);
+        }
+        self.payout_address()
+    }
+
     fn payout_address(&self) -> String {
         // Another account of the same test phrase: the trade's coins end up somewhere the
         // owner of the phrase controls, and the payout is a real transfer out of the trade
@@ -88,6 +107,7 @@ impl Trader {
                 "rpcs": {
                     SEPOLIA.to_string(): env("RPC_SEPOLIA", "https://sepolia.gateway.tenderly.co"),
                     BSC_TESTNET.to_string(): env("RPC_BSC_TESTNET", "https://bsc-testnet-rpc.publicnode.com"),
+                    SOL_DEVNET.to_string(): env("RPC_SOL_DEVNET", "https://api.devnet.solana.com"),
                 },
                 "walletSeedHex": self.seed_hex,
                 "accountIndex": self.index,
@@ -115,8 +135,24 @@ async fn main() {
         for (label, file) in [("maker phrase", &maker_phrase), ("taker phrase", &taker_phrase)] {
             let seed = phrase_seed(file);
             for i in 0..6 {
-                println!("{label} index {i}: {}", evm_account(&seed, i).unwrap().address());
+                println!("{label} index {i}: {}  sol {}", evm_account(&seed, i).unwrap().address(), sol_address(&seed, i));
             }
+        }
+        return;
+    }
+    if arg == "fund-sol" {
+        // Test SOL for both traders' Solana accounts from the devnet deployer key
+        let lamports: u64 = env("LAMPORTS", "120000000").parse().unwrap();
+        let key = monzero_dex_evm::sol::relayer_key(&std::fs::read_to_string(env("SOL_FUNDER", &format!("{home}/.config/monzero-dex/solana-deployer.json"))).unwrap()).unwrap();
+        let rpc = env("RPC_SOL_DEVNET", "https://api.devnet.solana.com");
+        for (phrase, index) in [(&maker_phrase, env("MAKER_INDEX", "2")), (&taker_phrase, env("TAKER_INDEX", "3"))] {
+            let to = sol_address(&phrase_seed(phrase), index.parse().unwrap());
+            let to_key = monzero_dex_evm::sol::from_base58(&to).unwrap();
+            let have = monzero_dex_evm::sol::balance(&rpc, &key.verifying_key().to_bytes()).await.unwrap();
+            let keep = have.saturating_sub(lamports + 5000);
+            let r = monzero_dex_evm::sol::pay_out(&rpc, &key, &to_key, keep).await;
+            println!("{to}: {r:?}");
+            tokio::time::sleep(Duration::from_secs(20)).await;
         }
         return;
     }
@@ -132,7 +168,7 @@ async fn main() {
     let posted_marker = work.join("posted.json");
     if !posted_marker.exists() {
         let posted = maker
-            .call("directPost", json!({"directOffer": {"givesChainId": SEPOLIA, "givesValue": gives, "wantsChainId": BSC_TESTNET, "wantsValue": wants, "lifetimeSecs": 3 * 3600}}))
+            .call("directPost", json!({"directOffer": {"givesChainId": SEPOLIA, "givesValue": gives, "wantsChainId": wanted_chain(), "wantsValue": wants, "lifetimeSecs": 3 * 3600}}))
             .await;
         log(format!("maker posted: {}", short(&posted)));
         assert_eq!(posted["ok"], true, "the post was refused");
@@ -205,8 +241,8 @@ async fn main() {
     }
 
     // 4. Payouts: each side sends what the trade brought in to another account of its phrase
-    for (who, chain) in [(&taker, SEPOLIA), (&maker, BSC_TESTNET)] {
-        let paid = who.call("directPayout", json!({"chainId": chain, "payoutAddress": who.payout_address()})).await;
+    for (who, chain) in [(&taker, SEPOLIA), (&maker, wanted_chain())] {
+        let paid = who.call("directPayout", json!({"chainId": chain, "payoutAddress": who.payout_address_on(chain)})).await;
         log(format!("{} payout on {chain}: {}", who.name, short(&paid)));
         assert_eq!(paid["ok"], true);
     }
