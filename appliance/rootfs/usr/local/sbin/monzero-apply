@@ -11,6 +11,8 @@ import secrets
 import subprocess
 import time
 
+from monzero_i18n import KEYBOARDS, LANGS
+
 REQUESTS = "/var/lib/monzero-web/requests"
 CONFIG = "/etc/monzero/appliance.json"
 RESULT = "/var/lib/monzero-web/last-result.json"
@@ -53,6 +55,24 @@ def apply_roles(roles):
     if "wallet" not in roles:   # the screen shows the box's artwork and status again
         run("systemctl", "restart", "monzero-screen")
     firewall()
+
+
+def apply_language(cfg):
+    """System locale (consoles, SSH) and the box's screen. The wallet screen picks the language
+    and keyboard up when it next starts: restarting it here could cut off a trade in progress."""
+    loc = LANGS[cfg["language"]][1]
+    with open("/etc/default/locale.tmp", "w") as f:
+        f.write(f"LANG={loc}\n")
+    os.replace("/etc/default/locale.tmp", "/etc/default/locale")
+    if "wallet" not in cfg.get("roles", []):
+        run("systemctl", "restart", "monzero-screen")
+
+
+def language_fields(req):
+    lang = req.get("language")
+    lang = lang if lang in LANGS else "en"
+    kb = req.get("keyboard")
+    return lang, kb if kb in KEYBOARDS else LANGS[lang][3]
 
 
 def apply_public_relay():
@@ -119,8 +139,11 @@ def handle(req, cfg):
         if key and not KEY_RE.match(key):
             key = ""
         share = req.get("share", True) is True and "relay" in roles
-        cfg.update(roles=roles, sshkey=key, configured=True, vnc=False, publicRelay="onion" if share else "off", publicRelayIp="")
+        lang, kb = language_fields(req)
+        cfg.update(roles=roles, sshkey=key, configured=True, vnc=False, publicRelay="onion" if share else "off", publicRelayIp="",
+                   language=lang, keyboard=kb)
         save(cfg)
+        apply_language(cfg)
         apply_roles(roles)
         apply_ssh(key)
         apply_public_relay()
@@ -128,7 +151,7 @@ def handle(req, cfg):
             os.unlink("/etc/monzero/web/setup-code")
         if os.path.exists("/etc/issue.d/50-monzero.issue"):
             open("/etc/issue.d/50-monzero.issue", "w").write("\n  Monzero box: https://\\4:8443\n\n")
-        return f"set up: {', '.join(roles) or 'no roles'}{', SSH on' if key else ''}"
+        return f"set up: {', '.join(roles) or 'no roles'}{', SSH on' if key else ''}, {LANGS[lang][0]}"
     if not cfg.get("configured"):
         return f"{kind} refused: not set up yet"
     if kind == "roles":
@@ -142,6 +165,11 @@ def handle(req, cfg):
             save(cfg)
             apply_vnc(False)
         return f"roles: {', '.join(roles) or 'none'}"
+    if kind == "language":
+        cfg["language"], cfg["keyboard"] = language_fields(req)
+        save(cfg)
+        apply_language(cfg)
+        return f"language: {LANGS[cfg['language']][0]}, keyboard {cfg['keyboard']}"
     if kind == "public_relay":
         mode = req.get("mode")
         if mode not in ("onion", "port", "off"):

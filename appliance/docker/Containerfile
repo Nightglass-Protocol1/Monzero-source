@@ -46,18 +46,22 @@ ARG MONZERO_VERSION
 LABEL org.opencontainers.image.title="Monzero wallet + DEX (browser screen)" org.opencontainers.image.vendor="Monzero" org.opencontainers.image.url="https://monzero.org" org.opencontainers.image.source="https://github.com/Nightglass-Protocol1/Monzero-source" org.opencontainers.image.documentation="https://monzero.org/download/" org.opencontainers.image.version=$MONZERO_VERSION org.monzero.version=$MONZERO_VERSION
 USER root
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-      xvfb openbox wmctrl x11-utils tint2 pcmanfm python3-tk python3-pil python3-pil.imagetk util-linux x11vnc novnc python3-websockify openssl x11-xserver-utils hsetroot fonts-dejavu-core fonts-wqy-microhei \
+      xvfb openbox wmctrl x11-utils tint2 pcmanfm python3-tk python3-pil python3-pil.imagetk util-linux locales x11vnc novnc python3-websockify openssl x11-xserver-utils hsetroot fonts-dejavu-core fonts-wqy-microhei \
       libgl1 libegl1 libgl1-mesa-dri libglib2.0-0t64 libx11-xcb1 libxcb1 libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-shm0 \
       libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-render0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
       libxkbcommon-x11-0 libxkbcommon0 libpcre2-8-0 >/dev/null \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && sed -i -E 's/^# *((en_US|es_ES|fr_FR|de_DE|it_IT|pt_BR|nl_NL|pl_PL|tr_TR|ru_RU|zh_CN|ja_JP)\.UTF-8 UTF-8)/\1/' /etc/locale.gen \
+ && locale-gen >/dev/null
 COPY --from=release /monzero /opt/monzero
+COPY rootfs/usr/lib/python3/dist-packages/monzero_i18n.py /usr/lib/python3/dist-packages/monzero_i18n.py
 COPY docker/wallet-entry.sh /usr/local/bin/wallet-entry
 COPY rootfs/usr/local/lib/monzero-wallet /usr/local/lib/monzero-wallet
 COPY rootfs/usr/share/monzero/branding /usr/share/monzero/branding
 COPY rootfs/usr/share/monzero/wallpapers /usr/share/monzero/wallpapers
 USER monzero
-ENV HOME=/home/monzero MONZERO_VERSION=$MONZERO_VERSION
+# MONZERO_LANG: en es fr de it pt nl pl tr ru zh ja (Personalise can change it too)
+ENV HOME=/home/monzero MONZERO_VERSION=$MONZERO_VERSION MONZERO_LANG=en
 VOLUME /home/monzero
 EXPOSE 6080
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/wallet-entry"]

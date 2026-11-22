@@ -3,6 +3,8 @@
 import json, os, socket, threading, tkinter as tk, urllib.request
 from pathlib import Path
 
+from monzero_i18n import LANGS, box_language, norm, tr
+
 ICONS = "/usr/share/monzero/branding/icons"
 ACCENTS = {"cyan": "#19d6e6", "emerald": "#2fd57a", "violet": "#9b7bff", "amber": "#ffb020", "rose": "#ff5c8a"}
 MODES = {"dark": ("#0b1418", "#13222a", "#e8eef2", "#8a9aa3"), "light": ("#eef3f6", "#ffffff", "#10181c", "#5b6b73")}
@@ -13,6 +15,16 @@ def settings():
         return json.loads((Path.home() / ".config/monzero-desktop/settings.json").read_text())
     except (OSError, ValueError):
         return {}
+
+
+def language():
+    s = settings()
+    if s.get("language") in LANGS:
+        return s["language"]
+    docker = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+    if docker or not os.path.exists("/etc/monzero/appliance.json"):
+        return norm(os.environ.get("MONZERO_LANG", "en"))
+    return box_language()
 
 
 def get(url, data=None):
@@ -39,28 +51,29 @@ def version():
     return os.environ.get("MONZERO_VERSION", "")
 
 
-def status():
+def status(L):
     rows = []
     box = os.path.exists("/etc/monzero/appliance.json")
     if box:
         ip = address()
-        rows.append(("Manage this box", f"https://{ip}:8443  (from a browser on your network)" if ip else "no network yet"))
+        rows.append((tr(L, "a_manage"), tr(L, "a_manage_v", url=f"https://{ip}:8443") if ip else tr(L, "a_no_network")))
     try:
         i = get("http://127.0.0.1:6175/get_info", b"{}")
         peers = i.get("outgoing_connections_count", 0) + i.get("incoming_connections_count", 0)
         if i.get("synchronized"):
-            rows.append(("Node", f"synced  ·  block {i['height']:,}  ·  {peers} peers"))
+            rows.append((tr(L, "node"), tr(L, "a_synced", height=f"{i['height']:,}", peers=peers)))
         else:
             target = max(i.get("target_height") or 0, i["height"])
-            rows.append(("Node", f"syncing  ·  block {i['height']:,} of {target:,}  ·  {peers} peers"))
+            rows.append((tr(L, "node"), tr(L, "a_syncing", height=f"{i['height']:,}", target=f"{target:,}", peers=peers)))
     except Exception:
-        rows.append(("Node", "not running on this box" if box else "not reachable"))
+        rows.append((tr(L, "node"), tr(L, "a_node_off" if box else "a_not_reachable")))
     try:
         r = get("http://127.0.0.1:8790/v1/info")
-        rows.append(("DEX relay", f"running  ·  pairs {', '.join(sorted({p for c in r.get('chains', []) for p in c.get('pairs', [])}))}"))
+        pairs = ", ".join(sorted({p for c in r.get("chains", []) for p in c.get("pairs", [])}))
+        rows.append((tr(L, "dex_relay"), tr(L, "a_relay_on", pairs=pairs)))
     except Exception:
         if box:
-            rows.append(("DEX relay", "off (turn it on in the box's settings page)"))
+            rows.append((tr(L, "dex_relay"), tr(L, "a_relay_off")))
     return rows
 
 
@@ -68,8 +81,9 @@ def main():
     s = settings()
     acc = ACCENTS.get(s.get("accent"), ACCENTS["cyan"])
     bg, surf, fg, dim = MODES.get(s.get("mode"), MODES["dark"])
+    L = language()
     root = tk.Tk(className="monzero-about")
-    root.title("About this box")
+    root.title(tr(L, "app_about"))
     root.configure(bg=bg)
     try:
         logo = tk.PhotoImage(file=f"{ICONS}/wallet.png")
@@ -91,8 +105,8 @@ def main():
     table.pack(fill="both", expand=True, padx=24, pady=(0, 14))
     foot = tk.Frame(root, bg=bg, padx=24, pady=(0))
     foot.pack(fill="x", pady=(0, 18))
-    tk.Label(foot, text="Updated every 10 seconds", bg=bg, fg=dim, font=F(9)).pack(side="left")
-    done = tk.Label(foot, text="Close", bg=acc, fg=bg, font=F(10, True), padx=22, pady=6, cursor="hand2")
+    tk.Label(foot, text=tr(L, "a_updated"), bg=bg, fg=dim, font=F(9)).pack(side="left")
+    done = tk.Label(foot, text=tr(L, "close"), bg=acc, fg=bg, font=F(10, True), padx=22, pady=6, cursor="hand2")
     done.pack(side="right")
     done.bind("<Button-1>", lambda e: root.destroy())
 
@@ -105,12 +119,12 @@ def main():
 
     def refresh():
         def work():
-            rows = status()
+            rows = status(L)
             root.after(0, lambda: show(rows))
         threading.Thread(target=work, daemon=True).start()
         root.after(10_000, refresh)
 
-    show([("Status", "checking…")])
+    show([(tr(L, "status"), tr(L, "a_checking"))])
     refresh()
     root.minsize(620, 0)
     root.update_idletasks()

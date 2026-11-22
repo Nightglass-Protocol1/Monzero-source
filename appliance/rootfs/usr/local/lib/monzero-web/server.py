@@ -3,8 +3,9 @@
 
 Runs as the unprivileged user monzero-web. It never changes the system itself: it writes a
 request file that the root service monzero-apply checks and carries out. No JavaScript, no
-outside resources. First visit: the one-time setup code from the console, a password, the
-roles. Afterwards: password login, status, roles, SSH, remote screen, update now.
+outside resources. First visit: the language, then the one-time setup code from the console,
+a password, the keyboard, the roles. Afterwards: password login, status, roles, language, SSH,
+remote screen, update now.
 """
 import hashlib
 import hmac
@@ -20,6 +21,8 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+
+from monzero_i18n import KEYBOARDS, LANGS, box_language, box_keyboard, from_accept, norm, tr
 
 WEB = "/etc/monzero/web"
 DATA = "/var/lib/monzero-web"
@@ -87,13 +90,15 @@ def service(name):
     return r.stdout.strip() or "unknown"
 
 
-def node_info():
+def node_info(L):
     try:
         req = urllib.request.Request("http://127.0.0.1:6175/get_info", data=b"{}", headers={"Content-Type": "application/json"})
         i = json.load(urllib.request.urlopen(req, timeout=3))
-        return f"height {i['height']} of {i.get('target_height') or i['height']}, {'synced' if i.get('synchronized') else 'syncing'}, peers {i.get('outgoing_connections_count', 0)} out / {i.get('incoming_connections_count', 0)} in"
+        return tr(L, "node_info", height=i["height"], target=i.get("target_height") or i["height"],
+                  state=tr(L, "synced" if i.get("synchronized") else "syncing"),
+                  out=i.get("outgoing_connections_count", 0), inc=i.get("incoming_connections_count", 0))
     except Exception:
-        return "not answering"
+        return tr(L, "not_answering")
 
 
 def read_json(path, default):
@@ -103,7 +108,7 @@ def read_json(path, default):
         return default
 
 
-PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+PAGE = """<!doctype html><html lang="{lang}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Monzero Box</title><link rel="icon" href="/favicon.png">
 <style>
 :root{{--bg:#0f1115;--card:#181b22;--fg:#e8e8ea;--muted:#9aa0aa;--accent:#19d6e6;--bad:#ff5c5c;--ok:#4cc38a}}
@@ -112,18 +117,27 @@ main{{max-width:640px;margin:0 auto}} .card{{background:var(--card);border-radiu
 h1{{font-size:1.4rem;margin:8px 0 0}} .brand{{display:flex;flex-direction:column;align-items:center;gap:4px;margin:8px 0 4px}} .brand img{{width:min(340px,80vw);height:auto}} .brand span{{color:var(--muted);letter-spacing:.2em;font-size:.8rem;text-transform:uppercase}} h2{{font-size:1.1rem;margin-top:0}} label{{display:block;margin:10px 0 4px}}
 input[type=text],input[type=password],textarea{{width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--muted);background:var(--bg);color:var(--fg)}}
 button{{background:var(--accent);color:#111;border:0;border-radius:8px;padding:8px 16px;font-weight:600;margin-top:12px;cursor:pointer}}
+select{{width:100%;padding:8px;border-radius:8px;border:1px solid var(--muted);background:var(--bg);color:var(--fg)}}
+.langs{{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}} .langs a{{display:block;padding:8px 10px;border-radius:8px;border:1px solid #2a2f3a;color:var(--fg);text-decoration:none;text-align:center}}
+.langs a.on{{border-color:var(--accent);background:#19d6e622;font-weight:600}} .langs a:hover{{border-color:var(--accent)}}
 .muted{{color:var(--muted)}} .bad{{color:var(--bad)}} .ok{{color:var(--ok)}} code{{word-break:break-all}}
 </style></head><body><main><div class="brand"><img src="/brand/wordmark.png" alt="Monzero"><span>Box</span></div>{body}</main></body></html>"""
 
 
-def page(body):
-    return PAGE.format(body=body).encode()
+def page(body, lang="en"):
+    return PAGE.format(body=body, lang=norm(lang)).encode()
 
 
-def role_boxes(selected):
-    names = {"node": "XMZ node: helps the network; your wallet uses it",
-             "relay": "DEX relay: carries signed offers for the DEX; holds no funds",
-             "wallet": "Wallet + DEX app: on this box's screen (or the remote screen)"}
+def lang_options(current):
+    return "".join(f'<option value="{c}" lang="{c}"{" selected" if c == current else ""}>{html.escape(v[0])}</option>' for c, v in LANGS.items())
+
+
+def keyboard_options(current):
+    return "".join(f'<option value="{html.escape(k)}"{" selected" if k == current else ""}>{html.escape(v)}</option>' for k, v in KEYBOARDS.items())
+
+
+def role_boxes(selected, L="en"):
+    names = {r: tr(L, f"role_{r}") for r in ROLES}
     # The wallet role only where the installed release has the wallet app (64-bit ARM: later)
     roles = [r for r in ROLES if r != "wallet" or os.path.exists("/opt/monzero/current/monzero-wallet-gui")]
     return "".join(f'<label><input type="checkbox" name="role" value="{r}"{" checked" if r in selected else ""}> {html.escape(names[r])}</label>' for r in roles)
@@ -135,6 +149,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+    def lang(self):
+        """The page language: the box's own once it is set up; before, the one picked in the
+        first step (?lang=, or the form's hidden field), else the browser's."""
+        if is_setup():
+            return box_language()
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("lang", [""])[0]
+        return q if q in LANGS else from_accept(self.headers.get("Accept-Language"))
 
     def send(self, status, body=b"", headers=()):
         self.send_response(status)
@@ -191,86 +213,96 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        if self.path not in ("/", "/index.html"):
-            return self.send(404, page("<p>Not found.</p>"))
+        L = self.lang()
+        if urllib.parse.urlsplit(self.path).path not in ("/", "/index.html"):
+            return self.send(404, page(f"<p>{tr(L, 'not_found')}</p>", L))
         if not is_setup():
-            return self.send(200, page(self.setup_form()))
+            return self.send(200, page(self.setup_form(L), L))
         s = self.session()
         if not s:
-            return self.send(200, page(self.login_form()))
-        return self.send(200, page(self.status(s)))
+            return self.send(200, page(self.login_form(L), L))
+        return self.send(200, page(self.status(s, L), L))
 
-    def setup_form(self, error=""):
-        return f"""<div class="card"><h2>Set up this box</h2>
-<p class="muted">The setup code is shown on the box's screen or console (it is used once).</p>
+    def setup_form(self, L, error="", keyboard=None):
+        keyboard = keyboard if keyboard in KEYBOARDS else LANGS[L][3]
+        langs = "".join(f'<a href="/?lang={c}" lang="{c}"{" class=on" if c == L else ""}>{html.escape(v[0])}</a>' for c, v in LANGS.items())
+        return f"""<div class="card"><h2>1 · {tr(L, 'choose_language')}</h2>
+<p class="muted">{tr(L, 'language_hint')}</p><nav class="langs">{langs}</nav></div>
+<div class="card"><h2>2 · {tr(L, 'setup_title')}</h2>
+<p class="muted">{tr(L, 'setup_hint')}</p>
 {f'<p class="bad">{html.escape(error)}</p>' if error else ''}
-<form method="post" action="/setup">
-<label>Setup code</label><input type="text" name="code" autocomplete="off" required>
-<label>New password for this page (12 characters or more)</label><input type="password" name="pw" minlength="12" required autocomplete="new-password">
-<label>Password again</label><input type="password" name="pw2" minlength="12" required autocomplete="new-password">
-<h2 style="margin-top:20px">What should it run?</h2>{role_boxes(("node", "relay"))}
-<label><input type="checkbox" name="share" value="1" checked> Share my relay with the Monzero network through Tor (recommended: no router setup, your home IP stays hidden; it carries signed offers only, never funds)</label>
-<label>SSH public key (optional; SSH stays off without one)</label><textarea name="sshkey" rows="3" placeholder="ssh-ed25519 AAAA... you@pc"></textarea>
-<button type="submit">Set up</button></form></div>"""
+<form method="post" action="/setup"><input type="hidden" name="lang" value="{L}">
+<label>{tr(L, 'setup_code')}</label><input type="text" name="code" autocomplete="off" required>
+<label>{tr(L, 'new_password')}</label><input type="password" name="pw" minlength="12" required autocomplete="new-password">
+<label>{tr(L, 'password_again')}</label><input type="password" name="pw2" minlength="12" required autocomplete="new-password">
+<label>{tr(L, 'keyboard')}</label><select name="keyboard">{keyboard_options(keyboard)}</select>
+<h2 style="margin-top:20px">{tr(L, 'what_run')}</h2>{role_boxes(("node", "relay"), L)}
+<label><input type="checkbox" name="share" value="1" checked> {tr(L, 'share_tor_setup')}</label>
+<label>{tr(L, 'ssh_optional')}</label><textarea name="sshkey" rows="3" placeholder="ssh-ed25519 AAAA... you@pc"></textarea>
+<button type="submit">{tr(L, 'set_up')}</button></form></div>"""
 
-    def login_form(self, error=""):
-        return f"""<div class="card"><h2>Sign in</h2>{f'<p class="bad">{html.escape(error)}</p>' if error else ''}
-<form method="post" action="/login"><label>Password</label><input type="password" name="pw" required autocomplete="current-password">
-<button type="submit">Sign in</button></form></div>"""
+    def login_form(self, L, error=""):
+        return f"""<div class="card"><h2>{tr(L, 'sign_in')}</h2>{f'<p class="bad">{html.escape(error)}</p>' if error else ''}
+<form method="post" action="/login"><label>{tr(L, 'password')}</label><input type="password" name="pw" required autocomplete="current-password">
+<button type="submit">{tr(L, 'sign_in')}</button></form></div>"""
 
-    def status(self, s):
+    def status(self, s, L):
         csrf = sessions[s][1]
         cfg = read_json("/etc/monzero/appliance.json", {})
         upd = read_json("/var/lib/monzero-update/status.json", {})
         result = read_json(f"{DATA}/last-result.json", {})
         roles = cfg.get("roles", [])
-        rows = "".join(f"<tr><td>{n}</td><td>{html.escape(service(u))}</td></tr>" for n, u in (("Node", "monzerod"), ("DEX relay", "monzero-dex-relay"), ("Wallet screen", "monzero-wallet-session"), ("Remote screen", "monzero-wallet-vnc"), ("SSH", "ssh")))
+        state = lambda u: (lambda v: tr(L, f"st_{v}") if v in ("active", "inactive", "failed", "activating") else v)(service(u))
+        rows = "".join(f"<tr><td>{n}</td><td>{html.escape(state(u))}</td></tr>" for n, u in ((tr(L, "node"), "monzerod"), (tr(L, "dex_relay"), "monzero-dex-relay"), (tr(L, "wallet_screen"), "monzero-wallet-session"), (tr(L, "remote_screen"), "monzero-wallet-vnc"), ("SSH", "ssh")))
         inst = upd.get("installed", {})
         tok = f'<input type="hidden" name="csrf" value="{csrf}">'
-        return f"""<div class="card"><h2>Status</h2><table>{rows}</table>
-<p>Node: {html.escape(node_info())}</p>
-<p class="muted">Installed: core {html.escape(str(inst.get('core')))}, relay {html.escape(str(inst.get('relay')))}.
-Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
-{f'<p class="muted">Last change: {html.escape(result.get("result", ""))}</p>' if result else ''}</div>
-<div class="card"><h2>Roles</h2><form method="post" action="/roles">{tok}{role_boxes(roles)}<button>Save</button></form></div>
-<div class="card"><h2>Share the relay with the Monzero network</h2>
-<p class="muted">Other relays and apps can then read the offers your relay carries (signed offers only: it never holds funds or keys).</p>
-{self.public_relay_info()}
+        return f"""<div class="card"><h2>{tr(L, 'status')}</h2><table>{rows}</table>
+<p>{tr(L, 'node')}: {html.escape(node_info(L))}</p>
+<p class="muted">{html.escape(tr(L, 'installed', core=inst.get('core'), relay=inst.get('relay')))}
+{html.escape(tr(L, 'last_check', result=upd.get('result') or tr(L, 'not_yet')))}</p>
+{f'<p class="muted">{html.escape(tr(L, "last_change", result=result.get("result", "")))}</p>' if result else ''}</div>
+<div class="card"><h2>{tr(L, 'language')}</h2><p class="muted">{tr(L, 'language_later')}</p>
+<form method="post" action="/language">{tok}<label>{tr(L, 'language')}</label><select name="lang">{lang_options(L)}</select>
+<label>{tr(L, 'keyboard_short')}</label><select name="keyboard">{keyboard_options(box_keyboard())}</select><button>{tr(L, 'save')}</button></form></div>
+<div class="card"><h2>{tr(L, 'roles')}</h2><form method="post" action="/roles">{tok}{role_boxes(roles, L)}<button>{tr(L, 'save')}</button></form></div>
+<div class="card"><h2>{tr(L, 'share_title')}</h2>
+<p class="muted">{tr(L, 'share_hint')}</p>
+{self.public_relay_info(L)}
 <form method="post" action="/public-relay">{tok}
-<label><input type="radio" name="mode" value="onion"{' checked' if cfg.get('publicRelay', 'off') == 'onion' else ''}> Through Tor (recommended: no router setup, home IP hidden)</label>
-<label><input type="radio" name="mode" value="port"{' checked' if cfg.get('publicRelay') == 'port' else ''}> Through a router port (UPnP, or forward TCP 8790 yourself)</label>
-<label>Your public IPv4 address (only if your router has no UPnP)</label><input type="text" name="ip" value="{html.escape(cfg.get('publicRelayIp', ''))}" placeholder="leave empty to ask the router">
-<label><input type="radio" name="mode" value="off"{' checked' if cfg.get('publicRelay', 'off') == 'off' else ''}> Not shared (only this box and your home network)</label>
-<button>Save</button></form></div>
-<div class="card"><h2>Remote screen for the wallet</h2>
-<p class="muted">Shows the wallet's screen in your browser (HTTPS, your network only). Off unless you need it.</p>
-{self.vnc_info(cfg)}
-<form method="post" action="/vnc">{tok}<label><input type="checkbox" name="on" value="1"{' checked' if cfg.get('vnc') else ''}> On</label><button>Save</button></form></div>
+<label><input type="radio" name="mode" value="onion"{' checked' if cfg.get('publicRelay', 'off') == 'onion' else ''}> {tr(L, 'share_tor')}</label>
+<label><input type="radio" name="mode" value="port"{' checked' if cfg.get('publicRelay') == 'port' else ''}> {tr(L, 'share_port')}</label>
+<label>{tr(L, 'public_ip')}</label><input type="text" name="ip" value="{html.escape(cfg.get('publicRelayIp', ''))}" placeholder="{tr(L, 'public_ip_hint')}">
+<label><input type="radio" name="mode" value="off"{' checked' if cfg.get('publicRelay', 'off') == 'off' else ''}> {tr(L, 'share_off')}</label>
+<button>{tr(L, 'save')}</button></form></div>
+<div class="card"><h2>{tr(L, 'vnc_title')}</h2>
+<p class="muted">{tr(L, 'vnc_hint')}</p>
+{self.vnc_info(cfg, L)}
+<form method="post" action="/vnc">{tok}<label><input type="checkbox" name="on" value="1"{' checked' if cfg.get('vnc') else ''}> {tr(L, 'on')}</label><button>{tr(L, 'save')}</button></form></div>
 <div class="card"><h2>SSH</h2><form method="post" action="/ssh">{tok}
-<label>Public key (keys only, no passwords). Empty = SSH off.</label><textarea name="sshkey" rows="3">{html.escape(cfg.get('sshkey', ''))}</textarea><button>Save</button></form></div>
-<div class="card"><h2>Updates</h2><p class="muted">Signed releases install by themselves once a day.</p>
-<form method="post" action="/update">{tok}<button>Check now</button></form></div>
-<div class="card"><h2>Password</h2><form method="post" action="/password">{tok}
-<label>New password</label><input type="password" name="pw" minlength="12" required autocomplete="new-password">
-<label>Again</label><input type="password" name="pw2" minlength="12" required autocomplete="new-password"><button>Change</button></form>
-<form method="post" action="/logout">{tok}<button>Sign out</button></form></div>"""
+<label>{tr(L, 'ssh_key')}</label><textarea name="sshkey" rows="3">{html.escape(cfg.get('sshkey', ''))}</textarea><button>{tr(L, 'save')}</button></form></div>
+<div class="card"><h2>{tr(L, 'updates')}</h2><p class="muted">{tr(L, 'updates_hint')}</p>
+<form method="post" action="/update">{tok}<button>{tr(L, 'check_now')}</button></form></div>
+<div class="card"><h2>{tr(L, 'password')}</h2><form method="post" action="/password">{tok}
+<label>{tr(L, 'new_password_short')}</label><input type="password" name="pw" minlength="12" required autocomplete="new-password">
+<label>{tr(L, 'again')}</label><input type="password" name="pw2" minlength="12" required autocomplete="new-password"><button>{tr(L, 'change')}</button></form>
+<form method="post" action="/logout">{tok}<button>{tr(L, 'sign_out')}</button></form></div>"""
 
-    def public_relay_info(self):
+    def public_relay_info(self, L):
         st = read_json(f"{DATA}/public-relay.json", {})
         if not st:
             return ""
-        url = f'<br>Address: <code>{html.escape(st["url"])}</code>' if st.get("url") else ""
+        url = f'<br>{tr(L, "address")} <code>{html.escape(st["url"])}</code>' if st.get("url") else ""
         return f'<p>{html.escape(st.get("message", ""))}{url}</p>'
 
-    def vnc_info(self, cfg):
+    def vnc_info(self, cfg, L):
         if not cfg.get("vnc"):
             return ""
         try:
             pw = open(f"{DATA}/vnc-password").read().strip()
         except OSError:
-            return '<p class="muted">Starting...</p>'
+            return f'<p class="muted">{tr(L, "starting")}</p>'
         host = html.escape(self.headers.get("Host", "").rsplit(":", 1)[0])
-        return f'<p>Open <code>https://{host}:6080/vnc.html</code> and enter <code>{html.escape(pw)}</code> (changes each time it is turned on).</p>'
+        return "<p>" + tr(L, "vnc_open", url=f"<code>https://{host}:6080/vnc.html</code>", password=f"<code>{html.escape(pw)}</code>") + "</p>"
 
     def do_POST(self):
         try:
@@ -281,33 +313,39 @@ Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
             return self.send(403, page("<p>Refused (other site).</p>"))
         get = lambda k: (f.get(k) or [""])[0]
         ip = self.client_address[0]
+        L = box_language() if is_setup() else norm(get("lang"))
         if self.path == "/setup" and not is_setup():
+            kb = get("keyboard") if get("keyboard") in KEYBOARDS else LANGS[L][3]
             if throttled(ip):
-                return self.send(429, page(self.setup_form("Too many wrong codes: wait and try again.")))
+                return self.send(429, page(self.setup_form(L, tr(L, "err_codes"), kb), L))
             if not check_code(get("code")):
                 failed(ip)
-                return self.send(200, page(self.setup_form("That setup code is not right.")))
+                return self.send(200, page(self.setup_form(L, tr(L, "err_code"), kb), L))
             if len(get("pw")) < 12 or get("pw") != get("pw2"):
-                return self.send(200, page(self.setup_form("The passwords differ or are shorter than 12 characters.")))
+                return self.send(200, page(self.setup_form(L, tr(L, "err_passwords"), kb), L))
             roles = [r for r in f.get("role", []) if r in ROLES]
             json.dump(hash_password(get("pw")), open(ADMIN + ".tmp", "w"))
             os.chmod(ADMIN + ".tmp", 0o600)
             os.replace(ADMIN + ".tmp", ADMIN)
             failures.pop(ip, None)
-            request_change("setup", roles=roles, sshkey=get("sshkey").strip(), share=get("share") == "1")
+            request_change("setup", roles=roles, sshkey=get("sshkey").strip(), share=get("share") == "1", language=L, keyboard=kb)
             return self.redirect_new_session()
         if self.path == "/login" and is_setup():
             if throttled(ip):
-                return self.send(429, page(self.login_form("Too many wrong passwords: wait and try again.")))
+                return self.send(429, page(self.login_form(L, tr(L, "err_passwords_many")), L))
             if not check_password(get("pw")):
                 failed(ip)
-                return self.send(200, page(self.login_form("Wrong password.")))
+                return self.send(200, page(self.login_form(L, tr(L, "err_password")), L))
             failures.pop(ip, None)
             return self.redirect_new_session()
         s = self.session()
         if not s or not hmac.compare_digest(get("csrf"), sessions[s][1]):
-            return self.send(403, page('<p>Please <a href="/">sign in</a> again.</p>'))
-        if self.path == "/roles":
+            return self.send(403, page(f'<p><a href="/">{tr(L, "sign_in_again")}</a></p>', L))
+        if self.path == "/language":
+            if get("lang") not in LANGS or get("keyboard") not in KEYBOARDS:
+                return self.send(400, page("<p>Bad request.</p>", L))
+            request_change("language", language=get("lang"), keyboard=get("keyboard"))
+        elif self.path == "/roles":
             request_change("roles", roles=[r for r in f.get("role", []) if r in ROLES])
         elif self.path == "/public-relay":
             request_change("public_relay", mode=get("mode"), ip=get("ip").strip())
@@ -319,7 +357,7 @@ Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
             request_change("update")
         elif self.path == "/password":
             if len(get("pw")) < 12 or get("pw") != get("pw2"):
-                return self.send(200, page('<p class="bad">The passwords differ or are too short.</p><p><a href="/">Back</a></p>'))
+                return self.send(200, page(f'<p class="bad">{tr(L, "err_passwords_short")}</p><p><a href="/">{tr(L, "back")}</a></p>', L))
             json.dump(hash_password(get("pw")), open(ADMIN + ".tmp", "w"))
             os.chmod(ADMIN + ".tmp", 0o600)
             os.replace(ADMIN + ".tmp", ADMIN)
@@ -328,7 +366,7 @@ Last update check: {html.escape(upd.get('result', 'not yet'))}</p>
         elif self.path == "/logout":
             sessions.pop(s, None)
         else:
-            return self.send(404, page("<p>Not found.</p>"))
+            return self.send(404, page(f"<p>{tr(L, 'not_found')}</p>", L))
         self.send(303, b"", [("Location", "/")])
 
     def redirect_new_session(self):

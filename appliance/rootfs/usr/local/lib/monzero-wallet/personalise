@@ -1,10 +1,14 @@
 #!/usr/bin/python3 -I
-"""Personalise the Monzero desktop: wallpaper, theme colour, dark or light, panel position.
+"""Personalise the Monzero desktop: wallpaper, theme colour, dark or light, panel position,
+language and keyboard.
   personalise            the settings window (changes apply at once)
   personalise --apply    write the desktop's config files from the saved settings, then reload
-  personalise --setup    session start: write the config files and desktop icons, no reload"""
+  personalise --setup    session start: write the config files and desktop icons, no reload
+  personalise --env      print LANG and the keyboard layout for the session (shell assignments)"""
 import json, os, shutil, subprocess, sys
 from pathlib import Path
+
+from monzero_i18n import KEYBOARDS, LANGS, box_keyboard, box_language, norm, set_wallet_language, tr
 
 HOME = Path.home()
 SETTINGS = HOME / ".config/monzero-desktop/settings.json"
@@ -19,12 +23,31 @@ MODES = {   # background, raised surface, text, dimmed text, line
     "dark": ("#0b1418", "#13222a", "#e8eef2", "#8a9aa3", "#1f3038"),
     "light": ("#eef3f6", "#ffffff", "#10181c", "#5b6b73", "#c9d4da"),
 }
+# language/keyboard "": follow the box (its setup page), or MONZERO_LANG in the Docker image
 DEFAULTS = {"wallpaper": str(WALLS / "01-monzero.jpg"), "fit": "crop", "accent": "cyan", "mode": "dark",
-            "panel": "bottom", "icons": "large"}
-FITS = {"crop": "Fill the screen", "fit": "Whole picture", "stretch": "Stretch"}
-APPS = [("wallet", "Monzero Wallet", "Your XMZ wallet and the exchange", "wallet"),
-        ("personalise", "Personalise", "Wallpaper, colours and the panel", "personalise"),
-        ("about", "About this box", "Address, node and relay status", "about")]
+            "panel": "bottom", "icons": "large", "language": "", "keyboard": ""}
+FITS = {"crop": "p_fill", "fit": "p_whole", "stretch": "p_stretch"}
+APPS = [("wallet", "app_wallet", "app_wallet_c", "wallet"),
+        ("personalise", "app_personalise", "app_personalise_c", "personalise"),
+        ("about", "app_about", "app_about_c", "about")]
+WALLET_CONF = HOME / ".config/monzero-project/monzero-core.conf"
+DOCKER = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+
+def language(s):
+    if s.get("language") in LANGS:
+        return s["language"]
+    if DOCKER or not os.path.exists("/etc/monzero/appliance.json"):
+        return norm(os.environ.get("MONZERO_LANG", "en"))
+    return box_language()
+
+
+def keyboard(s):
+    if s.get("keyboard") in KEYBOARDS:
+        return s["keyboard"]
+    if DOCKER or not os.path.exists("/etc/monzero/appliance.json"):
+        return LANGS[language(s)][3]
+    return box_keyboard()
 
 
 def load():
@@ -36,6 +59,8 @@ def load():
     if s["accent"] not in ACCENTS: s["accent"] = "cyan"
     if s["mode"] not in MODES: s["mode"] = "dark"
     if s["fit"] not in FITS: s["fit"] = "crop"
+    if s["language"] not in LANGS: s["language"] = ""
+    if s["keyboard"] not in KEYBOARDS: s["keyboard"] = ""
     if s["wallpaper"] != "colour" and not Path(s["wallpaper"]).exists():
         s["wallpaper"] = DEFAULTS["wallpaper"]
     return s
@@ -55,8 +80,24 @@ def write(path, text, mode=0o644):
 
 
 def desktop_entry(key, name, comment, icon):
-    return (f"[Desktop Entry]\nType=Application\nName={name}\nComment={comment}\n"
+    """A launcher with its name in every language (the desktop and panel pick the session's)."""
+    loc = lambda k: "".join(f"{k}[{LANGS[c][1].split('.')[0]}]={tr(c, v)}\n" for c, v in ((c, name if k == "Name" else comment) for c in LANGS if c != "en"))
+    return (f"[Desktop Entry]\nType=Application\nName={tr('en', name)}\n{loc('Name')}Comment={tr('en', comment)}\n{loc('Comment')}"
             f"Exec={LIB}/{key}\nIcon={ICONS}/{icon}.png\nTerminal=false\n")
+
+
+def sync_wallet_language(s):
+    """When the desktop's language changes, the wallet follows (its own setting, read when it
+    opens). A language picked inside the wallet stays until the desktop's changes again."""
+    lang = language(s)
+    mark = HOME / ".config/monzero-desktop/wallet-language"
+    try:
+        if mark.read_text().strip() == lang:
+            return
+    except OSError:
+        pass
+    set_wallet_language(str(WALLET_CONF), lang)
+    write(mark, lang + "\n")
 
 
 def files(s):
@@ -67,11 +108,12 @@ def files(s):
     for i, (key, name, comment, icon) in enumerate(APPS):
         write(HOME / f".local/share/monzero-desktop/apps/{key}.desktop", desktop_entry(key, name, comment, icon))
         d = HOME / "Desktop" / f"{key}.desktop"
-        if not (HOME / ".config/monzero-desktop/icons-made").exists():
+        if not (HOME / ".config/monzero-desktop/icons-made").exists() or (d.exists() and "Name[" not in d.read_text()):
             write(d, desktop_entry(key, name, comment, icon), 0o755)
             os.utime(d, (1_000_000_000 + i, 1_000_000_000 + i))   # keeps this order on the desktop
     (HOME / ".config/monzero-desktop").mkdir(parents=True, exist_ok=True)
     (HOME / ".config/monzero-desktop/icons-made").touch()
+    sync_wallet_language(s)
 
     # Desktop (pcmanfm): wallpaper, label colours, no file-manager clutter
     wp = s["wallpaper"]
@@ -284,25 +326,46 @@ osd.unhilight.bg.color: {line}
 """)
 
 
-def reload():
+def keyboard_apply(s):
+    if DOCKER:   # the browser screen sends key symbols: the layout is the viewer's own
+        return
+    kb = keyboard(s)
+    cmd = ["setxkbmap", "-layout", kb] + (["-option", "grp:alt_shift_toggle"] if "," in kb else [])
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def session_env(s):
+    loc = LANGS[language(s)][1]
+    return f"LANG={loc}\nLANGUAGE={loc.split('.')[0]}:en\n"
+
+
+def reload(s, lang_changed=False):
     run = lambda *c: subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    keyboard_apply(s)
     run("openbox", "--reconfigure")
-    run("pkill", "-USR1", "-x", "tint2")      # tint2 reloads its config
+    if lang_changed:   # restart the panel in the new language (its clock and tooltips)
+        run("pkill", "-u", str(os.getuid()), "-x", "tint2")
+        env = dict(os.environ, **dict(l.split("=", 1) for l in session_env(s).split()))
+        subprocess.Popen(["tint2", "-c", str(HOME / ".config/tint2/tint2rc")], env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    else:
+        run("pkill", "-USR1", "-x", "tint2")      # tint2 reloads its config
     # the desktop reads wallpaper, colours and icon size only when it starts
     run("pkill", "-u", str(os.getuid()), "-x", "pcmanfm")
-    subprocess.Popen(["pcmanfm", "--desktop", "--profile", "default"], stdin=subprocess.DEVNULL,
+    env = dict(os.environ, **dict(l.split("=", 1) for l in session_env(s).split()))
+    subprocess.Popen(["pcmanfm", "--desktop", "--profile", "default"], env=env, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
-def thumb(path):
+def thumb(path, w=192, h=108):
     from PIL import Image
     THUMBS.mkdir(parents=True, exist_ok=True)
     st = Path(path).stat()
     import hashlib
-    t = THUMBS / (hashlib.sha256(f"{path}|{st.st_mtime}|{st.st_size}".encode()).hexdigest()[:20] + ".png")
+    t = THUMBS / (hashlib.sha256(f"{path}|{st.st_mtime}|{st.st_size}|{w}x{h}".encode()).hexdigest()[:20] + ".png")
     if not t.exists():
         im = Image.open(path).convert("RGB")
-        im = im.resize((192, 108), Image.LANCZOS) if abs(im.width / im.height - 16 / 9) < 0.02 else _cover(im, 192, 108)
+        im = im.resize((w, h), Image.LANCZOS) if abs(im.width / im.height - 16 / 9) < 0.02 else _cover(im, w, h)
         im.save(t)
     return t
 
@@ -328,30 +391,33 @@ def window():
     from PIL import Image, ImageTk
 
     root = tk.Tk(className="monzero-personalise")
-    root.title("Personalise")
     try:
         root.iconphoto(True, tk.PhotoImage(file=f"{ICONS}/personalise.png"))
     except tk.TclError:
         pass
     state = {"s": load(), "imgs": []}
+    compact = root.winfo_screenheight() < 900   # e.g. 1280x800: smaller pictures, tighter gaps
+    TW, TH, GAP = (152, 86, 7) if compact else (192, 108, 12)
 
     def change(**kw):
+        before = language(state["s"])
         state["s"].update(kw)
         save(state["s"])
         files(state["s"])
-        reload()
+        reload(state["s"], lang_changed=language(state["s"]) != before)
         draw()
 
     def add_own():
-        f = filedialog.askopenfilename(parent=root, title="Choose a picture", initialdir=str(HOME),
-                                       filetypes=[("Pictures", "*.jpg *.jpeg *.png *.webp"), ("All files", "*")])
+        L = language(state["s"])
+        f = filedialog.askopenfilename(parent=root, title=tr(L, "p_choose"), initialdir=str(HOME),
+                                       filetypes=[(tr(L, "p_pictures"), "*.jpg *.jpeg *.png *.webp"), (tr(L, "p_all_files"), "*")])
         if not f:
             return
         try:
             with Image.open(f) as im:
                 im.verify()
         except Exception:
-            messagebox.showerror("Personalise", "That file is not a picture this box can show.", parent=root)
+            messagebox.showerror(tr(L, "app_personalise"), tr(L, "p_not_picture"), parent=root)
             return
         OWN.mkdir(parents=True, exist_ok=True)
         dest = OWN / Path(f).name
@@ -360,7 +426,8 @@ def window():
         change(wallpaper=str(dest))
 
     def remove_own(p):
-        if messagebox.askyesno("Personalise", f"Remove {p.name} from your wallpapers?", parent=root):
+        L = language(state["s"])
+        if messagebox.askyesno(tr(L, "app_personalise"), tr(L, "p_remove_q", name=p.name), parent=root):
             p.unlink(missing_ok=True)
             change(wallpaper=DEFAULTS["wallpaper"]) if state["s"]["wallpaper"] == str(p) else draw()
 
@@ -369,40 +436,49 @@ def window():
             w.destroy()
         state["imgs"].clear()
         s = state["s"]
+        L = language(s)
+        root.title(tr(L, "app_personalise"))
         acc = ACCENTS[s["accent"]][1]
         bg, surf, fg, dim, line = MODES[s["mode"]]
         root.configure(bg=bg)
         F = lambda size=10, bold=False: ("DejaVu Sans", size, "bold" if bold else "normal")
 
-        def heading(parent, text):
-            tk.Label(parent, text=text, bg=bg, fg=acc, font=F(11, True), anchor="w").pack(fill="x", pady=(14, 6))
+        def heading(parent, text, first=False):
+            tk.Label(parent, text=text, bg=bg, fg=acc, font=F(11, True), anchor="w").pack(fill="x", pady=(0 if first else GAP, 4))
 
         def choice_row(parent, options, current, key):
             row = tk.Frame(parent, bg=bg)
             row.pack(fill="x")
             for value, label in options.items():
                 on = value == current
-                b = tk.Label(row, text=label, font=F(10, on), padx=14, pady=6, cursor="hand2",
+                b = tk.Label(row, text=label, font=F(10, on), padx=12, pady=5, cursor="hand2",
                              bg=acc if on else surf, fg=bg if on else fg,
                              highlightthickness=1, highlightbackground=acc if on else line)
                 b.pack(side="left", padx=(0, 8))
                 b.bind("<Button-1>", lambda e, v=value: change(**{key: v}))
 
-        body = tk.Frame(root, bg=bg, padx=22, pady=12)
-        body.pack(fill="both", expand=True)
-        top = tk.Frame(body, bg=bg)
-        top.pack(fill="x")
-        tk.Label(top, text="Personalise your Monzero Box", bg=bg, fg=fg, font=F(15, True)).pack(side="left")
+        def menu(parent, label, options, current, key):
+            tk.Label(parent, text=label, bg=bg, fg=dim, font=F(9), anchor="w").pack(fill="x")
+            var = tk.StringVar(value=options[current])
+            m = tk.OptionMenu(parent, var, *options.values(),
+                              command=lambda v: change(**{key: next(k for k, x in options.items() if x == v)}))
+            m.configure(bg=surf, fg=fg, activebackground=acc, activeforeground=bg, highlightthickness=1,
+                        highlightbackground=line, relief="flat", font=F(10), anchor="w", width=26, cursor="hand2")
+            m["menu"].configure(bg=surf, fg=fg, activebackground=acc, activeforeground=bg, font=F(10))
+            m.pack(fill="x", pady=(2, 4 if compact else 8))
 
-        heading(body, "Wallpaper")
+        body = tk.Frame(root, bg=bg, padx=22, pady=10 if compact else 16)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text=tr(L, "p_heading"), bg=bg, fg=fg, font=F(15, True), anchor="w").pack(fill="x", pady=(0, GAP))
+
+        heading(body, tr(L, "p_wallpaper"), first=True)
         grid = tk.Frame(body, bg=bg)
         grid.pack(fill="x")
-        tiles = [(p, ImageTk.PhotoImage(Image.open(thumb(p)))) for p in wallpapers()]
-        col = 0
+        tiles = [(p, ImageTk.PhotoImage(Image.open(thumb(p, TW, TH)))) for p in wallpapers()]
         for i, (p, img) in enumerate(tiles + [("colour", None), ("add", None)]):
             on = str(p) == s["wallpaper"]
             cell = tk.Frame(grid, bg=acc if on else line, padx=3 if on else 1, pady=3 if on else 1, cursor="hand2")
-            cell.grid(row=i // 4, column=i % 4, padx=(0, 10), pady=(0, 10), sticky="n")
+            cell.grid(row=i // 4, column=i % 4, padx=(0, 10), pady=(0, 8), sticky="n")
             if img is not None:
                 state["imgs"].append(img)
                 w = tk.Label(cell, image=img, bd=0, bg=bg)
@@ -411,57 +487,73 @@ def window():
                     w.bind("<Button-3>", lambda e, p=p: remove_own(p))
             else:
                 colour = p == "colour"
-                w = tk.Frame(cell, width=192, height=108, bg=bg if colour else surf, cursor="hand2")
-                inner = tk.Label(w, text="Plain colour" if colour else "＋  Your own picture…", bg=bg if colour else surf,
-                                 fg=dim if colour else fg, font=F(9, not colour), cursor="hand2")
+                w = tk.Frame(cell, width=TW, height=TH, bg=bg if colour else surf, cursor="hand2")
+                inner = tk.Label(w, text=tr(L, "p_plain" if colour else "p_own"), bg=bg if colour else surf,
+                                 fg=dim if colour else fg, font=F(9, not colour), cursor="hand2", wraplength=TW - 12)
                 inner.place(relx=.5, rely=.5, anchor="center")
                 act = (lambda e: change(wallpaper="colour")) if colour else (lambda e: add_own())
                 w.bind("<Button-1>", act)
                 inner.bind("<Button-1>", act)
                 w.pack_propagate(False)
             w.pack()
-        tk.Label(body, text="Right-click one of your own pictures to remove it.", bg=bg, fg=dim, font=F(9),
-                 anchor="w").pack(fill="x")
-        heading(body, "Picture size")
-        choice_row(body, FITS, s["fit"], "fit")
+        tk.Label(body, text=tr(L, "p_remove_hint"), bg=bg, fg=dim, font=F(9), anchor="w").pack(fill="x")
 
-        heading(body, "Theme colour")
-        sw = tk.Frame(body, bg=bg)
+        cols = tk.Frame(body, bg=bg)
+        cols.pack(fill="x", pady=(GAP, 0))
+        left, right = tk.Frame(cols, bg=bg), tk.Frame(cols, bg=bg)
+        left.pack(side="left", fill="both", expand=True, anchor="n")
+        right.pack(side="left", fill="both", expand=True, anchor="n", padx=(24, 0))
+
+        heading(left, tr(L, "p_size"), first=True)
+        choice_row(left, {k: tr(L, v) for k, v in FITS.items()}, s["fit"], "fit")
+        heading(left, tr(L, "p_theme"))
+        sw = tk.Frame(left, bg=bg)
         sw.pack(fill="x")
-        for key, (name, colour) in ACCENTS.items():
+        for key, (_, colour) in ACCENTS.items():
             on = key == s["accent"]
-            c = tk.Canvas(sw, width=92, height=64, bg=bg, highlightthickness=0, cursor="hand2")
-            c.create_oval(30, 4, 62, 36, fill=colour, outline=fg if on else colour, width=3 if on else 1)
-            c.create_text(46, 52, text=name, fill=fg if on else dim, font=F(9, on))
+            c = tk.Canvas(sw, width=84, height=60, bg=bg, highlightthickness=0, cursor="hand2")
+            c.create_oval(26, 4, 58, 36, fill=colour, outline=fg if on else colour, width=3 if on else 1)
+            c.create_text(42, 50, text=tr(L, f"c_{key}"), fill=fg if on else dim, font=F(9, on))
             c.pack(side="left")
             c.bind("<Button-1>", lambda e, k=key: change(accent=k))
+        heading(left, tr(L, "p_look"))
+        choice_row(left, {"dark": tr(L, "p_dark"), "light": tr(L, "p_light")}, s["mode"], "mode")
 
-        heading(body, "Look")
-        choice_row(body, {"dark": "Dark", "light": "Light"}, s["mode"], "mode")
-        heading(body, "Panel")
-        choice_row(body, {"bottom": "Bottom of the screen", "top": "Top of the screen"}, s["panel"], "panel")
-        heading(body, "Desktop icons")
-        choice_row(body, {"large": "Large", "small": "Small"}, s["icons"], "icons")
+        heading(right, tr(L, "language"), first=True)
+        menu(right, tr(L, "language"), {c: v[0] for c, v in LANGS.items()}, L, "language")
+        menu(right, tr(L, "keyboard_short"), dict(KEYBOARDS), keyboard(s), "keyboard")
+        tk.Label(right, text=tr(L, "p_language_note"), bg=bg, fg=dim, font=F(9), anchor="w", justify="left",
+                 wraplength=330).pack(fill="x")
+        heading(right, tr(L, "p_panel"))
+        choice_row(right, {"bottom": tr(L, "p_bottom"), "top": tr(L, "p_top")}, s["panel"], "panel")
+        heading(right, tr(L, "p_icons"))
+        choice_row(right, {"large": tr(L, "p_large"), "small": tr(L, "p_small")}, s["icons"], "icons")
 
         foot = tk.Frame(body, bg=bg)
-        foot.pack(fill="x", side="bottom", pady=(18, 0))
-        tk.Label(foot, text="The wallet has its own dark/light switch: the moon button at its top.",
-                 bg=bg, fg=dim, font=F(9)).pack(side="left")
-        close = tk.Label(foot, text="Done", bg=acc, fg=bg, font=F(10, True), padx=22, pady=6, cursor="hand2")
+        foot.pack(fill="x", side="bottom", pady=(GAP + 4, 0))
+        tk.Label(foot, text=tr(L, "p_wallet_note"), bg=bg, fg=dim, font=F(9)).pack(side="left")
+        close = tk.Label(foot, text=tr(L, "done"), bg=acc, fg=bg, font=F(10, True), padx=22, pady=6, cursor="hand2")
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: root.destroy())
 
     draw()
     root.update_idletasks()
-    root.geometry(f"+{max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2)}+40")
+    root.geometry(f"+{max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2)}+{max(0, (root.winfo_screenheight() - root.winfo_reqheight()) // 2 - 20)}")
     root.mainloop()
 
 
 def main():
+    if "--env" in sys.argv[1:]:
+        s = load()
+        print(session_env(s) + f"MONZERO_KEYBOARD={keyboard(s)}", end="\n")
+        return
     if "--setup" in sys.argv[1:] or "--apply" in sys.argv[1:]:
-        files(load())
+        s = load()
+        files(s)
         if "--apply" in sys.argv[1:]:
-            reload()
+            reload(s)
+        else:
+            keyboard_apply(s)
         return
     window()
 

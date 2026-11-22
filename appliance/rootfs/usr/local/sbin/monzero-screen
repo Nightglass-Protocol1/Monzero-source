@@ -7,6 +7,7 @@ framebuffer. A console login stays on the second screen (Alt+F2).
   monzero-screen --once F   draw once into the PNG file F (for tests)"""
 import json, os, socket, subprocess, sys, time, urllib.request
 from PIL import Image, ImageDraw, ImageFont
+from monzero_i18n import CJK, CJK_FONT, box_language, tr
 
 ART = "/usr/share/monzero/branding/wallpaper-1920x1080.jpg"
 FB = "/sys/class/graphics/fb0"
@@ -33,20 +34,22 @@ def address():
         return None
 
 
-def node():
+def node(L):
     try:
         req = urllib.request.Request("http://127.0.0.1:6175/get_info", data=b"{}", headers={"Content-Type": "application/json"})
         i = json.load(urllib.request.urlopen(req, timeout=3))
-        return (f"block {i['height']:,}  ·  " + ("synced" if i.get("synchronized") else "syncing")
-                + f"  ·  {i.get('outgoing_connections_count', 0) + i.get('incoming_connections_count', 0)} peers")
+        peers = i.get("outgoing_connections_count", 0) + i.get("incoming_connections_count", 0)
+        return (tr(L, "scr_block", height=f"{i['height']:,}") + "  ·  " + tr(L, "synced" if i.get("synchronized") else "syncing")
+                + "  ·  " + tr(L, "scr_peers", n=peers))
     except Exception:
-        return "starting"
+        return tr(L, "scr_starting")
 
 
 def lines():
-    """[(text, size, colour)] under the artwork."""
+    """[(text, size, colour)] under the artwork, in the box's language (English before setup)."""
+    L = box_language()
     ip = address()
-    url = f"https://{ip}:8443" if ip else "waiting for the network (connect a cable)"
+    url = f"https://{ip}:8443" if ip else tr(L, "scr_no_network")
     out = []
     if not os.path.exists("/var/lib/monzero-web/admin.json"):
         code = ""
@@ -55,25 +58,25 @@ def lines():
             code = f"{c[0:4]}-{c[4:8]}-{c[8:12]}"
         except OSError:
             pass
-        out.append(("Set up this box from a browser on your network:", 30, GREY))
+        out.append((tr(L, "scr_setup"), 30, GREY))
         out.append((url, 44, WHITE))
         if code:
-            out.append((f"Setup code   {code}", 44, CYAN))
+            out.append((f"{tr(L, 'setup_code')}   {code}", 44, CYAN))
     else:
         cfg = read_json("/etc/monzero/appliance.json", {})
         roles = cfg.get("roles", [])
         out.append((f"Monzero Box  ·  {url}", 38, WHITE))
         parts = []
         if "node" in roles:
-            parts.append("Node: " + node())
+            parts.append(tr(L, "scr_node", status=node(L)))
         if "relay" in roles:
             st = read_json("/var/lib/monzero-web/public-relay.json", {})
-            shared = {"onion": "shared through Tor", "port": "shared by router port"}.get(st.get("mode"), "home network only")
-            parts.append("DEX relay: " + shared)
+            shared = tr(L, {"onion": "scr_shared_tor", "port": "scr_shared_port"}.get(st.get("mode"), "scr_home_only"))
+            parts.append(tr(L, "scr_relay", status=shared))
         if parts:
             out.append(("     ".join(parts), 28, CYAN))
     ver = os.path.basename(os.path.realpath("/opt/monzero/current")) if os.path.exists("/opt/monzero/current") else ""
-    out.append((("Monzero " + ver.lstrip("v") + "  ·  " if ver else "") + "console login: Alt+F2", 22, GREY))
+    out.append((("Monzero " + ver.lstrip("v") + "  ·  " if ver else "") + tr(L, "scr_console"), 22, GREY))
     return out
 
 
@@ -88,11 +91,12 @@ def render(size):
     d = ImageDraw.Draw(img)
     k = h / 1080
     rows = lines()
+    cjk = box_language() in CJK and os.path.exists(CJK_FONT)
     y = round(h * 0.80)
     if len(rows) > 3:
         y = round(h * 0.77)
     for text, size_px, colour in rows:
-        f = ImageFont.truetype(BOLD if size_px >= 38 else FONT, max(10, round(size_px * k)))
+        f = ImageFont.truetype(CJK_FONT if cjk else BOLD if size_px >= 38 else FONT, max(10, round(size_px * k)))
         tw = d.textlength(text, font=f)
         d.text(((w - tw) / 2, y), text, font=f, fill=colour)
         y += round(size_px * k * 1.45)

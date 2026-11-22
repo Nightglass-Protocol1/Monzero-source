@@ -7,7 +7,8 @@ if [ ! -f "$CONF" ]; then   # first start: no "desktop shortcut" question (the d
   mkdir -p "$(dirname "$CONF")"
   printf '[General]\naskDesktopShortcut=false\n' > "$CONF"
 fi
-$L/personalise --setup
+$L/personalise --setup   # config files, desktop icons, keyboard; the wallet follows the language
+eval "$($L/personalise --env)"; export LANG LANGUAGE
 hsetroot -cover /usr/share/monzero/branding/wallpaper-1920x1080.jpg 2>/dev/null || true   # until the desktop draws
 openbox --config-file $L/openbox-rc.xml &
 # the window manager first, or windows open before it and miss its rules

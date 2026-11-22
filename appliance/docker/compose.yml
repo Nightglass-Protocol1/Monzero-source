@@ -55,6 +55,7 @@ services:
     shm_size: 256m
     environment:
       MONZERO_SCREEN: "1600x1000"
+      MONZERO_LANG: "en"              # en es fr de it pt nl pl tr ru zh ja
     mem_limit: 3g
     pids_limit: 512
 
