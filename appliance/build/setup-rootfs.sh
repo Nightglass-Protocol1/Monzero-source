@@ -15,7 +15,7 @@ PKGS=(systemd-sysv systemd-timesyncd systemd-resolved dbus sudo openssh-server c
       nftables unattended-upgrades apt-listchanges cloud-guest-utils e2fsprogs openssl
       apparmor apparmor-utils apparmor-profiles
       wireguard-tools tor miniupnpc
-      xserver-xorg-core xserver-xorg-input-libinput xinit openbox wmctrl x11-xserver-utils
+      xserver-xorg-core xserver-xorg-input-libinput xinit openbox wmctrl x11-utils x11-xserver-utils
       libgl1 libegl1 libgl1-mesa-dri libglib2.0-0t64 libx11-xcb1 libxcb1 libxcb-glx0 libxcb-icccm4
       libxcb-image0 libxcb-shm0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-render0
       libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 libxkbcommon-x11-0 libxkbcommon0 libudev1

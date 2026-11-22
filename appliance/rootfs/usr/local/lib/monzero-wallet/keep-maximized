@@ -1,7 +1,13 @@
 #!/bin/sh
 # Kiosk: keep the wallet filling the screen. The wallet sets its own size after openbox has
-# placed it, and its title-bar button can shrink it to 980 px; put it back every few seconds.
+# placed it, and its title-bar buttons can shrink it to 980 px or minimize it, and the box has
+# no taskbar to bring it back. Every few seconds: restore a minimized wallet, re-maximize it.
 # Asking for a state a window already has changes nothing, so this is quiet.
 while sleep 3; do
-  wmctrl -x -r monzero-wallet-gui -b add,maximized_vert,maximized_horz 2>/dev/null
+  for w in $(wmctrl -l -x 2>/dev/null | awk '$3 ~ /^monzero-wallet-gui\./ {print $1}'); do
+    if xprop -id "$w" _NET_WM_STATE 2>/dev/null | grep -q _NET_WM_STATE_HIDDEN; then
+      wmctrl -i -a "$w"
+    fi
+    wmctrl -i -r "$w" -b add,maximized_vert,maximized_horz
+  done
 done
