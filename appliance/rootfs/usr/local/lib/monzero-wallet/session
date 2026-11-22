@@ -11,6 +11,7 @@ fi
 xset s off -dpms 2>/dev/null
 hsetroot -cover /usr/share/monzero/branding/wallpaper-1920x1080.jpg 2>/dev/null || hsetroot -fill /usr/share/monzero/branding/wallpaper-1920x1080.jpg 2>/dev/null || true
 openbox --config-file /usr/local/lib/monzero-wallet/openbox-rc.xml &
+/usr/local/lib/monzero-wallet/keep-maximized &
 while true; do
   /opt/monzero/current/monzero-wallet-gui
   sleep 2
