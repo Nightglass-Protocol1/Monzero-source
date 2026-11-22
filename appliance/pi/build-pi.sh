@@ -19,7 +19,8 @@ VERSION=${MONZERO_VERSION:?set MONZERO_VERSION}
 TAG=monzero-appliance-rootfs:pi-$VERSION
 ROOT=${MONZERO_ROOT:-$HOME/projects/Monzero-App}
 mkdir -p "$OUT"
-W=$(mktemp -d); trap 'podman unshare rm -rf "$W"' EXIT
+# work on disk next to the output (several multi-GB copies: too big for a RAM /tmp)
+W=$(mktemp -d -p "$OUT" .pi-build.XXXXXX); trap 'podman unshare rm -rf "$W"' EXIT
 
 podman run --rm --platform linux/arm64 docker.io/library/debian:trixie true 2>/dev/null \
   || { echo "!! no arm64 emulation for containers on this PC (install qemu-user-static + binfmt)"; exit 1; }
@@ -43,19 +44,20 @@ podman unshare bash -c "
   debugfs -R 'rdump / $W/root' '$W/root.ext4' >/dev/null 2>&1
   tar -C '$W/root' --numeric-owner -cf '$W/root.tar' .
 "
-podman import --platform linux/arm64 "$W/root.tar" monzero-raspios-base:$VERSION >/dev/null
+podman import --os linux --arch arm64 "$W/root.tar" monzero-raspios-base:$VERSION >/dev/null
 mkdir -p "$W/ctx"; cp -a "$HERE/rootfs" "$W/ctx/overlay"; cp "$HERE/build/setup-rootfs.sh" "$W/ctx/"
 [ -n "${RELAY_BIN_ARM64:-}" ] && cp "$RELAY_BIN_ARM64" "$W/ctx/monzero-dex-relay" || : > "$W/ctx/monzero-dex-relay"
 cat > "$W/ctx/Containerfile" <<EOF
 FROM monzero-raspios-base:$VERSION
 ARG MONZERO_VERSION
 COPY . /build
+ARG MONZERO_SKIP_RELEASE=
 RUN RELAY=/build/monzero-dex-relay; [ -s \$RELAY ] || RELAY=""; \
-    MONZERO_VERSION=\$MONZERO_VERSION bash /build/setup-rootfs.sh /build/overlay "\$RELAY" pi \
- && systemctl disable userconfig.service sshswitch.service 2>/dev/null || true \
+    MONZERO_SKIP_RELEASE=\$MONZERO_SKIP_RELEASE MONZERO_VERSION=\$MONZERO_VERSION bash /build/setup-rootfs.sh /build/overlay "\$RELAY" pi \
+ && { systemctl disable userconfig.service sshswitch.service 2>/dev/null || true; } \
  && rm -rf /build
 EOF
-podman build -q --platform linux/arm64 --build-arg MONZERO_VERSION="$VERSION" -t "$TAG" "$W/ctx" >/dev/null
+podman build -q --platform linux/arm64 --build-arg MONZERO_VERSION="$VERSION" --build-arg MONZERO_SKIP_RELEASE="${MONZERO_SKIP_RELEASE:-}" -t "$TAG" "$W/ctx" >/dev/null
 CID=$(podman create --platform linux/arm64 "$TAG" true); podman export "$CID" > "$W/new-root.tar"; podman rm "$CID" >/dev/null
 
 echo "== 3. image"
@@ -76,7 +78,7 @@ mcopy -o -i "$W/boot.vfat" ::/config.txt "$W/config.txt"
 grep -q '^disable_splash=1' "$W/config.txt" || printf '\n# Monzero Box: no rainbow boot square; the Monzero screen shows once the box is up\ndisable_splash=1\n' >> "$W/config.txt"
 mcopy -o -i "$W/boot.vfat" "$W/config.txt" ::/config.txt
 mcopy -o -i "$W/boot.vfat" "$W/cmdline.txt" ::/cmdline.txt
-IMG=$OUT/monzero-appliance-$VERSION-raspberrypi-arm64.img
+IMG=$OUT/monzero-appliance-$VERSION-raspberrypi-arm64${MONZERO_SKIP_RELEASE:+-TEST-no-monzero}.img
 truncate -s ${SIZE_MB}M "$IMG"
 sfdisk -q "$IMG" <<EOF
 label: dos

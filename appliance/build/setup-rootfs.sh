@@ -67,8 +67,14 @@ install -d -m 755 /etc/monzero
 install -d -o monzero -g monzero -m 750 /var/lib/monzero /var/log/monzero
 
 echo "== Monzero $VERSION (signed release, through monzero-update)"
-MONZERO_UPDATE_VERSION=$VERSION /usr/bin/python3 -I /usr/local/sbin/monzero-update
-[ "$(cat /opt/monzero/current/VERSION)" = "$VERSION" ]
+if [ -n "${MONZERO_SKIP_RELEASE:-}" ]; then
+  # Test builds only (checks the rest of the image): no Monzero installed, the box's daily
+  # signed update installs it once the release carries this machine's artifact. Never ship.
+  echo "!! TEST BUILD: Monzero release not installed (MONZERO_SKIP_RELEASE)"
+else
+  MONZERO_UPDATE_VERSION=$VERSION /usr/bin/python3 -I /usr/local/sbin/monzero-update
+  [ "$(cat /opt/monzero/current/VERSION)" = "$VERSION" ]
+fi
 if [ -n "$RELAY_BIN" ]; then
   # Until releases carry a relay artifact: the relay built from the image's source commit,
   # as version 0.0.0 so the first signed relay release replaces it
