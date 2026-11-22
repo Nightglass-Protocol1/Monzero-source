@@ -10,9 +10,8 @@ ENGINE=${ENGINE:-$(command -v docker >/dev/null && echo docker || echo podman)}
 ROOT=${MONZERO_ROOT:-$HOME/projects/Monzero-App}
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 if [ -z "${RELAY_BIN:-}" ]; then
-  T=$ROOT/core/build/dex-rust-toolchain-1.95.0/sysroot/usr
-  ( cd "$REPO/gui/dex-contracts/relay" && PATH=$T/bin:$PATH LD_LIBRARY_PATH=$T/lib/x86_64-linux-gnu CARGO_HOME=$ROOT/core/build/dex-cargo-home cargo build --offline --release 2>&1 | tail -1 )
-  RELAY_BIN=$REPO/gui/dex-contracts/relay/target/release/monzero-dex-relay
+  . "$HERE/build/relay.sh"
+  RELAY_BIN=$(build_relay "$REPO" "$ROOT" | tail -1)
 fi
 mkdir -p "$W/rootfs/usr/local/sbin" "$W/docker"
 cp "$HERE/rootfs/usr/local/sbin/monzero-update" "$W/rootfs/usr/local/sbin/"

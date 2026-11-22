@@ -1,0 +1,9 @@
+# Any wired adapter: DHCP (IPv4 and IPv6). Written by the Monzero appliance image.
+[Match]
+Type=ether
+
+[Network]
+DHCP=yes
+IPv6PrivacyExtensions=yes
+LLMNR=no
+MulticastDNS=yes

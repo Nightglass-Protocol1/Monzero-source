@@ -33,7 +33,7 @@ chown root:monzero-web /etc/monzero/web/setup-code; chmod 640 /etc/monzero/web/s
 # shown on the console)
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
   -subj "/CN=monzero-box" -keyout /etc/monzero/web/tls.key -out /etc/monzero/web/tls.crt 2>/dev/null
-chown root:monzero-web /etc/monzero/web/tls.key /etc/monzero/web/tls.crt; chmod 640 /etc/monzero/web/tls.key
+chown root:monzero-web /etc/monzero/web/tls.key /etc/monzero/web/tls.crt; chmod 640 /etc/monzero/web/tls.key /etc/monzero/web/tls.crt
 FPR=$(openssl x509 -in /etc/monzero/web/tls.crt -noout -fingerprint -sha256 | cut -d= -f2)
 
 mkdir -p /etc/issue.d

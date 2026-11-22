@@ -20,11 +20,10 @@ mkdir -p "$OUT"
 W=$(mktemp -d); trap 'podman unshare rm -rf "$W"' EXIT
 
 echo "== 1. DEX relay from this checkout ($(git -C "$REPO" rev-parse --short HEAD))"
-T=$ROOT/core/build/dex-rust-toolchain-1.95.0/sysroot/usr
-( cd "$REPO/gui/dex-contracts/relay" && PATH=$T/bin:$PATH LD_LIBRARY_PATH=$T/lib/x86_64-linux-gnu CARGO_HOME=$ROOT/core/build/dex-cargo-home \
-    cargo build --offline --release 2>&1 | tail -1 )
+. "$HERE/build/relay.sh"
+RELAY_BIN=$(build_relay "$REPO" "$ROOT" | tail -1)
 mkdir -p "$W/ctx"
-cp "$REPO/gui/dex-contracts/relay/target/release/monzero-dex-relay" "$W/ctx/"
+cp "$RELAY_BIN" "$W/ctx/monzero-dex-relay"
 cp -a "$HERE/rootfs" "$W/ctx/overlay"
 cp "$HERE/build/setup-rootfs.sh" "$HERE/vm/grub.cfg" "$W/ctx/"
 
@@ -50,6 +49,10 @@ echo "== 3. disk image"
 podman unshare bash -c "
   set -e; mkdir '$W/root'; tar -xpf '$W/rootfs.tar' -C '$W/root' --numeric-owner
   rm -f '$W/root/.containerenv' '$W/root/run/.containerenv'
+  # podman supplies these during the build, so the image's own are written here
+  echo monzero-box > '$W/root/etc/hostname'
+  printf '127.0.0.1\tlocalhost\n127.0.1.1\tmonzero-box\n::1\tlocalhost ip6-localhost ip6-loopback\n' > '$W/root/etc/hosts'
+  rm -f '$W/root/etc/resolv.conf'; ln -s ../run/systemd/resolve/stub-resolv.conf '$W/root/etc/resolv.conf'
   KVER=\$(ls '$W/root/lib/modules' | sort -V | tail -1)
   cp '$W/root/boot/vmlinuz-'\$KVER '$W/vmlinuz'; cp '$W/root/boot/initrd.img-'\$KVER '$W/initrd.img'
   ROOT_MB=\$(( $SIZE_MB - $ESP_MB - 2 ))
