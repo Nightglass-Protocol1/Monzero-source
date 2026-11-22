@@ -10,6 +10,11 @@
 //!
 //!   RELAY=http://127.0.0.1:18790 cargo run --example market_e2e -- <run dir>
 //!
+//! Real funds (owner's test, real-funds/run-xmr-bnb.sh): NET=mainnet with COIN=xmr trades on
+//! the main networks (CHAIN_ID 56: BNB/XMR), sends xmrMainnet in every request, and
+//! FUNDER_RPC=none: the run prints the addresses to fund and waits for the coins instead of a
+//! funding wallet. TRUSTED_DAEMON=0 when the wallets use a public node.
+//!
 //! Env: ACCOUNTS_FILE (test phrase; default ~/.config/monzero-dex/eth-sepolia-accounts.json),
 //! OWNER_INDEX (1) / CLAIMER_INDEX (0), EVM_RPC (Sepolia publicnode), XMZ_NODE (127.0.0.1:16175),
 //! FUNDER_RPC (a testnet wallet RPC that pays the claimer 20 tXMZ; 127.0.0.1:16183),
@@ -34,6 +39,48 @@ fn monero() -> bool {
     env("COIN", "xmz") == "xmr"
 }
 
+/// Real coins on the main networks (the owner's real-funds test only)
+fn mainnet() -> bool {
+    env("NET", "test") == "mainnet"
+}
+
+fn chain_id() -> u64 {
+    env("CHAIN_ID", if mainnet() { "56" } else { "11155111" }).parse().expect("CHAIN_ID")
+}
+
+/// The chain's own coin: BNB on BNB Smart Chain (56, 97), ETH otherwise
+fn evm_coin() -> &'static str {
+    if matches!(chain_id(), 56 | 97) {
+        "BNB"
+    } else {
+        "ETH"
+    }
+}
+
+fn evm_rpc() -> String {
+    env("EVM_RPC", match chain_id() {
+        56 => "https://bsc-rpc.publicnode.com",
+        97 => "https://bsc-testnet-rpc.publicnode.com",
+        1 => "https://ethereum-rpc.publicnode.com",
+        _ => "https://ethereum-sepolia-rpc.publicnode.com",
+    })
+}
+
+/// An EVM account's balance in wei
+async fn evm_balance(address: &str) -> u128 {
+    let r: Value = reqwest::Client::new()
+        .post(evm_rpc())
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [address, "latest"]}))
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .expect("EVM RPC")
+        .json()
+        .await
+        .expect("EVM RPC answer");
+    u128::from_str_radix(r["result"].as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0)
+}
+
 fn log(msg: impl AsRef<str>) {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     println!("{:02}:{:02}:{:02} {}", (t / 3600) % 24, (t / 60) % 60, t % 60, msg.as_ref());
@@ -55,12 +102,8 @@ fn bip39_seed(phrase: &str) -> [u8; 64] {
     out
 }
 
-fn pair() -> &'static str {
-    if monero() {
-        "ETH/XMR"
-    } else {
-        "ETH/XMZ"
-    }
+fn pair() -> String {
+    format!("{}/{}", evm_coin(), if monero() { "XMR" } else { "XMZ" })
 }
 
 /// The private-coin amount of the trade, in atoms: 10 tXMZ, or 0.01 stagenet XMR
@@ -90,9 +133,16 @@ async fn wallet_rpc(procs: &mut Procs, dir: &Path, name: &str) -> (WalletRpc, Va
     std::fs::create_dir_all(&wallets).unwrap();
     procs.0.push(
         Command::new(env("WALLET_RPC_BIN", if monero() { "monero-wallet-rpc" } else { "monzero-wallet-rpc" }))
-            .args([if monero() { "--stagenet" } else { "--testnet" }, "--wallet-dir", wallets.to_str().unwrap()])
+            .args(match (monero(), mainnet()) {
+                (true, true) => vec![],
+                (true, false) => vec!["--stagenet"],
+                (false, _) => vec!["--testnet"],
+            })
+            .args(["--wallet-dir", wallets.to_str().unwrap()])
             .args(["--daemon-address", &env("XMZ_NODE", if monero() { "node.monerodevs.org:38089" } else { "127.0.0.1:16175" })])
-            .args(["--trusted-daemon", "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", &port.to_string(), "--non-interactive"])
+            // A public node is not trusted with the wallet's view of its own outputs
+            .arg(if env("TRUSTED_DAEMON", "1") == "0" { "--untrusted-daemon" } else { "--trusted-daemon" })
+            .args(["--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", &port.to_string(), "--non-interactive"])
             .args(["--log-file", dir.join(format!("{name}.log")).to_str().unwrap()])
             .current_dir(dir)
             .stdout(Stdio::null())
@@ -122,6 +172,7 @@ struct Side {
     name: &'static str,
     dir: PathBuf,
     tick: Value,
+    address: String,
     _procs: Procs,
 }
 
@@ -140,14 +191,14 @@ impl Side {
         let swap_seed = monzero_evm_keys::swap_seed(&own);
         let key = evm_account(seed, index).unwrap();
         let tick = json!({
-            "evmRpc": env("EVM_RPC", "https://ethereum-sepolia-rpc.publicnode.com"),
+            "evmRpc": evm_rpc(),
             "swapKeys": {"swapSeedHex": hex::encode(*swap_seed), "evmKeyHex": hex::encode(key.to_bytes())},
             "mainWallet": main_ep,
             "swapWallet": swap_ep,
             "witnessDaemons": env("WITNESSES", "").split(',').filter(|w| !w.is_empty()).collect::<Vec<_>>(),
         });
         log(format!("{name}: account {}", key.address()));
-        (Side { name, dir: dir.join("trade"), tick, _procs: procs }, main)
+        (Side { name, dir: dir.join("trade"), tick, address: key.address().to_string(), _procs: procs }, main)
     }
 
     async fn call(&self, command: &str, extra: Value) -> Value {
@@ -158,10 +209,51 @@ impl Side {
         if command != "listings" && command != "post" && command != "serve" && command != "take" && command != "cancel" && command != "report" {
             req.as_object_mut().unwrap().remove("relays");
         }
+        if mainnet() && monero() {
+            req["xmrMainnet"] = json!(true);
+        }
         for (k, v) in extra.as_object().unwrap() {
             req[k] = v.clone();
         }
         handle(&serde_json::to_vec(&req).unwrap()).await
+    }
+}
+
+/// Real funds: the owner sends the coins; wait until every side holds what it needs.
+/// Maker: the offer's coin plus gas. Taker: the XMR to sell plus its fee, and a little of the
+/// chain's coin for the claim's gas.
+async fn wait_for_funds(run: &Path, maker: &Side, taker: &Side, taker_main: &WalletRpc, xmr_address: &str) {
+    if run.join("funded").exists() {
+        return;
+    }
+    let value: u128 = env("VALUE_WEI", "10000000000000000").parse().unwrap();
+    let maker_needs = value + env("MAKER_GAS_WEI", "1000000000000000").parse::<u128>().unwrap();
+    let taker_gas: u128 = env("TAKER_GAS_WEI", "500000000000000").parse().unwrap();
+    let atoms: u64 = xmz_atoms().parse().unwrap();
+    let xmr_needs = atoms + env("XMR_FEE_ATOMS", "1000000000").parse::<u64>().unwrap();
+    let coin = evm_coin();
+    let show = |wei: u128| format!("{:.6} {coin}", wei as f64 / 1e18);
+    let showx = |a: u64| format!("{:.6} XMR", a as f64 / 1e12);
+    println!("\n== Send the test coins (only these amounts or a little more):");
+    println!("   {} to the maker (pays for XMR):     {}", show(maker_needs), maker.address);
+    println!("   {} to the taker (claim gas):        {}", show(taker_gas), taker.address);
+    println!("   {} to the taker's XMR wallet:      {xmr_address}", showx(xmr_needs));
+    println!("   on BNB Smart Chain (BEP20) for {coin}; XMR needs 10 blocks (~20 min) before it can be spent.\n");
+    for round in 0u64.. {
+        let _ = taker_main.call("refresh", json!({})).await;
+        let b = taker_main.call("get_balance", json!({"account_index": 0})).await.unwrap_or(json!({}));
+        let (total, unlocked) = (b["balance"].as_u64().unwrap_or(0), b["unlocked_balance"].as_u64().unwrap_or(0));
+        let (m, t) = (evm_balance(&maker.address).await, evm_balance(&taker.address).await);
+        let ready = m >= maker_needs && t >= taker_gas && unlocked >= xmr_needs;
+        if ready || round % 4 == 0 {
+            log(format!("maker {} / {}, taker {} / {}, taker XMR {} spendable ({} arrived) / {}",
+                show(m), show(maker_needs), show(t), show(taker_gas), showx(unlocked), showx(total), showx(xmr_needs)));
+        }
+        if ready {
+            std::fs::write(run.join("funded"), "owner funded\n").unwrap();
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 
@@ -177,8 +269,11 @@ async fn main() {
 
     // The taker sells XMZ: fund its wallet from the testnet funder
     let address = taker_main.call("get_address", json!({})).await.unwrap()["address"].as_str().unwrap().to_string();
+    if env("FUNDER_RPC", "") == "none" {
+        wait_for_funds(&run, &maker, &taker, &taker_main, &address).await;
+    }
     let funder = WalletRpc::new(&format!("http://{}", env("FUNDER_RPC", "127.0.0.1:16183")), None);
-    if !run.join("funded").exists() {
+    if env("FUNDER_RPC", "") != "none" && !run.join("funded").exists() {
         // Twice the trade amount (XMZ default: 20 tXMZ for a 10 tXMZ trade), so fees are covered
         let amount: u64 = env("FUND_ATOMS", &(2 * xmz_atoms().parse::<u64>().unwrap()).to_string()).parse().unwrap();
         let r = funder.call("transfer", json!({"destinations": [{"amount": amount, "address": address}], "ring_size": 16})).await.unwrap();
@@ -190,7 +285,7 @@ async fn main() {
     let posted = if maker.dir.join("listing.json").exists() {
         json!({"ok": true})
     } else {
-        let mut offer = json!({"offer": {"chainId": 11155111, "side": "buy-xmz", "valueWei": env("VALUE_WEI", "10000000000000000"), "xmzAtoms": xmz_atoms(), "lifetimeSecs": 6 * 3600}});
+        let mut offer = json!({"offer": {"chainId": chain_id(), "side": "buy-xmz", "valueWei": env("VALUE_WEI", "10000000000000000"), "xmzAtoms": xmz_atoms(), "lifetimeSecs": 6 * 3600}});
         if monero() {
             offer["offer"]["coin"] = json!("xmr");
         }
