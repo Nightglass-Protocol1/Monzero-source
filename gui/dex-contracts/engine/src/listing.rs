@@ -153,6 +153,9 @@ impl SignedSolAccount {
 pub struct Rules {
     pub contracts: BTreeMap<u64, Address>,
     pub max_value: BTreeMap<u64, U256>,
+    /// A cap per chain for offers in a token (USDT), in the token's base units. The coin cap
+    /// above never applies to tokens (0.1 BNB is not 0.1 USDT); absent, tokens are not capped here.
+    pub max_token_value: BTreeMap<u64, U256>,
     /// Monero offers on the main networks are accepted. Off unless switched on: XMR trading with
     /// real coins opens only after its own real-funds tests (test networks always accept XMR).
     pub xmr_mainnet: bool,
@@ -366,7 +369,8 @@ impl Listing {
         if self.value.is_zero() || self.xmz == 0 {
             return Err(ListingError::Zero);
         }
-        if rules.max_value.get(&self.chain_id).is_some_and(|max| self.value > *max) {
+        let cap = if self.asset() == Address::ZERO { &rules.max_value } else { &rules.max_token_value };
+        if cap.get(&self.chain_id).is_some_and(|max| self.value > *max) {
             return Err(ListingError::TooLarge);
         }
         if self.created_at > now + CLOCK_SKEW || self.expires_at <= now || self.expires_at <= self.created_at || self.expires_at - self.created_at > self.max_lifetime() {

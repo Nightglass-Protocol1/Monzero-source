@@ -293,7 +293,7 @@ impl<C: ChainView> Relay<C> {
 
     /// What direct offers must keep to here: this relay's contracts and caps, on the chains it serves
     pub fn direct_rules(&self) -> DirectRules {
-        DirectRules { contracts: self.rules.contracts.clone(), max_value: self.rules.max_value.clone(), mainnet: self.direct_mainnet, local_contracts: self.direct_local.clone() }
+        DirectRules { contracts: self.rules.contracts.clone(), max_value: self.rules.max_value.clone(), max_token_value: self.rules.max_token_value.clone(), mainnet: self.direct_mainnet, local_contracts: self.direct_local.clone() }
     }
 
     /// Accepts a signed direct offer. Idempotent for the same offer. The maker's account must hold

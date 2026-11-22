@@ -276,3 +276,21 @@ fn monero_pairs_trade_the_chains_coin_and_its_usdt() {
     assert!(check(usdt.clone()).is_ok());
     assert_eq!(usdt.asset(), token);
 }
+
+#[test]
+fn the_coin_cap_never_caps_a_token_offer() {
+    // A relay's maxValueWei for BNB Smart Chain is in BNB: 0.1 BNB must not refuse 23 USDT
+    // (both 18 places); USDT has its own cap (found 2026-11-22 before the USDT-BSC/XMR swap)
+    let key = PrivateKeySigner::random();
+    let mut r = Rules { xmr_mainnet: true, ..Rules::default() };
+    r.contracts.insert(56, contract());
+    r.max_value.insert(56, U256::from(10u64.pow(17)));
+    let usdt = |coins: u64| Listing { chain_id: 56, pair: "USDT-BSC/XMR".into(), xmz_network: XmzNetwork::XmrMainnet, value: U256::from(coins) * U256::from(10u64.pow(18)), ..listing(&key) };
+    let bnb = Listing { pair: "BNB/XMR".into(), ..usdt(1) };
+    let check = |l: Listing, r: &Rules| l.sign(&key).verify(r, NOW);
+    assert_eq!(check(bnb, &r), Err(ListingError::TooLarge), "1 BNB is above the 0.1 BNB cap");
+    assert!(check(usdt(23), &r).is_ok(), "no USDT cap set: the BNB cap does not apply");
+    r.max_token_value.insert(56, U256::from(60u64) * U256::from(10u64.pow(18)));
+    assert!(check(usdt(60), &r).is_ok());
+    assert_eq!(check(usdt(61), &r), Err(ListingError::TooLarge), "above the USDT cap");
+}

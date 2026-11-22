@@ -99,7 +99,7 @@ pub struct DirectAccept {
 }
 
 pub fn rules(accept: &DirectAccept) -> DirectRules {
-    DirectRules { contracts: pinned_contracts(), max_value: BTreeMap::new(), mainnet: accept.mainnet, local_contracts: accept.local_contracts.clone() }
+    DirectRules { contracts: pinned_contracts(), max_value: BTreeMap::new(), max_token_value: BTreeMap::new(), mainnet: accept.mainnet, local_contracts: accept.local_contracts.clone() }
 }
 
 #[derive(Serialize, Deserialize)]

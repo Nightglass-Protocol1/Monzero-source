@@ -27,7 +27,7 @@ pub fn pinned_contracts() -> BTreeMap<u64, Address> {
 }
 
 pub fn pinned_rules() -> Rules {
-    Rules { contracts: pinned_contracts(), max_value: BTreeMap::new(), xmr_mainnet: false }
+    Rules { contracts: pinned_contracts(), max_value: BTreeMap::new(), max_token_value: BTreeMap::new(), xmr_mainnet: false }
 }
 
 /// Relay base URLs: https, or plain http to this machine only

@@ -288,7 +288,7 @@ public:
     Q_INVOKABLE bool returnEvmFunds(int chainId,const QString &address);
     // Monero (XMR) against ETH, BNB, SOL and USDT: the same offers and trades as the XMZ markets,
     // with the private side on the app's Monero wallets. By coin ("ETH", "USDT-BSC"), like
-    // evmMarketStatus. Real XMR only where the Monero wallet runs on mainnet (MONZERO_DEX_XMR_MAINNET=1).
+    // evmMarketStatus. Real XMR on the main network for BNB/XMR and USDT-BSC/XMR only (setUpXmrMarkets).
     QVariantMap xmrMarketStatus() const;
     Q_INVOKABLE bool refreshXmrOffers(const QString &coin);
     // side: "sell-xmz" (we sell XMR for the coin) or "buy-xmz", as the helper names both sides

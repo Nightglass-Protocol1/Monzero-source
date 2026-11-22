@@ -150,7 +150,7 @@ async fn info<C: ChainView>(State(api): State<Arc<Api<C>>>) -> Json<Value> {
                 let xmr: Vec<String> = pairs.iter().map(|p| p.replace("/XMZ", "/XMR")).collect();
                 pairs.extend(xmr);
             }
-            json!({ "chainId": id, "pair": pair, "pairs": pairs, "contract": contract, "maxValue": rules.max_value.get(id) })
+            json!({ "chainId": id, "pair": pair, "pairs": pairs, "contract": contract, "maxValue": rules.max_value.get(id), "maxTokenValue": rules.max_token_value.get(id) })
         })
         .collect();
     Json(json!({

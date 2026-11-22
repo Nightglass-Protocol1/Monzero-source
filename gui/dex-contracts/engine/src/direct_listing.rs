@@ -141,8 +141,10 @@ pub struct SignedDirectListing {
 pub struct DirectRules {
     /// The pinned contract (program stand-in) per chain
     pub contracts: BTreeMap<u64, Address>,
-    /// A cap per chain on what one side may be (base units)
+    /// A cap per chain on what one side may be in the chain's own coin (base units)
     pub max_value: BTreeMap<u64, U256>,
+    /// The same for a side in a token (USDT, its base units); absent, tokens are not capped here
+    pub max_token_value: BTreeMap<u64, U256>,
     /// Offers with real coins are accepted. Off until direct pairs are opened after their
     /// real-funds tests; test networks are accepted either way.
     pub mainnet: bool,
@@ -198,7 +200,8 @@ impl DirectListing {
             if coin.value.is_zero() {
                 return Err(ListingError::Zero);
             }
-            if rules.max_value.get(&coin.chain_id).is_some_and(|max| coin.value > *max) {
+            let cap = if coin.asset == Address::ZERO { &rules.max_value } else { &rules.max_token_value };
+            if cap.get(&coin.chain_id).is_some_and(|max| coin.value > *max) {
                 return Err(ListingError::TooLarge);
             }
             if chain.is_mainnet() && !rules.mainnet {

@@ -43,6 +43,10 @@ struct ChainConfig {
     #[serde(default)]
     sol_program: Option<String>,
     max_value_wei: Option<U256>,
+    /// A cap for offers in the chain's token (USDT; base units: 18 places on BNB Smart Chain, 6 on
+    /// Solana). maxValueWei is in the chain's own coin and never applies to tokens.
+    #[serde(default)]
+    max_token_value: Option<U256>,
 }
 
 #[derive(Deserialize)]
@@ -219,6 +223,9 @@ async fn main() {
             if let Some(max) = c.max_value_wei {
                 rules.max_value.insert(c.chain_id, max);
             }
+            if let Some(max) = c.max_token_value {
+                rules.max_token_value.insert(c.chain_id, max);
+            }
             chains.insert(c.chain_id, View::Solana(monzero_dex_relay::chain::SolView::new(&c.rpc, program)));
             eprintln!("chain {} ({}): program {text} ok (offers stand for it as {contract})", c.chain_id, chain.pair());
             continue;
@@ -239,6 +246,9 @@ async fn main() {
         rules.contracts.insert(c.chain_id, contract);
         if let Some(max) = c.max_value_wei {
             rules.max_value.insert(c.chain_id, max);
+        }
+        if let Some(max) = c.max_token_value {
+            rules.max_token_value.insert(c.chain_id, max);
         }
         chains.insert(c.chain_id, View::Evm(view));
         eprintln!("chain {} ({}): contract {} ok", c.chain_id, chain.pair(), contract);
