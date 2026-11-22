@@ -78,3 +78,15 @@ no new privileges. The node's wallet RPC is reachable only by the wallet contain
     MONZERO_VERSION=1.3.7 bash appliance/pi/build-pi.sh <raspios-lite-arm64.img.xz> [out]
 
 See SECURITY.md for what the box protects and how.
+
+## For releases (project maintainers)
+
+Boxes update from the normal signed release file, so a release that should update boxes adds:
+
+1. `bash appliance/release/build-box-artifacts.sh <version> <out>`: relay archives for x86-64
+   and 64-bit ARM, their entries for the release file (`artifacts-box.json`) and `latest.json`.
+2. `bash appliance/pi/build-arm64-node.sh <version>`: the 64-bit ARM node archive (Raspberry Pi)
+   and its entry.
+3. Add the entries to `v<version>.json` "artifacts", sign it as usual, upload the archives to
+   /downloads/ and the signed file to /releases/, and only then upload `latest.json` to
+   /releases/: boxes see the new version from that moment.
