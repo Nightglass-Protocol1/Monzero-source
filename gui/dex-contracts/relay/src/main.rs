@@ -20,6 +20,7 @@ use monzero_dex_evm::listing::{Rules, SignedListing, SignedSolAccount};
 use monzero_dex_evm::Chain;
 use monzero_dex_relay::chain::{AlloyView, View};
 use monzero_dex_relay::http::{now, router, Api};
+use monzero_dex_relay::mesh::{Announcer, Fetcher, Mesh};
 use monzero_dex_relay::{Print, Relay, Snapshot, ARCHIVE_SECS};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -69,6 +70,27 @@ struct Config {
     /// Pay USDT traders' network fees, paid back in USDT (absent: this relay does not)
     #[serde(default)]
     sponsor: Option<SponsorConfig>,
+    /// Tor's SOCKS port, to read relays with .onion addresses (peers or announced)
+    #[serde(default)]
+    tor_socks: Option<SocketAddr>,
+    /// Hub: accept relay announcements, list them at /v1/relays and pull their offers
+    #[serde(default)]
+    mesh: bool,
+    /// Box: announce this relay to hubs (absent: it does not)
+    #[serde(default)]
+    announce: Option<AnnounceConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AnnounceConfig {
+    /// A file holding this relay's public address (the onion name, or http://<public ip>:<port>);
+    /// absent or empty = nothing announced (public relay off)
+    url_file: PathBuf,
+    /// This relay's own Ed25519 key (made on the first start)
+    key_file: PathBuf,
+    /// Hubs to announce to
+    to: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -101,16 +123,8 @@ fn save(relay: &Relay<View>, dir: &Path) {
     }
 }
 
-async fn fetch<T: serde::de::DeserializeOwned>(client: &reqwest::Client, url: &str) -> Result<T, String> {
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("{url}: HTTP {}", resp.status()));
-    }
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > 8 * 1024 * 1024 {
-        return Err(format!("{url}: response too large"));
-    }
-    serde_json::from_slice(&bytes).map_err(|e| format!("{url}: {e}"))
+async fn fetch<T: serde::de::DeserializeOwned>(client: &Fetcher, url: &str) -> Result<T, String> {
+    client.get_json(url).await
 }
 
 #[derive(Deserialize)]
@@ -135,7 +149,7 @@ struct Prints {
 }
 
 /// Copies offers and trades from one peer relay, checking each again (signatures; claims on chain)
-async fn sync(relay: &Relay<View>, client: &reqwest::Client, peer: &str) -> Result<(usize, usize), String> {
+async fn sync(relay: &Relay<View>, client: &Fetcher, peer: &str) -> Result<(usize, usize), String> {
     let base = peer.trim_end_matches('/');
     let now = now();
     let mut offers = 0;
@@ -273,11 +287,18 @@ async fn main() {
             }
         });
     }
-    if !config.peers.is_empty() {
-        let (relay, peers) = (relay.clone(), config.peers.clone());
+    let fetcher = Fetcher::new(config.tor_socks);
+    // The swap contracts this relay serves: an announced relay must serve the same ones
+    let contracts: BTreeMap<u64, String> = relay.rules().contracts.iter().map(|(id, a)| (*id, format!("{a:#x}"))).collect();
+    let mesh = config.mesh.then(|| Arc::new(Mesh::new(fetcher.clone(), contracts, config.peers.clone(), config.trust_proxy)));
+    if mesh.is_some() {
+        eprintln!("mesh: accepting relay announcements{}", if config.tor_socks.is_some() { " (onions through Tor)" } else { " (no Tor: onions are refused)" });
+    }
+    if !config.peers.is_empty() || mesh.is_some() {
+        let (relay, peers, mesh, client) = (relay.clone(), config.peers.clone(), mesh.clone(), fetcher.clone());
         tokio::spawn(async move {
-            let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).user_agent("monzero-dex-relay").build().expect("client");
             let mut tick = tokio::time::interval(Duration::from_secs(30));
+            let mut round = 0usize;
             loop {
                 tick.tick().await;
                 for peer in &peers {
@@ -287,12 +308,48 @@ async fn main() {
                         Err(e) => eprintln!("{peer}: {e}"),
                     }
                 }
+                // Announced relays: a few per round, each about every five minutes
+                if let Some(mesh) = &mesh {
+                    mesh.prune(now());
+                    let listed = mesh.listed(now());
+                    let per_round = listed.len().div_ceil(10).max(1);
+                    for r in listed.iter().skip(round % 10 * per_round).take(per_round) {
+                        match sync(&relay, &client, &r.url).await {
+                            Ok((0, 0)) => {}
+                            Ok((o, t)) => eprintln!("mesh {}: {o} new offers, {t} new trades", r.url),
+                            Err(e) => eprintln!("mesh {}: {e}", r.url),
+                        }
+                    }
+                    round += 1;
+                }
+            }
+        });
+    }
+    if let Some(a) = &config.announce {
+        let announcer = Announcer::load(&a.key_file, a.url_file.clone(), a.to.clone()).unwrap_or_else(|e| fail(e));
+        eprintln!("announce: relay key {}", hex::encode(announcer.key.verifying_key().to_bytes()));
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(90)).user_agent("monzero-dex-relay").build().expect("client");
+            let mut tick = tokio::time::interval(Duration::from_secs(600));
+            let mut last = Vec::new();
+            loop {
+                tick.tick().await;
+                let results = announcer.announce_once(&client).await;
+                if results != last {
+                    for r in &results {
+                        eprintln!("announce: {r}");
+                    }
+                    last = results;
+                }
             }
         });
     }
 
     let api = Arc::new(Api::new(relay.clone(), config.peers.clone(), config.trust_proxy));
     let mut app = router(api);
+    if let Some(mesh) = &mesh {
+        app = app.merge(monzero_dex_relay::mesh::router(mesh.clone()));
+    }
     if let Some(sc) = &config.sponsor {
         use monzero_dex_evm::sol;
         use monzero_dex_relay::sponsor::{EvmSponsor, SolSponsor, Sponsor};
