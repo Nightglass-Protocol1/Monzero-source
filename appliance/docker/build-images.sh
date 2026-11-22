@@ -6,7 +6,7 @@
 set -euo pipefail
 VERSION=${1:?usage: build-images.sh <version>}
 HERE=$(cd "$(dirname "$0")/.." && pwd); REPO=$(cd "$HERE/.." && pwd)
-ENGINE=${ENGINE:-$(command -v docker >/dev/null && echo docker || echo podman)}
+ENGINE=${ENGINE:-$(docker info >/dev/null 2>&1 && echo docker || echo podman)}  # docker only if its daemon answers
 ROOT=${MONZERO_ROOT:-$HOME/projects/Monzero-App}
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 if [ -z "${RELAY_BIN:-}" ]; then
