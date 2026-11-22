@@ -30,7 +30,29 @@ KEY_URL=https://raw.githubusercontent.com/monero-project/monero/master/utils/gpg
 TARBALL=monero-linux-x64-$VERSION.tar.bz2
 
 # get_info has no pruning field; ask the node itself (full RPC, this machine)
-pruned_state() { curl -s -m 10 http://127.0.0.1:$1/json_rpc -d '{"jsonrpc":"2.0","id":0,"method":"prune_blockchain","params":{"check":true}}' | python3 -c 'import sys,json; print("pruned" if json.load(sys.stdin)["result"]["pruned"] else "full")' 2>/dev/null || echo unknown; }
+# Pruned or full, from eight old transactions one stripe apart: a pruned node keeps one stripe in
+# eight in full. (Never use prune_blockchain {"check":true} for this: it scans the whole database
+# and stops the node syncing for hours on mainnet.)
+pruned_state() {
+  python3 -I - "$1" <<'EOPY' 2>/dev/null || echo unknown
+import json, sys, urllib.request
+def rpc(path, body):
+    req = urllib.request.Request(f"http://127.0.0.1:{sys.argv[1]}{path}", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=30))
+top = rpc("/get_height", {})["height"]
+pruned = checked = 0
+for i in range(8):
+    for h in range(top - 100000 - i * 4096, top - 100000 - i * 4096 + 400):
+        if h < 1:
+            break
+        txs = rpc("/json_rpc", {"jsonrpc": "2.0", "id": 0, "method": "get_block", "params": {"height": h}})["result"].get("tx_hashes", [])
+        if txs:
+            checked += 1
+            pruned += bool(rpc("/get_transactions", {"txs_hashes": txs[:1]})["txs"][0].get("pruned_as_hex"))
+            break
+print("unknown" if checked < 4 else "pruned" if pruned * 2 > checked else "full")
+EOPY
+}
 
 case "$NET" in
   mainnet)  P2P=18080; RPC=18081; RRPC=18089; FLAG="" ;;
@@ -69,9 +91,8 @@ case "$NET" in
     fi
     set_flag
     systemctl start "monerod@$PNET"
-    # After the swap the node walks the whole database once more and answers no RPC meanwhile
-    # (mainnet: about an hour), so wait for the pruned answer itself, up to four hours.
-    echo "== waiting for the node to answer as pruned (mainnet: up to an hour)"
+    # Wait for the node's RPC after the swap (opening a large database can take a while).
+    echo "== waiting for the node to answer as pruned"
     STATE=unknown
     for i in $(seq 1 240); do STATE=$(pruned_state $PP); [ "$STATE" = unknown ] || break; sleep 60; done
     if [ "$STATE" = pruned ]; then
