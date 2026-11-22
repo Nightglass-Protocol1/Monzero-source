@@ -1,3 +1,51 @@
+# Monzero v1.3.8 release notes
+
+Release label: v1.3.8
+
+Monzero v1.3.8 adds **Monero (XMR) trading** to the wallet's Exchange. It changes no consensus rule:
+the chain, blocks, coins, wallets, seeds and addresses are the same as in v1.0.0 to v1.3.7, and nobody
+has to upgrade to stay on the network.
+
+## What is new
+
+- **XMR/BNB and XMR/USDT (BNB Chain)**: buy or sell Monero for BNB or for USDT (BEP-20) with an atomic
+  swap, from the same Exchange page as the XMZ markets. Both were tested with real coins on the main
+  networks before this release (22 November 2026: BNB for XMR, and XMR for USDT).
+- **A Monero wallet for trading**, run by the app with Monero's own official `monero-wallet-rpc`
+  (v0.18.5.4, unchanged, in the package). It syncs from the project's Monero node; every XMR lock must
+  also be seen by at least two independent public Monero nodes before the other side pays.
+- **XMR/XMZ** shows as one tile: it is two swaps (XMZ for BNB or USDT, then that for XMR), with a stop
+  between them.
+- XMR against ETH and SOL, and the direct coin-for-coin pairs (ETH/BNB, ETH/SOL, BNB/SOL and their USDT
+  pairs), appear as "coming soon" until their own real-funds tests are done.
+- Relays: an offer in USDT is no longer measured against the cap meant for the chain's own coin.
+
+## Before you trade
+
+- The swap programs and contracts are open source and were tested with real funds on each open
+  pair, but they have **not been independently audited**. Trade amounts you can afford to lose.
+- Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
+  or refunds after its time limit. See https://monzero.org/dex/recovery/.
+- A Monero trade takes longer than an XMZ one: the XMR lock needs 10 Monero blocks (about 20 minutes)
+  and the witnesses' confirmation. The first real-funds trades took 45 to 50 minutes.
+
+## Packaged platforms
+
+| Package | Intended compatibility scope |
+| --- | --- |
+| Linux x86-64 wallet (GUI), node and tools | 64-bit PC, glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), X11 or XWayland |
+| Windows x64 wallet (GUI, no mining), node and tools (unsigned beta) | 64-bit Windows 10 or 11 |
+
+Both packages contain Monero's `monero-wallet-rpc` v0.18.5.4 exactly as Monero publishes it (checked
+against Monero's signed hash list when packaged).
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.8 into a new folder and start it; it uses the same wallet files,
+node data and trading keys. The Monero trading wallet is made on first start.
+
+---
+
 # Monzero v1.3.7 release notes (Windows)
 
 Release label: v1.3.7 (Windows wallet, unsigned beta)

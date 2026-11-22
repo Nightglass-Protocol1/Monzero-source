@@ -6,6 +6,8 @@ set -euo pipefail
 usage() {
   echo "Usage: $0 <gui-build-bin-dir> <output-dir> <version>" >&2
   echo "Set ALLOW_DIRTY=1 only for an explicitly marked development artifact." >&2
+  echo "MONERO_RELEASE=<monero-linux-x64-vX.tar.bz2> with MONERO_HASHES=<its signed hashes.txt> bundles" >&2
+  echo "Monero's own monero-wallet-rpc (for XMR trading), byte for byte as published." >&2
   exit 2
 }
 [[ $# -eq 3 ]] || usage
@@ -86,6 +88,20 @@ install -m 0644 "$core/utils/release/linux-gui/START-HERE.txt" "$package_dir/STA
 install -m 0755 "$core/utils/release/linux-gui/install-desktop-entry.sh" "$package_dir/install-desktop-entry.sh"
 install -m 0644 "$source_root/gui/images/appicons/256x256.png" "$package_dir/monzero.png"
 
+# XMR trading: Monero's official wallet RPC, unchanged (the wallet hashes it before each start).
+# Only from an archive whose SHA-256 is in Monero's hash list (its signature checked beforehand).
+monero_rpc=none
+if [[ -n ${MONERO_RELEASE:-} ]]; then
+  hashes=${MONERO_HASHES:?MONERO_HASHES (the signed Monero hashes.txt) is needed with MONERO_RELEASE}
+  archive_sha=$(sha256sum "$MONERO_RELEASE" | cut -d' ' -f1)
+  grep -q "^$archive_sha  $(basename "$MONERO_RELEASE")$" "$hashes" || { echo "Monero archive not in the hash list: $MONERO_RELEASE" >&2; exit 1; }
+  monero_dir="$work_dir/monero"; mkdir -p "$monero_dir"
+  tar -xjf "$MONERO_RELEASE" -C "$monero_dir" --strip-components=1 --wildcards '*/monero-wallet-rpc' '*/LICENSE'
+  install -m 0755 "$monero_dir/monero-wallet-rpc" "$package_dir/monero-wallet-rpc"
+  install -m 0644 "$monero_dir/LICENSE" "$package_dir/LICENSE-MONERO"
+  monero_rpc="$(basename "$MONERO_RELEASE") sha256=$archive_sha"
+fi
+
 {
   echo "package=$package_name"
   echo "source_commit=$source_commit"
@@ -97,6 +113,7 @@ install -m 0644 "$source_root/gui/images/appicons/256x256.png" "$package_dir/mon
   echo "binary_build_reproducibility=${BINARY_BUILD_REPRODUCIBILITY:-unverified}"
   echo "assets_consensus_enabled=false"
   echo "native_ticker=XMZ"
+  echo "monero_wallet_rpc=$monero_rpc"
 } > "$package_dir/BUILD-MANIFEST.txt"
 
 (

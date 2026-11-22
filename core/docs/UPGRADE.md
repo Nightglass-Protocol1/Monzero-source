@@ -4,6 +4,13 @@ Back up wallet files, mnemonic seeds and the node data directory before
 replacing any binary. Never enter a Monero seed into Monzero or a Monzero seed
 into Monero.
 
+## v1.3.8: Monero (XMR) trading
+
+No consensus change. Close the old wallet and node, unpack v1.3.8 and start it: same wallet files,
+node data, trading keys and trading wallet. A running trade carries on. To go back, start the v1.3.7
+(Windows) or v1.3.6 (Linux) files again; a Monero trade must be finished (or refunded) first, as older
+versions do not run the Monero trading wallet.
+
 ## v1.3.7: trading starts on Windows (Windows only)
 
 No consensus change; Linux stays at v1.3.6. Close the old Windows wallet, unpack v1.3.7 into a new
