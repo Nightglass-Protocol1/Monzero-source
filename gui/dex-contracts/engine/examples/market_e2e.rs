@@ -102,7 +102,37 @@ fn bip39_seed(phrase: &str) -> [u8; 64] {
     out
 }
 
+/// SIDE=sell-xmz: the maker sells the private coin for the chain's coin (the taker locks BNB/ETH
+/// and the maker claims it); default buy-xmz: the maker locks BNB/ETH and buys the private coin
+fn sell() -> bool {
+    env("SIDE", "buy-xmz") == "sell-xmz"
+}
+
+/// PAIR=USDT-BSC/XMR: the payer locks USDT (BEP-20) instead of the chain's coin
+fn token() -> bool {
+    env("PAIR", "").starts_with("USDT")
+}
+
+/// A BEP-20 balance (USDT on BNB Smart Chain) in base units
+async fn usdt_balance(address: &str) -> u128 {
+    let data = format!("0x70a08231{:0>64}", address.trim_start_matches("0x").to_lowercase());
+    let r: Value = reqwest::Client::new()
+        .post(evm_rpc())
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [{"to": "0x55d398326f99059fF775485246999027B3197955", "data": data}, "latest"]}))
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .expect("EVM RPC")
+        .json()
+        .await
+        .expect("EVM RPC answer");
+    u128::from_str_radix(r["result"].as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0)
+}
+
 fn pair() -> String {
+    if let Ok(p) = std::env::var("PAIR") {
+        return p;
+    }
     format!("{}/{}", evm_coin(), if monero() { "XMR" } else { "XMZ" })
 }
 
@@ -220,34 +250,46 @@ impl Side {
 }
 
 /// Real funds: the owner sends the coins; wait until every side holds what it needs.
-/// Maker: the offer's coin plus gas. Taker: the XMR to sell plus its fee, and a little of the
-/// chain's coin for the claim's gas.
-async fn wait_for_funds(run: &Path, maker: &Side, taker: &Side, taker_main: &WalletRpc, xmr_address: &str) {
+/// The payer (maker, or taker with SIDE=sell-xmz): the chain's coin plus gas. The seller: the XMR
+/// to sell plus its fee, and a little of the chain's coin for the claim's gas.
+async fn wait_for_funds(run: &Path, payer: &Side, seller: &Side, seller_main: &WalletRpc, xmr_address: &str) {
     if run.join("funded").exists() {
         return;
     }
     let value: u128 = env("VALUE_WEI", "10000000000000000").parse().unwrap();
-    let maker_needs = value + env("MAKER_GAS_WEI", "1000000000000000").parse::<u128>().unwrap();
-    let taker_gas: u128 = env("TAKER_GAS_WEI", "500000000000000").parse().unwrap();
+    let payer_gas: u128 = env("MAKER_GAS_WEI", "1000000000000000").parse().unwrap();
+    // The payer's coin: the chain's own (value plus gas), or USDT (value) and the chain's coin for gas
+    let payer_needs = if token() { payer_gas } else { value + payer_gas };
+    let seller_gas: u128 = env("TAKER_GAS_WEI", "500000000000000").parse().unwrap();
     let atoms: u64 = xmz_atoms().parse().unwrap();
     let xmr_needs = atoms + env("XMR_FEE_ATOMS", "1000000000").parse::<u64>().unwrap();
     let coin = evm_coin();
     let show = |wei: u128| format!("{:.6} {coin}", wei as f64 / 1e18);
     let showx = |a: u64| format!("{:.6} XMR", a as f64 / 1e12);
     println!("\n== Send the test coins (only these amounts or a little more):");
-    println!("   {} to the maker (pays for XMR):     {}", show(maker_needs), maker.address);
-    println!("   {} to the taker (claim gas):        {}", show(taker_gas), taker.address);
-    println!("   {} to the taker's XMR wallet:      {xmr_address}", showx(xmr_needs));
+    let (p, s) = (payer.name, seller.name);
+    if token() {
+        println!("   {:.6} USDT (BEP20) to the {p} (pays for XMR): {}", value as f64 / 1e18, payer.address);
+        println!("   {} to the {p} (gas):           {}", show(payer_needs), payer.address);
+    } else {
+        println!("   {} to the {p} (pays for XMR):     {}", show(payer_needs), payer.address);
+    }
+    println!("   {} to the {s} (claim gas):        {}", show(seller_gas), seller.address);
+    println!("   {} to the {s}'s XMR wallet:      {xmr_address}", showx(xmr_needs));
     println!("   on BNB Smart Chain (BEP20) for {coin}; XMR needs 10 blocks (~20 min) before it can be spent.\n");
     for round in 0u64.. {
-        let _ = taker_main.call("refresh", json!({})).await;
-        let b = taker_main.call("get_balance", json!({"account_index": 0})).await.unwrap_or(json!({}));
+        let _ = seller_main.call("refresh", json!({})).await;
+        let b = seller_main.call("get_balance", json!({"account_index": 0})).await.unwrap_or(json!({}));
         let (total, unlocked) = (b["balance"].as_u64().unwrap_or(0), b["unlocked_balance"].as_u64().unwrap_or(0));
-        let (m, t) = (evm_balance(&maker.address).await, evm_balance(&taker.address).await);
-        let ready = m >= maker_needs && t >= taker_gas && unlocked >= xmr_needs;
+        let (m, t) = (evm_balance(&payer.address).await, evm_balance(&seller.address).await);
+        let usdt = if token() { usdt_balance(&payer.address).await } else { 0 };
+        let ready = m >= payer_needs && t >= seller_gas && unlocked >= xmr_needs && (!token() || usdt >= value);
         if ready || round % 4 == 0 {
-            log(format!("maker {} / {}, taker {} / {}, taker XMR {} spendable ({} arrived) / {}",
-                show(m), show(maker_needs), show(t), show(taker_gas), showx(unlocked), showx(total), showx(xmr_needs)));
+            if token() {
+                log(format!("{p} USDT {:.6} / {:.6}", usdt as f64 / 1e18, value as f64 / 1e18));
+            }
+            log(format!("{p} {} / {}, {s} {} / {}, {s} XMR {} spendable ({} arrived) / {}",
+                show(m), show(payer_needs), show(t), show(seller_gas), showx(unlocked), showx(total), showx(xmr_needs)));
         }
         if ready {
             std::fs::write(run.join("funded"), "owner funded\n").unwrap();
@@ -264,13 +306,15 @@ async fn main() {
     let home = env("HOME", "/root");
     let accounts: Value = serde_json::from_str(&std::fs::read_to_string(env("ACCOUNTS_FILE", &format!("{home}/.config/monzero-dex/eth-sepolia-accounts.json"))).unwrap()).unwrap();
     let seed = bip39_seed(accounts["mnemonic"].as_str().unwrap());
-    let (maker, _) = Side::new("maker", &run, &seed, env("OWNER_INDEX", "1").parse().unwrap()).await;
+    let (maker, maker_main) = Side::new("maker", &run, &seed, env("OWNER_INDEX", "1").parse().unwrap()).await;
     let (taker, taker_main) = Side::new("taker", &run, &seed, env("CLAIMER_INDEX", "0").parse().unwrap()).await;
+    // Who locks the chain's coin (payer) and who sells the private coin and claims (seller)
+    let (payer, seller, seller_main) = if sell() { (&taker, &maker, &maker_main) } else { (&maker, &taker, &taker_main) };
 
-    // The taker sells XMZ: fund its wallet from the testnet funder
-    let address = taker_main.call("get_address", json!({})).await.unwrap()["address"].as_str().unwrap().to_string();
+    // The seller's wallet holds the private coin: the owner's, or from the testnet funder
+    let address = seller_main.call("get_address", json!({})).await.unwrap()["address"].as_str().unwrap().to_string();
     if env("FUNDER_RPC", "") == "none" {
-        wait_for_funds(&run, &maker, &taker, &taker_main, &address).await;
+        wait_for_funds(&run, payer, seller, seller_main, &address).await;
     }
     let funder = WalletRpc::new(&format!("http://{}", env("FUNDER_RPC", "127.0.0.1:16183")), None);
     if env("FUNDER_RPC", "") != "none" && !run.join("funded").exists() {
@@ -278,16 +322,20 @@ async fn main() {
         let amount: u64 = env("FUND_ATOMS", &(2 * xmz_atoms().parse::<u64>().unwrap()).to_string()).parse().unwrap();
         let r = funder.call("transfer", json!({"destinations": [{"amount": amount, "address": address}], "ring_size": 16})).await.unwrap();
         std::fs::write(run.join("funded"), r.to_string()).unwrap();
-        log(format!("taker funded {amount} atoms: {}", r["tx_hash"]));
+        log(format!("{} funded {amount} atoms: {}", seller.name, r["tx_hash"]));
     }
 
-    // 1. The maker posts a buy-XMZ offer
+    // 1. The maker posts its offer (buy-xmz, or sell-xmz)
     let posted = if maker.dir.join("listing.json").exists() {
         json!({"ok": true})
     } else {
-        let mut offer = json!({"offer": {"chainId": chain_id(), "side": "buy-xmz", "valueWei": env("VALUE_WEI", "10000000000000000"), "xmzAtoms": xmz_atoms(), "lifetimeSecs": 6 * 3600}});
+        let mut offer = json!({"offer": {"chainId": chain_id(), "side": if sell() { "sell-xmz" } else { "buy-xmz" }, "valueWei": env("VALUE_WEI", "10000000000000000"), "xmzAtoms": xmz_atoms(), "lifetimeSecs": 6 * 3600}});
         if monero() {
             offer["offer"]["coin"] = json!("xmr");
+        }
+        // A token pair names itself; the chain's own coin is the offer's default
+        if token() {
+            offer["offer"]["pair"] = json!(pair());
         }
         maker.call("post", offer).await
     };
@@ -376,8 +424,8 @@ async fn main() {
     }
 
     // 5. The claimer reports its claim; the relay records it once final and charts it
-    let r = taker.call("report", json!({})).await;
-    log(format!("taker reported: {r}"));
+    let r = seller.call("report", json!({})).await;
+    log(format!("{} reported: {r}", seller.name));
     let relay = env("RELAY", "http://127.0.0.1:18790");
     let client = reqwest::Client::new();
     for _ in 0..180 {

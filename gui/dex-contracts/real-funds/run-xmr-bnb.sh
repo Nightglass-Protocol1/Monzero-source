@@ -10,17 +10,33 @@
 # any point: run the same command again and the trade carries on where it was.
 #   Maker (account 0): pays BNB_AMOUNT, receives XMR into its own Monero wallet
 #   Taker (account 1): sells XMR_AMOUNT from its Monero wallet, receives BNB
+#
+# Other runs with the same accounts (each in its own WORK folder):
+#   SIDE=sell-xmz   the maker's offer sells XMR (the maker holds the XMR and claims; the taker pays)
+#   USDT_AMOUNT=23  pair USDT-BSC/XMR: the payer locks USDT (BEP-20, at most 60) instead of BNB
+#   XMR_WALLET_FROM=<wallet file>  start the seller's Monero wallet as a copy of an earlier run's
+#                   (e.g. ~/dex-real/xmr-bnb-1/run/maker/main/maker), so its XMR need not be sent again
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); ENGINE=$HERE/../engine
 ROOT=${MONZERO_ROOT:-$HOME/projects/Monzero-App}
 MONERO_DIR=${MONERO_DIR:-$ROOT/core/build/monero-official}
-WORK=${WORK:-$HOME/dex-real/xmr-bnb-1}
+SIDE=${SIDE:-buy-xmz}
+case $SIDE in buy-xmz|sell-xmz) ;; *) echo "!! SIDE is buy-xmz or sell-xmz"; exit 1;; esac
+if [ -n "${USDT_AMOUNT:-}" ]; then PAIR=USDT-BSC/XMR; COINWORD=usdt; else PAIR=BNB/XMR; COINWORD=bnb; fi
+WORK=${WORK:-$HOME/dex-real/xmr-$COINWORD-$([ "$SIDE" = buy-xmz ] && echo 1 || echo sell-1)}
 ACCOUNTS_FILE=${ACCOUNTS_FILE:-$HOME/.config/monzero-dex/xmr-bnb-mainnet-accounts.json}
 RELAY_PORT=18797
-: "${BNB_AMOUNT:?set BNB_AMOUNT (BNB the maker pays), e.g. 0.03}"
-: "${XMR_AMOUNT:?set XMR_AMOUNT (XMR the taker sells), e.g. 0.06}"
-# A ceiling for this test (both are about 60 GBP at November 2026 prices): a typo cannot send more
-VALUE_WEI=$(python3 -c "from decimal import Decimal as D; v=D('$BNB_AMOUNT'); assert 0 < v <= D('0.1'), 'BNB_AMOUNT must be above 0 and at most 0.1'; print(int(v*10**18))")
+: "${XMR_AMOUNT:?set XMR_AMOUNT (XMR the seller sells), e.g. 0.06}"
+# A ceiling for this test (each about 50-60 GBP at November 2026 prices): a typo cannot send more
+if [ "$PAIR" = BNB/XMR ]; then
+  : "${BNB_AMOUNT:?set BNB_AMOUNT (BNB the payer pays), e.g. 0.03, or USDT_AMOUNT}"
+  VALUE_WEI=$(python3 -c "from decimal import Decimal as D; v=D('$BNB_AMOUNT'); assert 0 < v <= D('0.1'), 'BNB_AMOUNT must be above 0 and at most 0.1'; print(int(v*10**18))")
+  MAX_VALUE=100000000000000000
+else
+  # BSC-USD has 18 decimals, as BNB
+  VALUE_WEI=$(python3 -c "from decimal import Decimal as D; v=D('$USDT_AMOUNT'); assert 0 < v <= D('60'), 'USDT_AMOUNT must be above 0 and at most 60'; print(int(v*10**18))")
+  MAX_VALUE=60000000000000000000
+fi
 ATOMS=$(python3 -c "from decimal import Decimal as D; v=D('$XMR_AMOUNT'); assert 0 < v <= D('0.3'), 'XMR_AMOUNT must be above 0 and at most 0.3'; print(int(v*10**12))")
 
 T=$ROOT/core/build/dex-rust-toolchain-1.95.0/sysroot/usr
@@ -38,6 +54,14 @@ else
   echo "   $ACCOUNTS_FILE"
 fi
 mkdir -p "$WORK"; chmod 700 "$WORK"
+SELLER=$([ "$SIDE" = sell-xmz ] && echo maker || echo taker)
+if [ -n "${XMR_WALLET_FROM:-}" ] && [ ! -f "$WORK/run/$SELLER/main/$SELLER.keys" ]; then
+  [ -f "$XMR_WALLET_FROM.keys" ] || { echo "!! no wallet at $XMR_WALLET_FROM"; exit 1; }
+  pgrep -f "wallet-dir $(dirname "$XMR_WALLET_FROM")" >/dev/null && { echo "!! that wallet is open in another run"; exit 1; }
+  mkdir -p "$WORK/run/$SELLER/main"
+  cp "$XMR_WALLET_FROM" "$WORK/run/$SELLER/main/$SELLER"; cp "$XMR_WALLET_FROM.keys" "$WORK/run/$SELLER/main/$SELLER.keys"
+  echo "   the $SELLER's XMR wallet: a copy of $XMR_WALLET_FROM (use only this copy from now on)"
+fi
 
 echo "== Monero nodes"
 info() { curl -s -m 10 "$1/get_info" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['nettype']=='mainnet' and d['synchronized']; print(d['height'])" 2>/dev/null; }
@@ -60,30 +84,30 @@ for n in https://node.monerodevs.org:18089 https://monero.stackwallet.com:18081 
 done
 [ "$(echo "$WITNESSES" | tr ',' '\n' | grep -c .)" -ge 2 ] || { echo "!! fewer than 2 witness nodes answer; try later"; exit 1; }
 
-echo "== local relay (BNB Smart Chain, XMR offers on mainnet accepted: this test only)"
+echo "== local relay (BNB Smart Chain, $PAIR, XMR offers on mainnet accepted: this test only)"
 mkdir -p "$WORK/relay-data"
 cat > "$WORK/relay.json" <<J
 {"listen": "127.0.0.1:$RELAY_PORT", "dataDir": "$WORK/relay-data", "xmrMainnet": true,
- "chains": [{"chainId": 56, "rpc": "https://bsc-rpc.publicnode.com", "contract": "0x9073290952DCDF3225D8f65d787cF9148a490feb", "maxValueWei": "100000000000000000"}]}
+ "chains": [{"chainId": 56, "rpc": "https://bsc-rpc.publicnode.com", "contract": "0x9073290952DCDF3225D8f65d787cF9148a490feb", "maxValueWei": "$MAX_VALUE"}]}
 J
 ( cd "$HERE/../relay" && cargo build --offline --release 2>&1 | tail -1 )
 ( cd "$ENGINE" && cargo build --offline --release --example market_e2e 2>&1 | tail -1 )
 systemctl --user stop dex-xmr-bnb-relay 2>/dev/null || true
 trap 'systemctl --user stop dex-xmr-bnb-relay 2>/dev/null || true' EXIT
 systemd-run --user --quiet --unit=dex-xmr-bnb-relay --collect "$HERE/../relay/target/release/monzero-dex-relay" "$WORK/relay.json"
-for _ in $(seq 1 30); do curl -s -m 2 "http://127.0.0.1:$RELAY_PORT/v1/info" | grep -q 'BNB/XMR' && break; sleep 1; done
-curl -s -m 5 "http://127.0.0.1:$RELAY_PORT/v1/info" | grep -q 'BNB/XMR' || { echo "!! the relay did not come up with the BNB/XMR pair"; exit 1; }
+for _ in $(seq 1 30); do curl -s -m 2 "http://127.0.0.1:$RELAY_PORT/v1/info" | grep -qF "$PAIR" && break; sleep 1; done
+curl -s -m 5 "http://127.0.0.1:$RELAY_PORT/v1/info" | grep -qF "$PAIR" || { echo "!! the relay did not come up with the $PAIR pair"; exit 1; }
 
-echo "== the trade: $BNB_AMOUNT BNB for $XMR_AMOUNT XMR (allow 1-2 hours once funded)"
+echo "== the trade ($SIDE, $PAIR): ${BNB_AMOUNT:-${USDT_AMOUNT:-}} ${PAIR%%/*} for $XMR_AMOUNT XMR (allow 1-2 hours once funded)"
 mkdir -p "$WORK/run"
 code=0
-NET=mainnet COIN=xmr CHAIN_ID=56 FUNDER_RPC=none OWNER_INDEX=0 CLAIMER_INDEX=1 \
+NET=mainnet COIN=xmr CHAIN_ID=56 SIDE=$SIDE PAIR=$PAIR FUNDER_RPC=none OWNER_INDEX=0 CLAIMER_INDEX=1 \
   ACCOUNTS_FILE=$ACCOUNTS_FILE RELAY=http://127.0.0.1:$RELAY_PORT \
   XMZ_NODE=$WALLET_NODE TRUSTED_DAEMON=$TRUSTED WITNESSES=$WITNESSES \
   WALLET_RPC_BIN=$MONERO_DIR/linux-x64/monero-wallet-rpc VALUE_WEI=$VALUE_WEI XMZ_ATOMS=$ATOMS \
   "$ENGINE/target/release/examples/market_e2e" "$WORK/run" 2>&1 | tee -a "$WORK/run.log" || code=${PIPESTATUS[0]}
 case $code in
-  0) echo "== PASSED. The maker's XMR is in $WORK/run/maker/main, the taker's BNB on account 1." ;;
+  0) echo "== PASSED. The XMR bought is in $WORK/run/$([ "$SIDE" = sell-xmz ] && echo taker || echo maker)/main; the ${PAIR%%/*} went to account $([ "$SIDE" = sell-xmz ] && echo 0 || echo 1)." ;;
   3) echo "== NO SWAP: the trade ended by refund or abort; every coin went back to its sender. Send run.log to Claude." ;;
   *) echo "== stopped ($code). Run the same command again to carry on; send run.log to Claude if it repeats." ;;
 esac
