@@ -141,7 +141,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Strict-Transport-Security", "max-age=31536000")
         for k, v in headers:
@@ -164,9 +164,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return urllib.parse.parse_qs(self.rfile.read(n).decode(), keep_blank_values=True)
 
     def same_origin(self):
+        # A browser form post carries Origin (this page sends Referrer-Policy: same-origin, so
+        # browsers give the real origin here; with no-referrer they send "null"). A "null" origin
+        # counts only if the browser itself marks the request same-origin (Sec-Fetch-Site).
         origin = self.headers.get("Origin")
         host = self.headers.get("Host", "")
-        return origin is None or urllib.parse.urlparse(origin).netloc == host
+        if origin is None:
+            return True
+        if origin == "null":
+            return self.headers.get("Sec-Fetch-Site") == "same-origin"
+        return urllib.parse.urlparse(origin).netloc == host
 
     BRAND = {"/brand/wordmark.png": "wordmark-600.png", "/favicon.png": "favicon-32.png", "/favicon.ico": "favicon-32.png"}
 

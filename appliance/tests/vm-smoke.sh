@@ -32,6 +32,10 @@ shot() { [ -n "${SCREENSHOT:-}" ] && python3 -c "import socket,sys,time; s=socke
 check "setup page serves the Monzero artwork" "curl -sk -o $S/wordmark.png -w '%{http_code} %{content_type} %{size_download}' $U/brand/wordmark.png | grep -qE '^200 image/png [0-9]{4,}'"
 check "setup page is branded" "curl -sk $U/ | grep -q 'brand/wordmark.png'"
 echo "== setup"
+check "browser form post accepted (real Origin)" "curl -sk -H 'Origin: $U' $U/setup --data-urlencode code=AAAA-BBBB-CCCC -d pw=correcthorsebattery -d pw2=correcthorsebattery | grep -q 'not right'"
+check "browser form post accepted (Origin null, same-origin)" "curl -sk -H 'Origin: null' -H 'Sec-Fetch-Site: same-origin' $U/setup --data-urlencode code=AAAA-BBBB-CCCC -d pw=correcthorsebattery -d pw2=correcthorsebattery | grep -q 'not right'"
+check "post from another site refused" "curl -sk -H 'Origin: https://evil.example' $U/setup --data-urlencode code=AAAA-BBBB-CCCC -d pw=x -d pw2=x | grep -q 'other site'"
+check "Origin null without same-origin mark refused" "curl -sk -H 'Origin: null' -H 'Sec-Fetch-Site: cross-site' $U/setup --data-urlencode code=AAAA-BBBB-CCCC -d pw=x -d pw2=x | grep -q 'other site'"
 check "wrong code refused" "curl -sk $U/setup --data-urlencode code=AAAA-BBBB-CCCC -d pw=correcthorsebattery -d pw2=correcthorsebattery | grep -q 'not right'"
 ssh-keygen -q -t ed25519 -N '' -f "$S/key" -C smoke
 code=$(curl -sk -c "$J" -b "$J" -o /dev/null -w '%{http_code}' $U/setup --data-urlencode code="$CODE" -d pw=correcthorsebattery -d pw2=correcthorsebattery -d role=node -d role=relay -d share=1 --data-urlencode "sshkey=$(cat "$S/key.pub")")
