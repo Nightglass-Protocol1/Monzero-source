@@ -1,0 +1,19 @@
+#!/bin/sh
+# The Monzero desktop on an X screen that is already running ($DISPLAY): window manager, wallpaper
+# and icons, the panel, then the wallet. Used by the box's screen (session) and the Docker image.
+L=/usr/local/lib/monzero-wallet
+CONF="$HOME/.config/monzero-project/monzero-core.conf"
+if [ ! -f "$CONF" ]; then   # first start: no "desktop shortcut" question (the desktop has one)
+  mkdir -p "$(dirname "$CONF")"
+  printf '[General]\naskDesktopShortcut=false\n' > "$CONF"
+fi
+$L/personalise --setup
+hsetroot -cover /usr/share/monzero/branding/wallpaper-1920x1080.jpg 2>/dev/null || true   # until the desktop draws
+openbox --config-file $L/openbox-rc.xml &
+# the window manager first, or windows open before it and miss its rules
+i=0; while [ $i -lt 50 ] && ! wmctrl -m >/dev/null 2>&1; do sleep 0.1; i=$((i + 1)); done
+pcmanfm --desktop --profile default &
+tint2 -c "$HOME/.config/tint2/tint2rc" &
+$L/maximize-new &
+$L/wallet &
+wait

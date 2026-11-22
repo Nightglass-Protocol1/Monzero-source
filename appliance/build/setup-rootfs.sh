@@ -15,7 +15,7 @@ PKGS=(systemd-sysv systemd-timesyncd systemd-resolved dbus sudo openssh-server c
       nftables unattended-upgrades apt-listchanges cloud-guest-utils e2fsprogs openssl
       apparmor apparmor-utils apparmor-profiles
       wireguard-tools tor miniupnpc
-      xserver-xorg-core xserver-xorg-input-libinput xinit openbox wmctrl x11-utils x11-xserver-utils
+      xserver-xorg-core xserver-xorg-input-libinput xinit openbox wmctrl x11-utils tint2 pcmanfm python3-tk python3-pil.imagetk x11-xserver-utils
       libgl1 libegl1 libgl1-mesa-dri libglib2.0-0t64 libx11-xcb1 libxcb1 libxcb-glx0 libxcb-icccm4
       libxcb-image0 libxcb-shm0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-render0
       libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 libxkbcommon-x11-0 libxkbcommon0 libudev1
@@ -44,7 +44,8 @@ passwd -l root >/dev/null
 echo "== files"
 cp -a "$OVERLAY"/. /
 chown -R root:root /etc /usr/local /usr/share/monzero
-chmod 755 /usr/local/sbin/* /usr/local/lib/monzero-wallet/session /usr/local/lib/monzero-wallet/keep-maximized
+chmod 755 /usr/local/sbin/*
+chmod 755 /usr/local/lib/monzero-wallet/{session,desktop,wallet,personalise,about,maximize-new}
 gpg --dearmor < /usr/share/monzero/release-public.asc > /usr/share/monzero/release-keyring.gpg 2>/dev/null \
   || python3 -I - <<'PY'
 # gpgv reads an armored export too once dearmored; without gpg, strip the armor by hand

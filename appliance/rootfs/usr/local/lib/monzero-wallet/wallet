@@ -1,0 +1,9 @@
+#!/bin/sh
+# Open the wallet, or bring it to the front (also out of the panel) if it is already open.
+if wmctrl -l -x 2>/dev/null | awk '{print $3}' | grep -q '^monzero-wallet-gui\.'; then
+  exec wmctrl -x -a monzero-wallet-gui
+fi
+for GUI in /opt/monzero/current/monzero-wallet-gui /opt/monzero/monzero-wallet-gui; do
+  [ -x "$GUI" ] && exec flock -n /tmp/monzero-wallet-gui.lock "$GUI"
+done
+echo "the wallet is not installed" >&2; exit 1

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Open each new wallet window filling the screen (above or below the panel): the wallet sets its
+# own size while it starts. Only during its first 10 seconds, so a window the user made smaller or
+# minimized afterwards stays that way (the panel brings it back).
+seen=" "
+while sleep 1; do
+  for w in $(wmctrl -l -x 2>/dev/null | awk '$3 ~ /^monzero-wallet-gui\./ {print $1}'); do
+    case "$seen" in *" $w "*) continue ;; esac
+    seen="$seen$w "
+    ( for i in 1 2 3 4 5; do wmctrl -i -r "$w" -b add,maximized_vert,maximized_horz 2>/dev/null; sleep 2; done ) &
+  done
+done

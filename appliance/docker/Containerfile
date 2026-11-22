@@ -46,18 +46,18 @@ ARG MONZERO_VERSION
 LABEL org.opencontainers.image.title="Monzero wallet + DEX (browser screen)" org.opencontainers.image.vendor="Monzero" org.opencontainers.image.url="https://monzero.org" org.opencontainers.image.source="https://github.com/Nightglass-Protocol1/Monzero-source" org.opencontainers.image.documentation="https://monzero.org/download/" org.opencontainers.image.version=$MONZERO_VERSION org.monzero.version=$MONZERO_VERSION
 USER root
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-      xvfb openbox wmctrl x11-utils x11vnc novnc python3-websockify openssl x11-xserver-utils hsetroot fonts-dejavu-core fonts-wqy-microhei \
+      xvfb openbox wmctrl x11-utils tint2 pcmanfm python3-tk python3-pil python3-pil.imagetk util-linux x11vnc novnc python3-websockify openssl x11-xserver-utils hsetroot fonts-dejavu-core fonts-wqy-microhei \
       libgl1 libegl1 libgl1-mesa-dri libglib2.0-0t64 libx11-xcb1 libxcb1 libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-shm0 \
       libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-render0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
       libxkbcommon-x11-0 libxkbcommon0 libpcre2-8-0 >/dev/null \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=release /monzero /opt/monzero
 COPY docker/wallet-entry.sh /usr/local/bin/wallet-entry
-COPY rootfs/usr/local/lib/monzero-wallet/openbox-rc.xml /usr/local/lib/monzero-wallet/openbox-rc.xml
-COPY --chmod=755 rootfs/usr/local/lib/monzero-wallet/keep-maximized /usr/local/lib/monzero-wallet/keep-maximized
+COPY rootfs/usr/local/lib/monzero-wallet /usr/local/lib/monzero-wallet
 COPY rootfs/usr/share/monzero/branding /usr/share/monzero/branding
+COPY rootfs/usr/share/monzero/wallpapers /usr/share/monzero/wallpapers
 USER monzero
-ENV HOME=/home/monzero
+ENV HOME=/home/monzero MONZERO_VERSION=$MONZERO_VERSION
 VOLUME /home/monzero
 EXPOSE 6080
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/wallet-entry"]

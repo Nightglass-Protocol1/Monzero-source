@@ -1,0 +1,123 @@
+#!/usr/bin/python3 -I
+"""About this box: version, where to manage it from, node and relay status (refreshed every 10 s)."""
+import json, os, socket, threading, tkinter as tk, urllib.request
+from pathlib import Path
+
+ICONS = "/usr/share/monzero/branding/icons"
+ACCENTS = {"cyan": "#19d6e6", "emerald": "#2fd57a", "violet": "#9b7bff", "amber": "#ffb020", "rose": "#ff5c8a"}
+MODES = {"dark": ("#0b1418", "#13222a", "#e8eef2", "#8a9aa3"), "light": ("#eef3f6", "#ffffff", "#10181c", "#5b6b73")}
+
+
+def settings():
+    try:
+        return json.loads((Path.home() / ".config/monzero-desktop/settings.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def get(url, data=None):
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=3))
+
+
+def address():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))   # no packet is sent
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return None
+
+
+def version():
+    for p in ("/opt/monzero/current", "/opt/monzero"):
+        v = os.path.basename(os.path.realpath(p))
+        if v.startswith("v") or v[:1].isdigit():
+            return v.lstrip("v")
+    return os.environ.get("MONZERO_VERSION", "")
+
+
+def status():
+    rows = []
+    box = os.path.exists("/etc/monzero/appliance.json")
+    if box:
+        ip = address()
+        rows.append(("Manage this box", f"https://{ip}:8443  (from a browser on your network)" if ip else "no network yet"))
+    try:
+        i = get("http://127.0.0.1:6175/get_info", b"{}")
+        peers = i.get("outgoing_connections_count", 0) + i.get("incoming_connections_count", 0)
+        if i.get("synchronized"):
+            rows.append(("Node", f"synced  ·  block {i['height']:,}  ·  {peers} peers"))
+        else:
+            target = max(i.get("target_height") or 0, i["height"])
+            rows.append(("Node", f"syncing  ·  block {i['height']:,} of {target:,}  ·  {peers} peers"))
+    except Exception:
+        rows.append(("Node", "not running on this box" if box else "not reachable"))
+    try:
+        r = get("http://127.0.0.1:8790/v1/info")
+        rows.append(("DEX relay", f"running  ·  pairs {', '.join(sorted({p for c in r.get('chains', []) for p in c.get('pairs', [])}))}"))
+    except Exception:
+        if box:
+            rows.append(("DEX relay", "off (turn it on in the box's settings page)"))
+    return rows
+
+
+def main():
+    s = settings()
+    acc = ACCENTS.get(s.get("accent"), ACCENTS["cyan"])
+    bg, surf, fg, dim = MODES.get(s.get("mode"), MODES["dark"])
+    root = tk.Tk(className="monzero-about")
+    root.title("About this box")
+    root.configure(bg=bg)
+    try:
+        logo = tk.PhotoImage(file=f"{ICONS}/wallet.png")
+        root.iconphoto(True, tk.PhotoImage(file=f"{ICONS}/about.png"))
+    except tk.TclError:
+        logo = None
+    F = lambda size=10, bold=False: ("DejaVu Sans", size, "bold" if bold else "normal")
+    head = tk.Frame(root, bg=bg, padx=24, pady=20)
+    head.pack(fill="x")
+    if logo:
+        tk.Label(head, image=logo, bg=bg).pack(side="left", padx=(0, 18))
+    t = tk.Frame(head, bg=bg)
+    t.pack(side="left")
+    tk.Label(t, text="Monzero Box", bg=bg, fg=fg, font=F(18, True), anchor="w").pack(fill="x")
+    v = version()
+    tk.Label(t, text=f"Monzero {v}" if v else "Monzero", bg=bg, fg=acc, font=F(11), anchor="w").pack(fill="x")
+    tk.Label(t, text="monzero.org", bg=bg, fg=dim, font=F(9), anchor="w").pack(fill="x")
+    table = tk.Frame(root, bg=surf, padx=20, pady=14)
+    table.pack(fill="both", expand=True, padx=24, pady=(0, 14))
+    foot = tk.Frame(root, bg=bg, padx=24, pady=(0))
+    foot.pack(fill="x", pady=(0, 18))
+    tk.Label(foot, text="Updated every 10 seconds", bg=bg, fg=dim, font=F(9)).pack(side="left")
+    done = tk.Label(foot, text="Close", bg=acc, fg=bg, font=F(10, True), padx=22, pady=6, cursor="hand2")
+    done.pack(side="right")
+    done.bind("<Button-1>", lambda e: root.destroy())
+
+    def show(rows):
+        for w in table.winfo_children():
+            w.destroy()
+        for r, (k, val) in enumerate(rows):
+            tk.Label(table, text=k, bg=surf, fg=dim, font=F(10), anchor="w").grid(row=r, column=0, sticky="w", pady=5, padx=(0, 22))
+            tk.Label(table, text=val, bg=surf, fg=fg, font=F(10, True), anchor="w").grid(row=r, column=1, sticky="w", pady=5)
+
+    def refresh():
+        def work():
+            rows = status()
+            root.after(0, lambda: show(rows))
+        threading.Thread(target=work, daemon=True).start()
+        root.after(10_000, refresh)
+
+    show([("Status", "checking…")])
+    refresh()
+    root.minsize(620, 0)
+    root.update_idletasks()
+    w, h = max(620, root.winfo_reqwidth()), root.winfo_reqheight() + 60
+    root.geometry(f"+{max(0, (root.winfo_screenwidth() - w) // 2)}+{max(0, (root.winfo_screenheight() - h) // 3)}")
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
