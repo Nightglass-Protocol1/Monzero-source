@@ -415,7 +415,12 @@ impl Announcer {
             let r = client.post(format!("{}/v1/relays/announce", hub.trim_end_matches('/'))).json(&a).send().await;
             results.push(match r {
                 Ok(resp) if resp.status().is_success() => format!("{hub}: listed as {url}"),
-                Ok(resp) => format!("{hub}: {}", resp.text().await.unwrap_or_default()),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    // 404/405: that hub does not take announcements yet (not upgraded)
+                    format!("{hub}: HTTP {} {}", status.as_u16(), text.chars().take(200).collect::<String>())
+                }
                 Err(e) => format!("{hub}: {e}"),
             });
         }
