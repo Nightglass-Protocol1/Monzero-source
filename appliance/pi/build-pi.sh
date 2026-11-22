@@ -23,7 +23,10 @@ W=$(mktemp -d); trap 'podman unshare rm -rf "$W"' EXIT
 
 podman run --rm --platform linux/arm64 docker.io/library/debian:trixie true 2>/dev/null \
   || { echo "!! no arm64 emulation for containers on this PC (install qemu-user-static + binfmt)"; exit 1; }
-[ -n "${RELAY_BIN_ARM64:-}" ] || echo "note: RELAY_BIN_ARM64 not set: the image gets no relay until a signed relay release exists"
+if [ -z "${RELAY_BIN_ARM64:-}" ]; then
+  . "$HERE/build/relay.sh"
+  RELAY_BIN_ARM64=$(build_relay_arm64 "$REPO" "$ROOT" | tail -1)
+fi
 
 echo "== 1. Raspberry Pi OS image"
 # Check it against the published SHA-256 if one is next to it (<img>.sha256), as downloaded from raspberrypi.com

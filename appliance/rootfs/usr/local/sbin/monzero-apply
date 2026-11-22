@@ -42,6 +42,8 @@ def is_docker():
 
 
 def apply_roles(roles):
+    if "wallet" in roles and not os.path.exists("/opt/monzero/current/monzero-wallet-gui"):
+        roles.remove("wallet")   # no wallet app in this machine's release yet
     for role, units in ROLES.items():
         for u in units:
             if role in roles:

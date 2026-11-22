@@ -121,7 +121,9 @@ def role_boxes(selected):
     names = {"node": "XMZ node: helps the network; your wallet uses it",
              "relay": "DEX relay: carries signed offers for the DEX; holds no funds",
              "wallet": "Wallet + DEX app: on this box's screen (or the remote screen)"}
-    return "".join(f'<label><input type="checkbox" name="role" value="{r}"{" checked" if r in selected else ""}> {html.escape(names[r])}</label>' for r in ROLES)
+    # The wallet role only where the installed release has the wallet app (64-bit ARM: later)
+    roles = [r for r in ROLES if r != "wallet" or os.path.exists("/opt/monzero/current/monzero-wallet-gui")]
+    return "".join(f'<label><input type="checkbox" name="role" value="{r}"{" checked" if r in selected else ""}> {html.escape(names[r])}</label>' for r in roles)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):

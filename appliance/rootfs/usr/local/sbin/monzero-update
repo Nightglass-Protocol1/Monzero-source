@@ -40,8 +40,10 @@ MAX_DOWNLOAD = 400 * 1024 * 1024
 ARCH = {"x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(platform.machine(), platform.machine())
 # What this box installs from a release: the node+wallet bundle, and the relay when the release has one
 PARTS = {
-    "core": {"platform": f"linux-{ARCH}-gui", "dir": ROOT, "services": ["monzerod"], "health": "node"},
-    "relay": {"platform": f"linux-{ARCH}-relay", "dir": f"{ROOT}/relay", "services": ["monzero-dex-relay"], "health": "relay"},
+    # The node+wallet bundle; where a release has no wallet app for this machine yet (64-bit
+    # ARM at first), the node-only bundle
+    "core": {"platforms": [f"linux-{ARCH}-gui", f"linux-{ARCH}-node"], "dir": ROOT, "services": ["monzerod"], "health": "node"},
+    "relay": {"platforms": [f"linux-{ARCH}-relay"], "dir": f"{ROOT}/relay", "services": ["monzero-dex-relay"], "health": "relay"},
 }
 
 
@@ -180,9 +182,9 @@ def prune(base, keep_version):
 
 def install_part(part, d, version):
     spec = PARTS[part]
-    arts = [a for a in d.get("artifacts", []) if a.get("platform") == spec["platform"]]
+    arts = [a for p in spec["platforms"] for a in d.get("artifacts", []) if a.get("platform") == p]
     if not arts:
-        return f"{part}: no {spec['platform']} artifact in v{version}"
+        return f"{part}: no {' / '.join(spec['platforms'])} artifact in v{version}"
     have = installed(part)
     if have and version_key(version) <= version_key(have):
         return f"{part}: {have} installed"
