@@ -12,7 +12,8 @@ S=$(mktemp -d); trap 'kill $(cat $S/vm.pid 2>/dev/null) 2>/dev/null; rm -rf "$S"
 PASS=0; FAIL=0
 ok() { echo "  ok   $1"; PASS=$((PASS+1)); }
 no() { echo "  FAIL $1"; FAIL=$((FAIL+1)); }
-check() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else no "$1"; fi; }
+# (no pipefail inside a check: "curl | grep -q" stops reading at the first match and curl then exits 23)
+check() { if (set +o pipefail; eval "$2") >/dev/null 2>&1; then ok "$1"; else no "$1"; fi; }
 
 cp "$IMG" "$S/disk.qcow2"; cp "$OVMF/OVMF_VARS.4m.fd" "$S/vars.fd"
 qemu-system-x86_64 -enable-kvm -m 4096 -smp 2 -machine q35 \
@@ -32,7 +33,7 @@ shot() { [ -n "${SCREENSHOT:-}" ] && python3 -c "import socket,sys,time; s=socke
 check "setup page serves the Monzero artwork" "curl -sk -o $S/wordmark.png -w '%{http_code} %{content_type} %{size_download}' $U/brand/wordmark.png | grep -qE '^200 image/png [0-9]{4,}'"
 check "setup page is branded" "curl -sk $U/ | grep -q 'brand/wordmark.png'"
 echo "== language"
-check "language is the first step (12 languages)" "[ \$(curl -sk $U/ | grep -o 'href=\"/?lang=' | wc -l) = 12 ] && curl -sk $U/ | grep -q '1 · Choose your language'"
+check "language is the first step (12 languages)" "[ \$(curl -sk $U/ | grep -o 'href=\"/?lang=' | wc -l) = 12 ] && curl -sk $U/ | grep '1 · Choose your language' >/dev/null"
 check "page follows the browser's language" "curl -sk -H 'Accept-Language: fr-FR,fr;q=0.9' $U/ | grep -q 'Configurer ce boîtier'"
 check "picked language wins (?lang=de)" "curl -sk -H 'Accept-Language: fr' '$U/?lang=de' | grep -q 'Diese Box einrichten'"
 check "keyboard follows the language (ja -> jp)" "curl -sk '$U/?lang=ja' | grep -q 'option value=\"jp\" selected'"
@@ -60,12 +61,12 @@ check "no session -> sign-in page" "curl -sk $U/ | grep -q 'Sign in'"
 CSRF=$(curl -sk -b "$J" $U/ | grep -o 'name="csrf" value="[^"]*"' | head -1 | sed 's/.*value="//; s/"$//')
 check "language change accepted" "[ \$(curl -sk -b $J -o /dev/null -w '%{http_code}' $U/language -d csrf=$CSRF -d lang=es -d keyboard=es) = 303 ]"
 timeout 60 bash -c "until curl -sk -b $J $U/ | grep -q 'Estado'; do sleep 2; done"
-check "status page now in Spanish" "curl -sk -b $J $U/ | grep -q '<html lang=\"es\"' && curl -sk -b $J $U/ | grep -q 'Funciones'"
+check "status page now in Spanish" "curl -sk -b $J $U/ | grep '<html lang=\"es\"' >/dev/null && curl -sk -b $J $U/ | grep 'Funciones' >/dev/null"
 check "sign-in page in Spanish" "curl -sk $U/ | grep -q 'Iniciar sesión'"
 check "unknown language refused" "[ \$(curl -sk -b $J -o /dev/null -w '%{http_code}' $U/language -d csrf=$CSRF -d lang=xx -d keyboard=us) = 400 ]"
 echo "== inside (SSH with the key from setup)"
 SSHO=(-i "$S/key" -p 28022 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR)
-IN=$(ssh "${SSHO[@]}" monzero-admin@127.0.0.1 'sudo nft list ruleset; echo ===; systemctl is-active tor monzero-update.timer monzero-public-relay.timer; echo screen:$(systemctl is-active monzero-screen); sudo journalctl -u monzero-screen -o cat --no-pager | grep "^screen:" | tail -1; echo ===; ls /etc/ssh/ssh_host_ed25519_key; cat /etc/monzero/appliance.json; cat /etc/default/locale; locale -a; echo ===; sudo -n true && echo sudo-ok' 2>/dev/null)
+IN=$(ssh "${SSHO[@]}" monzero-admin@127.0.0.1 'sudo nft list ruleset; echo ===; systemctl is-active tor monzero-update.timer monzero-public-relay.timer; echo screen:$(systemctl is-active monzero-screen); sudo journalctl -u monzero-screen -o cat --no-pager | grep "^screen:" | tail -1; echo ===; ls /etc/ssh/ssh_host_ed25519_key; cat /etc/monzero/appliance.json; echo; cat /etc/default/locale; locale -a; echo ===; sudo -n true && echo sudo-ok' 2>/dev/null)
 check "SSH with the setup key" '[ -n "$IN" ]'
 check "firewall: 6174 open, rate-limited" 'echo "$IN" | grep -q "tcp dport 6174 ct state new limit"'
 check "firewall: 8790/8443 home network only" 'echo "$IN" | grep -qE "saddr @lan4 tcp dport \{.*8443.*8790"'
