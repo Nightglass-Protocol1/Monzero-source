@@ -71,7 +71,10 @@ podman unshare bash -c "
 # The boot partition: Raspberry Pi OS's own, with the first-boot user wizard turned off (the
 # Monzero setup page replaces it) and the console on HDMI
 mcopy -o -i "$W/boot.vfat" ::/cmdline.txt "$W/cmdline.txt"
-sed -i 's| init=/usr/lib/raspberrypi-sys-mods/firstboot||; s| quiet||' "$W/cmdline.txt"
+sed -i 's| init=/usr/lib/raspberrypi-sys-mods/firstboot||; s| quiet||; s|$| loglevel=3 logo.nologo consoleblank=0|' "$W/cmdline.txt"
+mcopy -o -i "$W/boot.vfat" ::/config.txt "$W/config.txt"
+grep -q '^disable_splash=1' "$W/config.txt" || printf '\n# Monzero Box: no rainbow boot square; the Monzero screen shows once the box is up\ndisable_splash=1\n' >> "$W/config.txt"
+mcopy -o -i "$W/boot.vfat" "$W/config.txt" ::/config.txt
 mcopy -o -i "$W/boot.vfat" "$W/cmdline.txt" ::/cmdline.txt
 IMG=$OUT/monzero-appliance-$VERSION-raspberrypi-arm64.img
 truncate -s ${SIZE_MB}M "$IMG"

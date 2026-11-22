@@ -39,7 +39,9 @@ FPR=$(openssl x509 -in /etc/monzero/web/tls.crt -noout -fingerprint -sha256 | cu
 mkdir -p /etc/issue.d
 cat > /etc/issue.d/50-monzero.issue <<ISSUE
 
-  Monzero box - set it up from a browser on your network:
+  \\e{cyan}M O N Z E R O\\e{reset}  ·  XMZ Box
+
+  Set it up from a browser on your network:
       https://\4:8443
   One-time setup code:   ${CODE:0:4}-${CODE:4:4}-${CODE:8:4}
   Page certificate (SHA-256): $FPR

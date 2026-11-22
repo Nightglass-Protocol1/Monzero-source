@@ -1,0 +1,32 @@
+[Unit]
+Description=Monzero screen: artwork, setup code and status on the box's display (tty1)
+Documentation=file:/usr/local/sbin/monzero-screen
+# The wallet takes the screen when it is on; a console login stays on tty2 (Alt+F2)
+Conflicts=getty@tty1.service monzero-wallet-session.service
+After=systemd-user-sessions.service monzero-firstboot.service
+
+[Service]
+ExecStart=/usr/local/sbin/monzero-screen
+# reads the setup state in /var/lib/monzero-web (group monzero-web) without root's override
+SupplementaryGroups=monzero-web
+Restart=always
+RestartSec=10
+# Draws into /dev/fb0 and on tty1; reads the setup code and status. Nothing else.
+DevicePolicy=closed
+DeviceAllow=/dev/fb0 rw
+DeviceAllow=/dev/tty1 rw
+DeviceAllow=/dev/tty0 rw
+DeviceAllow=char-drm rw
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=CAP_SYS_TTY_CONFIG
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

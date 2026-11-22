@@ -16,6 +16,7 @@ fi
 mkdir -p "$W/rootfs/usr/local/sbin" "$W/rootfs/usr/local/lib/monzero-wallet" "$W/docker"
 cp "$HERE/rootfs/usr/local/lib/monzero-wallet/openbox-rc.xml" "$W/rootfs/usr/local/lib/monzero-wallet/"
 cp "$HERE/rootfs/usr/local/sbin/monzero-update" "$W/rootfs/usr/local/sbin/"
+mkdir -p "$W/rootfs/usr/share/monzero" && cp -r "$HERE/rootfs/usr/share/monzero/branding" "$W/rootfs/usr/share/monzero/"
 cp "$HERE/docker/relay.json" "$HERE/docker/wallet-entry.sh" "$HERE/docker/tor-entry.sh" "$W/docker/"
 cp "$RELAY_BIN" "$W/monzero-dex-relay"
 gpg --dearmor < "$HERE/rootfs/usr/share/monzero/release-public.asc" > "$W/release-keyring.gpg"

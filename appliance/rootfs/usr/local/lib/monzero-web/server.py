@@ -104,17 +104,16 @@ def read_json(path, default):
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Monzero box</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Monzero Box</title><link rel="icon" href="/favicon.png">
 <style>
-:root{{--bg:#0f1115;--card:#181b22;--fg:#e8e8ea;--muted:#9aa0aa;--accent:#ff7a1a;--bad:#ff5c5c;--ok:#4cc38a}}
-@media (prefers-color-scheme: light){{:root{{--bg:#f4f5f7;--card:#fff;--fg:#16181d;--muted:#5b616b}}}}
-body{{background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif;margin:0;padding:16px}}
+:root{{--bg:#0f1115;--card:#181b22;--fg:#e8e8ea;--muted:#9aa0aa;--accent:#19d6e6;--bad:#ff5c5c;--ok:#4cc38a}}
+body{{color-scheme:dark;accent-color:var(--accent);background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif;margin:0;padding:16px}}
 main{{max-width:640px;margin:0 auto}} .card{{background:var(--card);border-radius:12px;padding:16px 20px;margin:16px 0}}
-h1{{font-size:1.4rem}} h2{{font-size:1.1rem;margin-top:0}} label{{display:block;margin:10px 0 4px}}
+h1{{font-size:1.4rem;margin:8px 0 0}} .brand{{display:flex;flex-direction:column;align-items:center;gap:4px;margin:8px 0 4px}} .brand img{{width:min(340px,80vw);height:auto}} .brand span{{color:var(--muted);letter-spacing:.2em;font-size:.8rem;text-transform:uppercase}} h2{{font-size:1.1rem;margin-top:0}} label{{display:block;margin:10px 0 4px}}
 input[type=text],input[type=password],textarea{{width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--muted);background:var(--bg);color:var(--fg)}}
 button{{background:var(--accent);color:#111;border:0;border-radius:8px;padding:8px 16px;font-weight:600;margin-top:12px;cursor:pointer}}
 .muted{{color:var(--muted)}} .bad{{color:var(--bad)}} .ok{{color:var(--ok)}} code{{word-break:break-all}}
-</style></head><body><main><h1>Monzero box</h1>{body}</main></body></html>"""
+</style></head><body><main><div class="brand"><img src="/brand/wordmark.png" alt="Monzero"><span>Box</span></div>{body}</main></body></html>"""
 
 
 def page(body):
@@ -140,7 +139,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def send(self, status, body=b"", headers=()):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
@@ -169,7 +168,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         host = self.headers.get("Host", "")
         return origin is None or urllib.parse.urlparse(origin).netloc == host
 
+    BRAND = {"/brand/wordmark.png": "wordmark-600.png", "/favicon.png": "favicon-32.png", "/favicon.ico": "favicon-32.png"}
+
     def do_GET(self):
+        if self.path in self.BRAND:   # the Monzero artwork, from the image itself
+            try:
+                data = open("/usr/share/monzero/branding/" + self.BRAND[self.path], "rb").read()
+            except OSError:
+                return self.send(404, page("<p>Not found.</p>"))
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path not in ("/", "/index.html"):
             return self.send(404, page("<p>Not found.</p>"))
         if not is_setup():

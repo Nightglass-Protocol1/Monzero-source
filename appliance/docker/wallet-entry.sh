@@ -21,6 +21,7 @@ export DISPLAY=:0
 sleep 1
 CONF="$HOME/.config/monzero-project/monzero-core.conf"
 [ -f "$CONF" ] || { mkdir -p "$(dirname "$CONF")"; printf '[General]\naskDesktopShortcut=false\n' > "$CONF"; }
+hsetroot -cover /usr/share/monzero/branding/wallpaper-1920x1080.jpg 2>/dev/null || true
 openbox --config-file /usr/local/lib/monzero-wallet/openbox-rc.xml &
 ( while true; do /opt/monzero/monzero-wallet-gui; sleep 2; done ) &
 x11vnc -display :0 -localhost -rfbport 5900 -rfbauth "$S/passwd" -forever -shared -quiet &

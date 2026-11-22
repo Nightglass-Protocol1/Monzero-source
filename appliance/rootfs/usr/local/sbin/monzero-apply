@@ -50,6 +50,8 @@ def apply_roles(roles):
                 run("systemctl", "enable", "--now", u)
             else:
                 run("systemctl", "disable", "--now", u)
+    if "wallet" not in roles:   # the screen shows the box's artwork and status again
+        run("systemctl", "restart", "monzero-screen")
     firewall()
 
 

@@ -19,7 +19,7 @@ qemu-system-x86_64 -enable-kvm -m 4096 -smp 2 -machine q35 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF/OVMF_CODE.4m.fd" -drive if=pflash,format=raw,file="$S/vars.fd" \
   -drive file="$S/disk.qcow2",if=virtio \
   -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:28443-:8443,hostfwd=tcp:127.0.0.1:28022-:22,hostfwd=tcp:127.0.0.1:28790-:8790 \
-  -display none -vga std -serial file:"$S/serial.log" -daemonize -pidfile "$S/vm.pid" || exit 1
+  -display none -vga std -monitor unix:"$S/mon",server,nowait -serial file:"$S/serial.log" -daemonize -pidfile "$S/vm.pid" || exit 1
 U=https://127.0.0.1:28443; J=$S/cookies
 echo "== first start"
 timeout 240 bash -c "until curl -sk -m 3 $U/ >/dev/null && tr -d '\r' < $S/serial.log | grep -aqE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}'; do sleep 5; done"
@@ -27,6 +27,10 @@ CODE=$(tr -d '\r' < "$S/serial.log" | grep -aoE '[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9
 check "setup code on the console" '[ -n "$CODE" ]'
 check "console shows the box address" "tr -d '\r' < $S/serial.log | grep -aq 'https://[0-9]'"
 check "hostname monzero-box" "tr -d '\r' < $S/serial.log | grep -aq 'monzero-box login'"
+shot() { [ -n "${SCREENSHOT:-}" ] && python3 -c "import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(('screendump '+sys.argv[2]+'\\n').encode()); time.sleep(2)" "$S/mon" "$1" && echo "  display saved to $1"; }
+[ -n "${SCREENSHOT:-}" ] && { sleep 40; shot "${SCREENSHOT%.*}-setup.ppm"; }
+check "setup page serves the Monzero artwork" "curl -sk -o $S/wordmark.png -w '%{http_code} %{content_type} %{size_download}' $U/brand/wordmark.png | grep -qE '^200 image/png [0-9]{4,}'"
+check "setup page is branded" "curl -sk $U/ | grep -q 'brand/wordmark.png'"
 echo "== setup"
 check "wrong code refused" "curl -sk $U/setup --data-urlencode code=AAAA-BBBB-CCCC -d pw=correcthorsebattery -d pw2=correcthorsebattery | grep -q 'not right'"
 ssh-keygen -q -t ed25519 -N '' -f "$S/key" -C smoke
@@ -45,12 +49,15 @@ check "change without CSRF token refused" "[ \$(curl -sk -b $J -o /dev/null -w '
 check "no session -> sign-in page" "curl -sk $U/ | grep -q 'Sign in'"
 echo "== inside (SSH with the key from setup)"
 SSHO=(-i "$S/key" -p 28022 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR)
-IN=$(ssh "${SSHO[@]}" monzero-admin@127.0.0.1 'sudo nft list ruleset; echo ===; systemctl is-active tor monzero-update.timer monzero-public-relay.timer; echo ===; ls /etc/ssh/ssh_host_ed25519_key; cat /etc/monzero/appliance.json; echo ===; sudo -n true && echo sudo-ok' 2>/dev/null)
+IN=$(ssh "${SSHO[@]}" monzero-admin@127.0.0.1 'sudo nft list ruleset; echo ===; systemctl is-active tor monzero-update.timer monzero-public-relay.timer; echo screen:$(systemctl is-active monzero-screen); sudo journalctl -u monzero-screen -o cat --no-pager | grep "^screen:" | tail -1; echo ===; ls /etc/ssh/ssh_host_ed25519_key; cat /etc/monzero/appliance.json; echo ===; sudo -n true && echo sudo-ok' 2>/dev/null)
 check "SSH with the setup key" '[ -n "$IN" ]'
 check "firewall: 6174 open, rate-limited" 'echo "$IN" | grep -q "tcp dport 6174 ct state new limit"'
 check "firewall: 8790/8443 home network only" 'echo "$IN" | grep -qE "saddr @lan4 tcp dport \{.*8443.*8790"'
 check "firewall: relay not open to the internet (Tor mode)" '! echo "$IN" | grep -qE "dport \{[^}]*8790[^}]*\} ct state new limit"'
 check "Tor and timers running" '[ $(echo "$IN" | grep -c "^active") -ge 3 ]'
+check "Monzero screen on the display" 'echo "$IN" | grep -q "^screen:active"'
+check "screen shows the status after setup" 'echo "$IN" | grep -q "^screen: status"'
+[ -n "${SCREENSHOT:-}" ] && { sleep 20; shot "$SCREENSHOT"; }
 check "settings saved (publicRelay onion)" 'echo "$IN" | grep -q "\"publicRelay\": \"onion\""'
 echo
 echo "passed $PASS, failed $FAIL"

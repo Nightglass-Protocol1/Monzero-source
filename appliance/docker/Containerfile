@@ -20,7 +20,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-cert
 
 FROM base AS node
 ARG MONZERO_VERSION
-LABEL org.opencontainers.image.title="Monzero node" org.monzero.version=$MONZERO_VERSION
+LABEL org.opencontainers.image.title="Monzero node" org.opencontainers.image.vendor="Monzero" org.opencontainers.image.url="https://monzero.org" org.opencontainers.image.source="https://github.com/Nightglass-Protocol1/Monzero-source" org.opencontainers.image.documentation="https://monzero.org/download/" org.opencontainers.image.version=$MONZERO_VERSION org.monzero.version=$MONZERO_VERSION
 COPY --from=release /monzero/monzerod /usr/local/bin/monzerod
 USER monzero
 VOLUME /data
@@ -33,7 +33,7 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/monzerod", "--data-dir", "/da
 
 FROM base AS relay
 ARG MONZERO_VERSION
-LABEL org.opencontainers.image.title="Monzero DEX relay" org.monzero.version=$MONZERO_VERSION
+LABEL org.opencontainers.image.title="Monzero DEX relay" org.opencontainers.image.vendor="Monzero" org.opencontainers.image.url="https://monzero.org" org.opencontainers.image.source="https://github.com/Nightglass-Protocol1/Monzero-source" org.opencontainers.image.documentation="https://monzero.org/download/" org.opencontainers.image.version=$MONZERO_VERSION org.monzero.version=$MONZERO_VERSION
 COPY monzero-dex-relay /usr/local/bin/monzero-dex-relay
 COPY docker/relay.json /etc/monzero-dex-relay/config.json
 USER monzero
@@ -43,10 +43,10 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/monzero-dex-relay", "/etc/mon
 
 FROM base AS wallet
 ARG MONZERO_VERSION
-LABEL org.opencontainers.image.title="Monzero wallet + DEX (browser screen)" org.monzero.version=$MONZERO_VERSION
+LABEL org.opencontainers.image.title="Monzero wallet + DEX (browser screen)" org.opencontainers.image.vendor="Monzero" org.opencontainers.image.url="https://monzero.org" org.opencontainers.image.source="https://github.com/Nightglass-Protocol1/Monzero-source" org.opencontainers.image.documentation="https://monzero.org/download/" org.opencontainers.image.version=$MONZERO_VERSION org.monzero.version=$MONZERO_VERSION
 USER root
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-      xvfb openbox x11vnc novnc python3-websockify openssl x11-xserver-utils fonts-dejavu-core fonts-wqy-microhei \
+      xvfb openbox x11vnc novnc python3-websockify openssl x11-xserver-utils hsetroot fonts-dejavu-core fonts-wqy-microhei \
       libgl1 libegl1 libgl1-mesa-dri libglib2.0-0t64 libx11-xcb1 libxcb1 libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-shm0 \
       libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-render0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
       libxkbcommon-x11-0 libxkbcommon0 libpcre2-8-0 >/dev/null \
@@ -54,6 +54,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 COPY --from=release /monzero /opt/monzero
 COPY docker/wallet-entry.sh /usr/local/bin/wallet-entry
 COPY rootfs/usr/local/lib/monzero-wallet/openbox-rc.xml /usr/local/lib/monzero-wallet/openbox-rc.xml
+COPY rootfs/usr/share/monzero/branding /usr/share/monzero/branding
 USER monzero
 ENV HOME=/home/monzero
 VOLUME /home/monzero
@@ -62,7 +63,7 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/wallet-entry"]
 
 FROM base AS tor
 ARG MONZERO_VERSION
-LABEL org.opencontainers.image.title="Tor onion service for the Monzero relay" org.monzero.version=$MONZERO_VERSION
+LABEL org.opencontainers.image.title="Tor onion service for the Monzero relay" org.opencontainers.image.vendor="Monzero" org.opencontainers.image.url="https://monzero.org" org.opencontainers.image.source="https://github.com/Nightglass-Protocol1/Monzero-source" org.opencontainers.image.documentation="https://monzero.org/download/" org.opencontainers.image.version=$MONZERO_VERSION org.monzero.version=$MONZERO_VERSION
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends tor >/dev/null && rm -rf /var/lib/apt/lists/*
 COPY docker/tor-entry.sh /usr/local/bin/tor-entry
 # The shared address volume takes this folder's owner when it is first created
