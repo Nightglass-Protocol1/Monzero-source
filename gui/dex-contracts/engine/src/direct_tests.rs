@@ -173,3 +173,25 @@ fn a_second_different_frame_expiry_and_reused_keys_are_refused() {
     ex.accept(&fs.direct_frame(&o, Side::Follower, &account(2)).unwrap(), 1_000).unwrap();
     assert_eq!(ex.finish().err(), Some(E::InvalidShare("a key was used twice")));
 }
+
+#[test]
+fn the_cross_curve_proof_rides_only_with_a_solana_leg() {
+    let (ls, _) = seeds();
+    // Between EVM chains: no proof, so the frame stays small
+    let evm = offer(Chain::EthSepolia, Chain::BscTestnet);
+    let small = ls.direct_frame(&evm, Side::Leader, &account(1)).unwrap();
+    let f: DirectFrame = serde_json::from_slice(&small.frame).unwrap();
+    assert!(f.claim.as_ref().unwrap().proof.is_none());
+    assert!(small.frame.len() < 2_000, "EVM-only frame is {} bytes", small.frame.len());
+    // With Solana: the proof is there
+    let sol = offer(Chain::EthSepolia, Chain::SolDevnet);
+    let big = ls.direct_frame(&sol, Side::Leader, &account(1)).unwrap();
+    let f: DirectFrame = serde_json::from_slice(&big.frame).unwrap();
+    assert!(f.claim.as_ref().unwrap().proof.is_some());
+    // A Solana trade without the proof, and an EVM trade with one, are refused
+    let stripped = forged(&sol, Side::Leader, &account(1), |f| f.claim.as_mut().unwrap().proof = None);
+    assert_eq!(follower_exchange(&sol).accept(&stripped, 1_000), Err(E::InvalidShare("a Solana leg needs the cross-curve proof")));
+    let proof = serde_json::from_slice::<DirectFrame>(&big.frame).unwrap().claim.unwrap().proof;
+    let padded = forged(&evm, Side::Leader, &account(1), |f| f.claim.as_mut().unwrap().proof = proof);
+    assert_eq!(follower_exchange(&evm).accept(&padded, 1_000), Err(E::InvalidShare("no cross-curve proof between EVM chains")));
+}
