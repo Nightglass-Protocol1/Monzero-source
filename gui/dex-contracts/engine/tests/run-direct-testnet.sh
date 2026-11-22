@@ -29,11 +29,13 @@ mkdir -p "$WORK/relay-data" "$WORK/run"
 # fund the Solana accounts first:  cargo run --example direct_testnet -- fund-sol
 export PAIR=${PAIR:-eth-bnb}
 SOL_CHAIN=""
-if [ "$PAIR" = eth-sol ]; then
+case "$PAIR" in eth-sol|sol-bnb) SOLANA=1 ;; *) SOLANA= ;; esac
+[ "$PAIR" = sol-bnb ] && export GIVES_WEI=${GIVES_WEI:-30000000} WANTS_WEI=${WANTS_WEI:-5000000000000000}   # 0.03 SOL for 0.005 tBNB
+if [ -n "$SOLANA" ]; then
   export RPC_SOL_DEVNET=${RPC_SOL_DEVNET:-https://api.devnet.solana.com}
   SOL_CHAIN=", {\"chainId\": 501000102, \"rpc\": \"$RPC_SOL_DEVNET\", \"solProgram\": \"9idXkjjEeyu6nLrYSnCcX6PjmRemKQvuz7VwwwYMtihh\"}"
   export WANTS_WEI=${WANTS_WEI:-50000000}     # 0.05 SOL in lamports
-  WORK=${WORK_SOL:-$ROOT/core/build/direct-testnet-sol}; mkdir -p "$WORK/relay-data" "$WORK/run"
+  WORK=${WORK_SOL:-$ROOT/core/build/direct-testnet-$PAIR}; mkdir -p "$WORK/relay-data" "$WORK/run"
 fi
 echo "== local relay (Sepolia + BSC testnet${SOL_CHAIN:+ + Solana devnet})"
 cat > "$WORK/relay.json" <<J
@@ -48,7 +50,7 @@ systemd-run --user --quiet --unit=dex-direct-relay --collect "$PWD/../relay/targ
 for _ in $(seq 1 30); do curl -s -m 2 "$RELAY/v1/info" >/dev/null && break; sleep 1; done
 curl -s -m 5 "$RELAY/v1/info" >/dev/null || { echo "!! the relay did not come up"; exit 1; }
 
-echo "== the trade ($PAIR): 0.002 SepETH for $([ "$PAIR" = eth-sol ] && echo 0.05 devnet SOL || echo 0.01 tBNB)"
+echo "== the trade ($PAIR): gives ${GIVES_WEI:-2000000000000000}, wants ${WANTS_WEI:-10000000000000000} (smallest units)"
 cargo run --offline --example direct_testnet -- "$WORK/run" 2>&1 | grep --line-buffered -v -E '^warning|^ *-->|^ *\||^ *= note|^$' | tee -a "$WORK/run.log" || true
 if grep -q -E '^SWAPPED|^NO SWAP' <(tail -3 "$WORK/run.log"); then
   mv "$WORK/run" "$WORK/run-ended-$(date +%Y%m%d-%H%M%S)"

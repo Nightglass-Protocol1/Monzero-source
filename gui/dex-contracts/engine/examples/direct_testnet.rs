@@ -28,9 +28,21 @@ const BSC_TESTNET: u64 = 97;
 const SOL_DEVNET: u64 = 501_000_102;
 
 /// PAIR=eth-bnb (default): the maker gives Sepolia ETH for BSC testnet BNB;
-/// PAIR=eth-sol: the maker gives Sepolia ETH for devnet SOL
+/// PAIR=eth-sol: Sepolia ETH for devnet SOL; PAIR=sol-bnb: devnet SOL for BSC testnet BNB
+fn chains() -> (u64, u64) {
+    match env("PAIR", "eth-bnb").as_str() {
+        "eth-sol" => (SEPOLIA, SOL_DEVNET),
+        "sol-bnb" => (SOL_DEVNET, BSC_TESTNET),
+        _ => (SEPOLIA, BSC_TESTNET),
+    }
+}
+
 fn wanted_chain() -> u64 {
-    if env("PAIR", "eth-bnb") == "eth-sol" { SOL_DEVNET } else { BSC_TESTNET }
+    chains().1
+}
+
+fn given_chain() -> u64 {
+    chains().0
 }
 
 fn sol_address(seed: &[u8], index: u32) -> String {
@@ -168,7 +180,7 @@ async fn main() {
     let posted_marker = work.join("posted.json");
     if !posted_marker.exists() {
         let posted = maker
-            .call("directPost", json!({"directOffer": {"givesChainId": SEPOLIA, "givesValue": gives, "wantsChainId": wanted_chain(), "wantsValue": wants, "lifetimeSecs": 3 * 3600}}))
+            .call("directPost", json!({"directOffer": {"givesChainId": given_chain(), "givesValue": gives, "wantsChainId": wanted_chain(), "wantsValue": wants, "lifetimeSecs": 3 * 3600}}))
             .await;
         log(format!("maker posted: {}", short(&posted)));
         assert_eq!(posted["ok"], true, "the post was refused");
@@ -241,7 +253,7 @@ async fn main() {
     }
 
     // 4. Payouts: each side sends what the trade brought in to another account of its phrase
-    for (who, chain) in [(&taker, SEPOLIA), (&maker, wanted_chain())] {
+    for (who, chain) in [(&taker, given_chain()), (&maker, wanted_chain())] {
         let paid = who.call("directPayout", json!({"chainId": chain, "payoutAddress": who.payout_address_on(chain)})).await;
         log(format!("{} payout on {chain}: {}", who.name, short(&paid)));
         assert_eq!(paid["ok"], true);
