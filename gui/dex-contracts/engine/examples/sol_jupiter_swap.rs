@@ -71,7 +71,9 @@ async fn main() {
     println!("account {address}: {:.9} SOL, {:.6} USDT", bal as f64 / 1e9, sol::token_balance(&url, &me, &usdt).await.unwrap() as f64 / 1e6);
     assert!(lamports + keep <= bal, "LAMPORTS would leave less than KEEP_LAMPORTS");
     let http = reqwest::Client::new();
-    let quote: Value = http.get(format!("{JUP}/quote?inputMint={WSOL}&outputMint={USDT}&amount={lamports}&slippageBps=100"))
+    // Only the established pools (Raydium, Orca, Meteora) unless DEXES says otherwise
+    let dexes = { let d = env("DEXES"); if d.is_empty() { "Raydium,Raydium CLMM,Whirlpool,Meteora DLMM".to_string() } else { d } };
+    let quote: Value = http.get(format!("{JUP}/quote?inputMint={WSOL}&outputMint={USDT}&amount={lamports}&slippageBps=100&dexes={}", dexes.replace(' ', "%20")))
         .send().await.expect("Jupiter quote").json().await.expect("quote json");
     let out: f64 = quote["outAmount"].as_str().expect("outAmount").parse().unwrap();
     let min: f64 = quote["otherAmountThreshold"].as_str().unwrap_or("0").parse().unwrap();
