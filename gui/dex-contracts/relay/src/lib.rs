@@ -443,9 +443,13 @@ impl<C: ChainView> Relay<C> {
             None => chain.balance(l.maker).await,
         }
         .map_err(RelayError::ChainRead)?;
+        // A buyer backs the offer with the coin it pays; for a token (USDT) offer, as for a direct
+        // offer, with the chain's coin for its fees: the relay does not read token balances (the
+        // maker's own app checks the tokens before posting). Comparing the gas coin with a token
+        // amount refused every USDT offer that buys (22 Nov 2026, USDT-BSC/XMR).
         let backed = match l.maker_role() {
-            Role::Owner => balance >= l.value,
-            Role::Claimer => !balance.is_zero(),
+            Role::Owner if l.asset() == Address::ZERO => balance >= l.value,
+            Role::Owner | Role::Claimer => !balance.is_zero(),
         };
         if !backed {
             return Err(RelayError::Unfunded);

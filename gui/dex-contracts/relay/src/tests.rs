@@ -561,3 +561,32 @@ mod direct {
         assert_eq!(again.post_direct(offer(&m, 5, (BSCT, 0xb1, ETH), (SEP, 0xa1, ETH)), NOW).await, Err(RelayError::Closed));
     }
 }
+
+/// 22 Nov 2026: a USDT-BSC/XMR offer that buys XMR (the maker locks 22 USDT) was refused as
+/// unbacked because the relay compared the maker's BNB with the USDT amount. A token offer is
+/// backed by gas, as a direct offer is; a coin offer still needs the coin.
+#[tokio::test]
+async fn a_token_offer_that_buys_is_backed_by_gas() {
+    let bsc = monzero_dex_evm::Chain::BscMainnet.id();
+    let mut rules = Rules::default();
+    rules.contracts.insert(bsc, contract());
+    rules.max_value.insert(bsc, U256::from(ETH / 10));
+    rules.max_token_value.insert(bsc, U256::from(60u64) * U256::from(ETH));
+    rules.xmr_mainnet = true;
+    let r = Relay::new(rules, BTreeMap::from([(bsc, Mock::default())]));
+    let a = PrivateKeySigner::random();
+    let usdt = |id: u8, pair: &str, value: U256| {
+        let mut l = offer(&a, id, Side::BuyXmz, 0, 1).listing;
+        l.pair = pair.into();
+        l.chain_id = bsc;
+        l.xmz_network = XmzNetwork::XmrMainnet;
+        l.value = value;
+        l.xmz = 46_500_000_000; // 0.0465 XMR
+        l.sign(&a)
+    };
+    let twenty_two = U256::from(22u64) * U256::from(ETH);
+    assert_eq!(r.post(usdt(1, "USDT-BSC/XMR", twenty_two), NOW).await, Err(RelayError::Unfunded), "no gas at all");
+    r.chains[&bsc].balances.lock().unwrap().insert(a.address(), U256::from(ETH / 1000));
+    assert_eq!(r.post(usdt(1, "USDT-BSC/XMR", twenty_two), NOW).await, Ok(true), "0.001 BNB of gas backs a 22 USDT offer");
+    assert_eq!(r.post(usdt(2, "BNB/XMR", U256::from(ETH / 20)), NOW).await, Err(RelayError::Unfunded), "a BNB offer still needs the BNB");
+}
