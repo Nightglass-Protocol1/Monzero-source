@@ -14,6 +14,8 @@
 # Other runs with the same accounts (each in its own WORK folder):
 #   SIDE=sell-xmz   the maker's offer sells XMR (the maker holds the XMR and claims; the taker pays)
 #   USDT_AMOUNT=23  pair USDT-BSC/XMR: the payer locks USDT (BEP-20, at most 60) instead of BNB
+#   USDT_SOL_AMOUNT=10  pair USDT/XMR on Solana mainnet: the payer locks USDT (Tether's SPL mint, at most
+#                   60) and needs a little SOL for fees; the seller needs ~0.003 SOL (its USDT account's rent)
 #   SOL_AMOUNT=0.2  pair SOL/XMR on Solana mainnet: the payer locks SOL (at most 0.25); the trade
 #                   accounts are the Solana keys the wallet derives from accounts 0 and 1
 #   XMR_WALLET_FROM=<wallet file>  start the seller's Monero wallet as a copy of an earlier run's
@@ -25,7 +27,9 @@ MONERO_DIR=${MONERO_DIR:-$ROOT/core/build/monero-official}
 SIDE=${SIDE:-buy-xmz}
 case $SIDE in buy-xmz|sell-xmz) ;; *) echo "!! SIDE is buy-xmz or sell-xmz"; exit 1;; esac
 CHAIN=56; RELAY_CHAIN='"rpc": "https://bsc-rpc.publicnode.com", "contract": "0x9073290952DCDF3225D8f65d787cF9148a490feb"'
-if [ -n "${SOL_AMOUNT:-}" ]; then PAIR=SOL/XMR; COINWORD=sol; CHAIN=501000101
+if [ -n "${USDT_SOL_AMOUNT:-}" ]; then PAIR=USDT/XMR; COINWORD=usdt-sol; CHAIN=501000101
+  RELAY_CHAIN='"rpc": "https://solana-rpc.publicnode.com", "solProgram": "GtbWmiCkc4c9nmEbN8tERLovA5CG3FbJQTKisaunEkLK", "maxTokenValue": "60000000"'
+elif [ -n "${SOL_AMOUNT:-}" ]; then PAIR=SOL/XMR; COINWORD=sol; CHAIN=501000101
   RELAY_CHAIN='"rpc": "https://solana-rpc.publicnode.com", "solProgram": "GtbWmiCkc4c9nmEbN8tERLovA5CG3FbJQTKisaunEkLK"'
 elif [ -n "${USDT_AMOUNT:-}" ]; then PAIR=USDT-BSC/XMR; COINWORD=usdt; else PAIR=BNB/XMR; COINWORD=bnb; fi
 WORK=${WORK:-$HOME/dex-real/xmr-$COINWORD-$([ "$SIDE" = buy-xmz ] && echo 1 || echo sell-1)}
@@ -33,7 +37,12 @@ ACCOUNTS_FILE=${ACCOUNTS_FILE:-$HOME/.config/monzero-dex/xmr-bnb-mainnet-account
 RELAY_PORT=18797
 : "${XMR_AMOUNT:?set XMR_AMOUNT (XMR the seller sells), e.g. 0.06}"
 # A ceiling for this test (each about 50-60 GBP at November 2026 prices): a typo cannot send more
-if [ "$PAIR" = SOL/XMR ]; then
+if [ "$PAIR" = USDT/XMR ]; then
+  # Tether's SPL mint has 6 decimals; gas in lamports (the seller's: its USDT account's rent)
+  VALUE_WEI=$(python3 -c "from decimal import Decimal as D; v=D('$USDT_SOL_AMOUNT'); assert 0 < v <= D('60'), 'USDT_SOL_AMOUNT must be above 0 and at most 60'; print(int(v*10**6))")
+  MAX_VALUE=250000000
+  export MAKER_GAS_WEI=${MAKER_GAS_WEI:-10000000} TAKER_GAS_WEI=${TAKER_GAS_WEI:-3000000}
+elif [ "$PAIR" = SOL/XMR ]; then
   # Lamports (10^9 per SOL); gas in lamports too (fees and the swap account's rent)
   VALUE_WEI=$(python3 -c "from decimal import Decimal as D; v=D('$SOL_AMOUNT'); assert 0 < v <= D('0.25'), 'SOL_AMOUNT must be above 0 and at most 0.25'; print(int(v*10**9))")
   MAX_VALUE=250000000
@@ -108,7 +117,7 @@ systemd-run --user --quiet --unit=dex-xmr-bnb-relay --collect "$HERE/../relay/ta
 for _ in $(seq 1 30); do curl -s -m 2 "http://127.0.0.1:$RELAY_PORT/v1/info" | grep -qF "$PAIR" && break; sleep 1; done
 curl -s -m 5 "http://127.0.0.1:$RELAY_PORT/v1/info" | grep -qF "$PAIR" || { echo "!! the relay did not come up with the $PAIR pair"; exit 1; }
 
-echo "== the trade ($SIDE, $PAIR): ${SOL_AMOUNT:-${BNB_AMOUNT:-${USDT_AMOUNT:-}}} ${PAIR%%/*} for $XMR_AMOUNT XMR (allow 1-2 hours once funded)"
+echo "== the trade ($SIDE, $PAIR): ${USDT_SOL_AMOUNT:-${SOL_AMOUNT:-${BNB_AMOUNT:-${USDT_AMOUNT:-}}}} ${PAIR%%/*} for $XMR_AMOUNT XMR (allow 1-2 hours once funded)"
 mkdir -p "$WORK/run"
 code=0
 NET=mainnet COIN=xmr CHAIN_ID=$CHAIN SIDE=$SIDE PAIR=$PAIR FUNDER_RPC=none OWNER_INDEX=0 CLAIMER_INDEX=1 \

@@ -137,6 +137,22 @@ fn token() -> bool {
     env("PAIR", "").starts_with("USDT")
 }
 
+/// The payer's USDT in base units: the SPL token account on Solana (6 decimals), else BEP-20
+async fn usdt_of(side: &Side) -> u128 {
+    if solana() {
+        let chain = monzero_dex_evm::Chain::from_id(chain_id()).unwrap();
+        let mint = monzero_dex_evm::sol::usdt_mint(chain).expect("USDT mint on this cluster");
+        let pk = monzero_dex_evm::sol::from_base58(&side.address).expect("Solana address");
+        return monzero_dex_evm::sol::token_balance(&evm_rpc(), &pk, &mint).await.expect("Solana RPC") as u128;
+    }
+    usdt_balance(&side.address).await
+}
+
+/// Base units per USDT: 10^6 for Tether's SPL mint, 10^18 for BSC-USD
+fn usdt_unit() -> f64 {
+    if solana() { 1e6 } else { 1e18 }
+}
+
 /// A BEP-20 balance (USDT on BNB Smart Chain) in base units
 async fn usdt_balance(address: &str) -> u128 {
     let data = format!("0x70a08231{:0>64}", address.trim_start_matches("0x").to_lowercase());
@@ -301,7 +317,7 @@ async fn wait_for_funds(run: &Path, payer: &Side, seller: &Side, seller_main: &W
     println!("\n== Send the test coins (only these amounts or a little more):");
     let (p, s) = (payer.name, seller.name);
     if token() {
-        println!("   {:.6} USDT (BEP20) to the {p} (pays for XMR): {}", value as f64 / 1e18, payer.address);
+        println!("   {:.6} USDT ({}) to the {p} (pays for XMR): {}", value as f64 / usdt_unit(), if solana() { "SPL" } else { "BEP20" }, payer.address);
         println!("   {} to the {p} (gas):           {}", show(payer_needs), payer.address);
     } else {
         println!("   {} to the {p} (pays for XMR):     {}", show(payer_needs), payer.address);
@@ -314,11 +330,11 @@ async fn wait_for_funds(run: &Path, payer: &Side, seller: &Side, seller_main: &W
         let b = seller_main.call("get_balance", json!({"account_index": 0})).await.unwrap_or(json!({}));
         let (total, unlocked) = (b["balance"].as_u64().unwrap_or(0), b["unlocked_balance"].as_u64().unwrap_or(0));
         let (m, t) = (coin_balance(payer).await, coin_balance(seller).await);
-        let usdt = if token() { usdt_balance(&payer.address).await } else { 0 };
+        let usdt = if token() { usdt_of(payer).await } else { 0 };
         let ready = m >= payer_needs && t >= seller_gas && unlocked >= xmr_needs && (!token() || usdt >= value);
         if ready || round % 4 == 0 {
             if token() {
-                log(format!("{p} USDT {:.6} / {:.6}", usdt as f64 / 1e18, value as f64 / 1e18));
+                log(format!("{p} USDT {:.6} / {:.6}", usdt as f64 / usdt_unit(), value as f64 / usdt_unit()));
             }
             log(format!("{p} {} / {}, {s} {} / {}, {s} XMR {} spendable ({} arrived) / {}",
                 show(m), show(payer_needs), show(t), show(seller_gas), showx(unlocked), showx(total), showx(xmr_needs)));
@@ -334,7 +350,6 @@ async fn wait_for_funds(run: &Path, payer: &Side, seller: &Side, seller_main: &W
 #[tokio::main]
 async fn main() {
     let run = PathBuf::from(std::env::args().nth(1).expect("run dir"));
-    assert!(!(solana() && token()), "USDT on Solana is not in this kit yet (its balance is an SPL token account)");
     std::fs::create_dir_all(&run).unwrap();
     let home = env("HOME", "/root");
     let accounts: Value = serde_json::from_str(&std::fs::read_to_string(env("ACCOUNTS_FILE", &format!("{home}/.config/monzero-dex/eth-sepolia-accounts.json"))).unwrap()).unwrap();
