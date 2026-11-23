@@ -1007,9 +1007,10 @@ void DexEngine::setUpXmrMarkets() {
     const auto root=m_xmrWallets->root();
     for (const auto &c:m_marketChains) {
         // Real XMR only on the pairs proven with real coins: BNB/XMR and USDT-BSC/XMR (owner's swaps,
-        // 22 Nov 2026). ETH/XMR and SOL/XMR open after their own real-funds swap (tests:
-        // MONZERO_DEX_XMR_UNTESTED=1).
-        if (mainnet && c.first!=56 && c.first!=int(DexChains::BscUsdtMainnet) && qEnvironmentVariable("MONZERO_DEX_XMR_UNTESTED")!=QLatin1String("1")) continue;
+        // 22-23 Nov 2026) and SOL/XMR (both directions, 23 Nov 2026). ETH/XMR and USDT (Solana)/XMR
+        // open after their own real-funds swap (tests: MONZERO_DEX_XMR_UNTESTED=1).
+        const bool proven=c.first==56 || c.first==int(DexChains::BscUsdtMainnet) || c.first==int(DexChains::SolMainnet);
+        if (mainnet && !proven && qEnvironmentVariable("MONZERO_DEX_XMR_UNTESTED")!=QLatin1String("1")) continue;
         QJsonObject config{{"schema","monzero-private-xmz-evm-market-v1"},{"helper",m_dexWallets->helper()},{"helperDigest",m_dexWallets->helperSha256()},
             {"tradesDir",QStringLiteral("%1/evm-trades/xmr-%2").arg(m_dexWallets->root()).arg(c.first)},{"evmRpc",c.second},
             {"chainId",c.first},{"accountIndex",0},{"mainWallet",m_xmrWallets->mainEndpoint()},{"swapWallet",m_xmrWallets->mainEndpoint()},
