@@ -14,6 +14,8 @@
 # Other runs with the same accounts (each in its own WORK folder):
 #   SIDE=sell-xmz   the maker's offer sells XMR (the maker holds the XMR and claims; the taker pays)
 #   USDT_AMOUNT=23  pair USDT-BSC/XMR: the payer locks USDT (BEP-20, at most 60) instead of BNB
+#   SOL_AMOUNT=0.2  pair SOL/XMR on Solana mainnet: the payer locks SOL (at most 0.25); the trade
+#                   accounts are the Solana keys the wallet derives from accounts 0 and 1
 #   XMR_WALLET_FROM=<wallet file>  start the seller's Monero wallet as a copy of an earlier run's
 #                   (e.g. ~/dex-real/xmr-bnb-1/run/maker/main/maker), so its XMR need not be sent again
 set -euo pipefail
@@ -22,13 +24,21 @@ ROOT=${MONZERO_ROOT:-$HOME/projects/Monzero-App}
 MONERO_DIR=${MONERO_DIR:-$ROOT/core/build/monero-official}
 SIDE=${SIDE:-buy-xmz}
 case $SIDE in buy-xmz|sell-xmz) ;; *) echo "!! SIDE is buy-xmz or sell-xmz"; exit 1;; esac
-if [ -n "${USDT_AMOUNT:-}" ]; then PAIR=USDT-BSC/XMR; COINWORD=usdt; else PAIR=BNB/XMR; COINWORD=bnb; fi
+CHAIN=56; RELAY_CHAIN='"rpc": "https://bsc-rpc.publicnode.com", "contract": "0x9073290952DCDF3225D8f65d787cF9148a490feb"'
+if [ -n "${SOL_AMOUNT:-}" ]; then PAIR=SOL/XMR; COINWORD=sol; CHAIN=501000101
+  RELAY_CHAIN='"rpc": "https://solana-rpc.publicnode.com", "solProgram": "GtbWmiCkc4c9nmEbN8tERLovA5CG3FbJQTKisaunEkLK"'
+elif [ -n "${USDT_AMOUNT:-}" ]; then PAIR=USDT-BSC/XMR; COINWORD=usdt; else PAIR=BNB/XMR; COINWORD=bnb; fi
 WORK=${WORK:-$HOME/dex-real/xmr-$COINWORD-$([ "$SIDE" = buy-xmz ] && echo 1 || echo sell-1)}
 ACCOUNTS_FILE=${ACCOUNTS_FILE:-$HOME/.config/monzero-dex/xmr-bnb-mainnet-accounts.json}
 RELAY_PORT=18797
 : "${XMR_AMOUNT:?set XMR_AMOUNT (XMR the seller sells), e.g. 0.06}"
 # A ceiling for this test (each about 50-60 GBP at November 2026 prices): a typo cannot send more
-if [ "$PAIR" = BNB/XMR ]; then
+if [ "$PAIR" = SOL/XMR ]; then
+  # Lamports (10^9 per SOL); gas in lamports too (fees and the swap account's rent)
+  VALUE_WEI=$(python3 -c "from decimal import Decimal as D; v=D('$SOL_AMOUNT'); assert 0 < v <= D('0.25'), 'SOL_AMOUNT must be above 0 and at most 0.25'; print(int(v*10**9))")
+  MAX_VALUE=250000000
+  export MAKER_GAS_WEI=${MAKER_GAS_WEI:-10000000} TAKER_GAS_WEI=${TAKER_GAS_WEI:-0}
+elif [ "$PAIR" = BNB/XMR ]; then
   : "${BNB_AMOUNT:?set BNB_AMOUNT (BNB the payer pays), e.g. 0.03, or USDT_AMOUNT}"
   VALUE_WEI=$(python3 -c "from decimal import Decimal as D; v=D('$BNB_AMOUNT'); assert 0 < v <= D('0.1'), 'BNB_AMOUNT must be above 0 and at most 0.1'; print(int(v*10**18))")
   MAX_VALUE=100000000000000000
@@ -84,11 +94,11 @@ for n in https://node.monerodevs.org:18089 https://monero.stackwallet.com:18081 
 done
 [ "$(echo "$WITNESSES" | tr ',' '\n' | grep -c .)" -ge 2 ] || { echo "!! fewer than 2 witness nodes answer; try later"; exit 1; }
 
-echo "== local relay (BNB Smart Chain, $PAIR, XMR offers on mainnet accepted: this test only)"
+echo "== local relay (chain $CHAIN, $PAIR, XMR offers on mainnet accepted: this test only)"
 mkdir -p "$WORK/relay-data"
 cat > "$WORK/relay.json" <<J
 {"listen": "127.0.0.1:$RELAY_PORT", "dataDir": "$WORK/relay-data", "xmrMainnet": true,
- "chains": [{"chainId": 56, "rpc": "https://bsc-rpc.publicnode.com", "contract": "0x9073290952DCDF3225D8f65d787cF9148a490feb", "maxValueWei": "$MAX_VALUE"}]}
+ "chains": [{"chainId": $CHAIN, $RELAY_CHAIN, "maxValueWei": "$MAX_VALUE"}]}
 J
 ( cd "$HERE/../relay" && cargo build --offline --release 2>&1 | tail -1 )
 ( cd "$ENGINE" && cargo build --offline --release --example market_e2e 2>&1 | tail -1 )
@@ -98,10 +108,10 @@ systemd-run --user --quiet --unit=dex-xmr-bnb-relay --collect "$HERE/../relay/ta
 for _ in $(seq 1 30); do curl -s -m 2 "http://127.0.0.1:$RELAY_PORT/v1/info" | grep -qF "$PAIR" && break; sleep 1; done
 curl -s -m 5 "http://127.0.0.1:$RELAY_PORT/v1/info" | grep -qF "$PAIR" || { echo "!! the relay did not come up with the $PAIR pair"; exit 1; }
 
-echo "== the trade ($SIDE, $PAIR): ${BNB_AMOUNT:-${USDT_AMOUNT:-}} ${PAIR%%/*} for $XMR_AMOUNT XMR (allow 1-2 hours once funded)"
+echo "== the trade ($SIDE, $PAIR): ${SOL_AMOUNT:-${BNB_AMOUNT:-${USDT_AMOUNT:-}}} ${PAIR%%/*} for $XMR_AMOUNT XMR (allow 1-2 hours once funded)"
 mkdir -p "$WORK/run"
 code=0
-NET=mainnet COIN=xmr CHAIN_ID=56 SIDE=$SIDE PAIR=$PAIR FUNDER_RPC=none OWNER_INDEX=0 CLAIMER_INDEX=1 \
+NET=mainnet COIN=xmr CHAIN_ID=$CHAIN SIDE=$SIDE PAIR=$PAIR FUNDER_RPC=none OWNER_INDEX=0 CLAIMER_INDEX=1 \
   ACCOUNTS_FILE=$ACCOUNTS_FILE RELAY=http://127.0.0.1:$RELAY_PORT \
   XMZ_NODE=$WALLET_NODE TRUSTED_DAEMON=$TRUSTED WITNESSES=$WITNESSES \
   WALLET_RPC_BIN=$MONERO_DIR/linux-x64/monero-wallet-rpc VALUE_WEI=$VALUE_WEI XMZ_ATOMS=$ATOMS \

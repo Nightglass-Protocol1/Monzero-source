@@ -48,9 +48,22 @@ fn chain_id() -> u64 {
     env("CHAIN_ID", if mainnet() { "56" } else { "11155111" }).parse().expect("CHAIN_ID")
 }
 
-/// The chain's own coin: BNB on BNB Smart Chain (56, 97), ETH otherwise
+/// A Solana cluster (CHAIN_ID 501000101 mainnet, or devnet): amounts in lamports, the trade
+/// accounts' Solana addresses, balances read from the cluster
+fn solana() -> bool {
+    monzero_dex_evm::Chain::from_id(chain_id()).is_some_and(|c| c.is_solana())
+}
+
+/// Base units per coin of the chain's coin: 10^9 lamports per SOL, 10^18 wei otherwise
+fn coin_unit() -> f64 {
+    if solana() { 1e9 } else { 1e18 }
+}
+
+/// The chain's own coin: SOL on Solana, BNB on BNB Smart Chain (56, 97), ETH otherwise
 fn evm_coin() -> &'static str {
-    if matches!(chain_id(), 56 | 97) {
+    if solana() {
+        "SOL"
+    } else if matches!(chain_id(), 56 | 97) {
         "BNB"
     } else {
         "ETH"
@@ -59,11 +72,22 @@ fn evm_coin() -> &'static str {
 
 fn evm_rpc() -> String {
     env("EVM_RPC", match chain_id() {
+        _ if solana() && mainnet() => "https://solana-rpc.publicnode.com",
+        _ if solana() => "https://api.devnet.solana.com",
         56 => "https://bsc-rpc.publicnode.com",
         97 => "https://bsc-testnet-rpc.publicnode.com",
         1 => "https://ethereum-rpc.publicnode.com",
         _ => "https://ethereum-sepolia-rpc.publicnode.com",
     })
+}
+
+/// A trade account's balance of the chain's coin: wei, or lamports on Solana
+async fn coin_balance(side: &Side) -> u128 {
+    if solana() {
+        let pk = monzero_dex_evm::sol::from_base58(&side.address).expect("Solana address");
+        return monzero_dex_evm::sol::balance(&evm_rpc(), &pk).await.expect("Solana RPC") as u128;
+    }
+    evm_balance(&side.address).await
 }
 
 /// An EVM account's balance in wei
@@ -227,8 +251,14 @@ impl Side {
             "swapWallet": swap_ep,
             "witnessDaemons": env("WITNESSES", "").split(',').filter(|w| !w.is_empty()).collect::<Vec<_>>(),
         });
-        log(format!("{name}: account {}", key.address()));
-        (Side { name, dir: dir.join("trade"), tick, address: key.address().to_string(), _procs: procs }, main)
+        // On Solana the trade account is the Solana key the wallet derives from the same EVM key
+        let address = if solana() {
+            monzero_dex_evm::sol::to_base58(&monzero_dex_evm::sol::account_key(&key.to_bytes().0).verifying_key().to_bytes())
+        } else {
+            key.address().to_string()
+        };
+        log(format!("{name}: account {address}"));
+        (Side { name, dir: dir.join("trade"), tick, address, _procs: procs }, main)
     }
 
     async fn call(&self, command: &str, extra: Value) -> Value {
@@ -264,7 +294,9 @@ async fn wait_for_funds(run: &Path, payer: &Side, seller: &Side, seller_main: &W
     let atoms: u64 = xmz_atoms().parse().unwrap();
     let xmr_needs = atoms + env("XMR_FEE_ATOMS", "1000000000").parse::<u64>().unwrap();
     let coin = evm_coin();
-    let show = |wei: u128| format!("{:.6} {coin}", wei as f64 / 1e18);
+    let unit = coin_unit();
+    let show = |wei: u128| format!("{:.6} {coin}", wei as f64 / unit);
+    let network = if solana() { "Solana" } else { "BNB Smart Chain (BEP20)" };
     let showx = |a: u64| format!("{:.6} XMR", a as f64 / 1e12);
     println!("\n== Send the test coins (only these amounts or a little more):");
     let (p, s) = (payer.name, seller.name);
@@ -276,12 +308,12 @@ async fn wait_for_funds(run: &Path, payer: &Side, seller: &Side, seller_main: &W
     }
     println!("   {} to the {s} (claim gas):        {}", show(seller_gas), seller.address);
     println!("   {} to the {s}'s XMR wallet:      {xmr_address}", showx(xmr_needs));
-    println!("   on BNB Smart Chain (BEP20) for {coin}; XMR needs 10 blocks (~20 min) before it can be spent.\n");
+    println!("   on {network} for {coin}; XMR needs 10 blocks (~20 min) before it can be spent.\n");
     for round in 0u64.. {
         let _ = seller_main.call("refresh", json!({})).await;
         let b = seller_main.call("get_balance", json!({"account_index": 0})).await.unwrap_or(json!({}));
         let (total, unlocked) = (b["balance"].as_u64().unwrap_or(0), b["unlocked_balance"].as_u64().unwrap_or(0));
-        let (m, t) = (evm_balance(&payer.address).await, evm_balance(&seller.address).await);
+        let (m, t) = (coin_balance(payer).await, coin_balance(seller).await);
         let usdt = if token() { usdt_balance(&payer.address).await } else { 0 };
         let ready = m >= payer_needs && t >= seller_gas && unlocked >= xmr_needs && (!token() || usdt >= value);
         if ready || round % 4 == 0 {
@@ -302,6 +334,7 @@ async fn wait_for_funds(run: &Path, payer: &Side, seller: &Side, seller_main: &W
 #[tokio::main]
 async fn main() {
     let run = PathBuf::from(std::env::args().nth(1).expect("run dir"));
+    assert!(!(solana() && token()), "USDT on Solana is not in this kit yet (its balance is an SPL token account)");
     std::fs::create_dir_all(&run).unwrap();
     let home = env("HOME", "/root");
     let accounts: Value = serde_json::from_str(&std::fs::read_to_string(env("ACCOUNTS_FILE", &format!("{home}/.config/monzero-dex/eth-sepolia-accounts.json"))).unwrap()).unwrap();
