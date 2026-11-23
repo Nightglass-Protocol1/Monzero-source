@@ -10,7 +10,8 @@ has to upgrade to stay on the network.
 
 - **XMR/BNB and XMR/USDT (BNB Chain)**: buy or sell Monero for BNB or for USDT (BEP-20) with an atomic
   swap, from the same Exchange page as the XMZ markets. Both were tested with real coins on the main
-  networks before this release (22 November 2026: BNB for XMR, and XMR for USDT).
+  networks before this release, in both directions for USDT (22 and 23 November 2026: BNB for XMR,
+  XMR for USDT, and USDT for XMR).
 - **A Monero wallet for trading**, run by the app with Monero's own official `monero-wallet-rpc`
   (v0.18.5.4, unchanged, in the package). It syncs from the project's Monero node; every XMR lock must
   also be seen by at least two independent public Monero nodes before the other side pays.
@@ -19,6 +20,8 @@ has to upgrade to stay on the network.
 - XMR against ETH and SOL, and the direct coin-for-coin pairs (ETH/BNB, ETH/SOL, BNB/SOL and their USDT
   pairs), appear as "coming soon" until their own real-funds tests are done.
 - Relays: an offer in USDT is no longer measured against the cap meant for the chain's own coin.
+- Relays: an offer that pays in USDT is backed by the maker's fee coin, as direct offers already were
+  (the relay compared the maker's BNB with the USDT amount and refused every USDT offer that buys).
 
 ## Before you trade
 
@@ -27,7 +30,7 @@ has to upgrade to stay on the network.
 - Keep the wallet open until a trade is finished. If it closes, open it again: the trade resumes,
   or refunds after its time limit. See https://monzero.org/dex/recovery/.
 - A Monero trade takes longer than an XMZ one: the XMR lock needs 10 Monero blocks (about 20 minutes)
-  and the witnesses' confirmation. The first real-funds trades took 45 to 50 minutes.
+  and the witnesses' confirmation. The real-funds trades took 37 to 52 minutes.
 
 ## Packaged platforms
 
