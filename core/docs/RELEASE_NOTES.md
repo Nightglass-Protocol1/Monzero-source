@@ -8,20 +8,22 @@ has to upgrade to stay on the network.
 
 ## What is new
 
-- **XMR/BNB and XMR/USDT (BNB Chain)**: buy or sell Monero for BNB or for USDT (BEP-20) with an atomic
+- **XMR/BNB, XMR/USDT (BNB Chain) and XMR/SOL**: buy or sell Monero for BNB, USDT (BEP-20) or SOL with an atomic
   swap, from the same Exchange page as the XMZ markets. Both were tested with real coins on the main
-  networks before this release, in both directions for USDT (22 and 23 November 2026: BNB for XMR,
-  XMR for USDT, and USDT for XMR).
+  networks before this release, in both directions for USDT and SOL (22 and 23 November 2026: BNB for XMR,
+  XMR for USDT, USDT for XMR, SOL for XMR and XMR for SOL).
 - **A Monero wallet for trading**, run by the app with Monero's own official `monero-wallet-rpc`
   (v0.18.5.4, unchanged, in the package). It syncs from the project's Monero node; every XMR lock must
   also be seen by at least two independent public Monero nodes before the other side pays.
 - **XMR/XMZ** shows as one tile: it is two swaps (XMZ for BNB or USDT, then that for XMR), with a stop
   between them.
-- XMR against ETH and SOL, and the direct coin-for-coin pairs (ETH/BNB, ETH/SOL, BNB/SOL and their USDT
+- XMR against ETH and against USDT on Solana, and the direct coin-for-coin pairs (ETH/BNB, ETH/SOL, BNB/SOL and their USDT
   pairs), appear as "coming soon" until their own real-funds tests are done.
 - Relays: an offer in USDT is no longer measured against the cap meant for the chain's own coin.
 - Relays: an offer that pays in USDT is backed by the maker's fee coin, as direct offers already were
   (the relay compared the maker's BNB with the USDT amount and refused every USDT offer that buys).
+- A trade reads the Monero wallet's height only once the wallet has synced: a wallet made seconds
+  before a trade said height 0 and the trade's Monero wallet set out to scan the whole chain.
 
 ## Before you trade
 
