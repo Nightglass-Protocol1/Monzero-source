@@ -212,13 +212,26 @@ fn parse_amount(text: &str, what: &str) -> Result<U256, String> {
     t.parse().map_err(|_| format!("{what} is out of range"))
 }
 
+/// The private coin's chain height as the main wallet sees it once synced. The trade's swap wallet
+/// scans from here, so a wallet that has not synced yet must not answer: a Monero wallet made
+/// seconds before a trade said height 0 and its swap wallet set out to scan all 3.8 million blocks
+/// (SOL/XMR real-funds run, 23 Nov 2026). `refresh` first brings it up to the chain's tip.
+async fn synced_height(cfg: &TickConfig) -> Result<u64, String> {
+    let main = rpc(&cfg.main_wallet)?;
+    main.call("refresh", json!({})).await.map_err(|e| format!("syncing the wallet: {e}"))?;
+    let h = main.call("get_height", json!({})).await.map_err(|e| e.to_string())?["height"].as_u64().ok_or("the XMZ wallet gave no height")?;
+    if h <= 1 {
+        return Err("the wallet has not synced with its network yet; try again in a minute".into());
+    }
+    Ok(h)
+}
+
 /// The EVM clock and head, and the XMZ height: what a saved trade records
 async fn heights(cfg: &TickConfig, chain: Chain, evm_from_block: Option<u64>) -> Result<Heights, String> {
     crate::helper::step("reading the coin's network");
     if chain.is_solana() {
         let (now, slot) = crate::sol::clock(&cfg.evm_rpc).await.map_err(|e| e.to_string())?;
-        let main = rpc(&cfg.main_wallet)?;
-        let xmz = main.call("get_height", json!({})).await.map_err(|e| e.to_string())?["height"].as_u64().ok_or("the XMZ wallet gave no height")?;
+        let xmz = synced_height(cfg).await?;
         return Ok(Heights { now, evm_from_block: evm_from_block.unwrap_or(slot), xmz_restore_height: xmz.saturating_sub(1) });
     }
     let provider = ProviderBuilder::new().connect_reqwest(crate::chain::http_client(), cfg.evm_rpc.parse().map_err(|e| format!("evmRpc: {e}"))?);
@@ -228,8 +241,7 @@ async fn heights(cfg: &TickConfig, chain: Chain, evm_from_block: Option<u64>) ->
         .await
         .map_err(|e| e.to_string())?
         .ok_or("the EVM head block is not available")?;
-    let main = rpc(&cfg.main_wallet)?;
-    let xmz = main.call("get_height", json!({})).await.map_err(|e| e.to_string())?["height"].as_u64().ok_or("the XMZ wallet gave no height")?;
+    let xmz = synced_height(cfg).await?;
     Ok(Heights { now: block.header.timestamp, evm_from_block: evm_from_block.unwrap_or(head), xmz_restore_height: xmz.saturating_sub(1) })
 }
 
