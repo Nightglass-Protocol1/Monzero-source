@@ -23,7 +23,12 @@ PKGS=(systemd-sysv systemd-timesyncd systemd-resolved dbus sudo openssh-server c
       x11vnc novnc python3-websockify python3-pil hsetroot kbd)
 case "$KIND" in
   vm) PKGS+=(linux-image-amd64 systemd-boot systemd-boot-efi qemu-guest-agent xserver-xorg-video-qxl xserver-xorg-video-vmware) ;;
-  pi) PKGS+=(wpasupplicant) ;;   # Raspberry Pi OS brings its own kernel, firmware and network setup
+  # Raspberry Pi OS brings its own kernel, firmware and network setup. The 64-bit ARM wallet
+  # (linux-aarch64-gui) is linked against the system's Qt 5.15 and Boost 1.83: their runtime packages
+  pi) PKGS+=(wpasupplicant
+        libboost-chrono1.83.0t64 libboost-filesystem1.83.0 libboost-program-options1.83.0 libboost-serialization1.83.0 libboost-thread1.83.0 libgcrypt20 libhidapi-libusb0 libprotobuf32t64 libreadline8t64 libsodium23 libssl3t64 libunbound8
+        libusb-1.0-0 libzmq5 libqt5core5t64 libqt5gui5t64 libqt5network5t64 libqt5qml5 libqt5quick5 libqt5quicktest5 libqt5widgets5t64 libqt5svg5 qml-module-qtquick2 qml-module-qtquick-layouts
+        qml-module-qtquick-controls qml-module-qtquick-controls2 qml-module-qtquick-templates2 qml-module-qtquick-dialogs qml-module-qtquick-privatewidgets qml-module-qtgraphicaleffects qml-module-qtquick-window2 qml-module-qtqml-models2 qml-module-qt-labs-platform qml-module-qt-labs-folderlistmodel qml-module-qt-labs-settings qml-module-qtmultimedia) ;;
 esac
 apt-get install -y -qq --no-install-recommends "${PKGS[@]}" >/dev/null
 

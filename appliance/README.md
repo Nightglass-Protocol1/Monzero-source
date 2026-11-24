@@ -17,8 +17,8 @@ What a box can run (you choose on the setup page):
   carries, with no router setup and without showing your home IP. You can share it through a
   router port instead, or keep it private.
 - **Wallet + DEX app**: the desktop wallet with the Exchange page, on the box's own screen
-  (HDMI) or in your browser (remote screen, off unless you turn it on). Not on Raspberry Pi
-  until a 64-bit ARM wallet app is released.
+  (HDMI) or in your browser (remote screen, off unless you turn it on). On Raspberry Pi from
+  the release that carries the 64-bit ARM wallet (linux-aarch64-gui, v1.3.8 on).
 
 ## Virtual machine
 
