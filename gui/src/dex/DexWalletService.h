@@ -33,6 +33,8 @@ public:
     QString daemonHost() const {return m_daemonHost;}
     bool start();
     void stop();
+    // At quit: every service of this coin ended before the app goes (none left running)
+    void stopNow();
     bool ready() const {return m_state=="ready";}
     QJsonObject mainEndpoint() const;
     QVariantMap status() const;

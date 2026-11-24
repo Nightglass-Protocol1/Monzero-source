@@ -1986,6 +1986,12 @@ bool DexEngine::configureBchRefundWalletService(const QString &path) {
     }
     emit bchRefundWalletChanged();return true;
 }
+void DexEngine::shutdownWalletServices() {
+    // A running trade carries on from its saved state next time; its services must not outlive the app
+    m_dexWallets->stopNow();
+    m_xmrWallets->stopNow();
+}
+
 void DexEngine::shutdownBchRefundWalletService() {
     if (!m_bchRefundWalletService) return;
     if (m_bchRefundWalletServiceAttach) m_bchRefundWalletServiceAttach->stop();

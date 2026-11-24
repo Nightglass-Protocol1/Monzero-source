@@ -19,6 +19,10 @@ on the network.
   a running one says "matched: trade in progress". The amount column names its coin (XMZ or XMR).
 - **Funds, Send XMR**: the Monero address has its own line; the amount box no longer squeezes it.
 - **24h volume** shows a dash when there were no trades, like the other figures.
+- **Upgrading in a new folder**: the exchange's wallet programs from the old version could stay running
+  after it closed, and the new version then would not start its trading wallets, so XMR and USDT pairs
+  showed as "coming soon". The wallet now stops them when it quits, and on start it also ends ones left
+  by an earlier version (only the ones serving its own exchange folder).
 
 ## What is new
 

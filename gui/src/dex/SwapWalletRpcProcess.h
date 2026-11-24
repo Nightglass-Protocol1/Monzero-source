@@ -27,6 +27,8 @@ public:
     bool startBoundWithDigest(const QString &program,const QString &expectedSha256,
         const QString &directory,const QString &tradeId,quint16 daemonPort,quint16 walletPort);
     void stop();
+    // At quit: end the service now (it saves its wallet on SIGTERM), waiting up to waitMs, then kill
+    void stopNow(int waitMs);
     // The XMZ network of the daemon ("--testnet" or "--stagenet"; none for mainnet). Before start.
     bool setNetworkFlag(const QString &flag);
     // The node the wallet reads the chain from: 127.0.0.1 (the app's own node, the default) or a

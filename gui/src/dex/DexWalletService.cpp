@@ -103,7 +103,12 @@ bool DexWalletService::stopLeftover(const QString &serviceDir,const QString &pid
     bool ok=false;const auto pid=f.readAll().trimmed().toLongLong(&ok);
     if (!ok || pid<=1) return false;
     const auto proc=QStringLiteral("/proc/%1").arg(pid);
-    if (QFileInfo(proc+"/exe").symLinkTarget()!=QFileInfo(m_walletRpc).canonicalFilePath()) return false;
+    // This build's wallet RPC, or the same program of an earlier version installed in another folder
+    // (an upgrade unpacks next to the old one): the service's own wallet folder in its command line
+    // (checked below) makes it ours
+    const auto exe=QFileInfo(proc+"/exe").symLinkTarget();
+    const auto exeName=QFileInfo(exe).fileName();
+    if (exe!=QFileInfo(m_walletRpc).canonicalFilePath() && exeName!=QLatin1String("monzero-wallet-rpc") && exeName!=QLatin1String("monero-wallet-rpc")) return false;
     QFile cmd(proc+"/cmdline");
     if (!cmd.open(QIODevice::ReadOnly) || !cmd.readAll().split('\0').contains(QFile::encodeName(serviceDir+"/wallets"))) return false;
     ::kill(pid_t(pid),SIGTERM);
@@ -202,6 +207,16 @@ QJsonObject DexWalletService::utxoLocal() const {
         {"sourceWalletPort",m_walletPort},{"sourceLoginFile",m_main->loginFile()},{"sourceAddress",address},
         {"observerWalletPort",m_observerPort},{"observerLoginFile",m_observer->loginFile()},
         {"walletPasswordFile",m_root+"/claim-wallet.password"}};
+}
+
+void DexWalletService::stopNow() {
+    m_poll.stop();m_stopping=true;
+    // Ask all to end first (each saves its wallet), then wait for each
+    QList<SwapWalletRpcProcess*> all;
+    for (SwapWalletRpcProcess *s:{m_main.data(),m_claim.data(),m_observer.data()}) if (s) all.append(s);
+    for (const auto &s:m_trades) if (s) all.append(s);
+    for (auto *s:all) s->stop();
+    for (auto *s:all) s->stopNow(8000);
 }
 
 void DexWalletService::stop() {

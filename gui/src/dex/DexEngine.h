@@ -214,6 +214,8 @@ public:
     bool configureBchRefundWalletService(const QString &path);
     // Blocking clean stop for application shutdown (bounded by the service's own kill timer).
     void shutdownBchRefundWalletService();
+    // At quit: the XMZ and Monero trading-wallet services (and running trades' swap wallets) ended
+    void shutdownWalletServices();
     bool submitBchRefundWallet(const QString &commitment,QByteArray &&password);
     Q_INVOKABLE bool approveBchRefundWallet(const QString &commitment,const QString &password,const QString &confirmation,bool approved);
     Q_INVOKABLE bool requestBchRefundWalletReview(const QString &action);
