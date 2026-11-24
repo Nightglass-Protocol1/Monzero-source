@@ -261,6 +261,17 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         return wallets.send(homeAddress, "");
     }
 
+    /** Every trade of this wallet (XMZ and Monero pairs) as CSV: {ok, csv, rows}, or null when the helper gave no answer */
+    void tradeHistory(DexHelper.Done done) {
+        try {
+            final JSONObject request = new JSONObject().put("schema", DexHelper.REQUEST_SCHEMA).put("command", "history")
+                    .put("tradeDir", new File(root, "evm-trades").getPath());
+            helper.run(request, 60000, 16 * 1024 * 1024, done);
+        } catch (Exception e) {
+            done.done(null);
+        }
+    }
+
     // ---- the Monero trading wallet --------------------------------------------------------------
 
     /** Whether this build can trade Monero pairs (it has Monero's wallet RPC for this phone) */

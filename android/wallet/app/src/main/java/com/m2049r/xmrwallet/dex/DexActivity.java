@@ -34,7 +34,8 @@ public class DexActivity extends SecureActivity {
     public static final String EXTRA_HOME = "home", EXTRA_DAEMON = "daemon";
     private SwitchCompat link;
     private TextView status;
-    private Button pending, back, words, disconnect;
+    private Button pending, back, words, disconnect, export;
+    private static final int REQUEST_EXPORT = 7301;
     private final Runnable refresh = this::refresh;
 
     /** From an open wallet: its address is where trading XMZ goes back to, its node the one the trading wallet uses. */
@@ -90,6 +91,48 @@ public class DexActivity extends SecureActivity {
             if (s != null) s.engine().post(() -> s.bridge().disconnectPage());
         });
         words.setOnClickListener(v -> askWords());
+        // The trade history as a CSV file wherever the user saves it (Android's own save screen: no permission needed)
+        export = findViewById(R.id.dexExport);
+        export.setOnClickListener(v -> {
+            final DexService s = DexService.get();
+            if (s == null || s.engine() == null) {
+                Toast.makeText(this, R.string.dex_export_off, Toast.LENGTH_LONG).show();
+                return;
+            }
+            final String day = new java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.ROOT).format(new java.util.Date());
+            final Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("text/csv")
+                    .putExtra(Intent.EXTRA_TITLE, "monzero-dex-trades-" + day + ".csv");
+            try {
+                startActivityForResult(save, REQUEST_EXPORT);
+            } catch (android.content.ActivityNotFoundException e) {
+                Toast.makeText(this, getString(R.string.dex_export_failed, "no file app"), Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_EXPORT || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        final Uri target = data.getData();
+        final DexService s = DexService.get();
+        if (s == null || s.engine() == null) return;
+        final android.content.Context app = getApplicationContext();
+        s.engine().post(() -> s.engine().tradeHistory(answer -> {
+            String message;
+            if (answer == null || !answer.optBoolean("ok", true) || !answer.has("csv")) {
+                message = app.getString(R.string.dex_export_failed, answer == null ? "no answer" : answer.optString("error"));
+            } else {
+                try (java.io.OutputStream out = app.getContentResolver().openOutputStream(target, "w")) {
+                    out.write(answer.optString("csv").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    message = app.getString(R.string.dex_export_done, answer.optInt("rows"));
+                } catch (Exception e) {
+                    message = app.getString(R.string.dex_export_failed, String.valueOf(e.getMessage()));
+                }
+            }
+            final String shown = message;
+            runOnUiThread(() -> Toast.makeText(app, shown, Toast.LENGTH_LONG).show());
+        }));
     }
 
     @Override

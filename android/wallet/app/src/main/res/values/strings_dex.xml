@@ -70,6 +70,10 @@
     <string name="dex_direct_approve_body">You pay %1$s\nYou receive %2$s\n\nYou pay on: %3$s\nYou receive on: %4$s\nThese amounts are from the signed offer this wallet holds, not from the web page. Once approved the swap runs by itself; keep the DEX link on and the phone connected until it is finished. If the other side does not lock its coin, yours comes back after its time limit (about 9 hours).\n\nWhat you receive goes to %5$s</string>
     <string name="dex_approve">Approve</string>
     <string name="dex_approve_cancel">Cancel this trade</string>
+    <string name="dex_export">Export trade history (CSV)</string>
+    <string name="dex_export_done">%1$d trade(s) saved.</string>
+    <string name="dex_export_failed">The trade history could not be saved: %1$s</string>
+    <string name="dex_export_off">Turn the DEX link on first: its trade helper reads the history.</string>
     <string name="dex_xmr_add_title">Add XMR for trading</string>
     <string name="dex_xmr_add_body">Send %1$s to your Monero trading wallet from Cake Wallet or any Monero wallet:
 

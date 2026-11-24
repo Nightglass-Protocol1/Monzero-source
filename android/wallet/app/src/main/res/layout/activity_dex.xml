@@ -70,6 +70,13 @@
             android:text="@string/dex_words" />
 
         <Button
+            android:id="@+id/dexExport"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/dex_export" />
+
+        <Button
             android:id="@+id/dexDisconnect"
             style="?android:attr/borderlessButtonStyle"
             android:layout_width="match_parent"
