@@ -4,6 +4,13 @@ Back up wallet files, mnemonic seeds and the node data directory before
 replacing any binary. Never enter a Monero seed into Monzero or a Monzero seed
 into Monero.
 
+## v1.3.10: Exchange fixes, smaller Monero parts, market price
+
+No consensus change. Close the old wallet and node, unpack v1.3.10 and start it: same wallet files,
+node data, trading keys and trading wallets. A running trade carries on. To go back, start the v1.3.9
+files again (Monero partial offers with parts under 0.1 XMR are then not shown). Relays: update them
+first.
+
 ## v1.3.9: Funds tab fix, 64-bit ARM wallet
 
 No consensus change. Close the old wallet and node, unpack v1.3.9 and start it: same wallet files,

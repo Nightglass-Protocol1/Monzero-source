@@ -1,3 +1,49 @@
+# Monzero v1.3.10 release notes
+
+Release label: v1.3.10
+
+Monzero v1.3.10 polishes the Exchange: small Monero offers can be split, every pair shows a market
+price, and finished trades read as finished. It changes no consensus rule: the chain, blocks, coins,
+wallets, seeds and addresses are the same as in v1.0.0 to v1.3.9, and nobody has to upgrade to stay
+on the network.
+
+## What is fixed
+
+- **Partial fills on Monero pairs**: the smallest part of a partial offer was a fixed number of atoms
+  meant as 1 XMZ, which on Monero (12 decimal places) came to 0.1 XMR, so an offer under 0.2 XMR could
+  not be split and a sell of 0.06 XMR was refused. The smallest part is now 0.001 XMR, some 30 times a
+  Monero transfer's network fee. XMZ pairs keep 1 XMZ.
+- **Offers too small to split** are posted whole, with a note, instead of being refused while
+  "Allow partial fills" is on.
+- **My orders**: a finished trade shows "finished" instead of "matched: see the trade above" forever;
+  a running one says "matched: trade in progress". The amount column names its coin (XMZ or XMR).
+- **Funds, Send XMR**: the Monero address has its own line; the amount box no longer squeezes it.
+- **24h volume** shows a dash when there were no trades, like the other figures.
+
+## What is new
+
+- **Market price on Monero pairs**: the chart draws an amber "Market" line from XMR's hourly USD price
+  (monzero.org/markets), in USD or the pair's coin, so a pair with no swaps yet still shows the price.
+- **Market hint on limit orders**: under the price, "Market: … per XMR (or XMZ)" and how far your price
+  is from it, in amber past 10%. Click it to use the market price.
+- **Pair tiles**: the pairs still to come fold into one "+N more pairs" tile; both USDTs are named the
+  same way everywhere, "USDT (SOL)" and "USDT (BNB)".
+
+## Relay operators
+
+Update relays to the v1.3.10 relay before wallets post the smaller Monero parts: an older relay (and
+an older wallet) refuses a Monero partial offer whose smallest part is under 0.1 XMR. Wallets before
+v1.3.10 do not show such offers; everything else trades between versions as before.
+
+Everything else is as in v1.3.9, below.
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.10 into a new folder and start it; it uses the same wallet files,
+node data, trading keys and Monero trading wallet. A Monzero Box updates itself within a day.
+
+---
+
 # Monzero v1.3.9 release notes
 
 Release label: v1.3.9
