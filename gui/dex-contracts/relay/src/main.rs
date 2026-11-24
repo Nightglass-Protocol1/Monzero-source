@@ -83,6 +83,21 @@ struct Config {
     /// Box: announce this relay to hubs (absent: it does not)
     #[serde(default)]
     announce: Option<AnnounceConfig>,
+    /// The operator's control key (hex): this relay mirrors the signed control documents it
+    /// verifies with it (wallets still find a current one when the website is down)
+    #[serde(default = "default_control_key")]
+    control_key: String,
+    /// Where the documents are fetched from every 10 minutes ("": only those posted here)
+    #[serde(default = "default_control_source")]
+    control_source: String,
+}
+
+fn default_control_key() -> String {
+    "9eba2b1784ddfc23f028c03c78f862fecc81af81616722b56e671e6662e0a6fb".into()
+}
+
+fn default_control_source() -> String {
+    "https://monzero.org/dex/control/".into()
 }
 
 #[derive(Deserialize)]
@@ -366,6 +381,20 @@ async fn main() {
 
     let api = Arc::new(Api::new(relay.clone(), config.peers.clone(), config.trust_proxy));
     let mut app = router(api);
+    // The signed control documents, mirrored (see monzero_dex_relay::control)
+    let control = monzero_dex_relay::control::ControlMirror::new(&config.control_key, config.data_dir.join("control")).unwrap_or_else(|e| fail(e));
+    if !config.control_source.is_empty() {
+        let (keep, source) = (control.clone(), config.control_source.clone());
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).user_agent("monzero-dex-relay").build().expect("client");
+            let mut tick = tokio::time::interval(Duration::from_secs(600));
+            loop {
+                tick.tick().await;
+                keep.refresh_from(&client, &source).await;
+            }
+        });
+    }
+    app = app.merge(monzero_dex_relay::control::router(control));
     if let Some(mesh) = &mesh {
         app = app.merge(monzero_dex_relay::mesh::router(mesh.clone()));
     }

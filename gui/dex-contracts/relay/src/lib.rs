@@ -10,6 +10,7 @@ pub mod chain;
 pub mod http;
 pub mod sponsor;
 pub mod mesh;
+pub mod control;
 
 use alloy::primitives::{Address, Bytes, B256, U256};
 use monzero_dex_evm::mail::MAX_SEALED;
