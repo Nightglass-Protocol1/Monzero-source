@@ -40,7 +40,7 @@ ColumnLayout {
     property string directPair: ""          // the direct pair picked in the pair row ("BNB/ETH")
     function pickDirect(p) { directPair = p; pick("DIRECT") }
     // A direct pair as people read it: Solana's USDT and BNB Chain's named by their chains
-    function directCoin(t) { return t === "USDT" ? "USDT-SOL" : t }
+    function directCoin(t) { return label(t) }   // one name for each coin on every tile: "USDT (SOL)", "USDT (BNB)"
     function directLabel(p) {
         var x = String(p).split("/")
         if (x[1] === "XMR") x = [x[1], x[0]]   // Monero pairs read XMR first
@@ -62,6 +62,7 @@ ColumnLayout {
     })
     readonly property var soonPairs: announcedPairs.filter(function (p) { return livePairs.indexOf(p) < 0 && xmrLive.indexOf(p) < 0 })
     property string soonPair: ""            // the coming-soon pair picked in the pair row
+    property bool soonOpen: false           // the coming-soon tiles are folded into one tile until opened
     readonly property bool soonMode: coin === "SOON"
     readonly property bool routeMode: coin === "ROUTE"
     // The XMZ pair screens (stats, chart, book, form, orders) give way to a direct or coming-soon pair
@@ -405,6 +406,7 @@ ColumnLayout {
             delegate: Rectangle {
                 objectName: "pair_" + modelData
                 readonly property bool active: ex.soonMode && ex.soonPair === modelData
+                visible: ex.soonOpen || active
                 width: 136; height: 44; radius: 6
                 color: active ? M.Style.surfaceRaised : "transparent"
                 border.color: active ? M.Style.accent : M.Style.accentMuted
@@ -417,6 +419,20 @@ ColumnLayout {
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.pickSoon(modelData) }
             }
+        }
+        // One tile for every pair still to come: opens (and folds) their tiles
+        Rectangle {
+            objectName: "soonToggle"
+            visible: ex.soonPairs.length > 0
+            width: 136; height: 44; radius: 6
+            color: "transparent"; border.color: M.Style.accentMuted; opacity: 0.8
+            Column {
+                anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
+                spacing: 2
+                Text { objectName: "soonToggleText"; text: ex.soonOpen ? qsTr("Fewer pairs") : qsTr("+%n more pairs", "", ex.soonPairs.length); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
+                Text { text: ex.soonOpen ? qsTr("hide coming soon") : qsTr("coming soon"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
+            }
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.soonOpen = !ex.soonOpen }
         }
     }
 

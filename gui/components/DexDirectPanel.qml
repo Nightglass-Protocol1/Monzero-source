@@ -46,7 +46,7 @@ ColumnLayout {
     // Solana's coin and its USDT share the Solana trade account; the EVM coins and BNB Chain's USDT the other
     function accountOf(coin) { return coin === "SOL" || coin === "USDT" ? (wallet.solTradeAccount || "") : (wallet.tradeAccount || "") }
     // Solana's USDT and BNB Chain's, named by their chains
-    function label(coin) { return coin === "USDT" ? "USDT-SOL" : coin }
+    function label(coin) { return coin === "USDT" ? "USDT (SOL)" : coin === "USDT-BSC" ? "USDT (BNB)" : coin }
     function mine(l) { return String(l.maker || "").toLowerCase() === String(wallet.tradeAccount || "").toLowerCase() }
     // The pair's book: asks give the base (cheapest first), bids want it (dearest first)
     function side(which) {

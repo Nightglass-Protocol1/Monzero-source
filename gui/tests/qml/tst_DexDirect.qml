@@ -173,9 +173,9 @@ Item {
         }
         function test_usdt_coins_are_named_by_their_chains() {
             var p = panel()
-            compare(p.label("USDT"), "USDT-SOL")
-            compare(p.label("USDT-BSC"), "USDT-BSC")
-            compare(ex.directLabel("ETH/USDT"), "ETH / USDT-SOL")
+            compare(p.label("USDT"), "USDT (SOL)")
+            compare(p.label("USDT-BSC"), "USDT (BNB)")
+            compare(ex.directLabel("ETH/USDT"), "ETH / USDT (SOL)")
             compare(p.accountOf("USDT"), "11111111111111111111111111111112")   // Solana's USDT: the Solana trade account
             compare(p.accountOf("USDT-BSC"), root.me)
         }
