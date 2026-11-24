@@ -22,6 +22,10 @@ Rectangle {
     property var usd: ({})                   // coin -> USD price now
     property var usdHistory: ({})            // coin -> [[seconds, usd], …] hourly, recent days
     property var noir: null                  // NoirTrade's market: {last, stale, trades: [[ms, USDT per XMZ], …]}
+    // The amber reference line's name: NoirTrade on XMZ pairs; on Monero pairs the market price
+    // (XMR's USD price, hourly, from monzero.org/markets), so a pair with no swaps still has a price
+    property string refName: "NoirTrade"
+    property string refTip: ""               // its tooltip ("" = NoirTrade's)
     property int interval: 3600
     property real bestBid: 0                 // in the pair's coin
     property real bestAsk: 0
@@ -88,9 +92,10 @@ Rectangle {
                 spacing: 5
                 Rectangle { width: 14; height: 2; color: chart.noirColor; anchors.verticalCenter: parent.verticalCenter }
                 Text {
-                    text: chart.noir && chart.noir.stale ? qsTr("NoirTrade (old)") : qsTr("NoirTrade")
+                    objectName: "refLegend"
+                    text: chart.noir && chart.noir.stale ? qsTr("%1 (old)").arg(chart.refName) : chart.refName
                     color: M.Style.dimmedFontColor; font.pixelSize: 12
-                    M.Tooltip { id: noirTip; anchors.fill: parent; text: chart.inUsd ? chart.b(qsTr("The last trade on NoirTrade (XMZ/USDT)"))
+                    M.Tooltip { id: noirTip; anchors.fill: parent; text: chart.refTip !== "" ? chart.refTip : chart.inUsd ? chart.b(qsTr("The last trade on NoirTrade (XMZ/USDT)"))
                                                                                    : chart.b(qsTr("The last trade on NoirTrade (XMZ/USDT), in %1 at its USD price then")).arg(chart.coinName) }
                     MouseArea { anchors.fill: parent; hoverEnabled: true; onEntered: noirTip.tooltipPopup.open(); onExited: noirTip.tooltipPopup.close() }
                 }
@@ -160,7 +165,7 @@ Rectangle {
                 color: M.Style.dimmedFontColor; font.pixelSize: 13
                 text: chart.loading ? qsTr("Loading the chart…")
                       : (chart.inUsd ? qsTr("No completed swaps in this time range yet.") : chart.b(qsTr("No completed %1/XMZ swaps in this time range yet.")).arg(chart.coinName))
-                        + (chart.noirLine.length ? " " + qsTr("The amber line is NoirTrade.") : "")
+                        + (chart.noirLine.length ? " " + qsTr("The amber line is %1.").arg(chart.refName === "NoirTrade" ? "NoirTrade" : qsTr("the market price")) : "")
                         + (chart.bid > 0 || chart.ask > 0 ? " " + qsTr("The dashed lines are the best offers now.") : "")
             }
         }
@@ -189,7 +194,7 @@ Rectangle {
     }
     function readout() {
         var fmt = chart.interval >= 86400 ? "d MMM yyyy" : "d MMM HH:mm"
-        var n = noirAt(chart.hoverT), noirText = n !== null ? "  " + qsTr("NoirTrade %1").arg(money(n)) : ""
+        var n = noirAt(chart.hoverT), noirText = n !== null ? "  " + chart.refName + " " + money(n) : ""
         if (chart.drawn === "candles" && chart.hover >= 0 && chart.hover < chart.candles.length) {
             var c = chart.candles[chart.hover], change = c.o > 0 ? (c.c - c.o) / c.o * 100 : 0
             return Qt.formatDateTime(new Date(c.t * 1000), fmt) + "  O " + X.price(c.o) + "  H " + X.price(c.h) + "  L " + X.price(c.l)

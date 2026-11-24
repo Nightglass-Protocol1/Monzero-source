@@ -102,6 +102,14 @@ ColumnLayout {
     property string withdrawError: ""      // the Withdraw button's own refusal (before the helper runs)
     property var noir: null                // NoirTrade's XMZ/USDT market (from monzero.org), for the chart
     property var usdHistory: ({})          // coin -> [[seconds, usd], …] hourly, to value each swap at its time
+    // Monero's market price as a reference line, in NoirTrade's form ({last, stale, trades: [[ms, USD]]}):
+    // XMR's hourly USD price and the price now; the chart turns it into the pair's coin
+    readonly property var xmrMarketRef: {
+        var h = usdHistory.XMR || [], t = []
+        for (var i = 0; i < h.length; ++i) t.push([Number(h[i][0]) * 1000, Number(h[i][1])])
+        if (usd.XMR > 0) t.push([now * 1000, usd.XMR])
+        return t.length ? { last: usd.XMR || 0, stale: false, trades: t } : null
+    }
     property var balances: ({})            // coin -> trade account balance (coin)
     property string localError: ""
     property string pickedId: ""
@@ -595,7 +603,10 @@ ColumnLayout {
             interval: ex.interval
             bestBid: ex.book.bestBid
             bestAsk: ex.book.bestAsk
-            noir: ex.xmrPair ? null : ex.noir
+            noir: ex.xmrPair ? ex.xmrMarketRef : ex.noir
+            refName: ex.xmrPair ? qsTr("Market") : "NoirTrade"
+            refTip: ex.xmrPair ? (inUsd ? qsTr("Monero's market price in USD (hourly, from monzero.org/markets)")
+                                        : qsTr("Monero's market price in %1: XMR's USD price over %1's, hourly (monzero.org/markets)").arg(ex.label(ex.coin))) : ""
             loading: Object.keys(ex.prints).length === 0
             now: ex.now
             onIntervalPicked: ex.interval = seconds
@@ -629,6 +640,7 @@ ColumnLayout {
             coinDecimals: ex.coinDecimals
             book: ex.book
             coinUsd: ex.coinUsd
+            marketUsd: ex.xmrPair ? (ex.usd.XMR || 0) : (ex.noir && !ex.noir.stale ? Number(ex.noir.last) || 0 : 0)
             coinBalance: ex.coinBalance
             xmzBalance: ex.xmrPair ? ex.xmrBalance : ex.xmzBalance
             blockedReason: ex.blockedReason !== "" ? ex.blockedReason

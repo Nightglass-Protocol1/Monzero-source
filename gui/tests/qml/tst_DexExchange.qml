@@ -303,6 +303,23 @@ Item {
             press("orderButton"); press("orderButton")
             compare(JSON.stringify(engine.calls), JSON.stringify([["postXmr", 11155111, "buy-xmz", "0.00045", "0.0015", 6, ""]]))
             find(ex, "orderAmount").text = "0.25"; verify(f.partialOn)
+            // With no swaps, the chart still has Monero's market price (XMR's USD over ETH's), and the
+            // form shows it beside a limit price, warning when that is far from it
+            var oldUsd = ex.usd, oldHist = ex.usdHistory
+            ex.usdHistory = { XMR: [[ex.now - 7200, 480], [ex.now - 3600, 490]], ETH: [[ex.now - 7200, 2000], [ex.now - 3600, 2000]] }
+            ex.usd = { ETH: 2000, XMR: 500 }
+            var chart = find(ex, "exchangeChart")
+            chart.unit = "coin"
+            verify(chart.noirLine.length > 0)
+            compare(chart.noirLine[chart.noirLine.length - 1].p, 0.25)
+            compare(find(ex, "refLegend").text, "Market")
+            compare(f.marketPrice, 0.25)
+            find(ex, "limitPrice").text = "0.3"
+            compare(find(ex, "marketHint").text, "Market: 0.25 ETH per XMR · yours is 20% above")
+            verify(find(ex, "marketHint").far)
+            find(ex, "limitPrice").text = "0.26"; verify(!find(ex, "marketHint").far)
+            chart.unit = "USD"; compare(chart.noirLine[chart.noirLine.length - 1].p, 500)
+            ex.usd = oldUsd; ex.usdHistory = oldHist
             // Back to the XMZ pair
             ex.pick("SOL")
             verify(!ex.xmrPair); compare(ex.base, "XMZ"); compare(find(ex, "exchangeForm").base, "XMZ")

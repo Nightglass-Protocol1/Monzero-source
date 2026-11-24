@@ -14,6 +14,10 @@ Rectangle {
     property int coinDecimals: 18
     property var book: ({ asks: [], bids: [], bestAsk: 0, bestBid: 0 })
     property real coinUsd: 0
+    property real marketUsd: 0             // the market's USD price of the coin bought and sold (0: not known)
+    // The market price in the pair's coin, and how far a limit price is from it (in percent)
+    readonly property real marketPrice: marketUsd > 0 && coinUsd > 0 ? marketUsd / coinUsd : 0
+    readonly property real offMarket: marketPrice > 0 && limitPrice > 0 ? (limitPrice / marketPrice - 1) * 100 : 0
     property real coinBalance: -1          // the trade account's coin (-1: not known yet)
     property real xmzBalance: -1           // the trading wallet's unlocked XMZ (-1: not known yet)
     // The coin bought and sold: XMZ, or Monero on an XMR pair (12 places; the smallest part 0.001 XMR)
@@ -182,6 +186,17 @@ Rectangle {
                 placeholderText: form.coin; placeholderFontSize: 15
                 validator: RegExpValidator { regExp: /^[0-9]{0,6}(\.[0-9]{0,18})?$/ }
                 onTextChanged: form.reviewing = false
+            }
+            // The market price, and a warning when the price is far from it (more than 10%)
+            Text {
+                objectName: "marketHint"
+                visible: form.marketPrice > 0
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12
+                readonly property bool far: Math.abs(form.offMarket) > 10
+                color: far ? "#E5A23C" : M.Style.dimmedFontColor
+                text: b(qsTr("Market: %1 %2 per XMZ")).arg(X.price(form.marketPrice)).arg(form.coin)
+                      + (form.limitPrice > 0 ? " · " + (form.offMarket < 0 ? qsTr("yours is %1% below") : qsTr("yours is %1% above")).arg(Math.abs(form.offMarket).toFixed(Math.abs(form.offMarket) < 10 ? 1 : 0)) : "")
+                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: priceInput.text = X.plain(form.marketPrice, Math.min(form.coinDecimals, 9)) }
             }
             RowLayout {
                 spacing: 6
