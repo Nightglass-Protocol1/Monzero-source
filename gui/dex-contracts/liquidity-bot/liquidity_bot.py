@@ -392,15 +392,19 @@ class Bot:
 
     def control(self, network):
         """The control payload for a network, or (None, why)."""
-        try:
-            req = urllib.request.Request(self.cfg["control_base"] + network + ".json", headers={"user-agent": "monzero-liquidity-bot"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                raw = r.read(4097)
-            why = self.check_control(raw, network)
-            if why:
-                log.warning("control %s: %s", network, why)
-        except OSError as e:
-            log.warning("control %s: %s", network, e)
+        # The website, then the relays' mirrored copies when it does not answer with a valid one
+        sources = [self.cfg["control_base"]] + [r.rstrip("/") + "/v1/control/" for r in self.cfg["relays"]]
+        for source in sources:
+            try:
+                req = urllib.request.Request(source + network + ".json", headers={"user-agent": "monzero-liquidity-bot"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    raw = r.read(4097)
+                why = self.check_control(raw, network)
+                if not why:
+                    break
+                log.warning("control %s from %s: %s", network, source, why)
+            except OSError as e:
+                log.warning("control %s from %s: %s", network, source, e)
         doc = self.controls.get(network)
         now = time.time()
         if doc is None:

@@ -77,11 +77,19 @@ final class DexRisk {
 
     private void fetch(final String controlNetwork) {
         if (stopped) return;
+        // The website first, then the relays' mirrored copies: each valid one is offered to accept(), which keeps the newest
+        final java.util.List<String> sources = new java.util.ArrayList<>();
+        sources.add(DexConfig.CONTROL_BASE);
+        java.util.Collections.addAll(sources, DexConfig.CONTROL_MIRRORS);
+        for (String source : sources) fetchFrom(source, controlNetwork);
+    }
+
+    private void fetchFrom(final String source, final String controlNetwork) {
         network.execute(() -> {
             byte[] body = null;
             HttpURLConnection c = null;
             try {
-                c = (HttpURLConnection) new URL(DexConfig.CONTROL_BASE + controlNetwork + ".json").openConnection();
+                c = (HttpURLConnection) new URL(source + controlNetwork + ".json").openConnection();
                 c.setConnectTimeout(15000);
                 c.setReadTimeout(15000);
                 c.setUseCaches(false);

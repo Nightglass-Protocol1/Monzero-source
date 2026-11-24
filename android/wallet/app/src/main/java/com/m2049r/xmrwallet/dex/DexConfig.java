@@ -22,6 +22,11 @@ final class DexConfig {
     /** The owner's control key (the same one the desktop public edition pins). */
     static final String CONTROL_KEY = "9eba2b1784ddfc23f028c03c78f862fecc81af81616722b56e671e6662e0a6fb";
     static final String CONTROL_BASE = "https://monzero.org/dex/control/";
+    /**
+     * Where else the signed control documents are: the relays mirror them, so new trades go on
+     * while the website is down (every copy is checked against the pinned key; the newest wins)
+     */
+    static final String[] CONTROL_MIRRORS = {"https://relay1.monzero.org/v1/control/", "https://relay2.monzero.org/v1/control/"};
     static final long SOL_MAINNET = 501000101L, SOL_DEVNET = 501000102L, SOL_LOCAL = 501000103L;
     /** USDT on Solana: the app's own market ids (the chain's id + 100); the helper trades them on
      *  the Solana chain with the pair "USDT/XMZ". Same ids as the desktop wallet and the page. */

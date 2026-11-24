@@ -824,7 +824,12 @@ void DexEngine::bindEvmNetwork(const QString &network) {
     // Bind the EVM risk control to this chain and load its signed control document once
     m_evmRiskControl->setNetwork(network);m_evmBoundNetwork=network;
     if (!m_evmControlFile.isEmpty()) m_evmRiskControl->loadControlFile(m_evmControlFile);
-    if (!m_evmControlUrlBase.isEmpty() && network.endsWith("-mainnet")) m_evmRiskControl->startPolling(m_evmControlUrlBase+network+".json");
+    if (!m_evmControlUrlBase.isEmpty() && network.endsWith("-mainnet")) {
+        m_evmRiskControl->startPolling(m_evmControlUrlBase+network+".json");
+        // The relays mirror the signed documents: with the website down, new trades still find a
+        // current one (any copy is checked against the pinned key, the newest valid one wins)
+        for (const auto &relay:defaultRelays()) if (relay.startsWith("https://")) m_evmRiskControl->startPolling(relay+"/v1/control/"+network+".json");
+    }
 }
 
 bool DexEngine::configureEvmTrade(const QString &config,const QString &seedFile) {
