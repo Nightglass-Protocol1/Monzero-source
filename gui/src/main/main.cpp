@@ -717,6 +717,8 @@ int main(int argc, char *argv[])
 #endif
     DexDeployment::lockLitecoinStage();
     DexEngine dexEngine;
+    // The trading-wallet services end with the app, before the teardown (a crash there would orphan them)
+    QObject::connect(&app,&QCoreApplication::aboutToQuit,&dexEngine,&DexEngine::shutdownWalletServices);
     {
         // New-trade limits. The ledger is local; the control key is pinned at build time.
         const QString dexData=QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("dex");

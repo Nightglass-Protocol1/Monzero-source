@@ -2005,6 +2005,10 @@ bool DexEngine::exportTradeHistory(const QString &folder) {
     });
     if (!started) emit tradeHistoryExported({},0,tr("The trade helper is not available."));
     return started;
+void DexEngine::shutdownWalletServices() {
+    // A running trade carries on from its saved state next time; its services must not outlive the app
+    m_dexWallets->stopNow();
+    m_xmrWallets->stopNow();
 }
 
 void DexEngine::shutdownBchRefundWalletService() {

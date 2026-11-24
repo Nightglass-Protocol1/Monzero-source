@@ -35,6 +35,8 @@ public:
     void stop();
     // The trade history under <root>/evm-trades as CSV ({ok, csv, rows}); false when the helper cannot run
     bool tradeHistory(std::function<void(const QJsonObject&)> done);
+    // At quit: every service of this coin ended before the app goes (none left running)
+    void stopNow();
     bool ready() const {return m_state=="ready";}
     QJsonObject mainEndpoint() const;
     QVariantMap status() const;

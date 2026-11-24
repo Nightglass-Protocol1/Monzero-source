@@ -297,6 +297,15 @@ bool SwapWalletRpcProcess::completeWalletOperation(const QString &token, bool ve
     return true;
 }
 
+void SwapWalletRpcProcess::stopNow(int waitMs) {
+    if (m_process->state() == QProcess::NotRunning) return;
+    m_process->terminate();
+    if (!m_process->waitForFinished(waitMs)) {
+        m_process->kill();
+        m_process->waitForFinished(1000);
+    }
+}
+
 void SwapWalletRpcProcess::stop() {
     if (m_process->state() == QProcess::NotRunning || m_stopTimer->isActive()) return;
     m_stopTimer->start(10000);notifyAvailabilityChanged();
