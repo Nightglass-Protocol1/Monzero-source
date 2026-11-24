@@ -1,3 +1,35 @@
+# Monzero v1.3.9 release notes
+
+Release label: v1.3.9
+
+Monzero v1.3.9 fixes the Exchange's Funds tab and brings the full wallet with its exchange to 64-bit
+ARM (Raspberry Pi). It changes no consensus rule: the chain, blocks, coins, wallets, seeds and
+addresses are the same as in v1.0.0 to v1.3.8, and nobody has to upgrade to stay on the network.
+
+## What is fixed
+
+- **Funds tab on XMZ pairs**: with an XMZ pair selected (XMZ/SOL, XMZ/BNB, …) the Monero trading wallet
+  took the place beside the XMZ wallet and pushed the pair's own trade account (SOL, BNB, …) onto a
+  second row, out of view. Funds now shows the wallet the pair trades (XMZ on XMZ pairs, XMR on Monero
+  pairs, both on XMR/XMZ) beside the pair's trade account.
+
+## What is new
+
+- **64-bit ARM wallet** (`linux-aarch64-gui`): the graphical wallet with the Exchange (XMZ and XMR
+  markets) for Raspberry Pi OS trixie / Debian 13, with Monero's official monero-wallet-rpc for 64-bit
+  ARM. It uses the system's Qt 5.15 and Boost 1.83; the Monzero Box for Raspberry Pi installs them.
+- **Monzero Box for Raspberry Pi** runs the wallet with its exchange on the Pi's own screen or in your
+  browser, as the virtual machine and Docker boxes do.
+
+Everything else is as in v1.3.8, below.
+
+## Upgrading
+
+Close the old wallet, unpack v1.3.9 into a new folder and start it; it uses the same wallet files,
+node data, trading keys and Monero trading wallet. A Monzero Box updates itself within a day.
+
+---
+
 # Monzero v1.3.8 release notes
 
 Release label: v1.3.8
