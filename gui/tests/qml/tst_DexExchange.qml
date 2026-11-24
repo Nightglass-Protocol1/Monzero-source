@@ -279,6 +279,16 @@ Item {
             find(ex, "orderAmount").text = "0.25"
             press("orderButton"); press("orderButton")
             compare(JSON.stringify(engine.calls), JSON.stringify([["postXmr", 11155111, "buy-xmz", "0.075", "0.25", 6, "0.1"]]))
+            // Under 0.2 XMR an offer cannot split (the smallest part is 0.1 XMR): it is posted whole
+            engine.calls = []
+            find(ex, "orderAmount").text = "0.06"
+            verify(find(ex, "partialToggle").on); verify(!f.canSplit); verify(!f.partialOn)
+            verify(!find(ex, "minPart").visible)
+            verify(find(ex, "partialLabel").text.indexOf("0.2 XMR") >= 0)
+            verify(f.ready, f.problem)
+            press("orderButton"); press("orderButton")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["postXmr", 11155111, "buy-xmz", "0.018", "0.06", 6, ""]]))
+            find(ex, "orderAmount").text = "0.25"; verify(f.partialOn)
             // Back to the XMZ pair
             ex.pick("SOL")
             verify(!ex.xmrPair); compare(ex.base, "XMZ"); compare(find(ex, "exchangeForm").base, "XMZ")

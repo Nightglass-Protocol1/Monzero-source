@@ -44,7 +44,11 @@ Rectangle {
     readonly property var plan: type === "market" ? X.planMarket(book, side, amountAtoms, pickedId) : null
     readonly property real limitPrice: Number(priceInput.text)
     readonly property string limitCoin: amountAtoms > 0 && limitPrice > 0 ? X.limitCoin(limitPrice, amountAtoms, coinDecimals, places) : ""
-    readonly property real minXmz: partialToggle.on ? Number(minInput.text || X.defaultMin(amountAtoms, places)) : 0
+    // An offer splits only when it holds at least two smallest parts (0.2 XMR, 2 XMZ); a smaller
+    // one is posted whole, whatever the switch says
+    readonly property bool canSplit: amountAtoms <= 0 || amountAtoms >= 2e11
+    readonly property bool partialOn: partialToggle.on && canSplit
+    readonly property real minXmz: partialOn ? Number(minInput.text || X.defaultMin(amountAtoms, places)) : 0
     // How long a limit order stays open: a preset, or custom (an amount in hours or days)
     property int presetHours: 6
     property bool customLife: false
@@ -66,7 +70,7 @@ Rectangle {
         if (!(limitPrice > 0)) return qsTr("Enter your price")
         if (hours < 1) return qsTr("An offer stays open from 1 hour to 31 days")
         if (limitCoin === "" || Number(limitCoin) <= 0) return qsTr("The total is too small")
-        if (partialToggle.on && (!(minXmz >= leastPart) || minXmz * unit > amountAtoms)) return b(qsTr("The smallest part must be at least %1 XMZ and at most the amount").arg(leastPart))
+        if (partialOn && (!(minXmz >= leastPart) || minXmz * unit > amountAtoms)) return b(qsTr("The smallest part must be at least %1 XMZ and at most the amount").arg(leastPart))
         if (!buying && xmzBalance >= 0 && amountAtoms / unit > xmzBalance) return b(qsTr("Not enough XMZ in your trading wallet"))
         return capProblem(limitCoin, X.atomsText(amountAtoms, places))
     }
@@ -236,20 +240,27 @@ Rectangle {
                     id: partialToggle; objectName: "partialToggle"
                     property bool on: true
                     width: 34; height: 18; radius: 9
-                    color: on ? M.Style.accentMuted : "#20383C"
-                    Rectangle { width: 14; height: 14; radius: 7; y: 2; x: partialToggle.on ? 18 : 2; color: partialToggle.on ? M.Style.accent : M.Style.dimmedFontColor }
-                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: partialToggle.on = !partialToggle.on }
+                    color: form.partialOn ? M.Style.accentMuted : "#20383C"
+                    opacity: form.canSplit ? 1 : 0.5
+                    Rectangle { width: 14; height: 14; radius: 7; y: 2; x: form.partialOn ? 18 : 2; color: form.partialOn ? M.Style.accent : M.Style.dimmedFontColor }
+                    MouseArea { anchors.fill: parent; enabled: form.canSplit; cursorShape: Qt.PointingHandCursor; onClicked: partialToggle.on = !partialToggle.on }
                 }
-                Text { text: qsTr("Allow partial fills"); font.pixelSize: 13; color: M.Style.defaultFontColor; Layout.fillWidth: true }
-                Text { visible: partialToggle.on; text: qsTr("from"); font.pixelSize: 12; color: M.Style.dimmedFontColor }
+                Text {
+                    objectName: "partialLabel"
+                    text: form.canSplit ? qsTr("Allow partial fills")
+                                        : qsTr("Sold whole: partial fills need %1 %2 or more").arg(X.amount(2 * form.leastPart, 1)).arg(form.base)
+                    font.pixelSize: 13; color: form.canSplit ? M.Style.defaultFontColor : M.Style.dimmedFontColor
+                    wrapMode: Text.WordWrap; Layout.fillWidth: true
+                }
+                Text { visible: form.partialOn; text: qsTr("from"); font.pixelSize: 12; color: M.Style.dimmedFontColor }
                 M.LineEdit {
                     id: minInput; objectName: "minPart"
-                    visible: partialToggle.on
+                    visible: form.partialOn
                     Layout.preferredWidth: 90; Layout.maximumHeight: 34; fontSize: 13; inputPaddingTop: 4; inputPaddingBottom: 4
                     placeholderText: form.amountAtoms > 0 ? String(X.defaultMin(form.amountAtoms, form.places)) : "1"; placeholderFontSize: 13
                     validator: RegExpValidator { regExp: /^[0-9]{0,9}(\.[0-9]{0,11})?$/ }
                 }
-                Text { visible: partialToggle.on; text: form.base; font.pixelSize: 12; color: M.Style.dimmedFontColor }
+                Text { visible: form.partialOn; text: form.base; font.pixelSize: 12; color: M.Style.dimmedFontColor }
             }
             RowLayout {
                 Layout.fillWidth: true
@@ -387,7 +398,7 @@ Rectangle {
                         form.takeRequested(form.plan.row.id, all ? "" : X.atomsText(form.plan.atoms, form.places))
                     } else {
                         form.postRequested(form.buying ? "buy-xmz" : "sell-xmz", form.limitCoin, X.atomsText(form.amountAtoms, form.places), form.hours,
-                                           partialToggle.on ? String(form.minXmz) : "", renewToggle.on)
+                                           form.partialOn ? String(form.minXmz) : "", renewToggle.on)
                     }
                 }
             }
@@ -417,7 +428,7 @@ Rectangle {
         }
         if (limitCoin === "") return []
         var rows = [[buying ? qsTr("You pay") : qsTr("You receive"), limitCoin + " " + coin + usdText(Number(limitCoin))]]
-        if (partialToggle.on) rows.push([qsTr("Partial fills"), b(qsTr("from %1 XMZ")).arg(X.amount(minXmz, 4))])
+        if (partialOn) rows.push([qsTr("Partial fills"), b(qsTr("from %1 XMZ")).arg(X.amount(minXmz, 4))])
         if (renewToggle.on) rows.push([qsTr("Keep open"), qsTr("renewed at this price while the wallet runs")])
         if (hours > 0) rows.push([qsTr("Open until"), Qt.formatDateTime(new Date(Date.now() + hours * 3600000), "d MMM yyyy HH:mm")])
         return rows
@@ -456,7 +467,7 @@ Rectangle {
             return (buying ? b(qsTr("Your offer: buy %1 XMZ for %2 %3, open for %4.")) : b(qsTr("Your offer: sell %1 XMZ for %2 %3, open for %4.")))
                        .arg(X.amount(amountAtoms / unit, 4)).arg(limitCoin).arg(coin).arg(X.lifetimeText(hours))
                  + (hours > 24 ? " " + qsTr("Keep this wallet running when you can: a taker is answered only while it runs.") : "")
-                 + (partialToggle.on ? " " + b(qsTr("Others may take any part from %1 XMZ.")).arg(X.amount(minXmz, 4)) : "")
+                 + (partialOn ? " " + b(qsTr("Others may take any part from %1 XMZ.")).arg(X.amount(minXmz, 4)) : "")
                  + " " + qsTr("You can cancel it while it is open.")
         }
         return ""
