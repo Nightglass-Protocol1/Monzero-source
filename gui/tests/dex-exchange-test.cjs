@@ -62,6 +62,7 @@ t('limit', () => {
   assert.equal(X.limitCoin(0.0000143, 1500e11, 18), '0.02145')
   assert.equal(X.limitCoin(0.000143359, 1500e11, 9), '0.2150385')
   assert.equal(X.defaultMin(1500e11), 150); assert.equal(X.defaultMin(5e11), 1)
+  assert.equal(X.defaultMin(0.25e12, 12), 0.025); assert.equal(X.defaultMin(0.06e12, 12), 0.006); assert.equal(X.defaultMin(0.005e12, 12), 0.001); assert.equal(X.leastPart(12), 0.001); assert.equal(X.leastPart(11), 1)
 })
 t('dayStats', () => {
   const c = [{ t: now - 30 * 3600, o: 1, h: 1, l: 1, c: 1, v: 10, vc: 10, n: 1 },

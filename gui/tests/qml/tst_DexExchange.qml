@@ -278,16 +278,25 @@ Item {
             find(ex, "limitPrice").text = "0.3"
             find(ex, "orderAmount").text = "0.25"
             press("orderButton"); press("orderButton")
-            compare(JSON.stringify(engine.calls), JSON.stringify([["postXmr", 11155111, "buy-xmz", "0.075", "0.25", 6, "0.1"]]))
-            // Under 0.2 XMR an offer cannot split (the smallest part is 0.1 XMR): it is posted whole
+            compare(JSON.stringify(engine.calls), JSON.stringify([["postXmr", 11155111, "buy-xmz", "0.075", "0.25", 6, "0.025"]]))
+            // Small Monero offers split too: the smallest part is 0.001 XMR (0.06 XMR: parts from 0.006)
             engine.calls = []
             find(ex, "orderAmount").text = "0.06"
+            verify(f.canSplit); verify(f.partialOn); verify(f.ready, f.problem)
+            press("orderButton"); press("orderButton")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["postXmr", 11155111, "buy-xmz", "0.018", "0.06", 6, "0.006"]]))
+            find(ex, "minPart").text = "0.0009"; verify(!f.ready)      // under 0.001 XMR
+            find(ex, "minPart").text = "0.001"; verify(f.ready, f.problem)
+            find(ex, "minPart").text = ""
+            // Under two smallest parts (0.002 XMR) an offer cannot split: it is posted whole
+            engine.calls = []
+            find(ex, "orderAmount").text = "0.0015"
             verify(find(ex, "partialToggle").on); verify(!f.canSplit); verify(!f.partialOn)
             verify(!find(ex, "minPart").visible)
-            verify(find(ex, "partialLabel").text.indexOf("0.2 XMR") >= 0)
+            verify(find(ex, "partialLabel").text.indexOf("0.002 XMR") >= 0, find(ex, "partialLabel").text)
             verify(f.ready, f.problem)
             press("orderButton"); press("orderButton")
-            compare(JSON.stringify(engine.calls), JSON.stringify([["postXmr", 11155111, "buy-xmz", "0.018", "0.06", 6, ""]]))
+            compare(JSON.stringify(engine.calls), JSON.stringify([["postXmr", 11155111, "buy-xmz", "0.00045", "0.0015", 6, ""]]))
             find(ex, "orderAmount").text = "0.25"; verify(f.partialOn)
             // Back to the XMZ pair
             ex.pick("SOL")

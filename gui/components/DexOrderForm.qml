@@ -16,11 +16,11 @@ Rectangle {
     property real coinUsd: 0
     property real coinBalance: -1          // the trade account's coin (-1: not known yet)
     property real xmzBalance: -1           // the trading wallet's unlocked XMZ (-1: not known yet)
-    // The coin bought and sold: XMZ, or Monero on an XMR pair (12 places; the smallest part 0.1 XMR)
+    // The coin bought and sold: XMZ, or Monero on an XMR pair (12 places; the smallest part 0.001 XMR)
     property string base: "XMZ"
     readonly property int places: X.placesOf(base)
     readonly property real unit: Math.pow(10, places)
-    readonly property real leastPart: 1e11 / unit
+    readonly property real leastPart: X.leastPart(places)
     // A text written for XMZ, for this pair's coin
     function b(t) { return base === "XMZ" ? t : String(t).replace(/XMZ/g, base) }
     property string blockedReason: ""      // why no order can be placed now ("" when it can)
@@ -44,9 +44,9 @@ Rectangle {
     readonly property var plan: type === "market" ? X.planMarket(book, side, amountAtoms, pickedId) : null
     readonly property real limitPrice: Number(priceInput.text)
     readonly property string limitCoin: amountAtoms > 0 && limitPrice > 0 ? X.limitCoin(limitPrice, amountAtoms, coinDecimals, places) : ""
-    // An offer splits only when it holds at least two smallest parts (0.2 XMR, 2 XMZ); a smaller
+    // An offer splits only when it holds at least two smallest parts (0.002 XMR, 2 XMZ); a smaller
     // one is posted whole, whatever the switch says
-    readonly property bool canSplit: amountAtoms <= 0 || amountAtoms >= 2e11
+    readonly property bool canSplit: amountAtoms <= 0 || amountAtoms >= 2 * leastPart * unit
     readonly property bool partialOn: partialToggle.on && canSplit
     readonly property real minXmz: partialOn ? Number(minInput.text || X.defaultMin(amountAtoms, places)) : 0
     // How long a limit order stays open: a preset, or custom (an amount in hours or days)
@@ -248,7 +248,7 @@ Rectangle {
                 Text {
                     objectName: "partialLabel"
                     text: form.canSplit ? qsTr("Allow partial fills")
-                                        : qsTr("Sold whole: partial fills need %1 %2 or more").arg(X.amount(2 * form.leastPart, 1)).arg(form.base)
+                                        : qsTr("Sold whole: partial fills need %1 %2 or more").arg(X.amount(2 * form.leastPart, form.places)).arg(form.base)
                     font.pixelSize: 13; color: form.canSplit ? M.Style.defaultFontColor : M.Style.dimmedFontColor
                     wrapMode: Text.WordWrap; Layout.fillWidth: true
                 }

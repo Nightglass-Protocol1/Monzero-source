@@ -174,12 +174,17 @@ function limitCoin(unitPrice, atoms, decimals, places) {
     return plain(v, Math.min(decimals, 9))
 }
 
-// A sensible smallest part for a new partial offer: a tenth, at least 1 XMZ, whole XMZ
-// (XMR: a tenth, at least 0.1 XMR, in tenths: the engine's smallest part is 1e11 atoms either way)
+// The least smallest part a partial offer may name: 1 XMZ, or 0.001 XMR (12 places)
+function leastPart(places) {
+    return places === 12 ? 0.001 : 1e11 / scale(places)
+}
+
+// A sensible smallest part for a new partial offer: a tenth, at least the least part, in whole
+// least parts (whole XMZ; thousandths of XMR)
 function defaultMin(atoms, places) {
-    var least = 1e11 / scale(places)
-    var tenth = Math.floor(atoms / scale(places) / 10 / least) * least
-    return Number(plain(Math.max(least, tenth), 1))
+    var least = leastPart(places)
+    var tenth = Math.floor(atoms / scale(places) / 10 / least + 1e-9) * least
+    return Number(plain(Math.max(least, tenth), 3))
 }
 
 // 24 h figures from hourly candles {t, o, h, l, c, v, vc, n} (relay format), `now` in seconds

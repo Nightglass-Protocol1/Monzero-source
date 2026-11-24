@@ -164,6 +164,21 @@ fn a_partial_listing_needs_its_schema_and_a_sane_minimum() {
 }
 
 #[test]
+fn a_monero_partial_listing_may_split_down_to_a_thousandth_of_an_xmr() {
+    // XMR has 12 places: its floor is 0.001 XMR (1e9 atoms), not the XMZ floor's 0.1 XMR
+    let key = PrivateKeySigner::random();
+    let open = Rules { xmr_mainnet: true, ..rules() };
+    let check = |l: Listing| l.check(&open, NOW + 10);
+    let xmr = Listing { pair: "ETH/XMR".into(), xmz_network: XmzNetwork::XmrMainnet, xmz: 60_000_000_000, min_xmz: Some(MIN_FILL_FLOOR_XMR), ..partial(&key) };
+    assert_eq!(min_fill_floor("ETH/XMR"), 1_000_000_000);
+    assert_eq!(min_fill_floor("ETH/XMZ"), MIN_FILL_FLOOR);
+    assert_eq!(check(xmr.clone()), Ok(Chain::EthMainnet), "0.06 XMR in parts from 0.001 XMR");
+    assert_eq!(check(Listing { min_xmz: Some(MIN_FILL_FLOOR_XMR - 1), ..xmr.clone() }), Err(ListingError::Minimum));
+    // The XMZ floor is unchanged
+    assert_eq!(check(Listing { min_xmz: Some(MIN_FILL_FLOOR_XMR), ..partial(&key) }), Err(ListingError::Minimum));
+}
+
+#[test]
 fn a_version_2_listing_may_stay_open_a_month_a_first_version_one_a_day() {
     let key = PrivateKeySigner::random();
     let check = |l: Listing| l.check(&rules(), NOW + 10);

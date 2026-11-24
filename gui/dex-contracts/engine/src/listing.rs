@@ -23,6 +23,18 @@ pub const LISTING_SCHEMA: &str = "monzero-dex-listing/1";
 pub const PARTIAL_SCHEMA: &str = "monzero-dex-listing/2";
 /// The least a partial offer's minimum may be (1 XMZ): every fill is a whole swap with its own fees
 pub const MIN_FILL_FLOOR: u64 = 100_000_000_000;
+/// The same on a Monero pair: 0.001 XMR (1e9 of XMR's 1e12 atoms), some 30 times a Monero
+/// transfer's network fee. (Until v1.3.10 it was the XMZ figure in atoms, which is 0.1 XMR.)
+pub const MIN_FILL_FLOOR_XMR: u64 = 1_000_000_000;
+
+/// The least a partial offer of `pair` may name as its smallest part, in the private coin's atoms
+pub fn min_fill_floor(pair: &str) -> u64 {
+    if pair.ends_with("/XMR") {
+        MIN_FILL_FLOOR_XMR
+    } else {
+        MIN_FILL_FLOOR
+    }
+}
 pub const CANCEL_SCHEMA: &str = "monzero-dex-cancel/1";
 pub const SOL_ACCOUNT_SCHEMA: &str = "monzero-dex-sol-account/1";
 /// The longest a first-version listing may stay open (what every app since the opening accepts)
@@ -341,7 +353,7 @@ impl Listing {
         match (self.schema.as_str(), self.min_xmz) {
             (LISTING_SCHEMA, None) => {}
             (PARTIAL_SCHEMA, Some(min)) => {
-                if min < MIN_FILL_FLOOR || min > self.xmz {
+                if min < min_fill_floor(&self.pair) || min > self.xmz {
                     return Err(ListingError::Minimum);
                 }
             }

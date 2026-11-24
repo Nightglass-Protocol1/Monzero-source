@@ -1055,9 +1055,9 @@ bool DexEngine::postXmrOffer(int chainId,const QString &side,const QString &coin
     QString minAtoms;
     if (!minXmrAmount.trimmed().isEmpty()) {
         minAtoms=atomic(minXmrAmount,12);
-        // The engine's smallest part is 1e11 atoms: 0.1 XMR
-        if (minAtoms.isEmpty() || minAtoms.toULongLong()<100000000000ULL || minAtoms.toULongLong()>atoms.toULongLong()) {
-            m_marketMessage=tr("The smallest part must be at least 0.1 XMR and at most the whole offer.");emit evmMarketChanged();return false;
+        // The engine's smallest part on a Monero pair is 1e9 atoms: 0.001 XMR
+        if (minAtoms.isEmpty() || minAtoms.toULongLong()<1000000000ULL || minAtoms.toULongLong()>atoms.toULongLong()) {
+            m_marketMessage=tr("The smallest part must be at least 0.001 XMR and at most the whole offer.");emit evmMarketChanged();return false;
         }
     }
     const auto refusal=evmOfferRefusal(chainId,wei,QStringLiteral("0"));
