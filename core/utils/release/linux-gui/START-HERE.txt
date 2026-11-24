@@ -28,7 +28,7 @@ USDT
   account, plus a little SOL or BNB for fees. Turn on "Keep open" to renew an order by itself.
 
 Monero (XMR)
-  Exchange > XMR/BNB, XMR/USDT (BNB) or XMR/SOL: buy or sell Monero with an atomic swap. The wallet runs
+  Exchange > XMR/BNB, XMR/USDT (BNB), XMR/SOL or XMR/USDT (SOL): buy or sell Monero with an atomic swap. The wallet runs
   Monero's own monero-wallet-rpc (in this folder, unchanged from Monero's v0.18.5.4 release) as
   your Monero trading wallet: send XMR to the Monero address under Funds. A Monero trade takes
   about an hour (the XMR lock needs 10 Monero blocks and independent nodes to confirm it).
