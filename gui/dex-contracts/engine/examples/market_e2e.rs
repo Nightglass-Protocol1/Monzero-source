@@ -39,6 +39,11 @@ fn monero() -> bool {
     env("COIN", "xmz") == "xmr"
 }
 
+/// The private coin, as the helper names it
+fn private_coin() -> monzero_dex_evm::xmz::PrivateCoin {
+    if monero() { monzero_dex_evm::xmz::PrivateCoin::Xmr } else { monzero_dex_evm::xmz::PrivateCoin::Xmz }
+}
+
 /// Real coins on the main networks (the owner's real-funds test only)
 fn mainnet() -> bool {
     env("NET", "test") == "mainnet"
@@ -206,7 +211,8 @@ async fn wallet_rpc(procs: &mut Procs, dir: &Path, name: &str) -> (WalletRpc, Va
             .args(match (monero(), mainnet()) {
                 (true, true) => vec![],
                 (true, false) => vec!["--stagenet"],
-                (false, _) => vec!["--testnet"],
+                (false, true) => vec![],
+                (false, false) => vec!["--testnet"],
             })
             .args(["--wallet-dir", wallets.to_str().unwrap()])
             .args(["--daemon-address", &env("XMZ_NODE", if monero() { "node.monerodevs.org:38089" } else { "127.0.0.1:16175" })])
@@ -308,23 +314,25 @@ async fn wait_for_funds(run: &Path, payer: &Side, seller: &Side, seller_main: &W
     let payer_needs = if token() { payer_gas } else { value + payer_gas };
     let seller_gas: u128 = env("TAKER_GAS_WEI", "500000000000000").parse().unwrap();
     let atoms: u64 = xmz_atoms().parse().unwrap();
-    let xmr_needs = atoms + env("XMR_FEE_ATOMS", "1000000000").parse::<u64>().unwrap();
+    // The helper's own lock margin (1%, at least 1 XMZ / 0.0005 XMR) plus room for the fee
+    let xmr_needs = monzero_dex_evm::helper_market::xmz_needed(atoms, private_coin()) + env("XMR_FEE_ATOMS", "1000000000").parse::<u64>().unwrap();
     let coin = evm_coin();
     let unit = coin_unit();
     let show = |wei: u128| format!("{:.6} {coin}", wei as f64 / unit);
     let network = if solana() { "Solana" } else { "BNB Smart Chain (BEP20)" };
-    let showx = |a: u64| format!("{:.6} XMR", a as f64 / 1e12);
+    let (ticker, scale) = if monero() { ("XMR", 1e12) } else { ("XMZ", 1e11) };
+    let showx = |a: u64| format!("{:.6} {ticker}", a as f64 / scale);
     println!("\n== Send the test coins (only these amounts or a little more):");
     let (p, s) = (payer.name, seller.name);
     if token() {
-        println!("   {:.6} USDT ({}) to the {p} (pays for XMR): {}", value as f64 / usdt_unit(), if solana() { "SPL" } else { "BEP20" }, payer.address);
+        println!("   {:.6} USDT ({}) to the {p} (pays for {ticker}): {}", value as f64 / usdt_unit(), if solana() { "SPL" } else { "BEP20" }, payer.address);
         println!("   {} to the {p} (gas):           {}", show(payer_needs), payer.address);
     } else {
-        println!("   {} to the {p} (pays for XMR):     {}", show(payer_needs), payer.address);
+        println!("   {} to the {p} (pays for {ticker}):     {}", show(payer_needs), payer.address);
     }
     println!("   {} to the {s} (claim gas):        {}", show(seller_gas), seller.address);
-    println!("   {} to the {s}'s XMR wallet:      {xmr_address}", showx(xmr_needs));
-    println!("   on {network} for {coin}; XMR needs 10 blocks (~20 min) before it can be spent.\n");
+    println!("   {} to the {s}'s {ticker} wallet:      {xmr_address}", showx(xmr_needs));
+    println!("   on {network} for {coin}; {ticker} needs 10 blocks before it can be spent.\n");
     for round in 0u64.. {
         let _ = seller_main.call("refresh", json!({})).await;
         let b = seller_main.call("get_balance", json!({"account_index": 0})).await.unwrap_or(json!({}));
@@ -336,7 +344,7 @@ async fn wait_for_funds(run: &Path, payer: &Side, seller: &Side, seller_main: &W
             if token() {
                 log(format!("{p} USDT {:.6} / {:.6}", usdt as f64 / usdt_unit(), value as f64 / usdt_unit()));
             }
-            log(format!("{p} {} / {}, {s} {} / {}, {s} XMR {} spendable ({} arrived) / {}",
+            log(format!("{p} {} / {}, {s} {} / {}, {s} {ticker} {} spendable ({} arrived) / {}",
                 show(m), show(payer_needs), show(t), show(seller_gas), showx(unlocked), showx(total), showx(xmr_needs)));
         }
         if ready {
