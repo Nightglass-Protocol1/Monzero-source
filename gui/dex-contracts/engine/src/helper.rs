@@ -139,6 +139,8 @@ pub enum Command {
     Accounts,
     /// XMZ → XMR routes among the relays' offers on one chain (`chainId`, `evmRpc`), best first
     Routes,
+    /// The trade history under `tradeDir` (the wallet's evm-trades folder) as CSV: {csv, rows}
+    History,
     /// Direct (coin <-> coin) trades: see `helper_direct`
     DirectListings,
     DirectPost,
@@ -262,6 +264,7 @@ async fn dispatch(r: Request) -> Result<Value, String> {
         }
         Command::Listings => market_listings(&r).await,
         Command::Routes => market_routes(&r).await,
+        Command::History => crate::history::history(&r.trade_dir),
         Command::Post => match (&r.tick, &r.offer) {
             (Some(t), Some(o)) => crate::helper_market::post(&r.trade_dir, t, relays(&r)?, o, accept(&r)).await,
             _ => Err("post needs tick (keys and endpoints) and offer".into()),

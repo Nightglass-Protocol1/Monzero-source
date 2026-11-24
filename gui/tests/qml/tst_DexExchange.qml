@@ -37,6 +37,8 @@ Item {
         // The operator's per-trade cap in coins; the real engine reads it from the signed caps document
         property real capCoin: 1000
         signal dexRiskChanged()
+        signal tradeHistoryExported(string path, int rows, string error)
+        function exportTradeHistory(folder) { calls.push(["exportHistory", folder]); tradeHistoryExported(folder + "/monzero-dex-trades-2026-11-24.csv", 3, ""); return true }
         function evmOrderRefusal(chainId, coin, xmz) {
             return Number(coin) > capCoin ? "This order is above the per-trade limit of " + capCoin + " SOL while the DEX is opening. Post a smaller order." : ""
         }
@@ -376,6 +378,14 @@ Item {
             verify(shown.indexOf("|Amount|") >= 0, shown)
             compare(ex.openOrders, 0)
             engine.evmMarketStatus = before
+        }
+            function test_trade_history_exports_as_csv() {
+            ex.bottomTab = "orders"
+            verify(find(ex, "exportHistory").visible)
+            engine.calls = []
+            engine.exportTradeHistory("file:///home/me/Documents")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["exportHistory", "file:///home/me/Documents"]]))
+            compare(find(ex, "exportHistoryResult").text, "3 trade(s) saved to file:///home/me/Documents/monzero-dex-trades-2026-11-24.csv")
         }
             function test_the_monero_wallet_shows_and_sends_from_the_funds_tab() {
             ex.bottomTab = "funds"

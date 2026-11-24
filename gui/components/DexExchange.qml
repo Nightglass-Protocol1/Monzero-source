@@ -1,5 +1,6 @@
 import QtQuick 2.9
 import QtQuick.Layouts 1.1
+import QtQuick.Dialogs 1.2
 
 import "." as M
 import "dexExchange.js" as X
@@ -143,6 +144,20 @@ ColumnLayout {
         return out
     }
     readonly property int openOrders: myOrders.filter(function (o) { return o.state === "open" }).length
+    property string historyNote: ""         // what the last trade-history export did
+    FileDialog {
+        id: historyFolder
+        title: qsTr("Choose a folder for your trade history")
+        selectFolder: true
+        onAccepted: { ex.historyNote = qsTr("Exporting…"); ex.dex.exportTradeHistory(String(folder)) }
+    }
+    Connections {
+        target: ex.dex && typeof ex.dex.exportTradeHistory === "function" ? ex.dex : null
+        ignoreUnknownSignals: true
+        function onTradeHistoryExported(path, rows, error) {
+            ex.historyNote = error !== "" ? error : qsTr("%n trade(s) saved to %1", "", rows).arg(path)
+        }
+    }
 
     readonly property string blockedReason: {
         if (wallet.state === undefined || wallet.state === "unconfigured") return qsTr("Trading is starting…")
@@ -810,6 +825,17 @@ ColumnLayout {
                     visible: ex.myOrders.length === 0
                     text: qsTr("No orders yet. Buy or sell above; your open offers and trades appear here.")
                     font.pixelSize: 13; color: M.Style.dimmedFontColor
+                }
+                // Every trade of this wallet (XMZ and Monero pairs, all coins) as a CSV file, for records and taxes
+                RowLayout {
+                    Layout.topMargin: 6; spacing: 10
+                    visible: !!ex.dex && typeof ex.dex.exportTradeHistory === "function"
+                    Text {
+                        objectName: "exportHistory"
+                        text: qsTr("Export trade history (CSV)"); font.pixelSize: 12; font.underline: true; color: M.Style.accent
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: historyFolder.open() }
+                    }
+                    Text { objectName: "exportHistoryResult"; text: ex.historyNote; font.pixelSize: 12; color: M.Style.dimmedFontColor; Layout.fillWidth: true; elide: Text.ElideMiddle }
                 }
             }
 

@@ -33,6 +33,8 @@ public:
     QString daemonHost() const {return m_daemonHost;}
     bool start();
     void stop();
+    // The trade history under <root>/evm-trades as CSV ({ok, csv, rows}); false when the helper cannot run
+    bool tradeHistory(std::function<void(const QJsonObject&)> done);
     bool ready() const {return m_state=="ready";}
     QJsonObject mainEndpoint() const;
     QVariantMap status() const;

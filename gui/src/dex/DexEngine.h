@@ -331,6 +331,9 @@ public:
     QVariantMap xmrWalletStatus() const;
     DexWalletService *xmrWallets() const {return m_xmrWallets;}
     Q_INVOKABLE bool refreshXmrWallet();
+    // Every trade of this wallet (XMZ and Monero pairs) as a CSV file in `folder` (a file: URL or a path):
+    // monzero-dex-trades-<date>.csv; the answer comes as tradeHistoryExported
+    Q_INVOKABLE bool exportTradeHistory(const QString &folder);
     // Send XMR from the trading wallet to `address` (a Monero address; amount in XMR, empty: everything)
     Q_INVOKABLE bool sendFromXmrWallet(const QString &address,const QString &amount);
     Q_INVOKABLE bool refreshDexWallet();
@@ -572,6 +575,8 @@ signals:
     void btcMarketChanged();
     void dexWalletChanged();
     void xmrWalletChanged();
+    // path: the file written ("" when it failed); error: why it failed
+    void tradeHistoryExported(const QString &path,int rows,const QString &error);
     void bchSuccessReleaseReviewChanged();
     void bchSuccessSignedReleaseReviewChanged();
     void bchSuccessSignatureReviewChanged();

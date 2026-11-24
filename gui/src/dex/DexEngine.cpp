@@ -68,6 +68,8 @@
 #include <limits>
 #include <QtConcurrent/QtConcurrentRun>
 #include <QPointer>
+#include <QSaveFile>
+#include <QUrl>
 
 namespace {
 constexpr int xmz_decimals = 11;
@@ -1987,6 +1989,24 @@ bool DexEngine::configureBchRefundWalletService(const QString &path) {
     }
     emit bchRefundWalletChanged();return true;
 }
+bool DexEngine::exportTradeHistory(const QString &folder) {
+    const QUrl url(folder);
+    const QString dir=url.isLocalFile() ? url.toLocalFile() : folder;
+    if (dir.isEmpty() || !QFileInfo(dir).isDir()) {emit tradeHistoryExported({},0,tr("Choose a folder to save the file in."));return false;}
+    const bool started=m_dexWallets->tradeHistory([this,dir](const QJsonObject &r){
+        if (!r.value("ok").toBool(true) || !r.value("csv").isString()) {
+            emit tradeHistoryExported({},0,tr("The trade history could not be read: %1").arg(r.value("error").toString()));return;
+        }
+        const auto path=QDir(dir).filePath(QStringLiteral("monzero-dex-trades-%1.csv").arg(QDate::currentDate().toString(QStringLiteral("yyyy-MM-dd"))));
+        QSaveFile f(path);
+        const auto bytes=r.value("csv").toString().toUtf8();
+        if (!f.open(QIODevice::WriteOnly) || f.write(bytes)!=bytes.size() || !f.commit()) {emit tradeHistoryExported({},0,tr("The file could not be written: %1").arg(path));return;}
+        emit tradeHistoryExported(path,r.value("rows").toInt(),{});
+    });
+    if (!started) emit tradeHistoryExported({},0,tr("The trade helper is not available."));
+    return started;
+}
+
 void DexEngine::shutdownBchRefundWalletService() {
     if (!m_bchRefundWalletService) return;
     if (m_bchRefundWalletServiceAttach) m_bchRefundWalletServiceAttach->stop();

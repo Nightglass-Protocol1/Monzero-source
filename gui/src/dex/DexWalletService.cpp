@@ -217,6 +217,25 @@ QJsonObject DexWalletService::mainEndpoint() const {
     return {{"url",QStringLiteral("http://127.0.0.1:%1").arg(m_walletPort)},{"loginFile",m_main->loginFile()}};
 }
 
+bool DexWalletService::tradeHistory(std::function<void(const QJsonObject&)> done) {
+    if (!BackendExecutable::matches(m_helper,m_helperSha256)) return false;
+    auto *p=new QProcess(this);
+    QProcessEnvironment env;env.insert("LANG","C");p->setProcessEnvironment(env);
+    const QJsonObject request{{"schema",RequestSchema},{"command","history"},{"tradeDir",m_root+"/evm-trades"}};
+    connect(p,qOverload<int,QProcess::ExitStatus>(&QProcess::finished),this,[p,done](int,QProcess::ExitStatus){
+        const auto r=QJsonDocument::fromJson(p->readAllStandardOutput().left(16*1024*1024)).object();
+        p->deleteLater();done(r);
+    });
+    connect(p,&QProcess::errorOccurred,this,[p,done](QProcess::ProcessError e){
+        if (e!=QProcess::FailedToStart) return;
+        p->deleteLater();done({{"ok",false},{"error","the helper did not start"}});
+    });
+    p->start(m_helper,QStringList{});
+    p->write(QJsonDocument(request).toJson(QJsonDocument::Compact));p->closeWriteChannel();
+    QTimer::singleShot(60000,p,[p]{if (p->state()!=QProcess::NotRunning) p->kill();});
+    return true;
+}
+
 bool DexWalletService::runHelper(const QJsonObject &walletRequest,std::function<void(const QJsonObject&)> done) {
     if (!BackendExecutable::matches(m_helper,m_helperSha256)) return false;
     auto *p=new QProcess(this);
