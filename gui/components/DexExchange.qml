@@ -815,14 +815,18 @@ ColumnLayout {
                 }
             }
 
-            // Funds: the trading wallet (XMZ) and this pair's trade account (coin)
+            // Funds: the wallet of the coin this pair trades (XMZ, or XMR on a Monero pair; both on the
+            // XMR/XMZ route) beside this pair's trade account (coin), so the coin's account is never
+            // pushed onto a second row by a wallet the pair does not use
             GridLayout {
                 Layout.fillWidth: true
                 visible: ex.bottomTab === "funds"
                 columns: ex.width >= 900 ? 2 : 1
                 columnSpacing: 24; rowSpacing: 16
                 ColumnLayout {
+                    objectName: "fundsXmzColumn"
                     Layout.fillWidth: true; Layout.alignment: Qt.AlignTop; spacing: 8
+                    visible: ex.base !== "XMR" || ex.routeMode
                     Text { text: qsTr("XMZ · trading wallet"); font.pixelSize: 14; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
                     Text {
                         objectName: "fundsXmz"
@@ -860,7 +864,7 @@ ColumnLayout {
                 ColumnLayout {
                     objectName: "fundsXmrColumn"
                     Layout.fillWidth: true; Layout.alignment: Qt.AlignTop; spacing: 8
-                    visible: ex.xmrShown
+                    visible: ex.xmrShown && (ex.base === "XMR" || ex.routeMode)
                     Text { text: qsTr("XMR · Monero trading wallet"); font.pixelSize: 14; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
                     Text {
                         objectName: "fundsXmr"

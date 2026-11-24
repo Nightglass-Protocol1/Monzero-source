@@ -320,6 +320,14 @@ Item {
         }
             function test_the_monero_wallet_shows_and_sends_from_the_funds_tab() {
             ex.bottomTab = "funds"
+            // On an XMZ pair the XMZ wallet sits beside the coin's account; the Monero wallet is not shown
+            ex.pick("SOL")
+            verify(find(ex, "fundsXmzColumn").visible)
+            verify(!find(ex, "fundsXmrColumn").visible)
+            // On a Monero pair it is the Monero wallet beside the coin's account
+            ex.pickXmr("SOL/XMR")
+            compare(ex.base, "XMR")
+            verify(!find(ex, "fundsXmzColumn").visible)
             verify(find(ex, "fundsXmrColumn").visible)
             compare(find(ex, "fundsXmr").text, "1.25 XMR available · 1.5 XMR in total")
             compare(find(ex, "xmrAddress").text, "5" + "A".repeat(94))
@@ -329,6 +337,7 @@ Item {
             compare(JSON.stringify(engine.calls), JSON.stringify([["sendXmr", "5" + "B".repeat(94), "0.5"]]))
             engine.xmrWalletStatus = { state: "unconfigured" }
             verify(!find(ex, "fundsXmrColumn").visible)
+            ex.pick("SOL")
         }
 }
 }
