@@ -1,29 +1,37 @@
 {
- "helper": "/opt/monzero-liquidity/monzero-dex-evm-helper",
- "wallet_rpc_bin": "/usr/bin/monzero-wallet-rpc",
- "state_dir": "/var/lib/monzero-liquidity",
- "daemon": "127.0.0.1:6175",
- "reference_usd": "0.01",
- "ladder_percent": [
-  2,
-  5,
-  10,
-  20
- ],
- "offer_xmz": "2000",
- "offer_hours": 6,
- "reprice_percent": 3,
- "keep_xmz": "0",
- "pairs": {
-  "SOL": {
-   "vault": "5LpU8TxNqWvs5ACyhxCXNVFXNMq6mnvvK1YvMGkBWXog"
+  "helper": "/opt/monzero-liquidity/monzero-dex-evm-helper",
+  "wallet_rpc_bin": "/usr/bin/monzero-wallet-rpc",
+  "state_dir": "/var/lib/monzero-liquidity",
+  "daemon": "127.0.0.1:6175",
+  "reference_usd": "0.01",
+  "ladder_percent": [
+    2,
+    5,
+    10,
+    20
+  ],
+  "offer_xmz": "2000",
+  "offer_hours": 6,
+  "reprice_percent": 3,
+  "keep_xmz": "0",
+  "pairs": {
+    "SOL": {
+      "vault": "5LpU8TxNqWvs5ACyhxCXNVFXNMq6mnvvK1YvMGkBWXog"
+    },
+    "ETH": {
+      "vault": "0xD0Eb7C50Db766c897B085A492387135123f0A6b9"
+    },
+    "BNB": {
+      "vault": "0xD0Eb7C50Db766c897B085A492387135123f0A6b9"
+    },
+    "USDT": {
+      "vault": "5LpU8TxNqWvs5ACyhxCXNVFXNMq6mnvvK1YvMGkBWXog",
+      "enabled": false
+    },
+    "USDT-BSC": {
+      "vault": "0xD0Eb7C50Db766c897B085A492387135123f0A6b9",
+      "enabled": false
+    }
   },
-  "ETH": {
-   "vault": "0xD0Eb7C50Db766c897B085A492387135123f0A6b9"
-  },
-  "BNB": {
-   "vault": "0xD0Eb7C50Db766c897B085A492387135123f0A6b9"
-  }
- },
- "min_part_xmz": "50"
+  "min_part_xmz": "50"
 }

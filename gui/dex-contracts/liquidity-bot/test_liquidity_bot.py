@@ -50,7 +50,8 @@ tk = Path(req["tradeDir"]) / "taken.json"
 part = json.loads(tk.read_text()) if tk.exists() else offer
 value = scen.get("trade_value") or part.get("valueWei")
 trade = {"role": scen.get("role", "claimer"), "commitment": "0x" + "ab" * 32, "stage": "Agreed",
-         "offer": {"chainId": offer.get("chainId"), "value": value, "xmzAmount": part.get("xmzAtoms")}}
+         "offer": {"chainId": offer.get("chainId"), "value": value, "xmzAmount": part.get("xmzAtoms"),
+                   "asset": scen.get("asset", "0x" + "00" * 20)}}
 approved = (Path(req["tradeDir"]) / "approved").exists()
 if cmd == "status":
     out({**trade, "done": scen.get("done", False), "approved": approved})
@@ -102,6 +103,43 @@ class BotTest(unittest.TestCase):
         p = self.tmp / "requests.jsonl"
         rows = [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
         return [r for r in rows if cmd is None or r["command"] == cmd]
+
+    def usdt_bot(self):
+        cfg_path = self.tmp / "u.json"
+        cfg_path.write_text(json.dumps({"helper": str(self.tmp / "helper"), "wallet_rpc_bin": "/bin/false", "state_dir": str(self.tmp / "state-u"),
+                                        "ladder_percent": [2], "offer_xmz": "2000", "reference_usd": "0.01", "dynamic_price": {"floor_usd": "0.01"},
+                                        "pairs": {"USDT-BSC": {"vault": "0x" + "d0" * 20}}}))
+        bot = lb.Bot(lb.load_config(cfg_path))
+        (self.tmp / "state-u" / "keys").mkdir(parents=True)
+        bot.seed_file.write_text("00" * 64)
+        bot.main.start = lambda: True
+        bot.main.endpoint = lambda: {"url": "http://127.0.0.1:1", "loginFile": "/x"}
+        bot.control = lambda network: (dict(CONTROL, maxLtcAtomsPerTrade=str(60 * 10 ** 18), maxLtcAtomsPerDay=str(600 * 10 ** 18)), None)
+        bot.prices, bot.prices_at = {}, time.time()          # USDT needs no price feed: it is a dollar
+        bot.gas_balance = lambda pair, addr: 10 ** 18
+        return bot
+
+    def test_usdt_offers_name_their_pair_at_a_dollar_and_approve_only_token_trades(self):
+        bot = self.usdt_bot()
+        bot.round()
+        posts = [p for p in self.requests("post") if "state-u" in p["tradeDir"]]
+        self.assertEqual(len(posts), 1)
+        o = posts[0]["offer"]
+        self.assertEqual((o["pair"], o["chainId"], o["side"]), ("USDT-BSC/XMZ", 56, "sell-xmz"))
+        self.assertEqual(o["valueWei"], str(20400000000000000000), "2000 XMZ at $0.0102 = 20.4 USDT (18 places on BNB Chain)")
+        self.assertEqual(posts[0]["tick"]["accountIndex"], 500)
+        # A taken trade that moves BNB (asset zero) is not this pair's: never approved
+        self.scenario({"unlocked": 100000 * lb.ATOMIC, "taken": True})
+        bot.round()
+        self.assertEqual([a for a in self.requests("approve") if "state-u" in a["tradeDir"]], [])
+        self.assertTrue(any("NOT approved" in a for a in bot.alerts))
+
+    def test_usdt_trade_moving_the_token_is_approved(self):
+        bot = self.usdt_bot()
+        bot.round()
+        self.scenario({"unlocked": 100000 * lb.ATOMIC, "taken": True, "asset": "0x55d398326f99059fF775485246999027B3197955"})
+        bot.round()
+        self.assertEqual(len([a for a in self.requests("approve") if "state-u" in a["tradeDir"]]), 1)
 
     def test_ladder_prices(self):
         self.bot.round()

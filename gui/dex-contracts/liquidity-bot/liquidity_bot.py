@@ -38,11 +38,19 @@ WALLET_NAME = "liquidity"
 
 PAIR_DEFAULTS = {
     "SOL": {"chain_id": 501000101, "decimals": 9, "control": "sol-mainnet", "rpc": "https://solana-rpc.publicnode.com",
-            "keep": "20000000", "key_base": 100},      # 0.02 SOL left for fees and the account minimum
+            "keep": "20000000", "key_base": 100, "solana": True},      # 0.02 SOL left for fees and the account minimum
     "ETH": {"chain_id": 1, "decimals": 18, "control": "eth-mainnet", "rpc": "https://ethereum-rpc.publicnode.com",
             "keep": "2000000000000000", "key_base": 200},    # 0.002 ETH
     "BNB": {"chain_id": 56, "decimals": 18, "control": "bnb-mainnet", "rpc": "https://bsc-rpc.publicnode.com",
             "keep": "4000000000000000", "key_base": 300},    # 0.004 BNB
+    # USDT: a token on its chain. The offer names its pair; the price is a dollar; network fees
+    # are the chain's coin (keep, gas_coin), and the payout sends the USDT first, then the coin over keep
+    "USDT": {"chain_id": 501000101, "pair": "USDT/XMZ", "decimals": 6, "control": "sol-usdt-v2-mainnet",
+             "rpc": "https://solana-rpc.publicnode.com", "keep": "20000000", "gas_coin": "SOL", "gas_decimals": 9,
+             "usd_fixed": "1", "key_base": 400, "solana": True},
+    "USDT-BSC": {"chain_id": 56, "pair": "USDT-BSC/XMZ", "decimals": 18, "control": "bnb-usdt-v2-mainnet",
+                 "rpc": "https://bsc-rpc.publicnode.com", "keep": "4000000000000000", "gas_coin": "BNB", "gas_decimals": 18,
+                 "usd_fixed": "1", "key_base": 500},
 }
 DEFAULTS = {
     "network": "mainnet",
@@ -191,7 +199,7 @@ def load_config(path):
     cfg["pairs"] = {}
     for name, p in pairs.items():
         if name not in PAIR_DEFAULTS:
-            sys.exit(f"config: unknown pair {name} (SOL, ETH or BNB)")
+            sys.exit(f"config: unknown pair {name} (SOL, ETH, BNB, USDT or USDT-BSC)")
         cfg["pairs"][name] = {**PAIR_DEFAULTS[name], **p}
     for key in ("helper", "wallet_rpc_bin", "state_dir"):
         if not cfg.get(key):
@@ -367,7 +375,7 @@ class Bot:
         r = self.helper({"command": "accounts", "tradeDir": str(self.state_dir), "tick": self.tick_config(pair, slot)})
         if not r.get("ok"):
             return None
-        return r["sol"] if pair == "SOL" else r["evm"]
+        return r["sol"] if self.cfg["pairs"][pair].get("solana") else r["evm"]
 
     # --- outside information
     def refresh_prices(self):
@@ -434,7 +442,7 @@ class Bot:
     def gas_balance(self, pair, address):
         p = self.cfg["pairs"][pair]
         try:
-            if pair == "SOL":
+            if p.get("solana"):
                 r = http_json(p["rpc"], {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [address, {"commitment": "confirmed"}]})
                 return int(r["result"]["value"])
             r = http_json(p["rpc"], {"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [address, "latest"]})
@@ -530,7 +538,7 @@ class Bot:
     def offer_for(self, pair, step, doc):
         """(value in the coin's atoms, XMZ atoms) for one ladder step, inside the document's limits."""
         p = self.cfg["pairs"][pair]
-        coin_usd = self.prices.get(pair)
+        coin_usd = Decimal(p["usd_fixed"]) if p.get("usd_fixed") else self.prices.get(pair)
         if not coin_usd:
             return None
         price_usd = self.reference() * (1 + Decimal(str(step)) / 100)
@@ -608,7 +616,8 @@ class Bot:
         s["account"] = account
         gas = self.gas_balance(pair, account)
         if gas is None or gas < int(self.cfg["pairs"][pair]["keep"]):
-            s["note"] = f"its trade account {account} needs {units(self.cfg['pairs'][pair]['keep'], self.cfg['pairs'][pair]['decimals'])} {pair} for network fees"
+            gp = self.cfg["pairs"][pair]
+            s["note"] = f"its trade account {account} needs {units(gp['keep'], gp.get('gas_decimals', gp['decimals']))} {gp.get('gas_coin', pair)} for network fees"
             self.alert(f"{key}: " + s["note"])
             return spare
         folder = self.trades_dir / f"{key}-{int(time.time())}"
@@ -621,6 +630,8 @@ class Bot:
         min_part = self.min_part(xmz)
         if min_part:
             offer["minXmzAtoms"] = str(min_part)
+        if self.cfg["pairs"][pair].get("pair"):
+            offer["pair"] = self.cfg["pairs"][pair]["pair"]
         r = self.helper({"command": "post", "tradeDir": str(folder), "relays": self.cfg["relays"], "tick": self.tick_config(pair, slot),
                          "offer": offer})
         listing = (r.get("listing") or {}).get("listing") if r.get("ok") else None
@@ -742,7 +753,10 @@ class Bot:
         if r.get("awaitingApproval") and not r.get("approved"):
             offer = r.get("offer") or {}
             # Only the trade we offered: our side, our chain, our amounts
+            # A USDT pair's trade moves the token, a coin pair's the coin (asset zero)
+            token = any(c not in "0x" for c in str(offer.get("asset", "0x0")))
             if (r.get("role") == "claimer" and int(offer.get("chainId", 0)) == self.cfg["pairs"][pair]["chain_id"]
+                    and token == bool(self.cfg["pairs"][pair].get("pair"))
                     and int(offer.get("value", "0"), 0) == s["valueAtoms"] and int(offer.get("xmzAmount", "0"), 0) == s["xmzAtoms"]):
                 a = self.helper({"command": "approve", "tradeDir": folder, "commitment": r["commitment"]})
                 log.info("%s: approved the trade%s", key, "" if a.get("ok") else ": " + str(a.get("error")))
