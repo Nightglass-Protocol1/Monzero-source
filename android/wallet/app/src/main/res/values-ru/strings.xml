@@ -76,7 +76,11 @@
     <string name="status_wallet_unloaded">Кошелёк сохранён</string>
     <string name="status_wallet_unload_failed">Ошибка сохранения кошелька!</string>
     <string name="status_wallet_connecting">Подключение …</string>
-    <string name="status_wallet_connect_failed">Ошибка подключения к удалённому узлу!\nПроверьте имя пользователя и пароль</string>
+    <string name="status_wallet_connect_failed">Ошибка подключения к узлу!\nПроверьте адрес узла, а также имя пользователя и пароль, если они заданы</string>
+    <string name="status_wallet_not_connected_title">Не удалось подключиться к узлу</string>
+    <string name="status_wallet_node_unreachable">Узел %1$s не ответил.</string>
+    <string name="status_wallet_open_failed">Не удалось запустить кошелёк.</string>
+    <string name="status_wallet_not_connected_help">Ваш кошелёк и средства в безопасности. Проверьте подключение к интернету и повторите попытку. Если ошибка повторяется, нажмите на название узла на начальном экране и выберите другой узел или попробуйте Wi-Fi вместо мобильного интернета: некоторые сети блокируют порт 6175.</string>
     <string name="status_wallet_node_invalid">Ошибка удалённого узла!\nПопробуйте ещё раз или другой.</string>
     <string name="status_wallet_connect_ioex">Не удается подключится к удалённому узлу!\nПопробуйте ещё раз или другой.</string>
     <string name="status_wallet_disconnected">Разъединено</string>
@@ -93,7 +97,8 @@
     <string name="bad_password">Неверный пароль!</string>
     <string name="bad_saved_password">Сохраненный пароль неверен.\nВведите пароль вручную.</string>
     <string name="bad_wallet">Кошелька не существует!</string>
-    <string name="prompt_daemon_missing">Должен быть установлен адрес удалённого узла!</string>
+    <string name="prompt_daemon_missing">Узел не выбран. Нажмите на название узла вверху и выберите узел (по умолчанию node.monzero.org).</string>
+    <string name="prompt_no_network">Нет подключения к интернету, поэтому не удалось выбрать узел. Подключитесь и повторите попытку.</string>
     <string name="prompt_wrong_net">Кошелёк не соответствует выбранной сети</string>
     <string name="label_watchonly">(Режим просмотра)</string>
     <string name="label_wallet_receive">Получить</string>
@@ -266,6 +271,7 @@
     <string name="node_scanning">Сканирование сети…</string>
     <string name="node_nobookmark">Автоматически отмечены лучшие %1$d узлы</string>
     <string name="label_test">Проверка</string>
+    <string name="node_use_ssl">Использовать SSL</string>
     <!--note: as in "Test a network connection"-->
 
     <string name="backup_success">Резервное копирование успешно</string>
