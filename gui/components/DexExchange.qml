@@ -878,11 +878,12 @@ ColumnLayout {
                         text: qsTr("Send XMR here from any Monero wallet to trade it. XMR you buy arrives here; send it on to your own Monero wallet whenever you like. Node: %1").arg(ex.xmrWallet.daemon || "—")
                     }
                     M.LineEdit { objectName: "xmrAddress"; Layout.fillWidth: true; readOnly: true; copyButton: true; fontSize: 12; text: ex.xmrWallet.address || ""; visible: (ex.xmrWallet.address || "") !== "" }
+                    // The address on its own line (a Monero address is 95 characters); the amount and button below
+                    M.LineEdit { id: xmrTo; objectName: "xmrSendTo"; Layout.fillWidth: true; visible: ex.xmrWallet.state === "ready"; fontSize: 13; inputPaddingTop: 6; inputPaddingBottom: 6; placeholderText: qsTr("Your Monero address"); placeholderFontSize: 13 }
                     RowLayout {
                         Layout.fillWidth: true
                         visible: ex.xmrWallet.state === "ready"
-                        M.LineEdit { id: xmrTo; objectName: "xmrSendTo"; Layout.fillWidth: true; fontSize: 13; inputPaddingTop: 6; inputPaddingBottom: 6; placeholderText: qsTr("Your Monero address"); placeholderFontSize: 13 }
-                        M.LineEdit { id: xmrAmount; objectName: "xmrSendAmount"; Layout.preferredWidth: 120; fontSize: 13; inputPaddingTop: 6; inputPaddingBottom: 6; placeholderText: qsTr("XMR (empty: all)"); placeholderFontSize: 13 }
+                        M.LineEdit { id: xmrAmount; objectName: "xmrSendAmount"; Layout.fillWidth: true; fontSize: 13; inputPaddingTop: 6; inputPaddingBottom: 6; placeholderText: qsTr("XMR (empty: all)"); placeholderFontSize: 13 }
                         M.StandardButton {
                             objectName: "xmrSend"
                             small: true; text: qsTr("Send XMR")
