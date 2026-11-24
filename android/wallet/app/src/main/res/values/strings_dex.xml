@@ -70,6 +70,25 @@
     <string name="dex_direct_approve_body">You pay %1$s\nYou receive %2$s\n\nYou pay on: %3$s\nYou receive on: %4$s\nThese amounts are from the signed offer this wallet holds, not from the web page. Once approved the swap runs by itself; keep the DEX link on and the phone connected until it is finished. If the other side does not lock its coin, yours comes back after its time limit (about 9 hours).\n\nWhat you receive goes to %5$s</string>
     <string name="dex_approve">Approve</string>
     <string name="dex_approve_cancel">Cancel this trade</string>
+    <string name="dex_xmr_add_title">Add XMR for trading</string>
+    <string name="dex_xmr_add_body">Send %1$s to your Monero trading wallet from Cake Wallet or any Monero wallet:
+
+%2$s
+
+It can be traded once the Monero network has confirmed it (10 blocks, about 20 minutes). Only your trading keys in this app can move it.</string>
+    <string name="dex_xmr_add_any">XMR</string>
+    <string name="dex_xmr_add_open">Open Cake Wallet</string>
+    <string name="dex_xmr_add_copy">Copy the address</string>
+    <string name="dex_xmr_add_copied">Address copied. Paste it in your Monero wallet\'s Send screen.</string>
+    <string name="dex_xmr_add_no_app">No Monero wallet app opened. Install Cake Wallet, or copy the address into your Monero wallet.</string>
+    <string name="dex_xmr_not_ready">The Monero trading wallet is still starting. Try again in a minute.</string>
+    <string name="dex_xmr_out_title">Send XMR to your own wallet</string>
+    <string name="dex_xmr_out_body">%1$s XMR is ready in your Monero trading wallet. Send it to your own Monero wallet (your Cake Wallet address, for example), minus the network fee. Leave the amount empty to send all of it.</string>
+    <string name="dex_xmr_out_none">No XMR is ready to send yet. XMR from a trade needs 10 confirmations (about 20 minutes).</string>
+    <string name="dex_xmr_out_address">Your Monero address (starts with 4 or 8)</string>
+    <string name="dex_xmr_out_amount">XMR (empty: all)</string>
+    <string name="dex_xmr_out_go">Send XMR</string>
+    <string name="dex_xmr_out_bad">Check the address: a Monero address starts with 4 or 8 and is 95 characters long.</string>
     <string name="dex_return_title">Move your trading XMZ back?</string>
     <string name="dex_return_body">%1$s XMZ is ready in your trading wallet. All of it goes back to your wallet\'s address, minus the network fee:\n\n%2$s</string>
     <string name="dex_return_none">Nothing is ready to move yet. XMZ from a trade needs about 20 minutes before it can be sent.</string>

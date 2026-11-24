@@ -83,9 +83,11 @@ final class DexText {
         }
     }
 
-    /** The XMZ side of an offer, as "2000 XMZ". */
+    /** The private side of an offer, as "2000 XMZ" or, on a Monero pair, "0.06 XMR" (the trade's own terms). */
     static String xmzText(JSONObject offer) {
         final String atoms = DexMarket.amountText(offer.opt("xmzAmount"));
-        return (atoms == null ? "?" : DexFiles.units(atoms, 11)) + " XMZ";
+        final boolean xmr = "XMR".equals(offer.optString("privateCoin"));
+        final int places = offer.optInt("privateDecimals", xmr ? 12 : 11);
+        return (atoms == null ? "?" : DexFiles.units(atoms, places == 12 ? 12 : 11)) + (xmr ? " XMR" : " XMZ");
     }
 }

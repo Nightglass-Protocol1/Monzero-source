@@ -10,18 +10,26 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * One XMZ wallet RPC program (monzero-wallet-rpc, built for Android) serving one private folder on
- * a loopback port. It makes its own login (monzero-wallet-rpc.&lt;port&gt;.login in the folder), which
- * only this app can read; the trade helper logs in with it.
+ * One wallet RPC program serving one private folder on a loopback port: XMZ's (monzero-wallet-rpc,
+ * built for Android) or Monero's own (monero-wallet-rpc, Monero's official Android release). It
+ * makes its own login (&lt;program&gt;.&lt;port&gt;.login in the folder), which only this app can read;
+ * the trade helper logs in with it.
  */
 final class DexWalletRpc {
     final File dir;
     final int port;
+    /** "monzero-wallet-rpc" or "monero-wallet-rpc": the name the program gives its login file */
+    private final String loginName;
     private Process process;
 
     DexWalletRpc(File dir, int port) {
+        this(dir, port, "monzero-wallet-rpc");
+    }
+
+    DexWalletRpc(File dir, int port, String loginName) {
         this.dir = dir;
         this.port = port;
+        this.loginName = loginName;
     }
 
     static int freePort() {
@@ -66,7 +74,7 @@ final class DexWalletRpc {
     }
 
     File loginFile() {
-        return new File(dir, "monzero-wallet-rpc." + port + ".login");
+        return new File(dir, loginName + "." + port + ".login");
     }
 
     File pidFile() {
@@ -118,7 +126,8 @@ final class DexWalletRpc {
         if (!DexFiles.privateDir(dir) || !DexFiles.privateDir(wallets)) return false;
         stopLeftover(pidFile(), program, dir);
         // A login file from a session that did not end cleanly would be taken for this one's
-        final File[] old = dir.listFiles((d, name) -> name.startsWith("monzero-wallet-rpc.") && name.endsWith(".login"));
+        final File[] old = dir.listFiles((d, name) -> (name.startsWith("monzero-wallet-rpc.") || name.startsWith("monero-wallet-rpc."))
+                && name.endsWith(".login"));
         if (old != null) for (File f : old) f.delete();
         if (!portFree(port)) return false;
         final List<String> args = new ArrayList<>();

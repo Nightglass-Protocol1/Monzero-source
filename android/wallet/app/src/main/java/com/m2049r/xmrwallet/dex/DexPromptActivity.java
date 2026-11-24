@@ -1,6 +1,11 @@
 package com.m2049r.xmrwallet.dex;
 
+import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.Button;
@@ -20,7 +25,10 @@ import org.json.JSONObject;
  */
 public class DexPromptActivity extends SecureActivity {
     private TextView title, code, body, note;
-    private EditText password, repeat;
+    private EditText password, repeat, address, amount;
+    /** The Monero address last sent to (the user's Cake Wallet, say), offered again next time */
+    static final String PREF_XMR_HOME = "dex_xmr_home";
+    private boolean xmrOutAsked;
     private Button yes, later, no;
     private String showing = "", notice = "";
     private boolean askedFresh, returnAsked, clearOnFail;
@@ -32,6 +40,8 @@ public class DexPromptActivity extends SecureActivity {
     private static final class Waiting {
         DexBridge.Pairing pairing;
         boolean keysWanted, keysExist, keysReady, keysBusy, approval, returnWanted, walletBusy;
+        boolean xmrAdd, xmrOut, xmrReady, xmrBusy;
+        String xmrAddAmount = "", xmrAddress = "", xmrUnlocked = "0", xmrError = "";
         String keysMessage = "", commitment = "", startRefusal = "", unlocked = "0", payoutAccount = "", walletError = "";
         JSONObject snapshot;
         // A direct (coin <-> coin) take of ours waiting for approval, and where its coin goes
@@ -49,6 +59,8 @@ public class DexPromptActivity extends SecureActivity {
         note = findViewById(R.id.dexPromptNote);
         password = findViewById(R.id.dexPromptPassword);
         repeat = findViewById(R.id.dexPromptRepeat);
+        address = findViewById(R.id.dexPromptAddress);
+        amount = findViewById(R.id.dexPromptAmount);
         yes = findViewById(R.id.dexPromptYes);
         later = findViewById(R.id.dexPromptLater);
         no = findViewById(R.id.dexPromptNo);
@@ -81,6 +93,12 @@ public class DexPromptActivity extends SecureActivity {
      */
     @Override
     protected void onStop() {
+        if (!isChangingConfigurations() && (showing.equals("xmr-add") || showing.equals("xmr-out") || showing.equals("xmr-done"))) {
+            xmrOutAsked = false;
+            showing = "";
+            final DexService service = DexService.get();
+            if (service != null && service.engine() != null && service.bridge() != null) service.engine().post(service.bridge()::dismissXmr);
+        }
         if (!isChangingConfigurations() && (showing.equals("return") || showing.equals("done"))) {
             returnAsked = false;
             showing = "";
@@ -108,6 +126,15 @@ public class DexPromptActivity extends SecureActivity {
             w.commitment = engine.tradeCommitment();
             w.startRefusal = engine.startRefusal();
             w.returnWanted = bridge.returnWanted();
+            w.xmrAdd = bridge.xmrAddWanted();
+            w.xmrOut = bridge.xmrOutWanted();
+            w.xmrAddAmount = bridge.xmrAddAmount();
+            final JSONObject xw = engine.xmrWalletStatus();
+            w.xmrReady = "ready".equals(xw.optString("state"));
+            w.xmrBusy = xw.optBoolean("busy");
+            w.xmrAddress = xw.optString("address");
+            w.xmrUnlocked = xw.optString("unlocked", "0");
+            w.xmrError = !xw.optString("message").isEmpty() ? xw.optString("message") : xw.optString("error");
             w.unlocked = engine.tradingUnlocked();
             final JSONObject wallet = engine.walletStatus();
             w.walletBusy = wallet.optBoolean("busy");
@@ -132,6 +159,8 @@ public class DexPromptActivity extends SecureActivity {
         title.setText(titleText);
         body.setText(bodyText);
         code.setVisibility(View.GONE);
+        address.setVisibility(View.GONE);
+        amount.setVisibility(View.GONE);
         password.setVisibility(View.GONE);
         repeat.setVisibility(View.GONE);
         no.setVisibility(View.GONE);
@@ -253,6 +282,14 @@ public class DexPromptActivity extends SecureActivity {
                 return;
             }
         }
+        if (w.xmrAdd) {
+            showXmrAdd(engine, bridge, w);
+            return;
+        }
+        if (w.xmrOut || xmrOutAsked) {
+            showXmrOut(engine, bridge, w);
+            return;
+        }
         if (w.returnWanted || returnAsked) {
             final String home = DexService.prefs(this).getString(DexService.PREF_HOME, "");
             final boolean any = !w.unlocked.equals("0");
@@ -290,6 +327,103 @@ public class DexPromptActivity extends SecureActivity {
             return;
         }
         nothing();
+    }
+
+    /**
+     * Add XMR: the Monero trading wallet's address (and the amount the page named), with a button
+     * that opens Cake Wallet (or any Monero wallet the phone has) with both filled in, through a
+     * standard monero: payment link. Nothing is sent from here: the user confirms in their wallet.
+     */
+    private void showXmrAdd(final DexEngine engine, final DexBridge bridge, Waiting w) {
+        final String xmr = w.xmrAddAmount;
+        if (!w.xmrReady || w.xmrAddress.isEmpty()) {
+            show("xmr-add", getString(R.string.dex_xmr_add_title), getString(R.string.dex_xmr_not_ready));
+            yes.setVisibility(View.GONE);
+        } else {
+            show("xmr-add", getString(R.string.dex_xmr_add_title), getString(R.string.dex_xmr_add_body,
+                    xmr.isEmpty() ? getString(R.string.dex_xmr_add_any) : xmr + " XMR", w.xmrAddress));
+            final String to = w.xmrAddress;
+            yes.setText(R.string.dex_xmr_add_open);
+            yes.setOnClickListener(v -> {
+                final Intent pay = new Intent(Intent.ACTION_VIEW, Uri.parse("monero:" + to + (xmr.isEmpty() ? "" : "?tx_amount=" + xmr)));
+                try {
+                    startActivity(pay);
+                } catch (ActivityNotFoundException e) {
+                    notice = getString(R.string.dex_xmr_add_no_app);
+                    note.setText(notice);
+                    note.setVisibility(View.VISIBLE);
+                }
+            });
+            no.setVisibility(View.VISIBLE);
+            no.setText(R.string.dex_xmr_add_copy);
+            no.setOnClickListener(v -> {
+                final ClipboardManager clip = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                if (clip != null) clip.setPrimaryClip(ClipData.newPlainText("Monero address", to));
+                notice = getString(R.string.dex_xmr_add_copied);
+                note.setText(notice);
+                note.setVisibility(View.VISIBLE);
+            });
+        }
+        later.setText(R.string.dex_close);
+        later.setOnClickListener(v -> {
+            engine.post(bridge::dismissXmr);
+            finish();
+        });
+    }
+
+    /**
+     * Send XMR out of the Monero trading wallet to the user's own Monero wallet. The address is
+     * typed or pasted here, in the wallet (the page never names it), and remembered for next time.
+     */
+    private void showXmrOut(final DexEngine engine, final DexBridge bridge, Waiting w) {
+        if (xmrOutAsked && !w.xmrBusy) {
+            notice = w.xmrError.isEmpty() ? getString(R.string.dex_return_sent) : w.xmrError;
+            show("xmr-done", getString(R.string.dex_xmr_out_title), "");
+            yes.setVisibility(View.GONE);
+            later.setText(R.string.dex_close);
+            later.setOnClickListener(v -> {
+                xmrOutAsked = false;
+                engine.post(bridge::dismissXmr);
+                finish();
+            });
+            return;
+        }
+        if (!w.xmrError.isEmpty() && !xmrOutAsked && showing.equals("xmr-out")) notice = w.xmrError;
+        final boolean fresh = !showing.equals("xmr-out");
+        final boolean any = w.xmrReady && !w.xmrUnlocked.equals("0");
+        show("xmr-out", getString(R.string.dex_xmr_out_title), any ? getString(R.string.dex_xmr_out_body, w.xmrUnlocked) : getString(R.string.dex_xmr_out_none));
+        address.setVisibility(View.VISIBLE);
+        amount.setVisibility(View.VISIBLE);
+        if (fresh) {
+            address.setText(DexService.prefs(this).getString(PREF_XMR_HOME, ""));
+            amount.setText("");
+        }
+        yes.setText(R.string.dex_xmr_out_go);
+        yes.setEnabled(any && !xmrOutAsked);
+        yes.setOnClickListener(v -> {
+            final String to = address.getText().toString().trim(), xmr = amount.getText().toString().trim();
+            // Main network: 4 (address) or 8 (subaddress); stagenet (test build): 5 or 7
+            if (!to.matches(DexConfig.mainnet() ? "\\A[48][0-9A-Za-z]{94}\\z" : "\\A[57][0-9A-Za-z]{94}\\z")) {
+                notice = getString(R.string.dex_xmr_out_bad);
+                note.setText(notice);
+                note.setVisibility(View.VISIBLE);
+                return;
+            }
+            DexService.prefs(this).edit().putString(PREF_XMR_HOME, to).apply();
+            xmrOutAsked = true;
+            yes.setEnabled(false);
+            engine.post(() -> {
+                if (!engine.sendXmr(to, xmr)) runOnUiThread(() -> {
+                    xmrOutAsked = false;
+                    refresh();
+                });
+            });
+        });
+        later.setOnClickListener(v -> {
+            xmrOutAsked = false;
+            engine.post(bridge::dismissXmr);
+            finish();
+        });
     }
 
     private void showWords(final DexEngine engine, final String typed) {

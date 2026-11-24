@@ -103,7 +103,8 @@ public class DexService extends Service implements DexBridge.Listener {
         final DexEngine e = engine;
         final DexBridge b = bridge;
         if (e == null || b == null) return false;
-        return Boolean.TRUE.equals(e.call(() -> b.pairing() != null || (b.keysWanted() && !e.keysReady()) || e.awaitingApproval() || b.returnWanted(), false));
+        return Boolean.TRUE.equals(e.call(() -> b.pairing() != null || (b.keysWanted() && !e.keysReady()) || e.awaitingApproval() || b.returnWanted()
+                || b.xmrAddWanted() || b.xmrOutWanted(), false));
     }
 
     /** Opening the wallet while a request is waiting shows that request (as tapping its notification does). */

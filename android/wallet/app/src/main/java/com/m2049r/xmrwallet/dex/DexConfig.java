@@ -106,6 +106,46 @@ final class DexConfig {
         return coin(chainId) + "/XMZ";
     }
 
+    /** The Monero pair of a chain ("BNB/XMR", "USDT/XMR", ...) */
+    static String xmrPair(long chainId) {
+        return coin(chainId) + "/XMR";
+    }
+
+    /**
+     * The chains with a Monero market here. Main network: the pairs proven with real coins, as in
+     * the desktop wallet (BNB/XMR, USDT-BSC/XMR, SOL/XMR, USDT (Solana)/XMR); ETH/XMR opens after
+     * its own real-funds swap. Test build: Monero's stagenet against the test chains.
+     */
+    static long[] xmrChains() {
+        return mainnet() ? new long[]{56, BSC_USDT_MAINNET, SOL_MAINNET, SOL_USDT_MAINNET} : new long[]{11155111, 97, SOL_DEVNET};
+    }
+
+    /** Monero's node for the app's Monero wallets: the project's own (main network, or stagenet for tests) */
+    static String defaultXmrDaemon() {
+        return mainnet() ? "31.70.193.31:18089" : "31.70.193.31:38089";
+    }
+
+    /** Monero's network for its wallet RPC: the main network, or stagenet in the test build */
+    static String xmrNetworkFlag() {
+        return mainnet() ? "" : "--stagenet";
+    }
+
+    /**
+     * Independent public Monero nodes that must also see the other trader's XMR lock before it
+     * counts (a main-network trade needs two; the engine refuses it otherwise). The same list as
+     * the desktop wallet.
+     */
+    static List<String> xmrWitnesses() {
+        final List<String> w = new ArrayList<>();
+        if (!mainnet()) return w;
+        w.add("https://node.monerodevs.org:18089");
+        w.add("https://monero.stackwallet.com:18081");
+        w.add("https://xmr.cryptostorm.is:18081");
+        w.add("https://xmr-node.cakewallet.com:18081");
+        w.add("https://xmr.unshakled.net:443");
+        return w;
+    }
+
     static int decimals(long chainId) {
         return usdt(chainId) ? 6 : solana(chainId) ? 9 : 18;
     }
@@ -174,6 +214,9 @@ final class DexConfig {
         final JSONObject rpc;
         final String daemon;
         final String localContract;
+        /** Test builds: the Monero node ("host:port") and witnesses (https:// or loopback URLs) */
+        final String xmrDaemon;
+        final List<String> xmrWitnesses = new ArrayList<>();
 
         Overrides(File root) {
             JSONObject o = null;
@@ -186,7 +229,7 @@ final class DexConfig {
                 }
             }
             JSONObject rpcs = new JSONObject();
-            String node = "", contract = "";
+            String node = "", contract = "", xmrNode = "";
             if (o != null) {
                 final JSONArray list = o.optJSONArray("relays");
                 for (int i = 0; list != null && i < list.length() && relays.size() < 8; i++) {
@@ -196,7 +239,14 @@ final class DexConfig {
                 if (o.optJSONObject("rpc") != null) rpcs = o.optJSONObject("rpc");
                 if (DAEMON.matcher(o.optString("daemon")).matches()) node = o.optString("daemon");
                 if (evmAddress(o.optString("localContract"))) contract = o.optString("localContract");
+                if (DAEMON.matcher(o.optString("xmrDaemon")).matches()) xmrNode = o.optString("xmrDaemon");
+                final JSONArray w = o.optJSONArray("xmrWitnesses");
+                for (int i = 0; w != null && i < w.length() && xmrWitnesses.size() < 8; i++) {
+                    final String u = w.optString(i);
+                    if (RELAY.matcher(u).matches()) xmrWitnesses.add(u);
+                }
             }
+            xmrDaemon = xmrNode;
             rpc = rpcs;
             daemon = node;
             localContract = contract;

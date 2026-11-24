@@ -74,7 +74,7 @@ android {
     packagingOptions {
         jniLibs {
             useLegacyPackaging true
-            keepDebugSymbols += ['**/libmonzero_dex_helper.so', '**/libmonzero_wallet_rpc.so']
+            keepDebugSymbols += ['**/libmonzero_dex_helper.so', '**/libmonzero_wallet_rpc.so', '**/libmonero_wallet_rpc.so']
         }
     }
 

@@ -67,8 +67,16 @@ final class DexTrade {
         return payout != null && payout.length() > 0;
     }
 
+    /** Monero nodes that must also see a lock (a Monero main-network trade); empty for XMZ */
+    private java.util.List<String> witnesses = new java.util.ArrayList<>();
+
     boolean configure(String dir, String evmRpc, JSONObject main, JSONObject swap) {
+        return configure(dir, evmRpc, main, swap, new java.util.ArrayList<>());
+    }
+
+    boolean configure(String dir, String evmRpc, JSONObject main, JSONObject swap, java.util.List<String> witnessDaemons) {
         if (configured() || busy || main == null || swap == null || !new File(dir).isDirectory()) return false;
+        witnesses = new java.util.ArrayList<>(witnessDaemons);
         tradeDir = dir;
         rpc = evmRpc;
         mainWallet = main;
@@ -84,6 +92,7 @@ final class DexTrade {
         if (busy || !done()) return false;
         tradeDir = rpc = trade = commitment = command = error = stepError = pendingApproval = "";
         mainWallet = swapWallet = funding = payout = null;
+        witnesses = new java.util.ArrayList<>();
         snapshot = new JSONObject();
         awaitingApproval = false;
         state = "unconfigured";
@@ -117,8 +126,10 @@ final class DexTrade {
 
     private JSONObject tickConfig(String seedHex) throws Exception {
         if (seedHex == null) return null;
-        return new JSONObject().put("evmRpc", rpc).put("walletSeedHex", seedHex).put("accountIndex", 0)
+        final JSONObject t = new JSONObject().put("evmRpc", rpc).put("walletSeedHex", seedHex).put("accountIndex", 0)
                 .put("mainWallet", mainWallet).put("swapWallet", swapWallet);
+        if (!witnesses.isEmpty()) t.put("witnessDaemons", new org.json.JSONArray(witnesses));
+        return t;
     }
 
     boolean refresh() {

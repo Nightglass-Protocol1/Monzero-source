@@ -35,6 +35,10 @@ final class DexMarket {
     }
 
     final long chainId;
+    /** A Monero market (BNB/XMR, ...): its private coin is XMR (12 places) in the Monero wallets */
+    final boolean xmr;
+    /** Monero nodes that must also see a lock (Monero main network); empty for XMZ */
+    final List<String> witnesses;
     final String rpc;
     final File tradesDir;
     private final List<String> relays;
@@ -51,7 +55,14 @@ final class DexMarket {
     private int next;
 
     DexMarket(long chainId, String rpc, File tradesDir, List<String> relays, String localContract, DexHelper helper, Listener listener) {
+        this(chainId, false, new ArrayList<>(), rpc, tradesDir, relays, localContract, helper, listener);
+    }
+
+    DexMarket(long chainId, boolean xmr, List<String> witnesses, String rpc, File tradesDir, List<String> relays, String localContract,
+              DexHelper helper, Listener listener) {
         this.chainId = chainId;
+        this.xmr = xmr;
+        this.witnesses = witnesses;
         this.rpc = rpc;
         this.tradesDir = tradesDir;
         this.relays = relays;
@@ -79,12 +90,28 @@ final class DexMarket {
         return DexConfig.coin(chainId);
     }
 
-    private static boolean listingValid(JSONObject signedListing) {
+    /** "BNB/XMZ" or "BNB/XMR" */
+    String pairName() {
+        return xmr ? DexConfig.xmrPair(chainId) : DexConfig.pair(chainId);
+    }
+
+    /** The private coin's decimal places: 11 for XMZ, 12 for XMR */
+    int privatePlaces() {
+        return xmr ? 12 : 11;
+    }
+
+    private boolean listingValid(JSONObject signedListing) {
+        return listingValid(signedListing, xmr);
+    }
+
+    private static boolean listingValid(JSONObject signedListing, boolean xmr) {
         if (signedListing == null || signedListing.length() != 2) return false;
         final JSONObject l = signedListing.optJSONObject("listing");
         if (l == null) return false;
         final String pair = l.optString("pair"), side = l.optString("side");
-        return HASH.matcher(l.optString("id")).matches() && (pair.equals("ETH/XMZ") || pair.equals("BNB/XMZ") || pair.equals("SOL/XMZ") || pair.equals("USDT/XMZ") || pair.equals("USDT-BSC/XMZ"))
+        final String base = xmr ? "/XMR" : "/XMZ";
+        final boolean known = pair.endsWith(base) && Arrays.asList("ETH", "BNB", "SOL", "USDT", "USDT-BSC").contains(pair.substring(0, pair.length() - 4));
+        return HASH.matcher(l.optString("id")).matches() && known
                 && (side.equals("sell-xmz") || side.equals("buy-xmz")) && HEX_QTY.matcher(l.optString("value")).matches()
                 && amountText(l.opt("xmz")) != null && DexConfig.evmAddress(l.optString("maker"))
                 && l.opt("expiresAt") instanceof Number && l.opt("chainId") instanceof Number;
@@ -104,12 +131,17 @@ final class DexMarket {
 
     /** Coin per XMZ, for display only: plain decimals, six significant digits. */
     static String priceText(String valueWei, String xmzAtoms, int decimals) {
+        return priceText(valueWei, xmzAtoms, decimals, 11);
+    }
+
+    /** Coin per XMZ (places 11) or per XMR (places 12) */
+    static String priceText(String valueWei, String xmzAtoms, int decimals, int places) {
         try {
             final double wei = Double.parseDouble(valueWei), atoms = Double.parseDouble(xmzAtoms);
             if (!(wei > 0) || !(atoms > 0)) return "";
-            final double price = wei / Math.pow(10.0, decimals) / (atoms / 1e11);
-            final int places = Math.max(0, Math.min(18, 5 - (int) Math.floor(Math.log10(price))));
-            String text = new java.math.BigDecimal(price).setScale(places, java.math.RoundingMode.HALF_UP).toPlainString();
+            final double price = wei / Math.pow(10.0, decimals) / (atoms / Math.pow(10.0, places));
+            final int shown = Math.max(0, Math.min(18, 5 - (int) Math.floor(Math.log10(price))));
+            String text = new java.math.BigDecimal(price).setScale(shown, java.math.RoundingMode.HALF_UP).toPlainString();
             if (text.contains(".")) {
                 text = text.replaceAll("0+\\z", "");
                 if (text.endsWith(".")) text = text.substring(0, text.length() - 1);
@@ -179,18 +211,22 @@ final class DexMarket {
         final JSONObject r = new JSONObject().put("schema", DexHelper.REQUEST_SCHEMA).put("command", cmd)
                 .put("tradeDir", dir == null || dir.isEmpty() ? tradesDir.getPath() : dir).put("relays", new JSONArray(relays));
         if (!localContract.isEmpty()) r.put("localContract", localContract);
+        // Monero main-network offers are refused unless the request says the app trades them
+        if (xmr && DexConfig.mainnet()) r.put("xmrMainnet", true);
         return r;
     }
 
     /** What every keyed helper request carries: the node, the keys and the wallet services. */
     JSONObject tickConfig(String seedHex, JSONObject swapWallet) throws Exception {
         if (seedHex == null || mainWallet == null) return null;
-        return new JSONObject().put("evmRpc", rpc).put("walletSeedHex", seedHex).put("accountIndex", 0)
+        final JSONObject t = new JSONObject().put("evmRpc", rpc).put("walletSeedHex", seedHex).put("accountIndex", 0)
                 .put("mainWallet", mainWallet).put("swapWallet", swapWallet == null ? mainWallet : swapWallet);
+        if (!witnesses.isEmpty()) t.put("witnessDaemons", new JSONArray(witnesses));
+        return t;
     }
 
     boolean refreshListings(String pair) {
-        if (!pair.equals(coin() + "/XMZ")) return false;
+        if (!pair.equals(pairName())) return false;
         try {
             // Partial offers too: this wallet can take part of one
             return run(base("listings", null).put("pair", pair).put("partial", true), "");
@@ -213,7 +249,8 @@ final class DexMarket {
                     .put("xmzAtoms", xmzAtoms).put("lifetimeSecs", lifetimeSecs);
             if (minXmzAtoms != null) offer.put("minXmzAtoms", minXmzAtoms);
             if (renew) offer.put("renew", true);
-            if (DexConfig.token(chainId)) offer.put("pair", DexConfig.pair(chainId));
+            if (xmr) offer.put("pair", pairName()).put("coin", "xmr");
+            else if (DexConfig.token(chainId)) offer.put("pair", DexConfig.pair(chainId));
             return run(base("post", dir).put("tick", t).put("offer", offer), dir);
         } catch (Exception e) {
             return false;
@@ -360,11 +397,11 @@ final class DexMarket {
                         final JSONArray at = entry.optJSONArray("relays");
                         final JSONObject shown = new JSONObject().put("id", id).put("pair", l.optString("pair")).put("side", l.optString("side"))
                                 .put("chainId", l.optLong("chainId")).put("maker", l.optString("maker")).put("valueWei", wei).put("xmzAtoms", xmz)
-                                .put("coin", DexFiles.units(wei, places)).put("xmz", DexFiles.units(xmz, 11)).put("price", priceText(wei, xmz, places))
+                                .put("coin", DexFiles.units(wei, places)).put("xmz", DexFiles.units(xmz, privatePlaces())).put("price", priceText(wei, xmz, places, privatePlaces()))
                                 .put("expiresAt", l.optLong("expiresAt")).put("relays", at == null ? 0 : at.length());
                         // A partial offer: any amount from its minimum may be taken
                         final String min = l.has("minXmz") ? amountText(l.opt("minXmz")) : null;
-                        if (min != null) shown.put("minXmzAtoms", min).put("minXmz", DexFiles.units(min, 11));
+                        if (min != null) shown.put("minXmzAtoms", min).put("minXmz", DexFiles.units(min, privatePlaces()));
                         listings.put(shown);
                     }
                     break;
@@ -439,12 +476,13 @@ final class DexMarket {
                 final String wei = hexToDecimal(l.optString("value")), xmz = amountText(l.opt("xmz"));
                 mine.put(new JSONObject().put("folder", f.path).put("kind", f.kind).put("state", f.state).put("detail", f.detail).put("id", f.listingId)
                         .put("pair", l.optString("pair")).put("side", l.optString("side")).put("coin", wei == null ? "" : DexFiles.units(wei, places))
-                        .put("xmz", xmz == null ? "" : DexFiles.units(xmz, 11)).put("price", wei == null || xmz == null ? "" : priceText(wei, xmz, places))
+                        .put("xmz", xmz == null ? "" : DexFiles.units(xmz, privatePlaces())).put("price", wei == null || xmz == null ? "" : priceText(wei, xmz, places, privatePlaces()))
                         .put("expiresAt", l.optLong("expiresAt")).put("partial", l.has("minXmz")).put("renew", f.renew));
             }
             return new JSONObject().put("configured", true).put("busy", busy).put("state", state).put("error", error).put("command", command)
                     .put("listings", listings).put("mine", mine).put("withdrawal", withdrawal).put("chainId", chainId).put("coin", coin())
-                    .put("decimals", places).put("solAccount", solAccount).put("message", message);
+                    .put("decimals", places).put("solAccount", solAccount).put("message", message)
+                    .put("pair", pairName()).put("privateCoin", xmr ? "XMR" : "XMZ").put("privateDecimals", privatePlaces());
         } catch (Exception e) {
             return new JSONObject();
         }

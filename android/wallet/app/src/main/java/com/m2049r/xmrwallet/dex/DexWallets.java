@@ -11,8 +11,9 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * The app's own XMZ trading wallet ("dex"), in its own wallet RPC service, and one more service per
- * running trade for that trade's shared swap wallet. The user's main wallet is never opened here:
+ * The app's own trading wallet ("dex") of one coin, XMZ or Monero (XMR), in its own wallet RPC
+ * service, and one more service per running trade for that trade's shared swap wallet.
+ * The XMR instance runs Monero's official wallet RPC on a Monero node. The user's main wallet is never opened here:
  * XMZ for trading is sent to the trading wallet and sent back when done. (The phone's version of
  * the desktop wallet's DexWalletService.) Everything runs on the engine's thread.
  */
@@ -33,6 +34,8 @@ final class DexWallets {
 
     private final File root, program;
     private final String daemon, networkFlag;
+    /** "xmz" or "xmr": names the folder, port and password files; 11 or 12 decimal places */
+    private final String coin;
     private final DexHelper helper;
     private final Handler handler;
     private final Listener listener;
@@ -51,6 +54,11 @@ final class DexWallets {
     };
 
     DexWallets(File root, File program, String daemon, String networkFlag, DexHelper helper, Handler handler, Listener listener) {
+        this("xmz", root, program, daemon, networkFlag, helper, handler, listener);
+    }
+
+    DexWallets(String coin, File root, File program, String daemon, String networkFlag, DexHelper helper, Handler handler, Listener listener) {
+        this.coin = coin.equals("xmr") ? "xmr" : "xmz";
         this.root = root;
         this.program = program;
         this.daemon = daemon;
@@ -64,12 +72,32 @@ final class DexWallets {
         return root;
     }
 
+    String coin() {
+        return coin;
+    }
+
+    boolean monero() {
+        return coin.equals("xmr");
+    }
+
+    int places() {
+        return monero() ? 12 : 11;
+    }
+
+    String daemon() {
+        return daemon;
+    }
+
+    private DexWalletRpc service(File dir, int port) {
+        return new DexWalletRpc(dir, port, monero() ? "monero-wallet-rpc" : "monzero-wallet-rpc");
+    }
+
     boolean ready() {
         return state.equals("ready");
     }
 
     private File passwordFile() {
-        return new File(root, "xmz-wallet.password");
+        return new File(root, coin + "-wallet.password");
     }
 
     private boolean makePasswordFile() {
@@ -95,9 +123,9 @@ final class DexWallets {
             fail("The DEX folder could not be created.");
             return false;
         }
-        final File dir = new File(root, "xmz-wallet");
-        final int port = DexWalletRpc.keptPort(new File(root, "xmz-wallet.port"), DexWalletRpc.freePort());
-        main = new DexWalletRpc(dir, port);
+        final File dir = new File(root, coin + "-wallet");
+        final int port = DexWalletRpc.keptPort(new File(root, coin + "-wallet.port"), DexWalletRpc.freePort());
+        main = service(dir, port);
         state = "starting";
         error = "";
         stopping = false;
@@ -238,7 +266,7 @@ final class DexWallets {
         }
         final File dir = new File(tradeDir, "swap-service");
         final int port = DexWalletRpc.keptPort(new File(tradeDir, "swap-service.port"), DexWalletRpc.freePort());
-        final DexWalletRpc service = new DexWalletRpc(dir, port);
+        final DexWalletRpc service = service(dir, port);
         if (!service.start(program, daemon, networkFlag)) {
             done.ready(null);
             return;
@@ -281,8 +309,9 @@ final class DexWallets {
         try {
             return new JSONObject().put("state", state).put("error", error).put("busy", running > 0)
                     .put("address", wallet.optString("address"))
-                    .put("balance", DexFiles.units(wallet.optString("balanceAtoms", "0"), 11))
-                    .put("unlocked", DexFiles.units(wallet.optString("unlockedAtoms", "0"), 11))
+                    .put("coin", coin).put("daemon", daemon)
+                    .put("balance", DexFiles.units(wallet.optString("balanceAtoms", "0"), places()))
+                    .put("unlocked", DexFiles.units(wallet.optString("unlockedAtoms", "0"), places()))
                     .put("height", wallet.optLong("height")).put("trades", trades.size());
         } catch (Exception e) {
             return new JSONObject();

@@ -56,6 +56,29 @@
             android:inputType="textPassword"
             android:visibility="gone" />
 
+        <!-- A Monero address and amount (sending XMR out to the user's own Monero wallet) -->
+        <EditText
+            android:id="@+id/dexPromptAddress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:hint="@string/dex_xmr_out_address"
+            android:importantForAutofill="no"
+            android:inputType="textNoSuggestions|textMultiLine"
+            android:maxLines="3"
+            android:typeface="monospace"
+            android:visibility="gone" />
+
+        <EditText
+            android:id="@+id/dexPromptAmount"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="@string/dex_xmr_out_amount"
+            android:importantForAutofill="no"
+            android:inputType="numberDecimal"
+            android:visibility="gone" />
+
         <TextView
             android:id="@+id/dexPromptNote"
             android:layout_width="match_parent"

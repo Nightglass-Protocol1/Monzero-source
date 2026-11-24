@@ -41,17 +41,22 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     private final DexHelper helper;
     private final DexKeys keys;
     private final DexWallets wallets;
+    /** The Monero trading wallet (Monero's official wallet RPC on a Monero node); null where this build has no Monero program */
+    private final DexWallets xmrWallets;
     private final DexRisk risk;
     private final DexTrade trade;
     private final Map<Long, DexMarket> markets = new LinkedHashMap<>();
+    /** Monero markets (BNB/XMR, ...), by chain id like the XMZ ones */
+    private final Map<Long, DexMarket> xmrMarkets = new LinkedHashMap<>();
     /** Direct (coin <-> coin) trades: test networks only until direct pairs are opened */
     private DexDirect direct;
     private String directMessage = "";
     private final java.util.Set<String> directRecorded = new java.util.HashSet<>();
     private final List<Listener> listeners = new ArrayList<>();
     private String marketMessage = "", startRefusal = "", keysMessage = "", evmAccount = "", solAccount = "", reportedTrade = "";
-    private boolean keysBusy, resumed, resuming, stopped, marketsUp, accountsAsked;
-    private final List<String[]> resume = new ArrayList<>();   // {chainId, tradeDir}
+    private boolean keysBusy, resumed, resuming, stopped, marketsUp, xmrMarketsUp, accountsAsked;
+    private String xmrMessage = "";
+    private final List<String> resume = new ArrayList<>();   // trade folders, newest first
     private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
@@ -74,6 +79,11 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         keys = new DexKeys(app, root);
         final String node = !overrides.daemon.isEmpty() ? overrides.daemon : DexConfig.daemonAddress(daemon) ? daemon : DexConfig.defaultDaemon();
         wallets = new DexWallets(root, new File(bin, "libmonzero_wallet_rpc.so"), node, DexConfig.networkFlag(), helper, handler, this);
+        // Monero's own wallet RPC (Monero's official Android release, arm64): Monero pairs only where it is in this build
+        final File moneroRpc = new File(bin, "libmonero_wallet_rpc.so");
+        final String xmrNode = !overrides.xmrDaemon.isEmpty() ? overrides.xmrDaemon : DexConfig.defaultXmrDaemon();
+        xmrWallets = moneroRpc.isFile()
+                ? new DexWallets("xmr", new File(root, "xmr"), moneroRpc, xmrNode, DexConfig.xmrNetworkFlag(), helper, handler, this) : null;
         risk = new DexRisk(DexConfig.CONTROL_KEY, new File(root, "started-trades.json"), handler, this::changed);
         trade = new DexTrade(helper, this);
         trade.setRelays(overrides.relaysOrDefault());
@@ -118,6 +128,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         handler.post(() -> {
             for (long chain : DexConfig.chains()) risk.watch(DexConfig.controlNetwork(chain));
             wallets.start();
+            if (xmrWallets != null) xmrWallets.start();
             handler.postDelayed(ticker, 5000);
         });
     }
@@ -132,6 +143,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             stopped = true;
             handler.removeCallbacks(ticker);
             wallets.stop();
+            if (xmrWallets != null) xmrWallets.stop();
             risk.stop();
             keys.lock();
             helper.shutdown();
@@ -145,6 +157,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     @Override
     public void walletsChanged() {
         if (wallets.ready() && !marketsUp) setUpMarkets();
+        if (marketsUp && !xmrMarketsUp && xmrWallets != null && xmrWallets.ready()) setUpXmrMarkets();
         changed();
     }
 
@@ -219,7 +232,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
                         if (answer == null || !answer.optBoolean("ok")) return;
                         if (DexConfig.evmAddress(answer.optString("evm"))) evmAccount = answer.optString("evm");
                         if (DexConfig.solanaAddress(answer.optString("sol"))) solAccount = answer.optString("sol");
-                        for (DexMarket m : markets.values()) m.setSolAccount(solAccount);
+                        for (DexMarket m : allMarkets()) m.setSolAccount(solAccount);
                         changed();
                     });
         } catch (Exception e) {
@@ -248,7 +261,90 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         return wallets.send(homeAddress, "");
     }
 
+    // ---- the Monero trading wallet --------------------------------------------------------------
+
+    /** Whether this build can trade Monero pairs (it has Monero's wallet RPC for this phone) */
+    boolean xmrAvailable() {
+        return xmrWallets != null;
+    }
+
+    JSONObject xmrWalletStatus() {
+        if (xmrWallets == null) {
+            try {
+                return new JSONObject().put("state", "unavailable").put("coin", "xmr");
+            } catch (Exception e) {
+                return new JSONObject();
+            }
+        }
+        final JSONObject s = xmrWallets.status();
+        try {
+            s.put("message", xmrMessage);
+        } catch (Exception ignored) {
+        }
+        return s;
+    }
+
+    String xmrAddress() {
+        return xmrWallets == null ? "" : xmrWallets.address();
+    }
+
+    boolean refreshXmrWallet() {
+        return xmrWallets != null && xmrWallets.refresh();
+    }
+
+    /** Send from the Monero trading wallet to the user's own Monero wallet (Cake Wallet, ...): an amount, or everything when empty. */
+    boolean sendXmr(String address, String amount) {
+        if (xmrWallets == null || !xmrWallets.ready()) return false;
+        if (trade.configured() && !trade.done()) {
+            xmrMessage = "A trade is running: its Monero is needed until it finishes.";
+            changed();
+            return false;
+        }
+        String atoms = "";
+        if (amount != null && !amount.trim().isEmpty()) {
+            atoms = DexFiles.atomic(amount.trim(), 12);
+            if (atoms == null) {
+                xmrMessage = "Check the XMR amount.";
+                changed();
+                return false;
+            }
+        }
+        final boolean started = xmrWallets.send(address == null ? "" : address.trim(), atoms);
+        xmrMessage = started ? "" : "Check the Monero address (it starts with 4 or 8).";
+        changed();
+        return started;
+    }
+
     // ---- markets -------------------------------------------------------------------------------
+
+    /** Every market: XMZ, then Monero */
+    private List<DexMarket> allMarkets() {
+        final List<DexMarket> all = new ArrayList<>(markets.values());
+        all.addAll(xmrMarkets.values());
+        return all;
+    }
+
+    /** The Monero markets, once both the XMZ wallet (the helper and keys) and the Monero wallet run */
+    private void setUpXmrMarkets() {
+        if (xmrMarketsUp || !marketsUp || xmrWallets == null || !xmrWallets.ready()) return;
+        xmrMarketsUp = true;
+        final List<String> witnesses = !overrides.xmrWitnesses.isEmpty() ? overrides.xmrWitnesses : DexConfig.xmrWitnesses();
+        final JSONObject main = xmrWallets.mainEndpoint();
+        for (long chain : DexConfig.xmrChains()) {
+            final DexMarket m = new DexMarket(chain, true, witnesses, overrides.rpcFor(chain),
+                    new File(new File(root, "evm-trades"), "xmr-" + chain), overrides.relaysOrDefault(), overrides.localContract, helper, this);
+            m.setMainWallet(main);
+            m.setSolAccount(solAccount);
+            xmrMarkets.put(chain, m);
+        }
+        // A Monero trade may have been running when the app closed: after the first resume, it joins the queue
+        if (!resumed) resumeTrades();
+        else if (!resuming && !trade.configured()) {
+            for (DexMarket m : xmrMarkets.values()) resume.addAll(m.agreedFolders());
+            nextResume();
+        }
+        changed();
+    }
 
     private void setUpMarkets() {
         if (marketsUp || !wallets.ready()) return;
@@ -272,6 +368,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
                         (request, done) -> helper.run(request, 120000, 8 * 1024 * 1024, done), this);
         }
         resumeTrades();
+        if (xmrWallets != null && xmrWallets.ready()) setUpXmrMarkets();
         changed();
     }
 
@@ -443,6 +540,16 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         return all;
     }
 
+    /** The Monero markets, by coin ("BNB", "USDT-BSC", ...), as the XMZ ones */
+    JSONObject xmrMarketStatus() {
+        final JSONObject all = new JSONObject();
+        try {
+            for (DexMarket m : xmrMarkets.values()) all.put(m.coin(), m.status(marketMessage));
+        } catch (Exception ignored) {
+        }
+        return all;
+    }
+
     /** One line per traded coin: what the owner-signed limits allow now (mainnet builds). */
     String limitsText() {
         final StringBuilder out = new StringBuilder();
@@ -473,17 +580,22 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     /** A trade was agreed or running when the app last closed, and the keys are still locked: it waits for the password. */
     boolean tradeWaitsForKeys() {
         if (keys.ready() || !keys.exist()) return false;
-        for (DexMarket m : markets.values()) if (!m.agreedFolders().isEmpty()) return true;
+        for (DexMarket m : allMarkets()) if (!m.agreedFolders().isEmpty()) return true;
         return direct != null && direct.hasRunningTrade();
     }
 
     private DexMarket marketFor(String tradeDir) {
-        for (DexMarket m : markets.values()) if (tradeDir.startsWith(m.tradesDir.getPath() + "/")) return m;
+        for (DexMarket m : allMarkets()) if (tradeDir.startsWith(m.tradesDir.getPath() + "/")) return m;
         return null;
     }
 
     private DexMarket marketForCoin(String coin) {
         for (DexMarket m : markets.values()) if (m.coin().equals(coin)) return m;
+        return null;
+    }
+
+    private DexMarket xmrMarketForCoin(String coin) {
+        for (DexMarket m : xmrMarkets.values()) if (m.coin().equals(coin)) return m;
         return null;
     }
 
@@ -506,7 +618,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
 
     boolean refreshOffers(String pair) {
         final int slash = pair.indexOf('/');
-        final DexMarket m = slash < 0 ? null : marketForCoin(pair.substring(0, slash));
+        final DexMarket m = slash < 0 ? null : pair.endsWith("/XMR") ? xmrMarketForCoin(pair.substring(0, slash)) : marketForCoin(pair.substring(0, slash));
         return m != null && m.refreshListings(pair);
     }
 
@@ -530,19 +642,43 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         return started;
     }
 
-    /** xmzAmount: empty to take all of the offer, else how much of a partial offer (in XMZ). */
+    /**
+     * A Monero offer: the amount in XMR (12 places); minXmrAmount empty for a whole offer, else the
+     * smallest part (at least 0.001 XMR). The coin's limits apply; XMZ's do not (none is traded).
+     */
+    boolean postXmrOffer(long chainId, String side, String coinAmount, String xmrAmount, String minXmrAmount, int hours, boolean renew) {
+        final DexMarket m = xmrMarkets.get(chainId);
+        if (m == null) return say("Monero trading is not open on this chain in this wallet.");
+        final String wei = DexFiles.atomic(coinAmount, DexConfig.decimals(chainId)), atoms = DexFiles.atomic(xmrAmount, 12);
+        if (wei == null || atoms == null || hours < 1 || hours > 31 * 24) return say("Check the amounts and how long the offer stays open (1 hour to 31 days).");
+        String minAtoms = null;
+        if (minXmrAmount != null && !minXmrAmount.trim().isEmpty()) {
+            minAtoms = DexFiles.atomic(minXmrAmount.trim(), 12);
+            if (minAtoms == null || new BigInteger(minAtoms).compareTo(MIN_FILL_XMR) < 0 || new BigInteger(minAtoms).compareTo(new BigInteger(atoms)) > 0)
+                return say("The smallest part must be at least 0.001 XMR and at most the whole offer.");
+        }
+        final String refusal = offerRefusal(chainId, wei, "0");
+        if (!refusal.isEmpty()) return say(refusal);
+        final boolean started = m.post(keys.seedHex(), side, wei, atoms, minAtoms, hours * 3600L, renew);
+        marketMessage = started ? "" : "The offer could not be posted now.";
+        changed();
+        return started;
+    }
+
+    /** xmzAmount: empty to take all of the offer, else how much of a partial offer (in XMZ, or XMR on a Monero market). */
     boolean takeOffer(String listingId, String xmzAmount) {
-        for (DexMarket m : markets.values()) {
+        for (DexMarket m : allMarkets()) {
             final JSONObject l = m.listing(listingId);
             if (l == null) continue;
+            final String unit = m.xmr ? "XMR" : "XMZ";
             String atoms = null, wei = l.optString("valueWei");
             if (xmzAmount != null && !xmzAmount.trim().isEmpty()) {
-                atoms = DexFiles.atomic(xmzAmount.trim(), 11);
+                atoms = DexFiles.atomic(xmzAmount.trim(), m.privatePlaces());
                 final String part = atoms == null ? null : partValue(l, new BigInteger(atoms));
                 if (part == null) {
                     final String min = l.optString("minXmz");
                     return say(min.isEmpty() ? "This offer can only be taken whole."
-                            : "Take at least " + min + " XMZ and at most " + l.optString("xmz") + " XMZ, leaving none or at least " + min + " XMZ.");
+                            : "Take at least " + min + " " + unit + " and at most " + l.optString("xmz") + " " + unit + ", leaving none or at least " + min + " " + unit + ".");
                 }
                 // All of it is a whole take: nothing to name
                 if (atoms.equals(l.optString("xmzAtoms"))) atoms = null;
@@ -552,8 +688,10 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             if (atoms == null && l.has("minXmzAtoms")) atoms = l.optString("xmzAtoms");
             // A USDT offer is checked under the USDT market's limits
             final String pairName = l.optString("pair");
-            final long market = "USDT/XMZ".equals(pairName) || "USDT-BSC/XMZ".equals(pairName) ? DexConfig.marketOf(l.optLong("chainId"), "usdt") : l.optLong("chainId");
-            final String refusal = offerRefusal(market, wei, atoms == null ? l.optString("xmzAtoms") : atoms);
+            final boolean usdt = pairName.startsWith("USDT/") || pairName.startsWith("USDT-BSC/");
+            final long market = usdt ? DexConfig.marketOf(l.optLong("chainId"), "usdt") : l.optLong("chainId");
+            // A Monero trade moves no XMZ: only the coin's limits apply
+            final String refusal = offerRefusal(market, wei, m.xmr ? "0" : atoms == null ? l.optString("xmzAtoms") : atoms);
             if (!refusal.isEmpty()) return say(refusal);
             final boolean started = m.take(keys.seedHex(), listingId, atoms);
             marketMessage = started ? "" : "The offer could not be taken now.";
@@ -565,6 +703,8 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
 
     /** The least a partial offer's smallest part may be: 1 XMZ (as the engine checks). */
     private static final BigInteger MIN_FILL = BigInteger.valueOf(100_000_000_000L);
+    /** The same on a Monero market: 0.001 XMR (1e9 of XMR's 1e12 atoms), as the engine checks */
+    private static final BigInteger MIN_FILL_XMR = BigInteger.valueOf(1_000_000_000L);
 
     /**
      * The coin (smallest unit) for `atoms` XMZ of a listing the relays showed, at its price, rounded
@@ -607,14 +747,14 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     }
 
     boolean hasOpenOffer() {
-        for (DexMarket m : markets.values()) if (m.hasOpenOffer()) return true;
+        for (DexMarket m : allMarkets()) if (m.hasOpenOffer()) return true;
         return false;
     }
 
     private void stepMarkets() {
         if (!keys.ready()) return;
         if (evmAccount.isEmpty()) askAccounts();
-        for (DexMarket m : markets.values()) if (!m.busy()) m.step(keys.seedHex());
+        for (DexMarket m : allMarkets()) if (!m.busy()) m.step(keys.seedHex());
         if (direct != null) direct.step(keys.seedHex());
     }
 
@@ -679,7 +819,8 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         try {
             final String v = offer.optString("value");
             value = v.startsWith("0x") ? new BigInteger(v.substring(2), 16) : new BigInteger(v);
-            xmz = new BigInteger(DexMarket.amountText(offer.opt("xmzAmount")));
+            // A Monero trade moves no XMZ: the XMZ cap does not apply (as the desktop wallet)
+            xmz = "XMR".equals(offer.optString("privateCoin")) ? BigInteger.ZERO : new BigInteger(DexMarket.amountText(offer.opt("xmzAmount")));
         } catch (Exception e) {
             return refuse("The trade amount could not be read.");
         }
@@ -701,9 +842,9 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     boolean abandonTrade() {
         final String dir = trade.tradeDir();
         if (!trade.abandon()) return false;
-        if (!dir.isEmpty()) wallets.releaseTradeService(dir);
+        if (!dir.isEmpty()) releaseService(dir);
         startRefusal = "";
-        for (DexMarket m : markets.values()) m.scanFolders();
+        for (DexMarket m : allMarkets()) m.scanFolders();
         changed();
         return true;
     }
@@ -734,15 +875,21 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         resumed = true;
         if (trade.configured()) return;
         final List<Object[]> found = new ArrayList<>();
-        for (DexMarket m : markets.values())
+        for (DexMarket m : allMarkets())
             for (String dir : m.agreedFolders()) {
                 final File journal = new File(dir, "journal.json");
-                found.add(new Object[]{(journal.exists() ? journal : new File(dir)).lastModified(), String.valueOf(m.chainId), dir});
+                found.add(new Object[]{(journal.exists() ? journal : new File(dir)).lastModified(), dir});
             }
         Collections.sort(found, (a, b) -> Long.compare((Long) b[0], (Long) a[0]));
         resume.clear();
-        for (Object[] f : found) resume.add(new String[]{(String) f[1], (String) f[2]});
+        for (Object[] f : found) resume.add((String) f[1]);
         nextResume();
+    }
+
+    /** A trade's swap-wallet service runs in its coin's wallets: stop it in both */
+    private void releaseService(String dir) {
+        wallets.releaseTradeService(dir);
+        if (xmrWallets != null) xmrWallets.releaseTradeService(dir);
     }
 
     private boolean releaseTrade() {
@@ -752,7 +899,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         if (!dir.isEmpty()) {
             final File mark = new File(dir, "finished");
             if (!mark.exists()) DexFiles.write(mark, "finished\n");
-            wallets.releaseTradeService(dir);
+            releaseService(dir);
         }
         return true;
     }
@@ -764,11 +911,11 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             return;
         }
         while (!resume.isEmpty()) {
-            final String[] next = resume.remove(0);
-            final DexMarket m = markets.get(Long.parseLong(next[0]));
+            final String next = resume.remove(0);
+            final DexMarket m = marketFor(next);
             if (m == null) continue;
             resuming = true;
-            agreed(m, next[1]);
+            agreed(m, next);
             return;
         }
         resuming = false;
@@ -788,7 +935,13 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
                 break;
             }
         }
-        wallets.tradeService(tradeDir, id, endpoint -> {
+        // A Monero trade's swap wallet is a Monero wallet, in the Monero wallets' service
+        final DexWallets coinWallets = market.xmr ? xmrWallets : wallets;
+        if (coinWallets == null) {
+            say("This wallet has no Monero program for this phone: the Monero trade cannot run here.");
+            return;
+        }
+        coinWallets.tradeService(tradeDir, id, endpoint -> {
             if (stopped) return;
             if (endpoint == null) {
                 say("The trade's swap wallet could not start: " + tradeDir);
@@ -806,7 +959,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
                 return;
             }
             startRefusal = "";
-            if (!trade.configure(tradeDir, market.rpc, wallets.mainEndpoint(), endpoint)) {
+            if (!trade.configure(tradeDir, market.rpc, coinWallets.mainEndpoint(), endpoint, market.witnesses)) {
                 say("The agreed trade could not be opened: " + tradeDir);
                 if (resuming) handler.post(this::nextResume);
                 return;

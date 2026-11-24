@@ -49,6 +49,10 @@ final class DexBridge implements DexEngine.Listener {
     private static final Pattern LOCAL_ORIGIN = Pattern.compile("\\Ahttp://(localhost|127\\.0\\.0\\.1)(:[0-9]{1,5})?\\z");
     private static final Pattern LISTING_ID = Pattern.compile("\\A0x[0-9a-fA-F]{64}\\z");
     private static final Pattern XMZ = Pattern.compile("\\A[0-9]{1,9}(\\.[0-9]{1,8})?\\z");
+    /** An XMR amount the page may name for "add XMR" (12 places at most) */
+    private static final Pattern XMR = Pattern.compile("\\A[0-9]{1,6}(\\.[0-9]{1,12})?\\z");
+    /** The pairs the page may ask the wallet to refresh: XMZ and Monero pairs of every coin traded here */
+    private static final Pattern PAIR = Pattern.compile("\\A(ETH|BNB|SOL|USDT|USDT-BSC)/(XMZ|XMR)\\z");
 
     private static final class Request {
         String method = "", path = "", query = "", origin = "", host = "", token = "";
@@ -69,6 +73,9 @@ final class DexBridge implements DexEngine.Listener {
     private long pairExpires, lastAsk;
     private String pairResult = "", pairResultId = "", pairResultToken = "";
     private boolean keysWanted, returnWanted, warnedLocked;
+    /** The page asked to add XMR (show the Monero trading wallet's address, and open Cake Wallet), or to send XMR out */
+    private boolean xmrAddWanted, xmrOutWanted;
+    private String xmrAddAmount = "";
     private String announcedTrade = "", paidTrade = "";
     private final java.util.Set<String> announcedDirect = new java.util.HashSet<>();
     private final java.util.Map<String, Long> directPayoutTried = new java.util.HashMap<>();   // folder -> when its payout was last asked for
@@ -113,6 +120,26 @@ final class DexBridge implements DexEngine.Listener {
 
     boolean returnWanted() {
         return returnWanted;
+    }
+
+    boolean xmrAddWanted() {
+        return xmrAddWanted;
+    }
+
+    String xmrAddAmount() {
+        return xmrAddAmount;
+    }
+
+    boolean xmrOutWanted() {
+        return xmrOutWanted;
+    }
+
+    void dismissXmr() {
+        if (xmrAddWanted || xmrOutWanted) {
+            xmrAddWanted = xmrOutWanted = false;
+            xmrAddAmount = "";
+            listener.bridgeChanged();
+        }
     }
 
     void dismissKeys() {
@@ -250,7 +277,7 @@ final class DexBridge implements DexEngine.Listener {
     void disconnectPage() {
         tokenHash = null;
         origin = account = solAccount = "";
-        keysWanted = returnWanted = false;
+        keysWanted = returnWanted = xmrAddWanted = xmrOutWanted = false;
         save();
         listener.bridgeChanged();
     }
@@ -345,7 +372,20 @@ final class DexBridge implements DexEngine.Listener {
         final JSONObject directOut = direct.optBoolean("configured")
                 ? pick(direct, "configured", "keys", "busy", "state", "error", "command", "message", "listings", "mine", "pairs", "chains", "payout") : null;
         if (directOut != null) features.put("direct");
-        return new JSONObject().putOpt("direct", directOut)
+        // Monero pairs: where this build has Monero's wallet program for the phone
+        JSONObject xmrOut = null, xmrWallet = null;
+        if (engine.xmrAvailable()) {
+            features.put("xmr");
+            xmrOut = new JSONObject();
+            final JSONObject xm = engine.xmrMarketStatus();
+            for (Iterator<String> it = xm.keys(); it.hasNext(); ) {
+                final String coin = it.next();
+                xmrOut.put(coin, pick(xm.optJSONObject(coin), "coin", "chainId", "decimals", "configured", "busy", "state", "mine", "message", "error",
+                        "withdrawal", "pair", "privateCoin", "privateDecimals"));
+            }
+            xmrWallet = pick(engine.xmrWalletStatus(), "state", "balance", "unlocked", "address", "busy", "error", "message");
+        }
+        return new JSONObject().putOpt("direct", directOut).putOpt("xmrMarkets", xmrOut).putOpt("xmrWallet", xmrWallet)
                 .put("wallet", pick(engine.walletStatus(), "state", "balance", "unlocked", "address", "keysReady", "keysExist", "keysBusy", "tradeAccount", "solTradeAccount", "error"))
                 .put("markets", marketOut).put("trade", tradeOut).put("account", account).put("solAccount", solAccount)
                 // What this wallet can do beyond the first page protocol: the page offers only these
@@ -430,13 +470,19 @@ final class DexBridge implements DexEngine.Listener {
         switch (r.path) {
             case "/v1/refresh": {
                 final String pair = body.optString("pair");
-                if (!pair.equals("ETH/XMZ") && !pair.equals("BNB/XMZ") && !pair.equals("SOL/XMZ")) return fail(400, "pair");
+                if (!PAIR.matcher(pair).matches()) return fail(400, "pair");
                 return ok(new JSONObject().put("ok", engine.refreshOffers(pair)));
             }
             case "/v1/offer": {
                 final long chainId = body.optLong("chainId");
                 final String side = body.optString("side");
                 if (!side.equals("buy-xmz") && !side.equals("sell-xmz")) return fail(400, "side");
+                // A Monero offer: "xmz" and "minXmz" are XMR amounts (12 places) and "side" says which way XMR goes
+                if (body.optString("base").equals("XMR")) {
+                    final boolean posted = engine.postXmrOffer(chainId, side, body.optString("coin"), body.optString("xmz"), body.optString("minXmz"),
+                            body.optInt("hours", 6), body.optBoolean("renew"));
+                    return ok(new JSONObject().put("ok", posted).put("message", marketMessage()));
+                }
                 final boolean posted = engine.postOffer(chainId, side, body.optString("coin"), body.optString("xmz"), body.optString("minXmz"), body.optInt("hours", 6),
                         body.optBoolean("renew"));
                 return ok(new JSONObject().put("ok", posted).put("message", marketMessage()));
@@ -478,7 +524,9 @@ final class DexBridge implements DexEngine.Listener {
             // shown (at most once every few seconds, so a page cannot flood the phone with notifications)
             case "/v1/unlock":
             case "/v1/xmz-add":
-            case "/v1/xmz-return": {
+            case "/v1/xmz-return":
+            case "/v1/xmr-add":
+            case "/v1/xmr-out": {
                 final long now = System.currentTimeMillis();
                 if (now - lastAsk < 3000) return fail(429, "wait a moment");
                 lastAsk = now;
@@ -487,6 +535,23 @@ final class DexBridge implements DexEngine.Listener {
                     keysWanted = true;
                     listener.bridgeChanged();
                     listener.attention("keys", "Your trading password is needed", "Tap to unlock your trading keys in your Monzero wallet.");
+                    return ok(new JSONObject().put("ok", true));
+                }
+                // Monero: the wallet shows its Monero address (and opens Cake Wallet), or asks where to send XMR. The page never names an address.
+                if (r.path.equals("/v1/xmr-add") || r.path.equals("/v1/xmr-out")) {
+                    if (!engine.xmrAvailable()) return ok(new JSONObject().put("ok", false).put("message", "This wallet cannot trade Monero on this phone."));
+                    if (r.path.equals("/v1/xmr-add")) {
+                        final String xmr = body.optString("xmr");
+                        if (!xmr.isEmpty() && !XMR.matcher(xmr).matches()) return fail(400, "xmr");
+                        xmrAddWanted = true;
+                        xmrAddAmount = xmr;
+                        listener.bridgeChanged();
+                        listener.attention("xmr-add", "Add XMR for trading", "Tap to see your Monero trading address and open Cake Wallet.");
+                    } else {
+                        xmrOutWanted = true;
+                        listener.bridgeChanged();
+                        listener.attention("xmr-out", "Send XMR to your own wallet", "Tap to send it to your Cake Wallet or other Monero wallet.");
+                    }
                     return ok(new JSONObject().put("ok", true));
                 }
                 if (!engine.walletReady()) return ok(new JSONObject().put("ok", false).put("message", "The trading wallet is still starting."));
