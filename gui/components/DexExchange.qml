@@ -394,7 +394,7 @@ ColumnLayout {
                     anchors.left: parent.left; anchors.leftMargin: 10; anchors.verticalCenter: parent.verticalCenter
                     spacing: 2
                     Text { text: ex.directLabel(modelData); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
-                    Text { text: route ? qsTr("two swaps") : offers > 0 ? qsTr("%n offer(s)", "", offers) : qsTr("Monero"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
+                    Text { text: route ? qsTr("two swaps") : offers > 0 ? qsTr("%n offer(s)", "", offers) : qsTr("no offers yet"); font.pixelSize: 10; color: M.Style.dimmedFontColor }
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: route ? ex.pick("ROUTE") : ex.pickXmr(modelData) }
             }
@@ -530,7 +530,7 @@ ColumnLayout {
                     { k: qsTr("24h change"), v: isNaN(ex.stats.change) ? "—" : (ex.stats.change >= 0 ? "+" : "") + ex.stats.change.toFixed(2) + "%", c: isNaN(ex.stats.change) ? "" : ex.stats.change >= 0 ? "up" : "down" },
                     { k: qsTr("24h high"), v: ex.stats.high > 0 ? X.price(ex.stats.high) : "—" },
                     { k: qsTr("24h low"), v: ex.stats.low > 0 ? X.price(ex.stats.low) : "—" },
-                    { k: qsTr("24h volume"), v: X.amount(ex.stats.volume, ex.xmrPair ? 4 : 0) + " " + ex.base, s: ex.stats.volumeCoin > 0 ? X.plain(ex.stats.volumeCoin, 4) + " " + ex.coin : "" },
+                    { k: qsTr("24h volume"), v: ex.stats.volume > 0 ? X.amount(ex.stats.volume, ex.xmrPair ? 4 : 0) + " " + ex.base : "—", s: ex.stats.volumeCoin > 0 ? X.plain(ex.stats.volumeCoin, 4) + " " + ex.coin : "" },
                     { k: qsTr("Best bid"), v: ex.book.bestBid > 0 ? X.price(ex.book.bestBid) : "—", c: "up" },
                     { k: qsTr("Best ask"), v: ex.book.bestAsk > 0 ? X.price(ex.book.bestAsk) : "—", c: "down" }
                 ]
@@ -730,7 +730,7 @@ ColumnLayout {
                     Layout.fillWidth: true
                     visible: ex.myOrders.length > 0
                     Repeater {
-                        model: [[qsTr("Pair"), 2], [qsTr("Order"), 3], [qsTr("Price"), 3], [qsTr("XMZ"), 3], [qsTr("Total"), 3], [qsTr("Status"), 5], ["", 2]]
+                        model: [[qsTr("Pair"), 2], [qsTr("Order"), 3], [qsTr("Price"), 3], [qsTr("Amount"), 3], [qsTr("Total"), 3], [qsTr("Status"), 5], ["", 2]]
                         delegate: Text { text: modelData[0]; font.pixelSize: 11; color: M.Style.dimmedFontColor; Layout.fillWidth: true; Layout.preferredWidth: modelData[1] }
                     }
                 }
@@ -743,13 +743,14 @@ ColumnLayout {
                         Text { text: (parent.buys ? qsTr("Buy") : qsTr("Sell")) + " · " + (modelData.kind === "offer" ? qsTr("limit") : qsTr("market"))
                                font.pixelSize: 13; color: parent.buys ? M.Style.green : "#E5677A"; Layout.fillWidth: true; Layout.preferredWidth: 3 }
                         Text { text: modelData.price || "—"; font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
-                        Text { text: modelData.xmz; font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
+                        Text { text: modelData.xmz + " " + (modelData.base || "XMZ"); font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
                         Text { text: modelData.amount + " " + modelData.coin; font.pixelSize: 13; font.family: M.Style.fontMonoRegular.name; color: M.Style.defaultFontColor; Layout.fillWidth: true; Layout.preferredWidth: 3 }
                         Text {
                             Layout.fillWidth: true; Layout.preferredWidth: 5; elide: Text.ElideRight
                             font.pixelSize: 12; color: M.Style.dimmedFontColor
                             text: (modelData.state === "open" ? (modelData.kind === "offer" ? (modelData.renew ? qsTr("open · renews itself") : qsTr("open · %1").arg(X.timeLeft(modelData.expiresAt, ex.now))) : qsTr("waiting for the maker"))
-                                  : modelData.state === "agreed" ? qsTr("matched: see the trade above")
+                                  : modelData.state === "agreed" ? qsTr("matched: trade in progress")
+                                  : modelData.state === "finished" ? qsTr("finished")
                                   : modelData.state === "expired" ? qsTr("expired") : modelData.state === "cancelled" ? qsTr("cancelled")
                                   : modelData.state === "withdrawn" ? qsTr("withdrawn: funds no longer there")
                                   : modelData.state === "refused" ? qsTr("not matched: the maker refused") : modelData.state)

@@ -2961,6 +2961,7 @@ Later addresses may be missing from this backup. Payment and active swap recover
                             + (modelData.side === "sell-xmz" ? qsTr("%1 XMZ for %2 %3") : qsTr("%1 XMZ for %2 %3")).arg(modelData.xmz).arg(modelData.coin).arg(offerBoard.coin)
                             + "  ·  " + (modelData.state === "open" ? (modelData.kind === "offer" ? qsTr("waiting for a taker") : qsTr("waiting for the maker"))
                                 : modelData.state === "agreed" ? qsTr("keys agreed: see the trade below")
+                                : modelData.state === "finished" ? qsTr("finished")
                                 : modelData.state === "expired" ? qsTr("expired") : qsTr("cancelled"))
                             + (modelData.detail ? "  ·  " + modelData.detail : "")
                     }

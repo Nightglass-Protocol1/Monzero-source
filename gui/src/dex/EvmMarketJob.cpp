@@ -149,6 +149,8 @@ void EvmMarketJob::scanFolders() {
         if (!listingValid(f.listing)) continue;
         f.listingId=f.listing.value("listing").toObject().value("id").toString();
         f.state=QFile::exists(path+"/journal.json") ? "agreed" : (maker && !o.value("takenBy").isNull() ? "agreed" : "open");
+        // A trade the wallet saw to its end (swapped or refunded): no longer in progress
+        if (f.state=="agreed" && QFile::exists(path+"/finished")) f.state="finished";
         if (QFile::exists(path+"/cancelled") || QFile::exists(path+"/abandoned")) f.state="cancelled";
         // A take the maker refused: it ended there, nothing was locked
         if (f.state=="open" && !maker && QFile::exists(path+"/refused")) {
@@ -167,6 +169,10 @@ void EvmMarketJob::scanFolders() {
         }
         m_folders.append(f);
     }
+}
+
+void EvmMarketJob::markFinished(const QString &folder) {
+    for (auto &f:m_folders) if (f.path==folder && f.state=="agreed") {f.state="finished";emit changed();}
 }
 
 QStringList EvmMarketJob::agreedFolders() const {

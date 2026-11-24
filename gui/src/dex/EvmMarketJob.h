@@ -55,6 +55,8 @@ public:
     static QString weiToCoin(const QString &valueWei,int decimals=18);
     // Folders of trades whose keys were agreed and that are not marked finished
     QStringList agreedFolders() const;
+    // A trade of `folder` ended (its folder now has `finished`): My orders shows it finished
+    void markFinished(const QString &folder);
     // Ask the helper for this wallet's trade accounts (Solana chains: where SOL is paid in)
     bool requestAccounts(QByteArray &walletSeed);
     QString solAccount() const {return m_solAccount;}

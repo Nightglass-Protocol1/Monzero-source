@@ -1741,6 +1741,7 @@ bool DexEngine::releaseEvmTrade() {
     if (!dir.isEmpty()) {
         QFile mark(dir+"/finished");
         if (!mark.exists() && mark.open(QIODevice::WriteOnly)) {mark.write("finished\n");mark.close();}
+        for (auto *m:allMarkets()) m->markFinished(dir);
         m_dexWallets->releaseTradeService(dir);
         m_xmrWallets->releaseTradeService(dir);
     }

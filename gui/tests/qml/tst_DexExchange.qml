@@ -337,6 +337,24 @@ Item {
             verify(!ex.routeOpen)
             ex.pick("SOL")
         }
+            function test_my_orders_show_finished_trades_and_each_pairs_coin() {
+            function texts(item, out) { if (item.text !== undefined && item.visible) out.push(String(item.text)); for (var i = 0; i < item.children.length; ++i) texts(item.children[i], out); return out }
+            var before = engine.evmMarketStatus
+            var sol = JSON.parse(JSON.stringify(before.SOL))
+            sol.mine = [ { kind: "offer", state: "finished", side: "buy-xmz", xmz: "2000", coin: "0.0242", price: "0.0000121", expiresAt: root.now - 60, folder: "/t/1" },
+                         { kind: "take", state: "agreed", side: "sell-xmz", xmz: "500", coin: "0.006", price: "0.000012", expiresAt: root.now + 600, folder: "/t/2" } ]
+            var next = JSON.parse(JSON.stringify(before)); next.SOL = sol
+            engine.evmMarketStatus = next
+            ex.bottomTab = "orders"
+            var shown = texts(ex, []).join("|")
+            verify(shown.indexOf("finished") >= 0, shown)
+            verify(shown.indexOf("matched: trade in progress") >= 0, shown)
+            verify(shown.indexOf("see the trade above") < 0, shown)
+            verify(shown.indexOf("2000 XMZ") >= 0, shown)
+            verify(shown.indexOf("|Amount|") >= 0, shown)
+            compare(ex.openOrders, 0)
+            engine.evmMarketStatus = before
+        }
             function test_the_monero_wallet_shows_and_sends_from_the_funds_tab() {
             ex.bottomTab = "funds"
             // On an XMZ pair the XMZ wallet sits beside the coin's account; the Monero wallet is not shown
