@@ -883,7 +883,8 @@ bool DexEngine::payoutEvmTrade(const QString &address) {
 bool DexEngine::abandonEvmTrade() {
     const auto dir=m_evmTrade->tradeDir();
     if (!m_evmTrade->abandon()) return false;
-    if (!dir.isEmpty()) m_dexWallets->releaseTradeService(dir);
+    // A Monero trade's swap wallet runs in the Monero service: release it from both, as releaseEvmTrade does
+    if (!dir.isEmpty()) {m_dexWallets->releaseTradeService(dir);m_xmrWallets->releaseTradeService(dir);}
     m_evmTicker->stop();m_evmStartRefusal.clear();
     for (auto *job:allMarkets()) job->rescan();
     emit evmTradeChanged();emit evmMarketChanged();return true;

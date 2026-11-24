@@ -364,7 +364,7 @@ pub struct WalletRpcConfig {
 /// The fewest confirmations the `witnesses` report for `txids`: 0 when any of them does not
 /// answer, does not know a transaction, or still has it in its pool.
 pub async fn witnessed_confirmations(witnesses: &[String], txids: &[String]) -> u64 {
-    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().unwrap_or_default();
+    let http = crate::chain::http_client_builder().timeout(std::time::Duration::from_secs(20)).build().unwrap_or_default();
     let mut least = u64::MAX;
     for url in witnesses {
         let base = url.trim_end_matches('/');
