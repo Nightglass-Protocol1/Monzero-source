@@ -38,7 +38,7 @@ Item {
     }
     QtObject {
         id: feed
-        property var data: ({ poolPayments: [{ txid: "b".repeat(64), amount: 400e11 }], usd: { SOL: 200 } })
+        property var data: ({ poolPayments: [{ txid: "b".repeat(64), amount: 400e11 }], usd: { SOL: 200, ETH: 3000 } })
         function poolPayments(a) { return true }
         function usdPrices() { return true }
     }
@@ -51,7 +51,10 @@ Item {
         // Bids: 0.000004 SOL/XMZ = $0.0008 (below the minimum) and 0.000006 SOL/XMZ = $0.0012
         property var evmMarketStatus: ({ SOL: { configured: true, listings: [
             { id: "0x" + "1".repeat(64), pair: "SOL/XMZ", side: "buy-xmz", valueWei: String(4000 * 1000), xmzAtoms: String(1000e11), minXmzAtoms: String(100e11), maker: "0xb0", expiresAt: 9e9 },
-            { id: "0x" + "2".repeat(64), pair: "SOL/XMZ", side: "buy-xmz", valueWei: String(6000 * 1000), xmzAtoms: String(1000e11), minXmzAtoms: String(100e11), maker: "0xb1", expiresAt: 9e9 } ] } })
+            { id: "0x" + "2".repeat(64), pair: "SOL/XMZ", side: "buy-xmz", valueWei: String(6000 * 1000), xmzAtoms: String(1000e11), minXmzAtoms: String(100e11), maker: "0xb1", expiresAt: 9e9 } ] },
+            // 0.0005 ETH for 300 XMZ (whole) = $0.005 per XMZ: the best buyer when ETH is picked too
+            ETH: { configured: true, listings: [
+            { id: "0x" + "3".repeat(64), pair: "ETH/XMZ", side: "buy-xmz", valueWei: "500000000000000", xmzAtoms: String(300e11), maker: "0xb2", expiresAt: 9e9 } ] } })
         function takeEvmOffers(list) { takes.push(list); return true }
     }
     M.DexAutoSell { id: auto; dex: engine; settings: settings }
@@ -90,6 +93,22 @@ Item {
             auto.step()
             compare(appWindow.sends.length, 0)
             auto.enable(false)
+        }
+        function test_several_coins_sell_to_the_best_paying_buyers_first() {
+            settings.dexAutoSellCoin = "SOL,ETH"
+            settings.dexAutoSellState = JSON.stringify({ seen: [], owed: 0, moved: 700e11, sold: 0 })
+            var w = JSON.parse(JSON.stringify(engine.dexWalletStatus)); w.unlocked = "700"; engine.dexWalletStatus = w
+            engine.takes = []
+            settings.dexAutoSell = true
+            settings.dexAutoSellSince = Math.floor(Date.now() / 1000)
+            currentWallet.history.list = []
+            auto.step()
+            compare(engine.takes.length, 1)
+            // ETH's whole 300 first ($0.005), then the rest to the SOL buyer at $0.0012
+            compare(engine.takes[0].map(function (t) { return t.id.slice(0, 3) + ":" + t.xmz }).join(), "0x3:,0x2:391.06930693069")
+            verify(auto.status.indexOf("ETH") > 0 && auto.status.indexOf("SOL") > 0, auto.status)
+            settings.dexAutoSell = false
+            settings.dexAutoSellCoin = "SOL"
         }
         function test_cannot_turn_on_without_a_minimum_price() {
             settings.dexAutoSellMinUsd = ""

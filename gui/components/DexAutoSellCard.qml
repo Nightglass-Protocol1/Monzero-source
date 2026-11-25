@@ -13,6 +13,13 @@ Rectangle {
     readonly property bool on: !!controller && controller.on
     readonly property var st: settings ? controller.state() : ({})
     property bool open: false
+    readonly property var picked: settings ? String(settings.dexAutoSellCoin || "").split(",").filter(function (c) { return c !== "" }) : []
+    // At least one coin stays picked
+    function toggleCoin(c) {
+        var list = picked.slice(), i = list.indexOf(c)
+        if (i >= 0) { if (list.length > 1) list.splice(i, 1) } else list.push(c)
+        settings.dexAutoSellCoin = list.join(",")
+    }
 
     radius: 8; color: M.Style.surfaceRaised; border.color: on ? M.Style.accent : M.Style.accentMuted
     implicitHeight: col.implicitHeight + 28
@@ -47,19 +54,22 @@ Rectangle {
         ColumnLayout {
             Layout.fillWidth: true; spacing: 8
             visible: card.open || !card.on
-            Text { text: qsTr("Sell for"); font.pixelSize: 12; color: M.Style.dimmedFontColor }
+            Text {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap
+                text: qsTr("Sell for (pick one or more: each sale goes to whichever pays the most)"); font.pixelSize: 12; color: M.Style.dimmedFontColor
+            }
             Flow {
                 Layout.fillWidth: true; spacing: 8
                 Repeater {
                     model: card.ex.allCoins.filter(function (c) { return (card.ex.markets[c] || {}).configured === true })
                     delegate: Rectangle {
                         objectName: "autoSellCoin_" + modelData
-                        readonly property bool picked: card.settings && card.settings.dexAutoSellCoin === modelData
+                        readonly property bool picked: card.picked.indexOf(modelData) >= 0
                         width: 110; height: 32; radius: 6
                         color: picked ? M.Style.accentMuted : "transparent"
                         border.color: picked ? M.Style.accent : M.Style.accentMuted
-                        Text { anchors.centerIn: parent; text: card.ex.label(modelData); font.pixelSize: 13; color: M.Style.defaultFontColor }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: card.settings.dexAutoSellCoin = modelData }
+                        Text { anchors.centerIn: parent; text: (parent.picked ? "✓ " : "") + card.ex.label(modelData); font.pixelSize: 13; color: M.Style.defaultFontColor }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: card.toggleCoin(modelData) }
                     }
                 }
             }

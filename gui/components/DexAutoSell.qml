@@ -87,28 +87,53 @@ Item {
         if (st.moved > 0) sell(st, trading)
     }
 
+    // The coins to sell for: one or several ("SOL,ETH"); each sale goes to the best-paying buyers
+    // across them, compared in USD
+    function coins() {
+        return String(settings.dexAutoSellCoin || "SOL").split(",").map(function (c) { return c.trim() }).filter(function (c) { return c !== "" })
+    }
     function sell(st, trading) {
-        var coin = settings.dexAutoSellCoin || "SOL"
-        var m = (dex.evmMarketStatus || {})[coin]
-        if (!m || m.configured !== true || trading.keysReady !== true || trading.state !== "ready") return
-        var usd = coin === "USDT" || coin === "USDT-BSC" ? 1 : Number(((feed && feed.data && feed.data.usd) || {})[coin]) || 0
+        if (trading.keysReady !== true || trading.state !== "ready" || dex.pendingTakes > 0) return
         var floor = Number(settings.dexAutoSellMinUsd) || 0
-        if (!(usd > 0) || !(floor > 0)) { status = qsTr("Waiting for the %1 price.").arg(coin); return }
-        if (dex.pendingTakes > 0) return
-        var decimals = coin === "USDT" ? 6 : coin === "SOL" ? 9 : 18
-        var b = X.book(m.listings || [], coin, decimals, trading.tradeAccount || "", Date.now() / 1000, "XMZ")
-        var bids = b.bids.filter(function (row) { return row.price * usd >= floor })
+        if (!(floor > 0)) return
+        var list = coins(), rows = [], priced = 0
+        for (var c = 0; c < list.length; ++c) {
+            var coin = list[c]
+            var m = (dex.evmMarketStatus || {})[coin]
+            if (!m || m.configured !== true) continue
+            var usd = coin === "USDT" || coin === "USDT-BSC" ? 1 : Number(((feed && feed.data && feed.data.usd) || {})[coin]) || 0
+            if (!(usd > 0)) continue
+            priced++
+            var decimals = coin === "USDT" ? 6 : coin === "SOL" ? 9 : 18
+            var b = X.book(m.listings || [], coin, decimals, trading.tradeAccount || "", Date.now() / 1000, "XMZ")
+            for (var i = 0; i < b.bids.length; ++i) {
+                var row = b.bids[i]
+                row.usdPrice = row.price * usd; row.pairCoin = coin
+                if (row.usdPrice >= floor) rows.push(row)
+            }
+        }
+        if (!priced) { status = qsTr("Waiting for the %1 price.").arg(list.join(", ")); return }
+        // Best USD price first, whatever the pair
+        rows.sort(function (a, b) { return b.usdPrice - a.usdPrice || b.xmz - a.xmz })
         // The lock fees come from the moved XMZ too: sell a little less than all of it
         var target = Math.floor(st.moved / 1.01) - 2e11
         if (target < 1e11) return
-        var plan = X.planSwap({ asks: [], bids: bids }, "sell", target)
-        if (!plan.legs.length) { status = qsTr("%1 XMZ waiting for a buyer at $%2 or more.").arg(xmz(st.moved)).arg(floor); return }
+        var plan = X.planSwap({ asks: [], bids: rows }, "sell", target)
+        if (!plan.legs.length) { status = qsTr("%1 XMZ waiting for a buyer at $%2 or more (%3).").arg(xmz(st.moved)).arg(floor).arg(list.join(", ")); return }
         if (Number(trading.unlocked) * 1e11 < X.sellNeed(plan.atoms, plan.legs.length)) { status = qsTr("Waiting for the moved XMZ to unlock in the trading wallet."); return }
         var takes = plan.legs.map(function (l) { return { id: l.row.id, xmz: l.atoms === l.row.atoms ? "" : X.atomsText(l.atoms) } })
         if (!dex.takeEvmOffers(takes)) return
         var now = state()
         now.moved = Math.max(0, now.moved - (plan.short ? plan.atoms : st.moved)); now.sold += plan.atoms
         save(now)
-        status = qsTr("Selling %1 mined XMZ for about %2 %3 (%n trade(s)).", "", plan.legs.length).arg(xmz(plan.atoms)).arg(X.plain(plan.coin, 6)).arg(coin)
+        // What each coin gets, in words: "0.012 SOL + 0.0004 ETH"
+        var byCoin = {}, order = []
+        for (var l = 0; l < plan.legs.length; ++l) {
+            var k = plan.legs[l].row.pairCoin
+            if (byCoin[k] === undefined) { byCoin[k] = 0; order.push(k) }
+            byCoin[k] += plan.legs[l].coin
+        }
+        status = qsTr("Selling %1 mined XMZ for about %2 (%n trade(s)).", "", plan.legs.length).arg(xmz(plan.atoms))
+            .arg(order.map(function (k) { return X.plain(byCoin[k], 6) + " " + k }).join(" + "))
     }
 }
