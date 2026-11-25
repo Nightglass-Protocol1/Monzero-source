@@ -32,6 +32,9 @@ public:
     Q_INVOKABLE bool balance(const QString &coin);
     Q_INVOKABLE bool usdPrices();
     Q_INVOKABLE bool noirTrade();
+    // The Monzero pool's payouts to this wallet's address (auto-sell of mined XMZ): only their
+    // transaction ids and amounts, stored as "poolPayments"
+    Q_INVOKABLE bool poolPayments(const QString &address);
     // Accepted coins and chart intervals (the relays' own list)
     static bool knownCoin(const QString &coin);
     static bool knownInterval(int interval);

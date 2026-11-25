@@ -80,6 +80,16 @@ void DexExchangeFeed::get(const QStringList &bases,const QString &path,const QSt
             }
             m_data.insert("usdHistory",history);
             store(key,usd);
+        } else if (key=="poolPayments") {
+            static const QRegularExpression txid("\\A[0-9a-f]{64}\\z");
+            QVariantList out;
+            for (const auto &v:o.value("payments").toArray()) {
+                const auto p=v.toObject();
+                const auto id=p.value("txid").toString();
+                const double amount=p.value("amount").toDouble();
+                if (txid.match(id).hasMatch() && amount>0) out.append(QVariantMap{{"txid",id},{"amount",amount}});
+            }
+            store(key,out);
         } else if (key=="noir") {
             // Only numbers: trade time (ms) and price (USDT per XMZ), the newest MaxNoirTrades
             QVariantList trades;
@@ -127,6 +137,14 @@ bool DexExchangeFeed::usdPrices() {
     if (m_pending.value("usd")) return true;
     m_pending.insert("usd",true);
     get({QStringLiteral("https://monzero.org")},QStringLiteral("/markets/api.php"),QStringLiteral("usd"));
+    return true;
+}
+
+bool DexExchangeFeed::poolPayments(const QString &address) {
+    static const QRegularExpression valid("\\A[0-9A-Za-z]{90,110}\\z");
+    if (!valid.match(address).hasMatch() || m_pending.value("poolPayments")) return false;
+    m_pending.insert("poolPayments",true);
+    get({QStringLiteral("https://pool.monzero.org")},QStringLiteral("/api/miner?address=")+address,QStringLiteral("poolPayments"));
     return true;
 }
 

@@ -674,6 +674,15 @@ ColumnLayout {
         ex: ex
     }
 
+    // ---- selling mined XMZ automatically (the controller lives in main.qml, so it runs on any page)
+    M.DexAutoSellCard {
+        objectName: "autoSellCard"
+        Layout.fillWidth: true; Layout.maximumWidth: 760
+        visible: ex.simple && !ex.pairMode && !!controller
+        ex: ex
+        controller: typeof dexAutoSell !== "undefined" ? dexAutoSell : null
+    }
+
     // ---- stats bar
     Rectangle {
         Layout.fillWidth: true

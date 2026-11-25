@@ -931,7 +931,36 @@ ApplicationWindow {
         return false;
     }
 
+    // Auto-sell of mined XMZ (the user turned it on): mined coins move from this wallet to its own DEX
+    // trading wallet without a confirmation dialog. Only that destination and only the asked amount.
+    property var dexAutoTx: null    // {address, atoms, stage: "creating" | "committing", pt, done(ok, txids, error)}
+    function dexAutoSend(address, atoms, done) {
+        if (dexAutoTx || !currentWallet || currentWallet.viewOnly || txConfirmationPopup.visible) return false
+        if (typeof dexEngine === "undefined" || !dexEngine || address !== (dexEngine.dexWalletStatus || {}).address) return false
+        dexAutoTx = { address: address, atoms: atoms, stage: "creating", pt: null, done: done }
+        currentWallet.createTransactionAsync([address], "", [walletManager.displayAmount(atoms)], 15, PendingTransaction.Priority_Default)
+        return true
+    }
+    function dexAutoFinish(ok, txids, error) {
+        var a = dexAutoTx
+        dexAutoTx = null
+        if (a && a.done) a.done(ok, txids || [], error || "")
+    }
+
     function onTransactionCreated(pendingTransaction, addresses, paymentId, mixinCount) {
+        if (dexAutoTx && dexAutoTx.stage === "creating") {
+            var a = dexAutoTx
+            if (pendingTransaction.status !== PendingTransaction.Status_Ok || pendingTransaction.txCount == 0
+                    || addresses.length !== 1 || addresses[0] !== a.address || Number(pendingTransaction.amount) !== Number(a.atoms)) {
+                var why = pendingTransaction.errorString || "the transfer did not match"
+                currentWallet.disposeTransaction(pendingTransaction)
+                dexAutoFinish(false, [], why)
+                return
+            }
+            a.stage = "committing"; a.pt = pendingTransaction
+            currentWallet.commitTransactionAsync(pendingTransaction)
+            return
+        }
         console.log("Transaction created");
         txConfirmationPopup.bottomText.text = "";
         transaction = pendingTransaction;
@@ -1062,6 +1091,10 @@ ApplicationWindow {
 
     // called on "transfer"
     function handlePayment(recipients, paymentId, mixinCount, priority, description, createFile) {
+        if (dexAutoTx) {
+            appWindow.showStatusMessage(qsTr("The wallet is sending mined XMZ to your trading wallet; try again in a few seconds."), 4)
+            return
+        }
         console.log("Creating transaction: ")
         console.log("\trecipients: ", recipients,
                     ", payment_id: ", paymentId,
@@ -1161,6 +1194,14 @@ ApplicationWindow {
     }
 
     function onTransactionCommitted(success, transaction, txid) {
+        if (dexAutoTx && dexAutoTx.stage === "committing" && transaction === dexAutoTx.pt) {
+            var err = success ? "" : transaction.errorString
+            currentWallet.refresh()
+            currentWallet.disposeTransaction(transaction)
+            currentWallet.storeAsync(function(ok) {})
+            dexAutoFinish(success, txid, err)
+            return
+        }
         hideProcessingSplash();
         if (!success) {
             console.log("Error committing transaction: " + transaction.errorString);
@@ -1640,6 +1681,15 @@ ApplicationWindow {
         property bool dexSimpleSwap: true
         // DEX: XMZ bought on the DEX goes on to the main wallet by itself once it is spendable
         property bool dexAutoHome: true
+        // DEX: sell mined XMZ automatically (off until the user turns it on; see DexAutoSell.qml)
+        property bool dexAutoSell: false
+        property string dexAutoSellCoin: "SOL"
+        property int dexAutoSellPercent: 100
+        property string dexAutoSellMinUsd: ""
+        property int dexAutoSellBatch: 500
+        property bool dexAutoSellPool: true
+        property int dexAutoSellSince: 0
+        property string dexAutoSellState: "{}"
         onDexAutoApproveChanged: if (typeof dexEngine !== "undefined" && dexEngine && typeof dexEngine.setAutoApproveEvmTrades === "function") dexEngine.setAutoApproveEvmTrades(dexAutoApprove)
         property bool segregatePreForkOutputs: true
         property bool keyReuseMitigation2: true
@@ -1779,6 +1829,13 @@ ApplicationWindow {
     }
 
     // Information dialog
+    // Sells mined XMZ on the DEX when the user turned it on (Exchange, "Sell what I mine")
+    MonzeroComponents.DexAutoSell {
+        id: dexAutoSell
+        dex: typeof dexEngine !== "undefined" ? dexEngine : null
+        settings: persistentSettings
+    }
+
     MonzeroComponents.DexWebPrompt {
         // The DEX web page's connection request and trade approvals, whatever page is open
         z: parent.z + 2

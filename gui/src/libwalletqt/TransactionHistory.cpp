@@ -62,6 +62,19 @@ namespace {
     }
 }
 
+QVariantList TransactionHistory::received(qint64 sinceSecs) const
+{
+    QReadLocker locker(&m_lock);
+    QVariantList out;
+    for (const auto *t : m_tinfo) {
+        if (t->direction() != TransactionInfo::Direction_In || t->isPending() || t->isFailed()) continue;
+        if (t->timestamp().toSecsSinceEpoch() < sinceSecs) continue;
+        out.append(QVariantMap{{"hash", t->hash()}, {"atoms", QString::number(t->atomicAmount())},
+                               {"coinbase", t->isCoinbase()}, {"confirmations", QVariant::fromValue(t->confirmations())}});
+    }
+    return out;
+}
+
 bool TransactionHistory::transaction(int index, std::function<void (TransactionInfo &)> callback)
 {
     QReadLocker locker(&m_lock);

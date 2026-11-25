@@ -56,6 +56,9 @@ public:
     // Q_INVOKABLE TransactionInfo * transaction(const QString &id);
     Q_INVOKABLE void refresh(quint32 accountIndex);
     Q_INVOKABLE QString writeCSV(quint32 accountIndex, QString out);
+    // Incoming, confirmed transfers since `sinceSecs` (auto-sell of mined XMZ): {hash, atoms (text),
+    // coinbase, confirmations}
+    Q_INVOKABLE QVariantList received(qint64 sinceSecs) const;
     quint64 count() const;
     QDateTime firstDateTime() const;
     QDateTime lastDateTime() const;

@@ -20,6 +20,8 @@
         <file>components/DexTradeProgress.qml</file>
         <file>components/DexExchange.qml</file>
         <file>components/DexSwap.qml</file>
+        <file>components/DexAutoSell.qml</file>
+        <file>components/DexAutoSellCard.qml</file>
         <file>components/DexDirectPanel.qml</file>
         <file>components/DexRoutePanel.qml</file>
         <file>components/AppearanceEditor.qml</file>
