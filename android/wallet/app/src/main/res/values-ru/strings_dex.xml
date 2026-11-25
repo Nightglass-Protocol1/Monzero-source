@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="dex_menu">Торговать на DEX</string>
+    <string name="dex_menu">Обмен на DEX</string>
     <string name="dex_title">Торговля на DEX</string>
     <string name="dex_channel_link">Связь с DEX</string>
     <string name="dex_channel_ask">Запросы DEX</string>
@@ -111,4 +111,57 @@
     <string name="dex_stage_sweeping_back">возврат ваших XMZ</string>
     <string name="dex_stage_done_swapped">завершено, своп выполнен</string>
     <string name="dex_stage_done_other">завершено (%1$s)</string>
+    <!-- Экран обмена -->
+    <string name="dex_swap_title">Обмен</string>
+    <string name="dex_swap_buy">Купить XMZ</string>
+    <string name="dex_swap_sell">Продать XMZ</string>
+    <string name="dex_swap_pay_with">Оплатить</string>
+    <string name="dex_swap_paid_in">Получить</string>
+    <string name="dex_swap_how_much">Сколько XMZ?</string>
+    <string name="dex_swap_amount_hint">например, 1000</string>
+    <string name="dex_swap_button">Обменять</string>
+    <string name="dex_swap_cancel">Отмена</string>
+    <string name="dex_swap_qr">QR-код вашего торгового счёта</string>
+    <string name="dex_swap_trades">Ваши сделки</string>
+    <string name="dex_swap_auto_approve">Подтверждать мои сделки автоматически</string>
+    <string name="dex_swap_more">Связь с DEX, слова восстановления и история</string>
+    <string name="dex_swap_quote_buy">Вы платите около %1$s %2$s и получаете %3$s XMZ.</string>
+    <string name="dex_swap_quote_sell">Вы отдаёте %3$s XMZ и получаете около %1$s %2$s.</string>
+    <string name="dex_swap_none">Сейчас никто не предлагает столько в %1$s. Попробуйте меньшую сумму или другую монету.</string>
+    <string name="dex_swap_offers">Собрано из %1$d предложений, сначала лучшие цены.</string>
+    <string name="dex_swap_fees_buy">Комиссии сети: до %1$s %2$s откладывается на них; неиспользованное остаётся на торговом счёте.</string>
+    <string name="dex_swap_fees_sell">Комиссии сети: около %1$s XMZ.</string>
+    <string name="dex_swap_only">Сейчас предлагается только %1$s XMZ. Нажмите, чтобы взять эту сумму.</string>
+    <string name="dex_swap_ready_off">Торговля выключена. Включите её для обмена (она работает, пока сделки не завершатся).</string>
+    <string name="dex_swap_ready_on">Включить торговлю</string>
+    <string name="dex_swap_ready_keys">Ваши торговые ключи заблокированы.</string>
+    <string name="dex_swap_ready_keys_new">Для торговли нужна разовая настройка: торговый пароль и 12 слов восстановления.</string>
+    <string name="dex_swap_ready_keys_button">Разблокировать торговлю</string>
+    <string name="dex_swap_ready_keys_new_button">Настроить торговлю</string>
+    <string name="dex_swap_ready_wallet">Торговый кошелёк запускается…</string>
+    <string name="dex_swap_deposit">Отправьте %1$s %2$s на ваш торговый счёт:</string>
+    <string name="dex_swap_deposit_gas">и %1$s %2$s на комиссии сети</string>
+    <string name="dex_swap_deposit_note">Этот адрес ваш: тратить с него может только этот кошелёк. Отправьте из любого кошелька или биржи в сети %1$s. Обмен начнётся сам, как только монеты придут.</string>
+    <string name="dex_swap_copy">Копировать адрес</string>
+    <string name="dex_swap_copied">Адрес скопирован</string>
+    <string name="dex_swap_move">Для этого обмена торговому кошельку нужно ещё %1$s XMZ.</string>
+    <string name="dex_swap_move_button">Перевести %1$s XMZ из моего кошелька</string>
+    <string name="dex_swap_move_note">После отправки XMZ станет доступен примерно через 20 минут (10 блоков). Обмен начнётся сам; не выключайте торговлю.</string>
+    <string name="dex_swap_started">Обмен начат (сделок: %1$d). Ход каждой виден ниже. Не выключайте торговлю, пока они не завершатся.</string>
+    <string name="dex_swap_again">Новый обмен</string>
+    <string name="dex_swap_price_moved">Цена изменилась за время ожидания. Проверьте новую сумму и снова нажмите «Обменять».</string>
+    <string name="dex_swap_failed">Сейчас обмен не удалось начать. Попробуйте чуть позже.</string>
+    <string name="dex_swap_no_offers">Сейчас нет предложений на эту сумму.</string>
+    <string name="dex_swap_approve_all">Подтвердить все (%1$d)</string>
+    <string name="dex_swap_step_agreed">Согласовано</string>
+    <string name="dex_swap_step_you_lock">Вы блокируете %1$s</string>
+    <string name="dex_swap_step_they_lock">Продавец блокирует %1$s</string>
+    <string name="dex_swap_step_buyer_locks">Покупатель блокирует %1$s</string>
+    <string name="dex_swap_step_arrives">%1$s поступает</string>
+    <string name="dex_swap_state_done">Готово</string>
+    <string name="dex_swap_state_refunded">Возвращено</string>
+    <string name="dex_swap_state_approval">Ждёт подтверждения</string>
+    <string name="dex_swap_state_funds">Нужны средства</string>
+    <string name="dex_swap_state_running">Идёт</string>
+    <string name="dex_swap_row">%1$s %2$s XMZ · %3$s %4$s — %5$s</string>
 </resources>

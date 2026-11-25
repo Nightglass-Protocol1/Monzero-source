@@ -150,6 +150,12 @@ final class DexBridge implements DexEngine.Listener {
     }
 
     /** The user asked, from the wallet's own screen, to move the trading XMZ back. */
+    /** The Swap screen needs the trading keys: ask for the password (the prompt screen shows it) */
+    void askKeys() {
+        keysWanted = !engine.keysReady();
+        listener.bridgeChanged();
+    }
+
     void askReturn() {
         returnWanted = true;
         listener.bridgeChanged();

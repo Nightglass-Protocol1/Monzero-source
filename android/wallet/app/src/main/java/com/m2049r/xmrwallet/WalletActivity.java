@@ -349,7 +349,8 @@ public class WalletActivity extends BaseActivity implements WalletFragment.Liste
             Timber.d("no daemon set");
         }
         final Wallet wallet = getWallet();
-        com.m2049r.xmrwallet.dex.DexActivity.open(this, wallet == null ? null : wallet.getAddress(), daemon);
+        // The Swap screen first; the DEX link (web page), recovery words and history are a tap away there
+        com.m2049r.xmrwallet.dex.DexSwapActivity.open(this, wallet == null ? null : wallet.getAddress(), daemon);
     }
 
     private void updateStreetMode() {

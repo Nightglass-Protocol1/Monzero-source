@@ -245,19 +245,24 @@ public class DexService extends Service implements DexBridge.Listener {
         ((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE)).notify(NOTE_ASK, notification);
     }
 
-    @Override
-    public void xmzAddRequested(String address, String xmz) {
-        // The wallet's own Send screen, with the trading wallet's address filled in: the user
-        // checks the amount and confirms as for any payment
+    /**
+     * The wallet's own Send screen, with the trading wallet's address filled in: the user checks the
+     * amount and confirms as for any payment. With a wallet open, straight to its Send screen (going
+     * through the wallet list would close it); with none open, the list: the user picks one first.
+     */
+    static Intent sendIntent(Context context, String address, String xmz) {
         final StringBuilder uri = new StringBuilder("monzero:").append(address);
         if (xmz != null && !xmz.isEmpty()) uri.append("?tx_amount=").append(xmz);
-        // With a wallet open, straight to its Send screen. Going through the wallet list instead
-        // would close the open wallet. With none open, the list: the user picks one first.
-        final Intent send = WalletActivity.isWalletOpen()
-                ? new Intent(this, WalletActivity.class).putExtra(WalletActivity.REQUEST_URI, uri.toString())
+        return WalletActivity.isWalletOpen()
+                ? new Intent(context, WalletActivity.class).putExtra(WalletActivity.REQUEST_URI, uri.toString())
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                : new Intent(Intent.ACTION_VIEW, Uri.parse(uri.toString()), this, LoginActivity.class)
+                : new Intent(Intent.ACTION_VIEW, Uri.parse(uri.toString()), context, LoginActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+    }
+
+    @Override
+    public void xmzAddRequested(String address, String xmz) {
+        final Intent send = sendIntent(this, address, xmz);
         final Notification notification = new NotificationCompat.Builder(this, CHANNEL_ASK)
                 .setContentTitle(getString(R.string.dex_add_title))
                 .setContentText(getString(R.string.dex_add_text))

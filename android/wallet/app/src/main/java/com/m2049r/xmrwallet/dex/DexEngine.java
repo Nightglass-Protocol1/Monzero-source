@@ -67,6 +67,10 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     private String marketMessage = "", startRefusal = "", keysMessage = "", evmAccount = "", solAccount = "";
     private boolean keysBusy, resumed, stopped, marketsUp, xmrMarketsUp, accountsAsked;
     private String xmrMessage = "";
+    private String solUsdtAccount = "";
+    /** A swap of several offers (the Swap screen): {listing id, amount ("" = whole)}, taken one after another */
+    private final List<String[]> takeQueue = new ArrayList<>();
+    private int takeTries;
     private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
@@ -244,6 +248,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
                         if (answer == null || !answer.optBoolean("ok")) return;
                         if (DexConfig.evmAddress(answer.optString("evm"))) evmAccount = answer.optString("evm");
                         if (DexConfig.solanaAddress(answer.optString("sol"))) solAccount = answer.optString("sol");
+                        if (DexConfig.solanaAddress(answer.optString("solUsdt"))) solUsdtAccount = answer.optString("solUsdt");
                         for (DexMarket m : allMarkets()) m.setSolAccount(solAccount);
                         changed();
                     });
@@ -723,6 +728,56 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         return false;
     }
 
+    /**
+     * The Swap screen's swap: several offers taken one after another, as each market allows (a market
+     * runs one take at a time). A refused take (gone, limits) is skipped; the rest go on.
+     */
+    boolean takeOffers(List<String[]> takes) {
+        if (takes == null || takes.isEmpty() || takes.size() > 20) return false;
+        final boolean idle = takeQueue.isEmpty();
+        takeQueue.addAll(takes);
+        takeTries = 0;
+        if (idle) takeNextQueued();
+        changed();
+        return true;
+    }
+
+    int pendingTakes() {
+        return takeQueue.size();
+    }
+
+    private void takeNextQueued() {
+        if (stopped || takeQueue.isEmpty()) return;
+        final String[] next = takeQueue.get(0);
+        for (DexMarket m : allMarkets())
+            if (m.listing(next[0]) != null && m.busy() && ++takeTries < 120) {
+                handler.postDelayed(this::takeNextQueued, 1000);
+                return;
+            }
+        takeOffer(next[0], next[1]);
+        takeQueue.remove(0);
+        takeTries = 0;
+        changed();
+        if (!takeQueue.isEmpty()) handler.postDelayed(this::takeNextQueued, 1500);
+    }
+
+    /** The trade accounts and their chains' nodes, for the Swap screen's balance reads */
+    String evmAccount() {
+        return evmAccount;
+    }
+
+    String solAccount() {
+        return solAccount;
+    }
+
+    String solUsdtAccount() {
+        return solUsdtAccount;
+    }
+
+    String rpcFor(long chainId) {
+        return overrides.rpcFor(chainId);
+    }
+
     /** The least a partial offer's smallest part may be: 1 XMZ (as the engine checks). */
     private static final BigInteger MIN_FILL = BigInteger.valueOf(100_000_000_000L);
     /** The same on a Monero market: 0.001 XMR (1e9 of XMR's 1e12 atoms), as the engine checks */
@@ -874,8 +929,14 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
                 final JSONObject o = new JSONObject().put("tradeDir", t.tradeDir()).put("tradeId", t.tradeId()).put("selected", t == trade)
                         .put("role", s.optString("role")).put("stage", s.optString("stage")).put("done", t.done())
                         .put("awaitingApproval", t.awaitingApproval()).put("approved", s.optBoolean("approved"));
-                if (offer != null) o.put("chainId", offer.optLong("chainId")).put("value", offer.optString("value"))
-                        .put("xmzAmount", DexMarket.amountText(offer.opt("xmzAmount"))).put("privateCoin", offer.optString("privateCoin"));
+                if (offer != null) {
+                    final long market = DexConfig.marketOf(offer.optLong("chainId"), offer.optString("asset"));
+                    o.put("chainId", offer.optLong("chainId")).put("value", offer.optString("value"))
+                            .put("xmzAmount", DexMarket.amountText(offer.opt("xmzAmount"))).put("privateCoin", offer.optString("privateCoin"))
+                            .put("coin", DexConfig.coin(market)).put("decimals", DexConfig.decimals(market));
+                }
+                final JSONObject funding = t.status("").optJSONObject("awaitingFunding");
+                o.put("awaitingFunding", funding != null && funding.length() > 0 && !t.done());
                 out.put(o);
             } catch (Exception ignored) {
             }

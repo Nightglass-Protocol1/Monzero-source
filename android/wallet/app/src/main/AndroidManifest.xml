@@ -105,6 +105,14 @@
             android:exported="false"
             android:label="@string/dex_title"
             android:launchMode="singleTop" />
+        <!-- The Swap screen: buy or sell XMZ in the wallet itself (see dex/DexSwapActivity) -->
+        <activity
+            android:name=".dex.DexSwapActivity"
+            android:configChanges="orientation|keyboardHidden|uiMode"
+            android:exported="false"
+            android:label="@string/dex_swap_title"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize" />
         <activity
             android:name=".dex.DexPromptActivity"
             android:configChanges="orientation|keyboardHidden|uiMode"

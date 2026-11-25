@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="dex_menu">Trade on the DEX</string>
+    <string name="dex_menu">Swap on the DEX</string>
     <string name="dex_title">DEX trading</string>
     <string name="dex_channel_link">DEX link</string>
     <string name="dex_channel_ask">DEX requests</string>
@@ -115,4 +115,57 @@ It can be traded once the Monero network has confirmed it (10 blocks, about 20 m
     <string name="dex_stage_sweeping_back">taking your XMZ back</string>
     <string name="dex_stage_done_swapped">finished, swap complete</string>
     <string name="dex_stage_done_other">finished (%1$s)</string>
+    <!-- The Swap screen -->
+    <string name="dex_swap_title">Swap</string>
+    <string name="dex_swap_buy">Buy XMZ</string>
+    <string name="dex_swap_sell">Sell XMZ</string>
+    <string name="dex_swap_pay_with">Pay with</string>
+    <string name="dex_swap_paid_in">Get paid in</string>
+    <string name="dex_swap_how_much">How much XMZ?</string>
+    <string name="dex_swap_amount_hint">e.g. 1000</string>
+    <string name="dex_swap_button">Swap</string>
+    <string name="dex_swap_cancel">Cancel</string>
+    <string name="dex_swap_qr">QR code of your trade account</string>
+    <string name="dex_swap_trades">Your trades</string>
+    <string name="dex_swap_auto_approve">Approve my trades automatically</string>
+    <string name="dex_swap_more">DEX link, recovery words and history</string>
+    <string name="dex_swap_quote_buy">You pay about %1$s %2$s and get %3$s XMZ.</string>
+    <string name="dex_swap_quote_sell">You give %3$s XMZ and get about %1$s %2$s.</string>
+    <string name="dex_swap_none">Nobody is offering that right now on %1$s. Try a smaller amount or another coin.</string>
+    <string name="dex_swap_offers">Filled from %1$d offers, best prices first.</string>
+    <string name="dex_swap_fees_buy">Network fees: up to %1$s %2$s is kept aside for them; what is not used stays in your trade account.</string>
+    <string name="dex_swap_fees_sell">Network fees: about %1$s XMZ.</string>
+    <string name="dex_swap_only">Only %1$s XMZ is offered at the moment. Tap to use that amount.</string>
+    <string name="dex_swap_ready_off">Trading is off. Turn it on to swap (it keeps running while trades finish).</string>
+    <string name="dex_swap_ready_on">Turn on trading</string>
+    <string name="dex_swap_ready_keys">Your trading keys are locked.</string>
+    <string name="dex_swap_ready_keys_new">Trading needs a one-time setup: a trading password and 12 recovery words.</string>
+    <string name="dex_swap_ready_keys_button">Unlock trading</string>
+    <string name="dex_swap_ready_keys_new_button">Set up trading</string>
+    <string name="dex_swap_ready_wallet">The trading wallet is starting…</string>
+    <string name="dex_swap_deposit">Send %1$s %2$s to your trade account:</string>
+    <string name="dex_swap_deposit_gas">and %1$s %2$s for network fees</string>
+    <string name="dex_swap_deposit_note">This address is yours: only this wallet can spend from it. Send from any wallet or exchange on the %1$s network. The swap starts by itself as soon as the coins arrive.</string>
+    <string name="dex_swap_copy">Copy address</string>
+    <string name="dex_swap_copied">Address copied</string>
+    <string name="dex_swap_move">Your trading wallet needs %1$s more XMZ for this swap.</string>
+    <string name="dex_swap_move_button">Move %1$s XMZ from my wallet</string>
+    <string name="dex_swap_move_note">After you send it, the XMZ needs about 20 minutes (10 blocks) before it can be used. The swap starts by itself then; keep trading on.</string>
+    <string name="dex_swap_started">Your swap has started (%1$d trades). Each one shows its progress below. Keep trading on until they finish.</string>
+    <string name="dex_swap_again">New swap</string>
+    <string name="dex_swap_price_moved">The price changed while waiting. Check the new amount and tap Swap again.</string>
+    <string name="dex_swap_failed">The swap could not start now. Try again in a moment.</string>
+    <string name="dex_swap_no_offers">No offers match this amount right now.</string>
+    <string name="dex_swap_approve_all">Approve all (%1$d)</string>
+    <string name="dex_swap_step_agreed">Agreed</string>
+    <string name="dex_swap_step_you_lock">You lock %1$s</string>
+    <string name="dex_swap_step_they_lock">Seller locks %1$s</string>
+    <string name="dex_swap_step_buyer_locks">Buyer locks %1$s</string>
+    <string name="dex_swap_step_arrives">%1$s arrives</string>
+    <string name="dex_swap_state_done">Done</string>
+    <string name="dex_swap_state_refunded">Refunded</string>
+    <string name="dex_swap_state_approval">Needs approval</string>
+    <string name="dex_swap_state_funds">Needs funds</string>
+    <string name="dex_swap_state_running">Running</string>
+    <string name="dex_swap_row">%1$s %2$s XMZ · %3$s %4$s — %5$s</string>
 </resources>
