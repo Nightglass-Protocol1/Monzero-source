@@ -545,6 +545,22 @@ public class DexSwapActivity extends SecureActivity {
         ticks.setText(line.toString());
         ticks.setTextSize(13);
         row.addView(ticks);
+        // Until this side locks anything the trade can be given up (the engine checks again)
+        final String stage = t.optString("stage");
+        if (!done && (stage.equals("Start") || stage.equals("WaitingForEvmLock"))) {
+            final Button cancelTrade = new Button(this, null, android.R.attr.borderlessButtonStyle);
+            cancelTrade.setText(R.string.dex_swap_cancel_trade);
+            cancelTrade.setTextColor(Color.parseColor("#E5677A"));
+            cancelTrade.setOnClickListener(v -> {
+                final DexService s = DexService.get();
+                if (s == null) return;
+                final DexEngine e = s.engine();
+                final Boolean ok = e.call(() -> e.selectTrade(t.optString("tradeDir")) && e.abandonTrade(), false);
+                if (ok == null || !ok) Toast.makeText(this, R.string.dex_swap_cancel_failed, Toast.LENGTH_LONG).show();
+                refresh();
+            });
+            row.addView(cancelTrade);
+        }
         // A trade waiting for the user: its details and approval are on the prompt screen
         if (t.optBoolean("awaitingApproval") && !done && !autoApprove) {
             row.setOnClickListener(v -> {

@@ -163,5 +163,7 @@
     <string name="dex_swap_state_approval">Ждёт подтверждения</string>
     <string name="dex_swap_state_funds">Нужны средства</string>
     <string name="dex_swap_state_running">Идёт</string>
+    <string name="dex_swap_cancel_trade">Отменить сделку (ничего ещё не заблокировано)</string>
+    <string name="dex_swap_cancel_failed">Сейчас сделку не отменить: её монеты, возможно, уже заблокированы.</string>
     <string name="dex_swap_row">%1$s %2$s XMZ · %3$s %4$s — %5$s</string>
 </resources>

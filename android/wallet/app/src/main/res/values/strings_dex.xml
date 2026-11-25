@@ -167,5 +167,7 @@ It can be traded once the Monero network has confirmed it (10 blocks, about 20 m
     <string name="dex_swap_state_approval">Needs approval</string>
     <string name="dex_swap_state_funds">Needs funds</string>
     <string name="dex_swap_state_running">Running</string>
+    <string name="dex_swap_cancel_trade">Cancel this trade (nothing is locked yet)</string>
+    <string name="dex_swap_cancel_failed">The trade could not be cancelled now: its coins may already be locked.</string>
     <string name="dex_swap_row">%1$s %2$s XMZ · %3$s %4$s — %5$s</string>
 </resources>
