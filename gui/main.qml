@@ -1499,6 +1499,7 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        if (typeof dexEngine !== "undefined" && dexEngine && typeof dexEngine.setAutoApproveEvmTrades === "function") dexEngine.setAutoApproveEvmTrades(persistentSettings.dexAutoApprove)
         if (screenAvailableWidth > width) {
             x = (screenAvailableWidth - width) / 2;
         }
@@ -1633,6 +1634,9 @@ ApplicationWindow {
         property string dexExternalWallet: ""
         // DEX: the user's own wallets per coin, as JSON {"BTC": "bc1…", "LTC": "ltc1…", …}. Optional.
         property string dexExternalWallets: "{}"
+        // DEX: approve each trade as soon as its terms are agreed (no click per trade)
+        property bool dexAutoApprove: true
+        onDexAutoApproveChanged: if (typeof dexEngine !== "undefined" && dexEngine && typeof dexEngine.setAutoApproveEvmTrades === "function") dexEngine.setAutoApproveEvmTrades(dexAutoApprove)
         property bool segregatePreForkOutputs: true
         property bool keyReuseMitigation2: true
         property int segregationHeight: 0

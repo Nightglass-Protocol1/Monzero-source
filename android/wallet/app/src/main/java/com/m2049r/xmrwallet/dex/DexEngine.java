@@ -44,7 +44,18 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     /** The Monero trading wallet (Monero's official wallet RPC on a Monero node); null where this build has no Monero program */
     private final DexWallets xmrWallets;
     private final DexRisk risk;
-    private final DexTrade trade;
+    /** The trade the screens show: one of `trades`, or `idle` when none is open */
+    private DexTrade trade;
+    private final DexTrade idle;
+    /** The open trades, oldest first. Several run side by side; the helper runs for one at a time, so trades on one account never send at once. */
+    private final List<DexTrade> trades = new ArrayList<>();
+    private final List<DexTrade> round = new ArrayList<>();
+    private final java.util.Set<String> finishedDirs = new java.util.HashSet<>(), reportedTrades = new java.util.HashSet<>(),
+            seenRunning = new java.util.HashSet<>(), autoTried = new java.util.HashSet<>();
+    private final List<Object[]> waiting = new ArrayList<>();   // {market, folder}: over the limit, opened as others finish
+    private static final int MAX_TRADES = 8;
+    /** Approve each trade as soon as its terms are agreed (on unless the user turned it off) */
+    private boolean autoApprove = true;
     private final Map<Long, DexMarket> markets = new LinkedHashMap<>();
     /** Monero markets (BNB/XMR, ...), by chain id like the XMZ ones */
     private final Map<Long, DexMarket> xmrMarkets = new LinkedHashMap<>();
@@ -53,10 +64,9 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     private String directMessage = "";
     private final java.util.Set<String> directRecorded = new java.util.HashSet<>();
     private final List<Listener> listeners = new ArrayList<>();
-    private String marketMessage = "", startRefusal = "", keysMessage = "", evmAccount = "", solAccount = "", reportedTrade = "";
-    private boolean keysBusy, resumed, resuming, stopped, marketsUp, xmrMarketsUp, accountsAsked;
+    private String marketMessage = "", startRefusal = "", keysMessage = "", evmAccount = "", solAccount = "";
+    private boolean keysBusy, resumed, stopped, marketsUp, xmrMarketsUp, accountsAsked;
     private String xmrMessage = "";
-    private final List<String> resume = new ArrayList<>();   // trade folders, newest first
     private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
@@ -85,8 +95,9 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         xmrWallets = moneroRpc.isFile()
                 ? new DexWallets("xmr", new File(root, "xmr"), moneroRpc, xmrNode, DexConfig.xmrNetworkFlag(), helper, handler, this) : null;
         risk = new DexRisk(DexConfig.CONTROL_KEY, new File(root, "started-trades.json"), handler, this::changed);
-        trade = new DexTrade(helper, this);
-        trade.setRelays(overrides.relaysOrDefault());
+        idle = new DexTrade(helper, this::changed);
+        trade = idle;
+        autoApprove = !new File(root, "auto-approve-off").exists();
     }
 
     // ---- threads -------------------------------------------------------------------------------
@@ -135,7 +146,8 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
 
     /** True while a trade is running: the app must stay up until it finishes or refunds. */
     boolean tradeRunning() {
-        return (trade.configured() && !trade.done() && trade.snapshot().optBoolean("approved")) || (direct != null && direct.hasRunningTrade());
+        for (DexTrade t : trades) if (!t.done() && t.snapshot().optBoolean("approved")) return true;
+        return direct != null && direct.hasRunningTrade();
     }
 
     void stop() {
@@ -306,7 +318,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     /** Send from the Monero trading wallet to the user's own Monero wallet (Cake Wallet, ...): an amount, or everything when empty. */
     boolean sendXmr(String address, String amount) {
         if (xmrWallets == null || !xmrWallets.ready()) return false;
-        if (trade.configured() && !trade.done()) {
+        if (anyRunning()) {
             xmrMessage = "A trade is running: its Monero is needed until it finishes.";
             changed();
             return false;
@@ -350,10 +362,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         }
         // A Monero trade may have been running when the app closed: after the first resume, it joins the queue
         if (!resumed) resumeTrades();
-        else if (!resuming && !trade.configured()) {
-            for (DexMarket m : xmrMarkets.values()) resume.addAll(m.agreedFolders());
-            nextResume();
-        }
+        else for (DexMarket m : xmrMarkets.values()) for (String dir : m.agreedFolders()) if (tradeFor(dir) == null) agreed(m, dir);
         changed();
     }
 
@@ -752,7 +761,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     boolean returnFunds(long chainId, String address) {
         final DexMarket m = markets.get(chainId);
         if (m == null || !keys.ready()) return false;
-        if (trade.configured() && !trade.done()) return say("A trade is running: its account needs its funds until it finishes.");
+        if (anyRunning()) return say("A trade is running: its account needs its funds until it finishes.");
         final boolean started = m.withdraw(keys.seedHex(), address.trim());
         marketMessage = started ? "" : "The funds could not be sent back now.";
         changed();
@@ -771,27 +780,142 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         if (direct != null) direct.step(keys.seedHex());
     }
 
-    // ---- the trade -----------------------------------------------------------------------------
+    // ---- the trades ----------------------------------------------------------------------------
+
+    private boolean anyRunning() {
+        for (DexTrade t : trades) if (!t.done()) return true;
+        return false;
+    }
+
+    private boolean anyBusy() {
+        for (DexTrade t : trades) if (t.busy()) return true;
+        return false;
+    }
+
+    private DexTrade tradeFor(String dir) {
+        for (DexTrade t : trades) if (t.tradeDir().equals(dir)) return t;
+        return null;
+    }
 
     @Override
     public void tradeChanged() {
-        if (resuming && trade.configured() && !trade.busy() && trade.snapshot().has("stage")) {
-            // The newest unfinished trade is the one to continue; finished ones are passed over
-            if (trade.done()) handler.post(this::nextResume);
-            else {
-                resuming = false;
-                resume.clear();
+        changed();
+    }
+
+    /** One trade's news: finished, waiting for approval (approved for the user when they chose so), or a step over */
+    private void tradeChanged(DexTrade t) {
+        if (!trades.contains(t)) {
+            changed();
+            return;
+        }
+        final String dir = t.tradeDir();
+        if (t.snapshot().has("stage") && !t.done()) seenRunning.add(dir);
+        if (t.done() && !t.busy()) {
+            // A swap we claimed: tell the relays where the claim is, for the public price chart
+            final JSONObject s = t.snapshot();
+            final DexMarket m = marketFor(dir);
+            if (s.optString("role").equals("claimer") && s.optString("stage").equals("Done(Swapped)") && !reportedTrades.contains(t.tradeId())
+                    && m != null && m.report(dir)) reportedTrades.add(t.tradeId());
+            if (finishedDirs.add(dir)) {
+                // Over: its swap wallet stops. It stays on screen (and for its payout) until it makes room for others.
+                releaseService(dir);
+                handler.post(this::openWaiting);
             }
+            // Over and paid out: nothing is left to do for it after a restart. The payout sends the whole
+            // account, so the other finished trades on that account are paid out with it.
+            if (t.hasPayout()) for (DexTrade o : new ArrayList<>(trades))
+                if (o.done() && !o.busy() && (o == t || accountOf(o).equals(accountOf(t)))) {
+                    final File mark = new File(o.tradeDir(), "finished");
+                    if (!mark.exists()) DexFiles.write(mark, "finished\n");
+                    if (o != t && o != trade) retire(o);
+                }
+        }
+        if (autoApprove && t.awaitingApproval() && !t.busy() && autoTried.add(t.commitment())) {
+            final String c = t.commitment();
+            handler.post(() -> {
+                if (trades.contains(t)) approve(t, c);
+            });
+        }
+        // One trade's step is over: the next of this round takes its turn
+        if (!t.busy() && !round.isEmpty() && !anyBusy()) handler.post(this::stepNext);
+        changed();
+    }
+
+    private void retire(DexTrade t) {
+        trades.remove(t);
+        round.remove(t);
+        t.release();
+        if (trade == t) {
+            trade = idle;
+            for (DexTrade o : trades) if (!o.done()) {
+                trade = o;
+                break;
+            }
+            if (trade == idle && !trades.isEmpty()) trade = trades.get(trades.size() - 1);
         }
         changed();
     }
 
     JSONObject tradeStatus() {
-        return trade.status(startRefusal);
+        final JSONObject s = trade.status(startRefusal);
+        try {
+            s.put("openTrades", trades.size()).put("autoApprove", autoApprove);
+        } catch (Exception ignored) {
+        }
+        return s;
     }
 
+    /** Every open trade, short: for the list the screens show */
+    org.json.JSONArray trades() {
+        final org.json.JSONArray out = new org.json.JSONArray();
+        for (DexTrade t : trades) {
+            try {
+                final JSONObject s = t.snapshot(), offer = t.offer();
+                final JSONObject o = new JSONObject().put("tradeDir", t.tradeDir()).put("tradeId", t.tradeId()).put("selected", t == trade)
+                        .put("role", s.optString("role")).put("stage", s.optString("stage")).put("done", t.done())
+                        .put("awaitingApproval", t.awaitingApproval()).put("approved", s.optBoolean("approved"));
+                if (offer != null) o.put("chainId", offer.optLong("chainId")).put("value", offer.optString("value"))
+                        .put("xmzAmount", DexMarket.amountText(offer.opt("xmzAmount"))).put("privateCoin", offer.optString("privateCoin"));
+                out.put(o);
+            } catch (Exception ignored) {
+            }
+        }
+        return out;
+    }
+
+    boolean selectTrade(String dir) {
+        final DexTrade t = dir == null ? null : tradeFor(dir);
+        if (t == null) return false;
+        trade = t;
+        startRefusal = "";
+        changed();
+        return true;
+    }
+
+    boolean autoApprove() {
+        return autoApprove;
+    }
+
+    void setAutoApprove(boolean on) {
+        if (autoApprove == on) return;
+        autoApprove = on;
+        final File off = new File(root, "auto-approve-off");
+        if (on) off.delete();
+        else DexFiles.write(off, "the user approves each trade\n");
+        autoTried.clear();
+        if (on) for (DexTrade t : new ArrayList<>(trades)) tradeChanged(t);
+        changed();
+    }
+
+    /** A trade waits for the user's approval: the screens show it (the one shown, or else the first waiting) */
     boolean awaitingApproval() {
-        return trade.configured() && trade.awaitingApproval();
+        if (trade.configured() && trade.awaitingApproval()) return true;
+        for (DexTrade t : trades)
+            if (t.awaitingApproval()) {
+                trade = t;
+                return true;
+            }
+        return false;
     }
 
     JSONObject tradeSnapshot() {
@@ -812,22 +936,36 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         return h.substring(0, 8) + "-" + h.substring(8, 12) + "-" + h.substring(12, 16) + "-" + h.substring(16, 20) + "-" + h.substring(20);
     }
 
-    private boolean refuse(String why) {
-        startRefusal = why;
+    private boolean refuse(DexTrade t, String why) {
+        if (t == trade) startRefusal = why;
+        marketMessage = why;
         changed();
         return false;
     }
 
+    /** The user's approval of the trade they were shown: found by its commitment, whichever trade is shown now. */
+    boolean approveTrade(String commitment) {
+        for (DexTrade t : trades) if (!commitment.isEmpty() && t.commitment().equals(commitment)) return approve(t, commitment);
+        return approve(trade, commitment);
+    }
+
+    /** Every trade waiting for approval; the number started */
+    int approveAll() {
+        int n = 0;
+        for (DexTrade t : new ArrayList<>(trades)) if (t.awaitingApproval() && approve(t, t.commitment())) n++;
+        return n;
+    }
+
     /**
-     * The user's approval. The kill switch and limits gate the START of a new trade; a trade already
+     * An approval. The kill switch and limits gate the START of a new trade; a trade already
      * counted is never blocked, so nothing in flight is stranded.
      */
-    boolean approveTrade(String commitment) {
-        final JSONObject offer = trade.offer();
-        if (offer == null || trade.tradeId().isEmpty()) return false;
+    private boolean approve(DexTrade t, String commitment) {
+        final JSONObject offer = t.offer();
+        if (offer == null || t.tradeId().isEmpty()) return false;
         // The trade's market: its chain, or for a token (USDT on Solana) the token's own market
         final String network = DexConfig.controlNetwork(DexConfig.marketOf(offer.optLong("chainId"), offer.optString("asset")));
-        if (network.isEmpty()) return refuse("This chain is not supported for trading.");
+        if (network.isEmpty()) return refuse(t, "This chain is not supported for trading.");
         final BigInteger value, xmz;
         try {
             final String v = offer.optString("value");
@@ -835,68 +973,106 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             // A Monero trade moves no XMZ: the XMZ cap does not apply (as the desktop wallet)
             xmz = "XMR".equals(offer.optString("privateCoin")) ? BigInteger.ZERO : new BigInteger(DexMarket.amountText(offer.opt("xmzAmount")));
         } catch (Exception e) {
-            return refuse("The trade amount could not be read.");
+            return refuse(t, "The trade amount could not be read.");
         }
-        final String id = ledgerId(trade.tradeId());
-        if (id == null) return refuse("The trade identifier could not be read.");
+        final String id = ledgerId(t.tradeId());
+        if (id == null) return refuse(t, "The trade identifier could not be read.");
         final String refusal = risk.refusal(network, id, value, xmz, 0);
-        if (!refusal.isEmpty()) return refuse(refusal);
-        if (!risk.recordStart(network, id, value, 0)) return refuse("The trade could not be recorded; not started.");
-        startRefusal = "";
-        final boolean sent = trade.approve(commitment);
+        if (!refusal.isEmpty()) return refuse(t, refusal);
+        if (!risk.recordStart(network, id, value, 0)) return refuse(t, "The trade could not be recorded; not started.");
+        if (t == trade) startRefusal = "";
+        final boolean sent = t.approve(commitment);
         if (sent) handler.postDelayed(this::stepTrade, 1500);   // the next step locks; no need to wait for the ticker
         return sent;
     }
 
+    /** Trades that pay from one trade account: Solana's (SOL and USDT), BNB Smart Chain's (BNB and its USDT); unknown shares with all */
+    private static String accountOf(DexTrade t) {
+        final JSONObject offer = t.offer();
+        final long chain = offer == null ? 0 : offer.optLong("chainId");
+        if (chain == 0) return "";
+        if (chain >= 501000000L && chain < 502000000L) return "sol";
+        if (chain == 56 || chain == 100000056L) return "bsc";
+        return Long.toString(chain);
+    }
+
     boolean payoutTrade(String address) {
-        return keys.ready() && !trade.busy() && trade.payout(keys.seedHex(), address);
+        if (!keys.ready() || trade.busy()) return false;
+        // The payout sends what the trade account holds: not while another trade on it needs its funds
+        final String mine = accountOf(trade);
+        for (DexTrade t : trades)
+            if (t != trade && !t.done() && (mine.isEmpty() || accountOf(t).isEmpty() || accountOf(t).equals(mine))) {
+                startRefusal = "Another trade on this account is still running and needs its funds: pay out when it finishes.";
+                changed();
+                return false;
+            }
+        return trade.payout(keys.seedHex(), address);
     }
 
     boolean abandonTrade() {
-        final String dir = trade.tradeDir();
-        if (!trade.abandon()) return false;
+        final DexTrade t = trade;
+        if (t == idle) return false;
+        final String dir = t.tradeDir();
+        if (!t.abandon()) return false;
         if (!dir.isEmpty()) releaseService(dir);
         startRefusal = "";
+        retire(t);
         for (DexMarket m : allMarkets()) m.scanFolders();
+        openWaiting();
         changed();
         return true;
     }
 
+    /** Every 20 s, a round: each running trade takes one step, one after another */
     private void stepTrade() {
-        if (!trade.configured()) return;
-        if (trade.done()) {
-            // A swap we claimed: tell the relays where the claim is, for the public price chart
-            final JSONObject s = trade.snapshot();
-            final DexMarket m = marketFor(trade.tradeDir());
-            if (s.optString("role").equals("claimer") && s.optString("stage").equals("Done(Swapped)") && !reportedTrade.equals(trade.tradeId())
-                    && m != null && m.report(trade.tradeDir())) reportedTrade = trade.tradeId();
-            // Over and paid out: nothing is left to do for it after a restart
-            final File mark = new File(trade.tradeDir(), "finished");
-            if (trade.hasPayout() && !trade.busy() && !mark.exists()) DexFiles.write(mark, "finished\n");
+        if (!round.isEmpty() || anyBusy()) return;
+        for (DexTrade t : trades) if (!t.done()) round.add(t);
+        if (round.isEmpty()) {
+            // Finished trades make room: keep the shown one and the newest few for their payouts
+            while (trades.size() > MAX_TRADES) {
+                DexTrade old = null;
+                for (DexTrade t : trades)
+                    if (t != trade) {
+                        old = t;
+                        break;
+                    }
+                if (old == null) break;
+                retire(old);
+            }
             return;
         }
-        if (trade.busy() || !keys.ready()) return;
-        trade.tick(keys.seedHex());
+        stepNext();
+    }
+
+    private void stepNext() {
+        if (anyBusy()) return;
+        if (!keys.ready()) {
+            round.clear();
+            return;
+        }
+        while (!round.isEmpty()) {
+            final DexTrade t = round.remove(0);
+            if (!trades.contains(t) || t.done()) continue;
+            if (t.tick(keys.seedHex())) return;
+        }
     }
 
     /**
-     * Once per session, when the keys are unlocked and the markets know their folders: a trade that
-     * was running when the app closed is reopened, or its refund would never be claimed.
+     * Once per session, when the keys are unlocked and the markets know their folders: trades that
+     * were running when the app closed are reopened, or their refunds would never be claimed.
      */
     private void resumeTrades() {
         if (resumed || markets.isEmpty() || !keys.ready()) return;
         resumed = true;
-        if (trade.configured()) return;
         final List<Object[]> found = new ArrayList<>();
         for (DexMarket m : allMarkets())
             for (String dir : m.agreedFolders()) {
                 final File journal = new File(dir, "journal.json");
-                found.add(new Object[]{(journal.exists() ? journal : new File(dir)).lastModified(), dir});
+                found.add(new Object[]{(journal.exists() ? journal : new File(dir)).lastModified(), dir, m});
             }
-        Collections.sort(found, (a, b) -> Long.compare((Long) b[0], (Long) a[0]));
-        resume.clear();
-        for (Object[] f : found) resume.add((String) f[1]);
-        nextResume();
+        // Oldest first: their time limits run out first
+        Collections.sort(found, (a, b) -> Long.compare((Long) a[0], (Long) b[0]));
+        for (Object[] f : found) if (tradeFor((String) f[1]) == null) agreed((DexMarket) f[2], (String) f[1]);
     }
 
     /** A trade's swap-wallet service runs in its coin's wallets: stop it in both */
@@ -905,39 +1081,29 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         if (xmrWallets != null) xmrWallets.releaseTradeService(dir);
     }
 
-    private boolean releaseTrade() {
-        // A finished trade leaves: mark its folder (so a restart does not reopen it) and stop its swap wallet
-        final String dir = trade.tradeDir();
-        if (!trade.release()) return false;
-        if (!dir.isEmpty()) {
-            final File mark = new File(dir, "finished");
-            if (!mark.exists()) DexFiles.write(mark, "finished\n");
-            releaseService(dir);
-        }
-        return true;
+    private int running() {
+        int n = 0;
+        for (DexTrade t : trades) if (!t.done()) n++;
+        return n;
     }
 
-    private void nextResume() {
-        if (trade.configured() && !releaseTrade()) {
-            resuming = false;
-            resume.clear();
-            return;
+    private void openWaiting() {
+        while (running() < MAX_TRADES && !waiting.isEmpty()) {
+            final Object[] next = waiting.remove(0);
+            if (tradeFor((String) next[1]) == null) agreed((DexMarket) next[0], (String) next[1]);
         }
-        while (!resume.isEmpty()) {
-            final String next = resume.remove(0);
-            final DexMarket m = marketFor(next);
-            if (m == null) continue;
-            resuming = true;
-            agreed(m, next);
-            return;
-        }
-        resuming = false;
     }
 
-    /** A taken offer is a saved trade now: give it its own swap-wallet service, then run it (one trade at a time). */
+    /** A taken offer is a saved trade now: give it its own swap-wallet service, then run it beside the others. */
     @Override
     public void agreed(final DexMarket market, final String tradeDir) {
-        if (stopped) return;
+        if (stopped || tradeFor(tradeDir) != null) return;
+        if (running() >= MAX_TRADES) {
+            for (Object[] w : waiting) if (w[1].equals(tradeDir)) return;
+            waiting.add(new Object[]{market, tradeDir});
+            say(running() + " trades are running; the new one starts as soon as one finishes.");
+            return;
+        }
         String id = "";
         for (String name : new String[]{"listing.json", "take.json"}) {
             final JSONObject o = DexFiles.readJson(new File(tradeDir, name), 65536);
@@ -955,30 +1121,26 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             return;
         }
         coinWallets.tradeService(tradeDir, id, endpoint -> {
-            if (stopped) return;
+            if (stopped || tradeFor(tradeDir) != null) return;
             if (endpoint == null) {
                 say("The trade's swap wallet could not start: " + tradeDir);
-                if (resuming) handler.post(this::nextResume);
                 return;
             }
-            // A finished trade makes room for the next one; a running one keeps the job
-            if (trade.configured() && !releaseTrade()) {
-                if (trade.done()) {
-                    // Finished, but its last step (the payout) is still in flight: open the new trade right after
-                    handler.postDelayed(() -> agreed(market, tradeDir), 3000);
-                    return;
-                }
-                say("Keys agreed for a new trade. Finish the current trade first; the new one opens when the app next starts.");
-                return;
-            }
+            final DexTrade[] box = new DexTrade[1];
+            final DexTrade t = new DexTrade(helper, () -> tradeChanged(box[0]));
+            box[0] = t;
+            t.setRelays(overrides.relaysOrDefault());
             startRefusal = "";
-            if (!trade.configure(tradeDir, market.rpc, coinWallets.mainEndpoint(), endpoint, market.witnesses)) {
+            if (!t.configure(tradeDir, market.rpc, coinWallets.mainEndpoint(), endpoint, market.witnesses)) {
                 say("The agreed trade could not be opened: " + tradeDir);
-                if (resuming) handler.post(this::nextResume);
                 return;
             }
-            trade.refresh();
+            trades.add(t);
+            // Shown, unless the screen shows a trade that is still running
+            if (trade == idle || trade.done()) trade = t;
+            t.refresh();
             handler.postDelayed(this::stepTrade, 2000);
+            changed();
         });
     }
 }

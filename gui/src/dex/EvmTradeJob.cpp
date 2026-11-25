@@ -114,6 +114,7 @@ EvmTradeJob::~EvmTradeJob() {
     disconnect(&m_process,nullptr,this,nullptr);
     if (m_process.state()!=QProcess::NotRunning) {m_process.kill();m_process.waitForFinished(1000);}
     m_input.fill('\0');
+    sodium_memzero(m_swapSeedHex.data(),m_swapSeedHex.size());sodium_memzero(m_evmKeyHex.data(),m_evmKeyHex.size());
 }
 bool EvmTradeJob::configure(const QString &path) {
     if (!m_path.isEmpty() || m_busy) return false;

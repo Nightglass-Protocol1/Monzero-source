@@ -299,6 +299,14 @@ final class DexBridge implements DexEngine.Listener {
         listener.bridgeChanged();
     }
 
+    /** The open trades for the page: no folder paths */
+    private JSONArray pageTrades() throws Exception {
+        final JSONArray all = engine.trades(), out = new JSONArray();
+        for (int i = 0; i < all.length(); i++)
+            out.put(pick(all.optJSONObject(i), "tradeId", "selected", "role", "stage", "done", "awaitingApproval", "approved", "chainId", "value", "xmzAmount", "privateCoin"));
+        return out;
+    }
+
     private void watchTrade() {
         final JSONObject trade = engine.tradeStatus();
         final JSONObject snapshot = trade.optJSONObject("snapshot");
@@ -364,7 +372,7 @@ final class DexBridge implements DexEngine.Listener {
         }
         final JSONObject trade = engine.tradeStatus();
         final JSONObject tradeOut = pick(trade, "configured", "busy", "state", "tradeId", "commitment", "awaitingApproval", "awaitingFunding",
-                "startRefusal", "error", "payout", "account", "solAccount");
+                "startRefusal", "error", "payout", "account", "solAccount", "openTrades", "autoApprove");
         tradeOut.put("snapshot", pick(trade.optJSONObject("snapshot"), "stage", "role", "done", "offer", "evmTxs", "xmzSweeps", "approved", "progress", "deadlines"));
         final JSONArray features = new JSONArray().put("partial").put("long-offers").put("renew").put("usdt-v2");
         // Direct trades, as the wallet checked them (the page shows these offers, not its own reading)
@@ -387,7 +395,7 @@ final class DexBridge implements DexEngine.Listener {
         }
         return new JSONObject().putOpt("direct", directOut).putOpt("xmrMarkets", xmrOut).putOpt("xmrWallet", xmrWallet)
                 .put("wallet", pick(engine.walletStatus(), "state", "balance", "unlocked", "address", "keysReady", "keysExist", "keysBusy", "tradeAccount", "solTradeAccount", "error"))
-                .put("markets", marketOut).put("trade", tradeOut).put("account", account).put("solAccount", solAccount)
+                .put("markets", marketOut).put("trade", tradeOut).put("trades", pageTrades()).put("account", account).put("solAccount", solAccount)
                 // What this wallet can do beyond the first page protocol: the page offers only these
                 .put("features", features);
     }
@@ -569,6 +577,20 @@ final class DexBridge implements DexEngine.Listener {
             // Giving up a trade that was never approved moves nothing: the page may ask for it
             case "/v1/abandon":
                 return ok(new JSONObject().put("ok", engine.abandonTrade()));
+            // Several trades run at once: the page shows one in full (by its trade id), and may turn
+            // automatic approval off or on (the kill switch and limits still check every trade)
+            case "/v1/select-trade": {
+                final String id = body.optString("tradeId");
+                final JSONArray all = engine.trades();
+                for (int i = 0; i < all.length(); i++)
+                    if (all.optJSONObject(i).optString("tradeId").equals(id)) return ok(new JSONObject().put("ok", engine.selectTrade(all.optJSONObject(i).optString("tradeDir"))));
+                return ok(new JSONObject().put("ok", false));
+            }
+            case "/v1/approve-all":
+                return ok(new JSONObject().put("ok", true).put("started", engine.approveAll()));
+            case "/v1/auto-approve":
+                engine.setAutoApprove(body.optBoolean("on", true));
+                return ok(new JSONObject().put("ok", true).put("autoApprove", engine.autoApprove()));
             case "/v1/disconnect":
                 disconnectPage();
                 return ok(new JSONObject().put("ok", true));

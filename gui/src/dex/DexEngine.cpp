@@ -200,6 +200,7 @@ DexEngine::DexEngine(QObject *parent) : QObject(parent),
     connect(m_bchNativeRelay,&BchNativeRelayJob::changed,this,&DexEngine::bchNativeProofChanged);
     connect(this,&DexEngine::bchNativeObservationChanged,this,&DexEngine::advanceBchStartupChecks,Qt::QueuedConnection);
     connect(m_bchNativeObservation,&BchNativeObservationJob::changed,this,&DexEngine::bchNativeObservationChanged);
+    m_evmIdle=m_evmTrade;
     connect(m_evmTrade,&EvmTradeJob::changed,this,&DexEngine::evmTradeChanged);
     m_evmTicker->setInterval(20000);
     connect(m_evmTicker,&QTimer::timeout,this,&DexEngine::stepEvmTrade);
@@ -835,13 +836,89 @@ void DexEngine::bindEvmNetwork(const QString &network) {
 bool DexEngine::configureEvmTrade(const QString &config,const QString &seedFile) {
     // A seed file (prototype) or this session's vault keys
     const bool seedOk=seedFile.isEmpty() ? dexKeysReady() : (QDir::isAbsolutePath(seedFile) && QDir::cleanPath(seedFile)==seedFile);
-    if (!seedOk || !m_evmTrade->configure(config)) return false;
-    m_evmSeedFile=seedFile;m_evmTrade->refresh();m_evmTicker->start();return true;
+    if (!seedOk) return false;
+    auto *job=new EvmTradeJob(this);
+    if (!m_evmSwapSeedHex.isEmpty()) job->setSwapKeys(m_evmSwapSeedHex,m_evmKeyHex);
+    if (!job->configure(config) || evmJobFor(job->tradeDir())) {job->deleteLater();return false;}
+    m_evmJobs.append(job);
+    connect(job,&EvmTradeJob::changed,this,[this,job]{evmJobChanged(job);});
+    m_evmSeedFile=seedFile;
+    // On the trade card, unless the card shows a trade that is still running
+    if (m_evmTrade==m_evmIdle || m_evmTrade->status().value("snapshot").toMap().value("done").toBool()) m_evmTrade=job;
+    job->refresh();m_evmTicker->start();
+    QTimer::singleShot(2000,this,&DexEngine::stepEvmTrade);
+    emit evmTradeChanged();return true;
+}
+EvmTradeJob *DexEngine::evmJobFor(const QString &tradeDir) const {
+    for (auto *j:m_evmJobs) if (j->tradeDir()==tradeDir) return j;
+    return nullptr;
+}
+bool DexEngine::evmJobsBusy() const {
+    for (auto *j:m_evmJobs) if (j->status().value("busy").toBool()) return true;
+    return false;
+}
+namespace {
+bool jobDone(EvmTradeJob *j) {return j->status().value("snapshot").toMap().value("done").toBool();}
+// Trades that pay from the same trade account: one Solana account for SOL and USDT, one BNB Smart
+// Chain account for BNB and its USDT; an unknown chain (no status yet) shares with everything
+QString accountOf(EvmTradeJob *j) {
+    const qint64 chain=qint64(j->offer().value("chainId").toDouble());
+    if (!chain) return QString();
+    if (DexChains::solana(chain)) return QStringLiteral("sol");
+    if (chain==56 || DexChains::usdtBsc(chain)) return QStringLiteral("bsc");
+    return QString::number(chain);
+}
+}
+void DexEngine::evmJobChanged(EvmTradeJob *job) {
+    if (!m_evmJobs.contains(job)) return;
+    const auto s=job->status();
+    const auto snapshot=s.value("snapshot").toMap();
+    const auto dir=job->tradeDir();
+    if (!snapshot.isEmpty() && !snapshot.value("done").toBool()) m_evmSeenRunning.insert(dir);
+    if (snapshot.value("done").toBool() && !s.value("busy").toBool()) {
+        // A swap we claimed: tell the relays where the claim is, for the public price chart
+        if (snapshot.value("role")=="claimer" && snapshot.value("stage")=="Done(Swapped)" && !m_evmReported.contains(job->tradeId())
+            && evmMarketFor(dir) && evmMarketFor(dir)->report(dir)) m_evmReported.insert(job->tradeId());
+        if (!m_evmFinished.contains(dir)) {
+            // Over: mark its folder (a restart does not reopen it) and stop its swap wallet. The
+            // job stays (on the card, for the payout) until it makes room for others.
+            m_evmFinished.insert(dir);
+            QFile mark(dir+"/finished");
+            if (!mark.exists() && mark.open(QIODevice::WriteOnly)) {mark.write("finished\n");mark.close();}
+            for (auto *m:allMarkets()) m->markFinished(dir);
+            m_dexWallets->releaseTradeService(dir);m_xmrWallets->releaseTradeService(dir);
+            // Finished before this session saw it run (reopened after a restart): nothing to show
+            if (!m_evmSeenRunning.contains(dir) && job!=m_evmTrade) {retireEvmJob(job);return;}
+            QTimer::singleShot(0,this,&DexEngine::openWaitingEvmTrade);
+        }
+    }
+    // Approved for the user, when they chose so (every approval still passes the kill switch and caps)
+    if (m_autoApprove && s.value("awaitingApproval").toBool() && s.value("canApprove").toBool() && !s.value("busy").toBool()
+        && !m_autoTried.contains(job->commitment())) {
+        m_autoTried.insert(job->commitment());
+        QTimer::singleShot(0,this,[this,job,c=job->commitment()]{if (m_evmJobs.contains(job)) approveEvmJob(job,c);});
+    }
+    // One trade's step is over: the next trade of this round takes its turn
+    if (!s.value("busy").toBool() && !m_evmRound.isEmpty() && !evmJobsBusy()) QTimer::singleShot(0,this,&DexEngine::stepNextEvmJob);
+    emit evmTradeChanged();
+}
+void DexEngine::retireEvmJob(EvmTradeJob *job) {
+    m_evmJobs.removeAll(job);m_evmRound.removeAll(job);
+    job->release();
+    if (m_evmTrade==job) {
+        // The card moves to a trade that still runs, else the newest one
+        m_evmTrade=m_evmIdle;
+        for (auto *j:m_evmJobs) if (!jobDone(j)) {m_evmTrade=j;break;}
+        if (m_evmTrade==m_evmIdle && !m_evmJobs.isEmpty()) m_evmTrade=m_evmJobs.last();
+    }
+    job->deleteLater();
+    emit evmTradeChanged();
 }
 QVariantMap DexEngine::evmTradeStatus() const {
     auto s=m_evmTrade->status();s.insert("stepping",m_evmTicker->isActive());s.insert("startRefusal",m_evmStartRefusal);
     // Which take or offer folder this trade is (the XMR/XMZ route follows its first swap by it)
     s.insert("tradeDir",m_evmTrade->tradeDir());
+    s.insert("openTrades",m_evmJobs.size());s.insert("autoApprove",m_autoApprove);
     // What the trade is paid in, for the trade card: the chain's coin, or USDT on Solana
     const auto offer=m_evmTrade->offer();
     if (!offer.isEmpty()) {
@@ -850,16 +927,59 @@ QVariantMap DexEngine::evmTradeStatus() const {
     }
     return s;
 }
+QVariantList DexEngine::evmTrades() const {
+    QVariantList out;
+    for (auto *j:m_evmJobs) {
+        const auto s=j->status();const auto snapshot=s.value("snapshot").toMap();const auto offer=j->offer();
+        QVariantMap t{{"tradeDir",j->tradeDir()},{"tradeId",j->tradeId()},{"selected",j==m_evmTrade},{"busy",s.value("busy")},
+            {"role",snapshot.value("role")},{"stage",snapshot.value("stage")},{"done",snapshot.value("done").toBool()},
+            {"awaitingApproval",s.value("awaitingApproval")},{"approved",snapshot.value("approved")},
+            {"error",s.value("stepError").toString().isEmpty() ? s.value("error") : s.value("stepError")},
+            {"awaitingFunding",!s.value("awaitingFunding").toMap().isEmpty()}};
+        if (!offer.isEmpty()) {
+            const auto market=DexChains::marketOf(qint64(offer.value("chainId").toDouble()),offer.value("asset").toString());
+            t.insert("coin",DexChains::coin(market));t.insert("decimals",DexChains::decimals(market));
+            t.insert("value",offer.value("value").toString());t.insert("xmzAmount",offer.value("xmzAmount").toVariant());
+            t.insert("privateCoin",offer.value("privateCoin").toString());
+        }
+        out.append(t);
+    }
+    return out;
+}
+bool DexEngine::selectEvmTrade(const QString &tradeDir) {
+    auto *job=evmJobFor(tradeDir);
+    if (!job) return false;
+    m_evmTrade=job;m_evmStartRefusal.clear();emit evmTradeChanged();return true;
+}
+void DexEngine::setAutoApproveEvmTrades(bool on) {
+    if (m_autoApprove==on) return;
+    m_autoApprove=on;m_autoTried.clear();
+    if (on) for (auto *j:m_evmJobs) evmJobChanged(j);
+    emit evmTradeChanged();
+}
 bool DexEngine::refreshEvmTrade() {return m_evmTrade->refresh();}
 bool DexEngine::approveEvmTrade(const QString &commitment) {
+    // The trade the user was shown: found by its commitment, whichever trade is on the card now
+    for (auto *j:m_evmJobs) if (!commitment.isEmpty() && j->commitment()==commitment) return approveEvmJob(j,commitment);
+    return approveEvmJob(m_evmTrade,commitment);
+}
+int DexEngine::approveAllEvmTrades() {
+    int started=0;
+    for (auto *j:m_evmJobs) {
+        const auto s=j->status();
+        if (s.value("awaitingApproval").toBool() && s.value("canApprove").toBool() && approveEvmJob(j,j->commitment())) ++started;
+    }
+    return started;
+}
+bool DexEngine::approveEvmJob(EvmTradeJob *job,const QString &commitment) {
     // The operator kill switch and caps gate the START of a new EVM trade, exactly as for UTXO
     // swaps. refusal() returns empty for a trade already in the ledger, so later approvals of an
     // in-flight trade are never blocked (nothing is stranded); only the first is enforced.
-    const auto offer=m_evmTrade->offer();const auto trade=m_evmTrade->tradeId();
+    const auto offer=job->offer();const auto trade=job->tradeId();
     if (offer.isEmpty() || trade.isEmpty()) return false;
     // The trade's market: its chain, and for a token (USDT on Solana) the token's own market
     const auto network=evmControlNetwork(DexChains::marketOf(qint64(offer.value("chainId").toDouble()),offer.value("asset").toString()));
-    const auto refuse=[this](const QString &why){m_evmStartRefusal=why;emit evmTradeChanged();return false;};
+    const auto refuse=[this,job](const QString &why){if (job==m_evmTrade) m_evmStartRefusal=why;m_marketMessage=why;emit evmTradeChanged();emit evmMarketChanged();return false;};
     if (network.isEmpty()) return refuse(tr("This EVM chain is not supported for trading."));
     bool valueOk=false,xmzOk=false;
     // The helper shows the value in decimal; hex ("0x...") is accepted too
@@ -878,39 +998,65 @@ bool DexEngine::approveEvmTrade(const QString &commitment) {
     const auto refusal=m_evmRiskControl->refusal(ledgerId,valueWei,capAtoms);
     if (!refusal.isEmpty()) return refuse(refusal);
     if (!m_evmRiskControl->recordStart(ledgerId,valueWei)) return refuse(tr("The trade could not be recorded; not started."));
-    m_evmStartRefusal.clear();
-    return m_evmTrade->approve(commitment);
+    if (job==m_evmTrade) m_evmStartRefusal.clear();
+    return job->approve(commitment);
 }
 bool DexEngine::payoutEvmTrade(const QString &address) {
     // A seed file (prototype) or this session's vault keys, as for every other trade step
     if ((m_evmSeedFile.isEmpty() && !dexKeysReady()) || m_evmTrade->status().value("busy").toBool()) return false;
+    // The payout sends what the trade account holds: not while another trade on that account
+    // still needs its funds
+    const auto mine=accountOf(m_evmTrade);
+    for (auto *j:m_evmJobs) if (j!=m_evmTrade && !jobDone(j) && (mine.isEmpty() || accountOf(j).isEmpty() || accountOf(j)==mine)) {
+        m_evmStartRefusal=tr("Another trade on this account is still running and needs its funds: pay out when it finishes.");
+        emit evmTradeChanged();return false;
+    }
     QByteArray seed=evmSeed();
     return m_evmTrade->payout(seed,address);
 }
 bool DexEngine::abandonEvmTrade() {
-    const auto dir=m_evmTrade->tradeDir();
-    if (!m_evmTrade->abandon()) return false;
-    // A Monero trade's swap wallet runs in the Monero service: release it from both, as releaseEvmTrade does
+    auto *job=m_evmTrade;
+    if (job==m_evmIdle) return false;
+    const auto dir=job->tradeDir();
+    if (!job->abandon()) return false;
+    // A Monero trade's swap wallet runs in the Monero service: release it from both
     if (!dir.isEmpty()) {m_dexWallets->releaseTradeService(dir);m_xmrWallets->releaseTradeService(dir);}
-    m_evmTicker->stop();m_evmStartRefusal.clear();
-    for (auto *job:allMarkets()) job->rescan();
+    m_evmStartRefusal.clear();
+    retireEvmJob(job);
+    if (m_evmJobs.isEmpty()) m_evmTicker->stop();
+    for (auto *market:allMarkets()) market->rescan();
+    openWaitingEvmTrade();
     emit evmTradeChanged();emit evmMarketChanged();return true;
 }
 void DexEngine::stepEvmTrade() {
-    const auto s=m_evmTrade->status();
-    const auto snapshot=s.value("snapshot").toMap();
-    if (snapshot.value("done").toBool()) {
-        // A swap we claimed: tell the relays where the claim is, for the public price chart
-        if (snapshot.value("role")=="claimer" && snapshot.value("stage")=="Done(Swapped)" && m_reportedTrade!=m_evmTrade->tradeId()
-            && evmMarketFor(m_evmTrade->tradeDir()) && evmMarketFor(m_evmTrade->tradeDir())->report(m_evmTrade->tradeDir()))
-            m_reportedTrade=m_evmTrade->tradeId();
-        m_evmTicker->stop();emit evmTradeChanged();return;
+    // Every 20 s, a round: each running trade takes one step, one after another (one helper run at a
+    // time: trades on one account never send at once)
+    if (!m_evmRound.isEmpty() || evmJobsBusy()) return;
+    for (auto *j:m_evmJobs) if (!jobDone(j)) m_evmRound.append(j);
+    if (m_evmRound.isEmpty()) {
+        m_evmTicker->stop();
+        // Finished trades make room: keep the card's one and the newest few for their payouts
+        while (m_evmJobs.size()>MaxEvmTrades) {
+            EvmTradeJob *old=nullptr;
+            for (auto *j:m_evmJobs) if (j!=m_evmTrade) {old=j;break;}
+            if (!old) break;
+            retireEvmJob(old);
+        }
+        emit evmTradeChanged();return;
     }
-    if (s.value("busy").toBool() || (m_evmSeedFile.isEmpty() && !dexKeysReady())) return;
-    // The seed is read for each step and wiped by the job once written to the helper
-    QByteArray hex=LitecoinJournalProtocol::privateConfig(m_evmSeedFile,256).trimmed();
-    QByteArray seed=QByteArray::fromHex(hex);hex.fill('\0');
-    m_evmTrade->tick(seed);
+    stepNextEvmJob();
+}
+void DexEngine::stepNextEvmJob() {
+    if (evmJobsBusy()) return;
+    if (m_evmSeedFile.isEmpty() && !dexKeysReady()) {m_evmRound.clear();return;}
+    while (!m_evmRound.isEmpty()) {
+        auto *job=m_evmRound.takeFirst();
+        if (!m_evmJobs.contains(job) || jobDone(job)) continue;
+        // The seed is read for each step and wiped by the job once written to the helper
+        QByteArray hex=LitecoinJournalProtocol::privateConfig(m_evmSeedFile,256).trimmed();
+        QByteArray seed=QByteArray::fromHex(hex);hex.fill('\0');
+        if (job->tick(seed)) return;
+    }
 }
 QByteArray DexEngine::evmSeed() const {
     if (m_evmSeedFile.isEmpty()) return {};
@@ -1038,9 +1184,7 @@ void DexEngine::setUpXmrMarkets() {
     // A trade of these markets may have been running when the app closed. Before the first resume,
     // it covers these markets too; after it (the Monero node answered late), their trades join the queue.
     if (!m_evmResumed) {resumeEvmTrades();return;}
-    if (m_evmResuming || m_evmTrade->status().value("configured").toBool()) return;
-    for (auto *job:m_xmrMarkets) for (const auto &dir:job->agreedFolders()) m_evmResume.append({job,dir});
-    nextEvmResume();
+    for (auto *job:m_xmrMarkets) for (const auto &dir:job->agreedFolders()) if (!evmJobFor(dir)) evmOfferAgreed(job,dir);
 }
 QVariantMap DexEngine::xmrMarketStatus() const {
     QVariantMap all;
@@ -1420,8 +1564,9 @@ bool DexEngine::returnEvmFunds(int chainId,const QString &address) {
     auto *job=m_evmMarkets.value(chainId);
     if (!job || (m_evmSeedFile.isEmpty() && !dexKeysReady())) return false;
     // The running trade, if any, may be on this account: the helper checks the folders, and so do we
-    const auto snapshot=m_evmTrade->status().value("snapshot").toMap();
-    if (m_evmTrade->status().value("configured").toBool() && !snapshot.value("done").toBool()) {
+    bool running=false;
+    for (auto *j:m_evmJobs) if (!jobDone(j)) running=true;
+    if (running) {
         m_marketMessage=tr("A trade is running: its account needs its funds until it finishes.");emit evmMarketChanged();return false;
     }
     QByteArray seed=evmSeed();
@@ -1509,7 +1654,8 @@ QString DexEngine::tradeKeyStorePath() const {
 void DexEngine::applyUnlockedTradeKeys(QByteArray seed,QByteArray key,const QString &address) {
     m_keysBusy=false;
     if (seed.isEmpty()||key.isEmpty()) {m_keysMessage=tr("The trading keys could not be unlocked; check the password.");emit dexWalletChanged();return;}
-    m_evmTrade->setSwapKeys(seed,key);
+    m_evmIdle->setSwapKeys(seed,key);
+    for (auto *j:m_evmJobs) j->setSwapKeys(seed,key);
     for (auto *job:allMarkets()) job->setSwapKeys(seed,key);
     if (m_direct) m_direct->setSwapKeys(seed,key);
     sodium_memzero(m_evmSwapSeedHex.data(),m_evmSwapSeedHex.size());sodium_memzero(m_evmKeyHex.data(),m_evmKeyHex.size());
@@ -1723,57 +1869,43 @@ void DexEngine::stepEvmMarket() {
     }
 }
 void DexEngine::resumeEvmTrades() {
-    // Once per session, when the keys are unlocked and the markets know their folders. A trade
-    // that was running when the app closed must be reopened, or its refund would never be claimed.
+    // Once per session, when the keys are unlocked and the markets know their folders. Trades that
+    // were running when the app closed are reopened, or their refunds would never be claimed.
     if (m_evmResumed || m_evmMarkets.isEmpty() || (m_evmSeedFile.isEmpty() && !dexKeysReady())) return;
     m_evmResumed=true;
-    if (m_evmTrade->status().value("configured").toBool()) return;
     QList<QPair<qint64,QPair<QPointer<EvmMarketJob>,QString>>> found;
     for (auto *job:allMarkets()) for (const auto &dir:job->agreedFolders()) {
         const QFileInfo journal(dir+"/journal.json");
         found.append({(journal.exists() ? journal : QFileInfo(dir)).lastModified().toSecsSinceEpoch(),{job,dir}});
     }
-    std::sort(found.begin(),found.end(),[](const auto &a,const auto &b){return a.first>b.first;});
-    m_evmResume.clear();
-    for (const auto &f:found) m_evmResume.append(f.second);
-    connect(m_evmTrade,&EvmTradeJob::changed,this,[this]{
-        if (!m_evmResuming) return;
-        const auto s=m_evmTrade->status();
-        const auto snapshot=s.value("snapshot").toMap();
-        if (!s.value("configured").toBool() || s.value("busy").toBool() || !snapshot.contains("stage")) return;
-        // The newest unfinished trade is the one to continue; finished ones are passed over
-        if (snapshot.value("done").toBool()) QTimer::singleShot(0,this,&DexEngine::nextEvmResume);
-        else {m_evmResuming=false;m_evmResume.clear();}
-    });
-    nextEvmResume();
+    // Oldest first: their time limits run out first
+    std::sort(found.begin(),found.end(),[](const auto &a,const auto &b){return a.first<b.first;});
+    for (const auto &f:found) if (f.second.first && !evmJobFor(f.second.second)) evmOfferAgreed(f.second.first,f.second.second);
 }
-bool DexEngine::releaseEvmTrade() {
-    // A finished trade leaves the job: mark its folder (so a restart does not reopen it) and stop
-    // its swap wallet, which otherwise runs until the app closes
-    const auto dir=m_evmTrade->tradeDir();
-    if (!m_evmTrade->release()) return false;
-    if (!dir.isEmpty()) {
-        QFile mark(dir+"/finished");
-        if (!mark.exists() && mark.open(QIODevice::WriteOnly)) {mark.write("finished\n");mark.close();}
-        for (auto *m:allMarkets()) m->markFinished(dir);
-        m_dexWallets->releaseTradeService(dir);
-        m_xmrWallets->releaseTradeService(dir);
+void DexEngine::openWaitingEvmTrade() {
+    int running=0;
+    for (auto *j:m_evmJobs) if (!jobDone(j)) ++running;
+    while (running<MaxEvmTrades && !m_evmWaiting.isEmpty()) {
+        const auto next=m_evmWaiting.takeFirst();
+        if (!next.first || evmJobFor(next.second)) continue;
+        evmOfferAgreed(next.first,next.second);++running;
     }
-    return true;
-}
-void DexEngine::nextEvmResume() {
-    if (m_evmTrade->status().value("configured").toBool() && !releaseEvmTrade()) {m_evmResuming=false;m_evmResume.clear();return;}
-    while (!m_evmResume.isEmpty()) {
-        const auto next=m_evmResume.takeFirst();
-        if (!next.first) continue;
-        m_evmResuming=true;evmOfferAgreed(next.first,next.second);return;
-    }
-    m_evmResuming=false;
 }
 void DexEngine::evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir) {
     // The taken offer is a saved trade now: give it its own swap-wallet service (the app's, when it
-    // runs the wallets), then hand it to the trade job (one trade at a time)
+    // runs the wallets), then run it beside the others
+    if (evmJobFor(tradeDir)) return;
+    int running=0;
+    for (auto *j:m_evmJobs) if (!jobDone(j)) ++running;
+    if (running>=MaxEvmTrades) {
+        // Rare: the trade waits for a free place (its folder is kept; a restart reopens it too)
+        for (const auto &w:m_evmWaiting) if (w.second==tradeDir) return;
+        m_evmWaiting.append({job,tradeDir});
+        m_marketMessage=tr("%n trade(s) are running; the new one starts as soon as one finishes.","",running);
+        emit evmMarketChanged();return;
+    }
     const auto open=[this,job,tradeDir](const QJsonObject &swapWallet){
+        if (evmJobFor(tradeDir)) return;
         const auto path=tradeDir+"/trade-config.json";
         auto config=job->tradeConfig(tradeDir);
         if (!swapWallet.isEmpty()) config.insert("swapWallet",swapWallet);
@@ -1790,20 +1922,8 @@ void DexEngine::evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir) {
             file.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);
             file.write(QJsonDocument(config).toJson(QJsonDocument::Compact));file.close();
         }
-        // A finished trade makes room for the next one; a running one keeps the job
-        if (m_evmTrade->status().value("configured").toBool() && !releaseEvmTrade()) {
-            if (m_evmTrade->status().value("snapshot").toMap().value("done").toBool()) {
-                // Finished, but its last step (the payout) is still in flight: open the new trade right after
-                QTimer::singleShot(3000,this,[this,job,tradeDir]{evmOfferAgreed(job,tradeDir);});
-                return;
-            }
-            m_marketMessage=tr("Keys agreed for a new trade (%1). Finish the current trade, then restart the app to continue it.").arg(tradeDir);
-            emit evmMarketChanged();return;
-        }
-        m_evmStartRefusal.clear();
         if (!configureEvmTrade(path,m_evmSeedFile)) {
             m_marketMessage=tr("The agreed trade could not be opened: %1").arg(tradeDir);emit evmMarketChanged();
-            if (m_evmResuming) QTimer::singleShot(0,this,&DexEngine::nextEvmResume);
         }
     };
     // A Monero trade's shared wallet runs in Monero's own wallet RPC, on the Monero node

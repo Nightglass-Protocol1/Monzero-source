@@ -68,6 +68,7 @@ class DexEngine : public QObject {
     Q_PROPERTY(QVariantMap bchNativeProofStatus READ bchNativeProofStatus NOTIFY bchNativeProofChanged)
     Q_PROPERTY(QVariantMap bchNativeObservationStatus READ bchNativeObservationStatus NOTIFY bchNativeObservationChanged)
     Q_PROPERTY(QVariantMap evmTradeStatus READ evmTradeStatus NOTIFY evmTradeChanged)
+    Q_PROPERTY(QVariantList evmTrades READ evmTrades NOTIFY evmTradeChanged)
     Q_PROPERTY(QVariantMap evmMarketStatus READ evmMarketStatus NOTIFY evmMarketChanged)
     Q_PROPERTY(QVariantMap xmrMarketStatus READ xmrMarketStatus NOTIFY evmMarketChanged)
     Q_PROPERTY(QVariantMap directMarketStatus READ directMarketStatus NOTIFY directMarketChanged)
@@ -253,6 +254,15 @@ public:
     // Give up the agreed trade before approving it (nothing is locked yet); the wallet is then free
     // for another trade. The other side gets its coin back after its time limit if it already locked.
     Q_INVOKABLE bool abandonEvmTrade();
+    // Several trades run side by side (each its own folder, swap wallet and helper run; the helper
+    // runs for one trade at a time, so their transactions never race). evmTradeStatus is the one on
+    // the trade card; evmTrades lists them all (short form) and selectEvmTrade puts one on the card.
+    QVariantList evmTrades() const;
+    Q_INVOKABLE bool selectEvmTrade(const QString &tradeDir);
+    // Approve every trade that is waiting for it (each through the kill switch and caps); the count started
+    Q_INVOKABLE int approveAllEvmTrades();
+    // Approve each trade as soon as its terms are agreed (the user's choice, on by default)
+    Q_INVOKABLE void setAutoApproveEvmTrades(bool on);
     // Public offers for XMZ<->ETH/BNB through the open relays (see EvmMarketJob). Uses the same
     // seed file as the trade. A taken offer becomes the EVM trade above.
     bool configureEvmMarket(const QString &config,const QString &seedFile);
@@ -629,8 +639,21 @@ private:
     BchNativeRelayJob *m_bchNativeRelay;
     BchNativeProofJob *m_bchNativeProof;
     BchNativeObservationJob *m_bchNativeObservation;
-    EvmTradeJob *m_evmTrade;
+    EvmTradeJob *m_evmTrade;      // the trade on the trade card: one of m_evmJobs, or m_evmIdle
     QTimer *m_evmTicker;
+    EvmTradeJob *m_evmIdle=nullptr;   // never configured: shown when no trade is open
+    QList<EvmTradeJob*> m_evmJobs;    // the open trades, oldest first
+    QList<EvmTradeJob*> m_evmRound;   // the trades still to step in this round (one helper run at a time)
+    QSet<QString> m_evmFinished,m_evmReported,m_evmSeenRunning;
+    static constexpr int MaxEvmTrades=8;
+    EvmTradeJob *evmJobFor(const QString &tradeDir) const;
+    bool evmJobsBusy() const;
+    void evmJobChanged(EvmTradeJob *job);
+    void retireEvmJob(EvmTradeJob *job);
+    void stepNextEvmJob();
+    bool approveEvmJob(EvmTradeJob *job,const QString &commitment);
+    bool m_autoApprove=true;
+    QSet<QString> m_autoTried;        // commitments approved automatically once (a refusal is not retried)
     QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();
     QHash<int,EvmMarketJob*> m_evmMarkets;   // by chain id
@@ -651,7 +674,7 @@ private:
     EvmMarketJob *evmMarketForCoin(const QString &coin) const;
     QByteArray m_evmSwapSeedHex,m_evmKeyHex;
     QTimer *m_marketTicker;
-    QString m_marketMessage,m_reportedTrade,m_evmControlUrlBase;
+    QString m_marketMessage,m_evmControlUrlBase;
     void bindEvmNetwork(const QString &network);
     void stepEvmMarket();
     BtcMarketJob *m_btcMarket=nullptr;
@@ -666,12 +689,12 @@ private:
     QString m_btcMessage;
     QString btcOfferRefusal(const QString &sats,const QString &atoms);
     void evmOfferAgreed(EvmMarketJob *job,const QString &tradeDir);
-    // After a restart: reopen the trade that was running when the app closed
+    // After a restart: reopen the trades that were running when the app closed
     void resumeEvmTrades();
-    void nextEvmResume();
-    bool releaseEvmTrade();
-    QList<QPair<QPointer<EvmMarketJob>,QString>> m_evmResume;
-    bool m_evmResuming=false,m_evmResumed=false;
+    // Agreed trades over the limit wait here and open as others finish
+    QList<QPair<QPointer<EvmMarketJob>,QString>> m_evmWaiting;
+    void openWaitingEvmTrade();
+    bool m_evmResumed=false;
     // Kill switch and caps for an offer before it is posted or taken (nothing is recorded)
     QString evmOfferRefusal(qint64 chainId,const QString &valueWei,const QString &xmzAtoms);
     QByteArray evmSeed() const;

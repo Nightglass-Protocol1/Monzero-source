@@ -530,6 +530,78 @@ ColumnLayout {
         }
     }
 
+    // ---- every open trade (several run side by side): pick one to show it on the trade card
+    readonly property var allTrades: (dex && dex.evmTrades) || []
+    readonly property int waitingApproval: allTrades.filter(function (t) { return t.awaitingApproval === true && t.done !== true }).length
+    function tradeLabel(t) {
+        var d = Number(t.decimals) || 18, b = t.privateCoin === "XMR" ? "XMR" : "XMZ"
+        var amount = t.xmzAmount !== undefined ? X.amount(Number(t.xmzAmount) / Math.pow(10, b === "XMR" ? 12 : 11), b === "XMR" ? 4 : 0) + " " + b : ""
+        var coinPart = t.value ? X.plain(Number(t.value) / Math.pow(10, d), 6) + " " + label(t.coin || "") : ""
+        var verb = t.role === "owner" ? qsTr("Buy") : t.role === "claimer" ? qsTr("Sell") : ""
+        return (verb + " " + amount + (coinPart ? " · " + coinPart : "")).trim() || qsTr("Trade starting…")
+    }
+    function tradeState(t) {
+        if (t.done === true) return t.stage === "Done(Swapped)" ? qsTr("Done") : String(t.stage || "").indexOf("Refund") >= 0 ? qsTr("Refunded") : qsTr("Finished")
+        if (t.awaitingApproval === true) return qsTr("Needs approval")
+        if (t.awaitingFunding === true) return qsTr("Needs funds")
+        if ((t.error || "") !== "") return qsTr("Retrying")
+        return qsTr("Running")
+    }
+    Rectangle {
+        objectName: "exchangeTrades"
+        Layout.fillWidth: true
+        visible: ex.allTrades.length > 1 || (ex.allTrades.length > 0 && ex.waitingApproval > 0)
+        implicitHeight: tradesCol.implicitHeight + 20
+        radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
+        ColumnLayout {
+            id: tradesCol
+            anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 10
+            spacing: 8
+            RowLayout {
+                Layout.fillWidth: true
+                Text { text: qsTr("Your trades (%1)").arg(ex.allTrades.length); font.pixelSize: 14; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor; Layout.fillWidth: true }
+                M.CheckBox {
+                    objectName: "autoApprove"
+                    text: qsTr("Approve my trades automatically")
+                    toggleOnClick: false
+                    checked: typeof persistentSettings !== "undefined" ? persistentSettings.dexAutoApprove : ((ex.trade.autoApprove) === true)
+                    onClicked: {
+                        if (typeof persistentSettings !== "undefined") persistentSettings.dexAutoApprove = !persistentSettings.dexAutoApprove
+                        else ex.dex.setAutoApproveEvmTrades(!(ex.trade.autoApprove === true))
+                    }
+                }
+                M.StandardButton {
+                    objectName: "approveAll"
+                    visible: ex.waitingApproval > 1
+                    small: true
+                    text: qsTr("Approve all (%1)").arg(ex.waitingApproval)
+                    onClicked: ex.localError = ex.dex.approveAllEvmTrades() > 0 ? "" : qsTr("No trade could be approved now.")
+                }
+            }
+            Flow {
+                Layout.fillWidth: true
+                spacing: 8
+                Repeater {
+                    model: ex.allTrades
+                    delegate: Rectangle {
+                        objectName: "tradeChip"
+                        width: chipText.implicitWidth + 20; height: chipText.implicitHeight + 12
+                        radius: 6
+                        color: modelData.selected ? M.Style.accentMuted : "transparent"
+                        border.color: modelData.awaitingApproval === true && modelData.done !== true ? "#E5A54B" : M.Style.accentMuted
+                        Text {
+                            id: chipText
+                            anchors.centerIn: parent
+                            text: ex.tradeLabel(modelData) + " — " + ex.tradeState(modelData)
+                            font.pixelSize: 12; color: M.Style.defaultFontColor
+                        }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.dex.selectEvmTrade(modelData.tradeDir) }
+                    }
+                }
+            }
+        }
+    }
+
     // ---- the running trade, always on top while it runs
     M.DexTradeProgress {
         objectName: "exchangeTrade"
@@ -658,8 +730,7 @@ ColumnLayout {
             marketUsd: ex.xmrPair ? (ex.usd.XMR || 0) : (ex.noir && !ex.noir.stale ? Number(ex.noir.last) || 0 : 0)
             coinBalance: ex.coinBalance
             xmzBalance: ex.xmrPair ? ex.xmrBalance : ex.xmzBalance
-            blockedReason: ex.blockedReason !== "" ? ex.blockedReason
-                         : form.type === "market" && ex.tradeRunning ? qsTr("Finish your current trade first") : ""
+            blockedReason: ex.blockedReason
             limitCheck: ex.chainId > 0 && typeof ex.dex.evmOrderRefusal === "function"
                         ? function (coinText, xmzText) { return ex.xmrPair ? ex.dex.xmrOrderRefusal(ex.chainId, coinText, xmzText) : ex.dex.evmOrderRefusal(ex.chainId, coinText, xmzText) } : null
             limitTick: ex.riskTick
