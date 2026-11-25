@@ -263,6 +263,11 @@ public:
     Q_INVOKABLE int approveAllEvmTrades();
     // Approve each trade as soon as its terms are agreed (the user's choice, on by default)
     Q_INVOKABLE void setAutoApproveEvmTrades(bool on);
+    // The user's own wallets per coin ({"SOL": address, ...}) as saved in the Exchange: finished
+    // trades are paid out there by themselves (before the DEX page's connected account)
+    Q_PROPERTY(QVariantMap ownWallets READ ownWallets NOTIFY evmMarketChanged)
+    Q_INVOKABLE void setOwnWallets(const QVariantMap &byCoin) {m_ownWallets=byCoin;emit evmMarketChanged();}
+    QVariantMap ownWallets() const {return m_ownWallets;}
     // Public offers for XMZ<->ETH/BNB through the open relays (see EvmMarketJob). Uses the same
     // seed file as the trade. A taken offer becomes the EVM trade above.
     bool configureEvmMarket(const QString &config,const QString &seedFile);
@@ -658,6 +663,7 @@ private:
     void stepNextEvmJob();
     bool approveEvmJob(EvmTradeJob *job,const QString &commitment);
     bool m_autoApprove=true;
+    QVariantMap m_ownWallets;
     QList<QPair<QString,QString>> m_takeQueue;   // {listing id, amount ("" = whole)} still to take
     int m_takeTries=0;
     void takeNextQueued();

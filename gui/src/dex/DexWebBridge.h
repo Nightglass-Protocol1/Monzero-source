@@ -77,6 +77,9 @@ private:
     // ETH/BNB, a Solana wallet such as Phantom for SOL). Either may be absent.
     QString m_origin,m_account,m_solAccount;
     QString payoutAccount(qint64 chainId) const;
+    // Where a finished trade is paid out by itself: the wallet's own saved address for that coin
+    // (Exchange, "your own wallet"), else the account the page connected
+    QString autoPayoutAccount(qint64 chainId) const;
     QString m_paidTrade,m_announcedTrade;
     QSet<QString> m_announcedDirect;
     QHash<QString,qint64> m_directPayoutTried;   // folder -> when its payout was last asked for

@@ -45,6 +45,18 @@ QString DexWebBridge::payoutAccount(qint64 chainId) const {
     return DexChains::solana(chainId) ? m_solAccount : m_account;
 }
 
+QString DexWebBridge::autoPayoutAccount(qint64 chainId) const {
+    const auto own=m_engine ? m_engine->property("ownWallets").toMap() : QVariantMap();
+    // The trade's chain names the account (Solana: SOL and USDT share one; BNB Smart Chain: BNB and its USDT)
+    const QStringList coins=DexChains::solana(chainId) ? QStringList{"SOL","USDT"}
+        : (chainId==56 || chainId==97) ? QStringList{"BNB","USDT-BSC"} : QStringList{DexChains::coin(chainId)};
+    for (const auto &c:coins) {
+        const auto a=own.value(c).toString().trimmed();
+        if (DexChains::address(chainId,a)) return a;
+    }
+    return payoutAccount(chainId);
+}
+
 bool DexWebBridge::listen(const QString &settingsFile) {
     if (!m_engine || m_server) return false;
     m_settingsFile=settingsFile;
@@ -166,7 +178,7 @@ void DexWebBridge::watchDirect() {
         if (!payout.value("tx").toString().isEmpty() || !payout.value("note").toString().isEmpty()) continue;
         if (now-m_directPayoutTried.value(folder,0)<300) continue;
         const auto in=(stage=="Done(Swapped)" ? f.value("wants") : f.value("gives")).toMap();
-        const auto to=payoutAccount(qint64(in.value("chainId").toDouble()));
+        const auto to=autoPayoutAccount(qint64(in.value("chainId").toDouble()));
         if (to.isEmpty()) continue;
         m_directPayoutTried.insert(folder,now);
         call("payoutDirectTrade",{folder,to});
@@ -192,7 +204,7 @@ void DexWebBridge::watchTrade() {
         if (mine.toMap().value("state")=="open") return;
     // To the user's account on the trade's chain; a page without one for that chain is not paid
     // to by itself (the user sends it back from the page after connecting that wallet)
-    const auto to=payoutAccount(qint64(snapshot.value("offer").toMap().value("chainId").toDouble()));
+    const auto to=autoPayoutAccount(qint64(snapshot.value("offer").toMap().value("chainId").toDouble()));
     if (!to.isEmpty() && call("payoutEvmTrade",{to})) m_paidTrade=id;
 }
 
