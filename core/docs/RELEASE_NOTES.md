@@ -27,6 +27,8 @@ upgrade to stay on the network.
 - **The wallet connects on first start**: the local node uses node.monzero.org while it downloads
   the chain, so balances show at once (no more "balance 0" while syncing).
 - Russian translation of the wallet and the phone app's DEX screens.
+- **Android wallet 1.1.14**: the same Swap screen inside the phone wallet (menu "Swap on the DEX"),
+  Monero pairs from the phone (XMR in and out with your own Monero wallet), several trades at once.
 - Trade history export (CSV); the control documents are mirrored by the relays.
 
 ## What is fixed
