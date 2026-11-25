@@ -812,8 +812,25 @@ ApplicationWindow {
         // Every automatically managed local node downloads the blockchain,
         // including simple mode; bootstrap is only a temporary RPC fallback.
         const noSync = false;
-        const bootstrapNodeAddress = persistentSettings.walletMode < 2 ? "auto" : persistentSettings.bootstrapNodeAddress
+        const bootstrapNodeAddress = effectiveBootstrapNode();
+        console.log("local node: bootstrap " + (bootstrapNodeAddress || "none"));
         daemonManager.start(flags, persistentSettings.nettype, persistentSettings.blockchainDataDir, bootstrapNodeAddress, noSync, persistentSettings.pruneBlockchain);
+    }
+
+    // Monzero's own public node (restricted RPC). While the local node downloads the blockchain it
+    // answers the wallet's requests through this node (the daemon's bootstrap mode), so a new
+    // wallet shows its balance straight away instead of 0 until the whole chain is synced.
+    function monzeroPublicNode() {
+        return parseInt(persistentSettings.nettype) === NetworkType.MAINNET ? "node.monzero.org:6175" : "";
+    }
+
+    // The bootstrap node the local node uses: the one the user set; "none" for none; otherwise
+    // (blank, or "auto" which finds nothing unless some node advertises itself) Monzero's node
+    function effectiveBootstrapNode() {
+        const chosen = persistentSettings.bootstrapNodeAddress;
+        if (chosen === "none") return "";
+        if (chosen !== "" && chosen !== "auto") return chosen;
+        return monzeroPublicNode() || (persistentSettings.walletMode < 2 ? "auto" : chosen);
     }
 
     function stopDaemon(callback, splash){
@@ -1553,6 +1570,11 @@ ApplicationWindow {
         }
 
         remoteNodesModel.initialize();
+        // A ready remote node, so "Connect to a remote node" works without typing an address
+        if (remoteNodesModel.count === 0 && monzeroPublicNode() !== "") {
+            remoteNodesModel.append({address: monzeroPublicNode(), username: "", password: "", trusted: false});
+            remoteNodesModel.store();
+        }
     }
 
     MonzeroSettings {

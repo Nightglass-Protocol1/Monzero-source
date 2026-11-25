@@ -342,13 +342,21 @@ Rectangle{
                         daemonPortLabelText: qsTr("Bootstrap Port") + translationManager.emptyString
                         initialAddress: persistentSettings.bootstrapNodeAddress
                         onEditingFinished: {
-                            if (daemonAddrText == "auto") {
+                            if (daemonAddrText == "auto" || daemonAddrText == "none") {
                                 persistentSettings.bootstrapNodeAddress = daemonAddrText;
                             } else {
                                 persistentSettings.bootstrapNodeAddress = daemonAddrText ? bootstrapNodeEdit.getAddress() : "";
                             }
                             console.log("setting bootstrap node to " + persistentSettings.bootstrapNodeAddress)
                         }
+                    }
+
+                    MonzeroComponents.TextPlain {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 13
+                        color: MonzeroComponents.Style.dimmedFontColor
+                        text: qsTr("While your local node downloads the blockchain, the wallet works through this node so your balance shows straight away. Blank: Monzero's own node (node.monzero.org). Type none to wait for your own node instead.") + translationManager.emptyString
                     }
                 }
             }

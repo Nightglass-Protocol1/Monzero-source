@@ -42,8 +42,8 @@ ColumnLayout {
 
     function save(){
         persistentSettings.useRemoteNode = remoteNode.checked;
-        if (bootstrapNodeEdit.daemonAddrText == "auto") {
-            persistentSettings.bootstrapNodeAddress = "auto";
+        if (bootstrapNodeEdit.daemonAddrText == "auto" || bootstrapNodeEdit.daemonAddrText == "none") {
+            persistentSettings.bootstrapNodeAddress = bootstrapNodeEdit.daemonAddrText;
         } else {
             persistentSettings.bootstrapNodeAddress = bootstrapNodeEdit.getAddress();
         }
