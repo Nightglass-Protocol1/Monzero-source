@@ -1638,6 +1638,8 @@ ApplicationWindow {
         property bool dexAutoApprove: true
         // DEX: the simple Swap screen first (the order book and limit orders under "Advanced")
         property bool dexSimpleSwap: true
+        // DEX: XMZ bought on the DEX goes on to the main wallet by itself once it is spendable
+        property bool dexAutoHome: true
         onDexAutoApproveChanged: if (typeof dexEngine !== "undefined" && dexEngine && typeof dexEngine.setAutoApproveEvmTrades === "function") dexEngine.setAutoApproveEvmTrades(dexAutoApprove)
         property bool segregatePreForkOutputs: true
         property bool keyReuseMitigation2: true
@@ -2360,9 +2362,46 @@ ApplicationWindow {
         confirmationDialog.open();
     }
 
+    // Swaps still running when the wallet closes: they pause (coins stay safe), but a swap that runs
+    // out of time is refunded only while the wallet is open. Ask once before closing.
+    property bool dexCloseConfirmed: false
+    function runningSwaps() {
+        if (typeof dexEngine === "undefined" || !dexEngine || !dexEngine.evmTrades) return 0
+        return dexEngine.evmTrades.filter(function (t) { return t.done !== true && t.approved === true }).length
+    }
+    // A swap that finished: say so wherever the user is in the wallet
+    property var dexDoneSeen: ({})
+    Connections {
+        target: typeof dexEngine !== "undefined" ? dexEngine : null
+        ignoreUnknownSignals: true
+        function onEvmTradeChanged() {
+            var seen = appWindow.dexDoneSeen, list = dexEngine.evmTrades || []
+            for (var i = 0; i < list.length; ++i) {
+                var t = list[i]
+                if (t.done !== true || !t.tradeId || seen[t.tradeId]) continue
+                seen[t.tradeId] = true
+                if (t.approved !== true) continue
+                appWindow.showStatusMessage(t.stage === "Done(Swapped)" ? qsTr("Swap finished: the coins are in your trading account.")
+                                            : qsTr("A swap did not finish in time and was refunded."), 8)
+            }
+            appWindow.dexDoneSeen = seen
+        }
+    }
+
     onClosing: {
         close.accepted = false;
         console.log("blocking close event");
+        if (!isAndroid && !dexCloseConfirmed && runningSwaps() > 0) {
+            confirmationDialog.title = qsTr("Swaps are still running") + translationManager.emptyString;
+            confirmationDialog.text = qsTr("%n swap(s) have not finished yet. If you close the wallet they pause: your coins stay safe, but a swap that runs out of time can only be refunded while the wallet is open. Keep the wallet open until they finish?", "", runningSwaps()) + translationManager.emptyString;
+            confirmationDialog.icon = StandardIcon.Warning;
+            confirmationDialog.okText = qsTr("Keep it open") + translationManager.emptyString;
+            confirmationDialog.cancelText = qsTr("Close anyway") + translationManager.emptyString;
+            confirmationDialog.onAcceptedCallback = function() {};
+            confirmationDialog.onRejectedCallback = function() { dexCloseConfirmed = true; appWindow.close(); };
+            confirmationDialog.open();
+            return;
+        }
         if(isAndroid) {
             console.log("blocking android exit");
             if(qrScannerEnabled)

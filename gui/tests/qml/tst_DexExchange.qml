@@ -50,6 +50,7 @@ Item {
         function takeEvmOffer(id, xmz) { calls.push(["take", id, xmz]); return true }
         function takeEvmOffers(list) { calls.push(["takes", JSON.stringify(list)]); return true }
         function setUpTradingKeys(pw) { calls.push(["keys", pw]); return true }
+        function sendFromDexWallet(to, xmz) { calls.push(["home", to, xmz]); return true }
         function postEvmOffer(chainId, side, coin, xmz, hours, min, renew) { calls.push(["post", chainId, side, coin, xmz, hours, min].concat(renew ? ["renew"] : [])); return true }
         function cancelEvmOffer(folder) { calls.push(["cancel", folder]); return true }
         function approveTradingKeysHelper(commitment) { calls.push(["approveHelper", commitment]); return true }
@@ -315,6 +316,20 @@ Item {
             verify(!find(ex, "quickSetup").visible)
             engine.dexWalletStatus = w0
             app.walletPassword = ""
+        }
+        function test_bought_xmz_moves_on_to_the_main_wallet_when_nothing_needs_it() {
+            ex.homeAtoms = 0; ex.homeSeen = ({})
+            engine.evmTrades = [ { tradeDir: "/t/a", tradeId: "0x1", role: "owner", stage: "Locked", done: false, xmzAmount: "800000000000000" } ]
+            compare(ex.homeAtoms, 0)
+            engine.evmTrades = [ { tradeDir: "/t/a", tradeId: "0x1", role: "owner", stage: "Done(Swapped)", done: true, approved: true, xmzAmount: "800000000000000" },
+                                 { tradeDir: "/t/b", tradeId: "0x2", role: "claimer", stage: "Done(Swapped)", done: true, approved: true, xmzAmount: "50000000000000" } ]
+            compare(ex.homeAtoms, 800000000000000)
+            // The page test has no main wallet: nothing is sent, the amount waits
+            ex.moveHome()
+            compare(engine.calls.filter(function (c) { return c[0] === "home" }).length, 0)
+            compare(ex.homeAtoms, 800000000000000)
+            engine.evmTrades = []
+            ex.homeAtoms = 0
         }
         function test_trades_are_rows_with_ticks_and_the_full_card_only_on_request() {
             engine.evmTrades = [

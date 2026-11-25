@@ -86,6 +86,27 @@ Rectangle {
 
         Text { text: qsTr("Swap"); font.pixelSize: 22; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor }
 
+        // Ready to trade? Three checks, each with what to do about it
+        ColumnLayout {
+            objectName: "swapChecklist"
+            Layout.fillWidth: true; spacing: 4
+            readonly property bool synced: typeof appWindow === "undefined" || appWindow.walletSynced === undefined || appWindow.walletSynced === true
+            readonly property bool trading: sw.ex.keysReady && sw.ex.wallet.state === "ready"
+            visible: sw.stage === "form" && (!synced || !trading)
+            Repeater {
+                model: [
+                    { ok: parent.synced, t: parent.synced ? qsTr("Wallet synced") : qsTr("Your wallet is still syncing: balances show once it catches up (it connects to Monzero's node by itself).") },
+                    { ok: parent.trading, t: parent.trading ? qsTr("Trading ready")
+                          : !sw.ex.keysReady ? qsTr("Trading is not set up yet: use the button above.") : qsTr("The trading wallet is starting…") }
+                ]
+                delegate: Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 13
+                    text: (modelData.ok ? "✓ " : "○ ") + modelData.t
+                    color: modelData.ok ? M.Style.green : M.Style.warningColor
+                }
+            }
+        }
+
         // ---- the form
         ColumnLayout {
             Layout.fillWidth: true; spacing: 12

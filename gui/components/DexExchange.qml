@@ -590,6 +590,32 @@ ColumnLayout {
 
     // ---- every open trade (several run side by side): pick one to show it on the trade card
     readonly property var allTrades: (dex && dex.evmTrades) || []
+    // XMZ bought in this session, still to move on to the main wallet (atoms). It moves once nothing
+    // else needs the trading wallet: no trade running, no open offer, no swap waiting for XMZ.
+    readonly property bool autoHome: typeof persistentSettings !== "undefined" ? persistentSettings.dexAutoHome !== false : true
+    property real homeAtoms: 0
+    property var homeSeen: ({})
+    function noteBought() {
+        var seen = homeSeen, add = 0
+        for (var i = 0; i < allTrades.length; ++i) {
+            var t = allTrades[i]
+            if (t.done !== true || !t.tradeId || seen[t.tradeId]) continue
+            seen[t.tradeId] = true
+            if (t.role === "owner" && t.stage === "Done(Swapped)" && t.privateCoin !== "XMR") add += Number(t.xmzAmount) || 0
+        }
+        homeSeen = seen
+        if (add > 0) homeAtoms += add
+    }
+    onAllTradesChanged: noteBought()
+    function moveHome() {
+        if (!autoHome || homeAtoms <= 0 || runningTrades > 0 || openOrders > 0 || wallet.state !== "ready" || wallet.busy === true || mainAddress() === "") return
+        if (swapView.stage === "moving") return
+        // What is spendable now, less a little for the transfer's own fee
+        var unlockedAtoms = Math.floor(Number(wallet.unlocked) * 1e11) - 1e9
+        if (unlockedAtoms < homeAtoms) return
+        if (dex.sendFromDexWallet(mainAddress(), X.atomsText(homeAtoms))) homeAtoms = 0
+    }
+    Timer { interval: 60000; repeat: true; running: ex.homeAtoms > 0; onTriggered: ex.moveHome() }
     readonly property int runningTrades: allTrades.filter(function (t) { return t.done !== true }).length
     readonly property int waitingApproval: allTrades.filter(function (t) { return t.awaitingApproval === true && t.done !== true }).length
     function tradeLabel(t) {
@@ -641,6 +667,7 @@ ColumnLayout {
 
     // ---- the simple Swap screen
     M.DexSwap {
+        id: swapView
         objectName: "swapScreen"
         Layout.fillWidth: true; Layout.maximumWidth: 760
         visible: ex.simple && !ex.pairMode
