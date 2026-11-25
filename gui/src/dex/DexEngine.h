@@ -292,6 +292,11 @@ public:
     Q_INVOKABLE QString evmOrderRefusal(int chainId,const QString &coinAmount,const QString &xmzAmount);
     // xmzAmount: empty to take all of the offer, else how much of a partial offer
     Q_INVOKABLE bool takeEvmOffer(const QString &listingId,const QString &xmzAmount=QString());
+    // A swap of several offers (the simple Swap screen): [{id, xmz}] taken one after another as the
+    // market allows (it runs one take at a time). False when the list is empty or not readable.
+    Q_INVOKABLE bool takeEvmOffers(const QVariantList &takes);
+    Q_PROPERTY(int pendingTakes READ pendingTakes NOTIFY evmMarketChanged)
+    int pendingTakes() const {return m_takeQueue.size();}
     // The coin for `atoms` XMZ of a listing as the market shows it, at its price, rounded in the
     // maker's favour as the helper does; empty when the offer does not allow that amount
     static QString evmPartValue(const QVariantMap &listing,const QString &atoms);
@@ -653,6 +658,9 @@ private:
     void stepNextEvmJob();
     bool approveEvmJob(EvmTradeJob *job,const QString &commitment);
     bool m_autoApprove=true;
+    QList<QPair<QString,QString>> m_takeQueue;   // {listing id, amount ("" = whole)} still to take
+    int m_takeTries=0;
+    void takeNextQueued();
     QSet<QString> m_autoTried;        // commitments approved automatically once (a refusal is not retried)
     QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();

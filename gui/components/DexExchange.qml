@@ -77,6 +77,14 @@ ColumnLayout {
     function label(c) { return c === "USDT" ? "USDT (SOL)" : c === "USDT-BSC" ? "USDT (BNB)" : c }
     readonly property string bscUsdt: "0x55d398326f99059fF775485246999027B3197955"
     property string coin: "ETH"
+    // The simple Swap screen (default) or the full exchange: book, chart, limit orders, every pair
+    property bool simple: typeof persistentSettings !== "undefined" ? persistentSettings.dexSimpleSwap !== false : true
+    function setSimple(on) {
+        if (typeof persistentSettings !== "undefined") persistentSettings.dexSimpleSwap = on
+        else simple = on
+        // The Swap screen trades XMZ against a coin: back to such a pair
+        if (on && (pairMode || xmrPair)) pick(allCoins.indexOf("SOL") >= 0 ? "SOL" : allCoins[0], "XMZ")
+    }
     // SOL and USDT live on Solana (same trade account, Solana addresses)
     function onSolana(c) { return c === "SOL" || c === "USDT" }
     readonly property string usdtMint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
@@ -353,9 +361,16 @@ ColumnLayout {
             text: qsTr("Atomic swaps · your coins stay yours until each swap completes or refunds")
             font.pixelSize: 12; color: M.Style.dimmedFontColor; Layout.fillWidth: true; elide: Text.ElideRight
         }
+        Text {
+            objectName: "modeSwitch"
+            text: ex.simple ? qsTr("Advanced exchange") : qsTr("Simple swap")
+            font.pixelSize: 13; font.underline: true; color: M.Style.accent
+            MouseArea { anchors.fill: parent; anchors.margins: -4; cursorShape: Qt.PointingHandCursor; onClicked: ex.setSimple(!ex.simple) }
+        }
     }
     Flow {
         Layout.fillWidth: true
+        visible: !ex.simple
         spacing: 8
         Repeater {
             model: ex.allCoins
@@ -459,7 +474,25 @@ ColumnLayout {
         }
     }
 
-    // ---- unlock trading (once per session)
+    // ---- unlock trading (once per session). The trading keys use the wallet's own password: set up
+    // with it in one click, and unlocked with it by themselves. Only keys made with another password
+    // (older setups) ask for it.
+    readonly property string walletPassword: typeof appWindow !== "undefined" && appWindow.walletPassword ? String(appWindow.walletPassword) : ""
+    property bool triedWalletPassword: false
+    property bool typedPassword: false
+    property bool ownPassword: false            // the user chose to type a trading password instead
+    readonly property bool unlockShown: !keysReady && wallet.state !== undefined && wallet.state !== "unconfigured"
+    function tryWalletPassword() {
+        if (triedWalletPassword || walletPassword === "" || wallet.keysExist !== true || wallet.keysBusy === true || wallet.keysHelperReview) return
+        triedWalletPassword = true
+        dex.setUpTradingKeys(walletPassword)
+    }
+    onUnlockShownChanged: if (unlockShown) tryWalletPassword()
+    Connections {
+        target: ex.dex
+        ignoreUnknownSignals: true
+        function onDexWalletChanged() { if (ex.unlockShown) ex.tryWalletPassword() }
+    }
     Rectangle {
         objectName: "unlockCard"
         Layout.fillWidth: true
@@ -499,16 +532,40 @@ ColumnLayout {
                     text: ex.localError
                 }
             }
+            // First time: one click, with the wallet's password
+            ColumnLayout {
+                id: quickSetup
+                objectName: "quickSetup"
+                Layout.fillWidth: true; spacing: 8
+                visible: !ex.wallet.keysHelperReview && ex.wallet.keysExist !== true && ex.wallet.keysBusy !== true && ex.walletPassword !== "" && !ex.ownPassword
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 14; color: M.Style.defaultFontColor
+                    text: qsTr("Trading needs a one-time setup. Your trading keys are made on this computer and protected with your wallet password.")
+                }
+                RowLayout {
+                    spacing: 14
+                    M.StandardButton {
+                        objectName: "quickSetupButton"
+                        text: qsTr("Set up trading")
+                        onClicked: { ex.triedWalletPassword = true; ex.dex.setUpTradingKeys(ex.walletPassword) }
+                    }
+                    Text {
+                        text: qsTr("Use a separate trading password"); font.pixelSize: 12; font.underline: true; color: M.Style.dimmedFontColor
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.ownPassword = true }
+                    }
+                }
+            }
             Text {
-                visible: !ex.wallet.keysHelperReview
+                visible: !ex.wallet.keysHelperReview && !quickSetup.visible
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 14; color: M.Style.defaultFontColor
                 text: ex.wallet.keysBusy === true ? qsTr("Setting up your trading keys…")
+                    : ex.wallet.keysExist === true && ex.triedWalletPassword && !ex.typedPassword ? qsTr("Your trading keys were set up with their own password, not your wallet password. Enter it to start trading.")
                     : ex.wallet.keysExist === true ? qsTr("Enter your trading password to start trading. Browsing the market needs no password.")
                     : qsTr("Choose a trading password to start trading. Your trading keys are made and kept encrypted on this device; keep the password safe, nobody can restore it.")
             }
             RowLayout {
                 Layout.fillWidth: true
-                visible: ex.wallet.keysBusy !== true && !ex.wallet.keysHelperReview
+                visible: ex.wallet.keysBusy !== true && !ex.wallet.keysHelperReview && !quickSetup.visible
                 M.LineEdit { id: pw; objectName: "exchangePassword"; Layout.fillWidth: true; password: true; fontSize: 15; inputPaddingTop: 8; inputPaddingBottom: 8
                              placeholderText: ex.wallet.keysExist === true ? qsTr("Trading password") : qsTr("New trading password"); placeholderFontSize: 15
                              onAccepted: unlockButton.go() }
@@ -518,13 +575,14 @@ ColumnLayout {
                     id: unlockButton; objectName: "exchangeUnlock"
                     text: ex.wallet.keysExist === true ? qsTr("Unlock") : qsTr("Create trading keys")
                     enabled: pw.text !== "" && (ex.wallet.keysExist === true || pw.text === pw2.text)
-                    function go() { if (!enabled) return; ex.dex.setUpTradingKeys(pw.text); pw.text = ""; pw2.text = "" }
+                    function go() { if (!enabled) return; ex.typedPassword = true; ex.dex.setUpTradingKeys(pw.text); pw.text = ""; pw2.text = "" }
                     onClicked: go()
                 }
             }
             Text {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 12; color: M.Style.errorColor
-                visible: (ex.wallet.keysMessage || "") !== ""
+                // Not after the quiet try with the wallet password: only after the user typed one
+                visible: (ex.wallet.keysMessage || "") !== "" && (ex.typedPassword || !ex.triedWalletPassword)
                 text: ex.wallet.keysMessage || ""
             }
         }
@@ -581,10 +639,18 @@ ColumnLayout {
         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.localError = ex.dex.abandonEvmTrade() ? "" : qsTr("The trade could not be cancelled now.") }
     }
 
+    // ---- the simple Swap screen
+    M.DexSwap {
+        objectName: "swapScreen"
+        Layout.fillWidth: true; Layout.maximumWidth: 760
+        visible: ex.simple && !ex.pairMode
+        ex: ex
+    }
+
     // ---- stats bar
     Rectangle {
         Layout.fillWidth: true
-        visible: !ex.pairMode
+        visible: !ex.pairMode && !ex.simple
         implicitHeight: statsFlow.implicitHeight + 20
         radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
         Flow {
@@ -628,7 +694,7 @@ ColumnLayout {
     GridLayout {
         id: grid
         Layout.fillWidth: true
-        visible: !ex.pairMode
+        visible: !ex.pairMode && !ex.simple
         columns: ex.width >= 1180 ? 3 : ex.width >= 820 ? 2 : 1
         columnSpacing: 12; rowSpacing: 12
         M.DexPriceChart {
@@ -713,7 +779,7 @@ ColumnLayout {
     Rectangle {
         objectName: "soonCard"
         Layout.fillWidth: true
-        visible: ex.soonMode
+        visible: ex.soonMode && !ex.simple
         implicitHeight: soonCol.implicitHeight + 28
         radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
         ColumnLayout {
@@ -738,7 +804,7 @@ ColumnLayout {
     M.DexRoutePanel {
         objectName: "routePanel"
         Layout.fillWidth: true
-        visible: ex.routeMode
+        visible: ex.routeMode && !ex.simple
         dex: ex.dex
         xmzMarkets: ex.markets
         xmrMarkets: ex.xmrMarkets
@@ -753,7 +819,7 @@ ColumnLayout {
     M.DexDirectPanel {
         objectName: "directPanel"
         Layout.fillWidth: true
-        visible: ex.directMode
+        visible: ex.directMode && !ex.simple
         pair: ex.directPair
         showPairs: false
         dex: ex.dex

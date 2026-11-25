@@ -1636,6 +1636,8 @@ ApplicationWindow {
         property string dexExternalWallets: "{}"
         // DEX: approve each trade as soon as its terms are agreed (no click per trade)
         property bool dexAutoApprove: true
+        // DEX: the simple Swap screen first (the order book and limit orders under "Advanced")
+        property bool dexSimpleSwap: true
         onDexAutoApproveChanged: if (typeof dexEngine !== "undefined" && dexEngine && typeof dexEngine.setAutoApproveEvmTrades === "function") dexEngine.setAutoApproveEvmTrades(dexAutoApprove)
         property bool segregatePreForkOutputs: true
         property bool keyReuseMitigation2: true

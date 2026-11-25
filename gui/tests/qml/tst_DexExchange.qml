@@ -8,7 +8,7 @@ Item {
     width: 1400; height: 1500
     property var appWindow: app
     property var translationManager: translations
-    QtObject { id: app; property bool themeTransition: false; function showStatusMessage(a, b) {} }
+    QtObject { id: app; property bool themeTransition: false; property string walletPassword: ""; function showStatusMessage(a, b) {} }
     QtObject { id: translations; property string emptyString: "" }
     function releaseFocus() {}
 
@@ -48,6 +48,8 @@ Item {
         }
         function refreshEvmOffers(pair) { return true }
         function takeEvmOffer(id, xmz) { calls.push(["take", id, xmz]); return true }
+        function takeEvmOffers(list) { calls.push(["takes", JSON.stringify(list)]); return true }
+        function setUpTradingKeys(pw) { calls.push(["keys", pw]); return true }
         function postEvmOffer(chainId, side, coin, xmz, hours, min, renew) { calls.push(["post", chainId, side, coin, xmz, hours, min].concat(renew ? ["renew"] : [])); return true }
         function cancelEvmOffer(folder) { calls.push(["cancel", folder]); return true }
         function approveTradingKeysHelper(commitment) { calls.push(["approveHelper", commitment]); return true }
@@ -75,7 +77,7 @@ Item {
     TestCase {
         name: "DexExchange"
         when: windowShown
-        function init() { engine.capCoin = 1000; engine.calls = []; ex.pick("SOL"); var f = find(ex, "exchangeForm"); f.clearPick(); f.reviewing = false }
+        function init() { ex.simple = false; engine.capCoin = 1000; engine.calls = []; ex.pick("SOL"); var f = find(ex, "exchangeForm"); f.clearPick(); f.reviewing = false }
 
         function test_book() {
             compare(ex.book.asks.map(function (r) { return r.id }).join(), "0xa1,0xa2,0xa3")
@@ -233,6 +235,86 @@ Item {
             find(ex, "orderAmount").text = "1500"
             verify(f.ready)
             engine.evmTradeStatus = { configured: false }
+        }
+        function test_swap_screen_buys_across_offers_in_one_click() {
+            ex.simple = true
+            var sw = find(ex, "swapScreen")
+            verify(sw.visible)
+            verify(!find(ex, "exchangeForm").visible)
+            sw.side = "buy"
+            // Enough SOL in the trade account: the swap starts at once, best offers first
+            var b = JSON.parse(JSON.stringify(ex.balances)); b.SOL = 10; ex.balances = b
+            find(ex, "swapAmount").text = "2500"
+            // 1500 whole from 0xa1, then 1000 of the partial 0xa2
+            compare(sw.plan.legs.map(function (l) { return l.row.id + ":" + l.atoms / 1e11 }).join(), "0xa1:1500,0xa2:1000")
+            press("swapButton")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["takes", JSON.stringify([{ id: "0xa1", xmz: "" }, { id: "0xa2", xmz: "1000" }])]]))
+            compare(sw.stage, "started")
+            find(ex, "swapAgain").clicked(null)
+            compare(sw.stage, "form")
+        }
+        function test_swap_waits_for_a_deposit_and_starts_when_it_arrives() {
+            ex.simple = true
+            var sw = find(ex, "swapScreen")
+            sw.side = "buy"
+            var b = JSON.parse(JSON.stringify(ex.balances)); b.SOL = 0; ex.balances = b
+            find(ex, "swapAmount").text = "1500"
+            press("swapButton")
+            compare(sw.stage, "deposit")
+            compare(engine.calls.length, 0)
+            // Price 0.215039 SOL plus the fee reserve for one trade
+            verify(find(ex, "swapDeposit").text.indexOf("0.219539 SOL") >= 0, find(ex, "swapDeposit").text)
+            b = JSON.parse(JSON.stringify(ex.balances)); b.SOL = 0.3; ex.balances = b
+            compare(sw.stage, "started")
+            compare(engine.calls[0][0], "takes")
+        }
+        function test_swap_sell_asks_to_move_xmz_when_the_trading_wallet_is_short() {
+            ex.simple = true
+            var sw = find(ex, "swapScreen")
+            sw.side = "sell"
+            find(ex, "swapAmount").text = "1500"
+            compare(sw.plan.legs.map(function (l) { return l.row.id }).join(), "0xb1")
+            // The trading wallet holds 2400 XMZ: 1500 + 15 for fees fits
+            press("swapButton")
+            compare(sw.stage, "started")
+            find(ex, "swapAgain").clicked(null)
+            find(ex, "swapAmount").text = "1500"
+            var w = JSON.parse(JSON.stringify(engine.dexWalletStatus)); w.unlocked = "100"; engine.dexWalletStatus = w
+            engine.calls = []
+            press("swapButton")
+            compare(sw.stage, "moving")
+            verify(find(ex, "swapMove").text.indexOf("1,415") >= 0, find(ex, "swapMove").text)
+            w.unlocked = "2400"; engine.dexWalletStatus = w
+            compare(sw.stage, "started")
+            find(ex, "swapAgain").clicked(null)
+        }
+        function test_swap_says_when_not_enough_is_offered() {
+            ex.simple = true
+            var sw = find(ex, "swapScreen")
+            sw.side = "buy"
+            find(ex, "swapAmount").text = "100000"
+            verify(sw.plan.short)
+            verify(!find(ex, "swapButton").enabled)
+            find(ex, "swapAmount").text = ""
+        }
+        function test_trading_sets_up_and_unlocks_with_the_wallet_password() {
+            var w0 = engine.dexWalletStatus
+            app.walletPassword = "wallet-pw"
+            ex.triedWalletPassword = false
+            var w = JSON.parse(JSON.stringify(w0)); w.keysReady = false; w.keysExist = false
+            engine.dexWalletStatus = w
+            verify(find(ex, "quickSetup").visible)
+            press("quickSetupButton")
+            compare(JSON.stringify(engine.calls), JSON.stringify([["keys", "wallet-pw"]]))
+            // Keys that exist: tried once with the wallet password, by themselves
+            engine.calls = []; ex.triedWalletPassword = false
+            engine.dexWalletStatus = w0
+            w = JSON.parse(JSON.stringify(w0)); w.keysReady = false; w.keysExist = true
+            engine.dexWalletStatus = w
+            compare(JSON.stringify(engine.calls), JSON.stringify([["keys", "wallet-pw"]]))
+            verify(!find(ex, "quickSetup").visible)
+            engine.dexWalletStatus = w0
+            app.walletPassword = ""
         }
         function test_trades_are_rows_with_ticks_and_the_full_card_only_on_request() {
             engine.evmTrades = [

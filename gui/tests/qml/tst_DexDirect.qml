@@ -58,7 +58,7 @@ Item {
         function approveDirectTrade(folder, commitment) { calls.push(["approve", folder, commitment]); return true }
         function payoutDirectTrade(folder, address) { calls.push(["payout", folder, address]); return true }
     }
-    M.DexExchange { id: ex; width: root.width; dex: engine; fetchEnabled: false }
+    M.DexExchange { id: ex; simple: false; width: root.width; dex: engine; fetchEnabled: false }
 
     function find(item, name) {
         if (item.objectName === name) return item

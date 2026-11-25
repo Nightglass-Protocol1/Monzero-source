@@ -387,3 +387,41 @@ function tradeStep(role, stage) {
     if (!row) return { step: 0, refund: false, finished: false }
     return { step: row[0], refund: row[1] === true, finished: row[0] === 4 || row[2] === true }
 }
+
+// The simple Swap screen: buy or sell `atoms` across as many offers as it takes, best price first
+// (whole offers only when all of them fits what is left; partial ones from their minimum, leaving
+// none or at least the minimum). {legs: [{row, atoms, coin}], atoms, coin, price, short}
+function planSwap(b, side, atoms) {
+    var rows = (side === "buy" ? b.asks : b.bids).filter(function (r) { return !r.mine })
+    var left = Math.round(atoms), legs = [], coin = 0
+    for (var i = 0; i < rows.length && left > 0; ++i) {
+        var r = rows[i], take = Math.min(left, r.atoms)
+        if (!fillOk(r, take)) {
+            // A partial offer that would be left with less than its minimum: take less of it
+            if (r.partial && take < r.atoms && r.atoms - take < r.minAtoms && fillOk(r, r.atoms - r.minAtoms)) take = r.atoms - r.minAtoms
+            else continue
+        }
+        var c = fillCoin(r, take)
+        legs.push({ row: r, atoms: take, coin: c })
+        coin += c; left -= take
+    }
+    var got = Math.round(atoms) - left
+    return { legs: legs, atoms: got, coin: coin, price: got > 0 ? coin / (got / ATOMS) : 0, short: left > 0, left: left }
+}
+
+// What a buyer's trade account must hold for one trade besides the price: the network fees the
+// wallet keeps in reserve (gas for lock, release and a refund, doubled; on Solana the swap
+// account's rent, returned when the swap closes). Most of it stays in the account afterwards.
+// {coin: the chain's own coin, amount}
+function feeReserve(coin) {
+    if (coin === "SOL" || coin === "USDT") return { coin: "SOL", amount: 0.0045 }
+    if (coin === "BNB" || coin === "USDT-BSC") return { coin: "BNB", amount: 0.0015 }
+    if (coin === "ETH") return { coin: "ETH", amount: 0.0045 }
+    return { coin: coin, amount: 0 }
+}
+
+// XMZ the trading wallet must hold unlocked to sell `atoms` in `legs` trades: each lock also pays
+// its transaction fee (the wallet keeps 1% and at least 1 XMZ per trade for it)
+function sellNeed(atoms, legs) {
+    return atoms + Math.max(atoms / 100, legs * ATOMS)
+}

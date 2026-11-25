@@ -1551,6 +1551,35 @@ bool DexEngine::takeEvmOffer(const QString &listingId,const QString &xmzAmount) 
     }
     return false;
 }
+bool DexEngine::takeEvmOffers(const QVariantList &takes) {
+    static const QRegularExpression id("\\A0x[0-9a-f]{64}\\z"),amount("\\A([0-9]{1,12}(\\.[0-9]{1,12})?)?\\z");
+    QList<QPair<QString,QString>> list;
+    for (const auto &v:takes) {
+        const auto t=v.toMap();
+        const auto listing=t.value("id").toString(),xmz=t.value("xmz").toString().trimmed();
+        if (!id.match(listing).hasMatch() || !amount.match(xmz).hasMatch()) return false;
+        list.append({listing,xmz});
+    }
+    if (list.isEmpty() || list.size()>20) return false;
+    const bool idle=m_takeQueue.isEmpty();
+    m_takeQueue+=list;m_takeTries=0;
+    if (idle) takeNextQueued();
+    emit evmMarketChanged();return true;
+}
+void DexEngine::takeNextQueued() {
+    if (m_takeQueue.isEmpty()) return;
+    const auto next=m_takeQueue.first();
+    // The market of this offer is busy (one take at a time): try again shortly
+    for (auto *job:allMarkets()) for (const auto &v:job->status().value("listings").toList()) {
+        if (v.toMap().value("id")!=next.first) continue;
+        if (job->status().value("busy").toBool() && ++m_takeTries<120) {QTimer::singleShot(1000,this,&DexEngine::takeNextQueued);return;}
+    }
+    // Taken, or refused (gone, limits): either way the swap goes on with the next offer
+    takeEvmOffer(next.first,next.second);
+    m_takeQueue.removeFirst();m_takeTries=0;
+    emit evmMarketChanged();
+    if (!m_takeQueue.isEmpty()) QTimer::singleShot(1500,this,&DexEngine::takeNextQueued);
+}
 bool DexEngine::setEvmOfferRenew(const QString &folder,bool on) {
     auto *job=evmMarketFor(folder);
     return job && job->setRenew(folder,on);
