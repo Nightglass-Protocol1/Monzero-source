@@ -351,6 +351,114 @@ class DynamicPrice(BotTest):
         self.assertFalse(self.bot.price_file.exists())
 
 
+D = Decimal
+
+
+class MarketFair(unittest.TestCase):
+    def test_volume_weighted_median_within_bid_and_ask(self):
+        now = 1_000_000
+        trades = [(now - 60, D("0.0011"), D("100")), (now - 120, D("0.0010"), D("500")), (now - 180, D("0.0030"), D("50"))]
+        # 650 XMZ in all: the median by volume is 0.0010 (a small trade at 0.003 does not move it)
+        self.assertEqual(lb.market_fair(trades, D("0.0005"), D("0.00105"), now, 24, 3), D("0.0010"))
+        # kept inside the book
+        self.assertEqual(lb.market_fair(trades, D("0.0012"), D("0.0013"), now, 24, 3), D("0.0012"))
+        # too few recent trades: the last trade; nothing at all: the middle of the book
+        old = [(now - 90000, D("0.002"), D("10")), (now - 100000, D("0.001"), D("10"))]
+        self.assertEqual(lb.market_fair(old, None, None, now, 24, 3), D("0.002"))
+        self.assertEqual(lb.market_fair([], D("0.001"), D("0.003"), now, 24, 3), D("0.002"))
+        self.assertIsNone(lb.market_fair([], None, None, now, 24, 3))
+
+
+class MarketBuyPrice(unittest.TestCase):
+    def test_average_price_of_buying_some_dollars(self):
+        asks = [(D("0.0011"), D("31500")), (D("0.00105"), D("2434"))]
+        p = lb.market_buy_price(asks, D("5"))
+        self.assertAlmostEqual(float(p), 5 / (2434 + (5 - 2434 * 0.00105) / 0.0011), places=9)
+        self.assertEqual(lb.market_buy_price([(D("0.002"), D("100"))], D("5")), D("0.002"), "a thin book: all of it")
+        self.assertIsNone(lb.market_buy_price([], D("5")))
+        # a tiny low ask hardly moves it
+        self.assertGreater(lb.market_buy_price(asks + [(D("0.0001"), D("10"))], D("5")), D("0.00105"))
+
+
+class MarketStep(unittest.TestCase):
+    M = {"floor_usd": "0.0008", "min_change_percent": 3, "max_fall_percent_per_hour": 5,
+         "confirm_jump_percent": 100, "confirm_seconds": 300}
+
+    def step(self, ref, target, now=10_000, changed=10_000, pending=None):
+        return lb.market_step(D(ref) if ref else None, D(target), now, changed, pending, self.M)
+
+    def test_start_noise_and_floor(self):
+        self.assertEqual(self.step(None, "0.0011")[0], D("0.0011"))
+        self.assertEqual(self.step(None, "0.0001")[0], D("0.0008"), "never below the floor")
+        self.assertIsNone(self.step("0.0011", "0.00112")[0], "under 3%: no re-post")
+
+    def test_rises_are_followed_at_once_and_big_jumps_confirmed(self):
+        self.assertEqual(self.step("0.0010", "0.0019")[0], D("0.0019"))
+        new, _, pending = self.step("0.0010", "0.0050", now=10_000)
+        self.assertIsNone(new, "a 5x jump is not followed on the first reading")
+        new, _, pending = self.step("0.0010", "0.0050", now=10_100, pending=pending)
+        self.assertIsNone(new, "nor 100 s later")
+        new, _, _ = self.step("0.0010", "0.0060", now=10_400, pending=pending)
+        self.assertEqual(new, D("0.0060"), "still there after 5 minutes: followed")
+        new, _, pending = self.step("0.0010", "0.0050", now=10_000)
+        self.assertEqual(self.step("0.0010", "0.0011", now=10_400, pending=pending)[2], None, "a spike that went away is forgotten")
+
+    def test_falls_are_slow(self):
+        self.assertIsNone(self.step("0.0020", "0.0010", now=10_000 + 1800)[0], "half an hour: 2.5%, under the 3% step")
+        new = self.step("0.0020", "0.0010", now=10_000 + 3600)[0]
+        self.assertEqual(new, D("0.0020") * D("0.95"), "an hour: at most 5% down")
+        new = self.step("0.0020", "0.0010", now=10_000 + 10 * 3600)[0]
+        self.assertEqual(new, D("0.0020") * D("0.95") ** 10)
+        self.assertEqual(self.step("0.0020", "0.0019", now=10_000 + 10 * 3600)[0], D("0.0019"), "a small fall is followed fully")
+        self.assertEqual(self.step("0.0010", "0.0001", now=10_000 + 99 * 3600)[0], D("0.0008"), "never below the floor")
+
+
+class MarketMode(BotTest):
+    def market_bot(self, trades, bid, ask):
+        self.bot.cfg["market_price"] = {**lb.DEFAULTS["market_price"], "enabled": True}
+        self.bot.read_market = lambda: (trades, bid, ask, [], "test")
+        return self.bot
+
+    def test_follows_the_market_and_reprices(self):
+        now = time.time()
+        bot = self.market_bot([(now - 60, D("0.0011"), D("500"))] * 3, D("0.0005"), D("0.00105"))
+        bot.cfg["ladder_percent"] = [2]
+        bot.price = {"referenceUsd": "0.01", "changedAt": int(now) - 10, "sales": 3}   # the old fixed-floor mode
+        self.assertIsNone(bot.reference(), "no price before the first market reading")
+        bot.round()
+        self.assertEqual(bot.reference(), D("0.00105"), "fair price kept within the ask; the old $0.01 is not followed down slowly")
+        self.assertEqual(self.requests("post")[0]["offer"]["valueWei"], str(int(D("2000") * D("0.00105") * D("1.02") / 2000 * 10 ** 18)))
+        # the market doubles: the open offer is re-posted higher
+        bot.read_market = lambda: ([(now, D("0.0021"), D("500"))] * 3, D("0.002"), D("0.0022"), [], "test")
+        bot.market_checked = 0
+        bot.round()
+        self.assertEqual(bot.reference(), D("0.0021"))
+        self.assertEqual(len(self.requests("cancel")), 1)
+        status = json.loads((bot.state_dir / "status.json").read_text())
+        self.assertEqual(status["market"]["source"], "test")
+
+    def test_never_below_the_bid_and_sales_do_not_move_it(self):
+        now = time.time()
+        bot = self.market_bot([(now - 60, D("0.0009"), D("500"))] * 3, D("0.0010"), D("0.0020"))
+        bot.follow_market(now)
+        self.assertEqual(bot.reference(), D("0.00105"), "bid + 5%")
+        bot.price_after_sale("ETH")
+        self.assertEqual(bot.reference(), D("0.00105"))
+
+    def test_no_reading_no_offers(self):
+        bot = self.market_bot([], None, None)
+        bot.round()
+        self.assertEqual(self.requests("post"), [])
+
+    def test_min_part_in_dollars(self):
+        now = time.time()
+        bot = self.market_bot([(now - 60, D("0.001"), D("500"))] * 3, D("0.0009"), D("0.0011"))
+        bot.follow_market(now)
+        bot.cfg["min_part_xmz"], bot.cfg["min_part_usd"] = "50", "1"
+        self.assertEqual(bot.min_part(2000 * lb.ATOMIC), 1000 * lb.ATOMIC, "$1 at $0.001 is 1000 XMZ")
+        self.assertEqual(bot.min_part(1500 * lb.ATOMIC), 0, "no room for two parts: whole offer")
+
+
 class Ed25519(unittest.TestCase):
     def test_rfc8032_vector_1(self):
         pub = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")

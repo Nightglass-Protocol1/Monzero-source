@@ -11,6 +11,11 @@
 #                                            price, one offer slot per step and pair) and the XMZ
 #                                            per offer; restarts the bot. A new slot needs its trade
 #                                            account funded for network fees (see 'accounts').
+#   bash install-liquidity-bot.sh update-bot only the bot program (not the trade helper); restarts it
+#   bash install-liquidity-bot.sh market on 0.0008 1
+#                                            the reference price follows XMZ on NoirTrade (floor in
+#                                            USD per XMZ; smallest part a buyer may take, in USD);
+#                                            'market off' goes back to the fixed/dynamic price
 # Config on the server: /etc/monzero-liquidity/config.json (written once, never overwritten).
 # Keys and wallet: /var/lib/monzero-liquidity/{keys,main-wallet} - back these up after the first install.
 set -euo pipefail
@@ -52,8 +57,51 @@ echo "backup: $C.before-layout-$TS"
 if systemctl is-active -q monzero-liquidity; then systemctl restart monzero-liquidity; echo "bot restarted with the new layout"; fi
 REMOTE
     exit ;;
+  update-bot)
+    python3 -m py_compile "$HERE/liquidity_bot.py"
+    python3 -W ignore "$HERE/test_liquidity_bot.py" 2>&1 | tail -1 | grep -qx OK || { echo "!! the bot's tests fail"; exit 1; }
+    scp -q "$HERE/liquidity_bot.py" "$HOST:/tmp/liquidity_bot.py"
+    remote sudo bash -s <<'REMOTE'
+set -euo pipefail
+TS=$(date -u +%Y%m%d-%H%M%S)
+cp -p /opt/monzero-liquidity/liquidity_bot.py /opt/monzero-liquidity/liquidity_bot.py.before-$TS
+install -o root -g root -m 644 /tmp/liquidity_bot.py /opt/monzero-liquidity/liquidity_bot.py; rm -f /tmp/liquidity_bot.py
+if ! sudo -u monzero-liquidity /usr/bin/python3 -I /opt/monzero-liquidity/liquidity_bot.py /etc/monzero-liquidity/config.json status >/dev/null; then
+  cp -p /opt/monzero-liquidity/liquidity_bot.py.before-$TS /opt/monzero-liquidity/liquidity_bot.py; echo "!! the new bot refused the config; the old one is back"; exit 1
+fi
+echo "bot updated (backup liquidity_bot.py.before-$TS)"
+if systemctl is-active -q monzero-liquidity; then systemctl restart monzero-liquidity; echo "restarted"; fi
+REMOTE
+    exit ;;
+  market)
+    MODE=${2:-}; FLOOR=${3:-0.0008}; PART=${4:-1}
+    case "$MODE" in on|off) ;; *) echo "usage: $0 market on|off [floor_usd] [min_part_usd]"; exit 1;; esac
+    [[ "$FLOOR" =~ ^[0-9]*\.?[0-9]+$ && "$PART" =~ ^[0-9]*\.?[0-9]+$ ]] || { echo "floor and part must be numbers"; exit 1; }
+    remote sudo MODE="$MODE" FLOOR="$FLOOR" PART="$PART" bash -s <<'REMOTE'
+set -euo pipefail
+C=/etc/monzero-liquidity/config.json
+TS=$(date -u +%Y%m%d-%H%M%S)
+cp -p "$C" "$C.before-market-$TS"
+python3 - "$C" <<'PY'
+import json, os, sys
+c = json.load(open(sys.argv[1]))
+m = c.setdefault("market_price", {})
+m["enabled"] = os.environ["MODE"] == "on"
+if m["enabled"]:
+    m["floor_usd"] = os.environ["FLOOR"]
+    c["min_part_usd"] = os.environ["PART"]
+open(sys.argv[1], "w").write(json.dumps(c, indent=1) + "\n")
+print("market price %s%s" % ("ON" if m["enabled"] else "off", ", floor $%s per XMZ, smallest part $%s" % (m["floor_usd"], c["min_part_usd"]) if m["enabled"] else ""))
+PY
+if ! sudo -u monzero-liquidity /usr/bin/python3 -I /opt/monzero-liquidity/liquidity_bot.py "$C" status >/dev/null; then
+  cp -p "$C.before-market-$TS" "$C"; echo "!! the bot refused the new config (run update-bot first?); the old one is back"; exit 1
+fi
+echo "backup: $C.before-market-$TS"
+if systemctl is-active -q monzero-liquidity; then systemctl restart monzero-liquidity; echo "bot restarted"; fi
+REMOTE
+    exit ;;
   install)  ;;
-  *) echo "usage: $0 [install|start|stop|accounts|status|layout STEPS XMZ]"; exit 1 ;;
+  *) echo "usage: $0 [install|start|stop|accounts|status|layout STEPS XMZ|update-bot|market on|off FLOOR PART]"; exit 1 ;;
 esac
 
 echo "== checking here"

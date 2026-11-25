@@ -63,11 +63,29 @@ DEFAULTS = {
     # The reference price follows demand: +up% per sale, -down% after every down_every_hours
     # without a sale or change, never below floor_usd. Its state is in price.json.
     "dynamic_price": {"enabled": True, "up_percent_per_sale": 2, "down_percent": 1, "down_every_hours": 12, "floor_usd": "0.01"},
+    # Or the reference follows XMZ's market on NoirTrade (it then replaces dynamic_price):
+    #  - market price: what buying depth_usd of XMZ there costs right now (the average price over
+    #    its asks): moving it down takes real asks others can buy, moving it up real buying.
+    #    With no asks: the volume-weighted median of the last window_hours' trades (the last trade
+    #    when there are fewer than min_trades), kept between bid and ask
+    #  - never below the bid plus over_bid_percent (nobody can buy from the bot and sell there at a profit)
+    #  - rises are followed at once; a jump of more than confirm_jump_percent must still be there
+    #    confirm_seconds later (a bad reading or a moment's spike is not followed)
+    #  - falls by at most max_fall_percent_per_hour and never below floor_usd (a dump of the
+    #    exchange's thin book cannot buy the bot's stock cheaply)
+    #  - changes under min_change_percent are ignored (offers are not re-posted for noise)
+    "market_price": {"enabled": False, "api": "https://noirtrade.com/api/v1", "ticker": "XMZ_USDT",
+                     "fallback": "https://monzero.org/markets/xmz.php", "depth_usd": "5", "window_hours": 24, "min_trades": 3,
+                     "over_bid_percent": 5, "min_change_percent": 3, "max_fall_percent_per_hour": 5,
+                     "confirm_jump_percent": 100, "confirm_seconds": 300, "floor_usd": "0.0008",
+                     "check_seconds": 120, "stale_hours": 6},
     "ladder_percent": [2, 5, 10, 20],
     "offer_xmz": "2000",
     # Buyers may take any part of an offer from this much XMZ (the rest stays on offer as a new
     # offer); "0" posts whole offers only
     "min_part_xmz": "50",
+    # ...and at least this much in USD (a part worth less than the network fee of its claim is a loss)
+    "min_part_usd": "0",
     "offer_hours": 6,
     "reprice_percent": 3,
     "keep_xmz": "0",
@@ -191,8 +209,18 @@ def load_config(path):
     user = json.loads(Path(path).read_text())
     pairs = user.pop("pairs", {})
     dynamic = {**cfg["dynamic_price"], **user.pop("dynamic_price", {})}
+    market = {**cfg["market_price"], **user.pop("market_price", {})}
     cfg.update(user)
     cfg["dynamic_price"] = dynamic
+    cfg["market_price"] = market
+    if market["enabled"] and not (Decimal(market["floor_usd"]) > 0 and 0 <= float(market["over_bid_percent"]) <= 100
+                                  and 0 < float(market["max_fall_percent_per_hour"]) <= 50 and float(market["min_change_percent"]) >= 0
+                                  and float(market["confirm_jump_percent"]) > 0 and int(market["min_trades"]) >= 1
+                                  and float(market["window_hours"]) > 0 and int(market["check_seconds"]) >= 30):
+        sys.exit("config: market_price needs a positive floor_usd, over_bid_percent 0..100, max_fall_percent_per_hour 0..50, "
+                 "confirm_jump_percent > 0, min_trades >= 1, window_hours > 0 and check_seconds >= 30")
+    if Decimal(str(cfg.get("min_part_usd", "0"))) < 0:
+        sys.exit("config: min_part_usd must not be negative")
     if not (0 <= float(dynamic["up_percent_per_sale"]) <= 50 and 0 <= float(dynamic["down_percent"]) <= 50
             and float(dynamic["down_every_hours"]) >= 1 and Decimal(dynamic["floor_usd"]) > 0):
         sys.exit("config: dynamic_price needs up/down 0..50 %, down_every_hours >= 1 and a positive floor_usd")
@@ -285,6 +313,65 @@ def free_port():
         return s.getsockname()[1]
 
 
+# ---------------------------------------------------------------- market price
+def market_fair(trades, bid, ask, now, window_hours, min_trades):
+    """XMZ's fair USD price from an exchange's trades [(unix seconds, price, XMZ volume)], bid and
+    ask (Decimal or None): the volume-weighted median of the window's trades, or the last trade
+    when there are too few, kept between bid and ask. None when nothing is known."""
+    trades = sorted((t for t in trades if t[1] > 0 and t[2] > 0), key=lambda t: t[0])
+    recent = [t for t in trades if t[0] >= now - window_hours * 3600]
+    fair = None
+    if len(recent) >= min_trades:
+        half, acc = sum(t[2] for t in recent) / 2, Decimal(0)
+        for _, price, vol in sorted(recent, key=lambda t: t[1]):
+            acc += vol
+            if acc >= half:
+                fair = price
+                break
+    elif trades:
+        fair = trades[-1][1]
+    if bid and ask and 0 < bid < ask:
+        fair = (bid + ask) / 2 if fair is None else min(max(fair, bid), ask)
+    return fair
+
+
+def market_buy_price(asks, usd):
+    """The average price of buying `usd` worth from asks [(price, XMZ)] (cheapest first); with less
+    on offer, the average over all of it. None without asks."""
+    spent, got = Decimal(0), Decimal(0)
+    for price, qty in sorted((a for a in asks if a[0] > 0 and a[1] > 0), key=lambda a: a[0]):
+        take = min(qty, (usd - spent) / price)
+        spent, got = spent + take * price, got + take
+        if spent >= usd:
+            break
+    return spent / got if got > 0 else None
+
+
+def market_step(ref, target, now, changed_at, pending, m):
+    """The next reference price: (new reference or None for no change, why, pending jump)."""
+    floor = Decimal(m["floor_usd"])
+    target = max(target, floor)
+    if ref is None:
+        return target, "market price", None
+    move = (target - ref) / ref * 100
+    if abs(move) < Decimal(str(m["min_change_percent"])):
+        return None, "", None
+    if move > 0:
+        if move > Decimal(str(m["confirm_jump_percent"])):
+            if pending is None or Decimal(pending["target"]) * 2 < target:   # first seen (or jumped again)
+                return None, "", {"since": pending["since"] if pending else int(now), "target": str(target)}
+            if now - pending["since"] < m["confirm_seconds"]:
+                return None, "", pending
+        return target, f"market rose {move:.1f}%", None
+    hours = Decimal(max(0, now - changed_at)) / 3600
+    lowest = ref * (1 - Decimal(str(m["max_fall_percent_per_hour"])) / 100) ** int(hours) \
+        * (1 - Decimal(str(m["max_fall_percent_per_hour"])) / 100 * (hours - int(hours)))
+    new = max(target, lowest, floor)
+    if (ref - new) / ref * 100 < Decimal(str(m["min_change_percent"])):
+        return None, "", None   # the fall allowed so far is still too small to re-post for
+    return new, f"market fell (to {target:.6f})" + ("" if new == target else ", followed slowly"), None
+
+
 # ---------------------------------------------------------------- the bot
 class Bot:
     def __init__(self, cfg, dry_run=False):
@@ -314,6 +401,9 @@ class Bot:
         self.price_file = self.state_dir / "price.json"
         self.price = read_json(self.price_file, None)
         self.alerts = []
+        self.market = {}          # the last market reading (for the status)
+        self.market_at = 0        # when the market was last read successfully
+        self.market_checked = 0
 
     # --- helper
     def helper(self, request, timeout=150):
@@ -487,8 +577,15 @@ class Bot:
         self.alerts.append(text)
 
     # --- pricing
+    def market_mode(self):
+        return bool(self.cfg.get("market_price", {}).get("enabled"))
+
     def reference(self):
-        """The USD price per XMZ the ladder starts from."""
+        """The USD price per XMZ the ladder starts from (None in market mode before the first reading)."""
+        if self.market_mode():
+            if not self.price or self.price.get("mode") != "market":
+                return None
+            return Decimal(self.price["referenceUsd"])
         if not self.cfg["dynamic_price"]["enabled"]:
             return Decimal(self.cfg["reference_usd"])
         if self.price is None:
@@ -502,7 +599,7 @@ class Bot:
         log.info("reference price %s USD per XMZ (%s)", self.price["referenceUsd"], why)
 
     def set_reference(self, value, why):
-        floor = Decimal(self.cfg["dynamic_price"]["floor_usd"])
+        floor = Decimal(self.cfg["market_price"]["floor_usd"] if self.market_mode() else self.cfg["dynamic_price"]["floor_usd"])
         value = max(floor, value).quantize(Decimal("1e-9"))
         self.price.update(referenceUsd=str(value), changedAt=int(time.time()))
         self.save_price(why)
@@ -511,7 +608,10 @@ class Bot:
         """+up% for a whole offer sold; a part of one moves it by its share (so small buys do not
         push the price up as fast as whole offers)."""
         d = self.cfg["dynamic_price"]
-        if not d["enabled"]:
+        if not d["enabled"] or self.market_mode():
+            if self.market_mode() and self.price:
+                self.price["sales"] = int(self.price.get("sales", 0)) + 1
+                atomic_write(self.price_file, json.dumps(self.price, indent=1), mode=0o644)
             return
         self.reference()
         self.price["sales"] = int(self.price.get("sales", 0)) + 1
@@ -522,7 +622,7 @@ class Bot:
     def price_decay(self, now=None):
         """-down% for each full quiet period since the last change (no sale, no change)."""
         d = self.cfg["dynamic_price"]
-        if not d["enabled"]:
+        if not d["enabled"] or self.market_mode():
             return
         ref = self.reference()
         now = now or time.time()
@@ -539,11 +639,73 @@ class Bot:
         self.set_reference(new, f"{steps * float(d['down_every_hours']):g} h without a sale")
         self.price["changedAt"] = int(now)
 
+    def read_market(self):
+        """(trades, bid, ask, asks, source) from the exchange, or from the website's copy of it."""
+        m = self.cfg["market_price"]
+        try:
+            tick = next(t for t in http_json(m["api"] + "/tickers") if t.get("ticker_id") == m["ticker"])
+            h = http_json(m["api"] + "/historical_trades?ticker_id=" + m["ticker"] + "&limit=500")
+            book = http_json(m["api"] + "/orderbook?ticker_id=" + m["ticker"] + "&depth=50")
+            asks = [(Decimal(str(a[0])), Decimal(str(a[1]))) for a in book.get("asks", [])]
+            rows = (h.get("buy") or []) + (h.get("sell") or []) if isinstance(h, dict) else h
+            trades = [(int(r["trade_timestamp"]) // 1000, Decimal(str(r["price"])), Decimal(str(r["base_volume"]))) for r in rows]
+            bid, ask = Decimal(str(tick.get("bid") or 0)) or None, Decimal(str(tick.get("ask") or 0)) or None
+            return trades, bid, ask, asks, "NoirTrade"
+        except (OSError, ValueError, KeyError, TypeError, StopIteration) as e:
+            log.warning("market: NoirTrade: %s", e)
+        d = http_json(m["fallback"])
+        if d.get("stale"):
+            raise ValueError("the website's copy is stale")
+        trades = [(int(t[0]) // 1000, Decimal(str(t[1])), Decimal(str(t[2]))) for t in d.get("trades", [])]
+        bid, ask = (Decimal(str(d[k])) if d.get(k) else None for k in ("bid", "ask"))
+        asks = [(Decimal(str(a[0])), Decimal(str(a[1]))) for a in (d.get("book") or {}).get("asks", [])]
+        return trades, bid, ask, asks, "monzero.org copy of NoirTrade"
+
+    def follow_market(self, now=None):
+        """Market mode: move the reference toward the market's price (see market_price)."""
+        if not self.market_mode():
+            return
+        m = self.cfg["market_price"]
+        now = now or time.time()
+        if now - self.market_checked < m["check_seconds"]:
+            return
+        self.market_checked = now
+        try:
+            trades, bid, ask, asks, source = self.read_market()
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log.warning("market: %s", e)
+            if self.market_at and now - self.market_at > m["stale_hours"] * 3600:
+                self.alert(f"no XMZ market price for {(now - self.market_at) / 3600:.0f} h; offers stay at the last price")
+            return
+        fair = market_buy_price(asks, Decimal(str(m["depth_usd"]))) or market_fair(trades, bid, ask, now, m["window_hours"], m["min_trades"])
+        if fair is None:
+            log.warning("market: no trades and no book")
+            return
+        target = max(fair, bid * (1 + Decimal(str(m["over_bid_percent"])) / 100)) if bid else fair
+        self.market_at = now
+        self.market = {"source": source, "fair": str(fair), "bid": str(bid) if bid else None, "ask": str(ask) if ask else None,
+                       "target": str(max(target, Decimal(m["floor_usd"]))), "readAt": int(now)}
+        fresh = not self.price or self.price.get("mode") != "market"
+        ref = None if fresh else Decimal(self.price["referenceUsd"])
+        new, why, pending = market_step(ref, target, now, 0 if fresh else self.price["changedAt"],
+                                        None if fresh else self.price.get("pending"), m)
+        if fresh:
+            self.price = {"mode": "market", "referenceUsd": "0", "changedAt": int(now), "sales": 0}
+        self.price["pending"] = pending
+        if pending:
+            self.market["pending"] = f"a jump to {pending['target']} waits to be confirmed"
+        if new is not None:
+            self.set_reference(new, why + f" ({source})")
+        else:
+            atomic_write(self.price_file, json.dumps(self.price, indent=1), mode=0o644)
+
     def offer_for(self, pair, step, doc):
         """(value in the coin's atoms, XMZ atoms) for one ladder step, inside the document's limits."""
         p = self.cfg["pairs"][pair]
         coin_usd = Decimal(p["usd_fixed"]) if p.get("usd_fixed") else self.prices.get(pair)
         if not coin_usd:
+            return None
+        if self.reference() is None:
             return None
         price_usd = self.reference() * (1 + Decimal(str(step)) / 100)
         xmz = Decimal(self.cfg["offer_xmz"])
@@ -564,6 +726,7 @@ class Bot:
     def round(self):
         self.alerts = []
         self.price_decay()
+        self.follow_market()
         self.refresh_prices()
         wallet = self.wallet_status()
         if wallet is None:
@@ -670,8 +833,9 @@ class Bot:
         # Re-price when the coin moved, or when the operator paused new trades
         fresh = self.offer_for(pair, step, doc) if doc else None
         # ...or when the reference price changed since it was posted (a sale or a quiet period)
-        posted_ref = Decimal(s.get("refUsd") or self.reference())
-        ref_moved = abs(self.reference() - posted_ref) * 1000 >= posted_ref * 9   # 0.9 % or more
+        ref = self.reference()
+        posted_ref = Decimal(s.get("refUsd") or ref or 0)
+        ref_moved = bool(ref and posted_ref) and abs(ref - posted_ref) * 1000 >= posted_ref * 9   # 0.9 % or more
         if doc is None or ref_moved or (fresh and abs(fresh[0] - s["valueAtoms"]) * 100 > s["valueAtoms"] * float(self.cfg["reprice_percent"])):
             if self.dry_run:
                 return spare
@@ -687,6 +851,9 @@ class Bot:
         m = int(Decimal(str(self.cfg.get("min_part_xmz", "0"))) * ATOMIC)
         if m <= 0:
             return 0
+        usd, ref = Decimal(str(self.cfg.get("min_part_usd", "0"))), self.reference()
+        if usd > 0 and ref:
+            m = max(m, int((usd / ref * ATOMIC).to_integral_value(ROUND_DOWN)))
         m = max(m, ATOMIC)            # the DEX's floor: 1 XMZ
         return m if m * 2 <= xmz else 0   # a part must leave room for another; smaller offers stay whole
 
@@ -794,7 +961,8 @@ class Bot:
     def write_status(self, wallet):
         atomic_write(self.state_dir / "status.json", json.dumps({
             "updatedAt": int(time.time()), "dryRun": self.dry_run, "referenceUsd": str(self.reference()),
-            "ladderUsd": [str((self.reference() * (1 + Decimal(str(x)) / 100)).quantize(Decimal("1e-8"))) for x in self.cfg["ladder_percent"]],
+            "ladderUsd": [str((self.reference() * (1 + Decimal(str(x)) / 100)).quantize(Decimal("1e-8"))) for x in self.cfg["ladder_percent"]] if self.reference() else [],
+            "market": self.market or None,
             "xmz": {"address": (wallet or {}).get("address"), "balance": units((wallet or {}).get("balanceAtoms", 0), 11),
                     "unlocked": units((wallet or {}).get("unlockedAtoms", 0), 11)},
             "prices": {k: str(v) for k, v in self.prices.items()},
