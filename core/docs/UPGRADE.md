@@ -4,6 +4,14 @@ Back up wallet files, mnemonic seeds and the node data directory before
 replacing any binary. Never enter a Monero seed into Monzero or a Monzero seed
 into Monero.
 
+## v1.3.11: simple Swap screen, several trades at once, auto-sell of mined XMZ
+
+No consensus change. Close the old wallet and node, unpack v1.3.11 and start it: same wallet files,
+node data, trading keys and trading wallets. Trades that were agreed but waiting in v1.3.10 open by
+themselves and run side by side. Wait until a running trade has finished (or refunded) before
+switching, or start v1.3.11 straight after closing v1.3.10 so the trade carries on. To go back,
+start the v1.3.10 files again.
+
 ## v1.3.10: Exchange fixes, smaller Monero parts, market price
 
 No consensus change. Close the old wallet and node, unpack v1.3.10 and start it: same wallet files,

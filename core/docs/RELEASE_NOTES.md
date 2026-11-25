@@ -1,3 +1,39 @@
+# Monzero v1.3.11 release notes
+
+Release label: v1.3.11
+
+Monzero v1.3.11 makes the DEX simple to use: a Swap screen, several trades at once that approve
+themselves, and an option to sell mined XMZ automatically. It changes no consensus rule: the chain,
+blocks, coins, wallets, seeds and addresses are the same as in v1.0.0 to v1.3.10, and nobody has to
+upgrade to stay on the network.
+
+## New
+
+- **Swap screen**: the Exchange opens on "buy (or sell) this much XMZ with this coin" and one
+  button. It fills the amount from as many offers as it takes, best price first. When the trade
+  account is short it shows one address, a QR code and one amount (network fees included) and
+  starts by itself when the coins arrive. The order book, chart and limit orders are under
+  "Advanced exchange".
+- **Several trades at once**: up to 8 trades run side by side (before, a second trade waited until
+  the app restarted). Each is a row under My orders with a tick for every step done.
+- **Automatic approval** of agreed trades (a switch turns it off); the operator's kill switch and
+  limits still check every trade.
+- **Trading set up with the wallet password**: one click, no second password; it unlocks by itself.
+- **Sell what I mine** (opt-in): a chosen share of XMZ mined after it is turned on (block rewards and
+  Monzero pool payouts) is sold on one or several pairs, best price first, never below a minimum
+  price. Nothing else in the wallet is touched.
+- XMZ bought on the DEX moves on to the main wallet by itself; closing the wallet while swaps run
+  asks first; a message when a swap finishes.
+- **The wallet connects on first start**: the local node uses node.monzero.org while it downloads
+  the chain, so balances show at once (no more "balance 0" while syncing).
+- Russian translation of the wallet and the phone app's DEX screens.
+- Trade history export (CSV); the control documents are mirrored by the relays.
+
+## What is fixed
+
+- Trading-wallet services end with the app; an upgrade stops the old version's.
+- Trade limits: an operator document with no limits ("open") is read correctly.
+
 # Monzero v1.3.10 release notes
 
 Release label: v1.3.10
