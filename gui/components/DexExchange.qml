@@ -616,6 +616,8 @@ ColumnLayout {
         if (dex.sendFromDexWallet(mainAddress(), X.atomsText(homeAtoms))) homeAtoms = 0
     }
     Timer { interval: 60000; repeat: true; running: ex.homeAtoms > 0; onTriggered: ex.moveHome() }
+    // A trade can be given up until this side locks anything (the engine checks again)
+    function cancellable(t) { return !!t && t.done !== true && (t.stage === "Start" || t.stage === "WaitingForEvmLock") }
     readonly property int runningTrades: allTrades.filter(function (t) { return t.done !== true }).length
     readonly property int waitingApproval: allTrades.filter(function (t) { return t.awaitingApproval === true && t.done !== true }).length
     function tradeLabel(t) {
@@ -659,7 +661,7 @@ ColumnLayout {
     }
     Text {
         objectName: "abandonTrade"
-        visible: ex.trade.configured === true && ex.trade.awaitingApproval === true && (ex.tradeDetail || ex.tradeNeedsYou)
+        visible: ex.trade.configured === true && ex.cancellable(ex.tradeSnapshot) && (ex.tradeDetail || ex.tradeNeedsYou)
         text: qsTr("Changed your mind? Cancel this trade (nothing is locked yet)")
         font.pixelSize: 12; color: M.Style.dimmedFontColor; font.underline: true
         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.localError = ex.dex.abandonEvmTrade() ? "" : qsTr("The trade could not be cancelled now.") }
@@ -944,6 +946,13 @@ ColumnLayout {
                                 Layout.fillWidth: true
                                 Text { text: ex.tradeLabel(modelData); font.pixelSize: 13; color: tradeRow.buyer ? M.Style.green : "#E5677A"; Layout.fillWidth: true; elide: Text.ElideRight }
                                 Text { text: ex.tradeState(modelData); font.pixelSize: 12; color: tradeRow.attention ? M.Style.warningColor : M.Style.dimmedFontColor }
+                                Text {
+                                    objectName: "tradeRowCancel"
+                                    visible: ex.cancellable(modelData) && modelData.busy !== true
+                                    text: qsTr("Cancel"); font.pixelSize: 12; font.underline: true; color: "#E5677A"
+                                    MouseArea { anchors.fill: parent; anchors.margins: -4; cursorShape: Qt.PointingHandCursor
+                                                onClicked: ex.localError = ex.dex.selectEvmTrade(modelData.tradeDir) && ex.dex.abandonEvmTrade() ? "" : qsTr("The trade could not be cancelled now.") }
+                                }
                                 Text {
                                     text: qsTr("Details"); font.pixelSize: 12; font.underline: true; color: M.Style.accent
                                     MouseArea { anchors.fill: parent; anchors.margins: -4; cursorShape: Qt.PointingHandCursor

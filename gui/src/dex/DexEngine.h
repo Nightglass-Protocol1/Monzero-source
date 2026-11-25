@@ -667,7 +667,8 @@ private:
     QList<QPair<QString,QString>> m_takeQueue;   // {listing id, amount ("" = whole)} still to take
     int m_takeTries=0;
     void takeNextQueued();
-    QSet<QString> m_autoTried;        // commitments approved automatically once (a refusal is not retried)
+    QSet<QString> m_autoTried;
+    QSet<QString> m_evmFresh;         // trades agreed in this session (approved automatically); resumed ones wait for the user        // commitments approved automatically once (a refusal is not retried)
     QString m_evmSeedFile,m_evmControlFile,m_evmBoundNetwork,m_evmStartRefusal;
     void stepEvmTrade();
     QHash<int,EvmMarketJob*> m_evmMarkets;   // by chain id

@@ -134,8 +134,11 @@ bool EvmTradeJob::release() {
     emit changed();return true;
 }
 bool EvmTradeJob::abandon() {
+    // Until this side locks anything: the buyer before its lock is sent ("Start"), the seller before
+    // it locks XMZ ("WaitingForEvmLock"), approved or not. Every later stage has funds on chain and
+    // goes on to its swap or its refund.
     const auto stage=m_snapshot.value("stage").toString();
-    if (m_path.isEmpty() || m_busy || m_tradeDir.isEmpty() || m_snapshot.value("approved").toBool()
+    if (m_path.isEmpty() || m_busy || m_tradeDir.isEmpty() || !m_pendingApproval.isEmpty()
         || (stage!="Start" && stage!="WaitingForEvmLock")) return false;
     QFile mark(m_tradeDir+"/abandoned");
     if (!mark.open(QIODevice::WriteOnly)) return false;

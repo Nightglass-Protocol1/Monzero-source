@@ -28,6 +28,7 @@ Item {
         property var evmTradeStatus: ({ configured: false })
         property var evmTrades: []
         function selectEvmTrade(dir) { calls.push(["select", dir]); return true }
+        function abandonEvmTrade() { calls.push(["abandon"]); return true }
         function approveAllEvmTrades() { calls.push(["approveAll"]); return 1 }
         function setAutoApproveEvmTrades(on) { calls.push(["auto", on]) }
         property var evmMarketStatus: ({
@@ -330,6 +331,22 @@ Item {
             compare(ex.homeAtoms, 800000000000000)
             engine.evmTrades = []
             ex.homeAtoms = 0
+        }
+        function test_a_trade_can_be_cancelled_until_its_coins_are_locked() {
+            engine.evmTrades = [
+                { tradeDir: "/t/old", tradeId: "0x1", role: "owner", stage: "Start", done: false, approved: true, coin: "SOL", decimals: 9, value: "1", xmzAmount: "100000000000" },
+                { tradeDir: "/t/locked", tradeId: "0x2", role: "owner", stage: "Locked", done: false, approved: true, coin: "SOL", decimals: 9, value: "1", xmzAmount: "100000000000" } ]
+            ex.bottomTab = "orders"
+            wait(50)
+            var cancels = []
+            ;(function walk(o) { if (o.objectName === "tradeRowCancel") cancels.push(o); for (var i = 0; i < o.children.length; ++i) walk(o.children[i]) })(ex)
+            compare(cancels.length, 2)
+            verify(cancels[0].visible)        // approved, but nothing locked yet
+            verify(!cancels[1].visible)       // its coin is locked: it goes on to the swap or the refund
+            engine.calls = []
+            cancels[0].children[0].clicked(null)
+            compare(JSON.stringify(engine.calls), JSON.stringify([["select", "/t/old"], ["abandon"]]))
+            engine.evmTrades = []
         }
         function test_trades_are_rows_with_ticks_and_the_full_card_only_on_request() {
             engine.evmTrades = [

@@ -893,7 +893,7 @@ void DexEngine::evmJobChanged(EvmTradeJob *job) {
         }
     }
     // Approved for the user, when they chose so (every approval still passes the kill switch and caps)
-    if (m_autoApprove && s.value("awaitingApproval").toBool() && s.value("canApprove").toBool() && !s.value("busy").toBool()
+    if (m_autoApprove && m_evmFresh.contains(dir) && s.value("awaitingApproval").toBool() && s.value("canApprove").toBool() && !s.value("busy").toBool()
         && !m_autoTried.contains(job->commitment())) {
         m_autoTried.insert(job->commitment());
         QTimer::singleShot(0,this,[this,job,c=job->commitment()]{if (m_evmJobs.contains(job)) approveEvmJob(job,c);});
@@ -1082,7 +1082,9 @@ bool DexEngine::addEvmMarket(const QString &config) {
     connect(job,&EvmMarketJob::changed,this,[this,job,known=QString()]() mutable {
         if (job->solAccount()!=known) {known=job->solAccount();emit dexWalletChanged();}
     });
-    connect(job,&EvmMarketJob::agreed,this,[this,job](const QString &tradeDir){evmOfferAgreed(job,tradeDir);});
+    // Agreed now, in this session: only these trades are approved automatically (never a trade left
+    // over from before a restart, which the user may have given up on)
+    connect(job,&EvmMarketJob::agreed,this,[this,job](const QString &tradeDir){m_evmFresh.insert(tradeDir);evmOfferAgreed(job,tradeDir);});
     markets.insert(chain,job);
     if (!m_evmSwapSeedHex.isEmpty()) job->setSwapKeys(m_evmSwapSeedHex,m_evmKeyHex);
     m_marketTicker->start();
