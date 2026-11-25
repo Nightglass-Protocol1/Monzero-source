@@ -25,7 +25,7 @@ import java.util.regex.Pattern;
  */
 final class DexRisk {
     private static final long DAY = 86400, RETENTION = 7 * DAY, MAX_AGE = 30 * DAY;
-    private static final Pattern ATOMS = Pattern.compile("\\A(?:0|[1-9][0-9]{0,18})\\z");
+    private static final Pattern ATOMS = Pattern.compile("\\A(?:0|[1-9][0-9]{0,77})\\z");
     private static final Pattern HEX128 = Pattern.compile("\\A[0-9a-f]{128}\\z");
     private static final Pattern UUID = Pattern.compile("\\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z");
     private static final BigInteger MAX_SAFE = BigInteger.valueOf(9007199254740991L);

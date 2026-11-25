@@ -1115,8 +1115,14 @@ QString DexEngine::directRefusal(const QString &ledgerId,qint64 givesChain,const
     for (const auto &leg:legs) {
         const auto network=evmControlNetwork(leg.first);
         if (network.isEmpty()) return tr("%1 is not supported for trading.").arg(DirectMarketJob::tickerOf(leg.first));
-        bool ok=false;const quint64 units=leg.second.toULongLong(&ok);
-        if (!ok) return tr("The amount is too large while the DEX is opening.");
+        // An amount beyond 64 bits (18-decimal coins above about 18.4) is counted as the largest
+        // 64-bit number: within an open "no limit" document, above any smaller limit
+        bool ok=false;quint64 units=leg.second.toULongLong(&ok);
+        if (!ok) {
+            static const QRegularExpression digits("\\A[0-9]{1,78}\\z");
+            if (!digits.match(leg.second).hasMatch()) return tr("The amount could not be read.");
+            units=std::numeric_limits<quint64>::max();
+        }
         bindEvmNetwork(network);
         const auto refusal=m_evmRiskControl->refusal(ledgerId,units,0);
         if (!refusal.isEmpty()) return refusal;

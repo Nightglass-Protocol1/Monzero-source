@@ -298,6 +298,15 @@ private slots:
         QVERIFY(!control.status().value("newTradesEnabled").toBool());
         QVERIFY(!control.acceptControlDocument(document({{"sequence",5}},sk),now));
         QVERIFY(!control.refusal(t3,1,1,now).isEmpty());
+        {   // "No limit" documents: numbers longer than 64 bits (USDT on BNB Chain has 18 decimals)
+            DexRiskControl open;open.setNetwork("ltc-testnet");QVERIFY(open.setLedgerFile(root.filePath("open.json")));
+            QVERIFY(open.setPublicKey(QString::fromLatin1(QByteArray(reinterpret_cast<const char *>(pk),32).toHex())));
+            QVERIFY(open.acceptControlDocument(document({{"maxLtcAtomsPerTrade","1000000000000000000000000000000"},
+                {"maxLtcAtomsPerDay","1000000000000000000000000000000"},{"maxXmzAtomsPerTrade","9999999999999999999"}},sk),now));
+            QVERIFY(open.refusal(t1,~0ULL,9999999999999999999ULL,now).isEmpty());
+            QVERIFY(open.recordStart(t1,~0ULL,now));
+            QVERIFY(!open.acceptControlDocument(document({{"sequence",2},{"maxLtcAtomsPerDay","1"+QString(78,'0')}},sk),now)); // over 78 digits
+        }
         QVERIFY(control.refusal(t1,100000000,1,now).isEmpty()); // started trade can always resume
         QVERIFY(!control.refusal(t3,1,1,now+86400+1).isEmpty()); // expired document pauses new trades
         // Unreadable ledger pauses new trades instead of resetting limits.

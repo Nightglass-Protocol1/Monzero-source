@@ -570,6 +570,8 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             if (out.length() > 0) out.append('\n');
             out.append(DexConfig.coin(chain)).append(": ");
             if (!l.optBoolean("open")) out.append("new trades paused (").append(l.optString("why")).append(")");
+            // 19 digits or more: the operator's "no limit" (the largest number older wallets read)
+            else if (l.optString("perTrade").length() >= 19 && l.optString("xmzPerTrade").length() >= 19) out.append("open, no trade limits");
             else out.append("up to ").append(shortUnits(l.optString("perTrade"), DexConfig.decimals(chain))).append(" per trade, ")
                     .append(shortUnits(l.optString("perDay"), DexConfig.decimals(chain))).append(" a day, ")
                     .append(DexFiles.units(l.optString("xmzPerTrade"), 11)).append(" XMZ per trade");
