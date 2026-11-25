@@ -26,6 +26,10 @@ Item {
         property var dexWalletStatus: ({ state: "ready", balance: "2500", unlocked: "2400", address: "MZtest", keysReady: true, keysExist: true,
                                          tradeAccount: "0x00000000000000000000000000000000000000a1", solTradeAccount: "11111111111111111111111111111112" })
         property var evmTradeStatus: ({ configured: false })
+        property var evmTrades: []
+        function selectEvmTrade(dir) { calls.push(["select", dir]); return true }
+        function approveAllEvmTrades() { calls.push(["approveAll"]); return 1 }
+        function setAutoApproveEvmTrades(on) { calls.push(["auto", on]) }
         property var evmMarketStatus: ({
             SOL: { configured: true, busy: false, coin: "SOL", chainId: 501000101, relays: [], mine: [], message: "",
                    listings: [ listing("0xa1", "sell-xmz", 215039000, 1500), listing("0xa2", "sell-xmz", 300000000, 2000, 100),
@@ -222,14 +226,45 @@ Item {
             delete w.keysHelperReview; w.keysReady = true; engine.dexWalletStatus = w
             verify(!find(ex, "unlockCard").visible)
         }
-        function test_market_orders_wait_for_the_running_trade() {
+        function test_market_orders_do_not_wait_for_a_running_trade() {
             engine.evmTradeStatus = { configured: true, snapshot: { done: false, role: "owner", stage: "Locked", offer: { chainId: 501000101, value: "1", xmzAmount: "1" } } }
             var f = find(ex, "exchangeForm")
             f.side = "buy"; f.type = "market"
             find(ex, "orderAmount").text = "1500"
-            verify(!f.ready)
-            engine.evmTradeStatus = { configured: false }
             verify(f.ready)
+            engine.evmTradeStatus = { configured: false }
+        }
+        function test_trades_are_rows_with_ticks_and_the_full_card_only_on_request() {
+            engine.evmTrades = [
+                { tradeDir: "/t/a", tradeId: "0x1", selected: true, role: "owner", stage: "Locked", done: false, awaitingApproval: false, awaitingFunding: false,
+                  coin: "SOL", decimals: 9, value: "112000000", xmzAmount: "800000000000000" },
+                { tradeDir: "/t/b", tradeId: "0x2", selected: false, role: "owner", stage: "Done(Swapped)", done: true, awaitingApproval: false, awaitingFunding: false,
+                  coin: "SOL", decimals: 9, value: "70000000", xmzAmount: "500000000000000" } ]
+            engine.evmTradeStatus = { configured: true, autoApprove: true, awaitingFunding: {}, startRefusal: "",
+                                      snapshot: { done: false, role: "owner", stage: "Locked", offer: { chainId: 501000101, value: "112000000", xmzAmount: "800000000000000" } } }
+            ex.bottomTab = "orders"
+            wait(50)
+            var rows = []
+            ;(function walk(o) { if (o.objectName === "tradeRow") rows.push(o); for (var i = 0; i < o.children.length; ++i) walk(o.children[i]) })(ex)
+            compare(rows.length, 2)
+            // Running: agreed and locked ticked, the seller's lock under way, arrival to come
+            var texts = []
+            ;(function walk(o) { if (o.text !== undefined && /^[✓●○↩] /.test(o.text)) texts.push(o.text); for (var i = 0; i < o.children.length; ++i) walk(o.children[i]) })(rows[0])
+            compare(texts.join("|"), "✓ Agreed|✓ You lock SOL|● Seller locks XMZ|○ XMZ arrives")
+            texts = []
+            ;(function walk(o) { if (o.text !== undefined && /^[✓●○↩] /.test(o.text)) texts.push(o.text); for (var i = 0; i < o.children.length; ++i) walk(o.children[i]) })(rows[1])
+            compare(texts.join("|"), "✓ Agreed|✓ You lock SOL|✓ Seller locks XMZ|✓ XMZ arrives")
+            // No banner for a trade that runs by itself; Details opens it
+            verify(!find(ex, "exchangeTrade").visible)
+            ex.tradeDetail = true
+            verify(find(ex, "exchangeTrade").visible)
+            ex.tradeDetail = false
+            // A trade that needs the user (funds) shows in full by itself
+            var t = JSON.parse(JSON.stringify(engine.evmTradeStatus)); t.awaitingFunding = { neededWei: "1", haveWei: "0", missingWei: "1" }
+            engine.evmTradeStatus = t
+            verify(find(ex, "exchangeTrade").visible)
+            engine.evmTrades = []
+            engine.evmTradeStatus = { configured: false }
         }
         function test_every_announced_pair_has_a_tile_and_the_ones_not_trading_say_coming_soon() {
             // No direct market in this wallet: all fifteen announced pairs show, each "coming soon"
@@ -372,8 +407,7 @@ Item {
             ex.bottomTab = "orders"
             var shown = texts(ex, []).join("|")
             verify(shown.indexOf("finished") >= 0, shown)
-            verify(shown.indexOf("matched: trade in progress") >= 0, shown)
-            verify(shown.indexOf("see the trade above") < 0, shown)
+            verify(shown.indexOf("matched: see Trades above") >= 0, shown)
             verify(shown.indexOf("2000 XMZ") >= 0, shown)
             verify(shown.indexOf("|Amount|") >= 0, shown)
             compare(ex.openOrders, 0)

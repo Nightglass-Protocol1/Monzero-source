@@ -375,3 +375,15 @@ function timeLeft(expiresAt, now) {
     if (s < 48 * 3600) return plain(Math.round(s / 360) / 10, 1) + " h left"
     return Math.floor(s / 86400) + " days left"
 }
+
+// Where a trade is, as four steps (agreed, first lock, second lock, coin arrives): {step 0..4, refund,
+// finished}. The same table as the trade card (DexTradeProgress.stepFor), without its words.
+function tradeStep(role, stage) {
+    var owner = { "Start": [1], "LockSent": [1], "Locked": [2], "ReadySent": [3], "Ready": [3], "Sweeping": [3], "Done(Swapped)": [4],
+                  "RefundSent": [2, true], "Done(Refunded)": [2, true, true], "Done(Aborted)": [1, true, true] }
+    var claimer = { "WaitingForEvmLock": [1], "XmzLockSent": [2], "XmzLocked": [2], "ClaimSent": [3], "Done(Swapped)": [4],
+                    "WaitingForRefund": [3, true], "SweepingBack": [3, true], "Done(Refunded)": [3, true, true], "Done(Aborted)": [1, true, true] }
+    var row = (role === "owner" ? owner : claimer)[stage]
+    if (!row) return { step: 0, refund: false, finished: false }
+    return { step: row[0], refund: row[1] === true, finished: row[0] === 4 || row[2] === true }
+}

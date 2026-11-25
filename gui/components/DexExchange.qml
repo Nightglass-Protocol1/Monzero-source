@@ -532,6 +532,7 @@ ColumnLayout {
 
     // ---- every open trade (several run side by side): pick one to show it on the trade card
     readonly property var allTrades: (dex && dex.evmTrades) || []
+    readonly property int runningTrades: allTrades.filter(function (t) { return t.done !== true }).length
     readonly property int waitingApproval: allTrades.filter(function (t) { return t.awaitingApproval === true && t.done !== true }).length
     function tradeLabel(t) {
         var d = Number(t.decimals) || 18, b = t.privateCoin === "XMR" ? "XMR" : "XMZ"
@@ -547,66 +548,22 @@ ColumnLayout {
         if ((t.error || "") !== "") return qsTr("Retrying")
         return qsTr("Running")
     }
-    Rectangle {
-        objectName: "exchangeTrades"
-        Layout.fillWidth: true
-        visible: ex.allTrades.length > 1 || (ex.allTrades.length > 0 && ex.waitingApproval > 0)
-        implicitHeight: tradesCol.implicitHeight + 20
-        radius: 8; color: M.Style.surfaceRaised; border.color: M.Style.accentMuted
-        ColumnLayout {
-            id: tradesCol
-            anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 10
-            spacing: 8
-            RowLayout {
-                Layout.fillWidth: true
-                Text { text: qsTr("Your trades (%1)").arg(ex.allTrades.length); font.pixelSize: 14; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor; Layout.fillWidth: true }
-                M.CheckBox {
-                    objectName: "autoApprove"
-                    text: qsTr("Approve my trades automatically")
-                    toggleOnClick: false
-                    checked: typeof persistentSettings !== "undefined" ? persistentSettings.dexAutoApprove : ((ex.trade.autoApprove) === true)
-                    onClicked: {
-                        if (typeof persistentSettings !== "undefined") persistentSettings.dexAutoApprove = !persistentSettings.dexAutoApprove
-                        else ex.dex.setAutoApproveEvmTrades(!(ex.trade.autoApprove === true))
-                    }
-                }
-                M.StandardButton {
-                    objectName: "approveAll"
-                    visible: ex.waitingApproval > 1
-                    small: true
-                    text: qsTr("Approve all (%1)").arg(ex.waitingApproval)
-                    onClicked: ex.localError = ex.dex.approveAllEvmTrades() > 0 ? "" : qsTr("No trade could be approved now.")
-                }
-            }
-            Flow {
-                Layout.fillWidth: true
-                spacing: 8
-                Repeater {
-                    model: ex.allTrades
-                    delegate: Rectangle {
-                        objectName: "tradeChip"
-                        width: chipText.implicitWidth + 20; height: chipText.implicitHeight + 12
-                        radius: 6
-                        color: modelData.selected ? M.Style.accentMuted : "transparent"
-                        border.color: modelData.awaitingApproval === true && modelData.done !== true ? "#E5A54B" : M.Style.accentMuted
-                        Text {
-                            id: chipText
-                            anchors.centerIn: parent
-                            text: ex.tradeLabel(modelData) + " — " + ex.tradeState(modelData)
-                            font.pixelSize: 12; color: M.Style.defaultFontColor
-                        }
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.dex.selectEvmTrade(modelData.tradeDir) }
-                    }
-                }
-            }
-        }
+    // ---- one trade in full: only when it needs the user (approval, funds, a refusal) or they opened
+    // it from My orders; the trades otherwise show as rows with ticks in My orders
+    property bool tradeDetail: false
+    readonly property bool tradeNeedsYou: ex.trade.configured === true && tradeSnapshot.done !== true
+        && ((ex.trade.awaitingApproval === true && ex.trade.autoApprove !== true)
+            || Object.keys(ex.trade.awaitingFunding || {}).length > 0 || (ex.trade.startRefusal || "") !== "")
+    Text {
+        visible: ex.tradeDetail && ex.trade.configured === true && !ex.tradeNeedsYou
+        Layout.alignment: Qt.AlignRight
+        text: qsTr("Hide trade details"); font.pixelSize: 12; font.underline: true; color: M.Style.accent
+        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.tradeDetail = false }
     }
-
-    // ---- the running trade, always on top while it runs
     M.DexTradeProgress {
         objectName: "exchangeTrade"
         Layout.fillWidth: true
-        visible: ex.trade.configured === true
+        visible: ex.trade.configured === true && (ex.tradeDetail || ex.tradeNeedsYou)
         trade: ex.trade
         coin: ex.tradeCoin
         coinDecimals: ex.decimalsOf(ex.tradeCoin)
@@ -618,7 +575,7 @@ ColumnLayout {
     }
     Text {
         objectName: "abandonTrade"
-        visible: ex.trade.configured === true && ex.trade.awaitingApproval === true
+        visible: ex.trade.configured === true && ex.trade.awaitingApproval === true && (ex.tradeDetail || ex.tradeNeedsYou)
         text: qsTr("Changed your mind? Cancel this trade (nothing is locked yet)")
         font.pixelSize: 12; color: M.Style.dimmedFontColor; font.underline: true
         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: ex.localError = ex.dex.abandonEvmTrade() ? "" : qsTr("The trade could not be cancelled now.") }
@@ -823,7 +780,7 @@ ColumnLayout {
             RowLayout {
                 spacing: 22
                 Repeater {
-                    model: [ { k: "orders", t: qsTr("My orders") + (ex.openOrders ? " (" + ex.openOrders + ")" : "") },
+                    model: [ { k: "orders", t: qsTr("My orders") + (ex.openOrders + ex.runningTrades ? " (" + (ex.openOrders + ex.runningTrades) + ")" : "") },
                              { k: "trades", t: qsTr("Market trades") },
                              { k: "funds", t: qsTr("Funds") } ]
                     delegate: Column {
@@ -840,6 +797,77 @@ ColumnLayout {
             ColumnLayout {
                 Layout.fillWidth: true; spacing: 4
                 visible: ex.bottomTab === "orders"
+                // Trades under way (several run at once): one row each, a tick for every step done
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: ex.allTrades.length > 0
+                    Text { text: qsTr("Trades"); font.pixelSize: 13; font.family: M.Style.fontMedium.name; color: M.Style.defaultFontColor; Layout.fillWidth: true }
+                    M.StandardButton {
+                        objectName: "approveAll"
+                        visible: ex.waitingApproval > 1 && ex.trade.autoApprove !== true
+                        small: true
+                        text: qsTr("Approve all (%1)").arg(ex.waitingApproval)
+                        onClicked: ex.localError = ex.dex.approveAllEvmTrades() > 0 ? "" : qsTr("No trade could be approved now.")
+                    }
+                    M.CheckBox {
+                        objectName: "autoApprove"
+                        text: qsTr("Approve my trades automatically")
+                        toggleOnClick: false
+                        checked: typeof persistentSettings !== "undefined" ? persistentSettings.dexAutoApprove : ex.trade.autoApprove === true
+                        onClicked: {
+                            if (typeof persistentSettings !== "undefined") persistentSettings.dexAutoApprove = !persistentSettings.dexAutoApprove
+                            else ex.dex.setAutoApproveEvmTrades(ex.trade.autoApprove !== true)
+                        }
+                    }
+                }
+                Repeater {
+                    model: ex.allTrades
+                    delegate: Rectangle {
+                        id: tradeRow
+                        objectName: "tradeRow"
+                        Layout.fillWidth: true
+                        readonly property var st: X.tradeStep(modelData.role, modelData.stage)
+                        readonly property bool buyer: modelData.role === "owner"
+                        readonly property string c: ex.label(modelData.coin || "")
+                        readonly property string b: modelData.privateCoin === "XMR" ? "XMR" : "XMZ"
+                        readonly property bool attention: modelData.done !== true && (modelData.awaitingFunding === true || (modelData.awaitingApproval === true && ex.trade.autoApprove !== true))
+                        implicitHeight: rowCol.implicitHeight + 12
+                        radius: 6; color: modelData.selected && ex.tradeDetail ? M.Style.accentMuted : "transparent"
+                        border.color: attention ? M.Style.warningColor : st.refund ? M.Style.warningColor : M.Style.accentMuted
+                        ColumnLayout {
+                            id: rowCol
+                            anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; anchors.margins: 8
+                            spacing: 4
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Text { text: ex.tradeLabel(modelData); font.pixelSize: 13; color: tradeRow.buyer ? M.Style.green : "#E5677A"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                Text { text: ex.tradeState(modelData); font.pixelSize: 12; color: tradeRow.attention ? M.Style.warningColor : M.Style.dimmedFontColor }
+                                Text {
+                                    text: qsTr("Details"); font.pixelSize: 12; font.underline: true; color: M.Style.accent
+                                    MouseArea { anchors.fill: parent; anchors.margins: -4; cursorShape: Qt.PointingHandCursor
+                                                onClicked: { ex.dex.selectEvmTrade(modelData.tradeDir); ex.tradeDetail = true } }
+                                }
+                            }
+                            // The four steps: ✓ done, ● under way, ○ still to come (↩ a refund stopped it there)
+                            Flow {
+                                Layout.fillWidth: true; spacing: 14
+                                Repeater {
+                                    model: tradeRow.buyer
+                                        ? [qsTr("Agreed"), qsTr("You lock %1").arg(tradeRow.c), qsTr("Seller locks %1").arg(tradeRow.b), qsTr("%1 arrives").arg(tradeRow.b)]
+                                        : [qsTr("Agreed"), qsTr("Buyer locks %1").arg(tradeRow.c), qsTr("You lock %1").arg(tradeRow.b), qsTr("%1 arrives").arg(tradeRow.c)]
+                                    delegate: Text {
+                                        readonly property var st: tradeRow.st
+                                        readonly property bool done: index < st.step
+                                        readonly property bool current: index === st.step && !st.finished
+                                        text: (done ? "✓ " : current ? (st.refund ? "↩ " : "● ") : "○ ") + modelData
+                                        font.pixelSize: 12
+                                        color: done ? M.Style.green : current ? (st.refund ? M.Style.warningColor : M.Style.defaultFontColor) : M.Style.dimmedFontColor
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     visible: ex.myOrders.length > 0
@@ -863,7 +891,7 @@ ColumnLayout {
                             Layout.fillWidth: true; Layout.preferredWidth: 5; elide: Text.ElideRight
                             font.pixelSize: 12; color: M.Style.dimmedFontColor
                             text: (modelData.state === "open" ? (modelData.kind === "offer" ? (modelData.renew ? qsTr("open · renews itself") : qsTr("open · %1").arg(X.timeLeft(modelData.expiresAt, ex.now))) : qsTr("waiting for the maker"))
-                                  : modelData.state === "agreed" ? qsTr("matched: trade in progress")
+                                  : modelData.state === "agreed" ? qsTr("matched: see Trades above")
                                   : modelData.state === "finished" ? qsTr("finished")
                                   : modelData.state === "expired" ? qsTr("expired") : modelData.state === "cancelled" ? qsTr("cancelled")
                                   : modelData.state === "withdrawn" ? qsTr("withdrawn: funds no longer there")
