@@ -1539,7 +1539,15 @@ ApplicationWindow {
         console.log("fiatPriceError: " + msg);
     }
 
+    function dexSendOwnWallets() {
+        if (typeof dexEngine === "undefined" || !dexEngine || typeof dexEngine.setOwnWallets !== "function") return
+        var m = {}
+        try { m = JSON.parse(persistentSettings.dexExternalWallets || "{}") || {} } catch (e) { m = {} }
+        dexEngine.setOwnWallets(m)
+    }
+
     Component.onCompleted: {
+        dexSendOwnWallets()
         if (typeof dexEngine !== "undefined" && dexEngine && typeof dexEngine.setAutoApproveEvmTrades === "function") dexEngine.setAutoApproveEvmTrades(persistentSettings.dexAutoApprove)
         if (screenAvailableWidth > width) {
             x = (screenAvailableWidth - width) / 2;
@@ -1675,6 +1683,8 @@ ApplicationWindow {
         property string dexExternalWallet: ""
         // DEX: the user's own wallets per coin, as JSON {"BTC": "bc1…", "LTC": "ltc1…", …}. Optional.
         property string dexExternalWallets: "{}"
+        // The engine pays finished trades out to these by itself (before the DEX page's account)
+        onDexExternalWalletsChanged: appWindow.dexSendOwnWallets()
         // DEX: approve each trade as soon as its terms are agreed (no click per trade)
         property bool dexAutoApprove: true
         // DEX: the simple Swap screen first (the order book and limit orders under "Advanced")
