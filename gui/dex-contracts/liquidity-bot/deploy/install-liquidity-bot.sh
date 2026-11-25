@@ -6,6 +6,11 @@
 #                                            continue when it starts again)
 #   bash install-liquidity-bot.sh accounts   the bot's XMZ address and each slot's trade account
 #   bash install-liquidity-bot.sh status     what it holds and is doing
+#   bash install-liquidity-bot.sh layout 2,5,10,20,35,50 2000
+#                                            set the ladder steps (percent above the reference
+#                                            price, one offer slot per step and pair) and the XMZ
+#                                            per offer; restarts the bot. A new slot needs its trade
+#                                            account funded for network fees (see 'accounts').
 # Config on the server: /etc/monzero-liquidity/config.json (written once, never overwritten).
 # Keys and wallet: /var/lib/monzero-liquidity/{keys,main-wallet} - back these up after the first install.
 set -euo pipefail
@@ -21,8 +26,34 @@ case "$ACTION" in
   stop)     remote sudo systemctl disable --now monzero-liquidity; exit ;;
   accounts) as_bot accounts 2>&1 | grep -v ' INFO '; exit ;;
   status)   as_bot status; remote sudo journalctl -u monzero-liquidity -n 15 --no-pager -o cat || true; exit ;;
+  layout)
+    LADDER=${2:-}; OFFER=${3:-}
+    [[ "$LADDER" =~ ^[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] || { echo "ladder: percents separated by commas, e.g. 2,5,10,20"; exit 1; }
+    [[ "$OFFER" =~ ^[0-9]+$ ]] && [ "$OFFER" -ge 1 ] || { echo "offer: whole XMZ per offer"; exit 1; }
+    remote sudo LADDER="$LADDER" OFFER="$OFFER" bash -s <<'REMOTE'
+set -euo pipefail
+C=/etc/monzero-liquidity/config.json
+TS=$(date -u +%Y%m%d-%H%M%S)
+cp -p "$C" "$C.before-layout-$TS"
+python3 - "$C" <<'PY'
+import json, os, sys
+c = json.load(open(sys.argv[1]))
+print("was: ladder %s, %s XMZ per offer" % (c.get("ladder_percent", "default"), c.get("offer_xmz", "default")))
+c["ladder_percent"] = [float(x) if "." in x else int(x) for x in os.environ["LADDER"].split(",")]
+c["offer_xmz"] = os.environ["OFFER"]
+open(sys.argv[1], "w").write(json.dumps(c, indent=1) + "\n")
+print("now: ladder %s, %s XMZ per offer" % (c["ladder_percent"], c["offer_xmz"]))
+PY
+# The bot checks the config as it loads it: a refused one is put back
+if ! sudo -u monzero-liquidity /usr/bin/python3 -I /opt/monzero-liquidity/liquidity_bot.py "$C" status >/dev/null; then
+  cp -p "$C.before-layout-$TS" "$C"; echo "!! the bot refused the new config; the old one is back"; exit 1
+fi
+echo "backup: $C.before-layout-$TS"
+if systemctl is-active -q monzero-liquidity; then systemctl restart monzero-liquidity; echo "bot restarted with the new layout"; fi
+REMOTE
+    exit ;;
   install)  ;;
-  *) echo "usage: $0 [install|start|stop|accounts|status]"; exit 1 ;;
+  *) echo "usage: $0 [install|start|stop|accounts|status|layout STEPS XMZ]"; exit 1 ;;
 esac
 
 echo "== checking here"
