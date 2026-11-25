@@ -33,6 +33,8 @@ upgrade to stay on the network.
 
 - Trading-wallet services end with the app; an upgrade stops the old version's.
 - Trade limits: an operator document with no limits ("open") is read correctly.
+- A finished trade is paid out to the address saved in the wallet for that coin; before, the DEX
+  page link could send it to the account the web page had connected instead.
 
 # Monzero v1.3.10 release notes
 
