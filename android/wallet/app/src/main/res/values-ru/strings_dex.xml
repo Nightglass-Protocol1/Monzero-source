@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="dex_menu">Торговать на DEX</string>
+    <string name="dex_title">Торговля на DEX</string>
+    <string name="dex_channel_link">Связь с DEX</string>
+    <string name="dex_channel_ask">Запросы DEX</string>
+    <string name="dex_link_title">Связь с Monzero DEX</string>
+    <string name="dex_link_starting">Запуск…</string>
+    <string name="dex_link_off">Выключить</string>
+    <string name="dex_link_no_port">Не удалось включить связь: её порты заняты. Выключите и снова включите её.</string>
+    <string name="dex_line_waiting">Включено. Откройте monzero.org/dex в браузере этого телефона и подключитесь.</string>
+    <string name="dex_line_connected">Подключено к %1$s.</string>
+    <string name="dex_line_approve">Сделка ожидает вашего подтверждения.</string>
+    <string name="dex_line_trade">Идёт сделка: %1$s. Не выключайте связь до её завершения.</string>
+    <string name="dex_stop_refused_title">Сделка ещё не завершена</string>
+    <string name="dex_stop_refused_text">Связь с DEX остаётся включённой, пока сделка не завершится или средства не будут возвращены. Если выключить её сейчас, ваши средства могут поступить с задержкой.</string>
+    <string name="dex_add_title">Пополнить XMZ для торговли</string>
+    <string name="dex_add_text">Нажмите, чтобы открыть экран отправки кошелька с уже указанным адресом вашего торгового кошелька.</string>
+    <string name="dex_add_waiting">Экран отправки откроется с заполненными полями, как только кошелёк завершит синхронизацию.</string>
+
+    <string name="dex_intro">Торговля ведётся на странице DEX, monzero.org/dex, открытой в браузере этого телефона. Этот кошелёк хранит торговые ключи и выполняет каждый своп. Страница может показывать ваш торговый баланс и запрашивать размещение или принятие предложений; начать сделку она не может. Каждое подключение, пароль и сделка подтверждаются здесь, через уведомление.</string>
+    <string name="dex_switch">Связь с DEX на этом телефоне</string>
+    <string name="dex_open_page">Открыть страницу DEX</string>
+    <string name="dex_disconnect">Отключить страницу</string>
+    <string name="dex_words">Показать слова восстановления</string>
+    <string name="dex_return">Вернуть торговые XMZ</string>
+    <string name="dex_pending">Ответить на ожидающий запрос</string>
+    <string name="dex_status_off">Связь выключена.</string>
+    <string name="dex_status_link">Связь: %1$s</string>
+    <string name="dex_status_page_none">страница не подключена</string>
+    <string name="dex_status_page">подключено к %1$s</string>
+    <string name="dex_status_wallet">Торговый кошелёк: %1$s</string>
+    <string name="dex_status_balance">Торговый баланс: %1$s XMZ (%2$s доступно)</string>
+    <string name="dex_status_keys_none">Торговые ключи: ещё не созданы (пароль задаётся при первом подключении)</string>
+    <string name="dex_status_keys_locked">Торговые ключи: заблокированы</string>
+    <string name="dex_status_keys_ready">Торговые ключи: разблокированы до выключения связи</string>
+    <string name="dex_status_account">Торговый аккаунт: %1$s</string>
+    <string name="dex_status_trade">Сделка: %1$s</string>
+    <string name="dex_status_limits">Лимиты, подписанные проектом (проверены на этом телефоне):</string>
+    <string name="dex_status_home">Возвращённые XMZ поступают на: %1$s</string>
+    <string name="dex_status_home_none">Откройте этот экран из кошелька (меню, «Торговать на DEX»), чтобы указать, куда возвращать торговые XMZ.</string>
+    <string name="dex_notifications_needed">Разрешите уведомления: через них кошелёк просит подтвердить подключения и сделки.</string>
+
+    <string name="dex_prompt_nothing">Нет ожидающих запросов.</string>
+    <string name="dex_close">Закрыть</string>
+    <string name="dex_not_now">Не сейчас</string>
+    <string name="dex_pair_title">Подключить веб-страницу DEX?</string>
+    <string name="dex_pair_body">%1$s запрашивает использование этого кошелька для торговли.\n\nПринимайте, только если на странице показан тот же код.\n\nВсё, что вы получаете в сделках, отправляется на ваш собственный кошелёк:\n%2$s\n\nСтраница может показывать ваш торговый баланс и запрашивать размещение или принятие предложений. Начать сделку она не может: каждую сделку вы подтверждаете здесь.</string>
+    <string name="dex_accept">Принять</string>
+    <string name="dex_refuse">Отклонить</string>
+    <string name="dex_keys_new_title">Задайте торговый пароль</string>
+    <string name="dex_keys_new_body">С ним будут созданы ваши торговые ключи. Они хранятся на этом телефоне в зашифрованном виде, и никто не сможет восстановить для вас пароль. Он будет запрашиваться при каждом включении связи с DEX.</string>
+    <string name="dex_keys_unlock_title">Введите торговый пароль</string>
+    <string name="dex_keys_unlock_body">Он разблокирует ваши торговые ключи до выключения связи с DEX.</string>
+    <string name="dex_keys_working">Выполняется… это может занять некоторое время.</string>
+    <string name="dex_password_new">Новый торговый пароль</string>
+    <string name="dex_password_repeat">Повторите пароль</string>
+    <string name="dex_password">Торговый пароль</string>
+    <string name="dex_password_mismatch">Пароли не совпадают.</string>
+    <string name="dex_password_short">Используйте не менее 8 символов.</string>
+    <string name="dex_keys_create">Создать торговые ключи</string>
+    <string name="dex_keys_unlock">Разблокировать</string>
+    <string name="dex_words_title">Запишите слова восстановления</string>
+    <string name="dex_words_body">Эти двенадцать слов — единственная резервная копия ваших торговых ключей. Если телефон будет потерян во время сделки, они позволят восстановить торговый аккаунт (с ними его также можно открыть в MetaMask и других кошельках Ethereum). Запишите их на бумаге; никогда не вводите их на веб-страницах.\n\n%1$s</string>
+    <string name="dex_words_wrong">Это не торговый пароль.</string>
+    <string name="dex_words_done">Я их записал(а)</string>
+    <string name="dex_approve_title">Подтвердить эту сделку?</string>
+    <string name="dex_approve_body">Вы платите %1$s\nВы получаете %2$s\n\nСеть: %3$s\nЭти суммы взяты из подписанного предложения, которое хранит этот кошелёк, а не с веб-страницы. После подтверждения своп выполняется сам; не выключайте связь с DEX и держите телефон подключённым к сети до его завершения. Если другая сторона остановится, ваши средства будут возвращены по истечении срока.\n\nОстаток %4$s на торговом аккаунте после сделки будет отправлен на %5$s</string>
+    <string name="dex_approve_no_account">(для этой монеты ещё не подключён кошелёк)</string>
+    <string name="dex_direct_approve_body">Вы платите %1$s\nВы получаете %2$s\n\nВы платите в сети: %3$s\nВы получаете в сети: %4$s\nЭти суммы взяты из подписанного предложения, которое хранит этот кошелёк, а не с веб-страницы. После подтверждения своп выполняется сам; не выключайте связь с DEX и держите телефон подключённым к сети до его завершения. Если другая сторона не заблокирует свою монету, ваша вернётся к вам по истечении срока (около 9 часов).\n\nПолученное будет отправлено на %5$s</string>
+    <string name="dex_approve">Подтвердить</string>
+    <string name="dex_approve_cancel">Отменить сделку</string>
+    <string name="dex_xmr_add_title">Пополнить XMR для торговли</string>
+    <string name="dex_xmr_add_body">Отправьте %1$s на ваш торговый кошелёк Monero из Cake Wallet или любого кошелька Monero:
+
+%2$s
+
+Средствами можно торговать после того, как сеть Monero их подтвердит (10 блоков, около 20 минут). Перевести их могут только ваши торговые ключи в этом приложении.</string>
+    <string name="dex_xmr_add_any">XMR</string>
+    <string name="dex_xmr_add_open">Открыть Cake Wallet</string>
+    <string name="dex_xmr_add_copy">Скопировать адрес</string>
+    <string name="dex_xmr_add_copied">Адрес скопирован. Вставьте его на экране отправки вашего кошелька Monero.</string>
+    <string name="dex_xmr_add_no_app">Не удалось открыть приложение кошелька Monero. Установите Cake Wallet или скопируйте адрес в свой кошелёк Monero.</string>
+    <string name="dex_xmr_not_ready">Торговый кошелёк Monero ещё запускается. Повторите попытку через минуту.</string>
+    <string name="dex_xmr_out_title">Отправить XMR на свой кошелёк</string>
+    <string name="dex_xmr_out_body">В вашем торговом кошельке Monero доступно %1$s XMR. Отправьте их на свой кошелёк Monero (например, на адрес в Cake Wallet) за вычетом комиссии сети. Оставьте сумму пустой, чтобы отправить всё.</string>
+    <string name="dex_xmr_out_none">Пока нет XMR, готовых к отправке. XMR, полученным в сделке, нужно 10 подтверждений (около 20 минут).</string>
+    <string name="dex_xmr_out_address">Ваш адрес Monero (начинается с 4 или 8)</string>
+    <string name="dex_xmr_out_amount">XMR (пусто: всё)</string>
+    <string name="dex_xmr_out_go">Отправить XMR</string>
+    <string name="dex_xmr_out_bad">Проверьте адрес: адрес Monero начинается с 4 или 8 и состоит из 95 символов.</string>
+    <string name="dex_return_title">Вернуть торговые XMZ?</string>
+    <string name="dex_return_body">В вашем торговом кошельке доступно %1$s XMZ. Вся сумма вернётся на адрес вашего кошелька за вычетом комиссии сети:\n\n%2$s</string>
+    <string name="dex_return_none">Пока нечего возвращать. XMZ, полученные в сделке, можно отправить примерно через 20 минут.</string>
+    <string name="dex_return_go">Вернуть</string>
+    <string name="dex_return_sent">Отправлено. Средства появятся в кошельке через несколько минут.</string>
+    <string name="dex_return_failed">Сейчас не удалось начать. Повторите попытку чуть позже.</string>
+
+    <string name="dex_stage_start">ожидает вашего подтверждения</string>
+    <string name="dex_stage_lock_sent">блокировка вашей монеты</string>
+    <string name="dex_stage_locked">ожидание XMZ продавца</string>
+    <string name="dex_stage_ready_sent">разблокировка свопа</string>
+    <string name="dex_stage_ready">ожидание, пока продавец заберёт средства</string>
+    <string name="dex_stage_sweeping">ваши XMZ поступают</string>
+    <string name="dex_stage_waiting_lock">ожидание монеты покупателя</string>
+    <string name="dex_stage_xmz_lock_sent">блокировка ваших XMZ</string>
+    <string name="dex_stage_xmz_locked">ожидание разблокировки от покупателя</string>
+    <string name="dex_stage_claim_sent">получение вашей монеты</string>
+    <string name="dex_stage_refund_sent">возврат вашей монеты</string>
+    <string name="dex_stage_waiting_refund">ожидание возврата средств покупателю</string>
+    <string name="dex_stage_sweeping_back">возврат ваших XMZ</string>
+    <string name="dex_stage_done_swapped">завершено, своп выполнен</string>
+    <string name="dex_stage_done_other">завершено (%1$s)</string>
+</resources>
