@@ -337,7 +337,20 @@ async fn main() {
         if token() {
             offer["offer"]["pair"] = json!(pair());
         }
-        maker.call("post", offer).await
+        // A maker selling XMZ waits for the funded coins to unlock (10 blocks): the helper refuses
+        // a sell offer the wallet cannot cover yet
+        let mut r = maker.call("post", offer.clone()).await;
+        for round in 0..90 {
+            if r["ok"] == true || !(sell() && r["error"].as_str().unwrap_or("").contains("unlocked")) {
+                break;
+            }
+            if round % 5 == 0 {
+                log(format!("maker: {}", r["error"]));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            r = maker.call("post", offer.clone()).await;
+        }
+        r
     };
     assert_eq!(posted["ok"], true, "post: {posted}");
     log(format!("maker posted: {}", posted.get("posted").unwrap_or(&Value::Null)));
