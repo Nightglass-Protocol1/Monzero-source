@@ -52,6 +52,8 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
     private final List<DexTrade> round = new ArrayList<>();
     private final java.util.Set<String> finishedDirs = new java.util.HashSet<>(), reportedTrades = new java.util.HashSet<>(),
             seenRunning = new java.util.HashSet<>(), autoTried = new java.util.HashSet<>();
+    /** Trades reopened after a restart: never approved automatically (the user may have moved on) */
+    private final java.util.Set<String> resumedDirs = new java.util.HashSet<>();
     private final List<Object[]> waiting = new ArrayList<>();   // {market, folder}: over the limit, opened as others finish
     private static final int MAX_TRADES = 8;
     /** Approve each trade as soon as its terms are agreed (on unless the user turned it off) */
@@ -367,7 +369,12 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
         }
         // A Monero trade may have been running when the app closed: after the first resume, it joins the queue
         if (!resumed) resumeTrades();
-        else for (DexMarket m : xmrMarkets.values()) for (String dir : m.agreedFolders()) if (tradeFor(dir) == null) agreed(m, dir);
+        else for (DexMarket m : xmrMarkets.values())
+            for (String dir : m.agreedFolders())
+                if (tradeFor(dir) == null) {
+                    resumedDirs.add(dir);
+                    agreed(m, dir);
+                }
         changed();
     }
 
@@ -885,7 +892,7 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
                     if (o != t && o != trade) retire(o);
                 }
         }
-        if (autoApprove && t.awaitingApproval() && !t.busy() && autoTried.add(t.commitment())) {
+        if (autoApprove && !resumedDirs.contains(dir) && t.awaitingApproval() && !t.busy() && autoTried.add(t.commitment())) {
             final String c = t.commitment();
             handler.post(() -> {
                 if (trades.contains(t)) approve(t, c);
@@ -1133,7 +1140,11 @@ final class DexEngine implements DexWallets.Listener, DexMarket.Listener, DexTra
             }
         // Oldest first: their time limits run out first
         Collections.sort(found, (a, b) -> Long.compare((Long) a[0], (Long) b[0]));
-        for (Object[] f : found) if (tradeFor((String) f[1]) == null) agreed((DexMarket) f[2], (String) f[1]);
+        for (Object[] f : found)
+            if (tradeFor((String) f[1]) == null) {
+                resumedDirs.add((String) f[1]);
+                agreed((DexMarket) f[2], (String) f[1]);
+            }
     }
 
     /** A trade's swap-wallet service runs in its coin's wallets: stop it in both */

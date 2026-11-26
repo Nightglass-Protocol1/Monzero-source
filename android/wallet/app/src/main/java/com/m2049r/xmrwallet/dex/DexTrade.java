@@ -102,9 +102,11 @@ final class DexTrade {
 
     /** Give up a trade that was never approved: nothing of it was ever locked. */
     boolean abandon() {
+        // Until this side locks anything: the buyer before its lock is sent ("Start"), the seller
+        // before it locks XMZ ("WaitingForEvmLock"), approved or not
         final String stage = snapshot.optString("stage");
-        if (!configured() || busy || snapshot.optBoolean("approved") || (!stage.equals("Start") && !stage.equals("WaitingForEvmLock"))) return false;
-        if (!DexFiles.write(new File(tradeDir, "abandoned"), "abandoned before approval\n")) return false;
+        if (!configured() || busy || !pendingApproval.isEmpty() || (!stage.equals("Start") && !stage.equals("WaitingForEvmLock"))) return false;
+        if (!DexFiles.write(new File(tradeDir, "abandoned"), "abandoned before anything was locked\n")) return false;
         try {
             snapshot.put("done", true);
         } catch (Exception ignored) {
