@@ -1,3 +1,34 @@
+# Monzero v1.3.12 release notes
+
+Release label: v1.3.12
+
+Monzero v1.3.12 is a fix release for the DEX in v1.3.11. It changes no consensus rule: the chain,
+blocks, coins, wallets, seeds and addresses are the same as in v1.0.0 to v1.3.11, and nobody has to
+upgrade to stay on the network.
+
+## What is fixed
+
+- **Old trades are no longer approved by themselves.** In v1.3.11, trades agreed before the wallet
+  was closed (for example ones you had given up on and whose coins you had already withdrawn) were
+  approved automatically on the next start. Now only trades agreed while the wallet runs approve
+  themselves; trades reopened after a restart wait for you.
+- **Cancel until your side locks anything.** A trade can be cancelled, approved or not, until your
+  side has locked coins (a buyer before its lock is sent, a seller before it locks XMZ). Rows under
+  My orders show a Cancel button while that holds.
+
+## Android wallet 1.1.15
+
+- The same two fixes: trades reopened after a restart wait for you, and Swap screen rows have a
+  Cancel until your side locks anything.
+- Swap screen: the "DEX link, recovery words and history", deposit "Cancel" and "only N XMZ is
+  offered" buttons were invisible (text the colour of the background); they show now.
+
+## Upgrading
+
+Close the old wallet and node, unpack v1.3.12 and start it: same wallet files, node data, trading
+keys and trading wallets. A running trade carries on in v1.3.12. Android: install 1.1.15 over
+1.1.14; your wallets stay.
+
 # Monzero v1.3.11 release notes
 
 Release label: v1.3.11
